@@ -1,0 +1,14 @@
+[package]
+name = "pon-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pon-ir.workspace = true
+pon-jit.workspace = true
+pon-aot.workspace = true
+anyhow.workspace = true
