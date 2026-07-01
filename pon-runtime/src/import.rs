@@ -528,8 +528,77 @@ fn resolve_import_name(name: &str, level: u32, importer_package: Option<&str>) -
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_import_name;
+    use std::env;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process;
+    use std::ptr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use super::{pon_import_from, pon_import_name, reset_import_state_for_tests, resolve_import_name};
+    use crate::abi::{format_object_for_print, pon_runtime_init};
+    use crate::intern::intern;
+    use crate::thread_state::{pon_err_clear, pon_err_message, test_state_lock};
+
+    static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
+
+    struct TempImportRoot {
+        path: PathBuf,
+    }
+
+    impl TempImportRoot {
+        fn new() -> Self {
+            let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let path = env::temp_dir().join(format!("pon-import-source-root-{}-{id}", process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempImportRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &Path) -> Self {
+            let previous = env::var_os(name);
+            unsafe {
+                env::set_var(name, value);
+            }
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    env::set_var(self.name, previous);
+                } else {
+                    env::remove_var(self.name);
+                }
+            }
+        }
+    }
+
+    struct ResetImportStateOnDrop;
+
+    impl Drop for ResetImportStateOnDrop {
+        fn drop(&mut self) {
+            reset_import_state_for_tests();
+        }
+    }
     #[test]
     fn absolute_import_keeps_name() {
         assert_eq!(resolve_import_name("pkg.sub", 0, None).unwrap(), "pkg.sub");
@@ -568,6 +637,38 @@ mod tests {
             resolve_import_name("sib", 2, Some("pkg")).unwrap_err(),
             "attempted relative import beyond top-level package"
         );
+    }
+
+    #[test]
+    fn pon_import_path_root_loads_curated_source_module() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+        pon_err_clear();
+        reset_import_state_for_tests();
+
+        let root = TempImportRoot::new();
+        let module_name = format!("pon_import_path_{}_source", process::id());
+        let module_path = root.path().join(format!("{module_name}.py"));
+        fs::write(&module_path, "marker = 'loaded-via-pon-import-path'\nanswer = 42\n").unwrap();
+        let _env = EnvVarGuard::set("PON_IMPORT_PATH", root.path());
+
+        let module = unsafe { pon_import_name(intern(&module_name), ptr::null(), 0, 0) };
+        assert!(
+            !module.is_null(),
+            "importing source module from PON_IMPORT_PATH failed: {:?}",
+            pon_err_message()
+        );
+
+        let marker = unsafe { pon_import_from(module, intern("marker")) };
+        assert_eq!(
+            format_object_for_print(marker).as_deref(),
+            Ok("loaded-via-pon-import-path")
+        );
+        let answer = unsafe { pon_import_from(module, intern("answer")) };
+        assert_eq!(format_object_for_print(answer).as_deref(), Ok("42"));
     }
 }
 
