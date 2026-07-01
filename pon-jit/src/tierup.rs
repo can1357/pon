@@ -10,6 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::mpsc;
+use std::thread::JoinHandle;
 
 use cranelift_codegen::ir::AbiParam;
 use cranelift_frontend::FunctionBuilderContext;
@@ -20,12 +22,12 @@ use pon_codegen::helpers::declare_helpers;
 use pon_codegen::isa::{OptLevel, make_isa};
 use pon_codegen::optimizing;
 use pon_codegen::{ModuleAnnotations, OptimizingPlan, infer_module_types, lowering_steps, plan_function};
-use pon_ir::ir::{Function, InstKind, Module as IrModule, PyConst, Value};
+use pon_ir::ir::{BlockId, Function, InstKind, Module as IrModule, PyConst, Value};
 use pon_runtime::abi::{HELPERS, TIER1_CALL_THRESHOLD, TIER1_DEFERRED_CALL_THRESHOLD, TIER1_LOOP_THRESHOLD, pon_tierup_set_hook};
 use pon_runtime::feedback::{FeedbackVec, TypeTag};
 use pon_runtime::object::{
-    PyFunction, TIER_STATE_DEFERRED, TIER_STATE_DISABLED, TIER_STATE_QUEUED, TIER_STATE_TIER0, TIER_STATE_TIER1,
-    Tier1Code,
+    PyFunction, PyObject, TIER_STATE_DEFERRED, TIER_STATE_DISABLED, TIER_STATE_QUEUED, TIER_STATE_TIER0,
+    TIER_STATE_TIER1, Tier1Code,
 };
 
 /// Function-entry hotness threshold mirrored from the runtime probe.
@@ -42,6 +44,14 @@ pub struct TierUpDriver {
     modules: Vec<RegisteredModule>,
     functions: Vec<RegisteredFunction>,
     installed: Vec<Box<Tier1Compilation>>,
+    /// Producer half of the background compile queue (J0.5).  `None` until O1
+    /// spawns the compiler thread; the synchronous hook path stays authoritative.
+    /// `mpsc::Sender` is `Sync` (Rust ≥1.72), so FT-build producers share it directly.
+    #[allow(dead_code, reason = "J0.5 pin: consumed by O1 in a later wave")]
+    compile_tx: Option<mpsc::Sender<CompileRequest>>,
+    /// Background compiler thread handle, joined on Drop (J0.5).  `None` until O1.
+    #[allow(dead_code, reason = "J0.5 pin: consumed by O1 in a later wave")]
+    compiler: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone)]
@@ -96,6 +106,8 @@ impl TierUpDriver {
             modules: Vec::new(),
             functions: Vec::new(),
             installed: Vec::new(),
+            compile_tx: None,
+            compiler: None,
         }
     }
 
@@ -183,6 +195,23 @@ impl TierUpDriver {
 impl Default for TierUpDriver {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for TierUpDriver {
+    /// J0.5 shutdown contract: close the queue, then drain-join the compiler.
+    ///
+    /// Dropping `compile_tx` hangs up the channel; the compiler thread observes
+    /// the hangup, resets every still-`QUEUED` request back to tier-0 without
+    /// compiling, and exits.  `join` then blocks until that drain finishes so no
+    /// compiler-thread access to driver-owned registries can outlive the driver.
+    /// The owning `JitEngine` unregisters the runtime hook before this runs, so
+    /// no new requests can be enqueued during the drain.
+    fn drop(&mut self) {
+        drop(self.compile_tx.take());
+        if let Some(compiler) = self.compiler.take() {
+            let _ = compiler.join();
+        }
     }
 }
 
@@ -423,6 +452,140 @@ fn range_trip(start: i64, stop: i64, step: i64) -> Option<i64> {
     let step = step.abs();
     Some((distance + step - 1) / step)
 }
+
+// ─── J0.5 pin: OSR + background compilation (implemented by O1) ─────────────
+//
+// Frozen interfaces for the background-compilation and OSR-entry contracts.
+// See `plans/pon-pin-J05-osr-bg-compile.md` for the full design: queue
+// lifecycle, install protocol, tier-state machine, OSR transfer layout, and
+// the deopt-thrash suppression policy that replaces `should_defer_tierup`.
+
+/// Maximum number of boxed slots an [`OsrTransferBuffer`] can carry.
+///
+/// Functions whose OSR live set exceeds this are OSR-ineligible and tier up
+/// through the function-entry path only.
+pub const OSR_MAX_LIVE: usize = 16;
+
+/// Deopt count within one tier-1 epoch that triggers a thrash reset (J0.5
+/// suppression replacement; see the design doc, §5).
+pub const DEOPT_THRASH_THRESHOLD: u32 = 64;
+/// Maximum exponent for the thrash re-try hotness backoff (`threshold << epoch`).
+pub const DEOPT_BACKOFF_MAX_SHIFT: u32 = 6;
+/// Tier epoch after which a thrashing function is pinned to tier-0 for good.
+pub const DEOPT_PIN_EPOCH: u8 = 8;
+
+/// A `*mut PyFunction` that may cross onto the background compiler thread.
+///
+/// `PyFunction` allocations live on the non-moving `pon-gc` heap, so the
+/// address itself is stable for the allocation's whole lifetime.  Liveness is
+/// NOT automatic: functions are collectible (`finalize_function` in
+/// `pon-runtime/src/abi.rs` runs for unreachable functions), so the enqueue
+/// protocol must pin the function in the driver's GC-visible pin set before a
+/// `SendPtr` is constructed and unpin it only after the request retires.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code, reason = "J0.5 pin: consumed by O1 in a later wave")]
+pub struct SendPtr(*mut PyFunction);
+
+// SAFETY: The pointer is only dereferenced by the compiler thread while the
+// pointee is pinned in the driver's GC pin set (enqueue pins, retire unpins),
+// so the allocation cannot be swept, and the pon-gc heap is non-moving, so the
+// address cannot change.  All cross-thread field accesses go through the
+// pointee's atomics (`tier_state`, `entry`); the `tier1` UnsafeCell is written
+// only after winning the QUEUED->TIER1 claim (design doc, §3).
+unsafe impl Send for SendPtr {}
+
+impl SendPtr {
+    /// Wrap a function pointer for the compile queue.
+    ///
+    /// # Safety
+    /// The caller must guarantee the pointee stays pinned (GC-reachable via the
+    /// driver's pin set or another root) for the whole lifetime of this value.
+    #[must_use]
+    #[allow(dead_code, reason = "J0.5 pin: consumed by O1 in a later wave")]
+    pub unsafe fn new(function: *mut PyFunction) -> Self {
+        Self(function)
+    }
+
+    /// The wrapped raw pointer.
+    #[must_use]
+    #[allow(dead_code, reason = "J0.5 pin: consumed by O1 in a later wave")]
+    pub fn as_ptr(self) -> *mut PyFunction {
+        self.0
+    }
+}
+
+/// Why a function was submitted to the background compiler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code, reason = "J0.5 pin: consumed by O1 in a later wave")]
+pub enum CompileReason {
+    /// The function-entry hotness probe crossed [`CALL_THRESHOLD`].
+    Call,
+    /// A loop back-edge probe crossed [`LOOP_THRESHOLD`]; the payload names the
+    /// loop-header block that identifies the OSR point.
+    LoopBackEdge(BlockId),
+}
+
+/// Stable identity of a registered IR snapshot: an index into the driver's
+/// append-only `functions` registry (which names its module and function).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code, reason = "J0.5 pin: consumed by O1 in a later wave")]
+pub struct IrSnapshotId(pub u32);
+
+/// One unit of work for the background compiler thread.
+///
+/// Everything the compiler needs is captured on the enqueuing (mutator) thread:
+/// the feedback snapshot is taken at enqueue time so the compiler never reads
+/// the function's live `FeedbackVec` cells concurrently with mutator writes.
+#[allow(dead_code, reason = "J0.5 pin: consumed by O1 in a later wave")]
+pub struct CompileRequest {
+    /// The queued function; pinned by the driver until this request retires.
+    pub function: SendPtr,
+    /// Registered IR snapshot to compile (resolved at enqueue time).
+    pub ir_snapshot_id: IrSnapshotId,
+    /// Monomorphic speculation snapshot, indexed by feedback slot.
+    pub feedback_snapshot: Vec<Option<(TypeTag, TypeTag)>>,
+    /// What made the function hot.
+    pub reason: CompileReason,
+}
+
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<CompileRequest>();
+};
+
+/// Stack-allocated live-state carrier for an OSR-entry transfer (J0.5).
+///
+/// Layout contract (repr(C); on 64-bit: 8-byte header words, then pointers):
+///
+/// ```text
+/// offset 0                : loop_header (u32)  — IR BlockId of the OSR point
+/// offset 4                : live_count  (u32)  — occupied prefix of `slots`
+/// offset 8 .. 8 + 16*ptr  : slots[OSR_MAX_LIVE] — boxed live values
+/// ```
+///
+/// Slot order is the canonical OSR live set for `loop_header`: every function
+/// local slot in ascending `LocalId` order (NULL for unbound locals), then SSA
+/// values live-in at the loop header (backward liveness on the raw IR) in
+/// ascending `Value` index order.  Tier-0 writes the buffer at the back-edge;
+/// the OSR body's entry block reads it with the same ordering rule.
+#[repr(C)]
+#[derive(Debug)]
+#[allow(dead_code, reason = "J0.5 pin: consumed by O1 in a later wave")]
+pub struct OsrTransferBuffer {
+    /// IR `BlockId.0` of the loop header this transfer targets.
+    pub loop_header: u32,
+    /// Number of occupied leading `slots`.
+    pub live_count: u32,
+    /// Boxed live values, canonical order; entries past `live_count` are NULL.
+    pub slots: [*mut PyObject; OSR_MAX_LIVE],
+}
+
+/// ABI of a tier-1 OSR entry: consumes a transfer buffer, runs the function to
+/// completion from the loop header, and returns the function's return value
+/// (NULL with the thread-state exception set on error), so tier-0 forwards the
+/// result unchanged.
+#[allow(dead_code, reason = "J0.5 pin: consumed by O1 in a later wave")]
+pub type OsrEntryFn = unsafe extern "C" fn(buffer: *mut OsrTransferBuffer) -> *mut PyObject;
 
 
 #[cfg(test)]
