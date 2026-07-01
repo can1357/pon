@@ -1,0 +1,74 @@
+//! Attribute access helper family namespace.
+
+use core::ptr;
+
+use crate::abstract_op;
+use crate::descr;
+use crate::feedback::FeedbackCell;
+use crate::object::PyObject;
+
+/// Interned attribute-name id carried through the helper ABI.
+pub type AttrName = u32;
+
+/// Loads an attribute by interned name, using generic descriptor semantics behind
+/// the receiver type's `tp_getattro` slot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_load_attr(
+    object: *mut PyObject,
+    name: AttrName,
+    feedback: *mut FeedbackCell,
+) -> *mut PyObject {
+    unsafe { super::record_feedback_unary(feedback, object) };
+    super::catch_object_helper(|| unsafe { abstract_op::get_attr(object, name) })
+}
+
+/// Stores an attribute by interned name and returns the stored value on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_store_attr(object: *mut PyObject, name: AttrName, value: *mut PyObject) -> *mut PyObject {
+    super::catch_object_helper(|| {
+        if value.is_null() {
+            return super::return_null_with_error("cannot store NULL attribute value");
+        }
+        if unsafe { abstract_op::set_attr(object, name, value) } < 0 {
+            ptr::null_mut()
+        } else {
+            value
+        }
+    })
+}
+
+/// Deletes an attribute by interned name and returns `None` on success.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_delete_attr(object: *mut PyObject, name: AttrName) -> *mut PyObject {
+    super::catch_object_helper(|| {
+        if unsafe { abstract_op::del_attr(object, name) } < 0 {
+            ptr::null_mut()
+        } else {
+            unsafe { super::pon_none() }
+        }
+    })
+}
+
+/// Tier-0 method load.  Descriptor binding is already performed by attribute
+/// lookup, so this helper returns the callable object directly; later tiers can
+/// replace it with a receiver-pair specialization without changing the IR shape.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_load_method(
+    object: *mut PyObject,
+    name: AttrName,
+    feedback: *mut FeedbackCell,
+) -> *mut PyObject {
+    unsafe { pon_load_attr(object, name, feedback) }
+}
+
+/// Core `isinstance` hook for builtin wiring.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_isinstance(object: *mut PyObject, cls: *mut PyObject) -> i32 {
+    super::catch_status_helper(|| unsafe { descr::isinstance(object, cls) })
+}
+
+/// Core `issubclass` hook for builtin wiring.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_issubclass(cls: *mut PyObject, base: *mut PyObject) -> i32 {
+    super::catch_status_helper(|| unsafe { descr::issubclass(cls, base) })
+}

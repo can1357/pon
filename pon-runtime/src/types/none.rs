@@ -1,0 +1,1 @@
+//! NoneType implementation namespace.

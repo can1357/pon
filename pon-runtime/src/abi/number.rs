@@ -1,0 +1,491 @@
+//! Numeric helper family namespace.
+//!
+//! The Phase-B numeric ABI owns the tier-0 behavior for built-in numeric
+//! objects.  It keeps the legacy `pon_const_int`/`pon_binary_add` path working
+//! while routing concrete int/bool/float/complex operands through real numeric
+//! semantics before falling back to generic slot dispatch for foreign objects.
+
+use num_bigint::BigInt;
+use num_integer::Integer;
+use num_traits::{Signed, ToPrimitive, Zero};
+
+use crate::abstract_op;
+use crate::feedback::FeedbackCell;
+use crate::object::PyObject;
+use crate::types::{bool_, complex_, float, int};
+
+/// Numeric operation selector passed through the helper ABI.
+pub type NumberOp = u8;
+
+pub use abstract_op::{
+    BINARY_ADD, BINARY_AND, BINARY_DIV, BINARY_FLOORDIV, BINARY_LSHIFT, BINARY_MATMUL, BINARY_MOD, BINARY_MUL,
+    BINARY_OR, BINARY_POW, BINARY_RSHIFT, BINARY_SUB, BINARY_XOR, UNARY_INVERT, UNARY_NEG, UNARY_POS,
+};
+
+enum NumericValue {
+    Int(BigInt),
+    Float(f64),
+    Complex(f64, f64),
+}
+
+/// Creates a boxed Python `float`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_const_float(value: f64) -> *mut PyObject {
+    super::catch_object_helper(|| float::from_f64(value))
+}
+
+/// Creates a boxed Python `bool` singleton.  Any non-zero argument is true.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_const_bool(value: i32) -> *mut PyObject {
+    super::catch_object_helper(|| bool_::from_bool(value != 0))
+}
+
+/// Creates a boxed Python `complex`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_const_complex(real: f64, imag: f64) -> *mut PyObject {
+    super::catch_object_helper(|| complex_::from_f64s(real, imag))
+}
+
+/// Dispatches a Python binary operation and returns NULL with the current
+/// exception set on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_binary_op(
+    op: NumberOp,
+    a: *mut PyObject,
+    b: *mut PyObject,
+    feedback: *mut FeedbackCell,
+) -> *mut PyObject {
+    unsafe { super::record_feedback_binary(feedback, a, b) };
+    super::catch_object_helper(|| {
+        unsafe {
+            install_runtime_int_slots(a);
+            install_runtime_int_slots(b);
+        }
+
+        match unsafe { (numeric_value(a), numeric_value(b)) } {
+            (Some(left), Some(right)) => binary_numeric(op, left, right),
+            (Some(_), None) | (None, Some(_)) if op == BINARY_MATMUL || op == BINARY_POW => {
+                raise_type_error(binary_unsupported_message(op))
+            }
+            _ => unsafe { abstract_op::binary_op(op, a, b) },
+        }
+    })
+}
+
+pub unsafe fn pon_binary_numeric_slot(op: NumberOp, a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
+    super::catch_object_helper(|| match unsafe { (numeric_value(a), numeric_value(b)) } {
+        (Some(left), Some(right)) => binary_numeric(op, left, right),
+        _ => raise_type_error(binary_unsupported_message(op)),
+    })
+}
+
+/// Phase-B helper-table alias for binary numeric dispatch.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_number_binary(
+    op: NumberOp,
+    a: *mut PyObject,
+    b: *mut PyObject,
+    feedback: *mut FeedbackCell,
+) -> *mut PyObject {
+    unsafe { pon_binary_op(op, a, b, feedback) }
+}
+
+/// Dispatches a Python unary operation and returns NULL with the current
+/// exception set on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_unary_op(op: NumberOp, a: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
+    unsafe { super::record_feedback_unary(feedback, a) };
+    super::catch_object_helper(|| {
+        unsafe {
+            install_runtime_int_slots(a);
+        }
+        match unsafe { numeric_value(a) } {
+            Some(value) => unary_numeric(op, value),
+            None => unsafe { abstract_op::unary_op(op, a) },
+        }
+    })
+}
+
+/// Phase-B helper-table alias for unary numeric dispatch.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_number_unary(op: NumberOp, a: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
+    unsafe { pon_unary_op(op, a, feedback) }
+}
+
+/// In-place numeric operations share immutable built-in semantics at tier 0.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_number_inplace(
+    op: NumberOp,
+    a: *mut PyObject,
+    b: *mut PyObject,
+    feedback: *mut FeedbackCell,
+) -> *mut PyObject {
+    unsafe { pon_binary_op(op, a, b, feedback) }
+}
+
+/// Implements `operator.index`: exact ints pass through, bool converts to `0`
+/// or `1`, and non-indexable values raise `TypeError`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_index(object: *mut PyObject) -> *mut PyObject {
+    super::catch_object_helper(|| {
+        unsafe {
+            install_runtime_int_slots(object);
+            if let Some(value) = int::to_bigint(object) {
+                return int::from_bigint(value);
+            }
+            if let Some(value) = bool_::to_bool(object) {
+                return int::from_i64(if value { 1 } else { 0 });
+            }
+        }
+        raise_type_error("object cannot be interpreted as an integer")
+    })
+}
+
+/// Converts a Python numeric object to `f64`.
+///
+/// On error this follows the scalar-sentinel ABI shape: it sets the current
+/// exception and returns `NaN`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_number_as_f64(object: *mut PyObject) -> f64 {
+    match super::catch_object_helper(|| {
+        unsafe {
+            install_runtime_int_slots(object);
+        }
+        match unsafe { numeric_value(object) } {
+            Some(NumericValue::Int(value)) => match value.to_f64() {
+                Some(value) => float::from_f64(value),
+                None => raise_type_error("int too large to convert to float"),
+            },
+            Some(NumericValue::Float(value)) => float::from_f64(value),
+            Some(NumericValue::Complex(_, _)) => raise_type_error("can't convert complex to float"),
+            None => raise_type_error("a real number is required"),
+        }
+    }) {
+        value if value.is_null() => f64::NAN,
+        value => unsafe { float::to_f64(value).unwrap_or(f64::NAN) },
+    }
+}
+
+unsafe fn install_runtime_int_slots(object: *mut PyObject) {
+    unsafe { int::install_slots_for_object(object) };
+}
+
+unsafe fn numeric_value(object: *mut PyObject) -> Option<NumericValue> {
+    if let Some(value) = unsafe { bool_::to_bool(object) } {
+        return Some(NumericValue::Int(BigInt::from(if value { 1 } else { 0 })));
+    }
+    if let Some(value) = unsafe { int::to_bigint(object) } {
+        return Some(NumericValue::Int(value));
+    }
+    if let Some(value) = unsafe { float::to_f64(object) } {
+        return Some(NumericValue::Float(value));
+    }
+    unsafe { complex_::to_f64s(object).map(|(real, imag)| NumericValue::Complex(real, imag)) }
+}
+
+fn binary_numeric(op: NumberOp, left: NumericValue, right: NumericValue) -> *mut PyObject {
+    match (&left, &right) {
+        (NumericValue::Complex(_, _), _) | (_, NumericValue::Complex(_, _)) => binary_complex(op, left, right),
+        (NumericValue::Float(_), _) | (_, NumericValue::Float(_)) => binary_float(op, left, right),
+        (NumericValue::Int(left), NumericValue::Int(right)) => binary_int(op, left, right),
+    }
+}
+
+fn binary_int(op: NumberOp, left: &BigInt, right: &BigInt) -> *mut PyObject {
+    match op {
+        BINARY_ADD => int::from_bigint(left + right),
+        BINARY_SUB => int::from_bigint(left - right),
+        BINARY_MUL => int::from_bigint(left * right),
+        BINARY_FLOORDIV => {
+            if right.is_zero() {
+                return raise_value_error("integer division by zero");
+            }
+            int::from_bigint(left.div_floor(right))
+        }
+        BINARY_MOD => {
+            if right.is_zero() {
+                return raise_value_error("integer modulo by zero");
+            }
+            int::from_bigint(left.mod_floor(right))
+        }
+        BINARY_POW => pow_int(left, right),
+        BINARY_LSHIFT => shift_int(left, right, true),
+        BINARY_RSHIFT => shift_int(left, right, false),
+        BINARY_AND => int::from_bigint(left & right),
+        BINARY_OR => int::from_bigint(left | right),
+        BINARY_XOR => int::from_bigint(left ^ right),
+        BINARY_DIV => match (left.to_f64(), right.to_f64()) {
+            (_, Some(0.0)) => raise_value_error("division by zero"),
+            (Some(left), Some(right)) => float::from_f64(left / right),
+            _ => raise_type_error("int too large to convert to float"),
+        },
+        _ => raise_type_error(binary_unsupported_message(op)),
+    }
+}
+
+fn pow_int(left: &BigInt, right: &BigInt) -> *mut PyObject {
+    if right.is_negative() {
+        return match (left.to_f64(), right.to_f64()) {
+            (Some(0.0), _) => raise_value_error("0.0 cannot be raised to a negative power"),
+            (Some(left), Some(right)) => float::from_f64(left.powf(right)),
+            _ => raise_type_error("int too large to convert to float"),
+        };
+    }
+    let Some(exponent) = right.to_u32() else {
+        return raise_value_error("exponent too large");
+    };
+    int::from_bigint(left.pow(exponent))
+}
+
+fn shift_int(left: &BigInt, right: &BigInt, left_shift: bool) -> *mut PyObject {
+    if right.is_negative() {
+        return raise_value_error("negative shift count");
+    }
+    let Some(shift) = right.to_usize() else {
+        return raise_value_error("shift count too large");
+    };
+    if left_shift {
+        int::from_bigint(left << shift)
+    } else {
+        int::from_bigint(left >> shift)
+    }
+}
+
+fn binary_float(op: NumberOp, left: NumericValue, right: NumericValue) -> *mut PyObject {
+    let Some(left) = real_as_f64(left) else {
+        return raise_type_error("int too large to convert to float");
+    };
+    let Some(right) = real_as_f64(right) else {
+        return raise_type_error("int too large to convert to float");
+    };
+
+    match op {
+        BINARY_ADD => float::from_f64(left + right),
+        BINARY_SUB => float::from_f64(left - right),
+        BINARY_MUL => float::from_f64(left * right),
+        BINARY_DIV => {
+            if right == 0.0 {
+                raise_value_error("float division by zero")
+            } else {
+                float::from_f64(left / right)
+            }
+        }
+        BINARY_FLOORDIV => {
+            if right == 0.0 {
+                raise_value_error("float floor division by zero")
+            } else {
+                float::from_f64((left / right).floor())
+            }
+        }
+        BINARY_MOD => {
+            if right == 0.0 {
+                raise_value_error("float modulo by zero")
+            } else {
+                float::from_f64(left - (left / right).floor() * right)
+            }
+        }
+        BINARY_POW => float::from_f64(left.powf(right)),
+        _ => raise_type_error(binary_unsupported_message(op)),
+    }
+}
+
+fn binary_complex(op: NumberOp, left: NumericValue, right: NumericValue) -> *mut PyObject {
+    let Some((left_real, left_imag)) = as_complex(left) else {
+        return raise_type_error("int too large to convert to complex");
+    };
+    let Some((right_real, right_imag)) = as_complex(right) else {
+        return raise_type_error("int too large to convert to complex");
+    };
+
+    match op {
+        BINARY_ADD => complex_::from_f64s(left_real + right_real, left_imag + right_imag),
+        BINARY_SUB => complex_::from_f64s(left_real - right_real, left_imag - right_imag),
+        BINARY_MUL => complex_::from_f64s(
+            left_real * right_real - left_imag * right_imag,
+            left_real * right_imag + left_imag * right_real,
+        ),
+        BINARY_DIV => {
+            let denominator = right_real.mul_add(right_real, right_imag * right_imag);
+            if denominator == 0.0 {
+                raise_value_error("complex division by zero")
+            } else {
+                complex_::from_f64s(
+                    (left_real * right_real + left_imag * right_imag) / denominator,
+                    (left_imag * right_real - left_real * right_imag) / denominator,
+                )
+            }
+        }
+        BINARY_POW => pow_complex(left_real, left_imag, right_real, right_imag),
+        _ => raise_type_error(binary_unsupported_message(op)),
+    }
+}
+
+fn pow_complex(left_real: f64, left_imag: f64, right_real: f64, right_imag: f64) -> *mut PyObject {
+    if left_real == 0.0 && left_imag == 0.0 {
+        if right_real == 0.0 && right_imag == 0.0 {
+            return complex_::from_f64s(1.0, 0.0);
+        }
+        if right_real < 0.0 || right_imag != 0.0 {
+            return raise_value_error("0.0 to a negative or complex power");
+        }
+        return complex_::from_f64s(0.0, 0.0);
+    }
+
+    let radius = left_real.hypot(left_imag);
+    let theta = left_imag.atan2(left_real);
+    let log_real = radius.ln();
+    let exp_real = right_real * log_real - right_imag * theta;
+    let exp_imag = right_real * theta + right_imag * log_real;
+    let scale = exp_real.exp();
+    complex_::from_f64s(scale * exp_imag.cos(), scale * exp_imag.sin())
+}
+
+fn unary_numeric(op: NumberOp, value: NumericValue) -> *mut PyObject {
+    match value {
+        NumericValue::Int(value) => match op {
+            UNARY_NEG => int::from_bigint(-value),
+            UNARY_POS => int::from_bigint(value),
+            UNARY_INVERT => int::from_bigint(!value),
+            _ => raise_type_error(unary_unsupported_message(op)),
+        },
+        NumericValue::Float(value) => match op {
+            UNARY_NEG => float::from_f64(-value),
+            UNARY_POS => float::from_f64(value),
+            UNARY_INVERT => raise_type_error(unary_unsupported_message(op)),
+            _ => raise_type_error(unary_unsupported_message(op)),
+        },
+        NumericValue::Complex(real, imag) => match op {
+            UNARY_NEG => complex_::from_f64s(-real, -imag),
+            UNARY_POS => complex_::from_f64s(real, imag),
+            UNARY_INVERT => raise_type_error(unary_unsupported_message(op)),
+            _ => raise_type_error(unary_unsupported_message(op)),
+        },
+    }
+}
+
+fn real_as_f64(value: NumericValue) -> Option<f64> {
+    match value {
+        NumericValue::Int(value) => value.to_f64(),
+        NumericValue::Float(value) => Some(value),
+        NumericValue::Complex(_, _) => None,
+    }
+}
+
+fn as_complex(value: NumericValue) -> Option<(f64, f64)> {
+    match value {
+        NumericValue::Int(value) => value.to_f64().map(|value| (value, 0.0)),
+        NumericValue::Float(value) => Some((value, 0.0)),
+        NumericValue::Complex(real, imag) => Some((real, imag)),
+    }
+}
+
+fn raise_type_error(message: &str) -> *mut PyObject {
+    unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) }
+}
+
+fn raise_value_error(message: &str) -> *mut PyObject {
+    unsafe { crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) }
+}
+
+fn binary_unsupported_message(op: NumberOp) -> &'static str {
+    match op {
+        BINARY_ADD => "unsupported operands for +",
+        BINARY_SUB => "unsupported operands for -",
+        BINARY_MUL => "unsupported operands for *",
+        BINARY_MATMUL => "unsupported operands for @",
+        BINARY_DIV => "unsupported operands for /",
+        BINARY_FLOORDIV => "unsupported operands for //",
+        BINARY_MOD => "unsupported operands for %",
+        BINARY_POW => "unsupported operands for **",
+        BINARY_LSHIFT => "unsupported operands for <<",
+        BINARY_RSHIFT => "unsupported operands for >>",
+        BINARY_AND => "unsupported operands for &",
+        BINARY_OR => "unsupported operands for |",
+        BINARY_XOR => "unsupported operands for ^",
+        _ => "unknown binary numeric operation",
+    }
+}
+
+fn unary_unsupported_message(op: NumberOp) -> &'static str {
+    match op {
+        UNARY_NEG => "bad operand type for unary -",
+        UNARY_POS => "bad operand type for unary +",
+        UNARY_INVERT => "bad operand type for unary ~",
+        _ => "unknown unary numeric operation",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::ptr;
+
+    use num_bigint::BigInt;
+    use num_traits::One;
+
+    use super::*;
+    use crate::thread_state::pon_err_clear;
+
+    unsafe fn init() {
+        assert_eq!(unsafe { crate::abi::pon_runtime_init() }, 0);
+        pon_err_clear();
+    }
+
+    #[test]
+    fn pow_keeps_large_ints_exact() {
+        unsafe {
+            init();
+            let result = pon_binary_op(
+                BINARY_POW,
+                crate::abi::pon_const_int(2),
+                crate::abi::pon_const_int(1000),
+                ptr::null_mut(),
+            );
+
+            assert!(!result.is_null());
+            assert_eq!(int::to_bigint(result), Some(BigInt::one() << 1000_usize));
+        }
+    }
+
+    #[test]
+    fn floor_division_and_modulo_follow_python_sign_rules() {
+        unsafe {
+            init();
+            let left = crate::abi::pon_const_int(-7);
+            let right = crate::abi::pon_const_int(2);
+
+            let div = pon_binary_op(BINARY_FLOORDIV, left, right, ptr::null_mut());
+            let modulo = pon_binary_op(BINARY_MOD, left, right, ptr::null_mut());
+
+            assert_eq!(int::to_bigint(div), Some(BigInt::from(-4)));
+            assert_eq!(int::to_bigint(modulo), Some(BigInt::from(1)));
+        }
+    }
+
+    #[test]
+    fn bool_is_distinct_but_numeric() {
+        unsafe {
+            init();
+            let truth = pon_const_bool(1);
+            assert!(bool_::is_exact_bool(truth));
+            assert!(!int::is_exact_int(truth));
+
+            let sum = pon_binary_op(BINARY_ADD, truth, crate::abi::pon_const_int(1), ptr::null_mut());
+            assert_eq!(int::to_bigint(sum), Some(BigInt::from(2)));
+        }
+    }
+
+    #[test]
+    fn unsupported_numeric_operation_raises_type_error() {
+        unsafe {
+            init();
+            let result = pon_binary_op(
+                BINARY_MATMUL,
+                crate::abi::pon_const_int(1),
+                crate::abi::pon_const_int(2),
+                ptr::null_mut(),
+            );
+
+            assert!(result.is_null());
+        }
+    }
+}
