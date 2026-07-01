@@ -23,6 +23,7 @@ static COMPLEX_TYPE: LazyLock<usize> = LazyLock::new(|| {
     let mut ty = PyType::new(ptr::null(), "complex", core::mem::size_of::<PyComplex>());
     ty.tp_bool = Some(bool_slot);
     ty.tp_as_number = number_methods_ptr();
+    ty.tp_getattro = Some(complex_getattro);
     Box::into_raw(Box::new(ty)) as usize
 });
 
@@ -53,10 +54,41 @@ pub unsafe fn to_f64s(object: *mut PyObject) -> Option<(f64, f64)> {
     }
 }
 
+#[must_use]
+pub fn repr_complex(real: f64, imag: f64) -> String {
+    if real == 0.0 {
+        return format!("{}j", repr_part(imag));
+    }
+    let sign = if imag.is_sign_negative() { "-" } else { "+" };
+    format!("({}{sign}{}j)", repr_part(real), repr_part(imag.abs()))
+}
+
+fn repr_part(value: f64) -> String {
+    if value.is_finite() && value.fract() == 0.0 && value >= i64::MIN as f64 && value <= i64::MAX as f64 {
+        (value as i64).to_string()
+    } else {
+        crate::types::float::repr_f64(value)
+    }
+}
+
 /// Returns the complex protocol slot table.
 #[must_use]
 pub fn number_methods_ptr() -> *mut PyNumberMethods {
     *COMPLEX_NUMBER_METHODS as *mut PyNumberMethods
+}
+
+unsafe extern "C" fn complex_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        return raise_type_error("complex attribute name must be str");
+    };
+    let Some((real, imag)) = (unsafe { to_f64s(object) }) else {
+        return raise_type_error("complex attribute receiver is invalid");
+    };
+    match name {
+        "real" => crate::types::float::from_f64(real),
+        "imag" => crate::types::float::from_f64(imag),
+        _ => unsafe { crate::abi::pon_raise_attribute_error(object, crate::intern::intern(name)) },
+    }
 }
 
 unsafe extern "C" fn bool_slot(object: *mut PyObject) -> c_int {
