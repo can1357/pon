@@ -4,6 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+free-threading = ["pon-runtime/free-threading"]
+
 [lints]
 workspace = true
 
@@ -15,6 +19,7 @@ cranelift-frontend.workspace = true
 cranelift-module.workspace = true
 cranelift-native.workspace = true
 target-lexicon.workspace = true
+ruff_python_ast.workspace = true
 
 [dev-dependencies]
 cranelift-jit.workspace = true

@@ -1,4 +1,17 @@
-//! Baseline IR-to-CLIF lowering for Phase A.
+//! Baseline IR-to-CLIF lowering for Phase A with Phase-B family dispatch hubs.
+
+pub(crate) mod attr;
+pub(crate) mod call;
+pub(crate) mod compare;
+pub(crate) mod container;
+pub(crate) mod control;
+pub(crate) mod exc;
+pub(crate) mod r#gen;
+pub(crate) mod mapping;
+pub(crate) mod match_;
+pub(crate) mod name;
+pub(crate) mod number;
+pub(crate) mod strings;
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -9,7 +22,7 @@ use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{self, AbiParam, FuncRef, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, FuncId, Module, ModuleError};
-use pon_ir::ir::{BinOp, Function, InstKind, Module as IrModule, PyConst, Terminator, Value as IrValue};
+use pon_ir::ir::{Block as IrBlock, Function, InstKind, Module as IrModule, PyConst, Value as IrValue};
 
 use crate::helpers::HelperRefs;
 
@@ -37,12 +50,32 @@ impl NameMap {
         }
     }
 
-    fn runtime_id(&self, source_id: u32) -> Result<u32, CodegenError> {
+    pub(crate) fn runtime_id(&self, source_id: u32) -> Result<u32, CodegenError> {
         self.runtime_ids
             .get(source_id as usize)
             .copied()
             .ok_or(CodegenError::NameOutOfRange { source_id })
     }
+}
+
+pub(crate) fn entry_arg_counts(module: &IrModule) -> Vec<usize> {
+    let mut counts = module.functions.iter().map(|function| function.arity).collect::<Vec<_>>();
+    for function in &module.functions {
+        for block in &function.blocks {
+            for inst in &block.insts {
+                if let InstKind::MakeFunctionFull { code, kwdefaults, .. } = &inst.kind {
+                    if let Some(count) = counts.get_mut(code.0 as usize) {
+                        *count = (*count).max(
+                            module.functions[code.0 as usize]
+                                .arity
+                                .saturating_add(kwdefaults.len()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    counts
 }
 
 /// Error reported while lowering Phase-A IR into Cranelift IR.
@@ -98,42 +131,167 @@ impl From<ModuleError> for CodegenError {
 }
 
 #[derive(Clone, Copy)]
-struct HelperFuncRefs {
-    const_int: FuncRef,
-    const_str: FuncRef,
-    binary_add: FuncRef,
-    call: FuncRef,
-    load_global: FuncRef,
-    make_function: FuncRef,
-    store_global: FuncRef,
-    none: FuncRef,
+pub(crate) struct HelperFuncRefs {
+    pub(crate) const_int: FuncRef,
+    pub(crate) const_float: FuncRef,
+    pub(crate) const_complex: FuncRef,
+    pub(crate) rich_compare: FuncRef,
+    pub(crate) number_unary: FuncRef,
+    pub(crate) number_binary: FuncRef,
+    pub(crate) is_true: FuncRef,
+    pub(crate) call: FuncRef,
+    pub(crate) call_ex: FuncRef,
+    pub(crate) call_method: FuncRef,
+    pub(crate) load_global: FuncRef,
+    pub(crate) load_name: FuncRef,
+    pub(crate) get_attr: FuncRef,
+    pub(crate) set_attr: FuncRef,
+    pub(crate) del_attr: FuncRef,
+    pub(crate) build_tuple: FuncRef,
+    pub(crate) build_list: FuncRef,
+    pub(crate) build_set: FuncRef,
+    pub(crate) build_slice: FuncRef,
+    pub(crate) list_append: FuncRef,
+    pub(crate) set_add: FuncRef,
+    pub(crate) list_extend: FuncRef,
+    pub(crate) unpack_seq: FuncRef,
+    pub(crate) unpack_ex: FuncRef,
+    pub(crate) get_len: FuncRef,
+    pub(crate) build_map: FuncRef,
+    pub(crate) map_insert: FuncRef,
+    pub(crate) dict_merge: FuncRef,
+    pub(crate) dict_merge_unique: FuncRef,
+    pub(crate) subscript_get: FuncRef,
+    pub(crate) subscript_set: FuncRef,
+    pub(crate) subscript_del: FuncRef,
+    pub(crate) build_string: FuncRef,
+    pub(crate) build_template: FuncRef,
+    pub(crate) load_builtin: FuncRef,
+    pub(crate) store_name: FuncRef,
+    pub(crate) import_name: FuncRef,
+    pub(crate) import_from: FuncRef,
+    pub(crate) import_star: FuncRef,
+    pub(crate) raise: FuncRef,
+    pub(crate) reraise: FuncRef,
+    pub(crate) push_exc_info: FuncRef,
+    pub(crate) pop_exc_info: FuncRef,
+    pub(crate) match_exc: FuncRef,
+    pub(crate) check_exc_star: FuncRef,
+    pub(crate) get_current_exc: FuncRef,
+    pub(crate) build_exc_group: FuncRef,
+    pub(crate) get_iter: FuncRef,
+    pub(crate) get_aiter: FuncRef,
+    pub(crate) for_next: FuncRef,
+    pub(crate) gen_stop_value: FuncRef,
+    pub(crate) yield_value: FuncRef,
+    pub(crate) yield_from: FuncRef,
+    pub(crate) await_value: FuncRef,
+    pub(crate) match_sequence: FuncRef,
+    pub(crate) match_mapping: FuncRef,
+    pub(crate) match_class: FuncRef,
+    pub(crate) match_keys: FuncRef,
+    pub(crate) match_len_ge: FuncRef,
+    pub(crate) make_function: FuncRef,
+    #[allow(dead_code)]
+    pub(crate) make_function_full: FuncRef,
+    pub(crate) function_set_closure: FuncRef,
+    pub(crate) make_cell: FuncRef,
+    pub(crate) cell_get: FuncRef,
+    pub(crate) cell_set: FuncRef,
+    pub(crate) cell_delete: FuncRef,
+    pub(crate) current_closure_cell: FuncRef,
+    pub(crate) setup_annotations: FuncRef,
+    pub(crate) build_class: FuncRef,
+    pub(crate) load_build_class: FuncRef,
+    pub(crate) store_global: FuncRef,
+    pub(crate) none: FuncRef,
+    #[cfg(feature = "free-threading")]
+    pub(crate) safepoint_poll: FuncRef,
+    #[cfg(feature = "free-threading")]
+    pub(crate) gc_write_barrier: FuncRef,
 }
 
-struct LowerState {
-    values: HashMap<IrValue, ir::Value>,
-    locals: Vec<Variable>,
-    local_defined: Vec<bool>,
+pub(crate) struct LowerState {
+    pub(crate) values: HashMap<IrValue, ir::Value>,
+    pub(crate) locals: Vec<Variable>,
+    pub(crate) local_defined: Vec<bool>,
+    pub(crate) cells: HashMap<u32, ir::Value>,
+    pub(crate) last_value: Option<ir::Value>,
 }
 
 impl LowerState {
-    fn new(local_count: usize) -> Self {
+    pub(crate) fn new(local_count: usize) -> Self {
         Self {
             values: HashMap::new(),
             locals: Vec::with_capacity(local_count),
             local_defined: vec![false; local_count],
+            cells: HashMap::new(),
+            last_value: None,
         }
     }
 
-    fn define_value(&mut self, ir_value: IrValue, clif_value: ir::Value) {
+    pub(crate) fn define_value(&mut self, ir_value: IrValue, clif_value: ir::Value) {
         self.values.insert(ir_value, clif_value);
+        self.last_value = Some(clif_value);
     }
 
-    fn value(&self, ir_value: IrValue) -> Result<ir::Value, CodegenError> {
+    pub(crate) fn last_value(&self) -> Option<ir::Value> {
+        self.last_value
+    }
+
+    pub(crate) fn value(&self, ir_value: IrValue) -> Result<ir::Value, CodegenError> {
         self.values
             .get(&ir_value)
             .copied()
             .ok_or(CodegenError::ValueNotDefined(ir_value))
     }
+
+    pub(crate) fn define_cell(&mut self, cell: u32, value: ir::Value) {
+        self.cells.insert(cell, value);
+    }
+
+    pub(crate) fn cell(&self, cell: u32) -> Option<ir::Value> {
+        self.cells.get(&cell).copied()
+    }
+}
+
+/// Lower a contiguous boxed IR sub-region with the baseline instruction lowering.
+///
+/// Phase-D optimizing codegen uses this as the cold-twin escape hatch: the fast
+/// path can speculate on unboxed values, while guard failures and unsupported
+/// typed operations jump to a cold copy that reuses the existing boxed lowering
+/// instead of duplicating baseline semantics.
+#[allow(dead_code, clippy::too_many_arguments, reason = "Phase-D cold-twin hook is reserved until the optimizing entry point lands")]
+pub(crate) fn lower_boxed_subregion<M: Module>(
+    module: &mut M,
+    builder: &mut FunctionBuilder<'_>,
+    helpers: &HelperFuncRefs,
+    func_ids: &[FuncId],
+    names: &NameMap,
+    state: &mut LowerState,
+    ptr_ty: ir::Type,
+    ptr_bytes: usize,
+    exception_exit: ir::Block,
+    blocks: &[&IrBlock],
+) -> Result<(), CodegenError> {
+    for block in blocks {
+        for inst in &block.insts {
+            let value = lower_inst(
+                module,
+                builder,
+                helpers,
+                func_ids,
+                names,
+                state,
+                ptr_ty,
+                ptr_bytes,
+                exception_exit,
+                &inst.kind,
+            )?;
+            state.define_value(inst.result, value);
+        }
+    }
+    Ok(())
 }
 
 /// Lower one IR function into the supplied Cranelift [`Context`].
@@ -152,8 +310,10 @@ pub fn compile_function<M: Module>(
     module: &mut M,
     helpers: &HelperRefs,
     func_ids: &[FuncId],
+    functions: &[Function],
     names: &NameMap,
     ir: &Function,
+    entry_arg_count: usize,
     ctx: &mut Context,
     fctx: &mut FunctionBuilderContext,
 ) -> Result<(), CodegenError> {
@@ -182,11 +342,28 @@ pub fn compile_function<M: Module>(
     for _ in 0..ir.n_locals {
         state.locals.push(builder.declare_var(ptr_ty));
     }
-    initialize_parameter_locals(&mut builder, &mut state, argv, ptr_bytes, ir.arity, ir.n_locals, ptr_ty)?;
+    initialize_parameter_locals(&mut builder, &mut state, argv, ptr_bytes, entry_arg_count, ir.n_locals, ptr_ty)?;
+    emit_safepoint_poll(&mut builder, &helper_refs);
+
+    let block_map: Vec<(pon_ir::ir::BlockId, ir::Block)> = ir
+        .blocks
+        .iter()
+        .map(|block| {
+            if block.id.0 == 0 {
+                (block.id, entry)
+            } else {
+                (block.id, builder.create_block())
+            }
+        })
+        .collect();
 
     for block in &ir.blocks {
+        let clif_block = block_map
+            .iter()
+            .find_map(|(id, clif)| (*id == block.id).then_some(*clif))
+            .ok_or(CodegenError::Unsupported("missing basic block"))?;
         if block.id.0 != 0 {
-            return Err(CodegenError::Unsupported("non-entry basic block"));
+            builder.switch_to_block(clif_block);
         }
         for inst in &block.insts {
             let value = lower_inst(
@@ -194,6 +371,7 @@ pub fn compile_function<M: Module>(
                 &mut builder,
                 &helper_refs,
                 func_ids,
+                functions,
                 names,
                 &mut state,
                 ptr_ty,
@@ -203,7 +381,20 @@ pub fn compile_function<M: Module>(
             )?;
             state.define_value(inst.result, value);
         }
-        lower_terminator(&mut builder, &state, ptr_ty, &block.term)?;
+        if ir.blocks.len() == 1 {
+            control::lower_terminator(&mut builder, &state, ptr_ty, &block.term)?;
+        } else {
+            control::lower_terminator_with_blocks(
+                &mut builder,
+                &state,
+                &helper_refs,
+                ptr_ty,
+                exception_exit,
+                &block_map,
+                block.id,
+                &block.term,
+            )?;
+        }
     }
 
     builder.switch_to_block(exception_exit);
@@ -215,20 +406,88 @@ pub fn compile_function<M: Module>(
     Ok(())
 }
 
-fn declare_helper_refs<M: Module>(module: &mut M, helpers: &HelperRefs, func: &mut ir::Function) -> HelperFuncRefs {
+pub(crate) fn declare_helper_refs<M: Module>(module: &mut M, helpers: &HelperRefs, func: &mut ir::Function) -> HelperFuncRefs {
     HelperFuncRefs {
         const_int: module.declare_func_in_func(helpers.const_int, func),
-        const_str: module.declare_func_in_func(helpers.const_str, func),
-        binary_add: module.declare_func_in_func(helpers.binary_add, func),
+        const_float: module.declare_func_in_func(helpers.const_float, func),
+        const_complex: module.declare_func_in_func(helpers.const_complex, func),
+        rich_compare: module.declare_func_in_func(helpers.rich_compare, func),
+        number_unary: module.declare_func_in_func(helpers.number_unary, func),
+        number_binary: module.declare_func_in_func(helpers.number_binary, func),
+        is_true: module.declare_func_in_func(helpers.is_true, func),
         call: module.declare_func_in_func(helpers.call, func),
+        call_ex: module.declare_func_in_func(helpers.call_ex, func),
+        call_method: module.declare_func_in_func(helpers.call_method, func),
         load_global: module.declare_func_in_func(helpers.load_global, func),
+        load_name: module.declare_func_in_func(helpers.load_name, func),
+        get_attr: module.declare_func_in_func(helpers.get_attr, func),
+        set_attr: module.declare_func_in_func(helpers.set_attr, func),
+        del_attr: module.declare_func_in_func(helpers.del_attr, func),
+        build_tuple: module.declare_func_in_func(helpers.build_tuple, func),
+        build_list: module.declare_func_in_func(helpers.build_list, func),
+        build_set: module.declare_func_in_func(helpers.build_set, func),
+        build_slice: module.declare_func_in_func(helpers.build_slice, func),
+        list_append: module.declare_func_in_func(helpers.list_append, func),
+        set_add: module.declare_func_in_func(helpers.set_add, func),
+        list_extend: module.declare_func_in_func(helpers.list_extend, func),
+        unpack_seq: module.declare_func_in_func(helpers.unpack_seq, func),
+        unpack_ex: module.declare_func_in_func(helpers.unpack_ex, func),
+        get_len: module.declare_func_in_func(helpers.get_len, func),
+        build_map: module.declare_func_in_func(helpers.build_map, func),
+        map_insert: module.declare_func_in_func(helpers.map_insert, func),
+        dict_merge: module.declare_func_in_func(helpers.dict_merge, func),
+        dict_merge_unique: module.declare_func_in_func(helpers.dict_merge_unique, func),
+        subscript_get: module.declare_func_in_func(helpers.subscript_get, func),
+        subscript_set: module.declare_func_in_func(helpers.subscript_set, func),
+        subscript_del: module.declare_func_in_func(helpers.subscript_del, func),
+        build_string: module.declare_func_in_func(helpers.build_string, func),
+        build_template: module.declare_func_in_func(helpers.build_template, func),
+        load_builtin: module.declare_func_in_func(helpers.load_builtin, func),
+        store_name: module.declare_func_in_func(helpers.store_name, func),
+        import_name: module.declare_func_in_func(helpers.import_name, func),
+        import_from: module.declare_func_in_func(helpers.import_from, func),
+        import_star: module.declare_func_in_func(helpers.import_star, func),
+        raise: module.declare_func_in_func(helpers.raise, func),
+        reraise: module.declare_func_in_func(helpers.reraise, func),
+        push_exc_info: module.declare_func_in_func(helpers.push_exc_info, func),
+        pop_exc_info: module.declare_func_in_func(helpers.pop_exc_info, func),
+        match_exc: module.declare_func_in_func(helpers.match_exc, func),
+        check_exc_star: module.declare_func_in_func(helpers.check_exc_star, func),
+        get_current_exc: module.declare_func_in_func(helpers.get_current_exc, func),
+        build_exc_group: module.declare_func_in_func(helpers.build_exc_group, func),
+        get_iter: module.declare_func_in_func(helpers.get_iter, func),
+        get_aiter: module.declare_func_in_func(helpers.get_aiter, func),
+        for_next: module.declare_func_in_func(helpers.for_next, func),
+        gen_stop_value: module.declare_func_in_func(helpers.gen_stop_value, func),
+        yield_value: module.declare_func_in_func(helpers.yield_value, func),
+        yield_from: module.declare_func_in_func(helpers.yield_from, func),
+        await_value: module.declare_func_in_func(helpers.await_value, func),
+        match_sequence: module.declare_func_in_func(helpers.match_sequence, func),
+        match_mapping: module.declare_func_in_func(helpers.match_mapping, func),
+        match_class: module.declare_func_in_func(helpers.match_class, func),
+        match_keys: module.declare_func_in_func(helpers.match_keys, func),
+        match_len_ge: module.declare_func_in_func(helpers.match_len_ge, func),
         make_function: module.declare_func_in_func(helpers.make_function, func),
+        make_function_full: module.declare_func_in_func(helpers.make_function_full, func),
+        function_set_closure: module.declare_func_in_func(helpers.function_set_closure, func),
+        make_cell: module.declare_func_in_func(helpers.make_cell, func),
+        cell_get: module.declare_func_in_func(helpers.cell_get, func),
+        cell_set: module.declare_func_in_func(helpers.cell_set, func),
+        cell_delete: module.declare_func_in_func(helpers.cell_delete, func),
+        current_closure_cell: module.declare_func_in_func(helpers.current_closure_cell, func),
+        setup_annotations: module.declare_func_in_func(helpers.setup_annotations, func),
+        build_class: module.declare_func_in_func(helpers.build_class, func),
+        load_build_class: module.declare_func_in_func(helpers.load_build_class, func),
         store_global: module.declare_func_in_func(helpers.store_global, func),
         none: module.declare_func_in_func(helpers.none, func),
+        #[cfg(feature = "free-threading")]
+        safepoint_poll: module.declare_func_in_func(helpers.safepoint_poll, func),
+        #[cfg(feature = "free-threading")]
+        gc_write_barrier: module.declare_func_in_func(helpers.gc_write_barrier, func),
     }
 }
 
-fn initialize_parameter_locals(
+pub(crate) fn initialize_parameter_locals(
     builder: &mut FunctionBuilder<'_>,
     state: &mut LowerState,
     argv: ir::Value,
@@ -250,11 +509,12 @@ fn initialize_parameter_locals(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lower_inst<M: Module>(
+pub(crate) fn lower_inst<M: Module>(
     module: &mut M,
     builder: &mut FunctionBuilder<'_>,
     helpers: &HelperFuncRefs,
     func_ids: &[FuncId],
+    functions: &[Function],
     names: &NameMap,
     state: &mut LowerState,
     ptr_ty: ir::Type,
@@ -263,104 +523,391 @@ fn lower_inst<M: Module>(
     kind: &InstKind,
 ) -> Result<ir::Value, CodegenError> {
     match kind {
-        InstKind::Const(PyConst::Int(value)) => {
-            let arg = builder.ins().iconst(ir::types::I64, *value);
-            Ok(call_pyobject_helper(builder, helpers.const_int, &[arg], ptr_ty, exception_exit))
-        }
+        InstKind::Const(PyConst::Int(value)) => number::lower_const_int(builder, helpers, *value, ptr_ty, exception_exit),
         InstKind::Const(PyConst::Str(value)) => {
-            let data_ptr = declare_string_data(module, builder, value, ptr_ty)?;
-            let len = builder.ins().iconst(ptr_ty, value.len() as i64);
-            Ok(call_pyobject_helper(builder, helpers.const_str, &[data_ptr, len], ptr_ty, exception_exit))
+            strings::lower_const_str(module, builder, helpers, value, ptr_ty, exception_exit)
         }
-        InstKind::Const(PyConst::None) => Ok(call_pyobject_helper(builder, helpers.none, &[], ptr_ty, exception_exit)),
-        InstKind::Const(PyConst::Float(_)) => Err(CodegenError::Unsupported("Const(Float)")),
-        InstKind::LoadLocal(slot) => load_local(builder, state, *slot),
-        InstKind::StoreLocal(slot, value) => {
-            let value = state.value(*value)?;
-            store_local(builder, state, *slot, value)?;
-            Ok(value)
+        InstKind::Const(PyConst::None) => control::lower_const_none(builder, helpers, ptr_ty, exception_exit),
+        InstKind::Const(PyConst::Float(value)) => number::lower_const_float(builder, helpers, *value, ptr_ty, exception_exit),
+        InstKind::Const(PyConst::Complex { real, imag }) => {
+            number::lower_const_complex(builder, helpers, *real, *imag, ptr_ty, exception_exit)
         }
-        InstKind::LoadGlobal(name) | InstKind::LoadName(name) => {
-            let runtime_name = builder.ins().iconst(ir::types::I32, i64::from(names.runtime_id(*name)?));
-            Ok(call_pyobject_helper(
-                builder,
-                helpers.load_global,
-                &[runtime_name],
-                ptr_ty,
-                exception_exit,
-            ))
+        InstKind::Const(_) => control::lower_future_value("Const(non Phase-A literal)"),
+        InstKind::ConstRef(_) => control::lower_future_value("ConstRef"),
+        InstKind::BuildTuple { elts } => container::lower_build_tuple(
+            builder,
+            helpers.build_tuple,
+            helpers,
+            state,
+            elts,
+            ptr_ty,
+            ptr_bytes,
+            exception_exit,
+        ),
+        InstKind::BuildList { elts } => container::lower_build_list(
+            builder,
+            helpers.build_list,
+            helpers,
+            state,
+            elts,
+            ptr_ty,
+            ptr_bytes,
+            exception_exit,
+        ),
+        InstKind::BuildSet { elts } => container::lower_build_set(
+            builder,
+            helpers.build_set,
+            helpers,
+            state,
+            elts,
+            ptr_ty,
+            ptr_bytes,
+            exception_exit,
+        ),
+        InstKind::BuildMap { pairs } => mapping::lower_build_map_with_helper(
+            builder,
+            helpers.build_map,
+            helpers,
+            state,
+            pairs,
+            ptr_ty,
+            ptr_bytes,
+            exception_exit,
+        ),
+        InstKind::BuildSlice { lower, upper, step } => container::lower_build_slice(
+            builder,
+            helpers.build_slice,
+            state,
+            *lower,
+            *upper,
+            *step,
+            ptr_ty,
+            exception_exit,
+        ),
+        InstKind::BuildString { parts } => {
+            strings::lower_build_string(module, builder, helpers.build_string, state, parts, ptr_ty, exception_exit)
         }
-        InstKind::StoreGlobal(name, value) => {
-            let runtime_name = builder.ins().iconst(ir::types::I32, i64::from(names.runtime_id(*name)?));
-            let value = state.value(*value)?;
-            Ok(call_pyobject_helper(
-                builder,
-                helpers.store_global,
-                &[runtime_name, value],
-                ptr_ty,
-                exception_exit,
-            ))
+        InstKind::BuildTemplate { parts } => {
+            strings::lower_build_template(module, builder, helpers.build_template, state, parts, ptr_ty, exception_exit)
         }
-        InstKind::BinaryOp { op: BinOp::Add, lhs, rhs } => {
-            let lhs = state.value(*lhs)?;
-            let rhs = state.value(*rhs)?;
-            Ok(call_pyobject_helper(builder, helpers.binary_add, &[lhs, rhs], ptr_ty, exception_exit))
+        InstKind::ListAppend { list, item } => {
+            container::lower_list_append(builder, helpers.list_append, state, *list, *item, ptr_ty, exception_exit)
         }
-        InstKind::BinaryOp { .. } => Err(CodegenError::Unsupported("BinaryOp other than Add")),
+        InstKind::SetAdd { set, item } => {
+            container::lower_set_add(builder, helpers.set_add, state, *set, *item, ptr_ty, exception_exit)
+        }
+        InstKind::MapInsert { map, key, val } => mapping::lower_map_insert_with_helper(
+            builder,
+            helpers.map_insert,
+            state,
+            *map,
+            *key,
+            *val,
+            ptr_ty,
+            exception_exit,
+        ),
+        InstKind::ListExtend { list, iter } => {
+            container::lower_list_extend(builder, helpers.list_extend, state, *list, *iter, ptr_ty, exception_exit)
+        }
+        InstKind::DictMerge { map, other } => {
+            mapping::lower_dict_merge_with_helper(builder, helpers.dict_merge, state, *map, *other, ptr_ty, exception_exit)
+        }
+        InstKind::DictMergeUnique { map, other } => {
+            mapping::lower_dict_merge_with_helper(builder, helpers.dict_merge_unique, state, *map, *other, ptr_ty, exception_exit)
+        }
+        InstKind::LoadLocal(slot) => name::lower_load_local(builder, state, slot.0),
+        InstKind::StoreLocal(slot, value) => name::lower_store_local(builder, state, slot.0, *value),
+        InstKind::DeleteLocal(_) => name::lower_delete_local(),
+        InstKind::LoadGlobal(name) => name::lower_load_global(builder, helpers, names, name.0, ptr_ty, exception_exit),
+        InstKind::StoreGlobal(name, value) => name::lower_store_global(
+            builder,
+            helpers,
+            names,
+            state,
+            name.0,
+            *value,
+            ptr_ty,
+            exception_exit,
+        ),
+        InstKind::DeleteGlobal(_) => name::lower_delete_global(),
+        InstKind::LoadName(name) => name::lower_load_name(builder, helpers, names, name.0, ptr_ty, exception_exit),
+        InstKind::StoreName(name, value) => name::lower_store_name(
+            builder,
+            helpers,
+            names,
+            state,
+            name.0,
+            *value,
+            ptr_ty,
+            exception_exit,
+        ),
+        InstKind::DeleteName(_) => name::lower_delete_name(),
+        InstKind::LoadCell(cell) => {
+            name::lower_load_cell(builder, helpers, state, cell.0, ptr_ty, exception_exit)
+        }
+        InstKind::StoreCell(cell, value) => {
+            name::lower_store_cell(builder, helpers, state, cell.0, *value, ptr_ty, exception_exit)
+        }
+        InstKind::DeleteCell(cell) => {
+            name::lower_delete_cell(builder, helpers, state, cell.0, ptr_ty, exception_exit)
+        }
+        InstKind::MakeCell(local) => {
+            name::lower_make_cell(builder, helpers, state, local.0, ptr_ty, exception_exit)
+        }
+        InstKind::LoadClosure(cell) => {
+            name::lower_load_closure(builder, helpers, state, cell.0, ptr_ty, exception_exit)
+        }
+        InstKind::LoadBuiltin(name_id) => name::lower_load_builtin(builder, helpers, names, name_id.0, ptr_ty, exception_exit),
+        InstKind::BinaryOp { op, lhs, rhs } => {
+            number::lower_binary_op(builder, helpers, state, *op, *lhs, *rhs, ptr_ty, exception_exit)
+        }
+        InstKind::InplaceOp { .. } => number::lower_inplace_op(),
+        InstKind::UnaryOp { op, operand } => {
+            number::lower_unary_op(builder, helpers.number_unary, state, *op, *operand, ptr_ty, exception_exit)
+        }
+        InstKind::Compare { op, lhs, rhs } => {
+            compare::lower_compare_op(builder, helpers.rich_compare, state, *op, *lhs, *rhs, ptr_ty, exception_exit)
+        }
+        InstKind::Contains { .. } => compare::lower_contains(),
+        InstKind::Is { lhs, rhs, negate } => {
+            compare::lower_is_op(builder, helpers.const_int, state, *lhs, *rhs, *negate, ptr_ty, exception_exit)
+        }
+        InstKind::BoolTest { val } => {
+            compare::lower_bool_test_op(builder, helpers.is_true, helpers.const_int, state, *val, ptr_ty, exception_exit)
+        }
+        InstKind::Not { val } => {
+            compare::lower_not_op(builder, helpers.is_true, helpers.const_int, state, *val, ptr_ty, exception_exit)
+        }
+        InstKind::LoadAttr { obj, name } => attr::lower_load_attr(builder, helpers, names, state, *obj, name.0, ptr_ty, exception_exit),
+        InstKind::StoreAttr { obj, name, val } => attr::lower_store_attr(builder, helpers, names, state, *obj, name.0, *val, ptr_ty, exception_exit),
+        InstKind::DeleteAttr { obj, name } => attr::lower_delete_attr(builder, helpers, names, state, *obj, name.0, ptr_ty, exception_exit),
+        InstKind::LoadMethod { obj, name } => attr::lower_load_method(builder, helpers, names, state, *obj, name.0, ptr_ty, exception_exit),
+        InstKind::SubscriptGet { obj, index } => {
+            mapping::lower_subscript_get_with_helper(builder, helpers.subscript_get, state, *obj, *index, ptr_ty, exception_exit)
+        }
+        InstKind::SubscriptSet { obj, index, val } => mapping::lower_subscript_set_with_helper(
+            builder,
+            helpers.subscript_set,
+            state,
+            *obj,
+            *index,
+            *val,
+            ptr_ty,
+            exception_exit,
+        ),
+        InstKind::SubscriptDel { obj, index } => {
+            mapping::lower_subscript_del_with_helper(builder, helpers.subscript_del, state, *obj, *index, ptr_ty, exception_exit)
+        }
         InstKind::Call { callee, args } => {
-            let callee = state.value(*callee)?;
-            let argv = build_call_argv(builder, state, args, ptr_ty, ptr_bytes)?;
-            let argc = builder.ins().iconst(ptr_ty, args.len() as i64);
-            Ok(call_pyobject_helper(builder, helpers.call, &[callee, argv, argc], ptr_ty, exception_exit))
+            call::lower_call(builder, helpers, state, *callee, args, ptr_ty, ptr_bytes, exception_exit)
         }
+        InstKind::CallEx {
+            callee,
+            args,
+            star,
+            kwargs,
+            dstar,
+        } => call::lower_call_ex(
+            builder,
+            helpers,
+            names,
+            state,
+            call::CallExArgs {
+                callee: *callee,
+                args,
+                star: *star,
+                kwargs,
+                dstar: *dstar,
+            },
+            ptr_ty,
+            ptr_bytes,
+            exception_exit,
+        ),
+        InstKind::CallMethod { recv_pair, args } => call::lower_call_method(
+            builder,
+            helpers,
+            state,
+            call::CallMethodArgs {
+                recv_pair: *recv_pair,
+                args,
+            },
+            ptr_ty,
+            ptr_bytes,
+            exception_exit,
+        ),
+        InstKind::GetIter { iterable } => {
+            r#gen::lower_get_iter(builder, helpers.get_iter, state, *iterable, ptr_ty, exception_exit)
+        }
+        InstKind::GetAIter { iterable } => {
+            r#gen::lower_get_aiter(builder, helpers.get_aiter, state, *iterable, ptr_ty, exception_exit)
+        }
+        InstKind::ForNext { iter } => r#gen::lower_for_next(builder, helpers.for_next, state, *iter, ptr_ty, exception_exit),
+        InstKind::UnpackSeq { val, n } => {
+            container::lower_unpack_seq(builder, helpers.unpack_seq, state, *val, *n, ptr_ty, exception_exit)
+        }
+        InstKind::UnpackEx { val, before, after } => {
+            container::lower_unpack_ex(builder, helpers.unpack_ex, state, *val, *before, *after, ptr_ty, exception_exit)
+        }
+        InstKind::Yield { val } => r#gen::lower_yield(builder, helpers.yield_value, state, *val, ptr_ty, exception_exit),
+        InstKind::YieldFrom { iter } => {
+            r#gen::lower_yield_from(builder, helpers.yield_from, state, *iter, ptr_ty, exception_exit)
+        }
+        InstKind::Await { awaitable } => {
+            r#gen::lower_await(builder, helpers.await_value, state, *awaitable, ptr_ty, exception_exit)
+        }
+        InstKind::Raise { exc, cause } => {
+            exc::lower_raise(builder, helpers.raise, helpers.reraise, state, *exc, *cause, ptr_ty, exception_exit)
+        }
+        InstKind::Reraise => exc::lower_reraise(builder, helpers.reraise, ptr_ty, exception_exit),
+        InstKind::PushExcInfo => exc::lower_push_exc_info(builder, helpers.push_exc_info, 0, 0, 0, ptr_ty, exception_exit),
+        InstKind::PopExcInfo => exc::lower_pop_exc_info(builder, helpers.pop_exc_info, ptr_ty, exception_exit),
+        InstKind::MatchExc { exc_type } => {
+            exc::lower_match_exc(builder, helpers.match_exc, state, *exc_type, ptr_ty, exception_exit)
+        }
+        InstKind::CheckExcStar { exc_types } => {
+            exc::lower_check_exc_star(builder, helpers.check_exc_star, state, *exc_types, ptr_ty, exception_exit)
+        }
+        InstKind::GetCurrentExc => exc::lower_get_current_exc(builder, helpers.get_current_exc, ptr_ty, exception_exit),
+        InstKind::BuildExcGroup { excs } => exc::lower_build_exc_group(
+            builder,
+            helpers.build_exc_group,
+            helpers,
+            state,
+            excs,
+            ptr_ty,
+            ptr_bytes,
+            exception_exit,
+        ),
+        InstKind::MatchSequence { subj } => {
+            match_::lower_match_sequence(builder, helpers.match_sequence, state, *subj, ptr_ty, exception_exit)
+        }
+        InstKind::MatchMapping { subj } => {
+            match_::lower_match_mapping(builder, helpers.match_mapping, state, *subj, ptr_ty, exception_exit)
+        }
+        InstKind::MatchClass { subj, cls, nargs, kw } => match_::lower_match_class(
+            builder,
+            helpers.match_class,
+            names,
+            state,
+            *subj,
+            *cls,
+            *nargs,
+            kw,
+            ptr_ty,
+            exception_exit,
+        ),
+        InstKind::MatchKeys { subj, keys } => match_::lower_match_keys(
+            builder,
+            helpers.match_keys,
+            helpers,
+            state,
+            *subj,
+            keys,
+            ptr_ty,
+            ptr_bytes,
+            exception_exit,
+        ),
+        InstKind::GetLen { subj } => container::lower_get_len(builder, helpers.get_len, state, *subj, ptr_ty, exception_exit),
+        InstKind::MatchLenGe { subj, n, exact } => {
+            match_::lower_match_len_ge(builder, helpers.match_len_ge, state, *subj, *n, *exact, ptr_ty, exception_exit)
+        }
+        InstKind::ImportName {
+            name,
+            fromlist,
+            level,
+        } => name::lower_import_name_call(
+            builder,
+            helpers.import_name,
+            names,
+            name.0,
+            fromlist,
+            *level,
+            ptr_ty,
+            ptr_bytes,
+            exception_exit,
+        ),
+        InstKind::ImportFrom { module, name } => {
+            name::lower_import_from_call(builder, helpers.import_from, names, state, *module, name.0, ptr_ty, exception_exit)
+        }
+        InstKind::ImportStar { module } => {
+            name::lower_import_star_call(builder, helpers.import_star, state, *module, ptr_ty, exception_exit)
+        }
+        InstKind::BuildClass {
+            body,
+            name,
+            bases,
+            keywords,
+            decorators,
+        } => call::lower_build_class(
+            module,
+            builder,
+            helpers,
+            func_ids,
+            names,
+            state,
+            *body,
+            *name,
+            bases,
+            keywords,
+            decorators,
+            ptr_ty,
+            ptr_bytes,
+            exception_exit,
+        ),
         InstKind::MakeFunction {
             func_index,
             name_interned,
             arity,
-        } => {
-            let func_id = *func_ids
-                .get(*func_index as usize)
-                .ok_or(CodegenError::FunctionIndexOutOfRange { func_index: *func_index })?;
-            let func_ref = module.declare_func_in_func(func_id, builder.func);
-            let code = builder.ins().func_addr(ptr_ty, func_ref);
-            let arity = builder.ins().iconst(ptr_ty, *arity as i64);
-            let runtime_name = builder.ins().iconst(ir::types::I32, i64::from(names.runtime_id(*name_interned)?));
-            Ok(call_pyobject_helper(
-                builder,
-                helpers.make_function,
-                &[code, arity, runtime_name],
-                ptr_ty,
-                exception_exit,
-            ))
+        } => call::lower_make_function(
+            module,
+            builder,
+            helpers,
+            func_ids,
+            names,
+            *func_index,
+            name_interned.0,
+            *arity,
+            ptr_ty,
+            exception_exit,
+        ),
+        InstKind::MakeFunctionFull {
+            code,
+            defaults,
+            kwdefaults,
+            closure,
+            annotations,
+        } => call::lower_make_function_full(
+            module,
+            builder,
+            helpers,
+            func_ids,
+            functions,
+            names,
+            state,
+            call::MakeFunctionFullArgs {
+                code: *code,
+                defaults,
+                kwdefaults,
+                closure,
+                annotations,
+            },
+            ptr_ty,
+            ptr_bytes,
+            exception_exit,
+        ),
+        InstKind::SetupAnnotations => {
+            name::lower_setup_annotations(builder, helpers.setup_annotations, ptr_ty, exception_exit)
         }
-        _ => Err(CodegenError::Unsupported("unknown future InstKind")),
+        InstKind::LoadBuildClass => {
+            name::lower_load_build_class(builder, helpers.load_build_class, ptr_ty, exception_exit)
+        }
+        _ => control::lower_future_value("unknown future InstKind"),
     }
 }
 
-fn lower_terminator(
+pub(crate) fn load_local(
     builder: &mut FunctionBuilder<'_>,
     state: &LowerState,
-    ptr_ty: ir::Type,
-    term: &Terminator,
-) -> Result<(), CodegenError> {
-    match term {
-        Terminator::Return(value) => {
-            let value = state.value(*value)?;
-            builder.ins().return_(&[value]);
-            Ok(())
-        }
-        Terminator::Jump(_) | Terminator::Branch { .. } | Terminator::Unreachable => {
-            let null = builder.ins().iconst(ptr_ty, 0);
-            builder.ins().return_(&[null]);
-            Err(CodegenError::Unsupported("non-return terminator"))
-        }
-        _ => Err(CodegenError::Unsupported("unknown future terminator")),
-    }
-}
-
-fn load_local(
-    builder: &mut FunctionBuilder<'_>,
-    state: &mut LowerState,
     slot: u32,
 ) -> Result<ir::Value, CodegenError> {
     let index = slot as usize;
@@ -373,7 +920,7 @@ fn load_local(
     Ok(builder.use_var(state.locals[index]))
 }
 
-fn store_local(
+pub(crate) fn store_local(
     builder: &mut FunctionBuilder<'_>,
     state: &mut LowerState,
     slot: u32,
@@ -383,12 +930,13 @@ fn store_local(
     if index >= state.locals.len() {
         return Err(CodegenError::LocalOutOfRange { slot, n_locals: state.locals.len() });
     }
+    // PHASE-E: WriteBarrier
     builder.def_var(state.locals[index], value);
     state.local_defined[index] = true;
     Ok(())
 }
 
-fn declare_string_data<M: Module>(
+pub(crate) fn declare_string_data<M: Module>(
     module: &mut M,
     builder: &mut FunctionBuilder<'_>,
     value: &str,
@@ -407,8 +955,9 @@ fn declare_string_data<M: Module>(
     Ok(builder.ins().global_value(ptr_ty, global))
 }
 
-fn build_call_argv(
+pub(crate) fn build_call_argv(
     builder: &mut FunctionBuilder<'_>,
+    helpers: &HelperFuncRefs,
     state: &LowerState,
     args: &[IrValue],
     ptr_ty: ir::Type,
@@ -431,13 +980,42 @@ fn build_call_argv(
     for (index, arg) in args.iter().enumerate() {
         let value = state.value(*arg)?;
         let offset = offset_i32(index * ptr_bytes)?;
-        // PHASE-E: WriteBarrier
-        builder.ins().stack_store(value, slot, offset);
+        store_stack_pyobject(builder, helpers, slot, offset, value, ptr_ty);
     }
     Ok(builder.ins().stack_addr(ptr_ty, slot, 0))
 }
 
-fn call_pyobject_helper(
+fn store_stack_pyobject(
+    builder: &mut FunctionBuilder<'_>,
+    helpers: &HelperFuncRefs,
+    slot: ir::StackSlot,
+    offset: i32,
+    value: ir::Value,
+    ptr_ty: ir::Type,
+) {
+    builder.ins().stack_store(value, slot, offset);
+
+    #[cfg(feature = "free-threading")]
+    {
+        let slot_addr = builder.ins().stack_addr(ptr_ty, slot, offset);
+        builder.ins().call(helpers.gc_write_barrier, &[slot_addr, value]);
+    }
+
+    #[cfg(not(feature = "free-threading"))]
+    {
+        let _ = (helpers, ptr_ty);
+    }
+}
+
+#[cfg(feature = "free-threading")]
+pub(crate) fn emit_safepoint_poll(builder: &mut FunctionBuilder<'_>, helpers: &HelperFuncRefs) {
+    builder.ins().call(helpers.safepoint_poll, &[]);
+}
+
+#[cfg(not(feature = "free-threading"))]
+pub(crate) fn emit_safepoint_poll(_builder: &mut FunctionBuilder<'_>, _helpers: &HelperFuncRefs) {}
+
+pub(crate) fn call_pyobject_helper(
     builder: &mut FunctionBuilder<'_>,
     helper: FuncRef,
     args: &[ir::Value],
@@ -464,7 +1042,7 @@ fn emit_null_check(
     builder.seal_block(continue_block);
 }
 
-fn offset_i32(offset: usize) -> Result<i32, CodegenError> {
+pub(crate) fn offset_i32(offset: usize) -> Result<i32, CodegenError> {
     i32::try_from(offset).map_err(|_| CodegenError::OffsetTooLarge { offset })
 }
 
@@ -472,7 +1050,7 @@ fn offset_i32(offset: usize) -> Result<i32, CodegenError> {
 mod tests {
     use cranelift_frontend::FunctionBuilderContext;
     use cranelift_module::{Linkage, Module};
-    use pon_ir::ir::{Block, BlockId, FunctionId, Inst, Module as IrModule, Value};
+    use pon_ir::ir::{BinOp, Block, BlockId, FunctionId, Inst, LocalId, Module as IrModule, NameId, Terminator, UnOp, Value};
     use pon_runtime::abi::HELPERS;
 
     use super::*;
@@ -487,8 +1065,25 @@ mod tests {
         for helper in HELPERS {
             builder.symbol(helper.symbol, helper.address.cast::<u8>());
         }
+        register_free_threading_symbols(&mut builder);
         cranelift_jit::JITModule::new(builder)
     }
+
+    #[cfg(feature = "free-threading")]
+    fn register_free_threading_symbols(builder: &mut cranelift_jit::JITBuilder) {
+        unsafe extern "C" fn safepoint_poll() {}
+        unsafe extern "C" fn write_barrier(_slot: *mut *mut pon_runtime::object::PyObject, _new: *mut pon_runtime::object::PyObject) {}
+        unsafe extern "C" fn stop_requested() -> bool {
+            false
+        }
+
+        builder.symbol(crate::FT_SAFEPOINT_POLL, safepoint_poll as *const u8);
+        builder.symbol(crate::FT_GC_WRITE_BARRIER, write_barrier as *const u8);
+        builder.symbol(crate::FT_GC_STOP_REQUESTED, stop_requested as *const u8);
+    }
+
+    #[cfg(not(feature = "free-threading"))]
+    fn register_free_threading_symbols(_builder: &mut cranelift_jit::JITBuilder) {}
 
     fn compiled_clif(ir_module: &IrModule, function_index: usize) -> String {
         let mut module = jit_module();
@@ -543,34 +1138,294 @@ mod tests {
         rendered_functions.remove(function_index)
     }
 
-    #[test]
-    fn add_function_clif_calls_binary_add_and_checks_null() {
-        let ir = IrModule {
+    fn compile_error(ir_module: &IrModule) -> CodegenError {
+        let mut module = jit_module();
+        let helpers = declare_helpers(&mut module).expect("helpers declare");
+        let mut sig = module.make_signature();
+        let ptr = module.target_config().pointer_type();
+        sig.params.push(AbiParam::new(ptr));
+        sig.params.push(AbiParam::new(ptr));
+        sig.returns.push(AbiParam::new(ptr));
+        let func_ids = ir_module
+            .functions
+            .iter()
+            .map(|func| {
+                module
+                    .declare_function(&func.name, Linkage::Local, &sig)
+                    .expect("function declare")
+            })
+            .collect::<Vec<_>>();
+        let names = NameMap::from_ir_module(ir_module);
+        let mut ctx = module.make_context();
+        let mut fctx = FunctionBuilderContext::new();
+
+        compile_function(
+            &mut module,
+            &helpers,
+            &func_ids,
+            &names,
+            &ir_module.functions[0],
+            &mut ctx,
+            &mut fctx,
+        )
+        .expect_err("unsupported IR returns typed error")
+    }
+
+    fn binary_ir(op: BinOp) -> IrModule {
+        IrModule {
             functions: vec![Function {
-                name: "add".to_owned(),
+                name: "binary".to_owned(),
                 arity: 2,
                 n_locals: 2,
                 blocks: vec![Block {
                     id: BlockId(0),
                     insts: vec![
-                        Inst {
-                            result: Value(0),
-                            kind: InstKind::LoadLocal(0),
-                        },
-                        Inst {
-                            result: Value(1),
-                            kind: InstKind::LoadLocal(1),
-                        },
-                        Inst {
-                            result: Value(2),
-                            kind: InstKind::BinaryOp {
-                                op: BinOp::Add,
+                        Inst::new(Value(0), InstKind::LoadLocal(LocalId(0))),
+                        Inst::new(Value(1), InstKind::LoadLocal(LocalId(1))),
+                        Inst::new(
+                            Value(2),
+                            InstKind::BinaryOp {
+                                op,
                                 lhs: Value(0),
                                 rhs: Value(1),
                             },
-                        },
+                        ),
                     ],
                     term: Terminator::Return(Value(2)),
+                }],
+            }],
+            main: FunctionId(0),
+            names: vec![],
+        }
+    }
+
+    fn selector_for_known_or_future_binary_op(op: Option<BinOp>) -> Result<u8, CodegenError> {
+        match op {
+            Some(BinOp::Add) => Ok(0),
+            Some(BinOp::Sub) => Ok(1),
+            Some(BinOp::Mul) => Ok(2),
+            Some(BinOp::MatMul) => Ok(3),
+            Some(BinOp::Div) => Ok(4),
+            Some(BinOp::FloorDiv) => Ok(5),
+            Some(BinOp::Mod) => Ok(6),
+            Some(BinOp::Pow) => Ok(7),
+            Some(BinOp::LShift) => Ok(8),
+            Some(BinOp::RShift) => Ok(9),
+            Some(BinOp::And) => Ok(10),
+            Some(BinOp::Or) => Ok(11),
+            Some(BinOp::Xor) => Ok(12),
+            Some(_) | None => Err(CodegenError::Unsupported("binary op")),
+        }
+    }
+
+    #[test]
+    fn binary_op_clif_uses_selector_mapping_and_typed_future_error() {
+        for (op, selector) in [
+            (BinOp::Add, 0_u8),
+            (BinOp::Sub, 1),
+            (BinOp::Mul, 2),
+            (BinOp::MatMul, 3),
+            (BinOp::Div, 4),
+            (BinOp::FloorDiv, 5),
+            (BinOp::Mod, 6),
+            (BinOp::Pow, 7),
+            (BinOp::LShift, 8),
+            (BinOp::RShift, 9),
+            (BinOp::And, 10),
+            (BinOp::Or, 11),
+            (BinOp::Xor, 12),
+        ] {
+            let clif = compiled_clif(&binary_ir(op), 0);
+
+            assert!(clif.contains("pon_number_binary"));
+            assert!(
+                clif.contains(&format!("iconst.i8 {selector}")),
+                "missing binary selector {selector} in CLIF:\n{clif}"
+            );
+            assert!(matches!(
+                selector_for_known_or_future_binary_op(Some(op)),
+                Ok(value) if value == selector
+            ));
+        }
+
+        // `BinOp` is non-exhaustive outside `pon-ir`; `None` stands in for the
+        // future selector this crate cannot construct until a new variant exists.
+        assert!(matches!(
+            selector_for_known_or_future_binary_op(None),
+            Err(CodegenError::Unsupported("binary op"))
+        ));
+    }
+
+
+    fn unary_ir(op: UnOp) -> IrModule {
+        IrModule {
+            functions: vec![Function {
+                name: "unary".to_owned(),
+                arity: 1,
+                n_locals: 1,
+                blocks: vec![Block {
+                    id: BlockId(0),
+                    insts: vec![
+                        Inst::new(Value(0), InstKind::LoadLocal(LocalId(0))),
+                        Inst::new(
+                            Value(1),
+                            InstKind::UnaryOp {
+                                op,
+                                operand: Value(0),
+                            },
+                        ),
+                    ],
+                    term: Terminator::Return(Value(1)),
+                }],
+            }],
+            main: FunctionId(0),
+            names: vec![],
+        }
+    }
+
+    fn selector_for_known_or_future_unary_op(op: Option<UnOp>) -> Result<u8, CodegenError> {
+        match op {
+            Some(UnOp::Neg) => Ok(0),
+            Some(UnOp::Pos) => Ok(1),
+            Some(UnOp::Invert) => Ok(2),
+            Some(_) | None => Err(CodegenError::Unsupported("unary op")),
+        }
+    }
+
+    #[test]
+    fn unary_op_clif_uses_selector_mapping_and_typed_future_error() {
+        for (op, selector) in [(UnOp::Neg, 0_u8), (UnOp::Pos, 1), (UnOp::Invert, 2)] {
+            let clif = compiled_clif(&unary_ir(op), 0);
+
+            assert!(clif.contains("pon_number_unary"));
+            assert!(
+                clif.contains(&format!("iconst.i8 {selector}")),
+                "missing unary selector {selector} in CLIF:\n{clif}"
+            );
+            assert!(matches!(
+                selector_for_known_or_future_unary_op(Some(op)),
+                Ok(value) if value == selector
+            ));
+        }
+
+        // `UnOp` is non-exhaustive outside `pon-ir`; `None` stands in for the
+        // future selector this crate cannot construct until a new variant exists.
+        assert!(matches!(
+            selector_for_known_or_future_unary_op(None),
+            Err(CodegenError::Unsupported("unary op"))
+        ));
+    }
+
+    #[test]
+    fn for_next_helper_clif_regresses_value_type_borrow_shape() {
+        let ir = IrModule {
+            functions: vec![Function {
+                name: "next_item".to_owned(),
+                arity: 1,
+                n_locals: 1,
+                blocks: vec![Block {
+                    id: BlockId(0),
+                    insts: vec![
+                        Inst::new(Value(0), InstKind::LoadLocal(LocalId(0))),
+                        Inst::new(Value(1), InstKind::ForNext { iter: Value(0) }),
+                    ],
+                    term: Terminator::Return(Value(1)),
+                }],
+            }],
+            main: FunctionId(0),
+            names: vec![],
+        };
+
+        // Regression harness for `lower_for_next`: compute the iterator value
+        // type before starting `builder.ins().iconst(...)`. Inlining
+        // `builder.func.dfg.value_type(iter)` into that call creates overlapping
+        // immutable/mutable borrows of the builder.
+        let clif = compiled_clif(&ir, 0);
+
+        assert!(clif.contains("pon_for_next"));
+        assert!(clif.contains("iconst.i64 0") || clif.contains("iconst.i32 0"));
+    }
+
+    #[test]
+    #[cfg(feature = "free-threading")]
+    fn free_threading_clif_polls_function_entry_and_loop_backedge() {
+        let ir = IrModule {
+            functions: vec![Function {
+                name: "loop_poll".to_owned(),
+                arity: 1,
+                n_locals: 2,
+                blocks: vec![
+                    Block {
+                        id: BlockId(0),
+                        insts: vec![
+                            Inst::new(Value(0), InstKind::LoadLocal(LocalId(0))),
+                            Inst::new(Value(1), InstKind::GetIter { iterable: Value(0) }),
+                        ],
+                        term: Terminator::Jump(BlockId(1)),
+                    },
+                    Block {
+                        id: BlockId(1),
+                        insts: vec![Inst::new(Value(2), InstKind::ForNext { iter: Value(1) })],
+                        term: Terminator::ForLoop {
+                            iter: Value(1),
+                            body: BlockId(2),
+                            done: BlockId(3),
+                        },
+                    },
+                    Block {
+                        id: BlockId(2),
+                        insts: vec![Inst::new(Value(3), InstKind::StoreLocal(LocalId(1), Value(2)))],
+                        term: Terminator::Jump(BlockId(1)),
+                    },
+                    Block {
+                        id: BlockId(3),
+                        insts: vec![Inst::new(Value(4), InstKind::Const(PyConst::None))],
+                        term: Terminator::Return(Value(4)),
+                    },
+                ],
+            }],
+            main: FunctionId(0),
+            names: vec![],
+        };
+
+        let clif = compiled_clif(&ir, 0);
+
+        assert!(clif.contains(crate::FT_SAFEPOINT_POLL));
+        // `pon_safepoint_poll` is the unique zero-arg, no-return helper. Resolve
+        // its CLIF func ref structurally so the assertion survives helper-table
+        // reordering (a hard-coded `fnN` breaks whenever a helper is inserted).
+        let poll_sig = clif
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("sig").and_then(|rest| {
+                let (num, tail) = rest.split_once(" = ")?;
+                (tail.starts_with("()") && !tail.contains("->")).then(|| num.to_owned())
+            }))
+            .expect("a zero-arg no-return signature for pon_safepoint_poll");
+        let poll_fn = clif
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("fn").and_then(|rest| {
+                let (num, tail) = rest.split_once(" = ")?;
+                tail.ends_with(&format!("sig{poll_sig}")).then(|| num.to_owned())
+            }))
+            .expect("a func ref bound to the safepoint-poll signature");
+        assert!(
+            clif.matches(&format!("call fn{poll_fn}()")).count() >= 2,
+            "expected function-entry and loop-backedge safepoint calls in CLIF:\n{clif}"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "free-threading"))]
+    fn default_clif_does_not_import_safepoint_poll() {
+        let ir = IrModule {
+            functions: vec![Function {
+                name: "no_poll".to_owned(),
+                arity: 0,
+                n_locals: 0,
+                blocks: vec![Block {
+                    id: BlockId(0),
+                    insts: vec![Inst::new(Value(0), InstKind::Const(PyConst::None))],
+                    term: Terminator::Return(Value(0)),
                 }],
             }],
             main: FunctionId(0),
@@ -579,8 +1434,10 @@ mod tests {
 
         let clif = compiled_clif(&ir, 0);
 
-        assert!(clif.contains("pon_binary_add"));
-        assert!(clif.contains("brif"));
+        assert!(
+            !clif.contains("pon_safepoint_poll"),
+            "default CLIF must not import FT safepoint polls:\n{clif}"
+        );
     }
 
     #[test]
@@ -594,22 +1451,16 @@ mod tests {
                     blocks: vec![Block {
                         id: BlockId(0),
                         insts: vec![
-                            Inst {
-                                result: Value(0),
-                                kind: InstKind::MakeFunction {
+                            Inst::new(
+                                Value(0),
+                                InstKind::MakeFunction {
                                     func_index: 1,
-                                    name_interned: 0,
+                                    name_interned: NameId(0),
                                     arity: 2,
                                 },
-                            },
-                            Inst {
-                                result: Value(1),
-                                kind: InstKind::StoreGlobal(0, Value(0)),
-                            },
-                            Inst {
-                                result: Value(2),
-                                kind: InstKind::Const(PyConst::None),
-                            },
+                            ),
+                            Inst::new(Value(1), InstKind::StoreGlobal(NameId(0), Value(0))),
+                            Inst::new(Value(2), InstKind::Const(PyConst::None)),
                         ],
                         term: Terminator::Return(Value(2)),
                     }],
@@ -621,22 +1472,16 @@ mod tests {
                     blocks: vec![Block {
                         id: BlockId(0),
                         insts: vec![
-                            Inst {
-                                result: Value(0),
-                                kind: InstKind::LoadLocal(0),
-                            },
-                            Inst {
-                                result: Value(1),
-                                kind: InstKind::LoadLocal(1),
-                            },
-                            Inst {
-                                result: Value(2),
-                                kind: InstKind::BinaryOp {
+                            Inst::new(Value(0), InstKind::LoadLocal(LocalId(0))),
+                            Inst::new(Value(1), InstKind::LoadLocal(LocalId(1))),
+                            Inst::new(
+                                Value(2),
+                                InstKind::BinaryOp {
                                     op: BinOp::Add,
                                     lhs: Value(0),
                                     rhs: Value(1),
                                 },
-                            },
+                            ),
                         ],
                         term: Terminator::Return(Value(2)),
                     }],
@@ -651,5 +1496,45 @@ mod tests {
         assert!(clif.contains("pon_make_function"));
         assert!(clif.contains("pon_store_global"));
         assert!(clif.matches("brif").count() >= 3);
+    }
+
+    #[test]
+    fn unsupported_phase_b_inst_returns_typed_error() {
+        let ir = IrModule {
+            functions: vec![Function {
+                name: "future".to_owned(),
+                arity: 0,
+                n_locals: 0,
+                blocks: vec![Block {
+                    id: BlockId(0),
+                    insts: vec![Inst::new(Value(0), InstKind::Const(PyConst::NotImplemented))],
+                    term: Terminator::Return(Value(0)),
+                }],
+            }],
+            main: FunctionId(0),
+            names: vec![],
+        };
+
+        assert!(matches!(compile_error(&ir), CodegenError::Unsupported("Const(non Phase-A literal)")));
+    }
+
+    #[test]
+    fn unsupported_phase_b_terminator_returns_typed_error() {
+        let ir = IrModule {
+            functions: vec![Function {
+                name: "future_term".to_owned(),
+                arity: 0,
+                n_locals: 0,
+                blocks: vec![Block {
+                    id: BlockId(0),
+                    insts: vec![Inst::new(Value(0), InstKind::Const(PyConst::None))],
+                    term: Terminator::Unreachable,
+                }],
+            }],
+            main: FunctionId(0),
+            names: vec![],
+        };
+
+        assert!(matches!(compile_error(&ir), CodegenError::Unsupported("non-return terminator")));
     }
 }
