@@ -199,10 +199,17 @@ fn usage() -> anyhow::Error {
     )
 }
 
-const BENCH_KERNELS: &[&str] = &["int_loop.py", "fib.py", "nbody.py"];
+const BENCH_KERNELS: &[&str] = &["int_loop.py", "fib.py", "nbody.py", "comprehension.py", "generator.py"];
+const BENCH_SPEEDUP_RATCHETS: &[(&str, f64)] = &[
+    ("int_loop.py", 5.0),
+    ("fib.py", 1.0),
+    ("nbody.py", 1.0),
+    ("comprehension.py", 1.0),
+    ("generator.py", 1.0),
+];
+const BENCH_SPEEDUP_NOISE_ALLOWANCE: f64 = 0.05;
 const BENCH_WARMUP_REPS: usize = 1;
 const BENCH_TIMED_REPS: usize = 5;
-const INT_LOOP_MIN_SPEEDUP: f64 = 5.0;
 const TIER0_ONLY_ENV: &str = "PON_TIER0_ONLY";
 
 #[derive(Clone, Debug)]
@@ -243,10 +250,9 @@ fn run_bench_gate(root: &Path, requested_modules: &[PathBuf]) -> Result<()> {
             tier1.best.as_secs_f64()
         );
 
-        if script.file_stem().and_then(|stem| stem.to_str()) == Some("int_loop") && speedup < INT_LOOP_MIN_SPEEDUP {
-            failures.push(format!(
-                "`{label}` speedup {speedup:.2}x is below the Phase D floor {INT_LOOP_MIN_SPEEDUP:.2}x"
-            ));
+        let floor = bench_speedup_floor(&script);
+        if speedup + BENCH_SPEEDUP_NOISE_ALLOWANCE < floor {
+            failures.push(format!("`{label}` speedup {speedup:.2}x is below the bench floor {floor:.2}x"));
         }
     }
 
@@ -256,6 +262,16 @@ fn run_bench_gate(root: &Path, requested_modules: &[PathBuf]) -> Result<()> {
 
     println!("Phase D bench gate PASS");
     Ok(())
+}
+
+fn bench_speedup_floor(script: &Path) -> f64 {
+    let Some(file_name) = script.file_name().and_then(|name| name.to_str()) else {
+        return 1.0;
+    };
+    BENCH_SPEEDUP_RATCHETS
+        .iter()
+        .find_map(|(name, floor)| (*name == file_name).then_some(*floor))
+        .unwrap_or(1.0)
 }
 
 fn bench_scripts(root: &Path, requested_modules: &[PathBuf]) -> Result<Vec<PathBuf>> {

@@ -14,7 +14,7 @@ def run():
     vx2 = 0
     vy2 = 0
 
-    for step in range(80):
+    for step in range(800):
         if x0 < x1:
             vx0 = vx0 + 1
             vx1 = vx1 - 1
