@@ -926,7 +926,7 @@ mod tests {
 
     #[test]
     fn binds_keyword_only_default_without_masking_later_required_parameter() {
-        let function = 0x1000usize as *mut PyObject;
+        let function = 0x1200usize as *mut PyObject;
         let positional_name = crate::intern::intern("positional");
         let defaulted_kwonly_name = crate::intern::intern("defaulted_kwonly");
         let required_kwonly_name = crate::intern::intern("required_kwonly");

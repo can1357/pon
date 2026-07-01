@@ -11,6 +11,9 @@ crate-type = ["rlib", "staticlib"]
 [features]
 default = []
 free-threading = ["pon-gc/free-threading"]
+# J0.2 bring-up flag: immediate small-int tagging.  Default-on at the N1
+# cutover, deleted once the boxed-only path is gone.
+tagged-ints = []
 [lints]
 workspace = true
 

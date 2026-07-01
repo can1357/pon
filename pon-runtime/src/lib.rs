@@ -18,6 +18,7 @@ pub mod thread;
 pub mod thread_state;
 pub mod stackmap;
 pub mod sys;
+pub mod tag;
 pub mod traceback;
 pub mod types;
 
