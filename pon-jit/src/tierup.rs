@@ -214,6 +214,7 @@ fn compile_tier1_module(
     let helpers = declare_helpers(&mut module)?;
     let func_ids = declare_tier1_functions(&mut module, ir_module)?;
     let names = NameMap::from_ir_module(ir_module);
+    let entry_arg_counts = pon_codegen::baseline::entry_arg_counts(ir_module);
     let mut ctx = module.make_context();
     let mut fctx = FunctionBuilderContext::new();
     for (index, function) in ir_module.functions.iter().enumerate() {
@@ -229,7 +230,17 @@ fn compile_tier1_module(
                 &mut fctx,
             )?;
         } else {
-            compile_baseline_function(&mut module, &helpers, &func_ids, &names, function, &mut ctx, &mut fctx)?;
+            compile_baseline_function(
+                &mut module,
+                &helpers,
+                &func_ids,
+                &ir_module.functions,
+                &names,
+                function,
+                entry_arg_counts[index],
+                &mut ctx,
+                &mut fctx,
+            )?;
         }
         module.define_function(func_ids[index], &mut ctx)?;
     }
@@ -443,6 +454,8 @@ mod tests {
             functions: vec![Function {
                 name: "sum_range".to_owned(),
                 arity: 0,
+                params: Default::default(),
+                is_coroutine: false,
                 n_locals: 1,
                 blocks: vec![
                     Block {

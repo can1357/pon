@@ -469,6 +469,7 @@ fn push_inst_operands(kind: &InstKind, operands: &mut Vec<IrValue>) {
         | InstKind::Yield { val: value }
         | InstKind::YieldFrom { iter: value }
         | InstKind::Await { awaitable: value }
+        | InstKind::EagerGeneratorReturn { value }
         | InstKind::MatchExc { exc_type: value }
         | InstKind::CheckExcStar { exc_types: value }
         | InstKind::MatchSequence { subj: value }
@@ -519,7 +520,7 @@ fn push_inst_operands(kind: &InstKind, operands: &mut Vec<IrValue>) {
             push_optional_operand(operands, *exc);
             push_optional_operand(operands, *cause);
         }
-        InstKind::Reraise | InstKind::PushExcInfo | InstKind::PopExcInfo | InstKind::GetCurrentExc => {}
+        InstKind::Reraise | InstKind::PushExcInfo { .. } | InstKind::PopExcInfo | InstKind::GetCurrentExc => {}
         InstKind::BuildExcGroup { excs } | InstKind::MatchKeys { keys: excs, .. } => {
             if let InstKind::MatchKeys { subj, .. } = kind {
                 operands.push(*subj);
@@ -606,58 +607,53 @@ mod tests {
 
     #[test]
     fn finds_region_across_noncontiguous_successor_block_ids() {
-        let function = Function {
-            name: "branchy".to_owned(),
-            arity: 0,
-            n_locals: 0,
-            blocks: vec![
-                Block {
-                    id: BlockId(10),
-                    insts: vec![Inst::new(Value(0), InstKind::Const(PyConst::Int(1)))],
-                    term: Terminator::Jump(BlockId(30)),
+        let function = Function { name: "branchy".to_owned(), arity: 0, is_coroutine: false, params: Default::default(), n_locals: 0, blocks: vec![
+            Block {
+                id: BlockId(10),
+                insts: vec![Inst::new(Value(0), InstKind::Const(PyConst::Int(1)))],
+                term: Terminator::Jump(BlockId(30)),
+            },
+            Block {
+                id: BlockId(30),
+                insts: vec![
+                    Inst::new(Value(1), InstKind::Const(PyConst::Int(2))),
+                    Inst::new(
+                        Value(2),
+                        InstKind::BinaryOp {
+                            op: BinOp::Add,
+                            lhs: Value(0),
+                            rhs: Value(1),
+                        },
+                    )
+                    .with_inferred_type(Type::IntI64),
+                ],
+                term: Terminator::Branch {
+                    cond: Value(2),
+                    then_blk: BlockId(20),
+                    else_blk: BlockId(40),
                 },
-                Block {
-                    id: BlockId(30),
-                    insts: vec![
-                        Inst::new(Value(1), InstKind::Const(PyConst::Int(2))),
-                        Inst::new(
-                            Value(2),
-                            InstKind::BinaryOp {
-                                op: BinOp::Add,
-                                lhs: Value(0),
-                                rhs: Value(1),
-                            },
-                        )
-                        .with_inferred_type(Type::IntI64),
-                    ],
-                    term: Terminator::Branch {
-                        cond: Value(2),
-                        then_blk: BlockId(20),
-                        else_blk: BlockId(40),
-                    },
-                },
-                Block {
-                    id: BlockId(20),
-                    insts: vec![
-                        Inst::new(
-                            Value(3),
-                            InstKind::BinaryOp {
-                                op: BinOp::Add,
-                                lhs: Value(2),
-                                rhs: Value(1),
-                            },
-                        )
-                        .with_inferred_type(Type::IntI64),
-                    ],
-                    term: Terminator::Return(Value(3)),
-                },
-                Block {
-                    id: BlockId(40),
-                    insts: vec![Inst::new(Value(4), InstKind::LoadGlobal(NameId(0)))],
-                    term: Terminator::Return(Value(4)),
-                },
-            ],
-        };
+            },
+            Block {
+                id: BlockId(20),
+                insts: vec![
+                    Inst::new(
+                        Value(3),
+                        InstKind::BinaryOp {
+                            op: BinOp::Add,
+                            lhs: Value(2),
+                            rhs: Value(1),
+                        },
+                    )
+                    .with_inferred_type(Type::IntI64),
+                ],
+                term: Terminator::Return(Value(3)),
+            },
+            Block {
+                id: BlockId(40),
+                insts: vec![Inst::new(Value(4), InstKind::LoadGlobal(NameId(0)))],
+                term: Terminator::Return(Value(4)),
+            },
+        ] };
 
         let region = find_maximal_typed_region(&function).expect("typed region");
 

@@ -24,6 +24,8 @@ pub struct HelperRefs {
     pub const_float: FuncId,
     /// `pon_const_complex(f64, f64) -> *mut PyObject`.
     pub const_complex: FuncId,
+    /// `pon_const_bool(i32) -> *mut PyObject`.
+    pub const_bool: FuncId,
     /// `pon_const_str(*const u8, usize) -> *mut PyObject`.
     pub const_str: FuncId,
     /// `pon_binary_add(*mut PyObject, *mut PyObject) -> *mut PyObject`.
@@ -34,8 +36,12 @@ pub struct HelperRefs {
     pub number_unary: FuncId,
     /// `pon_number_binary(op, lhs, rhs, feedback) -> *mut PyObject`.
     pub number_binary: FuncId,
+    /// `pon_number_inplace(op, lhs, rhs, feedback) -> *mut PyObject`.
+    pub number_inplace: FuncId,
     /// `pon_is_true(value) -> i32`.
     pub is_true: FuncId,
+    /// `pon_contains(container, item) -> i32`.
+    pub contains: FuncId,
     /// `pon_call(callee, argv, argc) -> *mut PyObject`.
     pub call: FuncId,
     /// `pon_call_ex(callee, argv, argc, star, kw_names, kw_values, kw_count, dstar, feedback) -> *mut PyObject`.
@@ -130,6 +136,8 @@ pub struct HelperRefs {
     pub yield_from: FuncId,
     /// `pon_await(awaitable, feedback) -> *mut PyObject`.
     pub await_value: FuncId,
+    /// `pon_eager_yield_generator(return_value) -> *mut PyObject`.
+    pub eager_yield_generator: FuncId,
     /// `pon_match_sequence(subject, feedback) -> *mut PyObject`.
     pub match_sequence: FuncId,
     /// `pon_match_mapping(subject, feedback) -> *mut PyObject`.
@@ -144,7 +152,7 @@ pub struct HelperRefs {
     pub print: FuncId,
     /// `pon_make_function(code, arity, name_id) -> *mut PyObject`.
     pub make_function: FuncId,
-    /// `pon_make_function_full(code_info, defaults, default_count, kwdefaults, kwdefault_count) -> *mut PyObject`.
+    /// `pon_make_function_full(code_info, defaults, default_count, kwdefault_names, kwdefaults, kwdefault_count, annotation_names, annotations, annotation_count) -> *mut PyObject`.
     pub make_function_full: FuncId,
     /// `pon_function_set_closure(function, cells, count) -> *mut PyObject`.
     pub function_set_closure: FuncId,
@@ -254,9 +262,11 @@ pub enum HelperId {
     ConstInt,
     ConstFloat,
     ConstComplex,
+    ConstBool,
     NumberUnary,
     NumberBinary,
     NumberInplace,
+    Contains,
     ConstStr,
     BuildString,
     BuildTemplate,
@@ -306,6 +316,7 @@ pub enum HelperId {
     Yield,
     YieldFrom,
     Await,
+    EagerGeneratorReturn,
     ImportName,
     ImportFrom,
     ImportStar,
@@ -387,6 +398,10 @@ const P_MAKE_FUNCTION_FULL: &[AbiShape] = &[
     AbiShape::CodeInfoPtr,
     AbiShape::PyObjectPtrPtr,
     AbiShape::Usize,
+    AbiShape::ConstNamePtr,
+    AbiShape::PyObjectPtrPtr,
+    AbiShape::Usize,
+    AbiShape::ConstNamePtr,
     AbiShape::PyObjectPtrPtr,
     AbiShape::Usize,
 ];
@@ -407,9 +422,11 @@ pub static PHASE_B_HELPERS: &[HelperSig] = &[
     HelperSig { id: HelperId::ConstInt, family: HelperFamily::Number, symbol: "pon_const_int", params: P_I64, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::ConstFloat, family: HelperFamily::Number, symbol: "pon_const_float", params: &[AbiShape::F64], ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::ConstComplex, family: HelperFamily::Number, symbol: "pon_const_complex", params: &[AbiShape::F64, AbiShape::F64], ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
+    HelperSig { id: HelperId::ConstBool, family: HelperFamily::Number, symbol: "pon_const_bool", params: &[AbiShape::I32], ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::NumberUnary, family: HelperFamily::Number, symbol: "pon_number_unary", params: P_OP_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
     HelperSig { id: HelperId::NumberBinary, family: HelperFamily::Number, symbol: "pon_number_binary", params: P_OP_OBJ_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
     HelperSig { id: HelperId::NumberInplace, family: HelperFamily::Number, symbol: "pon_number_inplace", params: P_OP_OBJ_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
+    HelperSig { id: HelperId::Contains, family: HelperFamily::Seq, symbol: "pon_contains", params: P_OBJ_OBJ, ret: AbiShape::I32, feedback_trailing: 0 },
     HelperSig { id: HelperId::ConstStr, family: HelperFamily::Str, symbol: "pon_const_str", params: P_STR_BYTES, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::BuildString, family: HelperFamily::Str, symbol: "pon_build_string", params: P_STR_PARTS, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::BuildTemplate, family: HelperFamily::Str, symbol: "pon_build_template", params: P_TSTR_PARTS, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
@@ -465,6 +482,7 @@ pub static PHASE_B_HELPERS: &[HelperSig] = &[
     HelperSig { id: HelperId::CurrentClosureCell, family: HelperFamily::Call, symbol: "pon_current_closure_cell", params: P_INDEX, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::YieldFrom, family: HelperFamily::IterGen, symbol: "pon_yield_from", params: P_OBJ_FEEDBACK, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
     HelperSig { id: HelperId::Await, family: HelperFamily::IterGen, symbol: "pon_await", params: P_OBJ_FEEDBACK, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
+    HelperSig { id: HelperId::EagerGeneratorReturn, family: HelperFamily::IterGen, symbol: "pon_eager_yield_generator", params: P_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::ImportName, family: HelperFamily::ImportBuiltins, symbol: "pon_import_name", params: P_IMPORT_NAME, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::ImportFrom, family: HelperFamily::ImportBuiltins, symbol: "pon_import_from", params: P_OBJ_NAME, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::ImportStar, family: HelperFamily::ImportBuiltins, symbol: "pon_import_star", params: P_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
@@ -495,12 +513,15 @@ pub fn declare_helpers<M: Module>(module: &mut M) -> ModuleResult<HelperRefs> {
         const_int: declare_one(module, "pon_const_int")?,
         const_float: declare_one(module, "pon_const_float")?,
         const_complex: declare_one(module, "pon_const_complex")?,
+        const_bool: declare_one(module, "pon_const_bool")?,
         const_str: declare_one(module, "pon_const_str")?,
         binary_add: declare_one(module, "pon_binary_add")?,
         rich_compare: declare_one(module, "pon_rich_compare")?,
         number_unary: declare_one(module, "pon_number_unary")?,
         number_binary: declare_one(module, "pon_number_binary")?,
+        number_inplace: declare_one(module, "pon_number_inplace")?,
         is_true: declare_one(module, "pon_is_true")?,
+        contains: declare_one(module, "pon_contains")?,
         call: declare_one(module, "pon_call")?,
         call_ex: declare_one(module, "pon_call_ex")?,
         call_method: declare_one(module, "pon_call_method")?,
@@ -548,6 +569,7 @@ pub fn declare_helpers<M: Module>(module: &mut M) -> ModuleResult<HelperRefs> {
         yield_value: declare_one(module, "pon_yield")?,
         yield_from: declare_one(module, "pon_yield_from")?,
         await_value: declare_one(module, "pon_await")?,
+        eager_yield_generator: declare_one(module, "pon_eager_yield_generator")?,
         match_sequence: declare_one(module, "pon_match_sequence")?,
         match_mapping: declare_one(module, "pon_match_mapping")?,
         match_class: declare_one(module, "pon_match_class")?,

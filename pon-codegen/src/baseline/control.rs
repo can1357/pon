@@ -1,7 +1,7 @@
 //! Control-flow and singleton lowering family.
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::ir::{self, FuncRef, InstBuilder};
+use cranelift_codegen::ir::{self, FuncRef, InstBuilder, TrapCode};
 use cranelift_frontend::FunctionBuilder;
 use pon_ir::ir::{BlockId, Terminator};
 
@@ -24,11 +24,13 @@ pub(crate) fn lower_future_value(feature: &'static str) -> Result<ir::Value, Cod
     Err(CodegenError::Unsupported(feature))
 }
 
-/// Lower a basic-block terminator, accepting only Phase-A `Return` today.
+/// Lower a basic-block terminator.
 pub(crate) fn lower_terminator(
     builder: &mut FunctionBuilder<'_>,
     state: &LowerState,
+    helpers: &HelperFuncRefs,
     ptr_ty: ir::Type,
+    exception_exit: ir::Block,
     term: &Terminator,
 ) -> Result<(), CodegenError> {
     match term {
@@ -37,17 +39,18 @@ pub(crate) fn lower_terminator(
             builder.ins().return_(&[value]);
             Ok(())
         }
+        Terminator::RaiseTerm => {
+            lower_raise_term(builder, helpers, ptr_ty, exception_exit);
+            Ok(())
+        }
+        Terminator::Suspend { .. } => Err(CodegenError::Unsupported(
+            "generator suspension terminator requires generator frame lowering",
+        )),
         Terminator::Jump(_)
         | Terminator::Branch { .. }
         | Terminator::CondBranch { .. }
         | Terminator::ForLoop { .. }
-        | Terminator::Suspend { .. }
-        | Terminator::RaiseTerm
-        | Terminator::Unreachable => {
-            let null = builder.ins().iconst(ptr_ty, 0);
-            builder.ins().return_(&[null]);
-            Err(CodegenError::Unsupported("non-return terminator"))
-        }
+        | Terminator::Unreachable => Err(CodegenError::Unsupported("non-return terminator")),
         _ => Err(CodegenError::Unsupported("unknown future terminator")),
     }
 }
@@ -102,10 +105,30 @@ pub(crate) fn lower_terminator_with_blocks(
             builder.ins().brif(stopped, done, &[], exception_exit, &[]);
             Ok(())
         }
+        Terminator::RaiseTerm => {
+            lower_raise_term(builder, helpers, ptr_ty, exception_exit);
+            Ok(())
+        }
+        Terminator::Suspend { .. } => Err(CodegenError::Unsupported(
+            "generator suspension terminator requires generator frame lowering",
+        )),
         Terminator::Unreachable => Err(CodegenError::Unsupported("unreachable terminator")),
-        Terminator::Suspend { .. } | Terminator::RaiseTerm => Err(CodegenError::Unsupported("generator/exception terminator")),
         _ => Err(CodegenError::Unsupported("unknown future terminator")),
     }
+}
+
+fn lower_raise_term(
+    builder: &mut FunctionBuilder<'_>,
+    helpers: &HelperFuncRefs,
+    ptr_ty: ir::Type,
+    exception_exit: ir::Block,
+) {
+    // `Raise`/`Reraise` instructions install the pending Python exception and
+    // return NULL.  The terminator owns the control-flow exit: route the normal
+    // NULL sentinel to the shared exception block, and trap only if the helper
+    // unexpectedly reports a non-NULL object.
+    let _ = call_pyobject_helper(builder, helpers.reraise, &[], ptr_ty, exception_exit);
+    builder.ins().trap(TrapCode::unwrap_user(1));
 }
 
 fn emit_loop_backedge_safepoint(

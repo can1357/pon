@@ -13,9 +13,30 @@ pub(crate) fn lower_compare() -> Result<ir::Value, CodegenError> {
     Err(CodegenError::Unsupported("Compare"))
 }
 
-/// Reserve containment-test lowering.
-pub(crate) fn lower_contains() -> Result<ir::Value, CodegenError> {
-    Err(CodegenError::Unsupported("Contains"))
+pub(crate) fn lower_contains_op(
+    builder: &mut FunctionBuilder<'_>,
+    contains: FuncRef,
+    const_bool: FuncRef,
+    state: &LowerState,
+    item: IrValue,
+    container: IrValue,
+    negate: bool,
+    ptr_ty: ir::Type,
+    exception_exit: ir::Block,
+) -> Result<ir::Value, CodegenError> {
+    let container = state.value(container)?;
+    let item = state.value(item)?;
+    let call = builder.ins().call(contains, &[container, item]);
+    let status = builder.func.dfg.inst_results(call)[0];
+    let failed = builder.ins().icmp_imm(IntCC::Equal, status, -1);
+    let continue_block = builder.create_block();
+    builder.ins().brif(failed, exception_exit, &[], continue_block, &[]);
+    builder.switch_to_block(continue_block);
+    builder.seal_block(continue_block);
+    let condition = builder
+        .ins()
+        .icmp_imm(if negate { IntCC::Equal } else { IntCC::NotEqual }, status, 0);
+    Ok(box_bool_i32(builder, const_bool, condition, ptr_ty, exception_exit))
 }
 
 /// Reserve identity-test lowering.
@@ -39,6 +60,8 @@ pub(crate) fn lower_not() -> Result<ir::Value, CodegenError> {
 pub(crate) fn lower_compare_op(
     builder: &mut FunctionBuilder<'_>,
     rich_compare: FuncRef,
+    is_true: FuncRef,
+    const_bool: FuncRef,
     state: &LowerState,
     op: CmpOp,
     lhs: IrValue,
@@ -50,12 +73,15 @@ pub(crate) fn lower_compare_op(
     let lhs = state.value(lhs)?;
     let rhs = state.value(rhs)?;
     let feedback = builder.ins().iconst(ptr_ty, 0);
-    Ok(call_pyobject_helper(builder, rich_compare, &[op, lhs, rhs, feedback], ptr_ty, exception_exit))
+    let result = call_pyobject_helper(builder, rich_compare, &[op, lhs, rhs, feedback], ptr_ty, exception_exit);
+    let truth = call_is_true(builder, is_true, result, exception_exit);
+    let condition = builder.ins().icmp_imm(IntCC::NotEqual, truth, 0);
+    Ok(box_bool_i32(builder, const_bool, condition, ptr_ty, exception_exit))
 }
 
 pub(crate) fn lower_is_op(
     builder: &mut FunctionBuilder<'_>,
-    const_int: FuncRef,
+    const_bool: FuncRef,
     state: &LowerState,
     lhs: IrValue,
     rhs: IrValue,
@@ -66,13 +92,13 @@ pub(crate) fn lower_is_op(
     let lhs = state.value(lhs)?;
     let rhs = state.value(rhs)?;
     let condition = builder.ins().icmp(if negate { IntCC::NotEqual } else { IntCC::Equal }, lhs, rhs);
-    Ok(box_bool(builder, const_int, condition, ptr_ty, exception_exit))
+    Ok(box_bool_i32(builder, const_bool, condition, ptr_ty, exception_exit))
 }
 
 pub(crate) fn lower_bool_test_op(
     builder: &mut FunctionBuilder<'_>,
     is_true: FuncRef,
-    const_int: FuncRef,
+    const_bool: FuncRef,
     state: &LowerState,
     val: IrValue,
     ptr_ty: ir::Type,
@@ -81,13 +107,13 @@ pub(crate) fn lower_bool_test_op(
     let val = state.value(val)?;
     let truth = call_is_true(builder, is_true, val, exception_exit);
     let condition = builder.ins().icmp_imm(IntCC::NotEqual, truth, 0);
-    Ok(box_bool(builder, const_int, condition, ptr_ty, exception_exit))
+    Ok(box_bool_i32(builder, const_bool, condition, ptr_ty, exception_exit))
 }
 
 pub(crate) fn lower_not_op(
     builder: &mut FunctionBuilder<'_>,
     is_true: FuncRef,
-    const_int: FuncRef,
+    const_bool: FuncRef,
     state: &LowerState,
     val: IrValue,
     ptr_ty: ir::Type,
@@ -96,7 +122,7 @@ pub(crate) fn lower_not_op(
     let val = state.value(val)?;
     let truth = call_is_true(builder, is_true, val, exception_exit);
     let condition = builder.ins().icmp_imm(IntCC::Equal, truth, 0);
-    Ok(box_bool(builder, const_int, condition, ptr_ty, exception_exit))
+    Ok(box_bool_i32(builder, const_bool, condition, ptr_ty, exception_exit))
 }
 
 fn call_is_true(
@@ -115,17 +141,17 @@ fn call_is_true(
     status
 }
 
-fn box_bool(
+fn box_bool_i32(
     builder: &mut FunctionBuilder<'_>,
-    const_int: FuncRef,
+    const_bool: FuncRef,
     condition: ir::Value,
     ptr_ty: ir::Type,
     exception_exit: ir::Block,
 ) -> ir::Value {
-    let one = builder.ins().iconst(ir::types::I64, 1);
-    let zero = builder.ins().iconst(ir::types::I64, 0);
+    let one = builder.ins().iconst(ir::types::I32, 1);
+    let zero = builder.ins().iconst(ir::types::I32, 0);
     let int_value = builder.ins().select(condition, one, zero);
-    call_pyobject_helper(builder, const_int, &[int_value], ptr_ty, exception_exit)
+    call_pyobject_helper(builder, const_bool, &[int_value], ptr_ty, exception_exit)
 }
 
 fn rich_compare_selector(op: CmpOp) -> Result<i64, CodegenError> {

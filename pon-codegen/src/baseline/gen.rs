@@ -125,6 +125,19 @@ pub(crate) fn lower_yield(
     Ok(call_pyobject_helper(builder, helper, &[val], ptr_ty, exception_exit))
 }
 
+/// Lower eager generator completion through `pon_eager_yield_generator`.
+pub(crate) fn lower_eager_generator_return(
+    builder: &mut FunctionBuilder<'_>,
+    helper: ir::FuncRef,
+    state: &LowerState,
+    value: IrValue,
+    ptr_ty: ir::Type,
+    exception_exit: ir::Block,
+) -> Result<ir::Value, CodegenError> {
+    let value = state.value(value)?;
+    Ok(call_pyobject_helper(builder, helper, &[value], ptr_ty, exception_exit))
+}
+
 /// Lower `yield from` through `pon_yield_from`.
 pub(crate) fn lower_yield_from(
     builder: &mut FunctionBuilder<'_>,

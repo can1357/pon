@@ -58,18 +58,15 @@ impl NameMap {
     }
 }
 
-pub(crate) fn entry_arg_counts(module: &IrModule) -> Vec<usize> {
+pub fn entry_arg_counts(module: &IrModule) -> Vec<usize> {
     let mut counts = module.functions.iter().map(|function| function.arity).collect::<Vec<_>>();
     for function in &module.functions {
         for block in &function.blocks {
             for inst in &block.insts {
-                if let InstKind::MakeFunctionFull { code, kwdefaults, .. } = &inst.kind {
+                if let InstKind::MakeFunctionFull { code, .. } = &inst.kind {
                     if let Some(count) = counts.get_mut(code.0 as usize) {
-                        *count = (*count).max(
-                            module.functions[code.0 as usize]
-                                .arity
-                                .saturating_add(kwdefaults.len()),
-                        );
+                        let target = &module.functions[code.0 as usize];
+                        *count = (*count).max(target.params.total_slot_count().max(target.arity));
                     }
                 }
             }
@@ -135,10 +132,13 @@ pub(crate) struct HelperFuncRefs {
     pub(crate) const_int: FuncRef,
     pub(crate) const_float: FuncRef,
     pub(crate) const_complex: FuncRef,
+    pub(crate) const_bool: FuncRef,
     pub(crate) rich_compare: FuncRef,
     pub(crate) number_unary: FuncRef,
     pub(crate) number_binary: FuncRef,
+    pub(crate) number_inplace: FuncRef,
     pub(crate) is_true: FuncRef,
+    pub(crate) contains: FuncRef,
     pub(crate) call: FuncRef,
     pub(crate) call_ex: FuncRef,
     pub(crate) call_method: FuncRef,
@@ -186,6 +186,7 @@ pub(crate) struct HelperFuncRefs {
     pub(crate) yield_value: FuncRef,
     pub(crate) yield_from: FuncRef,
     pub(crate) await_value: FuncRef,
+    pub(crate) eager_yield_generator: FuncRef,
     pub(crate) match_sequence: FuncRef,
     pub(crate) match_mapping: FuncRef,
     pub(crate) match_class: FuncRef,
@@ -281,6 +282,7 @@ pub(crate) fn lower_boxed_subregion<M: Module>(
                 builder,
                 helpers,
                 func_ids,
+                &[],
                 names,
                 state,
                 ptr_ty,
@@ -342,7 +344,7 @@ pub fn compile_function<M: Module>(
     for _ in 0..ir.n_locals {
         state.locals.push(builder.declare_var(ptr_ty));
     }
-    initialize_parameter_locals(&mut builder, &mut state, argv, ptr_bytes, entry_arg_count, ir.n_locals, ptr_ty)?;
+    initialize_parameter_locals(&mut builder, &mut state, argv, ptr_bytes, entry_arg_count, ir, ptr_ty)?;
     emit_safepoint_poll(&mut builder, &helper_refs);
 
     let block_map: Vec<(pon_ir::ir::BlockId, ir::Block)> = ir
@@ -356,6 +358,9 @@ pub fn compile_function<M: Module>(
             }
         })
         .collect();
+    let mut exception_target_stack = Vec::new();
+    let mut current_exception_exit = exception_exit;
+
 
     for block in &ir.blocks {
         let clif_block = block_map
@@ -366,30 +371,65 @@ pub fn compile_function<M: Module>(
             builder.switch_to_block(clif_block);
         }
         for inst in &block.insts {
-            let value = lower_inst(
-                module,
-                &mut builder,
-                &helper_refs,
-                func_ids,
-                functions,
-                names,
-                &mut state,
-                ptr_ty,
-                ptr_bytes,
-                exception_exit,
-                &inst.kind,
-            )?;
+            let value = match &inst.kind {
+                InstKind::PushExcInfo {
+                    target,
+                    stack_depth,
+                    kind,
+                } => {
+                    let value = exc::lower_push_exc_info(
+                        &mut builder,
+                        helper_refs.push_exc_info,
+                        target.0,
+                        *stack_depth,
+                        *kind,
+                        ptr_ty,
+                        current_exception_exit,
+                    )?;
+                    let handler = block_map
+                        .iter()
+                        .find_map(|(id, clif)| (*id == *target).then_some(*clif))
+                        .ok_or(CodegenError::Unsupported("exception handler target block"))?;
+                    exception_target_stack.push(current_exception_exit);
+                    current_exception_exit = handler;
+                    value
+                }
+                InstKind::PopExcInfo => {
+                    let previous_exception_exit = exception_target_stack.pop().unwrap_or(exception_exit);
+                    let value = exc::lower_pop_exc_info(
+                        &mut builder,
+                        helper_refs.pop_exc_info,
+                        ptr_ty,
+                        previous_exception_exit,
+                    )?;
+                    current_exception_exit = previous_exception_exit;
+                    value
+                }
+                _ => lower_inst(
+                    module,
+                    &mut builder,
+                    &helper_refs,
+                    func_ids,
+                    functions,
+                    names,
+                    &mut state,
+                    ptr_ty,
+                    ptr_bytes,
+                    current_exception_exit,
+                    &inst.kind,
+                )?,
+            };
             state.define_value(inst.result, value);
         }
         if ir.blocks.len() == 1 {
-            control::lower_terminator(&mut builder, &state, ptr_ty, &block.term)?;
+            control::lower_terminator(&mut builder, &state, &helper_refs, ptr_ty, current_exception_exit, &block.term)?;
         } else {
             control::lower_terminator_with_blocks(
                 &mut builder,
                 &state,
                 &helper_refs,
                 ptr_ty,
-                exception_exit,
+                current_exception_exit,
                 &block_map,
                 block.id,
                 &block.term,
@@ -411,10 +451,13 @@ pub(crate) fn declare_helper_refs<M: Module>(module: &mut M, helpers: &HelperRef
         const_int: module.declare_func_in_func(helpers.const_int, func),
         const_float: module.declare_func_in_func(helpers.const_float, func),
         const_complex: module.declare_func_in_func(helpers.const_complex, func),
+        const_bool: module.declare_func_in_func(helpers.const_bool, func),
         rich_compare: module.declare_func_in_func(helpers.rich_compare, func),
         number_unary: module.declare_func_in_func(helpers.number_unary, func),
         number_binary: module.declare_func_in_func(helpers.number_binary, func),
+        number_inplace: module.declare_func_in_func(helpers.number_inplace, func),
         is_true: module.declare_func_in_func(helpers.is_true, func),
+        contains: module.declare_func_in_func(helpers.contains, func),
         call: module.declare_func_in_func(helpers.call, func),
         call_ex: module.declare_func_in_func(helpers.call_ex, func),
         call_method: module.declare_func_in_func(helpers.call_method, func),
@@ -462,6 +505,7 @@ pub(crate) fn declare_helper_refs<M: Module>(module: &mut M, helpers: &HelperRef
         yield_value: module.declare_func_in_func(helpers.yield_value, func),
         yield_from: module.declare_func_in_func(helpers.yield_from, func),
         await_value: module.declare_func_in_func(helpers.await_value, func),
+        eager_yield_generator: module.declare_func_in_func(helpers.eager_yield_generator, func),
         match_sequence: module.declare_func_in_func(helpers.match_sequence, func),
         match_mapping: module.declare_func_in_func(helpers.match_mapping, func),
         match_class: module.declare_func_in_func(helpers.match_class, func),
@@ -492,19 +536,66 @@ pub(crate) fn initialize_parameter_locals(
     state: &mut LowerState,
     argv: ir::Value,
     ptr_bytes: usize,
-    arity: usize,
-    n_locals: usize,
+    entry_arg_count: usize,
+    function: &Function,
     ptr_ty: ir::Type,
 ) -> Result<(), CodegenError> {
-    if arity > n_locals {
-        return Err(CodegenError::LocalOutOfRange { slot: arity as u32, n_locals });
+    if entry_arg_count > function.n_locals {
+        return Err(CodegenError::LocalOutOfRange {
+            slot: entry_arg_count as u32,
+            n_locals: function.n_locals,
+        });
     }
-    for slot in 0..arity {
-        let offset = offset_i32(slot * ptr_bytes)?;
-        let value = builder.ins().load(ptr_ty, MemFlagsData::new(), argv, offset);
-        builder.def_var(state.locals[slot], value);
-        state.local_defined[slot] = true;
+    if function.params.total_slot_count() == 0 {
+        for slot in 0..entry_arg_count {
+            define_local_from_argv(builder, state, argv, ptr_bytes, ptr_ty, slot, slot)?;
+        }
+        return Ok(());
     }
+
+    let positional = function.params.positional_arity();
+    for slot in 0..positional {
+        define_local_from_argv(builder, state, argv, ptr_bytes, ptr_ty, slot, slot)?;
+    }
+
+    let mut argv_slot = positional;
+    let keyword_only_local = positional + usize::from(function.params.vararg_name.is_some());
+    for index in 0..function.params.keyword_only_count {
+        define_local_from_argv(builder, state, argv, ptr_bytes, ptr_ty, argv_slot, keyword_only_local + index)?;
+        argv_slot += 1;
+    }
+
+    if function.params.vararg_name.is_some() {
+        define_local_from_argv(builder, state, argv, ptr_bytes, ptr_ty, argv_slot, positional)?;
+        argv_slot += 1;
+    }
+    if function.params.kwarg_name.is_some() {
+        define_local_from_argv(
+            builder,
+            state,
+            argv,
+            ptr_bytes,
+            ptr_ty,
+            argv_slot,
+            keyword_only_local + function.params.keyword_only_count,
+        )?;
+    }
+    Ok(())
+}
+
+fn define_local_from_argv(
+    builder: &mut FunctionBuilder<'_>,
+    state: &mut LowerState,
+    argv: ir::Value,
+    ptr_bytes: usize,
+    ptr_ty: ir::Type,
+    argv_slot: usize,
+    local_slot: usize,
+) -> Result<(), CodegenError> {
+    let offset = offset_i32(argv_slot * ptr_bytes)?;
+    let value = builder.ins().load(ptr_ty, MemFlagsData::new(), argv, offset);
+    builder.def_var(state.locals[local_slot], value);
+    state.local_defined[local_slot] = true;
     Ok(())
 }
 
@@ -528,6 +619,7 @@ pub(crate) fn lower_inst<M: Module>(
             strings::lower_const_str(module, builder, helpers, value, ptr_ty, exception_exit)
         }
         InstKind::Const(PyConst::None) => control::lower_const_none(builder, helpers, ptr_ty, exception_exit),
+        InstKind::Const(PyConst::Bool(value)) => number::lower_const_bool(builder, helpers, *value, ptr_ty, exception_exit),
         InstKind::Const(PyConst::Float(value)) => number::lower_const_float(builder, helpers, *value, ptr_ty, exception_exit),
         InstKind::Const(PyConst::Complex { real, imag }) => {
             number::lower_const_complex(builder, helpers, *real, *imag, ptr_ty, exception_exit)
@@ -661,22 +753,49 @@ pub(crate) fn lower_inst<M: Module>(
         InstKind::BinaryOp { op, lhs, rhs } => {
             number::lower_binary_op(builder, helpers, state, *op, *lhs, *rhs, ptr_ty, exception_exit)
         }
-        InstKind::InplaceOp { .. } => number::lower_inplace_op(),
+        InstKind::InplaceOp { op, lhs, rhs } => {
+            number::lower_inplace_op(builder, helpers, state, *op, *lhs, *rhs, ptr_ty, exception_exit)
+        }
         InstKind::UnaryOp { op, operand } => {
             number::lower_unary_op(builder, helpers.number_unary, state, *op, *operand, ptr_ty, exception_exit)
         }
         InstKind::Compare { op, lhs, rhs } => {
-            compare::lower_compare_op(builder, helpers.rich_compare, state, *op, *lhs, *rhs, ptr_ty, exception_exit)
+            compare::lower_compare_op(
+                builder,
+                helpers.rich_compare,
+                helpers.is_true,
+                helpers.const_bool,
+                state,
+                *op,
+                *lhs,
+                *rhs,
+                ptr_ty,
+                exception_exit,
+            )
         }
-        InstKind::Contains { .. } => compare::lower_contains(),
+        InstKind::Contains {
+            item,
+            container,
+            negate,
+        } => compare::lower_contains_op(
+            builder,
+            helpers.contains,
+            helpers.const_bool,
+            state,
+            *item,
+            *container,
+            *negate,
+            ptr_ty,
+            exception_exit,
+        ),
         InstKind::Is { lhs, rhs, negate } => {
-            compare::lower_is_op(builder, helpers.const_int, state, *lhs, *rhs, *negate, ptr_ty, exception_exit)
+            compare::lower_is_op(builder, helpers.const_bool, state, *lhs, *rhs, *negate, ptr_ty, exception_exit)
         }
         InstKind::BoolTest { val } => {
-            compare::lower_bool_test_op(builder, helpers.is_true, helpers.const_int, state, *val, ptr_ty, exception_exit)
+            compare::lower_bool_test_op(builder, helpers.is_true, helpers.const_bool, state, *val, ptr_ty, exception_exit)
         }
         InstKind::Not { val } => {
-            compare::lower_not_op(builder, helpers.is_true, helpers.const_int, state, *val, ptr_ty, exception_exit)
+            compare::lower_not_op(builder, helpers.is_true, helpers.const_bool, state, *val, ptr_ty, exception_exit)
         }
         InstKind::LoadAttr { obj, name } => attr::lower_load_attr(builder, helpers, names, state, *obj, name.0, ptr_ty, exception_exit),
         InstKind::StoreAttr { obj, name, val } => attr::lower_store_attr(builder, helpers, names, state, *obj, name.0, *val, ptr_ty, exception_exit),
@@ -755,11 +874,31 @@ pub(crate) fn lower_inst<M: Module>(
         InstKind::Await { awaitable } => {
             r#gen::lower_await(builder, helpers.await_value, state, *awaitable, ptr_ty, exception_exit)
         }
+        InstKind::EagerGeneratorReturn { value } => r#gen::lower_eager_generator_return(
+            builder,
+            helpers.eager_yield_generator,
+            state,
+            *value,
+            ptr_ty,
+            exception_exit,
+        ),
         InstKind::Raise { exc, cause } => {
             exc::lower_raise(builder, helpers.raise, helpers.reraise, state, *exc, *cause, ptr_ty, exception_exit)
         }
         InstKind::Reraise => exc::lower_reraise(builder, helpers.reraise, ptr_ty, exception_exit),
-        InstKind::PushExcInfo => exc::lower_push_exc_info(builder, helpers.push_exc_info, 0, 0, 0, ptr_ty, exception_exit),
+        InstKind::PushExcInfo {
+            target,
+            stack_depth,
+            kind,
+        } => exc::lower_push_exc_info(
+            builder,
+            helpers.push_exc_info,
+            target.0,
+            *stack_depth,
+            *kind,
+            ptr_ty,
+            exception_exit,
+        ),
         InstKind::PopExcInfo => exc::lower_pop_exc_info(builder, helpers.pop_exc_info, ptr_ty, exception_exit),
         InstKind::MatchExc { exc_type } => {
             exc::lower_match_exc(builder, helpers.match_exc, state, *exc_type, ptr_ty, exception_exit)
@@ -1050,7 +1189,7 @@ pub(crate) fn offset_i32(offset: usize) -> Result<i32, CodegenError> {
 mod tests {
     use cranelift_frontend::FunctionBuilderContext;
     use cranelift_module::{Linkage, Module};
-    use pon_ir::ir::{BinOp, Block, BlockId, FunctionId, Inst, LocalId, Module as IrModule, NameId, Terminator, UnOp, Value};
+    use pon_ir::ir::{BinOp, Block, BlockId, CellId, FunctionId, Inst, LocalId, Module as IrModule, NameId, Terminator, UnOp, Value};
     use pon_runtime::abi::HELPERS;
 
     use super::*;
@@ -1103,6 +1242,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let names = NameMap::from_ir_module(ir_module);
+        let entry_arg_counts = entry_arg_counts(ir_module);
+
 
         let mut rendered_functions = Vec::with_capacity(ir_module.functions.len());
         for (index, function) in ir_module.functions.iter().enumerate() {
@@ -1112,8 +1253,10 @@ mod tests {
                 &mut module,
                 &helpers,
                 &func_ids,
+                &ir_module.functions,
                 &names,
                 function,
+                entry_arg_counts[index],
                 &mut ctx,
                 &mut fctx,
             )
@@ -1156,6 +1299,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let names = NameMap::from_ir_module(ir_module);
+        let entry_arg_counts = entry_arg_counts(ir_module);
         let mut ctx = module.make_context();
         let mut fctx = FunctionBuilderContext::new();
 
@@ -1163,8 +1307,10 @@ mod tests {
             &mut module,
             &helpers,
             &func_ids,
+            &ir_module.functions,
             &names,
             &ir_module.functions[0],
+            entry_arg_counts[0],
             &mut ctx,
             &mut fctx,
         )
@@ -1176,6 +1322,8 @@ mod tests {
             functions: vec![Function {
                 name: "binary".to_owned(),
                 arity: 2,
+                is_coroutine: false,
+                params: Default::default(),
                 n_locals: 2,
                 blocks: vec![Block {
                     id: BlockId(0),
@@ -1262,6 +1410,8 @@ mod tests {
             functions: vec![Function {
                 name: "unary".to_owned(),
                 arity: 1,
+                is_coroutine: false,
+                params: Default::default(),
                 n_locals: 1,
                 blocks: vec![Block {
                     id: BlockId(0),
@@ -1322,6 +1472,8 @@ mod tests {
             functions: vec![Function {
                 name: "next_item".to_owned(),
                 arity: 1,
+                is_coroutine: false,
+                params: Default::default(),
                 n_locals: 1,
                 blocks: vec![Block {
                     id: BlockId(0),
@@ -1353,6 +1505,8 @@ mod tests {
             functions: vec![Function {
                 name: "loop_poll".to_owned(),
                 arity: 1,
+                is_coroutine: false,
+                params: Default::default(),
                 n_locals: 2,
                 blocks: vec![
                     Block {
@@ -1421,6 +1575,8 @@ mod tests {
             functions: vec![Function {
                 name: "no_poll".to_owned(),
                 arity: 0,
+                is_coroutine: false,
+                params: Default::default(),
                 n_locals: 0,
                 blocks: vec![Block {
                     id: BlockId(0),
@@ -1447,6 +1603,8 @@ mod tests {
                 Function {
                     name: "__main__".to_owned(),
                     arity: 0,
+                is_coroutine: false,
+                    params: Default::default(),
                     n_locals: 0,
                     blocks: vec![Block {
                         id: BlockId(0),
@@ -1468,6 +1626,8 @@ mod tests {
                 Function {
                     name: "add".to_owned(),
                     arity: 2,
+                is_coroutine: false,
+                    params: Default::default(),
                     n_locals: 2,
                     blocks: vec![Block {
                         id: BlockId(0),
@@ -1499,11 +1659,156 @@ mod tests {
     }
 
     #[test]
+    fn make_function_full_clif_uses_code_info_and_default_arrays() {
+        let ir = IrModule {
+            functions: vec![
+                Function {
+                    name: "__main__".to_owned(),
+                    arity: 0,
+                is_coroutine: false,
+                    params: Default::default(),
+                    n_locals: 0,
+                    blocks: vec![Block {
+                        id: BlockId(0),
+                        insts: vec![
+                            Inst::new(Value(0), InstKind::Const(PyConst::Int(7))),
+                            Inst::new(Value(1), InstKind::Const(PyConst::Int(11))),
+                            Inst::new(
+                                Value(2),
+                                InstKind::MakeFunctionFull {
+                                    code: FunctionId(1),
+                                    defaults: vec![Value(0)],
+                                    kwdefaults: vec![(NameId(0), Value(1))],
+                                    closure: vec![],
+                                    annotations: vec![],
+                                },
+                            ),
+                        ],
+                        term: Terminator::Return(Value(2)),
+                    }],
+                },
+                Function {
+                    name: "with_defaults".to_owned(),
+                    arity: 1,
+                is_coroutine: false,
+                    params: Default::default(),
+                    n_locals: 2,
+                    blocks: vec![Block {
+                        id: BlockId(0),
+                        insts: vec![Inst::new(Value(0), InstKind::Const(PyConst::None))],
+                        term: Terminator::Return(Value(0)),
+                    }],
+                },
+            ],
+            main: FunctionId(0),
+            names: vec!["kw_only".to_owned()],
+        };
+
+        let clif = compiled_clif(&ir, 0);
+
+        assert!(
+            clif.contains("pon_make_function_full"),
+            "MakeFunctionFull should declare the full-function helper import:\n{clif}"
+        );
+        assert!(
+            clif.contains("global_value."),
+            "MakeFunctionFull should pass a static CodeInfo data pointer:\n{clif}"
+        );
+        assert!(
+            clif.matches("stack_addr.").count() >= 2,
+            "positional and keyword-only defaults should be passed through stack arrays:\n{clif}"
+        );
+        assert!(
+            clif.matches("stack_store").count() >= 2,
+            "default values should be stored into the generated argument arrays:\n{clif}"
+        );
+        assert!(
+            clif.contains("iconst.i64 1") || clif.contains("iconst.i32 1"),
+            "both default-count operands should materialize the one-default case:\n{clif}"
+        );
+    }
+
+    #[test]
+    fn make_function_full_clif_plumbs_closure_cells() {
+        let ir = IrModule {
+            functions: vec![
+                Function {
+                    name: "__main__".to_owned(),
+                    arity: 1,
+                is_coroutine: false,
+                    params: Default::default(),
+                    n_locals: 1,
+                    blocks: vec![Block {
+                        id: BlockId(0),
+                        insts: vec![
+                            Inst::new(Value(0), InstKind::MakeCell(LocalId(0))),
+                            Inst::new(
+                                Value(1),
+                                InstKind::MakeFunctionFull {
+                                    code: FunctionId(1),
+                                    defaults: vec![],
+                                    kwdefaults: vec![],
+                                    closure: vec![CellId(0)],
+                                    annotations: vec![],
+                                },
+                            ),
+                        ],
+                        term: Terminator::Return(Value(1)),
+                    }],
+                },
+                Function {
+                    name: "inner".to_owned(),
+                    arity: 0,
+                is_coroutine: false,
+                    params: Default::default(),
+                    n_locals: 0,
+                    blocks: vec![Block {
+                        id: BlockId(0),
+                        insts: vec![Inst::new(Value(0), InstKind::Const(PyConst::None))],
+                        term: Terminator::Return(Value(0)),
+                    }],
+                },
+            ],
+            main: FunctionId(0),
+            names: vec![],
+        };
+
+        let clif = compiled_clif(&ir, 0);
+
+        assert!(
+            clif.contains("pon_make_cell"),
+            "MakeCell should declare the cell-allocation helper import:\n{clif}"
+        );
+        assert!(
+            clif.contains("pon_make_function_full"),
+            "closure-bearing MakeFunctionFull should declare the full-function helper import:\n{clif}"
+        );
+        assert!(
+            clif.contains("pon_function_set_closure"),
+            "closure-bearing MakeFunctionFull should declare the closure setter import:\n{clif}"
+        );
+        assert!(
+            clif.contains("global_value."),
+            "closure-bearing MakeFunctionFull should still pass static CodeInfo data:\n{clif}"
+        );
+        assert!(
+            clif.contains("stack_store") && clif.contains("stack_addr."),
+            "captured cells should be written to a closure array before pon_function_set_closure:\n{clif}"
+        );
+        assert!(
+            clif.matches("call fn").count() >= 3,
+            "expected helper calls for make-cell, make-function-full, and set-closure:\n{clif}"
+        );
+    }
+
+    #[test]
     fn unsupported_phase_b_inst_returns_typed_error() {
         let ir = IrModule {
             functions: vec![Function {
                 name: "future".to_owned(),
                 arity: 0,
+                is_coroutine: false,
+                params: Default::default(),
                 n_locals: 0,
                 blocks: vec![Block {
                     id: BlockId(0),
@@ -1524,6 +1829,8 @@ mod tests {
             functions: vec![Function {
                 name: "future_term".to_owned(),
                 arity: 0,
+                is_coroutine: false,
+                params: Default::default(),
                 n_locals: 0,
                 blocks: vec![Block {
                     id: BlockId(0),

@@ -3,7 +3,7 @@
 use cranelift_codegen::ir::{self, InstBuilder, StackSlotData, StackSlotKind};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::{DataDescription, FuncId, Module};
-use pon_ir::ir::{CellId, Function, FunctionId, NameId, Value as IrValue};
+use pon_ir::ir::{CellId, Function, FunctionId, InstKind, NameId, Value as IrValue};
 
 use super::{
     CodegenError, HelperFuncRefs, LowerState, NameMap, build_call_argv, call_pyobject_helper,
@@ -220,9 +220,6 @@ pub(crate) fn lower_make_function_full<M: Module>(
     ptr_bytes: usize,
     exception_exit: ir::Block,
 ) -> Result<ir::Value, CodegenError> {
-    if !function.annotations.is_empty() {
-        return Err(CodegenError::Unsupported("MakeFunctionFull annotations"));
-    }
     let func_index = function.code.0;
     let target = functions
         .get(func_index as usize)
@@ -233,12 +230,26 @@ pub(crate) fn lower_make_function_full<M: Module>(
     let code_info = declare_code_info(module, builder, func_id, target, function.kwdefaults, names, ptr_ty, ptr_bytes)?;
     let defaults = build_value_array(builder, helpers, state, function.defaults, ptr_ty, ptr_bytes)?;
     let default_count = builder.ins().iconst(ptr_ty, function.defaults.len() as i64);
+    let kwdefault_names = build_kw_name_array(builder, names, function.kwdefaults, ptr_ty)?;
     let kwdefaults = build_kw_value_array(builder, state, function.kwdefaults, ptr_ty, ptr_bytes)?;
     let kwdefault_count = builder.ins().iconst(ptr_ty, function.kwdefaults.len() as i64);
+    let annotation_names = build_kw_name_array(builder, names, function.annotations, ptr_ty)?;
+    let annotations = build_kw_value_array(builder, state, function.annotations, ptr_ty, ptr_bytes)?;
+    let annotation_count = builder.ins().iconst(ptr_ty, function.annotations.len() as i64);
     let object = call_pyobject_helper(
         builder,
         helpers.make_function_full,
-        &[code_info, defaults, default_count, kwdefaults, kwdefault_count],
+        &[
+            code_info,
+            defaults,
+            default_count,
+            kwdefault_names,
+            kwdefaults,
+            kwdefault_count,
+            annotation_names,
+            annotations,
+            annotation_count,
+        ],
         ptr_ty,
         exception_exit,
     );
@@ -261,18 +272,15 @@ fn declare_code_info<M: Module>(
     builder: &mut FunctionBuilder<'_>,
     func_id: FuncId,
     target: &Function,
-    kwdefaults: &[(NameId, IrValue)],
-    names: &NameMap,
+    _kwdefaults: &[(NameId, IrValue)],
+    _names: &NameMap,
     ptr_ty: ir::Type,
     ptr_bytes: usize,
 ) -> Result<ir::Value, CodegenError> {
-    let keyword_only_count = kwdefaults.len();
-    let total_param_count = target
-        .arity
-        .checked_add(keyword_only_count)
-        .ok_or(CodegenError::OffsetTooLarge { offset: usize::MAX })?;
-    let names_data = declare_param_names_data(module, kwdefaults, names, target.arity, ptr_ty, ptr_bytes)?;
-    let params_data = declare_param_spec_data(module, names_data, target.arity, keyword_only_count, total_param_count, ptr_ty, ptr_bytes)?;
+    let params = &target.params;
+    let total_param_count = params.total_slot_count();
+    let names_data = declare_param_names_data(module, &params.names)?;
+    let params_data = declare_param_spec_data(module, names_data, params, total_param_count, ptr_bytes)?;
 
     let data_id = module.declare_anonymous_data(false, false)?;
     let mut data = DataDescription::new();
@@ -281,7 +289,7 @@ fn declare_code_info<M: Module>(
     put_u32(&mut bytes, CODE_INFO_NAME_OFFSET, pon_runtime::intern::intern(&target.name));
     put_u32(&mut bytes, CODE_INFO_N_LOCALS_OFFSET, u32::try_from(target.n_locals).map_err(|_| CodegenError::OffsetTooLarge { offset: target.n_locals })?);
     put_u32(&mut bytes, CODE_INFO_N_FEEDBACK_OFFSET, 0);
-    put_u32(&mut bytes, CODE_INFO_FLAGS_OFFSET, 0);
+    put_u32(&mut bytes, CODE_INFO_FLAGS_OFFSET, code_flags(target));
     data.define(bytes.into_boxed_slice());
     let func_ref = module.declare_func_in_data(func_id, &mut data);
     data.write_function_addr(offset_u32(CODE_INFO_ENTRY_OFFSET)?, func_ref);
@@ -294,26 +302,36 @@ fn declare_code_info<M: Module>(
     Ok(builder.ins().global_value(ptr_ty, global))
 }
 
+fn code_flags(target: &Function) -> u32 {
+    if target.is_coroutine {
+        return pon_runtime::abi::call::CODE_FLAG_COROUTINE;
+    }
+    if target
+        .blocks
+        .iter()
+        .flat_map(|block| &block.insts)
+        .any(|inst| matches!(inst.kind, InstKind::Yield { .. } | InstKind::YieldFrom { .. }))
+    {
+        pon_runtime::abi::call::CODE_FLAG_GENERATOR
+    } else {
+        0
+    }
+}
+
 fn declare_param_names_data<M: Module>(
     module: &mut M,
-    kwdefaults: &[(NameId, IrValue)],
-    names: &NameMap,
-    positional_count: usize,
-    _ptr_ty: ir::Type,
-    _ptr_bytes: usize,
+    param_names: &[String],
 ) -> Result<Option<cranelift_module::DataId>, CodegenError> {
-    let total = positional_count
-        .checked_add(kwdefaults.len())
-        .ok_or(CodegenError::OffsetTooLarge { offset: usize::MAX })?;
-    if total == 0 {
+    if param_names.is_empty() {
         return Ok(None);
     }
-    let size = total
+    let size = param_names
+        .len()
         .checked_mul(core::mem::size_of::<u32>())
         .ok_or(CodegenError::OffsetTooLarge { offset: usize::MAX })?;
     let mut bytes = vec![0_u8; size];
-    for (index, (name, _)) in kwdefaults.iter().enumerate() {
-        put_u32(&mut bytes, (positional_count + index) * 4, names.runtime_id(name.0)?);
+    for (index, name) in param_names.iter().enumerate() {
+        put_u32(&mut bytes, index * 4, pon_runtime::intern::intern(name));
     }
     let data_id = module.declare_anonymous_data(false, false)?;
     let mut data = DataDescription::new();
@@ -326,10 +344,8 @@ fn declare_param_names_data<M: Module>(
 fn declare_param_spec_data<M: Module>(
     module: &mut M,
     names_data: Option<cranelift_module::DataId>,
-    positional_count: usize,
-    keyword_only_count: usize,
+    params: &pon_ir::ir::ParamLayout,
     total_param_count: usize,
-    _ptr_ty: ir::Type,
     ptr_bytes: usize,
 ) -> Result<Option<cranelift_module::DataId>, CodegenError> {
     if total_param_count == 0 {
@@ -340,11 +356,11 @@ fn declare_param_spec_data<M: Module>(
     data.set_align(ptr_bytes as u64);
     let mut bytes = vec![0_u8; core::mem::size_of::<pon_runtime::abi::ParamSpec>()];
     put_u32(&mut bytes, PARAM_SPEC_TOTAL_OFFSET, u32::try_from(total_param_count).map_err(|_| CodegenError::OffsetTooLarge { offset: total_param_count })?);
-    put_u32(&mut bytes, PARAM_SPEC_POSONLY_OFFSET, 0);
-    put_u32(&mut bytes, PARAM_SPEC_POS_OFFSET, u32::try_from(positional_count).map_err(|_| CodegenError::OffsetTooLarge { offset: positional_count })?);
-    put_u32(&mut bytes, PARAM_SPEC_KWONLY_OFFSET, u32::try_from(keyword_only_count).map_err(|_| CodegenError::OffsetTooLarge { offset: keyword_only_count })?);
-    put_u32(&mut bytes, PARAM_SPEC_VARARGS_OFFSET, 0);
-    put_u32(&mut bytes, PARAM_SPEC_VARKW_OFFSET, 0);
+    put_u32(&mut bytes, PARAM_SPEC_POSONLY_OFFSET, u32::try_from(params.positional_only_count).map_err(|_| CodegenError::OffsetTooLarge { offset: params.positional_only_count })?);
+    put_u32(&mut bytes, PARAM_SPEC_POS_OFFSET, u32::try_from(params.positional_count).map_err(|_| CodegenError::OffsetTooLarge { offset: params.positional_count })?);
+    put_u32(&mut bytes, PARAM_SPEC_KWONLY_OFFSET, u32::try_from(params.keyword_only_count).map_err(|_| CodegenError::OffsetTooLarge { offset: params.keyword_only_count })?);
+    put_u32(&mut bytes, PARAM_SPEC_VARARGS_OFFSET, params.vararg_name.as_deref().map_or(0, pon_runtime::intern::intern));
+    put_u32(&mut bytes, PARAM_SPEC_VARKW_OFFSET, params.kwarg_name.as_deref().map_or(0, pon_runtime::intern::intern));
     data.define(bytes.into_boxed_slice());
     if let Some(names_data) = names_data {
         let data_ref = module.declare_data_in_data(names_data, &mut data);

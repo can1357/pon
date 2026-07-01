@@ -255,8 +255,8 @@ pub fn compile_function<M: Module>(
         &mut fast.boxed,
         argv,
         ptr_bytes,
-        function.arity,
-        function.n_locals,
+        function.params.total_slot_count().max(function.arity),
+        function,
         ptr_ty,
     )?;
 
@@ -605,6 +605,23 @@ fn const_int_value(function: &Function, value: IrValue) -> Option<i64> {
             _ => None,
         })
 }
+fn formal_local_slots(function: &Function) -> Vec<usize> {
+    if function.params.total_slot_count() == 0 {
+        return (0..function.arity.min(function.n_locals)).collect();
+    }
+    let positional = function.params.positional_arity();
+    let keyword_only_local = positional + usize::from(function.params.vararg_name.is_some());
+    let mut slots: Vec<usize> = (0..positional).collect();
+    slots.extend((0..function.params.keyword_only_count).map(|index| keyword_only_local + index));
+    if function.params.vararg_name.is_some() {
+        slots.push(positional);
+    }
+    if function.params.kwarg_name.is_some() {
+        slots.push(keyword_only_local + function.params.keyword_only_count);
+    }
+    slots
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lower_cold_copy<M: Module>(
     module: &mut M,
@@ -623,8 +640,10 @@ fn lower_cold_copy<M: Module>(
     let mut cold_state = LowerState::new(function.n_locals);
     cold_state.locals = fast_state.boxed.locals.clone();
     cold_state.local_defined = vec![false; function.n_locals];
-    for slot in 0..function.arity.min(function.n_locals) {
-        cold_state.local_defined[slot] = true;
+    for slot in formal_local_slots(function) {
+        if slot < cold_state.local_defined.len() {
+            cold_state.local_defined[slot] = true;
+        }
     }
 
     for block in &function.blocks {
@@ -638,6 +657,7 @@ fn lower_cold_copy<M: Module>(
                 builder,
                 helpers,
                 func_ids,
+                &[],
                 names,
                 &mut cold_state,
                 ptr_ty,
@@ -916,6 +936,7 @@ fn lower_baseline_inst<M: Module>(
         builder,
         helpers,
         func_ids,
+        &[],
         names,
         &mut state.boxed,
         ptr_ty,
@@ -1822,6 +1843,8 @@ def mix(seed):
             functions: vec![Function {
                 name: "reload_arg".to_owned(),
                 arity: 1,
+                is_coroutine: false,
+                params: Default::default(),
                 n_locals: 1,
                 blocks: vec![Block {
                     id: BlockId(0),
