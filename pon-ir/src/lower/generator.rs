@@ -27,15 +27,18 @@ pub(super) fn lower_yield_from_expr(
     scope.emit(InstKind::YieldFrom { iter })
 }
 
-/// Lowers `await EXPR` to the await helper instruction.  `pon_await` performs
-/// `__await__` lookup and iterator normalization at runtime.
+/// Lowers `await EXPR` to `__await__` normalization followed by the same
+/// delegation machinery used for `yield from`.  The delegation step records
+/// suspension values under the eager-yield fallback and returns the awaited
+/// `StopIteration.value` as the expression result.
 pub(super) fn lower_await_expr(
     driver: &mut LoweringDriver,
     scope: &mut BodyScope,
     expr: &ruff_python_ast::ExprAwait,
 ) -> Result<Value, LowerError> {
     let awaitable = driver.lower_expr(scope, &expr.value)?;
-    scope.emit(InstKind::Await { awaitable })
+    let iter = scope.emit(InstKind::Await { awaitable })?;
+    scope.emit(InstKind::YieldFrom { iter })
 }
 
 #[allow(dead_code)]

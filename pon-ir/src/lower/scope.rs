@@ -538,11 +538,15 @@ fn scan_expr(expr: &Expr, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
                 scan_expr(elt, scope)?;
             }
         }
-        Expr::ListComp(expr) => scan_comprehension(&expr.elt, &expr.generators, scope)?,
-        Expr::SetComp(expr) => scan_comprehension(&expr.elt, &expr.generators, scope)?,
+        Expr::ListComp(expr) => {
+            scan_comprehension("<listcomp>", &expr.elt, &expr.generators, scope)?
+        }
+        Expr::SetComp(expr) => {
+            scan_comprehension("<setcomp>", &expr.elt, &expr.generators, scope)?
+        }
         Expr::DictComp(expr) => {
             let mut child = ScopeBuilder::new(ScopeKind::Comprehension, "<dictcomp>", false);
-            scan_generators(&expr.generators, &mut child)?;
+            scan_comprehension_generators(&expr.generators, scope, &mut child)?;
             scan_expr(&expr.key, &mut child)?;
             scan_expr(&expr.value, &mut child)?;
             scope.children.push(child);
@@ -550,7 +554,7 @@ fn scan_expr(expr: &Expr, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
         Expr::Generator(expr) => {
             let mut child = ScopeBuilder::new(ScopeKind::Comprehension, "<genexpr>", false);
             child.is_generator = true;
-            scan_generators(&expr.generators, &mut child)?;
+            scan_comprehension_generators(&expr.generators, scope, &mut child)?;
             scan_expr(&expr.elt, &mut child)?;
             scope.children.push(child);
         }
@@ -638,28 +642,44 @@ fn scan_expr(expr: &Expr, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
 }
 
 fn scan_comprehension(
+    name: &str,
     elt: &Expr,
     generators: &[Comprehension],
     scope: &mut ScopeBuilder,
 ) -> Result<(), LowerError> {
-    let mut child = ScopeBuilder::new(ScopeKind::Comprehension, "<listcomp>", false);
-    scan_generators(generators, &mut child)?;
+    let mut child = ScopeBuilder::new(ScopeKind::Comprehension, name, false);
+    scan_comprehension_generators(generators, scope, &mut child)?;
     scan_expr(elt, &mut child)?;
     scope.children.push(child);
     Ok(())
 }
 
-fn scan_generators(
+fn scan_comprehension_generators(
     generators: &[Comprehension],
-    scope: &mut ScopeBuilder,
+    enclosing: &mut ScopeBuilder,
+    child: &mut ScopeBuilder,
 ) -> Result<(), LowerError> {
-    for generator in generators {
-        scan_expr(&generator.iter, scope)?;
-        bind_target(&generator.target, scope)?;
+    let Some((first, rest)) = generators.split_first() else {
+        return Err(LowerError::internal("comprehension without generator clause"));
+    };
+
+    child.params.push(".0".to_owned());
+    child.bind(".0");
+
+    scan_expr(&first.iter, enclosing)?;
+    bind_target(&first.target, child)?;
+    for if_expr in &first.ifs {
+        scan_expr(if_expr, child)?;
+    }
+    child.is_async |= first.is_async;
+
+    for generator in rest {
+        scan_expr(&generator.iter, child)?;
+        bind_target(&generator.target, child)?;
         for if_expr in &generator.ifs {
-            scan_expr(if_expr, scope)?;
+            scan_expr(if_expr, child)?;
         }
-        scope.is_async |= generator.is_async;
+        child.is_async |= generator.is_async;
     }
     Ok(())
 }

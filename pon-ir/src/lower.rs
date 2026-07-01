@@ -16,8 +16,8 @@ use ruff_python_ast::visitor::{self, Visitor};
 
 use crate::desugar::desugar_module;
 use crate::ir::{
-    Block, BlockId, CellId, Function, FunctionId, Inst, InstKind, LocalId, Module, NameId, PyConst,
-    Terminator, Value,
+    Block, BlockId, CellId, Function, FunctionId, Inst, InstKind, LocalId, Module, NameId,
+    ParamLayout, PyConst, Terminator, Value,
 };
 use crate::parse::parse_module_source;
 
@@ -239,7 +239,7 @@ impl NameTable {
 /// families to small routing modules.  Implemented Phase-A semantics remain in
 /// the `assign` and `func` families; unimplemented Phase-B families return
 /// `LowerError::Unsupported { feature, span }` from their route point.
-struct LoweringDriver {
+pub(crate) struct LoweringDriver {
     functions: Vec<Function>,
     names: NameTable,
 }
@@ -277,6 +277,8 @@ impl LoweringDriver {
         self.functions.push(Function {
             name: name.to_owned(),
             arity: 0,
+            is_coroutine: false,
+            params: ParamLayout::default(),
             blocks: vec![Block {
                 id: BlockId(0),
                 insts: Vec::new(),
@@ -348,7 +350,7 @@ impl LoweringDriver {
             Stmt::Assign(assign) => assign::lower_assign(self, scope, assign),
             Stmt::ClassDef(def) => class::lower_class_def(self, scope, def),
             Stmt::For(stmt) => self.lower_for_stmt(scope, stmt, loop_targets),
-            Stmt::While(stmt) => control::lower_while(stmt),
+            Stmt::While(stmt) => self.lower_while_stmt(scope, stmt, loop_targets),
             Stmt::If(stmt) => self.lower_if_stmt(scope, stmt, loop_targets),
             Stmt::Break(stmt) => control::lower_break_with_targets(scope, stmt, loop_targets),
             Stmt::Continue(stmt) => control::lower_continue_with_targets(scope, stmt, loop_targets),
@@ -359,7 +361,7 @@ impl LoweringDriver {
             Stmt::ImportFrom(stmt) => import::lower_import_from_stmt(self, scope, stmt),
             Stmt::Delete(stmt) => assign::lower_delete(stmt),
             Stmt::AugAssign(stmt) => assign::lower_aug_assign_with_driver(self, scope, stmt),
-            Stmt::AnnAssign(stmt) => assign::lower_ann_assign(stmt),
+            Stmt::AnnAssign(stmt) => assign::lower_ann_assign(self, scope, stmt),
             Stmt::TypeAlias(stmt) => assign::lower_type_alias(stmt),
             Stmt::Raise(stmt) => try_::lower_raise(self, scope, stmt),
             Stmt::Assert(stmt) => control::lower_assert(stmt),
@@ -444,14 +446,13 @@ impl LoweringDriver {
         stmt: &ruff_python_ast::StmtFor,
         _loop_targets: Option<control::LoopTargets>,
     ) -> Result<(), LowerError> {
-        if !stmt.orelse.is_empty() {
-            return unsupported_at(
-                "for-else statement",
-                span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()),
-            );
-        }
         let header_block = scope.alloc_block()?;
         let body_block = scope.alloc_block()?;
+        let else_block = if stmt.orelse.is_empty() {
+            None
+        } else {
+            Some(scope.alloc_block()?)
+        };
         let done_block = scope.alloc_block()?;
         let iterable = self.lower_expr(scope, &stmt.iter)?;
         let iter = scope.emit(InstKind::GetIter { iterable })?;
@@ -462,7 +463,7 @@ impl LoweringDriver {
         scope.set_term(Terminator::ForLoop {
             iter,
             body: body_block,
-            done: done_block,
+            done: else_block.unwrap_or(done_block),
         })?;
 
         scope.switch_to(body_block)?;
@@ -473,6 +474,55 @@ impl LoweringDriver {
         };
         self.lower_stmt_list(scope, &stmt.body, Some(nested_targets))?;
         scope.jump_if_open(header_block)?;
+
+        if let Some(else_block) = else_block {
+            scope.switch_to(else_block)?;
+            self.lower_stmt_list(scope, &stmt.orelse, _loop_targets)?;
+            scope.jump_if_open(done_block)?;
+        }
+
+        scope.switch_to(done_block)?;
+        Ok(())
+    }
+
+    fn lower_while_stmt(
+        &mut self,
+        scope: &mut BodyScope,
+        stmt: &ruff_python_ast::StmtWhile,
+        _loop_targets: Option<control::LoopTargets>,
+    ) -> Result<(), LowerError> {
+        let header_block = scope.alloc_block()?;
+        let body_block = scope.alloc_block()?;
+        let else_block = if stmt.orelse.is_empty() {
+            None
+        } else {
+            Some(scope.alloc_block()?)
+        };
+        let done_block = scope.alloc_block()?;
+        scope.set_term(Terminator::Jump(header_block))?;
+
+        scope.switch_to(header_block)?;
+        control::lower_while_header_with_driver(
+            self,
+            scope,
+            stmt,
+            body_block,
+            else_block.unwrap_or(done_block),
+        )?;
+
+        scope.switch_to(body_block)?;
+        let nested_targets = control::LoopTargets {
+            break_block: done_block,
+            continue_block: header_block,
+        };
+        self.lower_stmt_list(scope, &stmt.body, Some(nested_targets))?;
+        scope.jump_if_open(header_block)?;
+
+        if let Some(else_block) = else_block {
+            scope.switch_to(else_block)?;
+            self.lower_stmt_list(scope, &stmt.orelse, _loop_targets)?;
+            scope.jump_if_open(done_block)?;
+        }
 
         scope.switch_to(done_block)?;
         Ok(())
@@ -533,7 +583,7 @@ impl LoweringDriver {
             Expr::ListComp(list_comp) => comprehension::lower_list_comp_inline(self, scope, list_comp),
             Expr::SetComp(set_comp) => comprehension::lower_set_comp_inline(self, scope, set_comp),
             Expr::DictComp(dict_comp) => comprehension::lower_dict_comp_inline(self, scope, dict_comp),
-            Expr::Generator(generator) => comprehension::lower_generator_expr(generator),
+            Expr::Generator(generator) => comprehension::lower_generator_expr(self, scope, generator),
             Expr::Yield(yield_expr) => generator::lower_yield_expr(self, scope, yield_expr),
             Expr::YieldFrom(yield_from) => generator::lower_yield_from_expr(self, scope, yield_from),
             Expr::Await(await_expr) => generator::lower_await_expr(self, scope, await_expr),
@@ -729,6 +779,83 @@ impl LoweringDriver {
         }
     }
 
+    fn lower_sequence_store_target(
+        &mut self,
+        scope: &mut BodyScope,
+        target: &Expr,
+        elts: &[Expr],
+        value: Value,
+    ) -> Result<(), LowerError> {
+        let mut starred_index = None;
+        for (index, elt) in elts.iter().enumerate() {
+            if matches!(elt, Expr::Starred(_)) {
+                if starred_index.replace(index).is_some() {
+                    return unsupported_expr("multiple starred assignment targets", target);
+                }
+            }
+        }
+
+        if let Some(starred_index) = starred_index {
+            let before = starred_index;
+            let after = elts.len() - starred_index - 1;
+            scope.emit(InstKind::UnpackEx { val: value, before, after })?;
+            for (index, elt) in elts[..before].iter().enumerate() {
+                let item = self.lower_sequence_item(scope, value, index as i64)?;
+                self.lower_store_target(scope, elt, item)?;
+            }
+            if let Expr::Starred(starred) = &elts[starred_index] {
+                let rest = self.lower_sequence_rest(scope, value, before as i64, after as i64)?;
+                self.lower_store_target(scope, &starred.value, rest)?;
+            }
+            for (offset, elt) in elts[starred_index + 1..].iter().enumerate() {
+                let index = -((after - offset) as i64);
+                let item = self.lower_sequence_item(scope, value, index)?;
+                self.lower_store_target(scope, elt, item)?;
+            }
+        } else {
+            scope.emit(InstKind::UnpackSeq {
+                val: value,
+                n: elts.len(),
+            })?;
+            for (index, elt) in elts.iter().enumerate() {
+                let item = self.lower_sequence_item(scope, value, index as i64)?;
+                self.lower_store_target(scope, elt, item)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn lower_sequence_item(
+        &mut self,
+        scope: &mut BodyScope,
+        value: Value,
+        index: i64,
+    ) -> Result<Value, LowerError> {
+        let index = scope.emit(InstKind::Const(PyConst::Int(index)))?;
+        scope.emit(InstKind::SubscriptGet { obj: value, index })
+    }
+
+    fn lower_sequence_rest(
+        &mut self,
+        scope: &mut BodyScope,
+        value: Value,
+        before: i64,
+        after: i64,
+    ) -> Result<Value, LowerError> {
+        let lower = scope.emit(InstKind::Const(PyConst::Int(before)))?;
+        let upper = if after == 0 {
+            scope.emit(InstKind::Const(PyConst::None))?
+        } else {
+            scope.emit(InstKind::Const(PyConst::Int(-after)))?
+        };
+        let step = scope.emit(InstKind::Const(PyConst::None))?;
+        let slice = scope.emit(InstKind::BuildSlice { lower, upper, step })?;
+        let values = scope.emit(InstKind::SubscriptGet { obj: value, index: slice })?;
+        let list = scope.emit(InstKind::BuildList { elts: Vec::new() })?;
+        scope.emit(InstKind::ListExtend { list, iter: values })?;
+        Ok(list)
+    }
+
     fn lower_store_target(
         &mut self,
         scope: &mut BodyScope,
@@ -775,13 +902,14 @@ impl LoweringDriver {
                 scope.emit(InstKind::SubscriptSet { obj, index, val: value })?;
                 Ok(())
             }
-            Expr::List(_) | Expr::Tuple(_) => unsupported_expr("sequence unpack assignment target", target),
+            Expr::List(list) => self.lower_sequence_store_target(scope, target, &list.elts, value),
+            Expr::Tuple(tuple) => self.lower_sequence_store_target(scope, target, &tuple.elts, value),
             _ => unsupported_expr("assignment target", target),
         }
     }
 }
 
-struct BodyScope {
+pub(crate) struct BodyScope {
     info: ScopeInfo,
     child_used: Vec<bool>,
     blocks: Vec<Block>,
@@ -790,6 +918,8 @@ struct BodyScope {
     next_value: u32,
     term: Option<Terminator>,
     next_block: u32,
+    temp_locals: usize,
+    reraise_exc: Option<LocalId>,
 }
 
 impl BodyScope {
@@ -805,6 +935,8 @@ impl BodyScope {
             next_value: 0,
             term: None,
             next_block: 1,
+            temp_locals: 0,
+            reraise_exc: None,
         };
         scope.emit_cell_prologue();
         scope
@@ -834,6 +966,12 @@ impl BodyScope {
         self.info.symbol(name).map(|symbol| &symbol.class)
     }
 
+    fn alloc_temp_local(&mut self) -> LocalId {
+        let slot = self.info.locals.len() + self.temp_locals;
+        self.temp_locals += 1;
+        LocalId(slot as u32)
+    }
+
     fn emit_cell_prologue(&mut self) {
         for index in 0..self.info.cell_vars.len() {
             let name = &self.info.cell_vars[index];
@@ -841,6 +979,25 @@ impl BodyScope {
                 Some(NameClass::Cell { local_slot, .. }) => *local_slot,
                 _ => continue,
             };
+            let is_parameter = self
+                .info
+                .symbol(name)
+                .is_some_and(|symbol| symbol.is_parameter);
+            if !is_parameter {
+                let none = Value(self.next_value);
+                self.next_value = self
+                    .next_value
+                    .checked_add(1)
+                    .expect("too many SSA values for u32 ids");
+                self.insts.push(Inst::new(none, InstKind::Const(PyConst::None)));
+                let store = Value(self.next_value);
+                self.next_value = self
+                    .next_value
+                    .checked_add(1)
+                    .expect("too many SSA values for u32 ids");
+                self.insts
+                    .push(Inst::new(store, InstKind::StoreLocal(LocalId(local_slot), none)));
+            }
             let result = Value(self.next_value);
             self.next_value = self
                 .next_value
@@ -979,7 +1136,14 @@ impl BodyScope {
     fn finish(mut self) -> Result<Function, LowerError> {
         if self.term.is_none() {
             let none = self.emit(InstKind::Const(PyConst::None))?;
-            self.term = Some(Terminator::Return(none));
+            let result = if self.info.is_async {
+                self.emit(InstKind::EagerGeneratorReturn { value: none })?
+            } else if self.info.is_generator {
+                self.emit(InstKind::GetIter { iterable: none })?
+            } else {
+                none
+            };
+            self.term = Some(Terminator::Return(result));
         }
 
         let term = self
@@ -991,19 +1155,52 @@ impl BodyScope {
             insts: self.insts,
             term,
         });
+        let params = param_layout(&self.info);
         Ok(Function {
             name: self.info.name,
             arity: self.info.parameters.arity(),
+            is_coroutine: self.info.is_async,
+            params,
             blocks: self.blocks,
-            n_locals: self.info.locals.len(),
+            n_locals: self.info.locals.len() + self.temp_locals,
         })
     }
 }
 
-fn validate_function_header(def: &StmtFunctionDef) -> Result<(), LowerError> {
-    if def.is_async {
-        return unsupported_at("async function definition", span_function(def));
+fn param_layout(info: &ScopeInfo) -> ParamLayout {
+    let positional = info.parameters.arity();
+    let has_vararg = info.parameters.has_vararg;
+    let keyword_only = info.parameters.keyword_only;
+    let has_kwarg = info.parameters.has_kwarg;
+
+    let mut names = Vec::with_capacity(positional + keyword_only);
+    for local in info.locals.iter().take(positional) {
+        names.push(local.name.clone());
     }
+    let keyword_start = positional + usize::from(has_vararg);
+    for local in info.locals.iter().skip(keyword_start).take(keyword_only) {
+        names.push(local.name.clone());
+    }
+
+    ParamLayout {
+        names,
+        positional_only_count: info.parameters.positional_only,
+        positional_count: positional.saturating_sub(info.parameters.positional_only),
+        keyword_only_count: keyword_only,
+        vararg_name: has_vararg
+            .then(|| info.locals.get(positional).map(|local| local.name.clone()))
+            .flatten(),
+        kwarg_name: has_kwarg
+            .then(|| {
+                info.locals
+                    .get(positional + usize::from(has_vararg) + keyword_only)
+                    .map(|local| local.name.clone())
+            })
+            .flatten(),
+    }
+}
+
+fn validate_function_header(def: &StmtFunctionDef) -> Result<(), LowerError> {
     if !def.decorator_list.is_empty() {
         return unsupported_at("function decorator", span_function(def));
     }
@@ -1097,6 +1294,7 @@ fn span_expr(expr: &Expr) -> SourceSpan {
 
 mod assign;
 mod func;
+pub(crate) mod synth;
 mod control;
 mod class;
 mod strings;
@@ -1283,22 +1481,142 @@ def outer(x):
     }
 
     #[test]
-    fn rejects_async_function_def_with_useful_error() {
-        let err = lower_source(
+    fn lowers_nested_filtered_list_comprehension_shape() {
+        let module = lower_source(
+            r#"
+result = [(i, j) for i in range(3) if i for j in range(i) if j]
+"#,
+        )
+        .expect("nested filtered list comprehension should lower");
+
+        let listcomp = module
+            .functions
+            .iter()
+            .find(|function| function.name == "<listcomp>")
+            .expect("list comprehension should synthesize a child function");
+        assert_eq!(listcomp.arity, 1);
+        assert!(listcomp
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .any(|inst| matches!(inst.kind, InstKind::BuildList { .. })));
+        assert!(listcomp
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .any(|inst| matches!(inst.kind, InstKind::ListAppend { .. })));
+        assert_eq!(
+            listcomp
+                .blocks
+                .iter()
+                .filter(|block| matches!(block.term, Terminator::ForLoop { .. }))
+                .count(),
+            2,
+            "two generator clauses should lower to two iterator loops"
+        );
+        assert_eq!(
+            listcomp
+                .blocks
+                .iter()
+                .filter(|block| matches!(block.term, Terminator::CondBranch { .. }))
+                .count(),
+            2,
+            "two filters should lower to two guard branches"
+        );
+    }
+
+    #[test]
+    fn lowers_generator_expression_as_generator_function() {
+        let module = lower_source(
+            r#"
+g = (i for i in range(3))
+"#,
+        )
+        .expect("generator expression should lower");
+
+        let main = &module.functions[module.main.0 as usize];
+        assert!(main.blocks[0].insts.iter().any(|inst| match inst.kind {
+            InstKind::MakeFunctionFull { code, .. } => module.functions[code.0 as usize].name == "<genexpr>",
+            InstKind::MakeFunction { func_index, .. } => module.functions[func_index as usize].name == "<genexpr>",
+            _ => false,
+        }));
+        assert!(main.blocks[0]
+            .insts
+            .iter()
+            .any(|inst| matches!(inst.kind, InstKind::Call { ref args, .. } if args.len() == 1)));
+
+        let genexpr = module
+            .functions
+            .iter()
+            .find(|function| function.name == "<genexpr>")
+            .expect("generator expression should synthesize a child function");
+        assert_eq!(genexpr.arity, 1);
+        assert!(genexpr
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .any(|inst| matches!(inst.kind, InstKind::Yield { .. })));
+    }
+
+    #[test]
+    fn comprehension_target_does_not_clobber_enclosing_local() {
+        let module = lower_source(
+            r#"
+def f():
+    x = 5
+    y = [x for x in range(3)]
+    return x
+"#,
+        )
+        .expect("target-name isolation fixture should lower");
+
+        let outer = module
+            .functions
+            .iter()
+            .find(|function| function.name == "f")
+            .expect("outer function should lower");
+        let Terminator::Return(ret) = outer.blocks[0].term else {
+            panic!("outer function should return directly");
+        };
+        assert_eq!(
+            outer.blocks[0].insts[ret.0 as usize].kind,
+            InstKind::LoadLocal(LocalId(0)),
+            "outer return should reload the enclosing x local"
+        );
+
+        let listcomp = module
+            .functions
+            .iter()
+            .find(|function| function.name == "<listcomp>")
+            .expect("list comprehension should lower");
+        assert!(listcomp
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .any(|inst| matches!(inst.kind, InstKind::StoreLocal(LocalId(1), _))));
+    }
+
+    #[test]
+    fn lowers_async_function_def_as_coroutine() {
+        let module = lower_source(
             r#"
 async def f():
     return 1
 "#,
         )
-        .expect_err("async function definitions are outside the executable lowerer slice");
+        .expect("async functions should lower into coroutine-producing functions");
 
-        assert!(matches!(
-            err,
-            LowerError::Unsupported {
-                ref feature,
-                span: Some(_)
-            } if feature == "async function definition"
-        ));
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name == "f")
+            .expect("async function body should be present");
+        assert!(function.is_coroutine);
+        assert!(function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .any(|inst| matches!(inst.kind, InstKind::EagerGeneratorReturn { .. })));
     }
 
     #[test]

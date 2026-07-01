@@ -6,51 +6,31 @@ pub(super) fn lower_function_def_stmt(
     scope: &mut BodyScope,
     def: &StmtFunctionDef,
 ) -> Result<(), LowerError> {
-    if def.is_async {
-        return unsupported_at("async function definition", span_function(def));
-    }
     if def.type_params.is_some() {
         return unsupported_at("function type parameter", span_function(def));
-    }
-    reject_parameter_annotations(&def.parameters)?;
-    if def.returns.is_some() {
-        return unsupported_at("function return annotation", span_function(def));
     }
 
     let name = def.name.as_str();
     let function_info = scope.next_child_scope(ScopeKind::Function, name)?;
-    let closure = closure_cells(scope, &function_info)?;
-    let eagerly_needs_name_id =
-        !function_shape_requires_full(&def.parameters, &function_info, &closure)
-            || binding_needs_name_id(scope, name);
-    let mut name_interned = if eagerly_needs_name_id {
+    let name_interned = if binding_needs_name_id(scope, name) {
         Some(driver.names.intern(name)?)
     } else {
         None
     };
-    let function = lower_function_body(driver, &function_info, &def.body)?;
-
-    let defaults = lower_positional_defaults(driver, scope, &def.parameters)?;
-    let kwdefaults = lower_keyword_defaults(driver, scope, &def.parameters)?;
-
-    let mut value =
-        if needs_full_function(&def.parameters, &function_info, &defaults, &kwdefaults, &closure) {
-            scope.emit(InstKind::MakeFunctionFull {
-                code: function,
-                defaults,
-                kwdefaults,
-                closure,
-                annotations: Vec::new(),
-            })?
-        } else {
-            let name_interned = ensure_name_id(driver, name, &mut name_interned)?;
-            let arity = positional_parameters(&def.parameters)?.len();
-            scope.emit(InstKind::MakeFunction {
-                func_index: function.0,
-                name_interned,
-                arity,
-            })?
-        };
+    let annotations = lower_function_annotations(driver, scope, &def.parameters, def.returns.as_deref())?;
+    let mut value = synth::synthesize_scope_function_with_annotations(
+        driver,
+        scope,
+        function_info,
+        &def.parameters,
+        annotations,
+        |driver, body| {
+            for stmt in &def.body {
+                driver.lower_stmt(body, stmt)?;
+            }
+            Ok(())
+        },
+    )?;
 
     for decorator in def.decorator_list.iter().rev() {
         let callee = driver.lower_expr(scope, &decorator.expression)?;
@@ -135,43 +115,68 @@ pub(super) fn lower_lambda(
     let parameters = lambda.parameters.as_deref().cloned().unwrap_or_default();
     reject_parameter_annotations(&parameters)?;
     let lambda_info = scope.next_child_scope(ScopeKind::Function, "<lambda>")?;
-    let mut body = BodyScope::new(&lambda_info);
-    let value = driver.lower_expr(&mut body, &lambda.body)?;
-    body.set_term(Terminator::Return(value))?;
-    let function = driver.append_function(body.finish()?)?;
-    let defaults = lower_positional_defaults(driver, scope, &parameters)?;
-    let kwdefaults = lower_keyword_defaults(driver, scope, &parameters)?;
-    let closure = closure_cells(scope, &lambda_info)?;
-    if !needs_full_function(&parameters, &lambda_info, &defaults, &kwdefaults, &closure) {
-        let name = driver.names.intern("<lambda>")?;
-        scope.emit(InstKind::MakeFunction {
-            func_index: function.0,
-            name_interned: name,
-            arity: positional_parameters(&parameters)?.len(),
-        })
-    } else {
-        scope.emit(InstKind::MakeFunctionFull {
-            code: function,
-            defaults,
-            kwdefaults,
-            closure,
-            annotations: Vec::new(),
-        })
-    }
+    synth::synthesize_scope_function(driver, scope, lambda_info, &parameters, |driver, body| {
+        let value = driver.lower_expr(body, &lambda.body)?;
+        body.set_term(Terminator::Return(value))
+    })
 }
 
-fn lower_function_body(
+
+fn lower_function_annotations(
     driver: &mut LoweringDriver,
-    info: &ScopeInfo,
-    body_stmts: &[Stmt],
-) -> Result<FunctionId, LowerError> {
-    let mut body = BodyScope::new(info);
-    for stmt in body_stmts {
-        driver.lower_stmt(&mut body, stmt)?;
+    scope: &mut BodyScope,
+    parameters: &Parameters,
+    returns: Option<&Expr>,
+) -> Result<Vec<(NameId, Value)>, LowerError> {
+    let mut annotations = Vec::new();
+    for parameter in parameters.posonlyargs.iter().chain(&parameters.args) {
+        push_parameter_with_default_annotation(driver, scope, &mut annotations, parameter)?;
     }
-    let function = body.finish()?;
-    driver.append_function(function)
+    if let Some(parameter) = parameters.vararg.as_deref() {
+        push_parameter_annotation(driver, scope, &mut annotations, parameter)?;
+    }
+    for parameter in &parameters.kwonlyargs {
+        push_parameter_with_default_annotation(driver, scope, &mut annotations, parameter)?;
+    }
+    if let Some(parameter) = parameters.kwarg.as_deref() {
+        push_parameter_annotation(driver, scope, &mut annotations, parameter)?;
+    }
+    if let Some(annotation) = returns {
+        let name = driver.names.intern("return")?;
+        let value = driver.lower_expr(scope, annotation)?;
+        annotations.push((name, value));
+    }
+    Ok(annotations)
 }
+
+fn push_parameter_with_default_annotation(
+    driver: &mut LoweringDriver,
+    scope: &mut BodyScope,
+    annotations: &mut Vec<(NameId, Value)>,
+    parameter: &ruff_python_ast::ParameterWithDefault,
+) -> Result<(), LowerError> {
+    if let Some(annotation) = parameter.annotation() {
+        let name = driver.names.intern(parameter.name().as_str())?;
+        let value = driver.lower_expr(scope, annotation)?;
+        annotations.push((name, value));
+    }
+    Ok(())
+}
+
+fn push_parameter_annotation(
+    driver: &mut LoweringDriver,
+    scope: &mut BodyScope,
+    annotations: &mut Vec<(NameId, Value)>,
+    parameter: &ruff_python_ast::Parameter,
+) -> Result<(), LowerError> {
+    if let Some(annotation) = parameter.annotation() {
+        let name = driver.names.intern(parameter.name().as_str())?;
+        let value = driver.lower_expr(scope, annotation)?;
+        annotations.push((name, value));
+    }
+    Ok(())
+}
+
 
 fn store_function_value(
     driver: &mut LoweringDriver,
@@ -206,33 +211,6 @@ fn store_function_value(
     Ok(())
 }
 
-fn lower_positional_defaults(
-    driver: &mut LoweringDriver,
-    scope: &mut BodyScope,
-    parameters: &Parameters,
-) -> Result<Vec<Value>, LowerError> {
-    let mut defaults = Vec::new();
-    for parameter in parameters.posonlyargs.iter().chain(&parameters.args) {
-        if let Some(default) = parameter.default() {
-            defaults.push(driver.lower_expr(scope, default)?);
-        }
-    }
-    Ok(defaults)
-}
-
-fn lower_keyword_defaults(
-    driver: &mut LoweringDriver,
-    scope: &mut BodyScope,
-    parameters: &Parameters,
-) -> Result<Vec<(NameId, Value)>, LowerError> {
-    let mut defaults = Vec::new();
-    for parameter in &parameters.kwonlyargs {
-        if let Some(default) = parameter.default() {
-            defaults.push((driver.names.intern(parameter.name().as_str())?, driver.lower_expr(scope, default)?));
-        }
-    }
-    Ok(defaults)
-}
 
 fn binding_needs_name_id(scope: &BodyScope, name: &str) -> bool {
     scope.is_global_name(name)
@@ -256,53 +234,6 @@ fn ensure_name_id(
     }
 }
 
-fn closure_cells(scope: &BodyScope, info: &ScopeInfo) -> Result<Vec<CellId>, LowerError> {
-    info.free_vars
-        .iter()
-        .map(|name| {
-            scope.closure_slot(name).ok_or_else(|| {
-                LowerError::internal(format!("closure metadata missing parent cell for {name}"))
-            })
-        })
-        .collect()
-}
-
-fn function_shape_requires_full(
-    parameters: &Parameters,
-    info: &ScopeInfo,
-    closure: &[CellId],
-) -> bool {
-    positional_parameters_have_defaults(parameters)
-        || parameters.vararg.is_some()
-        || parameters.kwarg.is_some()
-        || !parameters.kwonlyargs.is_empty()
-        || !closure.is_empty()
-        || !info.cell_vars.is_empty()
-}
-
-fn positional_parameters_have_defaults(parameters: &Parameters) -> bool {
-    parameters
-        .posonlyargs
-        .iter()
-        .chain(&parameters.args)
-        .any(|parameter| parameter.default().is_some())
-}
-
-fn needs_full_function(
-    parameters: &Parameters,
-    info: &ScopeInfo,
-    defaults: &[Value],
-    kwdefaults: &[(NameId, Value)],
-    closure: &[CellId],
-) -> bool {
-    !defaults.is_empty()
-        || !kwdefaults.is_empty()
-        || parameters.vararg.is_some()
-        || parameters.kwarg.is_some()
-        || !parameters.kwonlyargs.is_empty()
-        || !closure.is_empty()
-        || !info.cell_vars.is_empty()
-}
 
 fn reject_parameter_annotations(parameters: &Parameters) -> Result<(), LowerError> {
     for parameter in parameters.iter_non_variadic_params() {
@@ -329,16 +260,6 @@ fn reject_parameter_annotations(parameters: &Parameters) -> Result<(), LowerErro
     Ok(())
 }
 
-fn positional_parameters(parameters: &Parameters) -> Result<Vec<String>, LowerError> {
-    let mut params = Vec::with_capacity(parameters.posonlyargs.len() + parameters.args.len());
-    for parameter in parameters.posonlyargs.iter().chain(&parameters.args) {
-        if parameter.annotation().is_some() {
-            return Err(LowerError::unsupported("parameter annotation"));
-        }
-        params.push(parameter.name().as_str().to_owned());
-    }
-    Ok(params)
-}
 
 #[cfg(test)]
 mod tests {
