@@ -1,3 +1,14 @@
+//! Curated native stdlib modules (HANDOFF Track L) and their lookup registry.
+//!
+//! Adding a native module (frozen J0.4 contract — see
+//! `plans/pon-pin-J04-stdlib-registry.md`):
+//! 1. add ONE `mod <file>;` declaration below, keeping the list sorted;
+//! 2. insert ONE `("<python name>", <file>::make_module)` row into
+//!    [`NATIVE_MODULES`], keeping the table sorted by module name.
+//!
+//! Existing rows are never edited or reordered. Eager startup registration is
+//! frozen to [`EAGER_MODULES`]; everything else imports lazily on first use.
+
 pub mod builtins_mod;
 mod installed;
 
@@ -8,23 +19,43 @@ pub(crate) use crate::import::install_module;
 mod io;
 mod os;
 mod sys;
-mod time;
 mod thread;
+mod time;
 
+/// Sorted, insert-only lookup table of curated native modules: Python module
+/// name -> factory that allocates the module object and installs it into the
+/// import cache. Table order is irrelevant to behavior (names are unique);
+/// factories must be self-contained and never rely on another row having run.
+pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>)] = &[
+    ("_io", io::make_module),
+    ("_thread", thread::make_module),
+    ("builtins", builtins_mod::make_module),
+    ("os", os::make_module),
+    ("sys", sys::make_module),
+    ("time", time::make_module),
+];
+
+/// Modules registered eagerly by [`register_modules`] at runtime init, in
+/// registration order. Frozen to the WS-IMPORT six: new native modules are
+/// imported lazily; growing this set requires a J0.4 design-doc amendment.
+const EAGER_MODULES: &[&str] = &["builtins", "sys", "_io", "time", "os", "_thread"];
+
+/// Creates the named curated module, falling back to installed-package
+/// fixtures. `Ok(None)` means "not native": the importer then consults source
+/// roots (site-packages, then the vendored stdlib — HANDOFF J0.4 order).
 pub(crate) fn make_module(name: &str) -> Result<Option<*mut PyObject>, String> {
-    match name {
-        "builtins" => builtins_mod::make_module().map(Some),
-        "sys" => sys::make_module().map(Some),
-        "_io" => io::make_module().map(Some),
-        "time" => time::make_module().map(Some),
-        "os" => os::make_module().map(Some),
-        "_thread" => thread::make_module().map(Some),
-        _ => installed::make_module(name),
+    for &(module_name, factory) in NATIVE_MODULES {
+        if module_name == name {
+            return factory().map(Some);
+        }
     }
+    installed::make_module(name)
 }
 
+/// Installs the eager curated modules into the import cache once core runtime
+/// allocation is available.
 pub(crate) fn register_modules() -> Result<(), String> {
-    for name in ["builtins", "sys", "_io", "time", "os", "_thread"] {
+    for &name in EAGER_MODULES {
         let name_id = crate::intern::intern(name);
         if crate::import::cached_module(name_id).is_none() {
             let _ = make_module(name)?;

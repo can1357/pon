@@ -77,12 +77,23 @@ pub fn set_source_module_loader(loader: SourceModuleLoader) {
     state.source_loader = Some(loader);
 }
 
-/// Clears the import cache and source loader. Intended for focused tests.
+/// Resets import state to its post-`pon_runtime_init` baseline. Intended for focused tests.
+///
+/// Clears the module cache, source loader, and importer stack. When the runtime
+/// is already initialized this re-registers the curated native modules, because
+/// `pon_runtime_init` is idempotent and will not restore them on a later call;
+/// dropping them here would leave the process without `sys` for every
+/// subsequently scheduled test (e.g. `pon_sys_set_argv` callers).
 pub fn reset_import_state_for_tests() {
-    let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
-    state.modules.clear();
-    state.source_loader = None;
-    state.current_modules.clear();
+    {
+        let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        state.modules.clear();
+        state.source_loader = None;
+        state.current_modules.clear();
+    }
+    if crate::abi::runtime_is_initialized() {
+        register_native_modules().expect("re-registering native modules after import-state reset");
+    }
 }
 
 /// Installs the curated native modules into the import cache after core runtime
@@ -213,10 +224,6 @@ fn import_module_by_name(name: &str) -> Result<*mut PyObject, String> {
         }
     }
 
-    if is_unsupported_c_accelerated(name) {
-        return Err(format!("module '{name}' is C-accelerated and unsupported"));
-    }
-
     if let Some(parent) = parent_module_name(name) {
         import_module_by_name(parent)?;
     }
@@ -227,6 +234,10 @@ fn import_module_by_name(name: &str) -> Result<*mut PyObject, String> {
         drop(state);
         bind_child_to_parent(name, module);
         return Ok(module);
+    }
+
+    if is_unsupported_c_accelerated(name) {
+        return Err(format!("module '{name}' is C-accelerated and unsupported"));
     }
 
     if let Some(spec) = find_source_module(name) {
@@ -269,6 +280,10 @@ fn native_module(name: &str) -> Result<Option<*mut PyObject>, String> {
     crate::native::make_module(name)
 }
 
+/// Names refused with a precise diagnostic instead of a confusing source-import
+/// failure. Consulted AFTER the native registry, so landing a native module
+/// (one `NATIVE_MODULES` row) shadows its entry here; delete the stale entry in
+/// the same change.
 fn is_unsupported_c_accelerated(name: &str) -> bool {
     matches!(
         name,
@@ -315,6 +330,15 @@ fn find_source_module(name: &str) -> Option<SourceSpec> {
     })
 }
 
+/// Environment override for the vendored-stdlib search root (HANDOFF J0.4).
+/// When set it is authoritative: the value is used as the stdlib root if that
+/// directory exists, and the built-in locations are not consulted.
+pub const STDLIB_PATH_ENV_VAR: &str = "PON_STDLIB_PATH";
+
+/// Workspace-relative location of the vendored CPython `Lib/` tree (L0 lands
+/// the real vendoring; the directory currently holds a stub).
+const VENDORED_STDLIB_SUFFIX: &str = "pon-conformance/vendor/cpython-3.14/Lib";
+
 fn search_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut push_root = |root: PathBuf| {
@@ -326,7 +350,6 @@ fn search_roots() -> Vec<PathBuf> {
         push_root(cwd.clone());
         push_root(cwd.join(".pon").join("packages").join("site-packages"));
         push_root(cwd.join("pon-conformance").join("corpus"));
-        push_root(cwd.join("pon-conformance").join("vendor").join("cpython-3.14").join("Lib"));
     }
     for var in ["PONPATH", "PON_IMPORT_PATH"] {
         if let Ok(extra) = env::var(var) {
@@ -335,7 +358,36 @@ fn search_roots() -> Vec<PathBuf> {
             }
         }
     }
+    if let Some(stdlib) = vendored_stdlib_root() {
+        push_root(stdlib);
+    }
     roots
+}
+
+/// Resolves the vendored-stdlib root, always LAST in import resolution order
+/// (native curated -> installed packages -> source roots -> vendored stdlib).
+///
+/// `PON_STDLIB_PATH` is authoritative when set: a missing directory there
+/// disables the root rather than falling back. Otherwise the workspace vendor
+/// tree is located from this crate's compile-time manifest path, then relative
+/// to the current directory. An absent directory is silently skipped so
+/// deployments without the vendor tree keep working.
+fn vendored_stdlib_root() -> Option<PathBuf> {
+    if let Ok(value) = env::var(STDLIB_PATH_ENV_VAR) {
+        if value.is_empty() {
+            return None;
+        }
+        let root = PathBuf::from(value);
+        return root.is_dir().then_some(root);
+    }
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(workspace) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
+        candidates.push(workspace.join(VENDORED_STDLIB_SUFFIX));
+    }
+    if let Ok(cwd) = env::current_dir() {
+        candidates.push(cwd.join(VENDORED_STDLIB_SUFFIX));
+    }
+    candidates.into_iter().find(|root| root.is_dir())
 }
 
 fn load_curated_assignment_module(name: &str, source: &str, is_package: bool) -> Result<*mut PyObject, String> {
@@ -535,7 +587,7 @@ mod tests {
     use std::ptr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{pon_import_from, pon_import_name, reset_import_state_for_tests, resolve_import_name};
+    use super::{STDLIB_PATH_ENV_VAR, pon_import_from, pon_import_name, reset_import_state_for_tests, resolve_import_name};
     use crate::abi::{format_object_for_print, pon_runtime_init};
     use crate::intern::intern;
     use crate::thread_state::{pon_err_clear, pon_err_message, test_state_lock};
@@ -669,6 +721,71 @@ mod tests {
         );
         let answer = unsafe { pon_import_from(module, intern("answer")) };
         assert_eq!(format_object_for_print(answer).as_deref(), Ok("42"));
+    }
+
+    #[test]
+    fn vendored_stdlib_root_loads_module_by_default() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+        pon_err_clear();
+        reset_import_state_for_tests();
+
+        let module = unsafe { pon_import_name(intern("pon_tiny"), ptr::null(), 0, 0) };
+        assert!(
+            !module.is_null(),
+            "importing pon_tiny from the vendored stdlib root failed: {:?}",
+            pon_err_message()
+        );
+        let name = unsafe { pon_import_from(module, intern("name")) };
+        assert_eq!(format_object_for_print(name).as_deref(), Ok("tiny"));
+    }
+
+    #[test]
+    fn stdlib_path_env_var_overrides_vendored_root() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+        pon_err_clear();
+        reset_import_state_for_tests();
+
+        let root = TempImportRoot::new();
+        fs::write(root.path().join("pon_tiny.py"), "name = 'override'\n").unwrap();
+        let _env = EnvVarGuard::set(STDLIB_PATH_ENV_VAR, root.path());
+
+        let module = unsafe { pon_import_name(intern("pon_tiny"), ptr::null(), 0, 0) };
+        assert!(
+            !module.is_null(),
+            "importing pon_tiny via PON_STDLIB_PATH failed: {:?}",
+            pon_err_message()
+        );
+        let name = unsafe { pon_import_from(module, intern("name")) };
+        assert_eq!(format_object_for_print(name).as_deref(), Ok("override"));
+    }
+
+    #[test]
+    fn missing_stdlib_override_skips_vendored_root() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+        pon_err_clear();
+        reset_import_state_for_tests();
+
+        let missing = env::temp_dir().join(format!("pon-stdlib-missing-{}", process::id()));
+        let _env = EnvVarGuard::set(STDLIB_PATH_ENV_VAR, &missing);
+
+        let module = unsafe { pon_import_name(intern("pon_tiny"), ptr::null(), 0, 0) };
+        assert!(
+            module.is_null(),
+            "pon_tiny import should fail when PON_STDLIB_PATH points at a missing dir"
+        );
+        pon_err_clear();
     }
 }
 

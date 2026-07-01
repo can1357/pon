@@ -1313,6 +1313,11 @@ fn with_runtime<T>(f: impl FnOnce(&mut Runtime) -> T) -> Option<T> {
     runtime.as_mut().map(f)
 }
 
+/// Returns whether `pon_runtime_init` has completed in this process.
+pub(crate) fn runtime_is_initialized() -> bool {
+    runtime_lock().is_some()
+}
+
 fn init_runtime() -> Result<(), String> {
     let should_register_native = {
         let mut slot = runtime_lock();
