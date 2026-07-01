@@ -9,7 +9,7 @@ use core::cell::UnsafeCell;
 use core::ffi::{c_int, c_void};
 use core::mem::{offset_of, size_of};
 use core::ptr;
-use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, Ordering};
 
 use crate::intern;
 use crate::feedback::FeedbackVec;
@@ -476,9 +476,42 @@ pub struct PyType {
     pub gc_type_id: usize,
     /// Object-valued dunder definitions that drive slot refreshes.
     pub dunder_slots: PyDunderSlots,
+    /// J0.3 inline-cache version tag; see [`PyType::bump_version`].
+    ///
+    /// Monotonically increasing per-type counter consumed by attribute
+    /// inline caches: an `AttrIC` entry records `(type identity, version)` and
+    /// is valid only while both still match.  Every mutation of type state
+    /// that can change attribute-lookup results (type dict set/del, dunder
+    /// slot rewrite, bases/MRO change) MUST bump this tag.
+    ///
+    /// Layout contract (LOCKED for tier-1 raw loads): this field is LAST in
+    /// `PyType`, at byte offset `PY_TYPE_VERSION_TAG_OFFSET` on 64-bit
+    /// targets.  New fields must be added BEFORE it, updating the offset
+    /// constant, never after it.
+    ///
+    /// `0` is the invalid sentinel ([`PyType::VERSION_TAG_INVALID`]): inline
+    /// caches never record it and guards comparing against it never match.
+    /// Live tags start at [`PyType::VERSION_TAG_SEED`].
+    pub version_tag: AtomicU32,
 }
 
+/// Byte offset of [`PyType::version_tag`] on 64-bit targets.
+///
+/// Tier-1 codegen emits raw `u32` loads at `type_ptr + this` for inline-cache
+/// guards; the compile-time assertion below keeps the constant honest.
+pub const PY_TYPE_VERSION_TAG_OFFSET: usize = 336;
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(offset_of!(PyType, version_tag) == PY_TYPE_VERSION_TAG_OFFSET);
+
 impl PyType {
+    /// Invalid version-tag sentinel: inline caches never record it, and a
+    /// guard comparing a cached version against a type whose tag were somehow
+    /// `0` must treat the cache entry as a miss.
+    pub const VERSION_TAG_INVALID: u32 = 0;
+
+    /// First live version tag assigned to every freshly created type.
+    pub const VERSION_TAG_SEED: u32 = 1;
     /// Creates an immortal type descriptor with every protocol slot unsupported.
     #[must_use]
     pub const fn new(type_type: *const PyType, name: &'static str, instance_size: usize) -> Self {
@@ -515,6 +548,7 @@ impl PyType {
             tp_as_async: ptr::null_mut(),
             gc_type_id: 0,
             dunder_slots: PyDunderSlots::EMPTY,
+            version_tag: AtomicU32::new(Self::VERSION_TAG_SEED),
         }
     }
 
@@ -523,6 +557,51 @@ impl PyType {
     pub fn name(&self) -> &str {
         // SAFETY: Type objects are created only from `'static str` names.
         unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(self.name, self.name_len)) }
+    }
+
+    /// Returns the current inline-cache version tag.
+    ///
+    /// `Relaxed` is sufficient: the tag is a pure invalidation counter.  A
+    /// stale load can only make an IC guard pass with the version that was
+    /// current when the cached entry was recorded; the seqlock discipline on
+    /// [`crate::feedback::FeedbackCell`] plus the mutator-side critical
+    /// section (FT builds) bound how stale the observed translation can be.
+    #[inline]
+    #[must_use]
+    pub fn version(&self) -> u32 {
+        self.version_tag.load(Ordering::Relaxed)
+    }
+
+    /// Invalidates every inline cache guarding this type.
+    ///
+    /// Must be called by every mutation of type state that can change
+    /// attribute-lookup results: type dict set/del, dunder slot rewrite,
+    /// `__bases__`/MRO change (see the J0.3 mutation-site inventory in
+    /// `plans/pon-pin-J03-inline-caches.md`).  Callers mutating a type whose
+    /// subclasses exist must also bump every subclass transitively, because a
+    /// subclass IC guards only the receiver's own tag while lookups traverse
+    /// the MRO.
+    ///
+    /// `Relaxed` is sound: the bump does not publish the mutated type data
+    /// itself.  IC guards re-validate against the live tag on every use, and a
+    /// guard that races with the bump and passes observes at worst the
+    /// pre-mutation translation — equivalent to the guard having executed just
+    /// before the mutation.  Mutation atomicity (a reader never sees a
+    /// half-updated dict) is owned by the mutation path (GIL today, type
+    /// critical section in FT builds), not by this counter.  In FT builds the
+    /// richer `sync.rs` side-table epoch (`bump_type_version_epoch`) is bumped
+    /// alongside this tag by the same mutation paths; that epoch carries the
+    /// Acquire/AcqRel ordering for protocols that need publication.
+    ///
+    /// Wraparound: a `u32` overflows after 2^32 mutations of one type and
+    /// re-enters the live-tag range (skipping through `0`, at which point
+    /// recording pauses for one bump).  ABA reuse of a tag value against a
+    /// never-overwritten IC entry is accepted as out-of-contract for J0.3;
+    /// see the design doc's "version exhaustion" section for the latch-to-
+    /// invalid upgrade path if profiling ever shows a type crossing 2^32.
+    #[inline]
+    pub fn bump_version(&self) {
+        self.version_tag.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -876,6 +955,37 @@ mod tests {
             offset_of!(PyType, dunder_slots),
             offset_of!(PyType, gc_type_id) + size_of::<usize>()
         );
+    }
+
+    #[test]
+    fn py_type_version_tag_is_last_field_at_locked_offset() {
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(offset_of!(PyType, version_tag), PY_TYPE_VERSION_TAG_OFFSET);
+        assert_eq!(
+            offset_of!(PyType, version_tag),
+            offset_of!(PyType, dunder_slots) + size_of::<PyDunderSlots>()
+        );
+    }
+
+    #[test]
+    fn py_type_version_starts_at_nonzero_seed() {
+        let ty = PyType::new(ptr::null(), "dummy", 0);
+
+        assert_eq!(ty.version(), PyType::VERSION_TAG_SEED);
+        assert_ne!(ty.version(), PyType::VERSION_TAG_INVALID);
+    }
+
+    #[test]
+    fn py_type_bump_version_is_monotonic() {
+        let ty = PyType::new(ptr::null(), "dummy", 0);
+
+        let mut previous = ty.version();
+        for _ in 0..8 {
+            ty.bump_version();
+            let current = ty.version();
+            assert_eq!(current, previous + 1);
+            previous = current;
+        }
     }
 
     #[test]
