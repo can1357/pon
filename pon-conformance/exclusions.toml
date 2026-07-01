@@ -1,0 +1,57 @@
+# Exclusion ledger for `pon-conformance --suite cpython-full`.
+#
+# Contract: plans/pon-pin-J07-cpython-full-runner.md §7 (frozen).
+#
+# A unit matching an `[[exclude]]` entry is never executed; it is recorded in
+# the scoreboard as `excluded` with detail `excluded by <pattern> (<reason>)`.
+# Exclusion is for tests that are meaningless for pon as a product — NOT for
+# tests that merely fail today (those stay `fail` and drive the backlog).
+#
+# Governance (frozen):
+#   - Every entry requires orchestrator approval (`approved_by`); the four
+#     seed entries below were approved as part of the J0 architecture pin.
+#   - Hard cap: 40 entries (`MAX_EXCLUSION_ENTRIES`); over cap the runner
+#     refuses to load this file.
+#   - `reason` must be one of the closed taxonomy below; anything else is a
+#     load error:
+#       c-abi-boundary          the test exercises the CPython C ABI itself
+#                               (ctypes FFI, Python/C API), which pon does
+#                               not present.
+#       platform-inapplicable   the test targets a platform or build
+#                               configuration pon never ships.
+#       interpreter-internals   the test asserts CPython implementation
+#                               internals (bytecode listings, settrace opcode
+#                               events, frame layout) with no pon analogue.
+#   - In an unsharded, unfiltered run a `pattern` matching zero discovered
+#     units is a load error.
+#
+# Pattern rule (frozen): glob (`*` crosses `.`, `?` = one char) matched
+# against the unit's match key (dotted name minus leading `test.`, e.g.
+# `test_dis`, `test_ctypes.test_numbers`) OR its file stem (e.g.
+# `test_numbers`). Package suites therefore need a trailing `*` on the
+# package name so members match by key: `test_ctypes*` covers both the
+# legacy single file and every `test.test_ctypes.<member>` unit.
+
+[[exclude]]
+pattern     = "test_ctypes*"
+reason      = "c-abi-boundary"
+note        = "ctypes is a CPython C-ABI FFI surface; pon exposes no libffi-backed C ABI, so the whole package (test.test_ctypes.*) is out of product scope."
+approved_by = "J0-pin"
+
+[[exclude]]
+pattern     = "test_capi*"
+reason      = "c-abi-boundary"
+note        = "test.test_capi.* validates the Python/C API of the CPython interpreter binary itself (_testcapi extension); pon does not implement the C API."
+approved_by = "J0-pin"
+
+[[exclude]]
+pattern     = "test_dis"
+reason      = "interpreter-internals"
+note        = "asserts exact CPython bytecode disassembly listings; pon compiles through its own IR and has no CPython bytecode to disassemble."
+approved_by = "J0-pin"
+
+[[exclude]]
+pattern     = "test_sys_settrace"
+reason      = "interpreter-internals"
+note        = "asserts per-opcode/per-line settrace event sequences of the CPython eval loop; pon's compiled tiers have no equivalent opcode-event stream."
+approved_by = "J0-pin"

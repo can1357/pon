@@ -1,0 +1,47 @@
+# Divergence ledger for `pon-conformance --suite cpython-full`.
+#
+# Contract: plans/pon-pin-J07-cpython-full-runner.md §7 (frozen).
+#
+# A unit whose per-test outcome vector differs from the python3.14 oracle is
+# classified `semantics-divergent` (instead of `fail`) ONLY when it matches an
+# entry in this file AND every differing test id is covered by that entry
+# (empty `test_ids` covers the whole file). Everything else is `fail`.
+#
+# Governance (frozen):
+#   - Every entry requires orchestrator approval, recorded in `approved_by`.
+#     Agents must not self-approve an entry in the change that makes a test
+#     pass the gate.
+#   - Hard cap: 25 entries (`MAX_DIVERGENCE_ENTRIES`). The runner refuses to
+#     load this file over cap.
+#   - `reason` must be one of the closed taxonomy below; anything else is a
+#     load error:
+#       refcount-observability  CPython refcount side effects visible to the
+#                               test (immediate `__del__` on scope exit,
+#                               `sys.getrefcount` deltas) that a tracing GC
+#                               cannot reproduce.
+#       del-timing              finalizer ordering/timing differences under
+#                               tracing GC.
+#       weakref-timing          weakref clear/callback timing differences
+#                               under tracing GC.
+#   - `cpython` must state the observed CPython behavior; `pon` must state
+#     pon's behavior and why the tracing-GC / product boundary forces it.
+#   - In an unsharded, unfiltered run a `pattern` matching zero discovered
+#     units is a load error (stale entries are removed, not kept).
+#
+# Pattern rule (frozen): glob (`*` crosses `.`, `?` = one char) matched
+# against the unit's match key (dotted name minus leading `test.`, e.g.
+# `test_gc`, `test_json.test_decode`) OR its file stem (e.g. `test_decode`).
+#
+# Entry shape:
+#
+# [[divergence]]
+# pattern     = "test_gc*"
+# reason      = "refcount-observability"
+# cpython     = "collects cycles synchronously at gc.collect(); refcounted temporaries die at scope exit"
+# pon         = "tracing GC frees unreachable objects at collection points; __del__ runs later than scope exit"
+# test_ids    = ["test.test_gc.GCTests.test_collect"]   # optional; [] / omitted = whole file
+# approved_by = "orchestrator-YYYY-MM-DD"
+# note        = "optional free text"
+#
+# Zero entries at J0: the ledger starts empty by design. Entries are added
+# only from observed, orchestrator-approved divergences — never ahead of one.
