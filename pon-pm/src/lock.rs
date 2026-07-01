@@ -310,6 +310,36 @@ mod tests {
     }
 
     #[test]
+    fn from_records_lists_full_transitive_graph_deterministically() {
+        let records = vec![
+            PackageRecord {
+                name: "pkg-a".to_owned(),
+                version: "1.0.0".to_owned(),
+                kind: PackageKind::Pure,
+            },
+            PackageRecord {
+                name: "pkg-c".to_owned(),
+                version: "1.0.0".to_owned(),
+                kind: PackageKind::Pure,
+            },
+            PackageRecord {
+                name: "pkg-b".to_owned(),
+                version: "1.0.0".to_owned(),
+                kind: PackageKind::Pure,
+            },
+        ];
+        let first = LockFile::from_records(&records).to_string();
+        let second = LockFile::from_records(&records).to_string();
+
+        assert_eq!(first, second);
+        assert!(first.contains("name = \"pkg-a\""));
+        assert!(first.contains("name = \"pkg-b\""));
+        assert!(first.contains("name = \"pkg-c\""));
+        assert!(first.find("name = \"pkg-a\"") < first.find("name = \"pkg-b\""));
+        assert!(first.find("name = \"pkg-b\"") < first.find("name = \"pkg-c\""));
+    }
+
+    #[test]
     fn reads_written_lock_file() {
         let lock = LockFile::new(vec![
             LockedPackage::pure("idna", "3.10"),
