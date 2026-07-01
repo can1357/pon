@@ -1,0 +1,5 @@
+point = (2, 3, 2, 5)
+print(point[1])
+print(point.count(2), point.index(5))
+print(point + (8,))
+print(point[1:3])

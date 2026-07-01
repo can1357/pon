@@ -1,0 +1,10 @@
+items = [3, 1]
+items.append(2)
+items.extend([5, 4])
+print(items)
+print(items.index(5), items.count(1))
+items.sort()
+print(items)
+print(items.pop(), items)
+items.reverse()
+print(items)

@@ -1,0 +1,7 @@
+{
+  "cpython_tag": "v3.14.0",
+  "passing_modules": [
+    "pon-conformance/corpus/cpython/import_support.py"
+  ],
+  "min_pass_count": 1
+}
