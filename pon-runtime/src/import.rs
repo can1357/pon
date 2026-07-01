@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::{LazyLock, Mutex};
 
-use crate::abi::{pon_const_int, pon_const_str, pon_none, pon_store_global, return_minus_one_with_error, return_null_with_error};
+use crate::abi::{pon_const_int, pon_const_str, pon_none, pon_store_global, raise_import_error_text, return_minus_one_with_error, return_null_with_error};
 use crate::intern::{intern, resolve};
 use crate::object::{PyObject, PyObjectHeader, PyType, PyUnicode, as_object_ptr};
 use crate::thread_state::pon_err_occurred;
@@ -117,13 +117,13 @@ pub unsafe extern "C" fn pon_import_name(
     let importer_package = (level != 0).then(current_importer_package).flatten();
     let name = match resolve_import_name(&raw_name, level, importer_package.as_deref()) {
         Ok(name) => name,
-        Err(message) => return return_null_with_error(message),
+        Err(message) => return raise_import_error_text(&message),
     };
 
     let imported = import_module_by_name(&name);
     let module = match imported {
         Ok(module) => module,
-        Err(message) => return return_null_with_error(message),
+        Err(message) => return raise_import_error_text(&message),
     };
 
     if requested_fromlist.is_empty() {
@@ -162,7 +162,7 @@ pub unsafe extern "C" fn pon_import_from(module: *mut PyObject, name_interned: u
             return child;
         }
     }
-    return_null_with_error(format!("cannot import name '{attr}' from '{module_name}'"))
+    raise_import_error_text(&format!("cannot import name '{attr}' from '{module_name}'"))
 }
 
 /// Imports all public module attributes into the active globals dictionary.
@@ -317,13 +317,23 @@ fn find_source_module(name: &str) -> Option<SourceSpec> {
 
 fn search_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
+    let mut push_root = |root: PathBuf| {
+        if !roots.contains(&root) {
+            roots.push(root);
+        }
+    };
     if let Ok(cwd) = env::current_dir() {
-        roots.push(cwd.clone());
-        roots.push(cwd.join("pon-conformance").join("corpus"));
-        roots.push(cwd.join("pon-conformance").join("vendor").join("cpython-3.14").join("Lib"));
+        push_root(cwd.clone());
+        push_root(cwd.join(".pon").join("packages").join("site-packages"));
+        push_root(cwd.join("pon-conformance").join("corpus"));
+        push_root(cwd.join("pon-conformance").join("vendor").join("cpython-3.14").join("Lib"));
     }
-    if let Ok(extra) = env::var("PONPATH") {
-        roots.extend(env::split_paths(&extra));
+    for var in ["PONPATH", "PON_IMPORT_PATH"] {
+        if let Ok(extra) = env::var(var) {
+            for root in env::split_paths(&extra) {
+                push_root(root);
+            }
+        }
     }
     roots
 }

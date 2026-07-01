@@ -46,6 +46,15 @@ pub fn run_file(path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
     let source = fs::read_to_string(path)
         .with_context(|| format!("failed to read UTF-8 source `{}`", path.display()))?;
+    let mut script_path_guard = EnvOverlay::new();
+    if let Some(script_dir) = path.parent() {
+        let mut roots = vec![script_dir.as_os_str().to_os_string()];
+        if let Some(existing) = env::var_os("PONPATH") {
+            roots.extend(env::split_paths(&existing).map(|path| path.into_os_string()));
+        }
+        let joined = env::join_paths(roots).context("failed to build import search path")?;
+        script_path_guard.set(OsString::from("PONPATH"), joined);
+    }
     let module = lower_source(&source).context("failed to parse/lower source")?;
     set_source_module_loader(load_source_module);
     let init_status = unsafe { pon_runtime_init() };

@@ -698,9 +698,12 @@ pub const TIER_STATE_TIER0: u8 = 0;
 pub const TIER_STATE_QUEUED: u8 = 1;
 /// Tier-up state value for functions whose dispatch cell targets tier-1 code.
 pub const TIER_STATE_TIER1: u8 = 2;
+/// Tier-up state value for functions whose first tier-up attempt was deferred
+/// until hotness proves compilation can be amortized.
+pub const TIER_STATE_DEFERRED: u8 = 3;
 /// Tier-up state value for functions that should remain on tier-0 after a
 /// failed or ineligible tier-1 attempt.
-pub const TIER_STATE_DISABLED: u8 = 3;
+pub const TIER_STATE_DISABLED: u8 = 4;
 
 /// Runtime-owned placeholder for a finalized tier-1 code handle.
 ///
@@ -733,8 +736,10 @@ pub struct PyFunction {
     pub hotness: AtomicU32,
     /// Loop back-edge hotness counter used by tier-up probes.
     pub loop_hotness: AtomicU32,
-    /// Tier state machine: 0=Tier0, 1=Queued, 2=Tier1, 3=Disabled.
+    /// Tier state machine: 0=Tier0, 1=Queued, 2=Tier1, 3=Deferred, 4=Disabled.
     pub tier_state: AtomicU8,
+    /// Function `__annotations__` dictionary, or NULL until first requested/installed.
+    pub annotations: *mut PyObject,
     /// Per-function feedback vector installed by profiling-aware lowering/JIT.
     pub feedback: UnsafeCell<Option<FeedbackVec>>,
     /// Opaque tier-1 code owner installed by the tier-up backend.
@@ -752,6 +757,7 @@ impl core::fmt::Debug for PyFunction {
             .field("hotness", &self.hotness.load(core::sync::atomic::Ordering::Relaxed))
             .field("loop_hotness", &self.loop_hotness.load(core::sync::atomic::Ordering::Relaxed))
             .field("tier_state", &self.tier_state.load(core::sync::atomic::Ordering::Relaxed))
+            .field("annotations", &self.annotations)
             .finish_non_exhaustive()
     }
 }
@@ -769,6 +775,7 @@ impl PyFunction {
             hotness: AtomicU32::new(0),
             loop_hotness: AtomicU32::new(0),
             tier_state: AtomicU8::new(TIER_STATE_TIER0),
+            annotations: ptr::null_mut(),
             feedback: UnsafeCell::new(None),
             tier1: UnsafeCell::new(None),
         }

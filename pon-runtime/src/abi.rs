@@ -12,7 +12,7 @@ pub mod exc;
 pub use exc::{
     pon_exc_fetch, pon_exc_group_split, pon_exc_matches, pon_exc_restore, pon_raise, pon_raise_attribute_error,
     pon_raise_index_error, pon_raise_key_error, pon_raise_stop_iteration, pon_raise_type_error, pon_raise_value_error,
-    pon_reraise,
+    pon_reraise, raise_import_error_text,
 };
 pub mod r#gen;
 pub mod import;
@@ -24,7 +24,7 @@ pub mod object;
 pub mod seq;
 pub mod str_;
 pub use iter::{pon_get_iter, pon_iter_next};
-pub use number::{pon_binary_op, pon_unary_op};
+pub use number::{pon_binary_op, pon_const_bool, pon_unary_op};
 pub use object::{pon_del_attr, pon_get_attr, pon_is_true, pon_rich_compare, pon_set_attr, pon_subscript_get};
 pub use crate::aot_entry::{pon_aot_entry, pon_err_report_uncaught, pon_threadstate_capture_stack_base};
 pub use crate::thread::{
@@ -57,11 +57,11 @@ use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set, thread_s
 const TYPE_ID_TYPE: TypeId = TypeId(1);
 
 /// Function-entry hotness threshold for the runtime-side tier-up probe.  The
-/// triggering call reloads the dispatch cell after this probe, so a value of one
-/// lets one-shot hot wrappers enter tier-1 without waiting for a second call.
-pub const TIER1_CALL_THRESHOLD: u32 = 1;
+/// triggering call reloads the dispatch cell after this probe; keep this high
+/// enough to amortize synchronous tier-1 compilation on short call-heavy kernels.
+pub const TIER1_CALL_THRESHOLD: u32 = 128;
 /// Loop back-edge hotness threshold for the runtime-side tier-up probe.
-pub const TIER1_LOOP_THRESHOLD: u32 = 10_000;
+pub const TIER1_LOOP_THRESHOLD: u32 = 900;
 
 /// Runtime-to-tier-up backend hook.  The concrete installer lives outside
 /// `pon-runtime`; the runtime calls through this pointer only after CAS-queuing.
@@ -69,8 +69,15 @@ pub type TierUpHook = unsafe extern "C" fn(*mut PyFunction);
 
 static TIERUP_HOOK: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 
+#[derive(Clone, Copy)]
+struct CurrentCall {
+    function: *mut PyFunction,
+    argv: *mut *mut PyObject,
+    argc: usize,
+}
+
 thread_local! {
-    static CURRENT_FUNCTION_STACK: RefCell<Vec<*mut PyFunction>> = RefCell::new(Vec::new());
+    static CURRENT_FUNCTION_STACK: RefCell<Vec<CurrentCall>> = RefCell::new(Vec::new());
 }
 const TYPE_ID_LONG: TypeId = TypeId(2);
 const TYPE_ID_UNICODE: TypeId = TypeId(3);
@@ -341,9 +348,16 @@ const PARAMS_MAKE_FUNCTION_FULL: &[AbiTy] = &[
     AbiTy::CodeInfoPtr,
     AbiTy::PyObjectPtrPtr,
     AbiTy::Usize,
+    AbiTy::ConstU32Ptr,
+    AbiTy::PyObjectPtrPtr,
+    AbiTy::Usize,
+    AbiTy::ConstU32Ptr,
     AbiTy::PyObjectPtrPtr,
     AbiTy::Usize,
 ];
+const PARAMS_FUNCTION_SET_CLOSURE: &[AbiTy] = &[AbiTy::PyObjectPtr, AbiTy::PyObjectPtrPtr, AbiTy::Usize];
+const PARAMS_CELL_SET: &[AbiTy] = &[AbiTy::PyObjectPtr, AbiTy::PyObjectPtr];
+const PARAMS_INDEX: &[AbiTy] = &[AbiTy::Usize];
 const PARAMS_IMPORT_NAME: &[AbiTy] = &[AbiTy::U32, AbiTy::ConstU32Ptr, AbiTy::Usize, AbiTy::U32];
 const PARAMS_MATCH_CLASS: &[AbiTy] = &[AbiTy::PyObjectPtr, AbiTy::PyObjectPtr, AbiTy::Usize, AbiTy::ConstU32Ptr, AbiTy::Usize];
 const PARAMS_MATCH_KEYS: &[AbiTy] = &[AbiTy::PyObjectPtr, AbiTy::PyObjectPtrPtr, AbiTy::Usize];
@@ -465,6 +479,12 @@ pub static HELPERS: &[HelperDecl] = &[
         ret: AbiTy::PyObjectPtr,
     },
     HelperDecl {
+        symbol: "pon_setup_annotations",
+        address: pon_setup_annotations as *const (),
+        params: PARAMS_NONE,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
         symbol: "pon_build_class",
         address: pon_build_class as *const (),
         params: PARAMS_BUILD_CLASS,
@@ -480,6 +500,42 @@ pub static HELPERS: &[HelperDecl] = &[
         symbol: "pon_make_function",
         address: pon_make_function as *const (),
         params: PARAMS_MAKE_FUNCTION,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_function_set_closure",
+        address: call::pon_function_set_closure as *const (),
+        params: PARAMS_FUNCTION_SET_CLOSURE,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_make_cell",
+        address: call::pon_make_cell as *const (),
+        params: PARAMS_OBJ,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_cell_get",
+        address: call::pon_cell_get as *const (),
+        params: PARAMS_OBJ,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_cell_set",
+        address: call::pon_cell_set as *const (),
+        params: PARAMS_CELL_SET,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_cell_delete",
+        address: call::pon_cell_delete as *const (),
+        params: PARAMS_OBJ,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_current_closure_cell",
+        address: call::pon_current_closure_cell as *const (),
+        params: PARAMS_INDEX,
         ret: AbiTy::PyObjectPtr,
     },
     HelperDecl {
@@ -1113,6 +1169,12 @@ pub static HELPERS: &[HelperDecl] = &[
         ret: AbiTy::PyObjectPtr,
     },
     HelperDecl {
+        symbol: "pon_eager_yield_generator",
+        address: r#gen::pon_eager_yield_generator as *const (),
+        params: PARAMS_OBJ,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
         symbol: "pon_yield_from",
         address: r#gen::pon_yield_from as *const (),
         params: PARAMS_OBJ_FEEDBACK,
@@ -1259,11 +1321,13 @@ fn init_runtime() -> Result<(), String> {
 
             let mut type_type = Box::new(PyType::new(ptr::null(), "type", mem::size_of::<PyType>()));
             type_type.tp_call = Some(type_::type_call);
+            type_type.tp_getattro = Some(crate::descr::generic_get_attr);
             let type_type = Box::into_raw(type_type);
             let long_type = Box::into_raw(Box::new(PyType::new(type_type, "int", mem::size_of::<PyLong>())));
             let unicode_type = Box::into_raw(Box::new(PyType::new(type_type, "str", mem::size_of::<PyUnicode>())));
             let mut function_type = Box::new(PyType::new(type_type, "function", mem::size_of::<PyFunction>()));
             function_type.tp_descr_get = Some(function::function_descr_get);
+            function_type.tp_getattro = Some(function::function_getattro);
             let function_type = Box::into_raw(function_type);
             let none_type = Box::into_raw(Box::new(PyType::new(type_type, "NoneType", mem::size_of::<PyNone>())));
             let exception_types = ExceptionTypeSet::new(type_type);
@@ -1665,11 +1729,49 @@ pub unsafe extern "C" fn pon_call(callee: *mut PyObject, argv: *mut *mut PyObjec
         };
 
         match target {
-            CallTarget::Function { function, code, arity } => unsafe { call_code_pointer(function, code, arity, argv, argc) },
+            CallTarget::Function { function, code, arity } => {
+                if function::function_record(callee).is_some() {
+                    let positional = match unsafe { object_arg_slice(argv, argc) } {
+                        Ok(values) => values,
+                        Err(message) => return return_null_with_error(message),
+                    };
+                    let keywords = function::KeywordArgs {
+                        names: &[],
+                        values: &[],
+                    };
+                    unsafe { call_phase_b_function(callee, positional, keywords, None, None) }
+                } else {
+                    unsafe { call_code_pointer(function, code, arity, argv, argc) }
+                }
+            }
             CallTarget::Type => unsafe { call_type_from_argv(callee, argv, argc) },
             CallTarget::Method => unsafe { call_method_from_argv(callee, argv, argc) },
         }
     })
+}
+
+unsafe fn object_arg_slice<'a>(argv: *mut *mut PyObject, argc: usize) -> Result<&'a [*mut PyObject], String> {
+    if argv.is_null() && argc != 0 {
+        return Err("argv pointer is null".to_owned());
+    }
+    Ok(if argc == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(argv.cast_const(), argc) }
+    })
+}
+
+pub(super) unsafe fn call_phase_b_function(
+    function_object: *mut PyObject,
+    positional: &[*mut PyObject],
+    keywords: function::KeywordArgs<'_>,
+    star: Option<*mut PyObject>,
+    dstar: Option<*mut PyObject>,
+) -> *mut PyObject {
+    match unsafe { function::call_bound_function(function_object, positional, keywords, star, dstar) } {
+        Ok(result) => result,
+        Err(message) => return_null_with_error(message),
+    }
 }
 
 unsafe fn call_code_pointer(
@@ -1686,16 +1788,26 @@ unsafe fn call_code_pointer(
         return return_null_with_error("function code pointer is null");
     }
 
+    unsafe { call_bound_code_pointer(function, code, argv, argc) }
+}
+
+unsafe fn call_bound_code_pointer(
+    function: *mut PyFunction,
+    code: *const u8,
+    argv: *mut *mut PyObject,
+    argc: usize,
+) -> *mut PyObject {
+    if code.is_null() {
+        return return_null_with_error("function code pointer is null");
+    }
+
     unsafe { pon_tierup_bump_call(function) };
-    // The tier-up hook runs synchronously from the hotness bump.  Reload the
-    // dispatch cell after the hook so the triggering call can enter tier-1
-    // immediately instead of waiting for a later call that may never happen.
     let code = unsafe { (*function).entry.load(Ordering::Acquire).cast_const() };
     if code.is_null() {
         return return_null_with_error("function code pointer is null");
     }
 
-    let _guard = CurrentFunctionGuard::push(function);
+    let _guard = CurrentFunctionGuard::push(function, argv, argc);
     pon_err_clear();
     let entry: PyCodeFn = unsafe { mem::transmute(code) };
     let result = unsafe { entry(argv, argc) };
@@ -1705,29 +1817,60 @@ unsafe fn call_code_pointer(
     result
 }
 
-struct CurrentFunctionGuard;
+pub(crate) struct CurrentFunctionGuard {
+    pushed: bool,
+}
 
 impl CurrentFunctionGuard {
-    fn push(function: *mut PyFunction) -> Self {
+    pub(crate) fn push(function: *mut PyFunction, argv: *mut *mut PyObject, argc: usize) -> Self {
         if !function.is_null() {
-            CURRENT_FUNCTION_STACK.with(|stack| stack.borrow_mut().push(function));
+            CURRENT_FUNCTION_STACK.with(|stack| stack.borrow_mut().push(CurrentCall { function, argv, argc }));
+            return Self { pushed: true };
         }
-        Self
+        Self { pushed: false }
     }
 }
 
 impl Drop for CurrentFunctionGuard {
     fn drop(&mut self) {
-        CURRENT_FUNCTION_STACK.with(|stack| {
-            let _ = stack.borrow_mut().pop();
-        });
+        if self.pushed {
+            CURRENT_FUNCTION_STACK.with(|stack| {
+                let _ = stack.borrow_mut().pop();
+            });
+        }
     }
 }
 
 fn current_function_for_tierup() -> *mut PyFunction {
     CURRENT_FUNCTION_STACK
-        .with(|stack| stack.borrow().last().copied())
+        .with(|stack| stack.borrow().last().map(|call| call.function))
         .unwrap_or(ptr::null_mut())
+}
+
+pub(crate) fn current_function_object() -> *mut PyObject {
+    current_function_for_tierup().cast::<PyObject>()
+}
+
+pub(crate) fn push_current_call(function: *mut PyFunction, argv: *mut *mut PyObject, argc: usize) -> CurrentFunctionGuard {
+    CurrentFunctionGuard::push(function, argv, argc)
+}
+
+
+pub(crate) fn current_call_snapshots() -> Vec<(*mut PyObject, *mut PyObject)> {
+    CURRENT_FUNCTION_STACK.with(|stack| {
+        stack
+            .borrow()
+            .iter()
+            .rev()
+            .filter_map(|call| {
+                if call.argv.is_null() || call.argc == 0 {
+                    return None;
+                }
+                let first_arg = unsafe { *call.argv };
+                (!first_arg.is_null()).then_some((call.function.cast::<PyObject>(), first_arg))
+            })
+            .collect()
+    })
 }
 
 #[inline]
@@ -1965,6 +2108,68 @@ pub unsafe extern "C" fn pon_build_class(
     })
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_setup_annotations() -> *mut PyObject {
+    catch_object_helper(|| {
+        if let Err(message) = ensure_runtime_initialized() {
+            return return_null_with_error(message);
+        }
+        let name = crate::intern::intern("__annotations__");
+        if let Some(existing) = with_runtime(|runtime| {
+            if let Some(namespace) = runtime.class_namespace_stack.last() {
+                unsafe { (&**namespace).get(name) }
+            } else {
+                runtime.globals.get(&name).copied()
+            }
+        })
+        .flatten()
+        {
+            return existing;
+        }
+        let annotations = unsafe { map::pon_build_map(ptr::null_mut(), 0) };
+        if annotations.is_null() {
+            return annotations;
+        }
+        match with_runtime(|runtime| {
+            if let Some(namespace) = runtime.class_namespace_stack.last().copied() {
+                unsafe {
+                    (&mut *namespace).set(name, annotations);
+                }
+                Ok(annotations)
+            } else {
+                runtime.globals.insert(name, annotations);
+                crate::import::store_active_module_attr(name, annotations);
+                ensure_module_annotate_function(runtime).map(|()| annotations)
+            }
+        }) {
+            Some(Ok(value)) => value,
+            Some(Err(message)) => return_null_with_error(message),
+            None => return_null_with_error("runtime is not initialized"),
+        }
+    })
+}
+
+fn ensure_module_annotate_function(runtime: &mut Runtime) -> Result<(), String> {
+    let name = crate::intern::intern("__annotate__");
+    if runtime.globals.contains_key(&name) {
+        return Ok(());
+    }
+    let function = alloc_function(runtime, module_annotations_annotate as *const u8, 1, name)?;
+    runtime.globals.insert(name, function);
+    crate::import::store_active_module_attr(name, function);
+    Ok(())
+}
+
+unsafe extern "C" fn module_annotations_annotate(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 1 {
+        return return_null_with_error("__annotate__ expects exactly one format argument");
+    }
+    let name = crate::intern::intern("__annotations__");
+    crate::import::active_module_attr(name)
+        .or_else(|| with_runtime(|runtime| runtime.globals.get(&name).copied()).flatten())
+        .unwrap_or_else(|| unsafe { pon_setup_annotations() })
+}
+
 /// Loads a module-global or builtin value by interned name.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_load_global(name_interned: u32) -> *mut PyObject {
@@ -2120,6 +2325,9 @@ pub fn format_object_for_print(value: *mut PyObject) -> Result<String, String> {
     with_runtime(|runtime| {
         // SAFETY: The type checks ensure exact concrete casts.
         unsafe {
+            if let Some(value) = bool_::to_bool(value) {
+                return Ok(if value { "True".to_owned() } else { "False".to_owned() });
+            }
             if is_exact_type(value, runtime.long_type) {
                 return Ok((*value.cast::<PyLong>()).value.to_string());
             }
