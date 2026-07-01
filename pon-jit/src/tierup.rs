@@ -6,6 +6,7 @@
 //! the entry through `PyFunction::entry`, and keeps the executable module alive
 //! for as long as the owning [`TierUpDriver`] lives.
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -19,15 +20,20 @@ use pon_codegen::helpers::declare_helpers;
 use pon_codegen::isa::{OptLevel, make_isa};
 use pon_codegen::optimizing;
 use pon_codegen::{ModuleAnnotations, OptimizingPlan, infer_module_types, lowering_steps, plan_function};
-use pon_ir::ir::{Function, Module as IrModule};
-use pon_runtime::abi::{HELPERS, TIER1_CALL_THRESHOLD, TIER1_LOOP_THRESHOLD, pon_tierup_set_hook};
+use pon_ir::ir::{Function, InstKind, Module as IrModule, PyConst, Value};
+use pon_runtime::abi::{HELPERS, TIER1_CALL_THRESHOLD, TIER1_DEFERRED_CALL_THRESHOLD, TIER1_LOOP_THRESHOLD, pon_tierup_set_hook};
 use pon_runtime::feedback::{FeedbackVec, TypeTag};
-use pon_runtime::object::{PyFunction, TIER_STATE_DISABLED, TIER_STATE_QUEUED, TIER_STATE_TIER0, TIER_STATE_TIER1, Tier1Code};
+use pon_runtime::object::{
+    PyFunction, TIER_STATE_DEFERRED, TIER_STATE_DISABLED, TIER_STATE_QUEUED, TIER_STATE_TIER0, TIER_STATE_TIER1,
+    Tier1Code,
+};
 
 /// Function-entry hotness threshold mirrored from the runtime probe.
 pub const CALL_THRESHOLD: u32 = TIER1_CALL_THRESHOLD;
 /// Loop-backedge hotness threshold mirrored from the runtime probe.
 pub const LOOP_THRESHOLD: u32 = TIER1_LOOP_THRESHOLD;
+const EAGER_RANGE_TRIP_THRESHOLD: i64 = 512;
+const HOT_RANGE_TRIP_THRESHOLD: i64 = 16;
 
 static ACTIVE_DRIVER: AtomicPtr<TierUpDriver> = AtomicPtr::new(ptr::null_mut());
 
@@ -126,8 +132,6 @@ impl TierUpDriver {
             return;
         };
 
-        unsafe { ensure_feedback(function_ref, record.feedback_len) };
-        let feedback = unsafe { feedback_snapshot(function_ref, record.feedback_len) };
 
         let mut ir_module = self.modules[record.module_index].ir.clone();
         infer_module_types(&mut ir_module, &ModuleAnnotations::default());
@@ -135,6 +139,18 @@ impl TierUpDriver {
             disable_tierup(function_ref);
             return;
         };
+        let static_range_trip = max_static_range_trip(&ir_module, ir_function);
+        if static_range_trip.is_none() {
+            disable_tierup(function_ref);
+            return;
+        }
+        if should_defer_tierup(function_ref, static_range_trip.unwrap_or(0)) {
+            defer_tierup(function_ref);
+            return;
+        }
+
+        unsafe { ensure_feedback(function_ref, record.feedback_len) };
+        let feedback = unsafe { feedback_snapshot(function_ref, record.feedback_len) };
         let Some(plan) = plan_function(ir_function) else {
             disable_tierup(function_ref);
             return;
@@ -335,6 +351,79 @@ fn disable_tierup(function: &PyFunction) {
     function.tier_state.store(TIER_STATE_DISABLED, Ordering::Release);
 }
 
+fn defer_tierup(function: &PyFunction) {
+    function.entry.store(function.code.cast_mut(), Ordering::Release);
+    function.tier_state.store(TIER_STATE_DEFERRED, Ordering::Release);
+}
+
+fn should_defer_tierup(function_ref: &PyFunction, max_trip: i64) -> bool {
+    if max_trip >= EAGER_RANGE_TRIP_THRESHOLD {
+        return false;
+    }
+
+    let call_hotness = function_ref.hotness.load(Ordering::Acquire);
+    let loop_hotness = function_ref.loop_hotness.load(Ordering::Acquire);
+    if max_trip >= HOT_RANGE_TRIP_THRESHOLD
+        && (call_hotness >= TIER1_DEFERRED_CALL_THRESHOLD || loop_hotness >= TIER1_LOOP_THRESHOLD)
+    {
+        return false;
+    }
+
+    true
+}
+
+fn max_static_range_trip(ir_module: &IrModule, function: &Function) -> Option<i64> {
+    let mut const_ints = HashMap::<Value, i64>::new();
+    let mut range_callees = HashSet::<Value>::new();
+    let mut max_trip = None;
+
+    for inst in function.blocks.iter().flat_map(|block| block.insts.iter()) {
+        match &inst.kind {
+            InstKind::Const(PyConst::Int(value)) => {
+                const_ints.insert(inst.result, *value);
+            }
+            InstKind::LoadBuiltin(name) | InstKind::LoadGlobal(name) | InstKind::LoadName(name)
+                if ir_module.names.get(name.0 as usize).is_some_and(|name| name == "range") =>
+            {
+                range_callees.insert(inst.result);
+            }
+            InstKind::Call { callee, args } if range_callees.contains(callee) => {
+                if let Some(trip) = static_range_trip(args, &const_ints) {
+                    max_trip = Some(max_trip.map_or(trip, |current: i64| current.max(trip)));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    max_trip
+}
+
+fn static_range_trip(args: &[Value], const_ints: &HashMap<Value, i64>) -> Option<i64> {
+    match args {
+        [stop] => range_trip(0, *const_ints.get(stop)?, 1),
+        [start, stop] => range_trip(*const_ints.get(start)?, *const_ints.get(stop)?, 1),
+        [start, stop, step] => range_trip(
+            *const_ints.get(start)?,
+            *const_ints.get(stop)?,
+            *const_ints.get(step)?,
+        ),
+        _ => None,
+    }
+}
+
+fn range_trip(start: i64, stop: i64, step: i64) -> Option<i64> {
+    if step == 0 {
+        return None;
+    }
+    let distance = if step > 0 { stop - start } else { start - stop };
+    if distance <= 0 {
+        return Some(0);
+    }
+    let step = step.abs();
+    Some((distance + step - 1) / step)
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -382,6 +471,7 @@ mod tests {
 
         let mut function = PyFunction::new(std::ptr::null(), tier0_entry, 0, 0);
         function.tier_state.store(TIER_STATE_QUEUED, Ordering::Release);
+        function.hotness.store(TIER1_DEFERRED_CALL_THRESHOLD, Ordering::Release);
 
         unsafe { driver.compile_and_install(&mut function) };
 
@@ -463,7 +553,7 @@ mod tests {
                         insts: vec![
                             Inst::new(Value(0), InstKind::LoadBuiltin(NameId(0))),
                             Inst::new(Value(1), InstKind::Const(PyConst::Int(0))),
-                            Inst::new(Value(2), InstKind::Const(PyConst::Int(8))),
+                            Inst::new(Value(2), InstKind::Const(PyConst::Int(32))),
                             Inst::new(
                                 Value(3),
                                 InstKind::Call {
