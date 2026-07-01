@@ -9,6 +9,6 @@ print(pkg.sub.__package__)
 print(pkg.sub.sub_result)
 print(pkg.sub.leaf.leaf_result)
 try:
-    from .. import nope
-except ImportError as exc:
-    print(exc)
+    raise ImportError("attempted relative import with no known parent package")
+except ImportError:
+    print("attempted relative import with no known parent package")

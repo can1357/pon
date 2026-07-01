@@ -1,5 +1,5 @@
 use super::*;
-use crate::ir::BinOp;
+use crate::ir::{BinOp, PyConst};
 
 pub(super) fn lower_assign(
     driver: &mut LoweringDriver,
@@ -58,6 +58,9 @@ impl AugTarget {
             AugStore::Global(name) => {
                 scope.emit(InstKind::StoreGlobal(name, value))?;
             }
+            AugStore::Cell(cell) => {
+                scope.emit(InstKind::StoreCell(cell, value))?;
+            }
             AugStore::Name(name) => {
                 scope.emit(InstKind::StoreName(name, value))?;
             }
@@ -74,6 +77,7 @@ impl AugTarget {
 
 enum AugStore {
     Local(LocalId),
+    Cell(CellId),
     Global(NameId),
     Name(NameId),
     Attr { obj: Value, name: NameId },
@@ -88,20 +92,55 @@ fn lower_aug_target(
     match target {
         Expr::Name(name) => {
             let raw_name = name.id.as_str();
-            if let Some(slot) = scope.local_slot(raw_name) {
-                let current = scope.emit(InstKind::LoadLocal(slot))?;
-                Ok(AugTarget {
-                    current,
-                    store: AugStore::Local(slot),
-                })
-            } else {
+            if scope.is_global_name(raw_name) {
                 let name = driver.names.intern(raw_name)?;
-                let (current, store) = if scope.is_global_name(raw_name) {
-                    (scope.emit(InstKind::LoadGlobal(name))?, AugStore::Global(name))
-                } else {
-                    (scope.emit(InstKind::LoadName(name))?, AugStore::Name(name))
-                };
-                Ok(AugTarget { current, store })
+                let current = scope.emit(InstKind::LoadGlobal(name))?;
+                return Ok(AugTarget {
+                    current,
+                    store: AugStore::Global(name),
+                });
+            }
+            if scope.is_class() {
+                let name = driver.names.intern(raw_name)?;
+                let current = scope.emit(InstKind::LoadName(name))?;
+                return Ok(AugTarget {
+                    current,
+                    store: AugStore::Name(name),
+                });
+            }
+            match scope.name_class(raw_name) {
+                Some(NameClass::Cell { cell_slot, .. }) => {
+                    let cell = CellId(*cell_slot);
+                    let current = scope.emit(InstKind::LoadCell(cell))?;
+                    Ok(AugTarget {
+                        current,
+                        store: AugStore::Cell(cell),
+                    })
+                }
+                Some(NameClass::Free { slot }) => {
+                    let cell = CellId(*slot);
+                    let current = scope.emit(InstKind::LoadCell(cell))?;
+                    Ok(AugTarget {
+                        current,
+                        store: AugStore::Cell(cell),
+                    })
+                }
+                Some(NameClass::Local { slot }) => {
+                    let slot = LocalId(*slot);
+                    let current = scope.emit(InstKind::LoadLocal(slot))?;
+                    Ok(AugTarget {
+                        current,
+                        store: AugStore::Local(slot),
+                    })
+                }
+                Some(NameClass::Builtin) | Some(NameClass::Global { .. }) | None => {
+                    let name = driver.names.intern(raw_name)?;
+                    let current = scope.emit(InstKind::LoadName(name))?;
+                    Ok(AugTarget {
+                        current,
+                        store: AugStore::Name(name),
+                    })
+                }
             }
         }
         Expr::Attribute(attr) => {
@@ -144,11 +183,30 @@ pub(super) fn bin_op_from_operator(op: ruff_python_ast::Operator) -> Result<BinO
     })
 }
 
-pub(super) fn lower_ann_assign(stmt: &ruff_python_ast::StmtAnnAssign) -> Result<(), LowerError> {
-    unsupported_at(
-        "annotated assignment",
-        span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()),
-    )
+pub(super) fn lower_ann_assign(
+    driver: &mut LoweringDriver,
+    scope: &mut BodyScope,
+    stmt: &ruff_python_ast::StmtAnnAssign,
+) -> Result<(), LowerError> {
+    if (scope.is_module() || scope.is_class())
+        && let Expr::Name(name) = stmt.target.as_ref()
+        && matches!(name.ctx, ExprContext::Store)
+    {
+        let annotations = scope.emit(InstKind::SetupAnnotations)?;
+        let annotation = driver.lower_expr(scope, &stmt.annotation)?;
+        let key = scope.emit(InstKind::Const(PyConst::Str(name.id.as_str().to_owned())))?;
+        scope.emit(InstKind::SubscriptSet {
+            obj: annotations,
+            index: key,
+            val: annotation,
+        })?;
+    }
+
+    if let Some(value) = stmt.value.as_deref() {
+        let value = driver.lower_expr(scope, value)?;
+        driver.lower_store_target(scope, &stmt.target, value)?;
+    }
+    Ok(())
 }
 
 pub(super) fn lower_type_alias(stmt: &ruff_python_ast::StmtTypeAlias) -> Result<(), LowerError> {

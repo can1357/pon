@@ -26,18 +26,19 @@ fn lower_exit_call(
     manager: Value,
     name: &str,
     is_async: bool,
-) -> Result<(), LowerError> {
+    args: [Value; 3],
+) -> Result<Value, LowerError> {
     let name = driver.names.intern(name)?;
     let method = scope.emit(InstKind::LoadAttr { obj: manager, name })?;
-    let none = scope.emit(InstKind::Const(PyConst::None))?;
     let called = scope.emit(InstKind::Call {
         callee: method,
-        args: vec![none, none, none],
+        args: args.to_vec(),
     })?;
     if is_async {
-        scope.emit(InstKind::Await { awaitable: called })?;
+        scope.emit(InstKind::Await { awaitable: called })
+    } else {
+        Ok(called)
     }
-    Ok(())
 }
 
 /// Lowers representative `with`/`async with` ordering into the family-owned IR
@@ -66,17 +67,52 @@ pub(super) fn lower_with_stmt(
     }
 
     for body_stmt in &stmt.body {
+        if scope.is_terminated() {
+            break;
+        }
         driver.lower_stmt(scope, body_stmt)?;
     }
 
-    for manager in managers.into_iter().rev() {
-        lower_exit_call(
-            driver,
-            scope,
-            manager,
-            if stmt.is_async { "__aexit__" } else { "__exit__" },
-            stmt.is_async,
-        )?;
+    let pending = scope.term.take();
+    match pending {
+        Some(Terminator::RaiseTerm) => {
+            for manager in managers.into_iter().rev() {
+                let exc = scope.emit(InstKind::GetCurrentExc)?;
+                let type_name = driver.names.intern("type")?;
+                let type_fn = scope.emit(InstKind::LoadBuiltin(type_name))?;
+                let exc_type = scope.emit(InstKind::Call {
+                    callee: type_fn,
+                    args: vec![exc],
+                })?;
+                let tb = scope.emit(InstKind::Const(PyConst::None))?;
+                lower_exit_call(
+                    driver,
+                    scope,
+                    manager,
+                    if stmt.is_async { "__aexit__" } else { "__exit__" },
+                    stmt.is_async,
+                    [exc_type, exc, tb],
+                )?;
+            }
+        }
+        term => {
+            for manager in managers.into_iter().rev() {
+                let none_type = scope.emit(InstKind::Const(PyConst::Bool(false)))?;
+                let none = scope.emit(InstKind::Const(PyConst::None))?;
+                let tb = scope.emit(InstKind::Const(PyConst::None))?;
+                lower_exit_call(
+                    driver,
+                    scope,
+                    manager,
+                    if stmt.is_async { "__aexit__" } else { "__exit__" },
+                    stmt.is_async,
+                    [none_type, none, tb],
+                )?;
+            }
+            if let Some(term) = term {
+                scope.set_term(term)?;
+            }
+        }
     }
     Ok(())
 }

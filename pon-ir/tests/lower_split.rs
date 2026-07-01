@@ -1,4 +1,4 @@
-use pon_ir::{BinOp, CellId, InstKind, LocalId, LowerError, NameId, PyConst, Terminator, Value, lower_source};
+use pon_ir::{BinOp, CellId, InstKind, LocalId, NameId, PyConst, Terminator, Value, lower_source};
 
 const PHASE_A_HELLO: &str = r#"
 def add(a, b):
@@ -156,26 +156,25 @@ else:
 }
 
 #[test]
-fn unsupported_while_statement_reports_unsupported_feature() {
-    let err = lower_source(
+fn while_statement_lowers_to_conditional_loop_blocks() {
+    let module = lower_source(
         r#"
-while 1:
-    print("nope")
+i = 0
+while i < 1:
+    i = i + 1
 "#,
     )
-    .expect_err("while statements should remain outside the supported lowerer slice");
+    .expect("while statements should lower into CFG blocks");
 
-    let LowerError::Unsupported { feature, span } = err else {
-        panic!("expected unsupported while statement, got {err:?}");
-    };
-
+    let main = module
+        .functions
+        .get(module.main.0 as usize)
+        .expect("module.main should point at a lowered function");
     assert!(
-        feature.contains("while"),
-        "unsupported feature should mention while, got {feature:?}"
-    );
-    assert!(
-        span.is_some(),
-        "unsupported while statement should retain a source span"
+        main.blocks
+            .iter()
+            .any(|block| matches!(block.term, Terminator::CondBranch { .. })),
+        "while header should lower to a conditional branch"
     );
 }
 
@@ -258,5 +257,30 @@ def outer(x):
         inner_block.term,
         Terminator::Return(add.result),
         "inner should return the captured-variable addition"
+    );
+}
+
+#[test]
+fn generator_return_lowers_to_eager_generator_return_value() {
+    let module = lower_source(
+        r#"
+def inner():
+    yield 1
+    return 6
+"#,
+    )
+    .expect("generator return should lower");
+    let inner = module
+        .functions
+        .iter()
+        .find(|function| function.name == "inner")
+        .expect("expected lowered functions to include inner");
+    assert!(
+        inner
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .any(|inst| matches!(inst.kind, InstKind::EagerGeneratorReturn { .. })),
+        "explicit return in a generator should preserve StopIteration.value through EagerGeneratorReturn"
     );
 }

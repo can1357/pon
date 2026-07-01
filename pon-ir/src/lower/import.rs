@@ -117,11 +117,8 @@ pub(super) fn lower_global(_stmt: &ruff_python_ast::StmtGlobal) -> Result<(), Lo
     Ok(())
 }
 
-pub(super) fn lower_nonlocal(stmt: &ruff_python_ast::StmtNonlocal) -> Result<(), LowerError> {
-    unsupported_at(
-        "nonlocal statement",
-        span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()),
-    )
+pub(super) fn lower_nonlocal(_stmt: &ruff_python_ast::StmtNonlocal) -> Result<(), LowerError> {
+    Ok(())
 }
 
 pub(crate) fn is_known_builtin_name(name: &str) -> bool {
@@ -135,11 +132,13 @@ pub(crate) fn is_known_builtin_name(name: &str) -> bool {
             | "callable"
             | "chr"
             | "classmethod"
+            | "complex"
             | "dict"
             | "dir"
             | "divmod"
             | "enumerate"
             | "filter"
+            | "format"
             | "float"
             | "getattr"
             | "globals"

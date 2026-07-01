@@ -16,6 +16,11 @@ pub(super) fn lower_return(
         Some(expr) => driver.lower_expr(scope, expr)?,
         None => scope.emit(InstKind::Const(PyConst::None))?,
     };
+    let value = if scope.info.is_generator || scope.info.is_async {
+        scope.emit(InstKind::EagerGeneratorReturn { value })?
+    } else {
+        value
+    };
     scope.set_term(Terminator::Return(value))
 }
 
@@ -71,11 +76,12 @@ pub(super) fn lower_compare_expr_with_driver(
             Some(previous) => {
                 let previous_truth = scope.emit(InstKind::BoolTest { val: previous })?;
                 let comparison_truth = scope.emit(InstKind::BoolTest { val: comparison })?;
-                scope.emit(InstKind::BinaryOp {
+                let combined = scope.emit(InstKind::BinaryOp {
                     op: BinOp::And,
                     lhs: previous_truth,
                     rhs: comparison_truth,
-                })?
+                })?;
+                scope.emit(InstKind::BoolTest { val: combined })?
             }
         });
         lhs = rhs;
@@ -100,20 +106,22 @@ pub(super) fn lower_bool_expr_with_driver(
             ruff_python_ast::BoolOp::And => {
                 let lhs_truth = scope.emit(InstKind::BoolTest { val: result })?;
                 let rhs_truth = scope.emit(InstKind::BoolTest { val: rhs })?;
-                scope.emit(InstKind::BinaryOp {
+                let combined = scope.emit(InstKind::BinaryOp {
                     op: BinOp::And,
                     lhs: lhs_truth,
                     rhs: rhs_truth,
-                })?
+                })?;
+                scope.emit(InstKind::BoolTest { val: combined })?
             }
             ruff_python_ast::BoolOp::Or => {
                 let lhs_truth = scope.emit(InstKind::BoolTest { val: result })?;
                 let rhs_truth = scope.emit(InstKind::BoolTest { val: rhs })?;
-                scope.emit(InstKind::BinaryOp {
+                let combined = scope.emit(InstKind::BinaryOp {
                     op: BinOp::Or,
                     lhs: lhs_truth,
                     rhs: rhs_truth,
-                })?
+                })?;
+                scope.emit(InstKind::BoolTest { val: combined })?
             }
         };
     }
@@ -125,20 +133,30 @@ pub(super) fn lower_if_expr_with_driver(
     scope: &mut BodyScope,
     expr: &ruff_python_ast::ExprIf,
 ) -> Result<Value, LowerError> {
+    let result_slot = scope.alloc_temp_local();
+    let then_block = scope.alloc_block()?;
+    let else_block = scope.alloc_block()?;
+    let done_block = scope.alloc_block()?;
     let test = driver.lower_expr(scope, &expr.test)?;
-    let truth = scope.emit(InstKind::BoolTest { val: test })?;
-    let body = driver.lower_expr(scope, &expr.body)?;
-    let orelse = driver.lower_expr(scope, &expr.orelse)?;
-    let selected_body = scope.emit(InstKind::BinaryOp {
-        op: BinOp::And,
-        lhs: truth,
-        rhs: body,
+    let cond = scope.emit(InstKind::BoolTest { val: test })?;
+    scope.set_term(Terminator::CondBranch {
+        cond,
+        then_: then_block,
+        else_: else_block,
     })?;
-    scope.emit(InstKind::BinaryOp {
-        op: BinOp::Or,
-        lhs: selected_body,
-        rhs: orelse,
-    })
+
+    scope.switch_to(then_block)?;
+    let body = driver.lower_expr(scope, &expr.body)?;
+    scope.emit(InstKind::StoreLocal(result_slot, body))?;
+    scope.jump_if_open(done_block)?;
+
+    scope.switch_to(else_block)?;
+    let orelse = driver.lower_expr(scope, &expr.orelse)?;
+    scope.emit(InstKind::StoreLocal(result_slot, orelse))?;
+    scope.jump_if_open(done_block)?;
+
+    scope.switch_to(done_block)?;
+    scope.emit(InstKind::LoadLocal(result_slot))
 }
 
 fn lower_single_compare(
@@ -307,6 +325,7 @@ pub(super) fn lower_for(stmt: &ruff_python_ast::StmtFor) -> Result<(), LowerErro
     )
 }
 
+#[allow(dead_code)]
 pub(super) fn lower_while(stmt: &ruff_python_ast::StmtWhile) -> Result<(), LowerError> {
     unsupported_at(
         "while statement",
