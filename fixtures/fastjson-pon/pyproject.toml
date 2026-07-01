@@ -1,0 +1,11 @@
+[build-system]
+requires = []
+build-backend = "pon_native"
+
+[project]
+name = "fastjson-pon"
+version = "0.1.0"
+
+[tool.pon.native]
+import-name = "fastjson"
+crate = "fastjson_pon"
