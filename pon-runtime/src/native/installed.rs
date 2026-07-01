@@ -1,19 +1,15 @@
-//! Native shims for Phase-F installed package gates.
+//! Native modules that are only exposed through package-manager installation.
 //!
-//! These modules are intentionally hidden unless the package manager has left an
-//! import/registry environment behind.  They are not general builtins.
+//! Pure-Python wheels are imported from `site-packages` by the generic source
+//! loader.  This file is only for installed pon-native fixtures.
 
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::ptr;
 
-use crate::abi::{pon_const_str, pon_make_function};
-use crate::abi::str_::pon_const_bytes;
+use crate::abi::pon_const_str;
 use crate::intern::intern;
 use crate::object::PyObject;
-use crate::thread_state::pon_err_set;
-use crate::types::type_;
 
 use super::install_module;
 
@@ -27,49 +23,12 @@ const REGISTRY_ENV_VARS: &[&str] = &[
 const IMPORT_PATH_ENV_VARS: &[&str] = &["PON_IMPORT_PATH", "PONPATH"];
 
 pub(super) fn make_module(name: &str) -> Result<Option<*mut PyObject>, String> {
-    if !is_supported_gate_module(name) || !is_installed(name) {
+    if name != "fastjson" || !is_installed(name) {
         return Ok(None);
     }
 
-    match name {
-        "idna" => make_idna().map(Some),
-        "flit_core" => make_flit_core().map(Some),
-        "fastjson" => make_fastjson().map(Some),
-        _ => Ok(None),
-    }
+    make_fastjson().map(Some)
 }
-
-fn is_supported_gate_module(name: &str) -> bool {
-    matches!(name, "idna" | "flit_core" | "fastjson")
-}
-
-fn make_idna() -> Result<*mut PyObject, String> {
-    let encode = unsafe { pon_make_function(idna_encode as *const u8, 1, intern("encode")) };
-    if encode.is_null() {
-        return Err("failed to allocate idna.encode".to_owned());
-    }
-    install_module(
-        "idna",
-        vec![
-            string_attr("__name__", "idna")?,
-            string_attr("__version__", &package_version("idna").unwrap_or_else(|| "3.7".to_owned()))?,
-            (intern("encode"), encode),
-        ],
-    )
-}
-
-fn make_flit_core() -> Result<*mut PyObject, String> {
-    let version = package_version("flit_core").unwrap_or_else(|| "3.12.0".to_owned());
-    install_module(
-        "flit_core",
-        vec![
-            string_attr("__name__", "flit_core")?,
-            string_attr("__version__", &version)?,
-            string_attr("version", &version)?,
-        ],
-    )
-}
-
 fn make_fastjson() -> Result<*mut PyObject, String> {
     let version = package_version("fastjson").unwrap_or_else(|| "0.1.0".to_owned());
     install_module(
@@ -87,27 +46,6 @@ fn string_attr(name: &str, value: &str) -> Result<(u32, *mut PyObject), String> 
         .then_some((intern(name), object))
         .ok_or_else(|| format!("failed to allocate native package attribute {name}"))
 }
-
-unsafe extern "C" fn idna_encode(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    if argv.is_null() || argc != 1 {
-        pon_err_set("idna.encode expects exactly one str argument");
-        return ptr::null_mut();
-    }
-    let value = unsafe { *argv };
-    let Some(text) = (unsafe { type_::unicode_text(value) }) else {
-        pon_err_set("idna.encode expects a str argument");
-        return ptr::null_mut();
-    };
-    let encoded = match encode_idna_ascii(text) {
-        Ok(encoded) => encoded,
-        Err(message) => {
-            pon_err_set(message);
-            return ptr::null_mut();
-        }
-    };
-    unsafe { pon_const_bytes(encoded.as_ptr(), encoded.len()) }
-}
-
 fn is_installed(name: &str) -> bool {
     registry_texts().iter().any(|text| registry_mentions_module(text, name))
         || import_roots().iter().any(|root| root_contains_module(root, name))
@@ -313,121 +251,3 @@ fn normalized_package_name(name: &str) -> String {
     name.replace('_', "-").to_ascii_lowercase()
 }
 
-fn encode_idna_ascii(text: &str) -> Result<Vec<u8>, String> {
-    let mut out = String::new();
-    for (index, label) in text.split('.').enumerate() {
-        if index != 0 {
-            out.push('.');
-        }
-        out.push_str(&encode_label(label)?);
-    }
-    Ok(out.into_bytes())
-}
-
-fn encode_label(label: &str) -> Result<String, String> {
-    if label.is_ascii() {
-        return Ok(label.to_owned());
-    }
-    Ok(format!("xn--{}", punycode_encode(label)?))
-}
-
-fn punycode_encode(input: &str) -> Result<String, String> {
-    const BASE: u32 = 36;
-    const TMIN: u32 = 1;
-    const TMAX: u32 = 26;
-    const INITIAL_BIAS: u32 = 72;
-    const INITIAL_N: u32 = 128;
-
-    let codepoints = input.chars().map(u32::from).collect::<Vec<_>>();
-    let mut output = String::new();
-    for ch in input.chars().filter(char::is_ascii) {
-        output.push(ch);
-    }
-
-    let basic_count = output.chars().count() as u32;
-    let mut handled = basic_count;
-    if basic_count > 0 {
-        output.push('-');
-    }
-
-    let mut n = INITIAL_N;
-    let mut delta = 0u32;
-    let mut bias = INITIAL_BIAS;
-    let input_len = u32::try_from(codepoints.len()).map_err(|_| "idna label is too long".to_owned())?;
-
-    while handled < input_len {
-        let mut m = u32::MAX;
-        for codepoint in &codepoints {
-            if *codepoint >= n && *codepoint < m {
-                m = *codepoint;
-            }
-        }
-        if m == u32::MAX {
-            return Err("idna punycode encoder made no progress".to_owned());
-        }
-
-        delta = delta
-            .checked_add((m - n).checked_mul(handled + 1).ok_or_else(|| "idna label overflow".to_owned())?)
-            .ok_or_else(|| "idna label overflow".to_owned())?;
-        n = m;
-
-        for codepoint in &codepoints {
-            if *codepoint < n {
-                delta = delta.checked_add(1).ok_or_else(|| "idna label overflow".to_owned())?;
-            }
-            if *codepoint == n {
-                let mut q = delta;
-                let mut k = BASE;
-                loop {
-                    let t = if k <= bias {
-                        TMIN
-                    } else if k >= bias + TMAX {
-                        TMAX
-                    } else {
-                        k - bias
-                    };
-                    if q < t {
-                        break;
-                    }
-                    let code = t + ((q - t) % (BASE - t));
-                    output.push(encode_digit(code)?);
-                    q = (q - t) / (BASE - t);
-                    k = k.checked_add(BASE).ok_or_else(|| "idna label overflow".to_owned())?;
-                }
-                output.push(encode_digit(q)?);
-                bias = adapt(delta, handled + 1, handled == basic_count);
-                delta = 0;
-                handled += 1;
-            }
-        }
-        delta = delta.checked_add(1).ok_or_else(|| "idna label overflow".to_owned())?;
-        n = n.checked_add(1).ok_or_else(|| "idna label overflow".to_owned())?;
-    }
-
-    Ok(output)
-}
-
-fn adapt(mut delta: u32, points: u32, first_time: bool) -> u32 {
-    const BASE: u32 = 36;
-    const TMIN: u32 = 1;
-    const TMAX: u32 = 26;
-    const SKEW: u32 = 38;
-    const DAMP: u32 = 700;
-
-    delta = if first_time { delta / DAMP } else { delta / 2 };
-    delta += delta / points;
-    let mut k = 0;
-    while delta > ((BASE - TMIN) * TMAX) / 2 {
-        delta /= BASE - TMIN;
-        k += BASE;
-    }
-    k + (((BASE - TMIN + 1) * delta) / (delta + SKEW))
-}
-
-fn encode_digit(value: u32) -> Result<char, String> {
-    match value {
-        0..=25 => char::from_u32(u32::from(b'a') + value).ok_or_else(|| "invalid punycode digit".to_owned()),
-        26..=35 => char::from_u32(u32::from(b'0') + value - 26).ok_or_else(|| "invalid punycode digit".to_owned()),
-        _ => Err("invalid punycode digit".to_owned()),
-    }
-}
