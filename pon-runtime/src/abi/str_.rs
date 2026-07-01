@@ -1033,9 +1033,132 @@ fn str_encode_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
             }
             receiver.as_bytes().to_vec()
         }
+        "idna" => match encode_idna_ascii(receiver) {
+            Ok(encoded) => encoded,
+            Err(message) => return super::return_null_with_error(message),
+        },
         _ => return super::return_null_with_error(format!("unsupported str.encode encoding '{encoding}'")),
     };
     unsafe { pon_const_bytes(encoded.as_ptr(), encoded.len()) }
+}
+
+fn encode_idna_ascii(text: &str) -> Result<Vec<u8>, String> {
+    let mut out = String::new();
+    for (index, label) in text.split('.').enumerate() {
+        if index != 0 {
+            out.push('.');
+        }
+        out.push_str(&encode_idna_label(label)?);
+    }
+    Ok(out.into_bytes())
+}
+
+fn encode_idna_label(label: &str) -> Result<String, String> {
+    if label.is_ascii() {
+        return Ok(label.to_owned());
+    }
+    Ok(format!("xn--{}", punycode_encode(label)?))
+}
+
+fn punycode_encode(input: &str) -> Result<String, String> {
+    const BASE: u32 = 36;
+    const TMIN: u32 = 1;
+    const TMAX: u32 = 26;
+    const INITIAL_BIAS: u32 = 72;
+    const INITIAL_N: u32 = 128;
+
+    let codepoints = input.chars().map(u32::from).collect::<Vec<_>>();
+    let mut output = String::new();
+    for ch in input.chars().filter(char::is_ascii) {
+        output.push(ch);
+    }
+
+    let basic_count = output.chars().count() as u32;
+    let mut handled = basic_count;
+    if basic_count > 0 {
+        output.push('-');
+    }
+
+    let mut n = INITIAL_N;
+    let mut delta = 0u32;
+    let mut bias = INITIAL_BIAS;
+    let input_len = u32::try_from(codepoints.len()).map_err(|_| "idna label is too long".to_owned())?;
+
+    while handled < input_len {
+        let mut m = u32::MAX;
+        for codepoint in &codepoints {
+            if *codepoint >= n && *codepoint < m {
+                m = *codepoint;
+            }
+        }
+        if m == u32::MAX {
+            return Err("idna punycode encoder made no progress".to_owned());
+        }
+
+        delta = delta
+            .checked_add((m - n).checked_mul(handled + 1).ok_or_else(|| "idna label overflow".to_owned())?)
+            .ok_or_else(|| "idna label overflow".to_owned())?;
+        n = m;
+
+        for codepoint in &codepoints {
+            if *codepoint < n {
+                delta = delta.checked_add(1).ok_or_else(|| "idna label overflow".to_owned())?;
+            }
+            if *codepoint == n {
+                let mut q = delta;
+                let mut k = BASE;
+                loop {
+                    let t = if k <= bias {
+                        TMIN
+                    } else if k >= bias + TMAX {
+                        TMAX
+                    } else {
+                        k - bias
+                    };
+                    if q < t {
+                        break;
+                    }
+                    let code = t + ((q - t) % (BASE - t));
+                    output.push(encode_punycode_digit(code)?);
+                    q = (q - t) / (BASE - t);
+                    k = k.checked_add(BASE).ok_or_else(|| "idna label overflow".to_owned())?;
+                }
+                output.push(encode_punycode_digit(q)?);
+                bias = adapt_punycode_bias(delta, handled + 1, handled == basic_count);
+                delta = 0;
+                handled += 1;
+            }
+        }
+        delta = delta.checked_add(1).ok_or_else(|| "idna label overflow".to_owned())?;
+        n = n.checked_add(1).ok_or_else(|| "idna label overflow".to_owned())?;
+    }
+
+    Ok(output)
+}
+
+fn adapt_punycode_bias(mut delta: u32, points: u32, first_time: bool) -> u32 {
+    const BASE: u32 = 36;
+    const TMIN: u32 = 1;
+    const TMAX: u32 = 26;
+    const SKEW: u32 = 38;
+    const DAMP: u32 = 700;
+
+    delta = if first_time { delta / DAMP } else { delta / 2 };
+    delta += delta / points;
+    let mut k = 0;
+    while delta > ((BASE - TMIN) * TMAX) / 2 {
+        delta /= BASE - TMIN;
+        k += BASE;
+    }
+    k + (((BASE - TMIN + 1) * delta) / (delta + SKEW))
+}
+
+fn encode_punycode_digit(value: u32) -> Result<char, String> {
+    match value {
+        0..=25 => char::from_u32(u32::from(b'a') + value).ok_or_else(|| "invalid punycode digit".to_owned()),
+        26..=35 => char::from_u32(u32::from(b'0') + value - 26).ok_or_else(|| "invalid punycode digit".to_owned()),
+        _ => Err("invalid punycode digit".to_owned()),
+    }
 }
 
 fn bytes_split_method(receiver: &[u8], args: &[*mut PyObject]) -> *mut PyObject {
@@ -1341,7 +1464,34 @@ fn raw_template_parts<'a>(parts: *const super::TStrPartRaw, len: usize) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::thread_state::test_state_lock;
+    use crate::thread_state::{pon_err_clear, pon_err_message, test_state_lock};
+    use crate::types::bytes_::PyBytes;
+
+    fn str_object(text: &str) -> *mut PyObject {
+        unsafe { super::super::pon_const_str(text.as_ptr(), text.len()) }
+    }
+
+    fn encode_bytes(text: &str, encoding: Option<&str>) -> Vec<u8> {
+        unsafe {
+            let receiver = str_object(text);
+            assert!(!receiver.is_null(), "failed to allocate str receiver");
+            let mut args = Vec::new();
+            if let Some(encoding) = encoding {
+                let encoding = str_object(encoding);
+                assert!(!encoding.is_null(), "failed to allocate str.encode encoding");
+                args.push(encoding);
+            }
+            let argv = if args.is_empty() { ptr::null_mut() } else { args.as_mut_ptr() };
+            pon_err_clear();
+            let encoded = pon_str_method(STR_METHOD_ENCODE, receiver, argv, args.len());
+            assert!(
+                !encoded.is_null(),
+                "str.encode({encoding:?}) failed for {text:?}: {:?}",
+                pon_err_message()
+            );
+            (&*encoded.cast::<PyBytes>()).as_slice().to_vec()
+        }
+    }
 
     #[test]
     fn fstring_helper_formats_unicode_repr_and_ascii() {
@@ -1351,6 +1501,36 @@ mod tests {
             let value = super::super::pon_const_str("é".as_ptr(), "é".len());
             let rendered = pon_format_value(value, b'a', ptr::null_mut());
             assert_eq!(super::super::format_object_for_print(rendered).as_deref(), Ok("'\\xe9'"));
+        }
+    }
+
+    #[test]
+    fn str_encode_emits_utf8_ascii_and_idna_bytes() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(super::super::pon_runtime_init(), 0);
+        }
+
+        assert_eq!(encode_bytes("ä", Some("idna")), b"xn--4ca");
+        assert_eq!(encode_bytes("Grüße", None), "Grüße".as_bytes());
+        assert_eq!(encode_bytes("plain-ascii", Some("ascii")), b"plain-ascii");
+    }
+
+    #[test]
+    fn str_encode_ascii_rejects_non_ascii_text() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(super::super::pon_runtime_init(), 0);
+            let receiver = str_object("ä");
+            let mut args = [str_object("ascii")];
+            pon_err_clear();
+            let encoded = pon_str_method(STR_METHOD_ENCODE, receiver, args.as_mut_ptr(), args.len());
+            assert!(encoded.is_null());
+            assert_eq!(
+                pon_err_message().as_deref(),
+                Some("ascii codec can't encode non-ascii character")
+            );
+            pon_err_clear();
         }
     }
 }
