@@ -6,16 +6,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::env::EnvLayout;
 use crate::error::{Error, Result};
-use crate::index::CatalogIndex;
-use crate::install::{ResolvedRecord, install_package};
+use crate::index::{PackageIndex, SelectedIndex};
+use crate::install::{ResolvedRecord, install_package, remove_installed_package};
 use crate::lock::LockFile;
 use crate::manifest::{ProjectManifest, Requirement, remove_dependency};
-use crate::resolve::provider::ResolveProvider;
+use crate::resolve::provider::{ResolveProvider, ResolvedPackage};
 use crate::resolve::source::{PackageKind, PackageRecord, PackageSource};
 
-struct ResolvedDependency {
-    raw: String,
-    record: PackageRecord,
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProjectOptions {
+    manifest_path: PathBuf,
+    index_url: Option<String>,
 }
 
 static INLINE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -34,28 +35,23 @@ pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()> {
             let requirement = args
                 .next()
                 .ok_or_else(|| Error::Cli(format!("missing requirement\n{}", usage(&program))))?;
-            let manifest = parse_manifest_flag(args)?;
-            add_command(&manifest, &requirement)
+            let options = parse_project_options(args)?;
+            add_command(&options.manifest_path, &requirement, options.index_url.as_deref())
         }
         Some("install") => {
-            let manifest = parse_manifest_flag(args)?;
-            install_command(&manifest)
+            let options = parse_project_options(args)?;
+            install_command(&options.manifest_path, options.index_url.as_deref())
         }
         Some("lock") => {
-            let manifest = parse_manifest_flag(args)?;
-            lock_command(&manifest)
+            let options = parse_project_options(args)?;
+            lock_command(&options.manifest_path, options.index_url.as_deref())
         }
         Some("remove") => {
             let name = args
                 .next()
                 .ok_or_else(|| Error::Cli(format!("missing package name\n{}", usage(&program))))?;
             let manifest = parse_manifest_flag(args)?;
-            if remove_dependency(&manifest, name)? {
-                println!("updated {}", manifest.display());
-            } else {
-                println!("not present in {}", manifest.display());
-            }
-            Ok(())
+            remove_command(&manifest, &name)
         }
         Some("list") => {
             let manifest = parse_manifest_flag(args)?;
@@ -89,17 +85,18 @@ fn init_command(args: impl Iterator<Item = String>) -> Result<()> {
     Ok(())
 }
 
-fn add_command(manifest_path: &Path, requirement: &str) -> Result<()> {
-    let resolved = resolve_requirement(requirement)?;
+fn add_command(manifest_path: &Path, requirement: &str, index_url: Option<&str>) -> Result<()> {
+    let layout = layout_for_manifest(manifest_path);
+    let index = selected_index(&layout, index_url);
+    let resolved = resolve_requirement(&index, requirement)?;
     reject_cabi_package(&resolved)?;
 
     let mut manifest = ProjectManifest::read(manifest_path)?;
     let changed = manifest.add(Requirement::for_resolved_package(requirement, &resolved.name)?);
     manifest.write()?;
 
-    let dependencies = resolve_manifest(&manifest)?;
-    let layout = layout_for_manifest(manifest_path);
-    install_dependencies(&layout, &dependencies)?;
+    let dependencies = resolve_manifest(&manifest, &index)?;
+    install_dependencies(&layout, &dependencies, &index)?;
     write_lock(&layout, &dependencies)?;
 
     if changed {
@@ -110,20 +107,43 @@ fn add_command(manifest_path: &Path, requirement: &str) -> Result<()> {
     Ok(())
 }
 
-fn install_command(manifest_path: &Path) -> Result<()> {
+fn install_command(manifest_path: &Path, index_url: Option<&str>) -> Result<()> {
     let manifest = ProjectManifest::read(manifest_path)?;
-    let dependencies = resolve_manifest(&manifest)?;
     let layout = layout_for_manifest(manifest_path);
-    install_dependencies(&layout, &dependencies)?;
+    let index = selected_index(&layout, index_url);
+    let dependencies = resolve_manifest(&manifest, &index)?;
+    install_dependencies(&layout, &dependencies, &index)?;
     write_lock(&layout, &dependencies)?;
     println!("installed {} package(s)", dependencies.len());
     Ok(())
 }
 
-fn lock_command(manifest_path: &Path) -> Result<()> {
+fn remove_command(manifest_path: &Path, name: &str) -> Result<()> {
+    let changed = remove_dependency(manifest_path, name)?;
     let manifest = ProjectManifest::read(manifest_path)?;
-    let dependencies = resolve_manifest(&manifest)?;
     let layout = layout_for_manifest(manifest_path);
+    let index = selected_index(&layout, None);
+    let dependencies = resolve_manifest(&manifest, &index)?;
+    let removed = remove_installed_package(&layout, name)?;
+    write_lock(&layout, &dependencies)?;
+    if changed {
+        println!("updated {}", manifest_path.display());
+    } else {
+        println!("not present in {}", manifest_path.display());
+    }
+    if removed.is_some() {
+        println!("removed {name}");
+    } else {
+        println!("not installed {name}");
+    }
+    Ok(())
+}
+
+fn lock_command(manifest_path: &Path, index_url: Option<&str>) -> Result<()> {
+    let manifest = ProjectManifest::read(manifest_path)?;
+    let layout = layout_for_manifest(manifest_path);
+    let index = selected_index(&layout, index_url);
+    let dependencies = resolve_manifest(&manifest, &index)?;
     write_lock(&layout, &dependencies)?;
     println!("wrote {}", layout.project_root.join("pon.lock").display());
     Ok(())
@@ -160,24 +180,22 @@ fn run_inline_code(layout: &EnvLayout, code: &str, extra_env: Vec<(OsString, OsS
     result
 }
 
-fn resolve_manifest(manifest: &ProjectManifest) -> Result<Vec<ResolvedDependency>> {
-    manifest
+fn resolve_manifest(manifest: &ProjectManifest, index: &impl PackageIndex) -> Result<Vec<ResolvedPackage>> {
+    let requirements = manifest
         .dependencies()
         .into_iter()
-        .map(|requirement| {
-            let resolved = resolve_requirement(requirement.raw())?;
-            reject_cabi_package(&resolved)?;
-            Ok(ResolvedDependency {
-                raw: requirement.raw().to_owned(),
-                record: resolved,
-            })
-        })
-        .collect()
+        .map(|requirement| requirement.raw())
+        .collect::<Vec<_>>();
+    let dependencies = ResolveProvider::new(index).resolve_requirements(requirements)?;
+    for dependency in &dependencies {
+        reject_cabi_package(&dependency.record)?;
+    }
+    Ok(dependencies)
 }
 
-fn resolve_requirement(requirement: &str) -> Result<PackageRecord> {
+fn resolve_requirement(index: &impl PackageIndex, requirement: &str) -> Result<PackageRecord> {
     let (source, specifier) = split_requirement(requirement);
-    ResolveProvider::default().resolve_input(source, specifier)
+    ResolveProvider::new(index).resolve_input(source, specifier)
 }
 
 fn split_requirement(requirement: &str) -> (&str, &str) {
@@ -198,18 +216,22 @@ fn split_requirement(requirement: &str) -> (&str, &str) {
     }
 }
 
-fn install_dependencies(layout: &EnvLayout, dependencies: &[ResolvedDependency]) -> Result<()> {
+fn install_dependencies(
+    layout: &EnvLayout,
+    dependencies: &[ResolvedPackage],
+    index: &impl PackageIndex,
+) -> Result<()> {
     for dependency in dependencies {
-        let install_record = install_record_for(&dependency.raw, &dependency.record)?;
+        let install_record = install_record_for(&dependency.raw, &dependency.record, index)?;
         install_package(layout, &install_record)?;
     }
     Ok(())
 }
 
-fn install_record_for(requirement: &str, record: &PackageRecord) -> Result<ResolvedRecord> {
+fn install_record_for(requirement: &str, record: &PackageRecord, index: &impl PackageIndex) -> Result<ResolvedRecord> {
     match &record.kind {
         PackageKind::Pure => {
-            let filename = catalog_filename(&record.name, &record.version)?;
+            let filename = package_filename(index, &record.name, &record.version)?;
             Ok(ResolvedRecord::wheel(&record.name, &record.version, filename))
         }
         PackageKind::Native => {
@@ -226,8 +248,7 @@ fn install_record_for(requirement: &str, record: &PackageRecord) -> Result<Resol
     }
 }
 
-fn catalog_filename(name: &str, version: &str) -> Result<String> {
-    let index = CatalogIndex::new();
+fn package_filename(index: &impl PackageIndex, name: &str, version: &str) -> Result<String> {
     let project = index
         .lookup(name)?
         .ok_or_else(|| Error::InvalidRequirement(format!("unknown package `{name}`")))?;
@@ -258,7 +279,7 @@ fn cabi_error(record: &PackageRecord) -> Error {
     ))
 }
 
-fn write_lock(layout: &EnvLayout, dependencies: &[ResolvedDependency]) -> Result<()> {
+fn write_lock(layout: &EnvLayout, dependencies: &[ResolvedPackage]) -> Result<()> {
     fs::create_dir_all(&layout.project_root)?;
     let records = dependencies
         .iter()
@@ -297,7 +318,6 @@ fn runtime_env(layout: &EnvLayout) -> Vec<(OsString, OsString)> {
         ),
     ]
 }
-
 fn parse_manifest_flag(args: impl Iterator<Item = String>) -> Result<PathBuf> {
     let mut manifest = PathBuf::from("pyproject.toml");
     let mut args = args.peekable();
@@ -315,6 +335,40 @@ fn parse_manifest_flag(args: impl Iterator<Item = String>) -> Result<PathBuf> {
     Ok(manifest)
 }
 
+fn parse_project_options(args: impl Iterator<Item = String>) -> Result<ProjectOptions> {
+    let mut options = ProjectOptions {
+        manifest_path: PathBuf::from("pyproject.toml"),
+        index_url: None,
+    };
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--manifest" | "--pyproject" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| Error::Cli("missing path after --manifest".to_owned()))?;
+                options.manifest_path = PathBuf::from(value);
+            }
+            "--index-url" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| Error::Cli("missing URL after --index-url".to_owned()))?;
+                options.index_url = Some(value);
+            }
+            _ => return Err(Error::Cli(format!("unexpected argument `{arg}`"))),
+        }
+    }
+    Ok(options)
+}
+
+fn selected_index(layout: &EnvLayout, index_url: Option<&str>) -> SelectedIndex {
+    let pon_home = env::var_os("PON_HOME").map_or_else(|| layout.pon_dir.clone(), PathBuf::from);
+    index_url
+        .map(str::to_owned)
+        .or_else(|| env::var("PON_INDEX_URL").ok().filter(|url| !url.trim().is_empty()))
+        .map_or_else(SelectedIndex::catalog, |url| SelectedIndex::simple_json(url, &pon_home))
+}
+
 fn reject_extra(extra: Option<String>, command: &str) -> Result<()> {
     if let Some(extra) = extra {
         Err(Error::Cli(format!("unexpected argument `{extra}` for `{command}`")))
@@ -326,7 +380,7 @@ fn reject_extra(extra: Option<String>, command: &str) -> Result<()> {
 fn usage(program: impl AsRef<str>) -> String {
     let program = program.as_ref();
     format!(
-        "usage: {program} init [--manifest <pyproject.toml>]\n       {program} add <requirement-or-path> [--manifest <pyproject.toml>]\n       {program} install [--manifest <pyproject.toml>]\n       {program} lock [--manifest <pyproject.toml>]\n       {program} run <file>\n       {program} run -c <code>\n       {program} remove <name> [--manifest <pyproject.toml>]\n       {program} list [--manifest <pyproject.toml>]\n       {program} env [project-root]"
+        "usage: {program} init [--manifest <pyproject.toml>]\n       {program} add <requirement-or-path> [--manifest <pyproject.toml>] [--index-url <url>]\n       {program} install [--manifest <pyproject.toml>] [--index-url <url>]\n       {program} lock [--manifest <pyproject.toml>] [--index-url <url>]\n       {program} run <file>\n       {program} run -c <code>\n       {program} remove <name> [--manifest <pyproject.toml>]\n       {program} list [--manifest <pyproject.toml>]\n       {program} env [project-root]"
     )
 }
 
@@ -355,6 +409,21 @@ mod tests {
     fn manifest_flag_accepts_explicit_path() {
         let args = ["--manifest".to_owned(), "demo.toml".to_owned()].into_iter();
         assert_eq!(parse_manifest_flag(args).expect("flag"), PathBuf::from("demo.toml"));
+    }
+
+    #[test]
+    fn project_options_accept_index_url_for_resolving_commands() {
+        let args = [
+            "--manifest".to_owned(),
+            "demo.toml".to_owned(),
+            "--index-url".to_owned(),
+            "https://packages.example/simple/".to_owned(),
+        ]
+        .into_iter();
+        let options = parse_project_options(args).expect("options");
+
+        assert_eq!(options.manifest_path, PathBuf::from("demo.toml"));
+        assert_eq!(options.index_url.as_deref(), Some("https://packages.example/simple/"));
     }
 
     #[test]
@@ -394,10 +463,41 @@ mod tests {
 
         let pyproject = fs::read_to_string(&manifest).expect("pyproject");
         assert!(pyproject.contains("\"idna\""));
-        assert!(root.join(".pon/packages/site-packages/idna.py").is_file());
+        assert!(root.join(".pon/packages/site-packages/idna/__init__.py").is_file());
         let lock = fs::read_to_string(root.join("pon.lock")).expect("lock");
         assert!(lock.contains("name = \"idna\""));
         assert!(lock.contains("version = \"3.10\""));
+    }
+
+    #[test]
+    fn remove_deletes_installed_wheel_files_and_registry_row() {
+        let root = temp_project("remove");
+        let manifest = root.join("pyproject.toml");
+        fs::create_dir_all(&root).expect("root");
+        run_from_args([
+            "pon-pm".to_owned(),
+            "add".to_owned(),
+            "idna".to_owned(),
+            "--manifest".to_owned(),
+            manifest.display().to_string(),
+        ])
+        .expect("add");
+
+        run_from_args([
+            "pon-pm".to_owned(),
+            "remove".to_owned(),
+            "idna".to_owned(),
+            "--manifest".to_owned(),
+            manifest.display().to_string(),
+        ])
+        .expect("remove");
+
+        let pyproject = fs::read_to_string(&manifest).expect("pyproject");
+        assert!(!pyproject.contains("\"idna\""));
+        assert!(!root.join(".pon/packages/site-packages/idna").exists());
+        assert!(!root.join(".pon/packages/site-packages/idna-3.10.dist-info").exists());
+        let registry = fs::read_to_string(root.join(".pon/packages/installed.tsv")).expect("registry");
+        assert!(registry.is_empty());
     }
 
     #[test]
