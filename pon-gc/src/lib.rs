@@ -2,9 +2,17 @@
 #![allow(improper_ctypes_definitions)]
 
 
+pub mod handshake;
+
+pub use handshake::{
+    GcHandshake, GcPhase, ack_global_stop, clear_global_stop_request, gc_stop_requested,
+    global_handshake, request_global_stop, resume_global_stop,
+};
+
 use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
 use std::collections::{HashMap, VecDeque};
-use std::ptr::NonNull;
+use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 /// Default byte alignment used for every heap allocation.
@@ -12,6 +20,66 @@ use std::sync::{Mutex, MutexGuard};
 /// Phase A does not carry per-type alignment metadata, so the heap uses a
 /// conservative C-compatible alignment for every object.
 pub const DEFAULT_HEAP_ALIGNMENT: usize = 16;
+
+static EXTERNAL_STACK_BASE: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
+
+/// Precise stack-root enumerator installed by runtimes with stack maps.
+///
+/// The callback returns `true` only when it handled the whole active native
+/// stack precisely.  Returning `false` asks the collector to keep the existing
+/// conservative stack scan after accepting any precise roots already reported.
+pub type PreciseStackRootFn = unsafe extern "C" fn(visitor: &mut dyn FnMut(*mut u8)) -> bool;
+
+static PRECISE_STACK_ROOTS: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+
+/// Supplies the conservative stack root scanner with the outer stack boundary.
+///
+/// Runtimes that enter generated code from a native frame should set this to an
+/// address in that entry frame before collections can run. A NULL base disables
+/// conservative stack scanning, preserving the existing explicit-root-only path.
+pub fn set_external_stack_base(base: *mut u8) {
+    EXTERNAL_STACK_BASE.store(base, Ordering::SeqCst);
+}
+
+/// Returns the currently supplied conservative stack boundary.
+#[must_use]
+pub fn external_stack_base() -> *mut u8 {
+    EXTERNAL_STACK_BASE.load(Ordering::SeqCst)
+}
+
+/// C ABI hook for runtimes that cannot call the Rust wrapper directly.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_gc_set_external_stack_base(base: *mut u8) {
+    set_external_stack_base(base);
+}
+
+/// Installs or clears the precise stack-root hook.
+///
+/// A hook is optional: with no hook, or when the hook reports an incomplete
+/// precise walk, collection falls back to the conservative external-stack scan.
+pub fn set_precise_stack_roots(hook: Option<PreciseStackRootFn>) {
+    let hook = hook.map_or(ptr::null_mut(), |hook| hook as *const () as *mut ());
+    PRECISE_STACK_ROOTS.store(hook, Ordering::SeqCst);
+}
+
+/// Returns the currently installed precise stack-root hook, if any.
+#[must_use]
+pub fn precise_stack_roots() -> Option<PreciseStackRootFn> {
+    let hook = PRECISE_STACK_ROOTS.load(Ordering::SeqCst);
+    if hook.is_null() {
+        return None;
+    }
+
+    // SAFETY: `set_precise_stack_roots` stores only function pointers with this
+    // exact signature, and null is handled above.
+    Some(unsafe { std::mem::transmute::<*mut (), PreciseStackRootFn>(hook) })
+}
+
+/// Clears the precise-root hook from C-compatible embedders.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_gc_clear_precise_stack_roots() {
+    set_precise_stack_roots(None);
+}
 
 /// Stable numeric identifier for a registered heap object layout.
 ///
@@ -83,15 +151,220 @@ pub trait RootSource {
     fn for_each_root(&mut self, visitor: &mut dyn FnMut(*mut u8));
 }
 
-/// Public write-barrier hook reserved for future incremental collectors.
+/// Public write-barrier hook used by generated stores into managed objects.
+///
+/// The barrier is inert for the default stop-the-world collector.  In
+/// free-threaded builds it remains inert until concurrent marking is explicitly
+/// enabled; while enabled it records the changed slot and shades the newly
+/// stored pointer as a candidate for the concurrent marker.
 pub struct WriteBarrier;
 
 impl WriteBarrier {
     /// Records that `slot` now contains `new`.
-    ///
-    /// Phase A uses a stop-the-world collector, so this hook intentionally does
-    /// nothing.  The signature is kept stable for Phase E.
-    pub fn record(_slot: *mut *mut u8, _new: *mut u8) {}
+    pub fn record(slot: *mut *mut u8, new: *mut u8) {
+        #[cfg(feature = "free-threading")]
+        {
+            write_barrier_state().record(slot, new);
+        }
+
+        #[cfg(not(feature = "free-threading"))]
+        {
+            let _ = (slot, new);
+        }
+    }
+
+    /// Enables write recording and allocation-black behavior for a concurrent
+    /// mark cycle.
+    #[cfg(feature = "free-threading")]
+    pub fn begin_concurrent_marking() {
+        write_barrier_state().begin_concurrent_marking();
+    }
+
+    /// Disables concurrent write recording.
+    #[cfg(feature = "free-threading")]
+    pub fn end_concurrent_marking() {
+        write_barrier_state().end_concurrent_marking();
+    }
+
+    /// Drains recorded slot updates.
+    #[cfg(feature = "free-threading")]
+    #[must_use]
+    pub fn drain_records() -> Vec<WriteBarrierRecord> {
+        write_barrier_state().drain_records()
+    }
+
+    /// Drains pointers shaded by the barrier.
+    #[cfg(feature = "free-threading")]
+    #[must_use]
+    pub fn drain_shaded() -> Vec<*mut u8> {
+        write_barrier_state().drain_shaded()
+    }
+
+    /// Returns whether allocation-black is currently active.
+    #[cfg(feature = "free-threading")]
+    #[must_use]
+    pub fn allocation_black_active() -> bool {
+        write_barrier_state().allocation_black_active()
+    }
+}
+
+/// C ABI write-barrier hook for generated code.
+///
+/// Default builds export an inert hook so callers do not need a second symbol
+/// contract for stop-the-world execution.
+#[unsafe(no_mangle)]
+pub extern "C" fn pon_gc_write_barrier(slot: *mut *mut u8, new: *mut u8) {
+    WriteBarrier::record(slot, new);
+}
+
+/// A raw slot update captured by the free-threaded write barrier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WriteBarrierRecord {
+    slot: usize,
+    new: usize,
+}
+
+impl WriteBarrierRecord {
+    #[cfg(feature = "free-threading")]
+    fn new(slot: *mut *mut u8, new: *mut u8) -> Self {
+        Self {
+            slot: slot as usize,
+            new: new.addr(),
+        }
+    }
+
+    /// Returns the slot whose contents changed.
+    #[must_use]
+    pub fn slot(self) -> *mut *mut u8 {
+        self.slot as *mut *mut u8
+    }
+
+    /// Returns the pointer written into the slot.
+    #[must_use]
+    pub fn new_value(self) -> *mut u8 {
+        self.new as *mut u8
+    }
+}
+
+#[cfg(feature = "free-threading")]
+#[derive(Debug, Default)]
+struct WriteBarrierState {
+    concurrent_marking: AtomicBool,
+    records: Mutex<Vec<WriteBarrierRecord>>,
+    shaded: Mutex<Vec<usize>>,
+}
+
+#[cfg(feature = "free-threading")]
+impl WriteBarrierState {
+    fn begin_concurrent_marking(&self) {
+        self.concurrent_marking.store(true, Ordering::Release);
+    }
+
+    fn end_concurrent_marking(&self) {
+        self.concurrent_marking.store(false, Ordering::Release);
+    }
+
+    fn allocation_black_active(&self) -> bool {
+        self.concurrent_marking.load(Ordering::Acquire)
+    }
+
+    fn record(&self, slot: *mut *mut u8, new: *mut u8) {
+        if slot.is_null() || new.is_null() || !self.concurrent_marking.load(Ordering::Acquire) {
+            return;
+        }
+
+        self.records
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(WriteBarrierRecord::new(slot, new));
+        self.shaded
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(new.addr());
+    }
+
+    fn drain_records(&self) -> Vec<WriteBarrierRecord> {
+        std::mem::take(&mut *self.records.lock().unwrap_or_else(|poison| poison.into_inner()))
+    }
+
+    fn drain_shaded(&self) -> Vec<*mut u8> {
+        std::mem::take(&mut *self.shaded.lock().unwrap_or_else(|poison| poison.into_inner()))
+            .into_iter()
+            .map(|address| address as *mut u8)
+            .collect()
+    }
+}
+
+#[cfg(feature = "free-threading")]
+fn write_barrier_state() -> &'static WriteBarrierState {
+    static STATE: std::sync::OnceLock<WriteBarrierState> = std::sync::OnceLock::new();
+    STATE.get_or_init(WriteBarrierState::default)
+}
+
+/// Non-owning thread-local allocation buffer descriptor for future fast paths.
+///
+/// The descriptor only tracks bounds; backing memory remains owned by the heap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ThreadLocalAllocationBuffer {
+    start: usize,
+    cursor: usize,
+    limit: usize,
+}
+
+impl ThreadLocalAllocationBuffer {
+    /// Returns an empty buffer.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            start: 0,
+            cursor: 0,
+            limit: 0,
+        }
+    }
+
+    /// Creates a descriptor for the half-open range `[start, limit)`.
+    #[must_use]
+    pub fn from_bounds(start: *mut u8, limit: *mut u8) -> Self {
+        let start = start.addr();
+        let limit = limit.addr();
+        let cursor = start.min(limit);
+        Self {
+            start: cursor,
+            cursor,
+            limit: start.max(limit),
+        }
+    }
+
+    /// Returns the number of bytes available in this buffer.
+    #[must_use]
+    pub fn remaining_bytes(self) -> usize {
+        self.limit.saturating_sub(self.cursor)
+    }
+
+    /// Returns whether this descriptor has no allocatable bytes.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.remaining_bytes() == 0
+    }
+}
+
+/// Minimal wake flag for a future concurrent GC worker.
+#[derive(Debug, Default)]
+pub struct ConcurrentWorkerState {
+    wake_requested: AtomicBool,
+}
+
+impl ConcurrentWorkerState {
+    /// Requests that the worker perform a collection step.
+    pub fn request_cycle(&self) {
+        self.wake_requested.store(true, Ordering::Release);
+    }
+
+    /// Consumes one pending worker request.
+    #[must_use]
+    pub fn take_request(&self) -> bool {
+        self.wake_requested.swap(false, Ordering::AcqRel)
+    }
 }
 
 /// Non-moving stop-the-world heap for managed runtime allocations.
@@ -166,7 +439,8 @@ impl Heap {
             type_id,
             classification: AllocationClass::LargeFallback,
         });
-        state.mark_states.push(MarkState::default());
+        let mark_state = state.new_allocation_mark_state();
+        state.mark_states.push(mark_state);
         state.index_allocation(allocation_index);
 
         raw
@@ -180,7 +454,9 @@ impl Heap {
     pub fn collect(&self, roots: &mut dyn RootSource) {
         let mut root_values = Vec::new();
         roots.for_each_root(&mut |root| root_values.push(root));
-
+        if !collect_precise_stack_roots(&mut |root| root_values.push(root)) {
+            collect_external_stack_roots(&mut |root| root_values.push(root));
+        }
         let mut state = self.lock_state();
         let mut mark_queue = MarkQueue::new();
 
@@ -271,6 +547,17 @@ impl HeapState {
             spans: Vec::new(),
             large_fallbacks: Vec::new(),
         }
+    }
+
+    fn new_allocation_mark_state(&self) -> MarkState {
+        #[cfg(feature = "free-threading")]
+        {
+            if write_barrier_state().allocation_black_active() {
+                return MarkState::black();
+            }
+        }
+
+        MarkState::default()
     }
 
     fn index_allocation(&mut self, allocation_index: usize) {
@@ -495,11 +782,92 @@ impl SmallSpan {
     }
 }
 
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MarkColor {
-    White,
-    Gray,
-    Black,
+pub enum MarkColor {
+    /// Object has not been reached in the current mark cycle.
+    White = 0,
+    /// Object has been reached and awaits scanning.
+    Gray = 1,
+    /// Object and its outgoing references have been scanned.
+    Black = 2,
+}
+
+impl MarkColor {
+    const fn from_byte(value: u8) -> Self {
+        match value {
+            value if value == Self::Gray as u8 => Self::Gray,
+            value if value == Self::Black as u8 => Self::Black,
+            _ => Self::White,
+        }
+    }
+}
+
+/// Atomic tri-color mark word for concurrent marking side tables.
+#[derive(Debug)]
+pub struct AtomicMarkState {
+    color: AtomicU8,
+}
+
+impl AtomicMarkState {
+    /// Creates a white mark word.
+    #[must_use]
+    pub const fn white() -> Self {
+        Self {
+            color: AtomicU8::new(MarkColor::White as u8),
+        }
+    }
+
+    /// Creates a black mark word for allocation-black during concurrent mark.
+    #[must_use]
+    pub const fn allocated_black() -> Self {
+        Self {
+            color: AtomicU8::new(MarkColor::Black as u8),
+        }
+    }
+
+    /// Returns the current color.
+    #[must_use]
+    pub fn color(&self) -> MarkColor {
+        MarkColor::from_byte(self.color.load(Ordering::Acquire))
+    }
+
+    /// Atomically shades a white object gray.
+    ///
+    /// Returns `true` only for the thread that performed the white-to-gray
+    /// transition and therefore owns enqueueing the object for scanning.
+    pub fn shade_gray(&self) -> bool {
+        self.color
+            .compare_exchange(
+                MarkColor::White as u8,
+                MarkColor::Gray as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Marks a scanned object black.
+    pub fn finish_scan_black(&self) {
+        self.color.store(MarkColor::Black as u8, Ordering::Release);
+    }
+
+    /// Resets this mark word for a new cycle.
+    pub fn reset_white(&self) {
+        self.color.store(MarkColor::White as u8, Ordering::Release);
+    }
+
+    /// Returns whether this object is reached in the active cycle.
+    #[must_use]
+    pub fn is_reached(&self) -> bool {
+        matches!(self.color(), MarkColor::Gray | MarkColor::Black)
+    }
+}
+
+impl Default for AtomicMarkState {
+    fn default() -> Self {
+        Self::white()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -520,6 +888,14 @@ impl Default for MarkState {
 impl MarkState {
     fn is_reached(&self) -> bool {
         matches!(self.color, MarkColor::Gray | MarkColor::Black)
+    }
+
+    #[cfg(feature = "free-threading")]
+    fn black() -> Self {
+        Self {
+            color: MarkColor::Black,
+            last_scan: None,
+        }
     }
 }
 
@@ -574,6 +950,42 @@ impl MarkQueue {
     }
 }
 
+fn collect_precise_stack_roots(visitor: &mut dyn FnMut(*mut u8)) -> bool {
+    let Some(hook) = precise_stack_roots() else {
+        return false;
+    };
+
+    // SAFETY: The installed hook owns its stack-walk invariants and may only
+    // call back with candidate root values for this stop-the-world collection.
+    unsafe { hook(visitor) }
+}
+
+fn collect_external_stack_roots(visitor: &mut dyn FnMut(*mut u8)) {
+    let base = external_stack_base();
+    if base.is_null() {
+        return;
+    }
+
+    let stack_marker = 0usize;
+    let current = ptr::addr_of!(stack_marker).cast::<u8>() as usize;
+    let base = base as usize;
+    if current == base {
+        return;
+    }
+
+    let (low, high) = if current < base { (current, base) } else { (base, current) };
+    let word = core::mem::size_of::<usize>();
+    let align_mask = word - 1;
+    let mut slot = (low + align_mask) & !align_mask;
+    while slot + word <= high {
+        let candidate = unsafe { ptr::read_unaligned(slot as *const usize) } as *mut u8;
+        if !candidate.is_null() {
+            visitor(candidate);
+        }
+        slot += word;
+    }
+}
+
 fn size_class_for(size: usize) -> usize {
     size.max(1).next_multiple_of(DEFAULT_HEAP_ALIGNMENT)
 }
@@ -619,6 +1031,20 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const TYPE_ID: TypeId = TypeId(1);
+
+    #[cfg(feature = "free-threading")]
+    static BARRIER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(feature = "free-threading")]
+    fn reset_write_barrier_for_test() -> std::sync::MutexGuard<'static, ()> {
+        let guard = BARRIER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        WriteBarrier::end_concurrent_marking();
+        let _ = WriteBarrier::drain_records();
+        let _ = WriteBarrier::drain_shaded();
+        guard
+    }
 
     struct Roots(Vec<*mut u8>);
 
@@ -904,13 +1330,86 @@ mod tests {
     }
 
     #[test]
-    fn write_barrier_record_is_noop() {
+    fn write_barrier_atomic_mark_state_shades_white_once() {
+        let mark = AtomicMarkState::white();
+
+        assert_eq!(mark.color(), MarkColor::White);
+        assert!(!mark.is_reached());
+        assert!(mark.shade_gray());
+        assert!(!mark.shade_gray());
+        assert_eq!(mark.color(), MarkColor::Gray);
+        assert!(mark.is_reached());
+
+        mark.finish_scan_black();
+
+        assert_eq!(mark.color(), MarkColor::Black);
+        assert!(!mark.shade_gray());
+
+        mark.reset_white();
+
+        assert_eq!(mark.color(), MarkColor::White);
+    }
+
+    #[test]
+    fn write_barrier_record_is_noop_when_inactive() {
+        #[cfg(feature = "free-threading")]
+        let _guard = reset_write_barrier_for_test();
+
         let mut slot = ptr::null_mut();
         let new = NonNull::<u8>::dangling().as_ptr();
 
         WriteBarrier::record(&mut slot, new);
         WriteBarrier::record(ptr::null_mut(), new);
+        pon_gc_write_barrier(&mut slot, new);
 
         assert!(slot.is_null());
+
+        #[cfg(feature = "free-threading")]
+        {
+            assert!(WriteBarrier::drain_records().is_empty());
+            assert!(WriteBarrier::drain_shaded().is_empty());
+            assert!(!WriteBarrier::allocation_black_active());
+        }
+    }
+
+    #[cfg(feature = "free-threading")]
+    #[test]
+    fn write_barrier_records_and_shades_during_concurrent_marking() {
+        let _guard = reset_write_barrier_for_test();
+        let mut slot = ptr::null_mut();
+        let new = NonNull::<u8>::dangling().as_ptr();
+
+        WriteBarrier::begin_concurrent_marking();
+        WriteBarrier::record(&mut slot, new);
+        WriteBarrier::record(ptr::null_mut(), new);
+        WriteBarrier::record(&mut slot, ptr::null_mut());
+        WriteBarrier::end_concurrent_marking();
+
+        assert_eq!(
+            WriteBarrier::drain_records(),
+            vec![WriteBarrierRecord::new(&mut slot, new)],
+        );
+        assert_eq!(WriteBarrier::drain_shaded(), vec![new]);
+        assert!(WriteBarrier::drain_records().is_empty());
+        assert!(WriteBarrier::drain_shaded().is_empty());
+    }
+
+    #[cfg(feature = "free-threading")]
+    #[test]
+    fn write_barrier_allocation_black_marks_new_objects_during_concurrent_marking() {
+        let _guard = reset_write_barrier_for_test();
+        let heap = Heap::new();
+        heap.register_type(TYPE_ID, type_info(8, None));
+
+        let first = heap.alloc(8, TYPE_ID);
+        WriteBarrier::begin_concurrent_marking();
+        let second = heap.alloc(8, TYPE_ID);
+        WriteBarrier::end_concurrent_marking();
+
+        let state = heap.lock_state();
+        assert_eq!(state.classify_pointer(first).unwrap().index, 0);
+        assert_eq!(state.mark_states[0].color, MarkColor::White);
+        assert_eq!(state.classify_pointer(second).unwrap().index, 1);
+        assert_eq!(state.mark_states[1].color, MarkColor::Black);
     }
 }

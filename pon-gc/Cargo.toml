@@ -4,7 +4,14 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+free-threading = []
+
 [lints]
 workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+loom.workspace = true
