@@ -51,6 +51,7 @@ impl PyBaseException {
 pub enum ExceptionKind {
     BaseException,
     Exception,
+    ImportError,
     TypeError,
     ValueError,
     KeyError,
@@ -69,6 +70,7 @@ pub enum ExceptionKind {
 pub struct ExceptionTypeSet {
     pub base_exception: *mut PyType,
     pub exception: *mut PyType,
+    pub import_error: *mut PyType,
     pub type_error: *mut PyType,
     pub value_error: *mut PyType,
     pub key_error: *mut PyType,
@@ -88,6 +90,7 @@ impl ExceptionTypeSet {
     pub fn new(type_type: *mut PyType) -> Self {
         let base_exception = new_exception_type(type_type, "BaseException", ptr::null_mut());
         let exception = new_exception_type(type_type, "Exception", base_exception);
+        let import_error = new_exception_type(type_type, "ImportError", exception);
         let type_error = new_exception_type(type_type, "TypeError", exception);
         let value_error = new_exception_type(type_type, "ValueError", exception);
         let key_error = new_exception_type(type_type, "KeyError", exception);
@@ -103,6 +106,7 @@ impl ExceptionTypeSet {
         Self {
             base_exception,
             exception,
+            import_error,
             type_error,
             value_error,
             key_error,
@@ -123,6 +127,7 @@ impl ExceptionTypeSet {
         match kind {
             ExceptionKind::BaseException => self.base_exception,
             ExceptionKind::Exception => self.exception,
+            ExceptionKind::ImportError => self.import_error,
             ExceptionKind::TypeError => self.type_error,
             ExceptionKind::ValueError => self.value_error,
             ExceptionKind::KeyError => self.key_error,
@@ -139,10 +144,11 @@ impl ExceptionTypeSet {
 
     /// Returns every core builtin exception type required by B05-EXC-CORE.
     #[must_use]
-    pub fn core_types(self) -> [(ExceptionKind, *mut PyType); 13] {
+    pub fn core_types(self) -> [(ExceptionKind, *mut PyType); 14] {
         [
             (ExceptionKind::BaseException, self.base_exception),
             (ExceptionKind::Exception, self.exception),
+            (ExceptionKind::ImportError, self.import_error),
             (ExceptionKind::TypeError, self.type_error),
             (ExceptionKind::ValueError, self.value_error),
             (ExceptionKind::KeyError, self.key_error),
@@ -168,7 +174,62 @@ impl ExceptionTypeSet {
 fn new_exception_type(type_type: *mut PyType, name: &'static str, base: *mut PyType) -> *mut PyType {
     let mut ty = PyType::new(type_type.cast_const(), name, size_of::<PyBaseException>());
     ty.tp_base = base;
+    ty.tp_getattro = Some(exception_getattro);
     Box::into_raw(Box::new(ty))
+}
+
+unsafe extern "C" fn exception_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        crate::thread_state::pon_err_set("exception attribute name must be str");
+        return ptr::null_mut();
+    };
+    let exception = unsafe { &*object.cast::<PyBaseException>() };
+    match name {
+        "args" => {
+            if exception.message.is_null() {
+                crate::native::builtins_mod::alloc_tuple(Vec::new())
+            } else {
+                crate::native::builtins_mod::alloc_tuple(vec![exception.message])
+            }
+        }
+        "value" => {
+            let is_stop_iteration = unsafe {
+                !exception.ob_base.ob_type.is_null()
+                    && (*exception.ob_base.ob_type).name() == "StopIteration"
+            };
+            if is_stop_iteration {
+                if exception.message.is_null() {
+                    unsafe { crate::abi::pon_none() }
+                } else {
+                    exception.message
+                }
+            } else {
+                unsafe { crate::abi::pon_raise_attribute_error(object, crate::intern::intern(name)) }
+            }
+        }
+        "__cause__" => {
+            if exception.cause.is_null() {
+                unsafe { crate::abi::pon_none() }
+            } else {
+                exception.cause
+            }
+        }
+        "__context__" => {
+            if exception.context.is_null() {
+                unsafe { crate::abi::pon_none() }
+            } else {
+                exception.context
+            }
+        }
+        "__traceback__" => {
+            if exception.traceback.is_null() {
+                unsafe { crate::abi::pon_none() }
+            } else {
+                exception.traceback
+            }
+        }
+        _ => unsafe { crate::abi::pon_raise_attribute_error(object, crate::intern::intern(name)) },
+    }
 }
 
 /// Returns true when `sub` is `base` or inherits from it through `tp_base`.

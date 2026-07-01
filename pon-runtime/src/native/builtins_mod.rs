@@ -9,12 +9,14 @@
 use std::cmp::Ordering;
 use std::io::{self, Write};
 use std::ptr;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
 use crate::abi::{self, pon_get_iter, pon_iter_next};
 use crate::intern::{intern, resolve};
 use crate::object::{PyFunction, PyLong, PyObject, PyObjectHeader, PyType, PyUnicode};
 use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set};
+use crate::types::{bool_, property};
+use crate::types::exc::PyBaseException;
 
 pub const VARIADIC_ARITY: usize = usize::MAX;
 
@@ -41,6 +43,7 @@ pub fn for_each_builtin(mut f: impl FnMut(&'static str, usize, *const u8)) {
     builtin!("hasattr", 2, builtin_hasattr);
     builtin!("repr", 1, builtin_repr);
     builtin!("str", VARIADIC_ARITY, builtin_str);
+    builtin!("format", VARIADIC_ARITY, builtin_format);
     builtin!("hash", 1, builtin_hash);
     builtin!("sorted", VARIADIC_ARITY, builtin_sorted);
     builtin!("enumerate", VARIADIC_ARITY, builtin_enumerate);
@@ -62,6 +65,7 @@ pub fn for_each_builtin(mut f: impl FnMut(&'static str, usize, *const u8)) {
     builtin!("int", VARIADIC_ARITY, builtin_int);
     builtin!("issubclass", 2, builtin_issubclass);
     builtin!("float", VARIADIC_ARITY, builtin_float);
+    builtin!("complex", VARIADIC_ARITY, builtin_complex);
     builtin!("bool", VARIADIC_ARITY, builtin_bool);
     builtin!("list", VARIADIC_ARITY, builtin_list);
     builtin!("tuple", VARIADIC_ARITY, builtin_tuple);
@@ -90,6 +94,7 @@ pub(crate) fn make_module() -> Result<*mut PyObject, String> {
     for exception_name in [
         "BaseException",
         "Exception",
+        "ImportError",
         "TypeError",
         "ValueError",
         "KeyError",
@@ -155,6 +160,16 @@ static ZIP_TYPE: OnceLock<usize> = OnceLock::new();
 static MAP_TYPE: OnceLock<usize> = OnceLock::new();
 static FILTER_TYPE: OnceLock<usize> = OnceLock::new();
 static PLACEHOLDER_TYPE: OnceLock<usize> = OnceLock::new();
+static PROPERTY_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let mut ty = PyType::new(ptr::null(), "property", std::mem::size_of::<property::PyProperty>());
+    property::install_property_slots(&mut ty);
+    Box::into_raw(Box::new(ty)) as usize
+});
+static SUPER_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let mut ty = PyType::new(ptr::null(), "super", std::mem::size_of::<crate::types::super_::PySuper>());
+    crate::types::super_::install_super_slots(&mut ty);
+    Box::into_raw(Box::new(ty)) as usize
+});
 
 fn type_from(
     cell: &'static OnceLock<usize>,
@@ -220,6 +235,14 @@ fn placeholder_type() -> *mut PyType {
     type_from(&PLACEHOLDER_TYPE, "object", None, None)
 }
 
+fn property_type() -> *mut PyType {
+    *PROPERTY_TYPE as *mut PyType
+}
+
+fn super_type() -> *mut PyType {
+    *SUPER_TYPE as *mut PyType
+}
+
 fn alloc_native(payload: NativePayload, ty: *mut PyType) -> *mut PyObject {
     Box::into_raw(Box::new(NativeObject {
         ob_base: PyObjectHeader::new(ty),
@@ -262,26 +285,22 @@ unsafe fn as_native<'a>(object: *mut PyObject) -> Option<&'a mut NativeObject> {
     if ty.is_null() {
         return None;
     }
-    let name = unsafe { (*ty).name() };
-    if unsafe { (*ty).gc_type_id } != 0 {
-        return None;
-    }
-    matches!(
-        name,
-        "list"
-            | "tuple"
-            | "set"
-            | "dict"
-            | "range"
-            | "range_iterator"
-            | "list_iterator"
-            | "enumerate"
-            | "zip"
-            | "map"
-            | "filter"
-            | "object"
-    )
-    .then(|| unsafe { &mut *object.cast::<NativeObject>() })
+    let native_ty = [
+        list_type(),
+        tuple_type(),
+        set_type(),
+        dict_type(),
+        range_type(),
+        range_iter_type(),
+        seq_iter_type(),
+        enumerate_type(),
+        zip_type(),
+        map_type(),
+        filter_type(),
+        placeholder_type(),
+    ]
+    .contains(&ty.cast_mut());
+    native_ty.then(|| unsafe { &mut *object.cast::<NativeObject>() })
 }
 
 unsafe extern "C" fn identity_iter_slot(object: *mut PyObject) -> *mut PyObject {
@@ -415,6 +434,9 @@ pub unsafe extern "C" fn builtin_print(argv: *mut *mut PyObject, argc: usize) ->
     let Some(args) = (unsafe { argv_slice(argv, argc) }) else {
         return fail("print() received a null argv pointer");
     };
+    if abi::r#gen::suppress_eager_print() {
+        return unsafe { abi::pon_none() };
+    }
     let mut stdout = io::stdout().lock();
     for (index, value) in args.iter().copied().enumerate() {
         if index != 0 && write!(stdout, " ").is_err() {
@@ -500,7 +522,7 @@ pub unsafe extern "C" fn builtin_isinstance(argv: *mut *mut PyObject, argc: usiz
         return ptr::null_mut();
     };
     let result = unsafe { object_is_instance(args[0], args[1]) };
-    unsafe { abi::pon_const_int(bool_int(result)) }
+    unsafe { abi::number::pon_const_bool(i32::from(result)) }
 }
 
 pub unsafe extern "C" fn builtin_type(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -563,7 +585,7 @@ pub unsafe extern "C" fn builtin_hasattr(argv: *mut *mut PyObject, argc: usize) 
     if !has_attr {
         pon_err_clear();
     }
-    unsafe { abi::pon_const_int(bool_int(has_attr)) }
+    unsafe { abi::number::pon_const_bool(i32::from(has_attr)) }
 }
 
 pub unsafe extern "C" fn builtin_repr(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -584,6 +606,27 @@ pub unsafe extern "C" fn builtin_str(argv: *mut *mut PyObject, argc: usize) -> *
     }
 }
 
+pub unsafe extern "C" fn builtin_format(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { argv_slice(argv, argc) }) else {
+        return fail("format() received a null argv pointer");
+    };
+    if !(1..=2).contains(&args.len()) {
+        return fail(format!("format() expected 1 or 2 arguments, got {}", args.len()));
+    }
+    let spec = if let Some(spec) = args.get(1).copied() {
+        let Some(spec) = object_to_string(spec) else {
+            return fail("format() argument 2 must be str");
+        };
+        spec
+    } else {
+        String::new()
+    };
+    match abi::str_::format_object_with_spec(args[0], &spec) {
+        Ok(text) => alloc_str(&text),
+        Err(message) => fail(message),
+    }
+}
+
 pub unsafe extern "C" fn builtin_hash(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let Some(args) = (unsafe { exact_args(argv, argc, 1, "hash") }) else {
         return ptr::null_mut();
@@ -600,15 +643,22 @@ pub unsafe extern "C" fn builtin_sorted(argv: *mut *mut PyObject, argc: usize) -
     let Some(args) = (unsafe { argv_slice(argv, argc) }) else {
         return fail("sorted() received a null argv pointer");
     };
-    if !(1..=2).contains(&args.len()) {
-        return fail(format!("sorted() expected 1 or 2 positional arguments, got {}", args.len()));
+    if !(1..=3).contains(&args.len()) {
+        return fail(format!("sorted() expected 1 to 3 positional arguments, got {}", args.len()));
     }
     let mut items = match collect_iterable(args[0]) {
         Ok(items) => items,
         Err(message) => return fail(message),
     };
-    let key_func = (args.len() == 2).then_some(args[1]);
+    let key_func = args.get(1).copied().filter(|key| !is_none(*key));
     items.sort_by(|a, b| compare_for_sort(*a, *b, key_func));
+    if let Some(reverse) = args.get(2).copied() {
+        match unsafe { truth(reverse) } {
+            Ok(true) => items.reverse(),
+            Ok(false) => {}
+            Err(message) => return fail(message),
+        }
+    }
     alloc_sequence(SequenceKind::List, items)
 }
 
@@ -683,7 +733,7 @@ pub unsafe extern "C" fn builtin_all(argv: *mut *mut PyObject, argc: usize) -> *
         return ptr::null_mut();
     };
     match iterate_truth(args[0], true) {
-        Ok(value) => unsafe { abi::pon_const_int(bool_int(value)) },
+        Ok(value) => unsafe { abi::number::pon_const_bool(i32::from(value)) },
         Err(message) => fail(message),
     }
 }
@@ -693,7 +743,7 @@ pub unsafe extern "C" fn builtin_any(argv: *mut *mut PyObject, argc: usize) -> *
         return ptr::null_mut();
     };
     match iterate_truth(args[0], false) {
-        Ok(value) => unsafe { abi::pon_const_int(bool_int(value)) },
+        Ok(value) => unsafe { abi::number::pon_const_bool(i32::from(value)) },
         Err(message) => fail(message),
     }
 }
@@ -751,10 +801,20 @@ pub unsafe extern "C" fn builtin_round(argv: *mut *mut PyObject, argc: usize) ->
     if !(1..=2).contains(&args.len()) {
         return fail(format!("round() expected 1 or 2 arguments, got {}", args.len()));
     }
-    let Ok(value) = arg_i64(args[0], "round") else {
+    if let Some(value) = object_to_i64(args[0]) {
+        return unsafe { abi::pon_const_int(value) };
+    }
+    let Some(value) = object_to_f64(args[0]) else {
+        return fail("round() expected int or float argument");
+    };
+    if args.len() == 1 {
+        return unsafe { abi::pon_const_int(value.round() as i64) };
+    }
+    let Ok(ndigits) = arg_i64(args[1], "round") else {
         return ptr::null_mut();
     };
-    unsafe { abi::pon_const_int(value) }
+    let factor = 10_f64.powi(ndigits.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32);
+    crate::types::float::from_f64((value * factor).round() / factor)
 }
 
 pub unsafe extern "C" fn builtin_divmod(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -837,7 +897,7 @@ pub unsafe extern "C" fn builtin_issubclass(argv: *mut *mut PyObject, argc: usiz
         return ptr::null_mut();
     };
     let result = unsafe { type_object_name(args[0]) == type_object_name(args[1]) };
-    unsafe { abi::pon_const_int(bool_int(result)) }
+    unsafe { abi::number::pon_const_bool(i32::from(result)) }
 }
 
 pub unsafe extern "C" fn builtin_int(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -848,14 +908,40 @@ pub unsafe extern "C" fn builtin_float(argv: *mut *mut PyObject, argc: usize) ->
     unsafe { numeric_constructor(argv, argc, "float") }
 }
 
+pub unsafe extern "C" fn builtin_complex(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { argv_slice(argv, argc) }) else {
+        return fail("complex() received a null argv pointer");
+    };
+    if args.len() > 2 {
+        return fail(format!("complex() expected at most 2 arguments, got {}", args.len()));
+    }
+    let real = if let Some(arg) = args.first().copied() {
+        object_to_f64(arg).or_else(|| unsafe { crate::types::complex_::to_f64s(arg) }.map(|(real, _)| real))
+    } else {
+        Some(0.0)
+    };
+    let Some(real) = real else {
+        return fail("complex() first argument must be a number");
+    };
+    let imag = if let Some(arg) = args.get(1).copied() {
+        object_to_f64(arg)
+    } else {
+        Some(0.0)
+    };
+    let Some(imag) = imag else {
+        return fail("complex() second argument must be a real number");
+    };
+    crate::types::complex_::from_f64s(real, imag)
+}
+
 pub unsafe extern "C" fn builtin_bool(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let Some(args) = (unsafe { argv_slice(argv, argc) }) else {
         return fail("bool() received a null argv pointer");
     };
     match args.len() {
-        0 => unsafe { abi::pon_const_int(0) },
+        0 => unsafe { abi::number::pon_const_bool(0) },
         1 => match unsafe { truth(args[0]) } {
-            Ok(value) => unsafe { abi::pon_const_int(bool_int(value)) },
+            Ok(value) => unsafe { abi::number::pon_const_bool(i32::from(value)) },
             Err(message) => fail(message),
         },
         _ => fail(format!("bool() expected at most 1 argument, got {}", args.len())),
@@ -902,12 +988,42 @@ pub unsafe extern "C" fn builtin_object(argv: *mut *mut PyObject, argc: usize) -
     alloc_placeholder("object")
 }
 
-pub unsafe extern "C" fn builtin_super(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
-    alloc_placeholder("super")
+pub unsafe extern "C" fn builtin_super(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { argv_slice(argv, argc) }) else {
+        return fail("super() received a null argv pointer");
+    };
+    let (start, obj) = match args.len() {
+        0 => match infer_zero_arg_super() {
+            Ok(pair) => pair,
+            Err(message) => return fail(message),
+        },
+        2 => {
+            let Some(start) = (unsafe { type_object(args[0]) }) else {
+                return fail("super() argument 1 must be a type");
+            };
+            (start, args[1])
+        }
+        _ => return fail(format!("super() expected 0 or 2 arguments, got {}", args.len())),
+    };
+    unsafe { crate::types::super_::new_super(super_type(), start, obj) }
 }
 
-pub unsafe extern "C" fn builtin_property(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
-    alloc_placeholder("property")
+pub unsafe extern "C" fn builtin_property(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { argv_slice(argv, argc) }) else {
+        return fail("property() received a null argv pointer");
+    };
+    if args.len() > 4 {
+        return fail(format!("property() expected at most 4 arguments, got {}", args.len()));
+    }
+    unsafe {
+        property::new_property(
+            property_type(),
+            args.first().copied().unwrap_or(ptr::null_mut()),
+            args.get(1).copied().unwrap_or(ptr::null_mut()),
+            args.get(2).copied().unwrap_or(ptr::null_mut()),
+            args.get(3).copied().unwrap_or(ptr::null_mut()),
+        )
+    }
 }
 
 pub unsafe extern "C" fn builtin_classmethod(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -944,7 +1060,7 @@ pub unsafe extern "C" fn builtin_callable(argv: *mut *mut PyObject, argc: usize)
         return ptr::null_mut();
     };
     let result = unsafe { type_name(args[0]).is_some_and(|name| matches!(name, "function" | "method" | "type")) };
-    unsafe { abi::pon_const_int(bool_int(result)) }
+    unsafe { abi::number::pon_const_bool(i32::from(result)) }
 }
 
 pub unsafe extern "C" fn builtin_globals(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -970,12 +1086,18 @@ pub fn repr_text(object: *mut PyObject) -> String {
     if object.is_null() {
         return "<NULL>".to_owned();
     }
+    if let Some(value) = unsafe { bool_::to_bool(object) } {
+        return if value { "True".to_owned() } else { "False".to_owned() };
+    }
     if let Some(value) = object_to_i64(object) {
         return value.to_string();
     }
     if unsafe { crate::types::float::is_exact_float(object) } {
         let float = unsafe { &*object.cast::<crate::types::float::PyFloat>() };
         return crate::types::float::repr_f64(float.value);
+    }
+    if let Some((real, imag)) = unsafe { crate::types::complex_::to_f64s(object) } {
+        return crate::types::complex_::repr_complex(real, imag);
     }
     if let Some(text) = object_to_string(object) {
         return format!("'{text}'");
@@ -1007,6 +1129,9 @@ pub fn repr_text(object: *mut PyObject) -> String {
             if name == "function" {
                 let function = &*object.cast::<PyFunction>();
                 let fname = resolve(function.name_interned).unwrap_or_else(|| "<lambda>".to_owned());
+                if matches!(fname.as_str(), "int" | "str" | "bool" | "float") {
+                    return format!("<class '{fname}'>");
+                }
                 return format!("<function {fname}>");
             }
             if name == "type" {
@@ -1015,6 +1140,15 @@ pub fn repr_text(object: *mut PyObject) -> String {
             }
             if name == "list" {
                 if let Ok(text) = crate::types::list::list_repr(object) {
+                    return text;
+                }
+            }
+            if name == "tuple" {
+                let tuple = &*object.cast::<crate::types::tuple::PyTuple>();
+                return format_sequence(SequenceKind::Tuple, tuple.as_slice());
+            }
+            if name == "dict" {
+                if let Ok(text) = dict_repr(object) {
                     return text;
                 }
             }
@@ -1047,6 +1181,15 @@ fn format_sequence(kind: SequenceKind, items: &[*mut PyObject]) -> String {
 
 fn join_repr(items: &[*mut PyObject]) -> String {
     items.iter().copied().map(repr_text).collect::<Vec<_>>().join(", ")
+}
+
+fn dict_repr(object: *mut PyObject) -> Result<String, String> {
+    let entries = unsafe { crate::types::dict::dict_entries_snapshot(object)? };
+    let mut parts = Vec::with_capacity(entries.len());
+    for entry in entries {
+        parts.push(format!("{}: {}", repr_text(entry.key), repr_text(entry.value)));
+    }
+    Ok(format!("{{{}}}", parts.join(", ")))
 }
 
 unsafe fn argv_slice<'a>(argv: *mut *mut PyObject, argc: usize) -> Option<&'a [*mut PyObject]> {
@@ -1088,6 +1231,9 @@ fn object_to_i64(object: *mut PyObject) -> Option<i64> {
     if object.is_null() {
         return None;
     }
+    if let Some(value) = unsafe { bool_::to_bool(object) } {
+        return Some(i64::from(value));
+    }
     unsafe {
         let ty = (*object).ob_type;
         if ty.is_null() || (*ty).name() != "int" {
@@ -1097,17 +1243,47 @@ fn object_to_i64(object: *mut PyObject) -> Option<i64> {
     }
 }
 
+fn object_to_f64(object: *mut PyObject) -> Option<f64> {
+    if let Some(value) = unsafe { crate::types::float::to_f64(object) } {
+        return Some(value);
+    }
+    object_to_i64(object).map(|value| value as f64)
+}
+
 fn object_to_string(object: *mut PyObject) -> Option<String> {
     if object.is_null() {
         return None;
     }
     unsafe {
         let ty = (*object).ob_type;
-        if ty.is_null() || (*ty).name() != "str" {
+        if ty.is_null() {
             return None;
         }
-        (*object.cast::<PyUnicode>()).as_str().map(ToOwned::to_owned)
+        if (*ty).name() == "str" {
+            return (*object.cast::<PyUnicode>()).as_str().map(ToOwned::to_owned);
+        }
+        exception_message_text(object, ty)
     }
+}
+
+unsafe fn exception_message_text(object: *mut PyObject, mut ty: *const PyType) -> Option<String> {
+    let original_name = unsafe { (*ty).name() };
+    while !ty.is_null() {
+        if unsafe { (*ty).name() == "BaseException" } {
+            // SAFETY: Reaching BaseException in the type chain proves compatible layout.
+            let message = unsafe { (*object.cast::<PyBaseException>()).message };
+            if message.is_null() {
+                return Some(String::new());
+            }
+            if original_name == "KeyError" {
+                return Some(repr_text(message));
+            }
+            return object_to_string(message);
+        }
+        // SAFETY: `ty` is a live type object from an object header.
+        ty = unsafe { (*ty).tp_base.cast_const() };
+    }
+    None
 }
 
 unsafe fn type_name(object: *mut PyObject) -> Option<&'static str> {
@@ -1121,6 +1297,7 @@ unsafe fn type_name(object: *mut PyObject) -> Option<&'static str> {
     let name = unsafe { (*ty).name() };
     Some(match name {
         "int" => "int",
+        "bool" => "bool",
         "str" => "str",
         "function" => "function",
         "NoneType" => "NoneType",
@@ -1150,6 +1327,48 @@ fn arg_i64(object: *mut PyObject, owner: &str) -> Result<i64, *mut PyObject> {
     object_to_i64(object).ok_or_else(|| fail(format!("{owner}() expected int argument")))
 }
 
+unsafe fn type_object(object: *mut PyObject) -> Option<*mut PyType> {
+    if object.is_null() {
+        return None;
+    }
+    let ty = unsafe { (*object).ob_type };
+    if ty.is_null() || unsafe { (*ty).name() } != "type" {
+        return None;
+    }
+    Some(object.cast::<PyType>())
+}
+
+fn infer_zero_arg_super() -> Result<(*mut PyType, *mut PyObject), String> {
+    let mut saw_call_with_args = false;
+    for (function, self_arg) in abi::current_call_snapshots() {
+        saw_call_with_args = true;
+        let obj_type = unsafe { (*self_arg).ob_type.cast_mut() };
+        if obj_type.is_null() {
+            continue;
+        }
+        for class in unsafe { crate::mro::mro_entries(obj_type) } {
+            if class.is_null() {
+                continue;
+            }
+            let dict = unsafe { (*class).tp_dict };
+            if dict.is_null() {
+                continue;
+            }
+            let dict = unsafe { &*dict.cast::<crate::types::type_::PyClassDict>() };
+            if dict.iter().any(|(_, value)| value == function) {
+                return Ok((class, self_arg));
+            }
+        }
+    }
+    if saw_call_with_args {
+        Err("super(): current function was not found in the receiver MRO".to_owned())
+    } else if abi::current_function_object().is_null() {
+        Err("super(): no current function".to_owned())
+    } else {
+        Err("super(): no arguments".to_owned())
+    }
+}
+
 fn length(object: *mut PyObject) -> Result<i64, String> {
     if let Some(text) = object_to_string(object) {
         return Ok(text.len() as i64);
@@ -1161,6 +1380,23 @@ fn length(object: *mut PyObject) -> Result<i64, String> {
                 NativePayload::Range { start, stop, step } => Ok(range_len(*start, *stop, *step)),
                 _ => Err("object of this native type has no len()".to_owned()),
             };
+        }
+        let ty = (*object).ob_type;
+        if !ty.is_null() {
+            if let Some(slot) = (*ty).tp_as_sequence.as_ref().and_then(|methods| methods.sq_length) {
+                let len = slot(object);
+                if len >= 0 {
+                    return Ok(len as i64);
+                }
+                return Err("__len__ returned a negative value".to_owned());
+            }
+            if let Some(slot) = (*ty).tp_as_mapping.as_ref().and_then(|methods| methods.mp_length) {
+                let len = slot(object);
+                if len >= 0 {
+                    return Ok(len as i64);
+                }
+                return Err("mapping __len__ returned a negative value".to_owned());
+            }
         }
     }
     Err("object has no len()".to_owned())
@@ -1303,17 +1539,32 @@ unsafe fn numeric_constructor(argv: *mut *mut PyObject, argc: usize, name: &str)
         return fail(format!("{name}() received a null argv pointer"));
     };
     match args.len() {
+        0 if name == "float" => crate::types::float::from_f64(0.0),
         0 => unsafe { abi::pon_const_int(0) },
+        1 if name == "float" => {
+            if let Some(value) = object_to_f64(args[0]) {
+                crate::types::float::from_f64(value)
+            } else if let Some(text) = object_to_string(args[0]) {
+                match text.parse::<f64>() {
+                    Ok(value) => crate::types::float::from_f64(value),
+                    Err(_) => fail(format!("could not convert string to float: {text}")),
+                }
+            } else {
+                fail("float() expected int, float, or str argument")
+            }
+        }
         1 => {
             if let Some(value) = object_to_i64(args[0]) {
                 unsafe { abi::pon_const_int(value) }
+            } else if let Some(value) = object_to_f64(args[0]) {
+                unsafe { abi::pon_const_int(value as i64) }
             } else if let Some(text) = object_to_string(args[0]) {
                 match text.parse::<i64>() {
                     Ok(value) => unsafe { abi::pon_const_int(value) },
                     Err(_) => fail(format!("invalid literal for {name}(): {text}")),
                 }
             } else {
-                fail(format!("{name}() expected int or str argument"))
+                fail(format!("{name}() expected int, float, or str argument"))
             }
         }
         _ => fail(format!("{name}() expected at most 1 argument, got {}", args.len())),
@@ -1347,18 +1598,20 @@ unsafe fn object_is_instance(object: *mut PyObject, classinfo: *mut PyObject) ->
     if object.is_null() || classinfo.is_null() {
         return false;
     }
+    let classinfo_type = unsafe { (*classinfo).ob_type };
+    if !classinfo_type.is_null() && unsafe { (*classinfo_type).name() } == "type" {
+        return unsafe { crate::descr::isinstance(object, classinfo) > 0 };
+    }
     let object_type = unsafe { (*object).ob_type };
     if object_type.is_null() {
         return false;
-    }
-    if object_type.cast::<PyObject>() == classinfo {
-        return true;
     }
     let Some(expected_name) = (unsafe { type_object_name(classinfo) }) else {
         return false;
     };
     unsafe { (*object_type).name() == expected_name }
 }
+
 
 unsafe fn type_object_name(object: *mut PyObject) -> Option<String> {
     if object.is_null() {
@@ -1393,9 +1646,6 @@ unsafe fn type_object_name(object: *mut PyObject) -> Option<String> {
     unsafe { type_name(object).map(ToOwned::to_owned) }
 }
 
-fn bool_int(value: bool) -> i64 {
-    if value { 1 } else { 0 }
-}
 
 fn stable_hash(text: &str) -> i64 {
     let mut hash: i64 = 0xcbf29ce484222325_u64 as i64;

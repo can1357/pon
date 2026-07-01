@@ -121,6 +121,16 @@ fn raise_type_error_text(text: &str) -> *mut PyObject {
     }
 }
 
+pub fn raise_import_error_text(text: &str) -> *mut PyObject {
+    match ensure_runtime_for_exc() {
+        Ok(()) => match super::with_runtime(|runtime| raise_builtin_text(runtime, ExceptionKind::ImportError, text)) {
+            Some(result) => result,
+            None => super::return_null_with_error("runtime is not initialized"),
+        },
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
 fn raise_message_exception(kind: ExceptionKind, ptr: *const u8, len: usize) -> *mut PyObject {
     let bytes = match bytes_from_raw(ptr, len) {
         Ok(bytes) => bytes,
@@ -161,6 +171,7 @@ fn exception_kind_name(kind: ExceptionKind) -> &'static str {
     match kind {
         ExceptionKind::BaseException => "BaseException",
         ExceptionKind::Exception => "Exception",
+        ExceptionKind::ImportError => "ImportError",
         ExceptionKind::TypeError => "TypeError",
         ExceptionKind::ValueError => "ValueError",
         ExceptionKind::KeyError => "KeyError",
@@ -553,20 +564,10 @@ pub unsafe extern "C" fn pon_match_exc(exc_type: *mut PyObject) -> *mut PyObject
             return unsafe { super::pon_none() };
         }
 
-        let current = {
-            let mut state = thread_state_lock();
-            let current = state.current_exc;
-            if current.is_null() || is_diagnostic_sentinel(current) {
-                ptr::null_mut()
-            } else {
-                state.current_exc = ptr::null_mut();
-                current
-            }
-        };
-        if current.is_null() {
+        let current = thread_state_lock().current_exc;
+        if current.is_null() || is_diagnostic_sentinel(current) {
             unsafe { super::pon_none() }
         } else {
-            pon_err_clear();
             current
         }
     })

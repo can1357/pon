@@ -134,6 +134,10 @@ pub unsafe extern "C" fn generic_get_attr(object: *mut PyObject, name: *mut PyOb
     let Some(name_id) = (unsafe { name_id(name) }) else {
         return raise_attr_error("attribute name must be a string");
     };
+    if name_id == intern::intern("__name__") && unsafe { is_type_object(object) } {
+        let type_name = unsafe { (*object.cast::<PyType>()).name() };
+        return unsafe { abi::pon_const_str(type_name.as_ptr(), type_name.len()) };
+    }
 
     let obj_ty = unsafe { object_type(object) };
     if obj_ty.is_null() {
