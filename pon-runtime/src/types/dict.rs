@@ -95,6 +95,7 @@ pub fn dict_iter_type(type_type: *const PyType) -> *mut PyType {
     static TYPE: LazyLock<usize> = LazyLock::new(|| {
         let mut ty = PyType::new(ptr::null(), "dict_keyiterator", size_of::<PyDictIter>());
         ty.tp_iternext = Some(dict_iter_next_slot);
+        ty.tp_iter = Some(dict_iter_identity_slot);
         Box::into_raw(Box::new(ty)) as usize
     });
     let ty = *TYPE as *mut PyType;
@@ -474,17 +475,28 @@ unsafe extern "C" fn dict_iter_slot(object: *mut PyObject) -> *mut PyObject {
     unsafe { crate::abi::map::pon_dict_iter_keys(object) }
 }
 
+unsafe extern "C" fn dict_iter_identity_slot(iterator: *mut PyObject) -> *mut PyObject {
+    iterator
+}
+
 unsafe extern "C" fn dict_iter_next_slot(iterator: *mut PyObject) -> *mut PyObject {
     unsafe { crate::abi::map::pon_dict_iter_next(iterator) }
 }
 
 unsafe extern "C" fn dict_getattro_slot(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
-    if unsafe { unicode_attr_name_is(name, "get") } {
-        return unsafe { crate::abi::map::pon_dict_get_bound_method(object) };
+    let Some(attr) = (unsafe { unicode_attr_name_display(name) }) else {
+        pon_err_set("dict attribute name must be str");
+        return ptr::null_mut();
+    };
+    match attr.as_str() {
+        "get" | "keys" | "values" | "items" | "setdefault" | "pop" | "update" => unsafe {
+            crate::abi::map::pon_dict_bound_method(object, &attr)
+        },
+        _ => {
+            pon_err_set(format!("attribute '{attr}' was not found"));
+            ptr::null_mut()
+        }
     }
-    let attr = unsafe { unicode_attr_name_display(name) }.unwrap_or_else(|| "<unknown>".to_owned());
-    pon_err_set(format!("attribute '{attr}' was not found"));
-    ptr::null_mut()
 }
 
 unsafe fn unicode_attr_name_is(name: *mut PyObject, expected: &str) -> bool {

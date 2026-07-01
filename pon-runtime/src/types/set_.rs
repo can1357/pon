@@ -6,7 +6,7 @@ use core::ptr;
 use std::sync::LazyLock;
 
 use crate::object::{PyNumberMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType};
-use crate::types::dict::{hash_object, object_equal, type_name};
+use crate::types::{dict::{hash_object, object_equal, type_name}, type_};
 
 /// Boxed mutable Python `set`.
 #[repr(C)]
@@ -49,6 +49,7 @@ pub fn set_type(type_type: *const PyType) -> *mut PyType {
         ty.tp_as_sequence = Box::into_raw(Box::new(sequence));
         ty.tp_as_number = Box::into_raw(Box::new(number));
         ty.tp_iter = Some(set_iter_slot);
+        ty.tp_getattro = Some(set_getattro_slot);
         Box::into_raw(Box::new(ty)) as usize
     });
     let ty = *TYPE as *mut PyType;
@@ -181,6 +182,19 @@ pub unsafe fn set_add(set: *mut PyObject, item: *mut PyObject) -> Result<(), Str
         let index = set.entries.len();
         set.entries.push(item);
         insert_bucket(&mut set.buckets, &set.entries, index)?;
+    }
+    Ok(())
+}
+
+/// Removes an element from a mutable set if present.
+pub unsafe fn set_discard(set: *mut PyObject, item: *mut PyObject) -> Result<(), String> {
+    if item.is_null() {
+        return Err("set item is NULL".to_owned());
+    }
+    let set = unsafe { set_mut(set)? };
+    if let Some(index) = unsafe { find_element_index(&set.entries, item)? } {
+        set.entries.remove(index);
+        rebuild_set_buckets(set)?;
     }
     Ok(())
 }
@@ -342,6 +356,18 @@ unsafe extern "C" fn set_intersection_slot(left: *mut PyObject, right: *mut PyOb
 
 unsafe extern "C" fn set_difference_slot(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
     unsafe { crate::abi::map::pon_set_difference(left, right) }
+}
+
+unsafe extern "C" fn set_getattro_slot(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name) = (unsafe { type_::unicode_text(name) }) else {
+        return crate::abi::return_null_with_error("set attribute name must be str");
+    };
+    match name {
+        "add" | "discard" | "union" | "intersection" | "difference" | "issubset" => unsafe {
+            crate::abi::map::pon_set_bound_method(object, name)
+        },
+        _ => crate::abi::return_null_with_error(format!("attribute '{name}' was not found")),
+    }
 }
 
 unsafe fn install_type_type(ty: *mut PyType, type_type: *const PyType) {
