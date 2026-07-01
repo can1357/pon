@@ -79,7 +79,13 @@ pub fn install_package(env: &EnvLayout, resolved_record: &ResolvedRecord) -> Res
     match &resolved_record.artifact {
         PackageArtifact::Wheel { filename } => crate::wheel::install_wheel(env, resolved_record, filename),
         PackageArtifact::Sdist { filename } => crate::sdist::install_sdist(env, resolved_record, filename),
-        PackageArtifact::LocalPath { path } => crate::native::install_local_package(env, resolved_record, path),
+        PackageArtifact::LocalPath { path } => match crate::native::install_local_package(env, resolved_record, path) {
+            Ok(report) => Ok(report),
+            Err(Error::UnsupportedArtifact(message)) if message.contains("[tool.pon.native].import-name") => {
+                crate::local::install_local_python_package(env, resolved_record, path)
+            }
+            Err(error) => Err(error),
+        },
     }
 }
 

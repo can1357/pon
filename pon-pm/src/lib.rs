@@ -5,6 +5,7 @@ pub mod env;
 pub mod error;
 pub mod index;
 pub mod manifest;
+pub mod local;
 pub mod marker;
 pub mod install;
 pub mod native;
