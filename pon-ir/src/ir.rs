@@ -77,19 +77,57 @@ id_newtype! {
 
 /// A lowered Python function.
 ///
-/// Blocks are stored in layout order; `blocks[0]` is the entry block. Parameters
-/// occupy local slots `0..arity`, and `n_locals` includes both parameters and
-/// compiler-discovered local bindings.
+/// Blocks are stored in layout order; `blocks[0]` is the entry block. Positional
+/// parameters occupy the leading local slots; [`ParamLayout`] records the full
+/// call-binding order for keyword-only, `*args`, and `**kwargs` slots.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Function {
     /// Debug/source name. The synthetic module body is named `__main__`.
     pub name: String,
     /// Positional argument count accepted by the Phase-A ABI.
     pub arity: usize,
+    /// True when this function was produced from `async def` and calls must return a coroutine object.
+    pub is_coroutine: bool,
+    /// Full formal-parameter layout used by Phase-B function binding.
+    pub params: ParamLayout,
     /// Function control-flow blocks.
     pub blocks: Vec<Block>,
     /// Number of local slots needed by this function.
     pub n_locals: usize,
+}
+
+/// Full formal-parameter layout for a lowered function.
+///
+/// `names` contains positional and keyword-only parameter names in runtime
+/// binding order, excluding `*args` and `**kwargs`. Variadic names are kept
+/// separately because the runtime ABI stores them outside the named-parameter
+/// array.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParamLayout {
+    /// Positional and keyword-only parameter names, excluding variadics.
+    pub names: Vec<String>,
+    /// Leading positional-only count.
+    pub positional_only_count: usize,
+    /// Positional-or-keyword count after positional-only parameters.
+    pub positional_count: usize,
+    /// Keyword-only parameter count after positional parameters.
+    pub keyword_only_count: usize,
+    /// `*args` parameter name when present.
+    pub vararg_name: Option<String>,
+    /// `**kwargs` parameter name when present.
+    pub kwarg_name: Option<String>,
+}
+
+impl ParamLayout {
+    /// Total number of argv slots produced by runtime argument binding.
+    pub fn total_slot_count(&self) -> usize {
+        self.names.len() + usize::from(self.vararg_name.is_some()) + usize::from(self.kwarg_name.is_some())
+    }
+
+    /// Phase-A-compatible positional arity.
+    pub fn positional_arity(&self) -> usize {
+        self.positional_only_count + self.positional_count
+    }
 }
 
 /// Index of a basic block in [`Function::blocks`].
@@ -380,6 +418,8 @@ pub enum InstKind {
     YieldFrom { iter: ValueId },
     /// Await an awaitable via its `__await__` iterator.
     Await { awaitable: ValueId },
+    /// Finish an eagerly-lowered generator with an explicit StopIteration value.
+    EagerGeneratorReturn { value: ValueId },
     /// Raise an exception, optionally with an explicit cause.
     Raise {
         /// Exception instance or type; `None` means bare `raise`.
@@ -390,7 +430,14 @@ pub enum InstKind {
     /// Re-raise the active exception.
     Reraise,
     /// Push the current exception state for `except`/`finally` handling.
-    PushExcInfo,
+    PushExcInfo {
+        /// Handler block used by the boxed codegen NULL-sentinel edge while this handler is active.
+        target: BlockId,
+        /// Operand-stack depth to restore before entering the handler.
+        stack_depth: u32,
+        /// Handler kind tag owned by the lowering/runtime exception workstream.
+        kind: u8,
+    },
     /// Pop the current exception state after handler cleanup.
     PopExcInfo,
     /// Test whether the active exception matches an exception type.
