@@ -8,6 +8,9 @@ pub struct MarkerEnvironment {
     pub sys_platform: String,
     pub platform_machine: String,
     pub platform_system: String,
+    pub implementation_name: String,
+    pub implementation_version: String,
+    pub python_implementation: String,
     pub extra: Option<String>,
 }
 
@@ -21,6 +24,9 @@ impl MarkerEnvironment {
             sys_platform: std::env::consts::OS.to_owned(),
             platform_machine: std::env::consts::ARCH.to_owned(),
             platform_system: std::env::consts::OS.to_owned(),
+            implementation_name: "pon".to_owned(),
+            implementation_version: env!("CARGO_PKG_VERSION").to_owned(),
+            python_implementation: "Pon".to_owned(),
             extra: None,
         }
     }
@@ -33,6 +39,9 @@ impl MarkerEnvironment {
             "sys_platform" => Some(&self.sys_platform),
             "platform_machine" => Some(&self.platform_machine),
             "platform_system" => Some(&self.platform_system),
+            "implementation_name" => Some(&self.implementation_name),
+            "implementation_version" => Some(&self.implementation_version),
+            "python_implementation" | "platform_python_implementation" => Some(&self.python_implementation),
             "extra" => self.extra.as_deref(),
             _ => None,
         }
@@ -133,6 +142,9 @@ mod tests {
             sys_platform: "darwin".to_owned(),
             platform_machine: "arm64".to_owned(),
             platform_system: "Darwin".to_owned(),
+            implementation_name: "pon".to_owned(),
+            implementation_version: "0.1.0".to_owned(),
+            python_implementation: "Pon".to_owned(),
             extra: Some("test".to_owned()),
         }
     }
@@ -147,8 +159,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_marker_variables() {
-        let marker = MarkerExpression::parse("implementation_name == 'cpython'").expect("parse");
-        assert!(marker.evaluate(&env()).is_err());
+    fn evaluates_implementation_markers() {
+        let positive = MarkerExpression::parse("implementation_name == 'pon'").expect("parse");
+        let negative = MarkerExpression::parse("implementation_name == 'cpython'").expect("parse");
+
+        assert!(positive.evaluate(&env()).expect("positive"));
+        assert!(!negative.evaluate(&env()).expect("negative"));
     }
 }
