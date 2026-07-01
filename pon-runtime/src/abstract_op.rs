@@ -14,7 +14,7 @@ use core::ffi::c_int;
 use core::{mem, ptr};
 
 use crate::abi;
-use crate::object::{BinaryFunc, PyLong, PyObject, PyType, RichCmpFunc, UnaryFunc};
+use crate::object::{BinaryFunc, PyLong, PyObject, PyType, PyUnicode, RichCmpFunc, UnaryFunc};
 use crate::thread_state::pon_err_occurred;
 
 /// Binary operation selectors shared with the Phase-B IR lowering contract.
@@ -167,6 +167,21 @@ pub unsafe fn rich_compare(op: u8, a: *mut PyObject, b: *mut PyObject) -> *mut P
     let Some(right_type) = (unsafe { object_type(b) }) else {
         return raise_type_error("right operand is NULL or has no type");
     };
+
+    if unsafe { (*left_type).name() == "str" && (*right_type).name() == "str" } {
+        let left = unsafe { unicode_bytes(&*a.cast::<PyUnicode>()) };
+        let right = unsafe { unicode_bytes(&*b.cast::<PyUnicode>()) };
+        let result = match op {
+            RICH_EQ => left == right,
+            RICH_NE => left != right,
+            RICH_LT => left < right,
+            RICH_LE => left <= right,
+            RICH_GT => left > right,
+            RICH_GE => left >= right,
+            _ => return raise_type_error("unknown rich comparison operation"),
+        };
+        return unsafe { abi::pon_const_int(if result { 1 } else { 0 }) };
+    }
 
     let same_type = left_type == right_type;
     let left_richcmp_slot = unsafe { (*left_type).tp_richcmp };
@@ -406,6 +421,14 @@ fn same_binary_slot(left: Option<BinaryFunc>, right: Option<BinaryFunc>) -> bool
     match (left, right) {
         (Some(left), Some(right)) => (left as usize) == (right as usize),
         _ => false,
+    }
+}
+
+unsafe fn unicode_bytes(value: &PyUnicode) -> &[u8] {
+    if value.data.is_null() && value.len != 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(value.data, value.len) }
     }
 }
 

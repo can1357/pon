@@ -9,8 +9,8 @@ use core::mem;
 use core::ptr;
 use std::sync::{LazyLock, OnceLock};
 
-use crate::object::{PyLong, PyObject, PyObjectHeader, PySequenceMethods, PyType, PyUnicode, as_object_ptr, is_exact_type};
-use crate::types::{bytearray_ as bytearray_type, bytes_ as bytes_type, method, str_ as str_type, type_};
+use crate::object::{PyLong, PyMappingMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType, PyUnicode, as_object_ptr, is_exact_type};
+use crate::types::{bytearray_ as bytearray_type, bytes_ as bytes_type, method, slice_::PySlice, str_ as str_type, type_};
 
 /// String method selector passed through the helper ABI.
 pub type StrMethodId = u16;
@@ -21,6 +21,11 @@ pub const STR_METHOD_REPLACE: StrMethodId = 3;
 pub const STR_METHOD_FIND: StrMethodId = 4;
 pub const STR_METHOD_STARTSWITH: StrMethodId = 5;
 pub const STR_METHOD_ENCODE: StrMethodId = 6;
+pub const STR_METHOD_STRIP: StrMethodId = 7;
+pub const STR_METHOD_LOWER: StrMethodId = 8;
+pub const STR_METHOD_UPPER: StrMethodId = 9;
+pub const STR_METHOD_ENDSWITH: StrMethodId = 10;
+pub const STR_METHOD_TITLE: StrMethodId = 11;
 
 /// Bytes/bytearray method selector passed through the helper ABI.
 pub type BytesMethodId = u16;
@@ -53,9 +58,13 @@ struct PyInterpolation {
 static TEMPLATE_TYPE: OnceLock<usize> = OnceLock::new();
 static INTERPOLATION_TYPE: OnceLock<usize> = OnceLock::new();
 
+fn runtime_type_type() -> *mut PyType {
+    super::with_runtime(|runtime| runtime._type_type).unwrap_or(ptr::null_mut())
+}
+
 fn template_type() -> *mut PyType {
     *TEMPLATE_TYPE.get_or_init(|| {
-        let mut ty = Box::new(PyType::new(ptr::null(), "Template", mem::size_of::<PyTemplate>()));
+        let mut ty = Box::new(PyType::new(runtime_type_type(), "Template", mem::size_of::<PyTemplate>()));
         ty.tp_getattro = Some(template_getattro);
         Box::into_raw(ty) as usize
     }) as *mut PyType
@@ -63,7 +72,7 @@ fn template_type() -> *mut PyType {
 
 fn interpolation_type() -> *mut PyType {
     *INTERPOLATION_TYPE.get_or_init(|| {
-        let mut ty = Box::new(PyType::new(ptr::null(), "Interpolation", mem::size_of::<PyInterpolation>()));
+        let mut ty = Box::new(PyType::new(runtime_type_type(), "Interpolation", mem::size_of::<PyInterpolation>()));
         ty.tp_getattro = Some(interpolation_getattro);
         Box::into_raw(ty) as usize
     }) as *mut PyType
@@ -103,8 +112,19 @@ unsafe extern "C" fn interpolation_getattro(object: *mut PyObject, name: *mut Py
 /// `usize` so the static satisfies `Sync`.
 static STR_SEQUENCE_METHODS: LazyLock<usize> = LazyLock::new(|| {
     let methods = PySequenceMethods {
+        sq_length: Some(str_len_slot),
         sq_concat: Some(pon_str_concat),
+        sq_item: Some(str_item_slot),
         ..PySequenceMethods::EMPTY
+    };
+    Box::into_raw(Box::new(methods)) as usize
+});
+
+static STR_MAPPING_METHODS: LazyLock<usize> = LazyLock::new(|| {
+    let methods = PyMappingMethods {
+        mp_length: Some(str_len_slot),
+        mp_subscript: Some(str_subscript_slot),
+        mp_ass_subscript: None,
     };
     Box::into_raw(Box::new(methods)) as usize
 });
@@ -116,6 +136,7 @@ fn install_str_slots() -> Result<(), String> {
     super::with_runtime(|runtime| unsafe {
         (*runtime.unicode_type).tp_getattro = Some(str_getattro);
         (*runtime.unicode_type).tp_as_sequence = *STR_SEQUENCE_METHODS as *mut PySequenceMethods;
+        (*runtime.unicode_type).tp_as_mapping = *STR_MAPPING_METHODS as *mut PyMappingMethods;
     })
     .ok_or_else(|| "runtime is not initialized".to_owned())
 }
@@ -164,6 +185,35 @@ fn alloc_native_bytes_function(
         .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
 }
 
+
+unsafe extern "C" fn str_len_slot(object: *mut PyObject) -> isize {
+    match expect_str(object) {
+        Ok(text) => isize::try_from(str_type::codepoint_len(&text)).unwrap_or(isize::MAX),
+        Err(_) => -1,
+    }
+}
+
+unsafe extern "C" fn str_item_slot(object: *mut PyObject, index: isize) -> *mut PyObject {
+    match str_item_object(object, index) {
+        Ok(value) => value,
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
+unsafe extern "C" fn str_subscript_slot(object: *mut PyObject, key: *mut PyObject) -> *mut PyObject {
+    if unsafe { crate::types::dict::type_name(key) } == Some("slice") {
+        match str_slice_object(object, key) {
+            Ok(value) => value,
+            Err(message) => super::return_null_with_error(message),
+        }
+    } else {
+        match str_index_value(key).and_then(|index| str_item_object(object, index)) {
+            Ok(value) => value,
+            Err(message) => super::return_null_with_error(message),
+        }
+    }
+}
+
 unsafe extern "C" fn str_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
     let Some(name) = (unsafe { type_::unicode_text(name) }) else {
         return super::return_null_with_error("str attribute name must be str");
@@ -174,6 +224,11 @@ unsafe extern "C" fn str_getattro(object: *mut PyObject, name: *mut PyObject) ->
         "replace" => bound_str_method(object, name, str_replace_entry),
         "find" => bound_str_method(object, name, str_find_entry),
         "startswith" => bound_str_method(object, name, str_startswith_entry),
+        "endswith" => bound_str_method(object, name, str_endswith_entry),
+        "strip" => bound_str_method(object, name, str_strip_entry),
+        "lower" => bound_str_method(object, name, str_lower_entry),
+        "upper" => bound_str_method(object, name, str_upper_entry),
+        "title" => bound_str_method(object, name, str_title_entry),
         "encode" => bound_str_method(object, name, str_encode_entry),
         _ => super::return_null_with_error(format!("attribute '{name}' was not found")),
     }
@@ -210,13 +265,8 @@ fn alloc_native_str_function(
     .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
 }
 
-fn str_method_arity(name: &str) -> usize {
-    match name {
-        "encode" => 1,
-        "replace" => 3,
-        "split" | "join" | "find" | "startswith" => 2,
-        _ => 1,
-    }
+fn str_method_arity(_name: &str) -> usize {
+    crate::builtins::variadic_arity()
 }
 
 unsafe extern "C" fn str_split_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -237,6 +287,26 @@ unsafe extern "C" fn str_find_entry(argv: *mut *mut PyObject, argc: usize) -> *m
 
 unsafe extern "C" fn str_startswith_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     unsafe { str_method_entry(STR_METHOD_STARTSWITH, argv, argc) }
+}
+
+unsafe extern "C" fn str_endswith_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { str_method_entry(STR_METHOD_ENDSWITH, argv, argc) }
+}
+
+unsafe extern "C" fn str_strip_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { str_method_entry(STR_METHOD_STRIP, argv, argc) }
+}
+
+unsafe extern "C" fn str_lower_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { str_method_entry(STR_METHOD_LOWER, argv, argc) }
+}
+
+unsafe extern "C" fn str_upper_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { str_method_entry(STR_METHOD_UPPER, argv, argc) }
+}
+
+unsafe extern "C" fn str_title_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { str_method_entry(STR_METHOD_TITLE, argv, argc) }
 }
 
 unsafe extern "C" fn str_encode_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -420,6 +490,11 @@ pub unsafe extern "C" fn pon_str_method(
             STR_METHOD_REPLACE => str_replace_method(&receiver, args),
             STR_METHOD_FIND => str_find_method(&receiver, args),
             STR_METHOD_STARTSWITH => str_startswith_method(&receiver, args),
+            STR_METHOD_ENDSWITH => str_endswith_method(&receiver, args),
+            STR_METHOD_STRIP => str_strip_method(&receiver, args),
+            STR_METHOD_LOWER => str_lower_method(&receiver, args),
+            STR_METHOD_UPPER => str_upper_method(&receiver, args),
+            STR_METHOD_TITLE => str_title_method(&receiver, args),
             STR_METHOD_ENCODE => str_encode_method(&receiver, args),
             _ => super::return_null_with_error("unknown str method selector"),
         }
@@ -551,45 +626,251 @@ fn boxed_str(text: &str) -> Result<*mut PyObject, String> {
 }
 
 fn format_value_to_text(value: *mut PyObject, conversion: u8, format_spec: *mut PyObject) -> Result<String, String> {
-    let converted = match conversion {
-        0 => object_to_str(value)?,
-        b's' => object_to_str(value)?,
-        b'r' => object_to_repr(value)?,
-        b'a' => str_type::escape_non_ascii(&object_to_repr(value)?),
-        _ => return Err("unsupported f-string conversion".to_owned()),
-    };
-
     if format_spec.is_null() {
-        return Ok(converted);
+        return match conversion {
+            0 | b's' => object_to_str(value),
+            b'r' => object_to_repr(value),
+            b'a' => Ok(str_type::escape_non_ascii(&object_to_repr(value)?)),
+            _ => Err("unsupported f-string conversion".to_owned()),
+        };
     }
+
     let spec = expect_str(format_spec)?;
-    apply_string_format(&converted, &spec)
+    match conversion {
+        0 => format_object_with_spec(value, &spec),
+        b's' => apply_format_spec(&object_to_str(value)?, &spec, FormatValueKind::Text),
+        b'r' => apply_format_spec(&object_to_repr(value)?, &spec, FormatValueKind::Text),
+        b'a' => apply_format_spec(&str_type::escape_non_ascii(&object_to_repr(value)?), &spec, FormatValueKind::Text),
+        _ => Err("unsupported f-string conversion".to_owned()),
+    }
 }
 
-fn apply_string_format(value: &str, spec: &str) -> Result<String, String> {
-    if spec.is_empty() {
+pub(crate) fn format_object_with_spec(value: *mut PyObject, spec: &str) -> Result<String, String> {
+    let parsed = ParsedFormatSpec::parse(spec)?;
+    let (body, kind) = match parsed.ty {
+        Some('d') => {
+            let value = object_to_i64(value).ok_or_else(|| "format code 'd' requires int".to_owned())?;
+            (value.to_string(), FormatValueKind::Number)
+        }
+        Some('f') => {
+            let value = object_to_f64(value).ok_or_else(|| "format code 'f' requires int or float".to_owned())?;
+            let precision = parsed.precision.unwrap_or(6);
+            (format!("{value:.precision$}"), FormatValueKind::Number)
+        }
+        Some('s') => {
+            let text = if let Some(precision) = parsed.precision {
+                truncate_to_precision(&object_to_str(value)?, precision)
+            } else {
+                object_to_str(value)?
+            };
+            (text, FormatValueKind::Text)
+        }
+        None => {
+            let text = object_to_str(value)?;
+            let text = if let Some(precision) = parsed.precision {
+                truncate_to_precision(&text, precision)
+            } else {
+                text
+            };
+            (text, FormatValueKind::Text)
+        }
+        Some(_) => return Err("unsupported format specification".to_owned()),
+    };
+    apply_parsed_format(&body, parsed, kind)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormatValueKind {
+    Text,
+    Number,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FormatAlign {
+    Left,
+    Right,
+    Center,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParsedFormatSpec {
+    fill: char,
+    align: Option<FormatAlign>,
+    zero: bool,
+    width: Option<usize>,
+    precision: Option<usize>,
+    ty: Option<char>,
+}
+
+impl ParsedFormatSpec {
+    fn parse(spec: &str) -> Result<Self, String> {
+        let mut chars = spec.chars().peekable();
+        let mut fill = ' ';
+        let mut align = None;
+        let mut zero = false;
+
+        let mut clone = chars.clone();
+        let first = clone.next();
+        let second = clone.next();
+        if let (Some(fill_ch), Some(align_ch)) = (first, second) {
+            if let Some(parsed) = parse_align(align_ch) {
+                fill = fill_ch;
+                align = Some(parsed);
+                chars.next();
+                chars.next();
+            }
+        }
+        if align.is_none() {
+            if let Some(parsed) = chars.peek().copied().and_then(parse_align) {
+                align = Some(parsed);
+                chars.next();
+            }
+        }
+        if chars.peek() == Some(&'0') {
+            zero = true;
+            fill = '0';
+            if align.is_none() {
+                align = Some(FormatAlign::Right);
+            }
+            chars.next();
+        }
+
+        let width = parse_digits(&mut chars)?;
+        let precision = if chars.peek() == Some(&'.') {
+            chars.next();
+            Some(parse_digits(&mut chars)?.unwrap_or(0))
+        } else {
+            None
+        };
+        let ty = chars.next();
+        if chars.next().is_some() {
+            return Err("unsupported format specification".to_owned());
+        }
+        if let Some(ty) = ty {
+            if !matches!(ty, 'd' | 'f' | 's') {
+                return Err("unsupported format specification".to_owned());
+            }
+        }
+        Ok(Self {
+            fill,
+            align,
+            zero,
+            width,
+            precision,
+            ty,
+        })
+    }
+}
+
+fn parse_align(ch: char) -> Option<FormatAlign> {
+    match ch {
+        '<' => Some(FormatAlign::Left),
+        '>' => Some(FormatAlign::Right),
+        '^' => Some(FormatAlign::Center),
+        _ => None,
+    }
+}
+
+fn parse_digits(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<Option<usize>, String> {
+    let mut value = 0usize;
+    let mut saw_digit = false;
+    while let Some(ch) = chars.peek().copied() {
+        if !ch.is_ascii_digit() {
+            break;
+        }
+        saw_digit = true;
+        let digit = ch.to_digit(10).expect("ASCII digit") as usize;
+        value = value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(digit))
+            .ok_or_else(|| "format width is too large".to_owned())?;
+        chars.next();
+    }
+    Ok(saw_digit.then_some(value))
+}
+
+fn apply_format_spec(value: &str, spec: &str, kind: FormatValueKind) -> Result<String, String> {
+    let parsed = ParsedFormatSpec::parse(spec)?;
+    if !matches!(parsed.ty, None | Some('s')) {
+        return Err("unsupported format specification".to_owned());
+    }
+    let value = if let Some(precision) = parsed.precision {
+        truncate_to_precision(value, precision)
+    } else {
+        value.to_owned()
+    };
+    apply_parsed_format(&value, parsed, kind)
+}
+
+fn apply_parsed_format(value: &str, spec: ParsedFormatSpec, kind: FormatValueKind) -> Result<String, String> {
+    let Some(width) = spec.width else {
+        return Ok(value.to_owned());
+    };
+    let len = str_type::codepoint_len(value);
+    let pad = width.saturating_sub(len);
+    if pad == 0 {
         return Ok(value.to_owned());
     }
-
-    let (fill, width_digits) = if let Some(rest) = spec.strip_prefix('0') {
-        ('0', rest)
-    } else {
-        (' ', spec)
-    };
-    if width_digits.chars().all(|ch| ch.is_ascii_digit()) {
-        let width = width_digits
-            .parse::<usize>()
-            .map_err(|_| "format width is too large".to_owned())?;
-        let pad = width.saturating_sub(str_type::codepoint_len(value));
+    let align = spec.align.unwrap_or(match kind {
+        FormatValueKind::Text => FormatAlign::Left,
+        FormatValueKind::Number => FormatAlign::Right,
+    });
+    if spec.zero && align == FormatAlign::Right && value.starts_with(['-', '+']) {
         let mut out = String::with_capacity(value.len() + pad);
-        for _ in 0..pad {
-            out.push(fill);
-        }
-        out.push_str(value);
+        out.push_str(&value[..1]);
+        push_fill(&mut out, spec.fill, pad);
+        out.push_str(&value[1..]);
         return Ok(out);
     }
+    let mut out = String::with_capacity(value.len() + pad * spec.fill.len_utf8());
+    match align {
+        FormatAlign::Left => {
+            out.push_str(value);
+            push_fill(&mut out, spec.fill, pad);
+        }
+        FormatAlign::Right => {
+            push_fill(&mut out, spec.fill, pad);
+            out.push_str(value);
+        }
+        FormatAlign::Center => {
+            let left = pad / 2;
+            let right = pad - left;
+            push_fill(&mut out, spec.fill, left);
+            out.push_str(value);
+            push_fill(&mut out, spec.fill, right);
+        }
+    }
+    Ok(out)
+}
 
-    Err("unsupported format specification".to_owned())
+fn push_fill(out: &mut String, fill: char, count: usize) {
+    for _ in 0..count {
+        out.push(fill);
+    }
+}
+
+fn truncate_to_precision(value: &str, precision: usize) -> String {
+    value.chars().take(precision).collect()
+}
+
+fn object_to_i64(value: *mut PyObject) -> Option<i64> {
+    if value.is_null() {
+        return None;
+    }
+    if let Some(value) = unsafe { crate::types::bool_::to_bool(value) } {
+        return Some(i64::from(value));
+    }
+    super::with_runtime(|runtime| unsafe {
+        is_exact_type(value, runtime.long_type).then(|| (*value.cast::<PyLong>()).value)
+    })
+    .flatten()
+}
+
+fn object_to_f64(value: *mut PyObject) -> Option<f64> {
+    if let Some(value) = unsafe { crate::types::float::to_f64(value) } {
+        return Some(value);
+    }
+    object_to_i64(value).map(|value| value as f64)
 }
 
 fn str_split_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
@@ -619,21 +900,37 @@ fn str_join_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
     if args.len() != 1 {
         return super::return_null_with_error("str.join expected exactly one argument");
     }
-    let Ok(arg) = expect_str(args[0]) else {
-        return super::return_null_with_error("representative str.join expects a str iterable");
+    let values = match super::seq::sequence_to_vec(args[0]) {
+        Ok(values) => values,
+        Err(message) => return super::return_null_with_error(message),
     };
-    let items = arg.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
+    let mut items = Vec::with_capacity(values.len());
+    for value in values {
+        match expect_str(value) {
+            Ok(item) => items.push(item),
+            Err(_) => return super::return_null_with_error("str.join expected every item to be str"),
+        }
+    }
     alloc_str_object(&str_type::join(receiver, &items))
 }
 
 fn str_replace_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
-    if args.len() != 2 {
-        return super::return_null_with_error("str.replace expected exactly two arguments");
+    if !(args.len() == 2 || args.len() == 3) {
+        return super::return_null_with_error("str.replace expected two or three arguments");
     }
     let (Ok(old), Ok(new)) = (expect_str(args[0]), expect_str(args[1])) else {
         return super::return_null_with_error("str.replace arguments must be str");
     };
-    alloc_str_object(&str_type::replace(receiver, &old, &new))
+    if let Some(count) = args.get(2).copied() {
+        let count = match str_long_value(count) {
+            Ok(value) if value >= 0 => value as usize,
+            Ok(_) => return alloc_str_object(&receiver.replace(&old, &new)),
+            Err(message) => return super::return_null_with_error(message),
+        };
+        alloc_str_object(&receiver.replacen(&old, &new, count))
+    } else {
+        alloc_str_object(&str_type::replace(receiver, &old, &new))
+    }
 }
 
 fn str_find_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
@@ -656,11 +953,88 @@ fn str_startswith_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObjec
     }
 }
 
-fn str_encode_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
-    if !args.is_empty() {
-        return super::return_null_with_error("representative str.encode supports default UTF-8 only");
+fn str_endswith_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
+    if args.len() != 1 {
+        return super::return_null_with_error("str.endswith expected exactly one argument");
     }
-    let encoded = str_type::encode_utf8(receiver);
+    match expect_str(args[0]) {
+        Ok(suffix) => alloc_str_object(if receiver.ends_with(&suffix) { "True" } else { "False" }),
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
+fn str_strip_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
+    if !args.is_empty() {
+        return super::return_null_with_error("representative str.strip supports default whitespace only");
+    }
+    alloc_str_object(receiver.trim())
+}
+
+fn str_lower_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
+    if !args.is_empty() {
+        return super::return_null_with_error("str.lower expected no arguments");
+    }
+    alloc_str_object(&receiver.to_lowercase())
+}
+
+fn str_upper_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
+    if !args.is_empty() {
+        return super::return_null_with_error("str.upper expected no arguments");
+    }
+    alloc_str_object(&receiver.to_uppercase())
+}
+
+fn str_title_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
+    if !args.is_empty() {
+        return super::return_null_with_error("str.title expected no arguments");
+    }
+    let mut out = String::with_capacity(receiver.len());
+    let mut new_word = true;
+    for ch in receiver.chars() {
+        if ch.is_alphanumeric() {
+            if new_word {
+                out.extend(ch.to_uppercase());
+                new_word = false;
+            } else {
+                out.extend(ch.to_lowercase());
+            }
+        } else {
+            out.push(ch);
+            new_word = true;
+        }
+    }
+    alloc_str_object(&out)
+}
+
+fn str_encode_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
+    if args.len() > 2 {
+        return super::return_null_with_error("str.encode expected at most two arguments");
+    }
+    let encoding = if let Some(arg) = args.first().copied() {
+        match expect_str(arg) {
+            Ok(encoding) => encoding,
+            Err(message) => return super::return_null_with_error(message),
+        }
+    } else {
+        "utf-8".to_owned()
+    };
+    if let Some(errors) = args.get(1).copied() {
+        match expect_str(errors) {
+            Ok(errors) if errors == "strict" => {}
+            Ok(errors) => return super::return_null_with_error(format!("unsupported str.encode errors handler '{errors}'")),
+            Err(message) => return super::return_null_with_error(message),
+        }
+    }
+    let encoded = match encoding.to_ascii_lowercase().as_str() {
+        "utf-8" | "utf8" => str_type::encode_utf8(receiver),
+        "ascii" => {
+            if !receiver.is_ascii() {
+                return super::return_null_with_error("ascii codec can't encode non-ascii character");
+            }
+            receiver.as_bytes().to_vec()
+        }
+        _ => return super::return_null_with_error(format!("unsupported str.encode encoding '{encoding}'")),
+    };
     unsafe { pon_const_bytes(encoded.as_ptr(), encoded.len()) }
 }
 
@@ -760,6 +1134,103 @@ fn expect_str(value: *mut PyObject) -> Result<String, String> {
             .ok_or_else(|| "unicode object contains invalid UTF-8".to_owned())
     })
     .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
+}
+
+fn str_long_value(value: *mut PyObject) -> Result<i64, String> {
+    if value.is_null() {
+        return Err("integer operand is NULL".to_owned());
+    }
+    if let Err(message) = super::ensure_runtime_initialized() {
+        return Err(message);
+    }
+    super::with_runtime(|runtime| unsafe {
+        if is_exact_type(value, runtime.long_type) {
+            Ok((*value.cast::<PyLong>()).value)
+        } else {
+            Err("expected int object".to_owned())
+        }
+    })
+    .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
+}
+
+fn str_index_value(value: *mut PyObject) -> Result<isize, String> {
+    isize::try_from(str_long_value(value)?).map_err(|_| "string index is out of range for this platform".to_owned())
+}
+
+fn normalize_str_index(index: isize, len: usize) -> Result<usize, String> {
+    let len_isize = isize::try_from(len).map_err(|_| "string is too large for this platform".to_owned())?;
+    let adjusted = if index < 0 { index.saturating_add(len_isize) } else { index };
+    if adjusted < 0 || adjusted >= len_isize {
+        Err("string index out of range".to_owned())
+    } else {
+        Ok(adjusted as usize)
+    }
+}
+
+fn str_item_object(object: *mut PyObject, index: isize) -> Result<*mut PyObject, String> {
+    let text = expect_str(object)?;
+    let index = normalize_str_index(index, str_type::codepoint_len(&text))?;
+    let Some(ch) = text.chars().nth(index) else {
+        return Err("string index out of range".to_owned());
+    };
+    let mut out = String::new();
+    out.push(ch);
+    Ok(alloc_str_object(&out))
+}
+
+fn is_none(value: *mut PyObject) -> bool {
+    super::with_runtime(|runtime| unsafe { is_exact_type(value, runtime.none_type) }).unwrap_or(false)
+}
+
+fn normalize_slice_bound(value: *mut PyObject, len: isize, default_none: isize, lower: isize, upper: isize) -> Result<isize, String> {
+    if is_none(value) {
+        return Ok(default_none.clamp(lower, upper));
+    }
+    let mut value = str_index_value(value)?;
+    if value < 0 {
+        value = value.saturating_add(len);
+    }
+    Ok(value.clamp(lower, upper))
+}
+
+fn normalize_str_slice(slice: &PySlice, len: usize) -> Result<crate::types::slice_::SliceIndices, String> {
+    let len = isize::try_from(len).map_err(|_| "string is too large for slice indices".to_owned())?;
+    let step = if is_none(slice.step) { 1 } else { str_index_value(slice.step)? };
+    if step == 0 {
+        return Err("slice step cannot be zero".to_owned());
+    }
+    let (start, stop) = if step > 0 {
+        (
+            normalize_slice_bound(slice.start, len, 0, 0, len)?,
+            normalize_slice_bound(slice.stop, len, len, 0, len)?,
+        )
+    } else {
+        (
+            normalize_slice_bound(slice.start, len, len - 1, -1, len - 1)?,
+            normalize_slice_bound(slice.stop, len, -1, -1, len - 1)?,
+        )
+    };
+    let slice_len = if step > 0 {
+        if stop <= start { 0 } else { ((stop - start - 1) / step + 1) as usize }
+    } else if stop >= start {
+        0
+    } else {
+        ((start - stop - 1) / (-step) + 1) as usize
+    };
+    Ok(crate::types::slice_::SliceIndices { start, stop, step, len: slice_len })
+}
+
+fn str_slice_object(object: *mut PyObject, key: *mut PyObject) -> Result<*mut PyObject, String> {
+    let text = expect_str(object)?;
+    let indices = normalize_str_slice(unsafe { &*key.cast::<PySlice>() }, str_type::codepoint_len(&text))?;
+    let chars = text.chars().collect::<Vec<_>>();
+    let mut out = String::with_capacity(text.len());
+    let mut index = indices.start;
+    for _ in 0..indices.len {
+        out.push(chars[index as usize]);
+        index = index.saturating_add(indices.step);
+    }
+    Ok(alloc_str_object(&out))
 }
 
 fn expect_bytes_like(value: *mut PyObject) -> Result<Vec<u8>, String> {

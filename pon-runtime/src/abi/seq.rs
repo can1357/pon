@@ -15,11 +15,13 @@ use pon_gc::{GcTypeInfo, TypeId};
 
 use crate::feedback::FeedbackCell;
 use crate::object::{PyLong, PyMappingMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType, PyUnicode, as_object_ptr, is_exact_type};
-use crate::thread_state::{pon_err_occurred, pon_err_set};
+use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set};
+use crate::types::dict;
 use crate::types::list::{self, PyList};
 use crate::types::range_::{self, PyRange};
 use crate::types::slice_::{self, PySlice, SliceIndices};
 use crate::types::tuple::{self, PyTuple};
+use crate::types::{method, type_};
 
 use super::{Runtime, alloc_long, catch_object_helper, catch_status_helper, return_minus_one_with_error, return_null_with_error, with_runtime};
 
@@ -46,7 +48,7 @@ fn list_type() -> *mut PyType {
             sq_repeat: None,
             sq_item: Some(list_item_slot),
             sq_ass_item: Some(list_ass_item_slot),
-            sq_contains: None,
+            sq_contains: Some(list_contains_slot),
             sq_inplace_concat: None,
             sq_inplace_repeat: None,
             sq_iter: Some(seq_iter_slot),
@@ -60,6 +62,7 @@ fn list_type() -> *mut PyType {
         let mut ty = PyType::new(ptr::null(), "list", mem::size_of::<PyList>());
         ty.tp_as_sequence = sequence;
         ty.tp_as_mapping = mapping;
+        ty.tp_getattro = Some(list_getattro_slot);
         ty.gc_type_id = TYPE_ID_LIST.0 as usize;
         Box::into_raw(Box::new(ty)) as usize
     });
@@ -70,11 +73,11 @@ fn tuple_type() -> *mut PyType {
     TUPLE_TYPE.get_or_init(|| {
         let sequence = Box::leak(Box::new(PySequenceMethods {
             sq_length: Some(tuple_len_slot),
-            sq_concat: None,
+            sq_concat: Some(tuple_concat_slot),
             sq_repeat: None,
             sq_item: Some(tuple_item_slot),
             sq_ass_item: None,
-            sq_contains: None,
+            sq_contains: Some(tuple_contains_slot),
             sq_inplace_concat: None,
             sq_inplace_repeat: None,
             sq_iter: Some(seq_iter_slot),
@@ -89,6 +92,7 @@ fn tuple_type() -> *mut PyType {
         ty.tp_hash = Some(tuple_hash_slot);
         ty.tp_as_sequence = sequence;
         ty.tp_as_mapping = mapping;
+        ty.tp_getattro = Some(tuple_getattro_slot);
         ty.gc_type_id = TYPE_ID_TUPLE.0 as usize;
         Box::into_raw(Box::new(ty)) as usize
     });
@@ -531,6 +535,25 @@ fn sequence_item_raw(object: *mut PyObject, index: isize) -> Result<*mut PyObjec
 }
 
 pub(crate) fn sequence_to_vec(object: *mut PyObject) -> Result<Vec<*mut PyObject>, String> {
+    let iter = unsafe { super::iter::pon_get_iter(object, ptr::null_mut()) };
+    if !iter.is_null() {
+        let mut out = Vec::new();
+        loop {
+            let value = unsafe { super::iter::pon_iter_next(iter, ptr::null_mut()) };
+            if value.is_null() {
+                if pon_err_occurred() {
+                    pon_err_clear();
+                }
+                break;
+            }
+            out.push(value);
+        }
+        return Ok(out);
+    }
+    if pon_err_occurred() {
+        pon_err_clear();
+    }
+
     let len = sequence_len_raw(object)?;
     let mut out = Vec::new();
     out.try_reserve_exact(len)
@@ -631,14 +654,12 @@ fn sequence_slice_raw(object: *mut PyObject, key: *mut PyObject) -> Result<*mut 
     let len = sequence_len_raw(object)?;
     let indices = unsafe { normalize_slice(&*key.cast::<PySlice>(), len)? };
     let values = sliced_values(object, indices)?;
-    with_runtime(|runtime| {
-        if is_tuple(object) {
-            alloc_tuple_from_slice(runtime, &values)
-        } else {
-            alloc_list_from_slice(runtime, &values)
-        }
-    })
-    .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
+    if is_tuple(object) {
+        Ok(crate::native::builtins_mod::alloc_tuple(values))
+    } else {
+        with_runtime(|runtime| alloc_list_from_slice(runtime, &values))
+            .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
+    }
 }
 
 fn list_resize(list: &mut PyList, new_cap: usize) -> Result<(), String> {
@@ -804,6 +825,335 @@ fn range_subscript_raw(object: *mut PyObject, key: *mut PyObject) -> Result<*mut
     }
 }
 
+fn list_pop_raw(list_object: *mut PyObject, index: isize) -> Result<*mut PyObject, String> {
+    if !is_list(list_object) {
+        return Err(format!("list pop expected list, got {}", object_type_name(list_object)));
+    }
+    let _guard = crate::sync::begin_critical_section(list_object);
+    let list = unsafe { &mut *list_object.cast::<PyList>() };
+    let index = normalize_index(index, list.len)?;
+    let value = unsafe { *list.items.add(index) };
+    unsafe {
+        for pos in index..list.len - 1 {
+            let shifted = *list.items.add(pos + 1);
+            crate::sync::store_heap_pointer(list.items.add(pos), shifted);
+        }
+        crate::sync::store_heap_pointer(list.items.add(list.len - 1), ptr::null_mut());
+    }
+    list.len -= 1;
+    Ok(value)
+}
+
+fn list_index_raw(list_object: *mut PyObject, needle: *mut PyObject) -> Result<usize, String> {
+    if !is_list(list_object) {
+        return Err(format!("list.index expected list, got {}", object_type_name(list_object)));
+    }
+    let list = unsafe { &*list_object.cast::<PyList>() };
+    for (index, item) in unsafe { list.as_slice() }.iter().copied().enumerate() {
+        if unsafe { crate::types::dict::object_equal(item, needle)? } {
+            return Ok(index);
+        }
+    }
+    Err("list.index(x): x not in list".to_owned())
+}
+
+fn list_count_raw(list_object: *mut PyObject, needle: *mut PyObject) -> Result<usize, String> {
+    if !is_list(list_object) {
+        return Err(format!("list.count expected list, got {}", object_type_name(list_object)));
+    }
+    let list = unsafe { &*list_object.cast::<PyList>() };
+    let mut count = 0usize;
+    for item in unsafe { list.as_slice() }.iter().copied() {
+        if unsafe { crate::types::dict::object_equal(item, needle)? } {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn tuple_index_raw(tuple_object: *mut PyObject, needle: *mut PyObject) -> Result<usize, String> {
+    if !is_tuple(tuple_object) {
+        return Err(format!("tuple.index expected tuple, got {}", object_type_name(tuple_object)));
+    }
+    let tuple = unsafe { &*tuple_object.cast::<PyTuple>() };
+    for (index, item) in unsafe { tuple.as_slice() }.iter().copied().enumerate() {
+        if unsafe { crate::types::dict::object_equal(item, needle)? } {
+            return Ok(index);
+        }
+    }
+    Err("tuple.index(x): x not in tuple".to_owned())
+}
+
+fn tuple_count_raw(tuple_object: *mut PyObject, needle: *mut PyObject) -> Result<usize, String> {
+    if !is_tuple(tuple_object) {
+        return Err(format!("tuple.count expected tuple, got {}", object_type_name(tuple_object)));
+    }
+    let tuple = unsafe { &*tuple_object.cast::<PyTuple>() };
+    let mut count = 0usize;
+    for item in unsafe { tuple.as_slice() }.iter().copied() {
+        if unsafe { crate::types::dict::object_equal(item, needle)? } {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn attr_name(name: *mut PyObject) -> Result<String, String> {
+    unsafe { type_::unicode_text(name) }
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "attribute name must be str".to_owned())
+}
+
+fn native_method_arity() -> usize {
+    crate::builtins::variadic_arity()
+}
+
+fn alloc_native_seq_function(
+    name: &str,
+    entry: unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject,
+) -> Result<*mut PyObject, String> {
+    let name_interned = crate::intern::intern(name);
+    with_runtime(|runtime| super::alloc_function(runtime, entry as *const u8, native_method_arity(), name_interned))
+        .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
+}
+
+fn bound_seq_method(
+    receiver: *mut PyObject,
+    name: &str,
+    entry: unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject,
+) -> *mut PyObject {
+    let function = match alloc_native_seq_function(name, entry) {
+        Ok(function) => function,
+        Err(message) => return return_null_with_error(message),
+    };
+    match method::new_bound_method(function, receiver) {
+        Ok(method) => method.cast::<PyObject>(),
+        Err(message) => return_null_with_error(message),
+    }
+}
+
+fn method_args<'a>(argv: *mut *mut PyObject, argc: usize, name: &str) -> Result<&'a [*mut PyObject], String> {
+    if argv.is_null() && argc != 0 {
+        return Err(format!("{name} received a NULL argv pointer"));
+    }
+    Ok(if argc == 0 { &[] } else { unsafe { core::slice::from_raw_parts(argv, argc) } })
+}
+
+fn seq_none() -> *mut PyObject {
+    match none_object() {
+        Ok(none) => none,
+        Err(message) => return_null_with_error(message),
+    }
+}
+
+unsafe extern "C" fn list_append_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.append") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        if args.len() != 2 {
+            return return_null_with_error(format!("list.append expected 1 argument, got {}", args.len().saturating_sub(1)));
+        }
+        match list_append_raw(args[0], args[1]) {
+            Ok(()) => seq_none(),
+            Err(message) => return_null_with_error(message),
+        }
+    })
+}
+
+unsafe extern "C" fn list_extend_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.extend") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        if args.len() != 2 {
+            return return_null_with_error(format!("list.extend expected 1 argument, got {}", args.len().saturating_sub(1)));
+        }
+        let values = match sequence_to_vec(args[1]) {
+            Ok(values) => values,
+            Err(message) => return return_null_with_error(message),
+        };
+        for value in values {
+            if let Err(message) = list_append_raw(args[0], value) {
+                return return_null_with_error(message);
+            }
+        }
+        seq_none()
+    })
+}
+
+unsafe extern "C" fn list_sort_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match method_args(argv, argc, "list.sort") {
+        Ok(args) => args,
+        Err(message) => return return_null_with_error(message),
+    };
+    if args.len() != 1 {
+        return return_null_with_error(format!("list.sort expected 0 arguments, got {}", args.len().saturating_sub(1)));
+    }
+    unsafe { pon_list_sort(args[0]) }
+}
+
+unsafe extern "C" fn list_reverse_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.reverse") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        if args.len() != 1 {
+            return return_null_with_error(format!("list.reverse expected 0 arguments, got {}", args.len().saturating_sub(1)));
+        }
+        if !is_list(args[0]) {
+            return return_null_with_error(format!("list.reverse expected list, got {}", object_type_name(args[0])));
+        }
+        let _guard = crate::sync::begin_critical_section(args[0]);
+        let list = unsafe { &mut *args[0].cast::<PyList>() };
+        unsafe { list.as_mut_slice() }.reverse();
+        seq_none()
+    })
+}
+
+unsafe extern "C" fn list_pop_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.pop") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        if !(args.len() == 1 || args.len() == 2) {
+            return return_null_with_error(format!("list.pop expected at most 1 argument, got {}", args.len().saturating_sub(1)));
+        }
+        let index = if args.len() == 2 {
+            match index_value(args[1]) {
+                Ok(index) => index,
+                Err(message) => return return_null_with_error(message),
+            }
+        } else {
+            -1
+        };
+        match list_pop_raw(args[0], index) {
+            Ok(value) => value,
+            Err(message) => return_null_with_error(message),
+        }
+    })
+}
+
+unsafe extern "C" fn list_index_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.index") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        if args.len() != 2 {
+            return return_null_with_error(format!("list.index expected 1 argument, got {}", args.len().saturating_sub(1)));
+        }
+        match list_index_raw(args[0], args[1]) {
+            Ok(index) => unsafe { super::pon_const_int(index as i64) },
+            Err(message) => return_null_with_error(message),
+        }
+    })
+}
+
+unsafe extern "C" fn list_count_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.count") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        if args.len() != 2 {
+            return return_null_with_error(format!("list.count expected 1 argument, got {}", args.len().saturating_sub(1)));
+        }
+        match list_count_raw(args[0], args[1]) {
+            Ok(count) => unsafe { super::pon_const_int(count as i64) },
+            Err(message) => return_null_with_error(message),
+        }
+    })
+}
+
+unsafe extern "C" fn list_insert_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.insert") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        if args.len() != 3 {
+            return return_null_with_error(format!("list.insert expected 2 arguments, got {}", args.len().saturating_sub(1)));
+        }
+        let index = match index_value(args[1]) {
+            Ok(index) => index,
+            Err(message) => return return_null_with_error(message),
+        };
+        if !is_list(args[0]) {
+            return return_null_with_error(format!("list.insert expected list, got {}", object_type_name(args[0])));
+        }
+        let _guard = crate::sync::begin_critical_section(args[0]);
+        let list = unsafe { &mut *args[0].cast::<PyList>() };
+        let len = match isize::try_from(list.len) {
+            Ok(len) => len,
+            Err(_) => return return_null_with_error("list length is too large"),
+        };
+        let pos = index.clamp(0, len) as usize;
+        let mut values = unsafe { list.as_slice() }.to_vec();
+        values.insert(pos, args[2]);
+        match replace_list_contents(list, &values) {
+            Ok(()) => seq_none(),
+            Err(message) => return_null_with_error(message),
+        }
+    })
+}
+
+unsafe extern "C" fn list_remove_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.remove") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        if args.len() != 2 {
+            return return_null_with_error(format!("list.remove expected 1 argument, got {}", args.len().saturating_sub(1)));
+        }
+        let index = match list_index_raw(args[0], args[1]) {
+            Ok(index) => index,
+            Err(message) => return return_null_with_error(message),
+        };
+        match list_delete_index_raw(args[0], index as isize) {
+            Ok(()) => seq_none(),
+            Err(message) => return_null_with_error(message),
+        }
+    })
+}
+
+unsafe extern "C" fn tuple_count_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "tuple.count") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        if args.len() != 2 {
+            return return_null_with_error(format!("tuple.count expected 1 argument, got {}", args.len().saturating_sub(1)));
+        }
+        match tuple_count_raw(args[0], args[1]) {
+            Ok(count) => unsafe { super::pon_const_int(count as i64) },
+            Err(message) => return_null_with_error(message),
+        }
+    })
+}
+
+unsafe extern "C" fn tuple_index_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "tuple.index") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        if args.len() != 2 {
+            return return_null_with_error(format!("tuple.index expected 1 argument, got {}", args.len().saturating_sub(1)));
+        }
+        match tuple_index_raw(args[0], args[1]) {
+            Ok(index) => unsafe { super::pon_const_int(index as i64) },
+            Err(message) => return_null_with_error(message),
+        }
+    })
+}
+
 fn py_hash(object: *mut PyObject) -> Result<isize, String> {
     if object.is_null() {
         return Err("cannot hash NULL".to_owned());
@@ -928,6 +1278,38 @@ unsafe extern "C" fn range_len_slot(object: *mut PyObject) -> isize {
     })
 }
 
+unsafe extern "C" fn list_contains_slot(object: *mut PyObject, item: *mut PyObject) -> c_int {
+    if !is_list(object) {
+        pon_err_set("list contains slot received a non-list");
+        return -1;
+    }
+    let list = unsafe { &*object.cast::<PyList>() };
+    contains_slice(unsafe { list.as_slice() }, item)
+}
+
+unsafe extern "C" fn tuple_contains_slot(object: *mut PyObject, item: *mut PyObject) -> c_int {
+    if !is_tuple(object) {
+        pon_err_set("tuple contains slot received a non-tuple");
+        return -1;
+    }
+    let tuple = unsafe { &*object.cast::<PyTuple>() };
+    contains_slice(unsafe { tuple.as_slice() }, item)
+}
+
+fn contains_slice(items: &[*mut PyObject], item: *mut PyObject) -> c_int {
+    for entry in items.iter().copied() {
+        match unsafe { dict::object_equal(entry, item) } {
+            Ok(true) => return 1,
+            Ok(false) => {}
+            Err(message) => {
+                pon_err_set(message);
+                return -1;
+            }
+        }
+    }
+    0
+}
+
 unsafe extern "C" fn list_item_slot(object: *mut PyObject, index: isize) -> *mut PyObject {
     match list_item_object(object, index) {
         Ok(value) => value,
@@ -946,6 +1328,49 @@ unsafe extern "C" fn range_item_slot(object: *mut PyObject, index: isize) -> *mu
     match range_item_object(object, index) {
         Ok(value) => value,
         Err(message) => return_null_with_error(message),
+    }
+}
+
+unsafe extern "C" fn tuple_concat_slot(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    if !is_tuple(left) || !is_tuple(right) {
+        return return_null_with_error("can only concatenate tuple to tuple");
+    }
+    let left_items = unsafe { (&*left.cast::<PyTuple>()).as_slice() };
+    let right_items = unsafe { (&*right.cast::<PyTuple>()).as_slice() };
+    let mut values = Vec::with_capacity(left_items.len().saturating_add(right_items.len()));
+    values.extend_from_slice(left_items);
+    values.extend_from_slice(right_items);
+    crate::native::builtins_mod::alloc_tuple(values)
+}
+
+unsafe extern "C" fn list_getattro_slot(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let name = match attr_name(name) {
+        Ok(name) => name,
+        Err(message) => return return_null_with_error(message),
+    };
+    match name.as_str() {
+        "append" => bound_seq_method(object, &name, list_append_method),
+        "extend" => bound_seq_method(object, &name, list_extend_method),
+        "sort" => bound_seq_method(object, &name, list_sort_method),
+        "reverse" => bound_seq_method(object, &name, list_reverse_method),
+        "pop" => bound_seq_method(object, &name, list_pop_method),
+        "index" => bound_seq_method(object, &name, list_index_method),
+        "count" => bound_seq_method(object, &name, list_count_method),
+        "insert" => bound_seq_method(object, &name, list_insert_method),
+        "remove" => bound_seq_method(object, &name, list_remove_method),
+        _ => return_null_with_error(format!("attribute '{name}' was not found")),
+    }
+}
+
+unsafe extern "C" fn tuple_getattro_slot(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let name = match attr_name(name) {
+        Ok(name) => name,
+        Err(message) => return return_null_with_error(message),
+    };
+    match name.as_str() {
+        "count" => bound_seq_method(object, &name, tuple_count_method),
+        "index" => bound_seq_method(object, &name, tuple_index_method),
+        _ => return_null_with_error(format!("attribute '{name}' was not found")),
     }
 }
 
