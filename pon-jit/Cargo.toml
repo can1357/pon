@@ -4,12 +4,17 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+free-threading = ["pon-codegen/free-threading", "pon-runtime/free-threading"]
+
 [lints]
 workspace = true
 
 [dependencies]
 pon-codegen.workspace = true
 pon-runtime.workspace = true
+pon-gc.workspace = true
 pon-ir.workspace = true
 cranelift-codegen.workspace = true
 cranelift-frontend.workspace = true

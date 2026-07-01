@@ -18,6 +18,8 @@ use pon_runtime::abi::{HELPERS, pon_runtime_init};
 use pon_runtime::object::PyObject;
 use pon_runtime::thread_state::pon_err_message;
 
+pub mod tierup;
+
 /// Phase-A compiled Python function ABI.
 pub type MainFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
 
@@ -30,6 +32,7 @@ pub struct JitEngine {
     module: JITModule,
     ctx: Context,
     fctx: FunctionBuilderContext,
+    tierup: Box<tierup::TierUpDriver>,
 }
 
 /// Error reported while compiling or running Phase-A JIT code.
@@ -83,10 +86,19 @@ impl JitEngine {
         for helper in HELPERS {
             builder.symbol(helper.symbol, helper.address.cast::<u8>());
         }
+        register_free_threading_symbols(&mut builder);
         let module = JITModule::new(builder);
         let ctx = module.make_context();
         let fctx = FunctionBuilderContext::new();
-        Self { module, ctx, fctx }
+        let tierup = Box::new(tierup::TierUpDriver::new());
+        let mut engine = Self {
+            module,
+            ctx,
+            fctx,
+            tierup,
+        };
+        tierup::register_runtime_hook(engine.tierup.as_mut());
+        engine
     }
 
     /// Compile every lowered IR function and return the finalized `__main__`
@@ -98,14 +110,18 @@ impl JitEngine {
         let helpers = declare_helpers(&mut self.module)?;
         let func_ids = self.declare_ir_functions(ir_module)?;
         let names = NameMap::from_ir_module(ir_module);
+        let entry_arg_counts = pon_codegen::baseline::entry_arg_counts(ir_module);
+
 
         for (index, function) in ir_module.functions.iter().enumerate() {
             compile_function(
                 &mut self.module,
                 &helpers,
                 &func_ids,
+                &ir_module.functions,
                 &names,
                 function,
+                entry_arg_counts[index],
                 &mut self.ctx,
                 &mut self.fctx,
             )?;
@@ -113,6 +129,8 @@ impl JitEngine {
         }
 
         self.module.finalize_definitions()?;
+
+        self.tierup.register_module(ir_module, &func_ids, &self.module);
 
         let main_id = func_ids
             .get(ir_module.main.0 as usize)
@@ -175,6 +193,39 @@ impl Default for JitEngine {
     }
 }
 
+impl Drop for JitEngine {
+    fn drop(&mut self) {
+        tierup::unregister_runtime_hook(self.tierup.as_ref());
+    }
+}
+
 fn runtime_message() -> String {
     pon_err_message().unwrap_or_else(|| "runtime returned NULL without a diagnostic".to_owned())
+}
+
+#[cfg(feature = "free-threading")]
+fn register_free_threading_symbols(builder: &mut JITBuilder) {
+    builder.symbol(pon_codegen::FT_SAFEPOINT_POLL, jit_safepoint_poll as *const u8);
+    builder.symbol(pon_codegen::FT_GC_WRITE_BARRIER, jit_gc_write_barrier as *const u8);
+    builder.symbol(pon_codegen::FT_GC_STOP_REQUESTED, jit_gc_stop_requested as *const u8);
+}
+
+#[cfg(not(feature = "free-threading"))]
+fn register_free_threading_symbols(_builder: &mut JITBuilder) {}
+
+#[cfg(feature = "free-threading")]
+unsafe extern "C" fn jit_safepoint_poll() {
+    if pon_gc::gc_stop_requested() {
+        std::hint::spin_loop();
+    }
+}
+
+#[cfg(feature = "free-threading")]
+unsafe extern "C" fn jit_gc_write_barrier(slot: *mut *mut PyObject, new: *mut PyObject) {
+    pon_gc::WriteBarrier::record(slot.cast::<*mut u8>(), new.cast::<u8>());
+}
+
+#[cfg(feature = "free-threading")]
+unsafe extern "C" fn jit_gc_stop_requested() -> bool {
+    pon_gc::gc_stop_requested()
 }
