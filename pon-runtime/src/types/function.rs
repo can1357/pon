@@ -13,11 +13,12 @@ use std::mem;
 use std::ptr;
 use std::sync::{LazyLock, Mutex};
 
-use crate::abi::{CodeInfo, ParamSpec};
-use crate::intern;
+use crate::abi::{CodeInfo, ParamSpec, return_null_with_error};
+use crate::abi::call::{CODE_FLAG_COROUTINE, CODE_FLAG_GENERATOR};
+use crate::intern::{self, intern, resolve};
 use crate::object::{PyCodeFn, PyFunction, PyObject, PyUnicode};
 use crate::thread_state::{pon_err_clear, pon_err_occurred};
-use crate::types::{dict, list::PyList, tuple::PyTuple};
+use crate::types::{dict, generator::GeneratorKind, list::PyList, tuple::PyTuple};
 
 static FUNCTION_RECORDS: LazyLock<Mutex<HashMap<usize, FunctionRecord>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -194,6 +195,84 @@ pub fn function_record(function: *mut PyObject) -> Option<FunctionRecord> {
         .lock()
         .ok()
         .and_then(|records| records.get(&(function as usize)).cloned())
+}
+
+/// Attribute lookup for function metadata exposed at Python level.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn function_getattro(function: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    if function.is_null() || name.is_null() {
+        return return_null_with_error("function attribute lookup received NULL");
+    }
+    let Some(name_text) = (unsafe { (&*name.cast::<PyUnicode>()).as_str() }) else {
+        return return_null_with_error("function attribute name is not valid UTF-8");
+    };
+    let name_id = intern(name_text);
+    if name_id == intern("__name__") {
+        let fname = resolve(unsafe { (*function.cast::<PyFunction>()).name_interned })
+            .unwrap_or_else(|| "<lambda>".to_owned());
+        return unsafe { crate::abi::pon_const_str(fname.as_ptr(), fname.len()) };
+    }
+    if name_id == intern("__annotations__") {
+        return unsafe { function_annotations(function) };
+    }
+    return_null_with_error(format!("function has no attribute '{name_text}'"))
+}
+
+pub unsafe fn set_function_annotations(
+    function: *mut PyObject,
+    names: &[u32],
+    values: &[*mut PyObject],
+) -> Result<(), String> {
+    if function.is_null() {
+        return Err("cannot set annotations on NULL function".to_owned());
+    }
+    let annotations = unsafe { build_annotations_dict(names, values)? };
+    unsafe {
+        (*function.cast::<PyFunction>()).annotations = annotations;
+    }
+    Ok(())
+}
+
+unsafe fn function_annotations(function: *mut PyObject) -> *mut PyObject {
+    let function = function.cast::<PyFunction>();
+    let existing = unsafe { (*function).annotations };
+    if !existing.is_null() {
+        return existing;
+    }
+    let annotations = unsafe { crate::abi::map::pon_build_map(ptr::null_mut(), 0) };
+    if annotations.is_null() {
+        return annotations;
+    }
+    unsafe {
+        (*function).annotations = annotations;
+    }
+    annotations
+}
+
+unsafe fn build_annotations_dict(names: &[u32], values: &[*mut PyObject]) -> Result<*mut PyObject, String> {
+    if names.len() != values.len() {
+        return Err(format!(
+            "annotation name/value length mismatch: {} names for {} values",
+            names.len(),
+            values.len()
+        ));
+    }
+    let annotations = unsafe { crate::abi::map::pon_build_map(ptr::null_mut(), 0) };
+    if annotations.is_null() {
+        return Err("failed to allocate function annotations dict".to_owned());
+    }
+    for (name, value) in names.iter().copied().zip(values.iter().copied()) {
+        if value.is_null() {
+            return Err(format!("annotation for interned name {name} is NULL"));
+        }
+        let spelling = resolve(name).ok_or_else(|| format!("annotation name id {name} is not interned"))?;
+        let key = unsafe { crate::abi::pon_const_str(spelling.as_ptr(), spelling.len()) };
+        if key.is_null() {
+            return Err(format!("failed to allocate annotation key for interned name {name}"));
+        }
+        unsafe { dict::dict_insert(annotations, key, value)? };
+    }
+    Ok(annotations)
 }
 
 /// Descriptor binding for function attributes stored on Python classes.
@@ -421,12 +500,191 @@ pub fn bind_arguments(
             if let Some(default) = record.kwdefaults.get(&name) {
                 bound[index] = *default as *mut PyObject;
             } else {
-                return Err(format!("missing required keyword-only argument {name}"));
+                return Err(format!(
+                    "missing 1 required keyword-only argument: '{}'",
+                    keyword_name(name)
+                ));
             }
         }
     }
 
     Ok(bound)
+}
+
+unsafe fn resume_lazy_delegate(
+    frame_ref: &mut crate::abi::PyFrame,
+    sent: *mut PyObject,
+) -> *mut PyObject {
+    // SAFETY: `frame_ref.parent` stores the eager-yield generator materialized
+    // by an earlier lazy resume.
+    let result = unsafe { crate::abi::r#gen::pon_gen_send(frame_ref.parent, sent) };
+    if !result.is_null() || !pon_err_occurred() {
+        return result;
+    }
+
+    // When the eager delegate finishes, consume its StopIteration.value and raise a
+    // fresh StopIteration with the same value from the wrapper.  This makes the
+    // lazy layer's public exhaustion path carry the delegate's return value
+    // instead of relying on callers to observe the delegate's pending exception.
+    let stop_value = unsafe { crate::abi::r#gen::pon_gen_stop_value() };
+    if stop_value.is_null() {
+        return ptr::null_mut();
+    }
+    frame_ref.mark_exhausted();
+    unsafe { crate::abi::exc::pon_raise_stop_iteration(stop_value) }
+}
+
+unsafe fn exhaust_delegate_for_return(delegate: *mut PyObject) -> *mut PyObject {
+    loop {
+        // SAFETY: The delegate is a generator-family object produced by the eager fallback.
+        let item = unsafe { crate::abi::r#gen::pon_gen_send(delegate, ptr::null_mut()) };
+        if !item.is_null() {
+            continue;
+        }
+        if !pon_err_occurred() {
+            return return_null_with_error("coroutine delegate ended without StopIteration");
+        }
+        let stop_value = unsafe { crate::abi::r#gen::pon_gen_stop_value() };
+        if stop_value.is_null() {
+            return ptr::null_mut();
+        }
+        return unsafe { crate::abi::exc::pon_raise_stop_iteration(stop_value) };
+    }
+}
+
+unsafe extern "C" fn lazy_eager_generator_resume(
+    frame: *mut crate::abi::PyFrame,
+    sent: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { lazy_eager_resume(frame, sent, false) }
+}
+
+unsafe extern "C" fn lazy_eager_coroutine_resume(
+    frame: *mut crate::abi::PyFrame,
+    sent: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { lazy_eager_resume(frame, sent, true) }
+}
+
+unsafe fn lazy_eager_resume(
+    frame: *mut crate::abi::PyFrame,
+    sent: *mut PyObject,
+    is_coroutine: bool,
+) -> *mut PyObject {
+    if frame.is_null() {
+        return return_null_with_error("generator frame pointer is null");
+    }
+    // SAFETY: The generator owns this heap frame while it is resumable.
+    let frame_ref = unsafe { &mut *frame };
+    if !frame_ref.parent.is_null() {
+        return unsafe { resume_lazy_delegate(frame_ref, sent) };
+    }
+    if frame_ref.n_locals == 0 {
+        return return_null_with_error("lazy generator frame has no function slot");
+    }
+
+    // SAFETY: Slot 0 stores the boxed function; later slots store bound arguments.
+    let function = unsafe { crate::abi::r#gen::pon_frame_get_local(frame, 0) };
+    if function.is_null() {
+        return ptr::null_mut();
+    }
+    let Some(record) = function_record(function) else {
+        return return_null_with_error("lazy generator function has no metadata record");
+    };
+    if record.entry.is_null() {
+        return return_null_with_error("lazy generator function code pointer is null");
+    }
+    let argc = frame_ref.n_locals.saturating_sub(1) as usize;
+    let mut argv = Vec::with_capacity(argc);
+    for index in 0..argc {
+        // SAFETY: The loop stays inside the frame's advertised local count.
+        let value = unsafe { crate::abi::r#gen::pon_frame_get_local(frame, (index + 1) as u32) };
+        if value.is_null() {
+            return ptr::null_mut();
+        }
+        argv.push(value);
+    }
+
+    // SAFETY: Function entrypoints are emitted with the compiled-code ABI.
+    let entry: PyCodeFn = unsafe { mem::transmute(record.entry) };
+    let result = if is_coroutine {
+        let (sent_override, print_suppression) = if frame_ref.state == 0 {
+            (ptr::null_mut(), 1)
+        } else {
+            (sent, 2)
+        };
+        crate::abi::r#gen::with_eager_coroutine_replay(sent_override, print_suppression, || {
+            let _guard = crate::abi::push_current_call(function.cast::<PyFunction>(), argv.as_mut_ptr(), argv.len());
+            pon_err_clear();
+            // SAFETY: `argv` is contiguous and lives for the duration of the call.
+            unsafe { entry(argv.as_mut_ptr(), argv.len()) }
+        })
+    } else {
+        crate::abi::r#gen::with_eager_yield_recording(|| {
+            let _guard = crate::abi::push_current_call(function.cast::<PyFunction>(), argv.as_mut_ptr(), argv.len());
+            pon_err_clear();
+            // SAFETY: `argv` is contiguous and lives for the duration of the call.
+            unsafe { entry(argv.as_mut_ptr(), argv.len()) }
+        })
+    };
+    if result.is_null() {
+        return ptr::null_mut();
+    }
+    // Compiled generator bodies return the delegate produced by the eager
+    // fallback (`GetIter(None)` for fallthrough or `pon_eager_yield_generator`
+    // for explicit `return value`).  Do not wrap it again, or the stored
+    // StopIteration.value is lost behind a second empty generator.
+    let delegate = result;
+    if delegate.is_null() {
+        return ptr::null_mut();
+    }
+    if is_coroutine {
+        if frame_ref.state == 0 {
+            frame_ref.state = 1;
+            return unsafe { crate::abi::r#gen::pon_gen_send(delegate, sent) };
+        }
+        frame_ref.mark_exhausted();
+        return unsafe { exhaust_delegate_for_return(delegate) };
+    }
+    unsafe { crate::sync::store_heap_pointer(ptr::addr_of_mut!(frame_ref.parent), delegate) };
+    unsafe { resume_lazy_delegate(frame_ref, sent) }
+}
+
+unsafe fn make_lazy_eager_generator(
+    function: *mut PyObject,
+    argv: &[*mut PyObject],
+    kind: GeneratorKind,
+) -> Result<*mut PyObject, String> {
+    let n_locals = u32::try_from(argv.len().saturating_add(1))
+        .map_err(|_| "generator/coroutine call has too many bound arguments".to_owned())?;
+    // SAFETY: Allocates a frame with one function slot plus bound argument slots.
+    let frame = unsafe { crate::abi::r#gen::pon_make_frame(n_locals) };
+    if frame.is_null() {
+        return Ok(ptr::null_mut());
+    }
+    // SAFETY: The frame was allocated with `n_locals` slots.
+    if unsafe { crate::abi::r#gen::pon_frame_set_local(frame, 0, function) }.is_null() {
+        return Ok(ptr::null_mut());
+    }
+    for (index, value) in argv.iter().copied().enumerate() {
+        // SAFETY: Slots 1..=argv.len() are in bounds by construction.
+        if unsafe { crate::abi::r#gen::pon_frame_set_local(frame, (index + 1) as u32, value) }.is_null() {
+            return Ok(ptr::null_mut());
+        }
+    }
+    let resume = if kind == GeneratorKind::Coroutine {
+        lazy_eager_coroutine_resume
+    } else {
+        lazy_eager_generator_resume
+    };
+    // SAFETY: `resume` follows `GenResumeFn`; `frame` is live.
+    Ok(unsafe {
+        crate::abi::r#gen::pon_make_generator(
+            resume,
+            frame,
+            kind.as_u8(),
+        )
+    })
 }
 
 /// Bind and call a boxed function through Phase-B metadata when present.
@@ -439,6 +697,14 @@ pub unsafe fn call_bound_function(
 ) -> Result<*mut PyObject, String> {
     let record = function_record(function);
     let mut argv = bind_arguments(function, positional, keywords, star, dstar)?;
+    if let Some(record) = record.as_ref() {
+        if record.flags & CODE_FLAG_COROUTINE != 0 {
+            return unsafe { make_lazy_eager_generator(function, &argv, GeneratorKind::Coroutine) };
+        }
+        if record.flags & CODE_FLAG_GENERATOR != 0 {
+            return unsafe { make_lazy_eager_generator(function, &argv, GeneratorKind::Generator) };
+        }
+    }
     let code = if let Some(record) = record {
         record.entry
     } else {
@@ -448,6 +714,7 @@ pub unsafe fn call_bound_function(
     if code.is_null() {
         return Err("function code pointer is null".to_owned());
     }
+    let _guard = crate::abi::push_current_call(function.cast::<PyFunction>(), argv.as_mut_ptr(), argv.len());
     pon_err_clear();
     // SAFETY: Function entrypoints are emitted with the compiled-code ABI.
     let entry: PyCodeFn = unsafe { mem::transmute(code) };
@@ -464,15 +731,15 @@ fn bind_phase_a_arguments(
     positional: &[*mut PyObject],
     keywords: KeywordArgs<'_>,
 ) -> Result<Vec<*mut PyObject>, String> {
-    if !keywords.names.is_empty() {
-        return Err("keyword arguments require Phase-B function metadata".to_owned());
-    }
     if function.is_null() {
         return Err("callee is NULL".to_owned());
     }
+    if !keywords.names.is_empty() {
+        return bind_native_keywords(function, positional, keywords);
+    }
     // SAFETY: The caller only invokes binding after the runtime type check.
     let arity = unsafe { (*function.cast::<PyFunction>()).arity };
-    if positional.len() != arity {
+    if arity != crate::builtins::variadic_arity() && positional.len() != arity {
         return Err(format!("function expected {arity} arguments, got {}", positional.len()));
     }
     for (index, value) in positional.iter().enumerate() {
@@ -483,20 +750,112 @@ fn bind_phase_a_arguments(
     Ok(positional.to_vec())
 }
 
+fn bind_native_keywords(
+    function: *mut PyObject,
+    positional: &[*mut PyObject],
+    keywords: KeywordArgs<'_>,
+) -> Result<Vec<*mut PyObject>, String> {
+    let Some(name) = function_name(function) else {
+        return Err("keyword arguments require Phase-B function metadata".to_owned());
+    };
+    match name.as_str() {
+        "sorted" => bind_sorted_keywords(positional, keywords),
+        "enumerate" => bind_single_keyword(positional, keywords, "enumerate", "start", 1, 2),
+        _ => Err("keyword arguments require Phase-B function metadata".to_owned()),
+    }
+}
+
+fn bind_sorted_keywords(positional: &[*mut PyObject], keywords: KeywordArgs<'_>) -> Result<Vec<*mut PyObject>, String> {
+    if positional.is_empty() || positional.len() > 2 {
+        return Err(format!("sorted() expected 1 or 2 positional arguments, got {}", positional.len()));
+    }
+    let mut key = positional.get(1).copied();
+    let mut reverse = None;
+    for (name, value) in keywords.names.iter().copied().zip(keywords.values.iter().copied()) {
+        if value.is_null() {
+            return Err(format!("keyword argument {} is NULL", keyword_name(name)));
+        }
+        match keyword_name(name).as_str() {
+            "key" => {
+                if key.is_some() {
+                    return Err("sorted() got multiple values for keyword argument 'key'".to_owned());
+                }
+                key = Some(value);
+            }
+            "reverse" => {
+                if reverse.is_some() {
+                    return Err("sorted() got multiple values for keyword argument 'reverse'".to_owned());
+                }
+                reverse = Some(value);
+            }
+            other => return Err(format!("sorted() got an unexpected keyword argument '{other}'")),
+        }
+    }
+    let mut argv = Vec::with_capacity(1 + usize::from(key.is_some() || reverse.is_some()) + usize::from(reverse.is_some()));
+    argv.push(positional[0]);
+    if let Some(key) = key {
+        argv.push(key);
+    } else if reverse.is_some() {
+        let none = unsafe { crate::abi::pon_none() };
+        if none.is_null() {
+            return Err("failed to allocate None for sorted key placeholder".to_owned());
+        }
+        argv.push(none);
+    }
+    if let Some(reverse) = reverse {
+        argv.push(reverse);
+    }
+    Ok(argv)
+}
+
+fn bind_single_keyword(
+    positional: &[*mut PyObject],
+    keywords: KeywordArgs<'_>,
+    function_name: &str,
+    keyword: &str,
+    min_positional: usize,
+    max_positional: usize,
+) -> Result<Vec<*mut PyObject>, String> {
+    if positional.len() < min_positional || positional.len() > max_positional {
+        return Err(format!(
+            "{function_name}() expected {min_positional} to {max_positional} positional arguments, got {}",
+            positional.len()
+        ));
+    }
+    let mut argv = positional.to_vec();
+    for (name, value) in keywords.names.iter().copied().zip(keywords.values.iter().copied()) {
+        if value.is_null() {
+            return Err(format!("keyword argument {} is NULL", keyword_name(name)));
+        }
+        let actual = keyword_name(name);
+        if actual != keyword {
+            return Err(format!("{function_name}() got an unexpected keyword argument '{actual}'"));
+        }
+        if argv.len() == max_positional {
+            return Err(format!("{function_name}() got multiple values for keyword argument '{keyword}'"));
+        }
+        argv.push(value);
+    }
+    Ok(argv)
+}
+
 unsafe fn copy_param_spec(params: *const ParamSpec) -> Result<Option<OwnedParamSpec>, String> {
     if params.is_null() {
         return Ok(None);
     }
     // SAFETY: The caller supplies a valid `ParamSpec` for the duration of this copy.
     let spec = unsafe { *params };
-    if spec.names.is_null() && spec.total_param_count != 0 {
+    let named_count = spec.positional_only_count as usize
+        + spec.positional_count as usize
+        + spec.keyword_only_count as usize;
+    if spec.names.is_null() && named_count != 0 {
         return Err("ParamSpec names pointer is null".to_owned());
     }
-    let names = if spec.total_param_count == 0 {
+    let names = if named_count == 0 {
         Vec::new()
     } else {
-        // SAFETY: `names` points to `total_param_count` interned ids by ABI contract.
-        unsafe { core::slice::from_raw_parts(spec.names, spec.total_param_count as usize) }.to_vec()
+        // SAFETY: `names` points to every named positional/keyword-only id.
+        unsafe { core::slice::from_raw_parts(spec.names, named_count) }.to_vec()
     };
     let described = spec.positional_only_count as usize + spec.positional_count as usize + spec.keyword_only_count as usize;
     if described > names.len() {
@@ -566,6 +925,83 @@ mod tests {
     }
 
     #[test]
+    fn binds_keyword_only_default_without_masking_later_required_parameter() {
+        let function = 0x1000usize as *mut PyObject;
+        let positional_name = crate::intern::intern("positional");
+        let defaulted_kwonly_name = crate::intern::intern("defaulted_kwonly");
+        let required_kwonly_name = crate::intern::intern("required_kwonly");
+        let function_name = crate::intern::intern("kwonly_binding_case");
+        let names = [positional_name, defaulted_kwonly_name, required_kwonly_name];
+        let params = ParamSpec {
+            names: names.as_ptr(),
+            total_param_count: names.len() as u32,
+            positional_only_count: 0,
+            positional_count: 1,
+            keyword_only_count: 2,
+            varargs_name: 0,
+            varkw_name: 0,
+        };
+        let code = CodeInfo {
+            entry: dummy_entry as *const u8,
+            params: &params,
+            name_interned: function_name,
+            n_locals: 3,
+            n_feedback: 0,
+            flags: 0,
+        };
+        let positional_arg = 0x2000usize as *mut PyObject;
+        let defaulted_kwonly_default = 0x2001usize as *mut PyObject;
+        let supplied_required_kwonly = 0x2002usize as *mut PyObject;
+        register_function_record(
+            function,
+            &code,
+            &[],
+            &[defaulted_kwonly_name],
+            &[defaulted_kwonly_default],
+            &[],
+        )
+        .unwrap();
+
+        let err = bind_arguments(
+            function,
+            &[positional_arg],
+            KeywordArgs {
+                names: &[],
+                values: &[],
+            },
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "missing 1 required keyword-only argument: 'required_kwonly'"
+        );
+
+        let bound = bind_arguments(
+            function,
+            &[positional_arg],
+            KeywordArgs {
+                names: &[required_kwonly_name],
+                values: &[supplied_required_kwonly],
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            bound,
+            vec![
+                positional_arg,
+                defaulted_kwonly_default,
+                supplied_required_kwonly
+            ]
+        );
+        unregister_function_record(function);
+    }
+
+    #[test]
     fn rejects_duplicate_keyword_binding() {
         let function = 0x1100usize as *mut PyObject;
         let names = [21_u32];
@@ -604,5 +1040,71 @@ mod tests {
 
         assert!(err.contains("multiple values"));
         unregister_function_record(function);
+    }
+
+    unsafe extern "C" fn lazy_return_six_entry(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+        for value in [2, 4] {
+            let object = unsafe { crate::abi::pon_const_int(value) };
+            if object.is_null() {
+                return ptr::null_mut();
+            }
+            if unsafe { crate::abi::r#gen::pon_yield(object) }.is_null() {
+                return ptr::null_mut();
+            }
+        }
+        let stop_value = unsafe { crate::abi::pon_const_int(6) };
+        if stop_value.is_null() {
+            return ptr::null_mut();
+        }
+        unsafe { crate::abi::r#gen::pon_eager_yield_generator(stop_value) }
+    }
+
+    #[test]
+    fn lazy_eager_generator_preserves_delegate_return_value() {
+        let _guard = crate::thread_state::test_state_lock();
+        unsafe {
+            assert_eq!(crate::abi::pon_runtime_init(), 0);
+            crate::thread_state::pon_err_clear();
+            let function = crate::abi::pon_make_function(
+                lazy_return_six_entry as *const u8,
+                0,
+                crate::intern::intern("lazy_return_six_entry"),
+            );
+            assert!(!function.is_null());
+            let code = CodeInfo {
+                entry: lazy_return_six_entry as *const u8,
+                params: ptr::null(),
+                name_interned: crate::intern::intern("lazy_return_six_entry"),
+                n_locals: 0,
+                n_feedback: 0,
+                flags: CODE_FLAG_GENERATOR,
+            };
+            register_function_record(function, &code, &[], &[], &[], &[]).unwrap();
+
+            let generator = call_bound_function(
+                function,
+                &[],
+                KeywordArgs {
+                    names: &[],
+                    values: &[],
+                },
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(!generator.is_null());
+
+            let first = crate::abi::r#gen::pon_gen_send(generator, crate::abi::pon_none());
+            assert_eq!(crate::abi::format_object_for_print(first).as_deref(), Ok("2"));
+            let second = crate::abi::r#gen::pon_gen_send(generator, crate::abi::pon_none());
+            assert_eq!(crate::abi::format_object_for_print(second).as_deref(), Ok("4"));
+            let done = crate::abi::r#gen::pon_gen_send(generator, crate::abi::pon_none());
+            assert!(done.is_null());
+            assert!(crate::thread_state::pon_err_occurred());
+            let stop_value = crate::abi::r#gen::pon_gen_stop_value();
+            assert_eq!(crate::abi::format_object_for_print(stop_value).as_deref(), Ok("6"));
+            assert!(!crate::thread_state::pon_err_occurred());
+            unregister_function_record(function);
+        }
     }
 }

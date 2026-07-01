@@ -23,6 +23,8 @@ use crate::types::generator::{GeneratorKind, PyGenerator, TYPE_ID_GENERATOR, as_
 pub type GenResumeFn = unsafe extern "C" fn(frame: *mut crate::abi::PyFrame, sent: *mut PyObject) -> *mut PyObject;
 thread_local! {
     static EAGER_YIELDS: RefCell<Vec<*mut PyObject>> = RefCell::new(Vec::new());
+    static EAGER_SENT_OVERRIDE: Cell<*mut PyObject> = const { Cell::new(ptr::null_mut()) };
+    static EAGER_PRINT_SUPPRESSION: Cell<u8> = const { Cell::new(0) };
     static RESUME_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
 
@@ -143,6 +145,48 @@ pub(crate) fn has_eager_yields() -> bool {
     EAGER_YIELDS.with(|pending| !pending.borrow().is_empty())
 }
 
+
+pub(crate) fn suppress_eager_print() -> bool {
+    EAGER_PRINT_SUPPRESSION.with(|mode| match mode.get() {
+        1 => has_eager_yields(),
+        2 => !has_eager_yields(),
+        _ => false,
+    })
+}
+
+pub(crate) fn with_eager_coroutine_replay<T>(
+    sent_override: *mut PyObject,
+    print_suppression: u8,
+    body: impl FnOnce() -> T,
+) -> T {
+    RESUME_DEPTH.with(|depth| {
+        let saved_depth = depth.get();
+        depth.set(0);
+        EAGER_SENT_OVERRIDE.with(|sent_slot| {
+            let saved_sent = sent_slot.get();
+            sent_slot.set(sent_override);
+            EAGER_PRINT_SUPPRESSION.with(|print_slot| {
+                let saved_print = print_slot.get();
+                print_slot.set(print_suppression);
+                let result = body();
+                print_slot.set(saved_print);
+                sent_slot.set(saved_sent);
+                depth.set(saved_depth);
+                result
+            })
+        })
+    })
+}
+pub(crate) fn with_eager_yield_recording<T>(body: impl FnOnce() -> T) -> T {
+    RESUME_DEPTH.with(|depth| {
+        let saved = depth.get();
+        depth.set(0);
+        let result = body();
+        depth.set(saved);
+        result
+    })
+}
+
 unsafe extern "C" fn eager_yields_resume(frame: *mut crate::abi::PyFrame, sent: *mut PyObject) -> *mut PyObject {
     let _ = sent;
     if frame.is_null() {
@@ -174,18 +218,21 @@ unsafe extern "C" fn eager_yields_resume(frame: *mut crate::abi::PyFrame, sent: 
             value
         }
     } else {
-        frame.mark_exhausted();
-        // SAFETY: `pon_none` and `pon_raise_stop_iteration` follow the NULL-sentinel ABI.
-        let none = unsafe { super::pon_none() };
-        unsafe { super::exc::pon_raise_stop_iteration(none) }
+        let value = if frame.parent.is_null() {
+            // SAFETY: `pon_none` returns the initialized immortal singleton.
+            unsafe { super::pon_none() }
+        } else {
+            frame.parent
+        };
+        frame.state = FRAME_STATE_EXHAUSTED;
+        unsafe { crate::sync::store_heap_pointer(ptr::addr_of_mut!(frame.parent), ptr::null_mut()) };
+        // SAFETY: `pon_raise_stop_iteration` follows the NULL-sentinel ABI.
+        unsafe { super::exc::pon_raise_stop_iteration(value) }
     }
 }
 
-pub(crate) unsafe fn take_eager_yield_generator() -> *mut PyObject {
+pub(crate) unsafe fn take_eager_yield_generator(return_value: *mut PyObject) -> *mut PyObject {
     let values = EAGER_YIELDS.with(|pending| core::mem::take(&mut *pending.borrow_mut()));
-    if values.is_empty() {
-        return ptr::null_mut();
-    }
     let Ok(n_locals) = u32::try_from(values.len()) else {
         return super::return_null_with_error("generator yielded too many values");
     };
@@ -200,8 +247,29 @@ pub(crate) unsafe fn take_eager_yield_generator() -> *mut PyObject {
             return ptr::null_mut();
         }
     }
+    if !return_value.is_null() {
+        // SAFETY: The freshly allocated frame is exclusively owned until the generator is published.
+        unsafe { crate::sync::store_heap_pointer(ptr::addr_of_mut!((*frame).parent), return_value) };
+    }
     // SAFETY: `eager_yields_resume` follows `GenResumeFn`; `frame` is live.
     unsafe { pon_make_generator(eager_yields_resume, frame, GeneratorKind::Generator.as_u8()) }
+}
+
+/// Consumes values recorded by the eager generator fallback and returns a heap
+/// generator whose eventual exhaustion carries `return_value`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_eager_yield_generator(return_value: *mut PyObject) -> *mut PyObject {
+    super::catch_object_helper(|| {
+        let value = if return_value.is_null() {
+            unsafe { super::pon_none() }
+        } else {
+            return_value
+        };
+        if value.is_null() {
+            return ptr::null_mut();
+        }
+        unsafe { take_eager_yield_generator(value) }
+    })
 }
 
 /// Allocates a heap frame with `n_locals` local/temp slots.
@@ -527,18 +595,42 @@ pub unsafe extern "C" fn pon_yield(value: *mut PyObject) -> *mut PyObject {
         };
         if !yielded.is_null() && recording_eager_yields() {
             record_eager_yield(yielded);
+            let sent_override = EAGER_SENT_OVERRIDE.with(Cell::get);
+            if !sent_override.is_null() {
+                return sent_override;
+            }
         }
         yielded
     })
 }
 
-/// Performs one `yield from` iterator step, preserving NULL+StopIteration.
+/// Performs `yield from` delegation.
+///
+/// During the Phase-B eager generator fallback, a generator body executes at
+/// call time and records yielded values.  In that mode this helper must exhaust
+/// the delegate now, recording every forwarded item and returning the consumed
+/// `StopIteration.value` as the expression result.  Inside a real stackless
+/// resume (`RESUME_DEPTH > 0`) it remains a single nullable iterator step.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_yield_from(iterator: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
     unsafe { super::record_feedback_unary(feedback, iterator) };
     super::catch_object_helper(|| {
         if iterator.is_null() {
             return raise_type_error("yield-from iterator is null");
+        }
+        if recording_eager_yields() {
+            loop {
+                // SAFETY: `abstract_op::iter_next` preserves StopIteration as NULL + pending exception.
+                let item = unsafe { abstract_op::iter_next(iterator) };
+                if item.is_null() {
+                    return match stop_iteration_value_and_clear() {
+                        Some(value) if !value.is_null() => value,
+                        Some(_) => unsafe { super::pon_none() },
+                        None => ptr::null_mut(),
+                    };
+                }
+                record_eager_yield(item);
+            }
         }
         // SAFETY: `abstract_op::iter_next` preserves StopIteration as NULL + pending exception.
         unsafe { abstract_op::iter_next(iterator) }
@@ -560,13 +652,25 @@ pub unsafe extern "C" fn pon_await(awaitable: *mut PyObject, feedback: *mut Feed
         }
         // SAFETY: `ty` is the object's live type descriptor.
         let slot = unsafe { (*ty).tp_as_async.as_ref().and_then(|methods| methods.am_await) };
-        let Some(slot) = slot else {
-            return raise_type_error("object is not awaitable");
+        let iterator = if let Some(slot) = slot {
+            // SAFETY: Slot follows the unary object ABI.
+            unsafe { slot(awaitable) }
+        } else {
+            let method = unsafe { abstract_op::get_attr(awaitable, crate::intern::intern("__await__")) };
+            if method.is_null() {
+                return ptr::null_mut();
+            }
+            unsafe { super::pon_call(method, ptr::null_mut(), 0) }
         };
-        // SAFETY: Slot follows the unary object ABI.
-        let iterator = unsafe { slot(awaitable) };
         if iterator.is_null() {
             return ptr::null_mut();
+        }
+        let types = match ensure_gen_runtime() {
+            Ok(types) => types,
+            Err(message) => return super::return_null_with_error(message),
+        };
+        if unsafe { generator_kind_for(iterator, types) } == Some(GeneratorKind::Coroutine) {
+            return iterator;
         }
         // SAFETY: Get an iterator from the await result.
         unsafe { abstract_op::get_iter(iterator) }
@@ -730,20 +834,20 @@ mod tests {
     }
 
     #[test]
-    fn yield_from_advances_generator_iterator() {
+    fn generator_object_is_its_own_iterator() {
         let _guard = test_state_lock();
         unsafe {
             assert_eq!(pon_runtime_init(), 0);
             pon_err_clear();
             let frame = pon_make_frame(0);
             let generator = pon_make_generator(two_yields, frame, GeneratorKind::Generator.as_u8());
-            let first = pon_yield_from(generator, ptr::null_mut());
-            assert_eq!(format_object_for_print(first).as_deref(), Ok("1"));
-            let second = pon_yield_from(generator, ptr::null_mut());
-            assert_eq!(format_object_for_print(second).as_deref(), Ok("2"));
-            assert!(pon_yield_from(generator, ptr::null_mut()).is_null());
+            assert_eq!(pon_get_iter(generator, ptr::null_mut()), generator);
+            assert_eq!(format_object_for_print(pon_gen_send(generator, pon_none())).as_deref(), Ok("1"));
+            assert_eq!(format_object_for_print(pon_gen_send(generator, pon_none())).as_deref(), Ok("2"));
+            assert!(pon_gen_send(generator, pon_none()).is_null());
             assert!(pon_err_occurred());
             pon_err_clear();
         }
     }
+
 }

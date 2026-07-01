@@ -8,8 +8,8 @@ use std::sync::{LazyLock, Mutex};
 
 use pon_gc::TypeId;
 
-use crate::object::{PyAsyncMethods, PyObject, PyType};
-use crate::types::generator::{PyGenerator, generator_am_send, generator_iter, generator_next};
+use crate::object::{GetAttrFunc, PyAsyncMethods, PyObject, PyType};
+use crate::types::generator::{PyGenerator, generator_am_send, generator_getattro, generator_next};
 
 /// GC type id reserved for coroutine objects in the WS-GEN family.
 pub const TYPE_ID_COROUTINE: TypeId = TypeId(31);
@@ -29,7 +29,7 @@ pub fn ensure_coroutine_type(type_type: *mut PyType) -> *mut PyType {
 
     let async_methods = ensure_coroutine_async_methods();
     let mut ty = PyType::new(type_type.cast_const(), "coroutine", mem::size_of::<PyCoroutine>());
-    ty.tp_iter = Some(generator_iter);
+    ty.tp_getattro = Some(generator_getattro as GetAttrFunc);
     ty.tp_iternext = Some(generator_next);
     ty.tp_as_async = async_methods;
     ty.gc_type_id = TYPE_ID_COROUTINE.0 as usize;

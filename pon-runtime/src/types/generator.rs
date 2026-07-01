@@ -11,7 +11,9 @@ use std::sync::{LazyLock, Mutex};
 use pon_gc::TypeId;
 
 use crate::abi::{PyFrame, r#gen::GenResumeFn};
-use crate::object::{PyAsyncMethods, PyObject, PyObjectHeader, PyType, SendFunc, as_object_ptr};
+use crate::intern;
+use crate::object::{GetAttrFunc, PyAsyncMethods, PyObject, PyObjectHeader, PyType, SendFunc, as_object_ptr};
+use crate::types::{method, type_};
 use crate::types::frame::FRAME_STATE_EXHAUSTED;
 
 /// GC type id reserved for generator objects in the WS-GEN family.
@@ -104,6 +106,7 @@ pub fn ensure_generator_type(type_type: *mut PyType) -> *mut PyType {
     let mut ty = PyType::new(type_type.cast_const(), "generator", mem::size_of::<PyGenerator>());
     ty.tp_iter = Some(generator_iter);
     ty.tp_iternext = Some(generator_next);
+    ty.tp_getattro = Some(generator_getattro as GetAttrFunc);
     ty.tp_as_async = async_methods;
     ty.gc_type_id = TYPE_ID_GENERATOR.0 as usize;
     let ptr = Box::into_raw(Box::new(ty));
@@ -201,4 +204,84 @@ pub unsafe fn as_generator_mut(object: *mut PyObject) -> *mut PyGenerator {
 #[must_use]
 pub fn as_generator_object(generator: *mut PyGenerator) -> *mut PyObject {
     as_object_ptr(generator)
+}
+
+unsafe fn argv_slice<'a>(argv: *mut *mut PyObject, argc: usize) -> Result<&'a [*mut PyObject], String> {
+    if argv.is_null() && argc != 0 {
+        return Err("argv pointer is null".to_owned());
+    }
+    Ok(if argc == 0 {
+        &[]
+    } else {
+        // SAFETY: The caller supplies `argc` contiguous object-pointer entries.
+        unsafe { core::slice::from_raw_parts(argv.cast_const(), argc) }
+    })
+}
+
+unsafe fn exact_args<'a>(argv: *mut *mut PyObject, argc: usize, expected: usize, name: &str) -> Result<&'a [*mut PyObject], String> {
+    if argc != expected {
+        return Err(format!("{name} expected {expected} arguments, got {argc}"));
+    }
+    unsafe { argv_slice(argv, argc) }
+}
+
+unsafe extern "C" fn generator_send_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { exact_args(argv, argc, 2, "send") } {
+        Ok(args) => args,
+        Err(message) => return crate::abi::return_null_with_error(message),
+    };
+    // SAFETY: The bound method receiver and value occupy the two exact slots.
+    unsafe { crate::abi::r#gen::pon_gen_send(args[0], args[1]) }
+}
+
+unsafe extern "C" fn generator_throw_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { exact_args(argv, argc, 2, "throw") } {
+        Ok(args) => args,
+        Err(message) => return crate::abi::return_null_with_error(message),
+    };
+    // SAFETY: The bound method receiver and exception occupy the two exact slots.
+    unsafe { crate::abi::r#gen::pon_gen_throw(args[0], args[1]) }
+}
+
+unsafe extern "C" fn generator_close_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { exact_args(argv, argc, 1, "close") } {
+        Ok(args) => args,
+        Err(message) => return crate::abi::return_null_with_error(message),
+    };
+    // SAFETY: The bound method receiver is the only exact slot.
+    unsafe { crate::abi::r#gen::pon_gen_close(args[0]) }
+}
+
+unsafe fn bound_generator_method(
+    object: *mut PyObject,
+    name: &'static str,
+    arity: usize,
+    code: *const u8,
+) -> *mut PyObject {
+    // SAFETY: `pon_make_function` allocates a normal runtime function object.
+    let function = unsafe { crate::abi::pon_make_function(code, arity, intern::intern(name)) };
+    if function.is_null() {
+        return ptr::null_mut();
+    }
+    match method::new_bound_method(function, object) {
+        Ok(method) => method.cast::<PyObject>(),
+        Err(message) => crate::abi::return_null_with_error(message),
+    }
+}
+
+/// Attribute surface for generator-family native methods.
+///
+/// # Safety
+/// `object` must be a boxed generator/coroutine object and `name` must be a boxed
+/// runtime string.
+pub unsafe extern "C" fn generator_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name) = (unsafe { type_::unicode_text(name) }) else {
+        return crate::abi::return_null_with_error("generator attribute name must be str");
+    };
+    match name {
+        "send" => unsafe { bound_generator_method(object, "send", 2, generator_send_method as *const u8) },
+        "throw" => unsafe { bound_generator_method(object, "throw", 2, generator_throw_method as *const u8) },
+        "close" => unsafe { bound_generator_method(object, "close", 1, generator_close_method as *const u8) },
+        _ => crate::abi::return_null_with_error(format!("attribute '{name}' was not found")),
+    }
 }

@@ -13,6 +13,10 @@ use super::{alloc_function, catch_object_helper, ensure_runtime_initialized, pon
 
 /// Function/code flags carried by [`crate::abi::CodeInfo`].
 pub type CodeFlags = u32;
+/// Function body contains generator suspension points and must return a generator object on call.
+pub const CODE_FLAG_GENERATOR: CodeFlags = 1 << 0;
+/// Function body was produced by `async def` and must return a coroutine object on call.
+pub const CODE_FLAG_COROUTINE: CodeFlags = 1 << 1;
 
 /// Calls a boxed callable with positional, keyword, `*args`, and `**kwargs`
 /// operands.  Unsupported expansion forms report a NULL-sentinel error rather
@@ -99,17 +103,19 @@ pub unsafe extern "C" fn pon_call_method(
     })
 }
 
-/// Creates a boxed function object from full Phase-B `CodeInfo` plus evaluated
-/// defaults.  Keyword-only defaults are assigned to the trailing keyword-only
-/// parameters in the copied `ParamSpec`; the temporary helper ABI has no separate
-/// name array yet.
+/// defaults.  Keyword-only defaults arrive with the matching interned parameter
+/// names because defaults may be sparse across keyword-only declarations.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_make_function_full(
     code: *const CodeInfo,
     defaults: *mut *mut PyObject,
     default_count: usize,
+    kwdefault_names: *const u32,
     kwdefaults: *mut *mut PyObject,
     kwdefault_count: usize,
+    annotation_names: *const u32,
+    annotations: *mut *mut PyObject,
+    annotation_count: usize,
 ) -> *mut PyObject {
     catch_object_helper(|| {
         if let Err(message) = ensure_runtime_initialized() {
@@ -120,7 +126,7 @@ pub unsafe extern "C" fn pon_make_function_full(
         }
         // SAFETY: The caller supplies a valid `CodeInfo` for this helper call.
         let code = unsafe { &*code };
-        let params = match unsafe { copy_param_names(code.params) } {
+        let params = match unsafe { copy_param_counts(code.params) } {
             Ok(params) => params,
             Err(message) => return return_null_with_error(message),
         };
@@ -131,11 +137,22 @@ pub unsafe extern "C" fn pon_make_function_full(
             Ok(values) => values,
             Err(message) => return return_null_with_error(message),
         };
+        let kwdefault_names = match unsafe { name_slice(kwdefault_names, kwdefault_count) } {
+            Ok(values) => values,
+            Err(message) => return return_null_with_error(message),
+        };
         let kwdefault_values = match unsafe { object_slice(kwdefaults, kwdefault_count) } {
             Ok(values) => values,
             Err(message) => return return_null_with_error(message),
         };
-        let kwdefault_names = derive_kwdefault_names(params.as_ref(), kwdefault_count);
+        let annotation_names = match unsafe { name_slice(annotation_names, annotation_count) } {
+            Ok(values) => values,
+            Err(message) => return return_null_with_error(message),
+        };
+        let annotation_values = match unsafe { object_slice(annotations, annotation_count) } {
+            Ok(values) => values,
+            Err(message) => return return_null_with_error(message),
+        };
         let object = match with_runtime(|runtime| alloc_function(runtime, code.entry, arity, code.name_interned)) {
             Some(Ok(object)) => object,
             Some(Err(message)) => return return_null_with_error(message),
@@ -145,8 +162,11 @@ pub unsafe extern "C" fn pon_make_function_full(
             return return_null_with_error(message);
         }
         if let Err(message) =
-            function::register_function_record(object, code, defaults, &kwdefault_names, kwdefault_values, &[])
+            function::register_function_record(object, code, defaults, kwdefault_names, kwdefault_values, &[])
         {
+            return return_null_with_error(message);
+        }
+        if let Err(message) = unsafe { function::set_function_annotations(object, annotation_names, annotation_values) } {
             return return_null_with_error(message);
         }
         object
@@ -258,52 +278,32 @@ unsafe fn name_slice<'a>(values: *const u32, len: usize) -> Result<&'a [u32], St
 }
 
 #[derive(Clone, Debug)]
-struct ParamNameCopy {
-    names: Vec<u32>,
+struct ParamCountCopy {
     positional_only_count: u32,
     positional_count: u32,
-    keyword_only_count: u32,
 }
 
-unsafe fn copy_param_names(params: *const ParamSpec) -> Result<Option<ParamNameCopy>, String> {
+unsafe fn copy_param_counts(params: *const ParamSpec) -> Result<Option<ParamCountCopy>, String> {
     if params.is_null() {
         return Ok(None);
     }
     // SAFETY: The caller supplies a valid `ParamSpec` for the duration of this copy.
     let params = unsafe { *params };
-    let names = if params.total_param_count == 0 {
-        Vec::new()
-    } else if params.names.is_null() {
+    if params.names.is_null()
+        && params
+            .positional_only_count
+            .saturating_add(params.positional_count)
+            .saturating_add(params.keyword_only_count)
+            != 0
+    {
         return Err("ParamSpec names pointer is null".to_owned());
-    } else {
-        // SAFETY: `names` points to `total_param_count` ids by ABI contract.
-        unsafe { core::slice::from_raw_parts(params.names, params.total_param_count as usize) }.to_vec()
-    };
-    Ok(Some(ParamNameCopy {
-        names,
+    }
+    Ok(Some(ParamCountCopy {
         positional_only_count: params.positional_only_count,
         positional_count: params.positional_count,
-        keyword_only_count: params.keyword_only_count,
     }))
 }
 
-fn derive_kwdefault_names(params: Option<&ParamNameCopy>, kwdefault_count: usize) -> Vec<u32> {
-    let Some(params) = params else {
-        return Vec::new();
-    };
-    let positional = (params.positional_only_count + params.positional_count) as usize;
-    let kw_start = positional;
-    let kw_end = kw_start + params.keyword_only_count as usize;
-    params.names.get(kw_start..kw_end).unwrap_or(&[])
-        .iter()
-        .rev()
-        .take(kwdefault_count)
-        .copied()
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
-}
 
 #[cfg(test)]
 mod tests {
@@ -311,17 +311,9 @@ mod tests {
     use core::ptr;
 
     #[test]
-    fn derives_trailing_keyword_default_names() {
-        let params = ParamNameCopy {
-            names: vec![1, 2, 3, 4],
-            positional_only_count: 0,
-            positional_count: 2,
-            keyword_only_count: 2,
-        };
-
-        assert_eq!(derive_kwdefault_names(Some(&params), 1), vec![4]);
-        assert_eq!(derive_kwdefault_names(Some(&params), 2), vec![3, 4]);
-        assert!(derive_kwdefault_names(None, 1).is_empty());
+    fn name_slice_rejects_null_non_empty_array() {
+        let err = unsafe { name_slice(ptr::null(), 1) }.unwrap_err();
+        assert!(err.contains("null"));
     }
 
     #[test]

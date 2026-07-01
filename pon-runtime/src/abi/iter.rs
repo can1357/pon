@@ -16,7 +16,6 @@ unsafe fn is_none_object(object: *mut PyObject) -> bool {
     }
     super::with_runtime(|runtime| unsafe { is_exact_type(object, runtime.none_type.cast_const()) }).unwrap_or(false)
 }
-
 /// Builds an iterator from an object through `tp_iter` or the sequence iterator
 /// seam.  The feedback pointer is accepted for ABI stability and ignored.
 #[unsafe(no_mangle)]
@@ -26,7 +25,7 @@ pub unsafe extern "C" fn pon_get_iter(object: *mut PyObject, feedback: *mut Feed
         if unsafe { is_none_object(object) } && super::r#gen::has_eager_yields() {
             // SAFETY: Consumes values recorded by eager `yield` lowering and wraps
             // them in the normal heap-frame generator representation.
-            return unsafe { super::r#gen::take_eager_yield_generator() };
+            return unsafe { super::r#gen::take_eager_yield_generator(object) };
         }
         // SAFETY: Delegates to the generic iterator protocol.
         unsafe { abstract_op::get_iter(object) }
