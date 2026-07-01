@@ -4,9 +4,14 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+free-threading = []
+
 [lints]
 workspace = true
 
 [dependencies]
+cranelift-codegen.workspace = true
 ruff_python_parser.workspace = true
 ruff_python_ast.workspace = true

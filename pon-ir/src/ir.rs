@@ -1,14 +1,17 @@
-//! Phase-A control-flow IR shared by the frontend and code generators.
+//! Phase-B control-flow IR shared by the frontend and code generators.
 //!
 //! The IR intentionally keeps Python values opaque: every [`Value`] denotes a
 //! boxed Python object at runtime. Name-bearing operations use deterministic
 //! `u32` ids into [`Module::names`] so this crate does not depend on runtime
-//! interning state.
+//! interning state. Phase-B additions are data-only here; lowering and codegen
+//! decide when each operation becomes executable.
+
+use crate::types::Type;
 
 /// A lowered Python module.
 ///
-/// `functions[main.0]` is the synthetic `__main__` function. Every `u32` name id
-/// in instruction operands indexes [`Module::names`].
+/// `functions[main.0]` is the synthetic `__main__` function. Every [`NameId`]
+/// operand indexes [`Module::names`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Module {
     /// All lowered functions, including the synthetic top-level `__main__`.
@@ -22,6 +25,55 @@ pub struct Module {
 /// Index of a function in [`Module::functions`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FunctionId(pub u32);
+
+macro_rules! id_newtype {
+    ($(#[$meta:meta])* $vis:vis struct $name:ident;) => {
+        $(#[$meta])*
+        #[repr(transparent)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        $vis struct $name(pub u32);
+
+        impl From<u32> for $name {
+            fn from(value: u32) -> Self {
+                Self(value)
+            }
+        }
+
+        impl From<$name> for u32 {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+    };
+}
+
+id_newtype! {
+    /// Index of a constant in a future module/function constant table.
+    pub struct ConstId;
+}
+
+id_newtype! {
+    /// Index of an interned Python identifier in [`Module::names`].
+    pub struct NameId;
+}
+
+id_newtype! {
+    /// Index of a function-local slot in [`Function::n_locals`].
+    pub struct LocalId;
+}
+
+id_newtype! {
+    /// Index of a closure cell captured or owned by a function.
+    pub struct CellId;
+}
+
+/// Index of a lowered function; kept compatible with [`FunctionId`].
+pub type FuncId = FunctionId;
+
+id_newtype! {
+    /// Index of an inline-cache feedback record reserved for later tiers.
+    pub struct FeedbackSlot;
+}
 
 /// A lowered Python function.
 ///
@@ -59,6 +111,9 @@ pub struct Block {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Value(pub u32);
 
+/// Numeric identity of a boxed SSA value; kept compatible with [`Value`].
+pub type ValueId = Value;
+
 /// Numeric identity of an instruction result.
 ///
 /// Phase A uses instruction result ids as SSA values, so this is an alias for
@@ -72,41 +127,364 @@ pub struct Inst {
     pub result: Value,
     /// Instruction payload.
     pub kind: InstKind,
+    /// Optional inline-cache feedback record used by later typed tiers.
+    pub feedback_slot: Option<FeedbackSlot>,
+    /// Best inferred/speculative type for this instruction's SSA result.
+    pub inferred_type: Type,
+    /// Sound static upper bound for this instruction's SSA result.
+    pub static_type: Type,
 }
 
-/// Phase-A instruction set.
+impl Inst {
+    /// Build a tier-0 boxed instruction with inert typed-tier metadata.
+    ///
+    /// The strict-prefix Phase D metadata must not change baseline lowering or
+    /// codegen behavior, so fresh instructions start with no feedback slot, an
+    /// unobserved inferred type, and boxed-object static type.
+    #[must_use]
+    pub fn new(result: Value, kind: InstKind) -> Self {
+        Self {
+            result,
+            kind,
+            feedback_slot: None,
+            inferred_type: Type::Bottom,
+            static_type: Type::Object,
+        }
+    }
+
+    /// Attach a feedback slot to an operation site.
+    #[must_use]
+    pub fn with_feedback_slot(mut self, feedback_slot: FeedbackSlot) -> Self {
+        self.feedback_slot = Some(feedback_slot);
+        self
+    }
+
+    /// Attach an inferred/speculative SSA-result type.
+    #[must_use]
+    pub fn with_inferred_type(mut self, inferred_type: Type) -> Self {
+        self.inferred_type = inferred_type;
+        self
+    }
+
+    /// Attach a sound static SSA-result type.
+    #[must_use]
+    pub fn with_static_type(mut self, static_type: Type) -> Self {
+        self.static_type = static_type;
+        self
+    }
+}
+
+/// Phase-B instruction set.
 ///
-/// This enum is non-exhaustive so later Python coverage can add operations
-/// without forcing downstream crates to assume Phase A is complete.
+/// This enum is non-exhaustive so future Python coverage can add operations
+/// without forcing downstream crates to assume Phase B is complete. Existing
+/// Phase-A variant names and constructor shapes remain source-compatible.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
 pub enum InstKind {
-    /// Materialize a Python constant.
+    /// Materialize an inline Python constant used by Phase-A lowering.
     Const(PyConst),
+    /// Materialize a constant-table entry.
+    ConstRef(ConstId),
+    /// Build a Python tuple from element values.
+    BuildTuple { elts: Vec<ValueId> },
+    /// Build a Python list from element values.
+    BuildList { elts: Vec<ValueId> },
+    /// Build a Python set from element values.
+    BuildSet { elts: Vec<ValueId> },
+    /// Build a Python dict from key/value pairs.
+    BuildMap { pairs: Vec<(ValueId, ValueId)> },
+    /// Build a Python slice object from lower, upper, and step values.
+    BuildSlice {
+        /// Lower bound value, usually `None` when omitted.
+        lower: ValueId,
+        /// Upper bound value, usually `None` when omitted.
+        upper: ValueId,
+        /// Step value, usually `None` when omitted.
+        step: ValueId,
+    },
+    /// Concatenate formatted-string parts into a Python string.
+    BuildString { parts: Vec<FStrPart> },
+    /// Build a Python 3.14 template-string object from parsed parts.
+    BuildTemplate { parts: Vec<TStrPart> },
+    /// Append an item to a list during comprehension or unpack lowering.
+    ListAppend { list: ValueId, item: ValueId },
+    /// Add an item to a set during comprehension or unpack lowering.
+    SetAdd { set: ValueId, item: ValueId },
+    /// Insert a key/value pair into a dict under Python overwrite rules.
+    MapInsert {
+        /// Dict object being mutated.
+        map: ValueId,
+        /// Key object to insert.
+        key: ValueId,
+        /// Value object to insert.
+        val: ValueId,
+    },
+    /// Extend a list with values produced by an iterable.
+    ListExtend { list: ValueId, iter: ValueId },
+    /// Merge another mapping into a dict for `**` display unpacking.
+    DictMerge { map: ValueId, other: ValueId },
+    /// Merge another mapping into a call-kwargs dict, rejecting duplicate keys.
+    DictMergeUnique { map: ValueId, other: ValueId },
     /// Load a function-local slot.
-    LoadLocal(u32),
-    /// Store a function-local slot.
-    StoreLocal(u32, Value),
+    LoadLocal(LocalId),
+    /// Store a boxed value into a function-local slot.
+    StoreLocal(LocalId, ValueId),
+    /// Delete a function-local binding.
+    DeleteLocal(LocalId),
     /// Load a global by deterministic interned name id.
-    LoadGlobal(u32),
-    /// Store a global by deterministic interned name id.
-    StoreGlobal(u32, Value),
-    /// Load a Python name using LEGB rules; at module scope this is global load.
-    LoadName(u32),
+    LoadGlobal(NameId),
+    /// Store a boxed value into a global by deterministic interned name id.
+    StoreGlobal(NameId, ValueId),
+    /// Delete a global binding by deterministic interned name id.
+    DeleteGlobal(NameId),
+    /// Load a Python name from the active namespace chain.
+    LoadName(NameId),
+    /// Store a Python name in the active namespace.
+    StoreName(NameId, ValueId),
+    /// Delete a Python name from the active namespace.
+    DeleteName(NameId),
+    /// Load a closure cell's current boxed value.
+    LoadCell(CellId),
+    /// Store a boxed value into a closure cell.
+    StoreCell(CellId, ValueId),
+    /// Delete the value currently held by a closure cell.
+    DeleteCell(CellId),
+    /// Convert a local slot into a closure cell.
+    MakeCell(LocalId),
+    /// Load the cell object used to close over a free variable.
+    LoadClosure(CellId),
+    /// Load a builtin by deterministic interned name id.
+    LoadBuiltin(NameId),
     /// Apply a binary Python operation.
-    BinaryOp { op: BinOp, lhs: Value, rhs: Value },
+    BinaryOp {
+        /// Python binary operator to apply.
+        op: BinOp,
+        /// Left-hand operand.
+        lhs: ValueId,
+        /// Right-hand operand.
+        rhs: ValueId,
+    },
+    /// Apply an in-place Python operation for augmented assignment.
+    InplaceOp {
+        /// Python operator to apply in-place.
+        op: BinOp,
+        /// Left-hand target operand.
+        lhs: ValueId,
+        /// Right-hand operand.
+        rhs: ValueId,
+    },
+    /// Apply a unary Python operation other than logical `not`.
+    UnaryOp {
+        /// Unary operator to apply.
+        op: UnOp,
+        /// Operand to transform.
+        operand: ValueId,
+    },
+    /// Apply one rich comparison operation.
+    Compare {
+        /// Comparison operator to apply.
+        op: CmpOp,
+        /// Left-hand operand.
+        lhs: ValueId,
+        /// Right-hand operand.
+        rhs: ValueId,
+    },
+    /// Evaluate `in` or `not in`.
+    Contains {
+        /// Candidate item.
+        item: ValueId,
+        /// Container or iterable to search.
+        container: ValueId,
+        /// Whether this represents `not in`.
+        negate: bool,
+    },
+    /// Evaluate identity with `is` or `is not`.
+    Is {
+        /// Left-hand object.
+        lhs: ValueId,
+        /// Right-hand object.
+        rhs: ValueId,
+        /// Whether this represents `is not`.
+        negate: bool,
+    },
+    /// Convert a Python object to a boxed truth-test result.
+    BoolTest { val: ValueId },
+    /// Apply Python logical `not`.
+    Not { val: ValueId },
+    /// Load an attribute by interned name.
+    LoadAttr { obj: ValueId, name: NameId },
+    /// Store an attribute by interned name.
+    StoreAttr {
+        /// Object whose attribute is assigned.
+        obj: ValueId,
+        /// Interned attribute name.
+        name: NameId,
+        /// Boxed value to store.
+        val: ValueId,
+    },
+    /// Delete an attribute by interned name.
+    DeleteAttr { obj: ValueId, name: NameId },
+    /// Load a method and receiver pair for call specialization.
+    LoadMethod { obj: ValueId, name: NameId },
+    /// Load `obj[index]`.
+    SubscriptGet { obj: ValueId, index: ValueId },
+    /// Store `obj[index] = val`.
+    SubscriptSet {
+        /// Subscriptable object to mutate.
+        obj: ValueId,
+        /// Subscript index or key.
+        index: ValueId,
+        /// Boxed value to store.
+        val: ValueId,
+    },
+    /// Delete `obj[index]`.
+    SubscriptDel { obj: ValueId, index: ValueId },
     /// Call a Python callable with positional arguments.
-    Call { callee: Value, args: Vec<Value> },
-    /// Box a lowered function object.
+    Call { callee: ValueId, args: Vec<ValueId> },
+    /// Call a Python callable with star-args, keywords, and double-star kwargs.
+    CallEx {
+        /// Callable object.
+        callee: ValueId,
+        /// Positional arguments already evaluated left-to-right.
+        args: Vec<ValueId>,
+        /// Optional `*args` iterable.
+        star: Option<ValueId>,
+        /// Keyword arguments by interned name.
+        kwargs: Vec<(NameId, ValueId)>,
+        /// Optional `**kwargs` mapping.
+        dstar: Option<ValueId>,
+    },
+    /// Call a method pair produced by [`InstKind::LoadMethod`].
+    CallMethod { recv_pair: ValueId, args: Vec<ValueId> },
+    /// Get the synchronous iterator for a value.
+    GetIter { iterable: ValueId },
+    /// Get the asynchronous iterator for a value.
+    GetAIter { iterable: ValueId },
+    /// Advance an iterator and yield the next item or StopIteration state.
+    ForNext { iter: ValueId },
+    /// Unpack exactly `n` sequence values.
+    UnpackSeq { val: ValueId, n: usize },
+    /// Unpack a sequence with one starred target.
+    UnpackEx {
+        /// Sequence value to unpack.
+        val: ValueId,
+        /// Number of required targets before the star.
+        before: usize,
+        /// Number of required targets after the star.
+        after: usize,
+    },
+    /// Produce a generator yield value before suspension.
+    Yield { val: ValueId },
+    /// Delegate generator control to another iterator.
+    YieldFrom { iter: ValueId },
+    /// Await an awaitable via its `__await__` iterator.
+    Await { awaitable: ValueId },
+    /// Raise an exception, optionally with an explicit cause.
+    Raise {
+        /// Exception instance or type; `None` means bare `raise`.
+        exc: Option<ValueId>,
+        /// Optional `from` cause.
+        cause: Option<ValueId>,
+    },
+    /// Re-raise the active exception.
+    Reraise,
+    /// Push the current exception state for `except`/`finally` handling.
+    PushExcInfo,
+    /// Pop the current exception state after handler cleanup.
+    PopExcInfo,
+    /// Test whether the active exception matches an exception type.
+    MatchExc { exc_type: ValueId },
+    /// Split an exception group for `except*` handling.
+    CheckExcStar { exc_types: ValueId },
+    /// Load the current active exception object.
+    GetCurrentExc,
+    /// Build an exception group from exception values.
+    BuildExcGroup { excs: Vec<ValueId> },
+    /// Test whether a subject is a sequence pattern candidate.
+    MatchSequence { subj: ValueId },
+    /// Test whether a subject is a mapping pattern candidate.
+    MatchMapping { subj: ValueId },
+    /// Match a class pattern against positional and keyword pattern names.
+    MatchClass {
+        /// Subject being matched.
+        subj: ValueId,
+        /// Class object to match.
+        cls: ValueId,
+        /// Number of positional subpatterns.
+        nargs: usize,
+        /// Keyword subpattern names.
+        kw: Vec<NameId>,
+    },
+    /// Extract values for mapping pattern keys.
+    MatchKeys { subj: ValueId, keys: Vec<ValueId> },
+    /// Load the length of a pattern-match subject.
+    GetLen { subj: ValueId },
+    /// Test a subject length against a pattern threshold.
+    MatchLenGe {
+        /// Subject whose length is tested.
+        subj: ValueId,
+        /// Required length.
+        n: usize,
+        /// Whether the length must be exactly `n`.
+        exact: bool,
+    },
+    /// Import a module by interned dotted name.
+    ImportName {
+        /// Module name.
+        name: NameId,
+        /// Names requested by `from ... import ...`.
+        fromlist: Vec<NameId>,
+        /// Relative import level.
+        level: u32,
+    },
+    /// Import an attribute from an imported module.
+    ImportFrom { module: ValueId, name: NameId },
+    /// Import all public names from a module into the active namespace.
+    ImportStar { module: ValueId },
+    /// Build a Python class object.
+    BuildClass {
+        /// Function containing the class body.
+        body: FuncId,
+        /// Interned class name.
+        name: NameId,
+        /// Evaluated base classes.
+        bases: Vec<ValueId>,
+        /// Class keyword arguments.
+        keywords: Vec<(NameId, ValueId)>,
+        /// Decorators applied after class creation.
+        decorators: Vec<ValueId>,
+    },
+    /// Box a lowered function object using the Phase-A constructor shape.
     MakeFunction {
         /// Index of the lowered function in [`Module::functions`].
         func_index: u32,
         /// Deterministic interned id of the function's source name.
-        name_interned: u32,
+        name_interned: NameId,
         /// Positional argument count.
         arity: usize,
     },
+    /// Box a lowered function object with Phase-B defaults and closure data.
+    MakeFunctionFull {
+        /// Lowered function body.
+        code: FuncId,
+        /// Positional default values.
+        defaults: Vec<ValueId>,
+        /// Keyword-only default values.
+        kwdefaults: Vec<(NameId, ValueId)>,
+        /// Closure cells captured by the function.
+        closure: Vec<CellId>,
+        /// Evaluated annotations by interned name.
+        annotations: Vec<(NameId, ValueId)>,
+    },
+    /// Ensure `__annotations__` exists in the active namespace.
+    SetupAnnotations,
+    /// Load Python's `__build_class__` helper.
+    LoadBuildClass,
 }
+
+/// Phase-B operation payload alias used by planning documents.
+pub type Op = InstKind;
 
 /// Basic-block terminator.
 ///
@@ -117,33 +495,73 @@ pub enum InstKind {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Terminator {
     /// Return a boxed Python value.
-    Return(Value),
+    Return(ValueId),
     /// Unconditional jump.
     Jump(BlockId),
-    /// Conditional branch.
+    /// Conditional branch using the Phase-A field names.
     Branch {
         /// Truth-tested condition value.
-        cond: Value,
+        cond: ValueId,
         /// Destination when `cond` is true.
         then_blk: BlockId,
         /// Destination when `cond` is false.
         else_blk: BlockId,
     },
+    /// Conditional branch using the frozen Phase-B field names.
+    CondBranch {
+        /// Boxed truth-test result or comparison result.
+        cond: ValueId,
+        /// Destination when `cond` is true.
+        then_: BlockId,
+        /// Destination when `cond` is false.
+        else_: BlockId,
+    },
+    /// Iterator loop branch driven by a preceding [`InstKind::ForNext`].
+    ForLoop {
+        /// Iterator being advanced.
+        iter: ValueId,
+        /// Destination when an item is available.
+        body: BlockId,
+        /// Destination when iteration is exhausted.
+        done: BlockId,
+    },
+    /// Suspend a generator or coroutine and record its resume state.
+    Suspend {
+        /// Generator state number to persist.
+        state: u32,
+        /// Value yielded to the caller.
+        val: ValueId,
+        /// Block to enter when resumed.
+        resume: BlockId,
+    },
+    /// Transfer to the active exception handler after an error was raised.
+    RaiseTerm,
     /// No valid control-flow continuation.
     Unreachable,
 }
 
-/// Python constants representable directly in Phase-A IR.
+/// Python constants representable directly in IR.
+#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq)]
 pub enum PyConst {
-    /// Python integer fitting in the Phase-A immediate representation.
+    /// Python integer fitting in the current immediate representation.
     Int(i64),
-    /// Python float; reserved for later phases but included in the frozen shape.
+    /// Python float stored as an IEEE-754 double.
     Float(f64),
+    /// Python complex stored as two IEEE-754 doubles.
+    Complex { real: f64, imag: f64 },
     /// Python Unicode string stored as UTF-8 Rust text.
     Str(String),
+    /// Python bytes object stored as raw bytes.
+    Bytes(Vec<u8>),
+    /// Python boolean singleton.
+    Bool(bool),
     /// Python `None` singleton.
     None,
+    /// Python `Ellipsis` singleton.
+    Ellipsis,
+    /// Python `NotImplemented` singleton.
+    NotImplemented,
 }
 
 /// Binary operations known to the IR.
@@ -152,8 +570,90 @@ pub enum PyConst {
 pub enum BinOp {
     /// Python `+`.
     Add,
-    /// Python `-`, reserved for later phases.
+    /// Python `-`.
     Sub,
-    /// Python `*`, reserved for later phases.
+    /// Python `*`.
     Mul,
+    /// Python matrix multiply `@`.
+    MatMul,
+    /// Python true division `/`.
+    Div,
+    /// Python floor division `//`.
+    FloorDiv,
+    /// Python modulo `%`.
+    Mod,
+    /// Python exponentiation `**`.
+    Pow,
+    /// Python left shift `<<`.
+    LShift,
+    /// Python right shift `>>`.
+    RShift,
+    /// Python bitwise `&`.
+    And,
+    /// Python bitwise `|`.
+    Or,
+    /// Python bitwise `^`.
+    Xor,
+}
+
+/// Unary operations other than logical `not`.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnOp {
+    /// Python unary negation `-x`.
+    Neg,
+    /// Python unary plus `+x`.
+    Pos,
+    /// Python bitwise inversion `~x`.
+    Invert,
+}
+
+/// Rich comparison operations; identity and containment are separate IR ops.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CmpOp {
+    /// Python equality `==`.
+    Eq,
+    /// Python inequality `!=`.
+    Ne,
+    /// Python less-than `<`.
+    Lt,
+    /// Python less-than-or-equal `<=`.
+    Le,
+    /// Python greater-than `>`.
+    Gt,
+    /// Python greater-than-or-equal `>=`.
+    Ge,
+}
+
+/// One part of a lowered Python f-string.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FStrPart {
+    /// Literal f-string text stored in the constant table.
+    Literal(ConstId),
+    /// Interpolated f-string expression with conversion and optional format.
+    Interp {
+        /// Value to interpolate.
+        value: ValueId,
+        /// Conversion byte such as `b's'`, `b'r'`, or zero for no conversion.
+        conversion: u8,
+        /// Optional pre-lowered format-spec value.
+        format_spec: Option<ValueId>,
+    },
+}
+
+/// One part of a lowered Python 3.14 template string.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TStrPart {
+    /// Literal template text stored in the constant table.
+    Literal(ConstId),
+    /// Interpolated template expression with conversion and optional format.
+    Interp {
+        /// Value to interpolate.
+        value: ValueId,
+        /// Conversion byte such as `b's'`, `b'r'`, or zero for no conversion.
+        conversion: u8,
+        /// Optional pre-lowered format-spec value.
+        format_spec: Option<ValueId>,
+    },
 }

@@ -1,27 +1,100 @@
-//! Lowering from Ruff's Python AST into Phase-A pon IR.
+//! Lowering from Ruff's Python AST into pon IR.
+//!
+//! Phase B keeps the public Phase-A entry points (`lower_source` and
+//! `lower_module`) stable while introducing a real driver boundary.  The driver
+//! performs scope analysis first, then routes every statement/expression family
+//! through a named module.  Most Phase-B families intentionally return precise
+//! `LowerError::Unsupported` values today; the routing exists so future semantic
+//! work lands in the right family instead of expanding a single monolithic match.
 
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use ruff_python_ast::{
-    Expr, ExprContext, ModModule, Number, Operator, Parameters, Stmt, StmtAssign, StmtFunctionDef,
-};
+use ruff_python_ast::{Expr, ExprContext, ModModule, Number, Parameters, Stmt, StmtAssign, StmtFunctionDef};
+use ruff_python_ast::visitor::{self, Visitor};
 
 use crate::desugar::desugar_module;
 use crate::ir::{
-    BinOp, Block, BlockId, Function, FunctionId, Inst, InstKind, Module, PyConst, Terminator,
-    Value,
+    Block, BlockId, CellId, Function, FunctionId, Inst, InstKind, LocalId, Module, NameId, PyConst,
+    Terminator, Value,
 };
 use crate::parse::parse_module_source;
 
-/// Error returned when parsing or lowering cannot produce Phase-A IR.
+pub mod scope;
+pub use scope::{
+    LocalSlotInfo, NameClass, ParameterSlot, ParameterSummary, ScopeAnalysis, ScopeInfo, ScopeKind,
+    SymbolInfo,
+};
+
+/// Byte span for a source construct that lowering rejected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceSpan {
+    /// Inclusive byte offset of the first byte.
+    pub start: u32,
+    /// Exclusive byte offset one past the final byte.
+    pub end: u32,
+}
+
+impl SourceSpan {
+    fn from_bounds(start: u32, end: u32) -> Self {
+        Self { start, end }
+    }
+}
+
+/// Direct dynamic-code entry points that an AoT build cannot compile away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DynamicCodeKind {
+    /// Python's `eval` builtin.
+    Eval,
+    /// Python's `exec` builtin.
+    Exec,
+    /// Python's `compile` builtin.
+    Compile,
+}
+
+impl DynamicCodeKind {
+    /// Source spelling of the builtin.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Eval => "eval",
+            Self::Exec => "exec",
+            Self::Compile => "compile",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "eval" => Some(Self::Eval),
+            "exec" => Some(Self::Exec),
+            "compile" => Some(Self::Compile),
+            _ => None,
+        }
+    }
+}
+
+/// A direct call to `eval`, `exec`, or `compile` found before lowering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DynamicSink {
+    /// Which dynamic-code builtin was called.
+    pub kind: DynamicCodeKind,
+    /// Byte span of the callee name, suitable for file:line diagnostics.
+    pub span: SourceSpan,
+}
+
+/// Error returned when parsing or lowering cannot produce executable IR.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LowerError {
     /// Ruff rejected the source before lowering.
     Parse(String),
-    /// The source uses Python syntax outside the Phase-A slice.
-    Unsupported(String),
+    /// The source uses Python syntax outside the currently executable slice.
+    Unsupported {
+        /// User-facing feature name.
+        feature: String,
+        /// Source byte span when the rejected AST node provided one.
+        span: Option<SourceSpan>,
+    },
     /// A numeric literal is syntactically valid Python but not representable in Phase A.
     InvalidInteger(String),
     /// The lowerer hit an internal capacity or consistency limit.
@@ -35,10 +108,20 @@ impl LowerError {
         Self::Parse(message.into())
     }
 
-    /// Build an unsupported-construct error.
+    /// Build an unsupported-construct error without a source span.
     #[must_use]
-    pub fn unsupported(construct: impl Into<String>) -> Self {
-        Self::Unsupported(construct.into())
+    pub fn unsupported(feature: impl Into<String>) -> Self {
+        Self::Unsupported {
+            feature: feature.into(),
+            span: None,
+        }
+    }
+
+    fn unsupported_at(feature: impl Into<String>, span: SourceSpan) -> Self {
+        Self::Unsupported {
+            feature: feature.into(),
+            span: Some(span),
+        }
     }
 
     fn invalid_integer(message: impl Into<String>) -> Self {
@@ -54,8 +137,12 @@ impl Display for LowerError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             LowerError::Parse(message) => write!(f, "failed to parse Python module: {message}"),
-            LowerError::Unsupported(construct) => {
-                write!(f, "unsupported Phase-A Python construct: {construct}")
+            LowerError::Unsupported { feature, span } => {
+                write!(f, "unsupported Phase-B Python construct: {feature}")?;
+                if let Some(span) = span {
+                    write!(f, " at byte {}..{}", span.start, span.end)?;
+                }
+                Ok(())
             }
             LowerError::InvalidInteger(message) => {
                 write!(f, "unsupported Phase-A integer literal: {message}")
@@ -67,30 +154,76 @@ impl Display for LowerError {
 
 impl Error for LowerError {}
 
-/// Parse and lower Python source into a Phase-A IR module.
+/// Parse and lower Python source into IR.
 pub fn lower_source(source: &str) -> Result<Module, LowerError> {
     let parsed = parse_module_source(source)?;
     lower_module(&parsed)
 }
 
-/// Lower a Ruff module AST into a Phase-A IR module.
+/// Lower a Ruff module AST into IR while preserving the Phase-A executable slice.
 pub fn lower_module(module: &ModModule) -> Result<Module, LowerError> {
-    Lowerer::new().lower_module(module).map(desugar_module)
+    LoweringDriver::new()
+        .lower_module(module)
+        .map(desugar_module)
+}
+
+/// Parse Python source and report direct `eval`/`exec`/`compile` calls.
+///
+/// This intentionally runs before lowering so AoT diagnostics can retain source
+/// locations even though the executable tier-0 IR does not carry spans.
+pub fn scan_dynamic_sinks_source(source: &str) -> Result<Vec<DynamicSink>, LowerError> {
+    let parsed = parse_module_source(source)?;
+    Ok(scan_dynamic_sinks(&parsed))
+}
+
+/// Report direct `eval`/`exec`/`compile` calls in a parsed Python module.
+///
+/// The scan is deliberately conservative and narrow: it catches the direct call
+/// form (`eval(...)`, `exec(...)`, `compile(...)`) that lowers through a builtin
+/// name load followed by `Call`. Indirect access through `getattr`, rebinding, or
+/// imports remains a runtime AoT-boundary check.
+#[must_use]
+pub fn scan_dynamic_sinks(module: &ModModule) -> Vec<DynamicSink> {
+    let mut scanner = DynamicSinkScanner { sinks: Vec::new() };
+    scanner.visit_body(&module.body);
+    scanner.sinks
+}
+
+struct DynamicSinkScanner {
+    sinks: Vec<DynamicSink>,
+}
+
+impl<'a> Visitor<'a> for DynamicSinkScanner {
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        if let Expr::Call(call) = expr {
+            if let Expr::Name(callee) = call.func.as_ref() {
+                if let Some(kind) = DynamicCodeKind::from_name(callee.id.as_str()) {
+                    self.sinks.push(DynamicSink {
+                        kind,
+                        span: span_expr(call.func.as_ref()),
+                    });
+                }
+            }
+        }
+
+        visitor::walk_expr(self, expr);
+    }
 }
 
 #[derive(Default)]
 struct NameTable {
     names: Vec<String>,
-    ids: HashMap<String, u32>,
+    ids: HashMap<String, NameId>,
 }
 
 impl NameTable {
-    fn intern(&mut self, name: &str) -> Result<u32, LowerError> {
+    fn intern(&mut self, name: &str) -> Result<NameId, LowerError> {
         if let Some(id) = self.ids.get(name) {
             return Ok(*id);
         }
 
         let id = u32::try_from(self.names.len())
+            .map(NameId)
             .map_err(|_| LowerError::internal("too many interned names for u32 ids"))?;
         let owned = name.to_owned();
         self.names.push(owned.clone());
@@ -99,12 +232,19 @@ impl NameTable {
     }
 }
 
-struct Lowerer {
+/// Phase-B lowering driver.
+///
+/// The driver owns module-wide allocation state (function table and interned
+/// name table), performs one scope-analysis pass, and then delegates AST
+/// families to small routing modules.  Implemented Phase-A semantics remain in
+/// the `assign` and `func` families; unimplemented Phase-B families return
+/// `LowerError::Unsupported { feature, span }` from their route point.
+struct LoweringDriver {
     functions: Vec<Function>,
     names: NameTable,
 }
 
-impl Lowerer {
+impl LoweringDriver {
     fn new() -> Self {
         Self {
             functions: Vec::new(),
@@ -113,14 +253,15 @@ impl Lowerer {
     }
 
     fn lower_module(mut self, module: &ModModule) -> Result<Module, LowerError> {
+        let analysis = scope::analyze_module(module)?;
         let main = self.reserve_function("__main__")?;
-        let mut scope = Scope::module("__main__");
+        let mut body = BodyScope::new(&analysis.root);
 
         for stmt in &module.body {
-            self.lower_stmt(&mut scope, stmt)?;
+            self.lower_stmt(&mut body, stmt)?;
         }
 
-        let main_function = scope.finish()?;
+        let main_function = body.finish()?;
         self.replace_reserved_function(main, main_function)?;
 
         Ok(Module {
@@ -166,153 +307,206 @@ impl Lowerer {
         Ok(FunctionId(index))
     }
 
+    #[allow(dead_code)]
     fn lower_function_def(&mut self, def: &StmtFunctionDef) -> Result<FunctionId, LowerError> {
         validate_function_header(def)?;
-
-        let params = positional_parameters(&def.parameters)?;
-        let mut scope = Scope::function(def.name.as_str(), params.len());
-        for parameter in &params {
-            scope.declare_local(parameter)?;
+        let info = scope::analyze_function_def(def)?;
+        if !info.free_vars.is_empty() || !info.cell_vars.is_empty() {
+            return unsupported_at("closure variables", span_function(def));
         }
-        collect_function_locals(&def.body, &mut scope)?;
+        let mut body = BodyScope::new(&info);
 
         for stmt in &def.body {
-            self.lower_stmt(&mut scope, stmt)?;
+            self.lower_stmt(&mut body, stmt)?;
         }
 
-        let function = scope.finish()?;
+        let function = body.finish()?;
         self.append_function(function)
     }
 
-    fn lower_stmt(&mut self, scope: &mut Scope, stmt: &Stmt) -> Result<(), LowerError> {
+    fn lower_stmt(&mut self, scope: &mut BodyScope, stmt: &Stmt) -> Result<(), LowerError> {
+        self.lower_stmt_with_loop(scope, stmt, None)
+    }
+
+    fn lower_stmt_with_loop(
+        &mut self,
+        scope: &mut BodyScope,
+        stmt: &Stmt,
+        loop_targets: Option<control::LoopTargets>,
+    ) -> Result<(), LowerError> {
         if scope.is_terminated() {
             return Err(LowerError::unsupported("statement after return"));
         }
 
         match stmt {
-            Stmt::FunctionDef(def) => self.lower_function_def_stmt(scope, def),
-            Stmt::Return(ret) => {
-                if scope.is_module() {
-                    return Err(LowerError::unsupported("top-level return statement"));
-                }
-                let value = match ret.value.as_deref() {
-                    Some(expr) => self.lower_expr(scope, expr)?,
-                    None => scope.emit(InstKind::Const(PyConst::None))?,
-                };
-                scope.set_term(Terminator::Return(value))
-            }
+            Stmt::FunctionDef(def) => func::lower_function_def_stmt(self, scope, def),
+            Stmt::Return(ret) => control::lower_return(self, scope, ret),
             Stmt::Expr(expr_stmt) => {
                 self.lower_expr(scope, &expr_stmt.value)?;
                 Ok(())
             }
-            Stmt::Assign(assign) => self.lower_assign(scope, assign),
-            Stmt::ClassDef(_) => Err(LowerError::unsupported("class definition")),
-            Stmt::Delete(_) => Err(LowerError::unsupported("delete statement")),
-            Stmt::TypeAlias(_) => Err(LowerError::unsupported("type alias statement")),
-            Stmt::AugAssign(_) => Err(LowerError::unsupported("augmented assignment")),
-            Stmt::AnnAssign(_) => Err(LowerError::unsupported("annotated assignment")),
-            Stmt::For(_) => Err(LowerError::unsupported("for statement")),
-            Stmt::While(_) => Err(LowerError::unsupported("while statement")),
-            Stmt::If(_) => Err(LowerError::unsupported("if statement")),
-            Stmt::With(_) => Err(LowerError::unsupported("with statement")),
-            Stmt::Match(_) => Err(LowerError::unsupported("match statement")),
-            Stmt::Raise(_) => Err(LowerError::unsupported("raise statement")),
-            Stmt::Try(_) => Err(LowerError::unsupported("try statement")),
-            Stmt::Assert(_) => Err(LowerError::unsupported("assert statement")),
-            Stmt::Import(_) => Err(LowerError::unsupported("import statement")),
-            Stmt::ImportFrom(_) => Err(LowerError::unsupported("import-from statement")),
-            Stmt::Global(_) => Err(LowerError::unsupported("global statement")),
-            Stmt::Nonlocal(_) => Err(LowerError::unsupported("nonlocal statement")),
-            Stmt::Pass(_) => Err(LowerError::unsupported("pass statement")),
-            Stmt::Break(_) => Err(LowerError::unsupported("break statement")),
-            Stmt::Continue(_) => Err(LowerError::unsupported("continue statement")),
-            Stmt::IpyEscapeCommand(_) => Err(LowerError::unsupported("IPython escape command")),
+            Stmt::Assign(assign) => assign::lower_assign(self, scope, assign),
+            Stmt::ClassDef(def) => class::lower_class_def(self, scope, def),
+            Stmt::For(stmt) => self.lower_for_stmt(scope, stmt, loop_targets),
+            Stmt::While(stmt) => control::lower_while(stmt),
+            Stmt::If(stmt) => self.lower_if_stmt(scope, stmt, loop_targets),
+            Stmt::Break(stmt) => control::lower_break_with_targets(scope, stmt, loop_targets),
+            Stmt::Continue(stmt) => control::lower_continue_with_targets(scope, stmt, loop_targets),
+            Stmt::With(stmt) => with_::lower_with_stmt(self, scope, stmt),
+            Stmt::Match(stmt) => match_::lower_match(self, scope, stmt, loop_targets),
+            Stmt::Try(stmt) => try_::lower_try(self, scope, stmt),
+            Stmt::Import(stmt) => import::lower_import_stmt(self, scope, stmt),
+            Stmt::ImportFrom(stmt) => import::lower_import_from_stmt(self, scope, stmt),
+            Stmt::Delete(stmt) => assign::lower_delete(stmt),
+            Stmt::AugAssign(stmt) => assign::lower_aug_assign_with_driver(self, scope, stmt),
+            Stmt::AnnAssign(stmt) => assign::lower_ann_assign(stmt),
+            Stmt::TypeAlias(stmt) => assign::lower_type_alias(stmt),
+            Stmt::Raise(stmt) => try_::lower_raise(self, scope, stmt),
+            Stmt::Assert(stmt) => control::lower_assert(stmt),
+            Stmt::Global(stmt) => import::lower_global(stmt),
+            Stmt::Nonlocal(stmt) => import::lower_nonlocal(stmt),
+            Stmt::Pass(stmt) => control::lower_pass(stmt),
+            Stmt::IpyEscapeCommand(stmt) => unsupported_at("IPython escape command", span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32())),
         }
     }
 
-    fn lower_function_def_stmt(
+    fn lower_stmt_list(
         &mut self,
-        scope: &mut Scope,
-        def: &StmtFunctionDef,
+        scope: &mut BodyScope,
+        body: &[Stmt],
+        loop_targets: Option<control::LoopTargets>,
     ) -> Result<(), LowerError> {
-        let name = def.name.as_str();
-        let name_interned = self.names.intern(name)?;
-        let function = self.lower_function_def(def)?;
-        let arity = positional_parameters(&def.parameters)?.len();
-        let value = scope.emit(InstKind::MakeFunction {
-            func_index: function.0,
-            name_interned,
-            arity,
+        for stmt in body {
+            if scope.is_terminated() {
+                break;
+            }
+            self.lower_stmt_with_loop(scope, stmt, loop_targets)?;
+        }
+        Ok(())
+    }
+
+    fn lower_if_stmt(
+        &mut self,
+        scope: &mut BodyScope,
+        stmt: &ruff_python_ast::StmtIf,
+        loop_targets: Option<control::LoopTargets>,
+    ) -> Result<(), LowerError> {
+        let then_block = scope.alloc_block()?;
+        let else_block = scope.alloc_block()?;
+        let done_block = scope.alloc_block()?;
+        control::lower_if_header_with_driver(self, scope, stmt, then_block, else_block)?;
+
+        scope.switch_to(then_block)?;
+        self.lower_stmt_list(scope, &stmt.body, loop_targets)?;
+        scope.jump_if_open(done_block)?;
+
+        scope.switch_to(else_block)?;
+        self.lower_elif_else_clauses(scope, &stmt.elif_else_clauses, done_block, loop_targets)?;
+        scope.jump_if_open(done_block)?;
+
+        scope.switch_to(done_block)?;
+        Ok(())
+    }
+
+    fn lower_elif_else_clauses(
+        &mut self,
+        scope: &mut BodyScope,
+        clauses: &[ruff_python_ast::ElifElseClause],
+        done_block: BlockId,
+        loop_targets: Option<control::LoopTargets>,
+    ) -> Result<(), LowerError> {
+        for clause in clauses {
+            if let Some(test) = clause.test.as_ref() {
+                let body_block = scope.alloc_block()?;
+                let next_block = scope.alloc_block()?;
+                let test = self.lower_expr(scope, test)?;
+                let cond = scope.emit(InstKind::BoolTest { val: test })?;
+                scope.set_term(Terminator::CondBranch {
+                    cond,
+                    then_: body_block,
+                    else_: next_block,
+                })?;
+                scope.switch_to(body_block)?;
+                self.lower_stmt_list(scope, &clause.body, loop_targets)?;
+                scope.jump_if_open(done_block)?;
+                scope.switch_to(next_block)?;
+            } else {
+                self.lower_stmt_list(scope, &clause.body, loop_targets)?;
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    fn lower_for_stmt(
+        &mut self,
+        scope: &mut BodyScope,
+        stmt: &ruff_python_ast::StmtFor,
+        _loop_targets: Option<control::LoopTargets>,
+    ) -> Result<(), LowerError> {
+        if !stmt.orelse.is_empty() {
+            return unsupported_at(
+                "for-else statement",
+                span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()),
+            );
+        }
+        let header_block = scope.alloc_block()?;
+        let body_block = scope.alloc_block()?;
+        let done_block = scope.alloc_block()?;
+        let iterable = self.lower_expr(scope, &stmt.iter)?;
+        let iter = scope.emit(InstKind::GetIter { iterable })?;
+        scope.set_term(Terminator::Jump(header_block))?;
+
+        scope.switch_to(header_block)?;
+        let item = scope.emit(InstKind::ForNext { iter })?;
+        scope.set_term(Terminator::ForLoop {
+            iter,
+            body: body_block,
+            done: done_block,
         })?;
 
-        if scope.is_module() {
-            scope.emit(InstKind::StoreGlobal(name_interned, value))?;
-        } else {
-            let slot = scope.local_slot(name)?;
-            scope.emit(InstKind::StoreLocal(slot, value))?;
-        }
+        scope.switch_to(body_block)?;
+        control::lower_for_item_store_with_driver(self, scope, stmt, item)?;
+        let nested_targets = control::LoopTargets {
+            break_block: done_block,
+            continue_block: header_block,
+        };
+        self.lower_stmt_list(scope, &stmt.body, Some(nested_targets))?;
+        scope.jump_if_open(header_block)?;
+
+        scope.switch_to(done_block)?;
         Ok(())
     }
 
-    fn lower_assign(&mut self, scope: &mut Scope, assign: &StmtAssign) -> Result<(), LowerError> {
-        let value = self.lower_expr(scope, &assign.value)?;
-        for target in &assign.targets {
-            self.lower_store_target(scope, target, value)?;
-        }
-        Ok(())
-    }
-
-    fn lower_store_target(
-        &mut self,
-        scope: &mut Scope,
-        target: &Expr,
-        value: Value,
-    ) -> Result<(), LowerError> {
-        match target {
-            Expr::Name(name) if matches!(name.ctx, ExprContext::Store) => {
-                let raw_name = name.id.as_str();
-                if scope.is_module() {
-                    let name_id = self.names.intern(raw_name)?;
-                    scope.emit(InstKind::StoreGlobal(name_id, value))?;
-                } else {
-                    let slot = scope.local_slot(raw_name)?;
-                    scope.emit(InstKind::StoreLocal(slot, value))?;
-                }
-                Ok(())
-            }
-            Expr::Name(_) => Err(LowerError::unsupported("non-store name assignment target")),
-            _ => Err(LowerError::unsupported("non-name assignment target")),
-        }
-    }
-
-    fn lower_expr(&mut self, scope: &mut Scope, expr: &Expr) -> Result<Value, LowerError> {
+    fn lower_expr(&mut self, scope: &mut BodyScope, expr: &Expr) -> Result<Value, LowerError> {
         match expr {
             Expr::Name(name) if matches!(name.ctx, ExprContext::Load) => {
-                if let Some(slot) = scope.lookup_local(name.id.as_str()) {
-                    scope.emit(InstKind::LoadLocal(slot))
-                } else {
-                    let name_id = self.names.intern(name.id.as_str())?;
+                let raw_name = name.id.as_str();
+                if scope.is_class() && !scope.is_global_name(raw_name) {
+                    let name_id = self.names.intern(raw_name)?;
                     scope.emit(InstKind::LoadName(name_id))
+                } else {
+                    match scope.name_class(raw_name) {
+                        Some(NameClass::Local { slot }) => scope.emit(InstKind::LoadLocal(LocalId(*slot))),
+                        Some(NameClass::Cell { cell_slot, .. }) => {
+                            scope.emit(InstKind::LoadCell(CellId(*cell_slot)))
+                        }
+                        Some(NameClass::Free { slot }) => scope.emit(InstKind::LoadCell(CellId(*slot))),
+                        Some(NameClass::Builtin) => {
+                            let name_id = self.names.intern(raw_name)?;
+                            scope.emit(InstKind::LoadBuiltin(name_id))
+                        }
+                        Some(NameClass::Global { .. }) | None => {
+                            let name_id = self.names.intern(raw_name)?;
+                            scope.emit(InstKind::LoadGlobal(name_id))
+                        }
+                    }
                 }
             }
-            Expr::Name(_) => Err(LowerError::unsupported("non-load name expression")),
-            Expr::Call(call) => {
-                if !call.arguments.keywords.is_empty() {
-                    return Err(LowerError::unsupported("keyword call argument"));
-                }
-
-                let callee = self.lower_expr(scope, &call.func)?;
-                let mut args = Vec::with_capacity(call.arguments.args.len());
-                for arg in &call.arguments.args {
-                    args.push(self.lower_expr(scope, arg)?);
-                }
-                scope.emit(InstKind::Call { callee, args })
-            }
+            Expr::Name(_) => unsupported_expr("non-load name expression", expr),
+            Expr::Call(call) => func::lower_call(self, scope, call),
             Expr::BinOp(binop) => {
-                let op = match binop.op {
-                    Operator::Add => BinOp::Add,
-                    _ => return Err(LowerError::unsupported("non-add binary operator")),
-                };
+                let op = assign::bin_op_from_operator(binop.op)?;
                 let lhs = self.lower_expr(scope, &binop.left)?;
                 let rhs = self.lower_expr(scope, &binop.right)?;
                 scope.emit(InstKind::BinaryOp { op, lhs, rhs })
@@ -327,107 +521,436 @@ impl Lowerer {
                     })?;
                     scope.emit(InstKind::Const(PyConst::Int(value)))
                 }
-                Number::Float(_) => Err(LowerError::unsupported("float literal")),
-                Number::Complex { .. } => Err(LowerError::unsupported("complex literal")),
+                Number::Float(value) => scope.emit(InstKind::Const(PyConst::Float(*value))),
+                Number::Complex { real, imag } => scope.emit(InstKind::Const(PyConst::Complex {
+                    real: *real,
+                    imag: *imag,
+                })),
             },
             Expr::NoneLiteral(_) => scope.emit(InstKind::Const(PyConst::None)),
-            Expr::BoolOp(_) => Err(LowerError::unsupported("boolean operation")),
-            Expr::Named(_) => Err(LowerError::unsupported("assignment expression")),
-            Expr::UnaryOp(_) => Err(LowerError::unsupported("unary operation")),
-            Expr::Lambda(_) => Err(LowerError::unsupported("lambda expression")),
-            Expr::If(_) => Err(LowerError::unsupported("conditional expression")),
-            Expr::Dict(_) => Err(LowerError::unsupported("dict literal")),
-            Expr::Set(_) => Err(LowerError::unsupported("set literal")),
-            Expr::ListComp(_) => Err(LowerError::unsupported("list comprehension")),
-            Expr::SetComp(_) => Err(LowerError::unsupported("set comprehension")),
-            Expr::DictComp(_) => Err(LowerError::unsupported("dict comprehension")),
-            Expr::Generator(_) => Err(LowerError::unsupported("generator expression")),
-            Expr::Await(_) => Err(LowerError::unsupported("await expression")),
-            Expr::Yield(_) => Err(LowerError::unsupported("yield expression")),
-            Expr::YieldFrom(_) => Err(LowerError::unsupported("yield-from expression")),
-            Expr::Compare(_) => Err(LowerError::unsupported("comparison expression")),
-            Expr::FString(_) => Err(LowerError::unsupported("f-string expression")),
-            Expr::TString(_) => Err(LowerError::unsupported("t-string expression")),
-            Expr::BytesLiteral(_) => Err(LowerError::unsupported("bytes literal")),
-            Expr::BooleanLiteral(_) => Err(LowerError::unsupported("boolean literal")),
-            Expr::EllipsisLiteral(_) => Err(LowerError::unsupported("ellipsis literal")),
-            Expr::Attribute(_) => Err(LowerError::unsupported("attribute expression")),
-            Expr::Subscript(_) => Err(LowerError::unsupported("subscript expression")),
-            Expr::Starred(_) => Err(LowerError::unsupported("starred expression")),
-            Expr::List(_) => Err(LowerError::unsupported("list literal")),
-            Expr::Tuple(_) => Err(LowerError::unsupported("tuple literal")),
-            Expr::Slice(_) => Err(LowerError::unsupported("slice expression")),
-            Expr::IpyEscapeCommand(_) => Err(LowerError::unsupported("IPython escape expression")),
+            Expr::FString(fstring) => strings::lower_f_string(self, scope, fstring),
+            Expr::TString(tstring) => strings::lower_t_string(self, scope, tstring),
+            Expr::ListComp(list_comp) => comprehension::lower_list_comp_inline(self, scope, list_comp),
+            Expr::SetComp(set_comp) => comprehension::lower_set_comp_inline(self, scope, set_comp),
+            Expr::DictComp(dict_comp) => comprehension::lower_dict_comp_inline(self, scope, dict_comp),
+            Expr::Generator(generator) => comprehension::lower_generator_expr(generator),
+            Expr::Yield(yield_expr) => generator::lower_yield_expr(self, scope, yield_expr),
+            Expr::YieldFrom(yield_from) => generator::lower_yield_from_expr(self, scope, yield_from),
+            Expr::Await(await_expr) => generator::lower_await_expr(self, scope, await_expr),
+            Expr::BoolOp(bool_op) => control::lower_bool_expr_with_driver(self, scope, bool_op),
+            Expr::Named(named) => control::lower_named_expr_with_driver(self, scope, named),
+            Expr::UnaryOp(unary) => control::lower_unary_expr_with_driver(self, scope, unary),
+            Expr::Lambda(lambda) => func::lower_lambda(self, scope, lambda),
+            Expr::If(expr_if) => control::lower_if_expr_with_driver(self, scope, expr_if),
+            Expr::Dict(dict) => self.lower_dict_expr(scope, dict),
+            Expr::Set(set) => self.lower_set_expr(scope, set),
+            Expr::Compare(compare) => control::lower_compare_expr_with_driver(self, scope, compare),
+            Expr::BytesLiteral(bytes) => self.lower_bytes_literal(scope, bytes),
+            Expr::BooleanLiteral(boolean) => scope.emit(InstKind::Const(PyConst::Bool(boolean.value))),
+            Expr::EllipsisLiteral(_) => scope.emit(InstKind::Const(PyConst::Ellipsis)),
+            Expr::Attribute(attr) => self.lower_attribute_expr(scope, attr),
+            Expr::Subscript(subscript) => self.lower_subscript_expr(scope, subscript),
+            Expr::Starred(_) => unsupported_expr("starred expression outside container literal or call", expr),
+            Expr::List(list) => self.lower_list_expr(scope, list),
+            Expr::Tuple(tuple) => self.lower_tuple_expr(scope, tuple),
+            Expr::Slice(slice) => self.lower_slice_expr(scope, slice),
+            Expr::IpyEscapeCommand(_) => unsupported_expr("IPython escape expression", expr),
+        }
+    }
+
+    fn lower_bytes_literal(
+        &mut self,
+        scope: &mut BodyScope,
+        bytes: &ruff_python_ast::ExprBytesLiteral,
+    ) -> Result<Value, LowerError> {
+        let mut value = Vec::new();
+        for part in bytes.value.iter() {
+            value.extend_from_slice(part.as_slice());
+        }
+        scope.emit(InstKind::Const(PyConst::Bytes(value)))
+    }
+
+    fn lower_attribute_expr(
+        &mut self,
+        scope: &mut BodyScope,
+        attr: &ruff_python_ast::ExprAttribute,
+    ) -> Result<Value, LowerError> {
+        if !matches!(attr.ctx, ExprContext::Load) {
+            return unsupported_at(
+                "non-load attribute expression",
+                span_bounds(attr.range.start().to_u32(), attr.range.end().to_u32()),
+            );
+        }
+        let obj = self.lower_expr(scope, &attr.value)?;
+        let name = self.names.intern(attr.attr.as_str())?;
+        scope.emit(InstKind::LoadAttr { obj, name })
+    }
+
+    fn lower_subscript_expr(
+        &mut self,
+        scope: &mut BodyScope,
+        subscript: &ruff_python_ast::ExprSubscript,
+    ) -> Result<Value, LowerError> {
+        if !matches!(subscript.ctx, ExprContext::Load) {
+            return unsupported_at(
+                "non-load subscript expression",
+                span_bounds(subscript.range.start().to_u32(), subscript.range.end().to_u32()),
+            );
+        }
+        let obj = self.lower_expr(scope, &subscript.value)?;
+        let index = self.lower_expr(scope, &subscript.slice)?;
+        scope.emit(InstKind::SubscriptGet { obj, index })
+    }
+
+    fn lower_list_expr(
+        &mut self,
+        scope: &mut BodyScope,
+        list: &ruff_python_ast::ExprList,
+    ) -> Result<Value, LowerError> {
+        if !matches!(list.ctx, ExprContext::Load) {
+            return unsupported_at(
+                "non-load list expression",
+                span_bounds(list.range.start().to_u32(), list.range.end().to_u32()),
+            );
+        }
+        if list.elts.iter().any(|elt| matches!(elt, Expr::Starred(_))) {
+            let value = scope.emit(InstKind::BuildList { elts: Vec::new() })?;
+            for elt in &list.elts {
+                if let Expr::Starred(starred) = elt {
+                    let iter = self.lower_expr(scope, &starred.value)?;
+                    scope.emit(InstKind::ListExtend { list: value, iter })?;
+                } else {
+                    let item = self.lower_expr(scope, elt)?;
+                    scope.emit(InstKind::ListAppend { list: value, item })?;
+                }
+            }
+            Ok(value)
+        } else {
+            let mut elts = Vec::with_capacity(list.elts.len());
+            for elt in &list.elts {
+                elts.push(self.lower_expr(scope, elt)?);
+            }
+            scope.emit(InstKind::BuildList { elts })
+        }
+    }
+
+    fn lower_tuple_expr(
+        &mut self,
+        scope: &mut BodyScope,
+        tuple: &ruff_python_ast::ExprTuple,
+    ) -> Result<Value, LowerError> {
+        if !matches!(tuple.ctx, ExprContext::Load) {
+            return unsupported_at(
+                "non-load tuple expression",
+                span_bounds(tuple.range.start().to_u32(), tuple.range.end().to_u32()),
+            );
+        }
+        if tuple.elts.iter().any(|elt| matches!(elt, Expr::Starred(_))) {
+            return unsupported_at(
+                "starred tuple literal",
+                span_bounds(tuple.range.start().to_u32(), tuple.range.end().to_u32()),
+            );
+        }
+        let mut elts = Vec::with_capacity(tuple.elts.len());
+        for elt in &tuple.elts {
+            elts.push(self.lower_expr(scope, elt)?);
+        }
+        scope.emit(InstKind::BuildTuple { elts })
+    }
+
+    fn lower_set_expr(
+        &mut self,
+        scope: &mut BodyScope,
+        set: &ruff_python_ast::ExprSet,
+    ) -> Result<Value, LowerError> {
+        let mut elts = Vec::with_capacity(set.elts.len());
+        for elt in &set.elts {
+            if matches!(elt, Expr::Starred(_)) {
+                return unsupported_at(
+                    "starred set literal",
+                    span_bounds(set.range.start().to_u32(), set.range.end().to_u32()),
+                );
+            }
+            elts.push(self.lower_expr(scope, elt)?);
+        }
+        scope.emit(InstKind::BuildSet { elts })
+    }
+
+    fn lower_dict_expr(
+        &mut self,
+        scope: &mut BodyScope,
+        dict: &ruff_python_ast::ExprDict,
+    ) -> Result<Value, LowerError> {
+        if dict.items.iter().any(|item| item.key.is_none()) {
+            let map = scope.emit(InstKind::BuildMap { pairs: Vec::new() })?;
+            for item in &dict.items {
+                if let Some(key_expr) = &item.key {
+                    let key = self.lower_expr(scope, key_expr)?;
+                    let val = self.lower_expr(scope, &item.value)?;
+                    scope.emit(InstKind::MapInsert { map, key, val })?;
+                } else {
+                    let other = self.lower_expr(scope, &item.value)?;
+                    scope.emit(InstKind::DictMerge { map, other })?;
+                }
+            }
+            Ok(map)
+        } else {
+            let mut pairs = Vec::with_capacity(dict.items.len());
+            for item in &dict.items {
+                let key = item
+                    .key
+                    .as_ref()
+                    .ok_or_else(|| LowerError::internal("dict item key disappeared"))?;
+                pairs.push((self.lower_expr(scope, key)?, self.lower_expr(scope, &item.value)?));
+            }
+            scope.emit(InstKind::BuildMap { pairs })
+        }
+    }
+
+    fn lower_slice_expr(
+        &mut self,
+        scope: &mut BodyScope,
+        slice: &ruff_python_ast::ExprSlice,
+    ) -> Result<Value, LowerError> {
+        let lower = self.lower_optional_slice_bound(scope, slice.lower.as_deref())?;
+        let upper = self.lower_optional_slice_bound(scope, slice.upper.as_deref())?;
+        let step = self.lower_optional_slice_bound(scope, slice.step.as_deref())?;
+        scope.emit(InstKind::BuildSlice { lower, upper, step })
+    }
+
+    fn lower_optional_slice_bound(
+        &mut self,
+        scope: &mut BodyScope,
+        bound: Option<&Expr>,
+    ) -> Result<Value, LowerError> {
+        match bound {
+            Some(expr) => self.lower_expr(scope, expr),
+            None => scope.emit(InstKind::Const(PyConst::None)),
+        }
+    }
+
+    fn lower_store_target(
+        &mut self,
+        scope: &mut BodyScope,
+        target: &Expr,
+        value: Value,
+    ) -> Result<(), LowerError> {
+        match target {
+            Expr::Name(name) if matches!(name.ctx, ExprContext::Store) => {
+                let raw_name = name.id.as_str();
+                if scope.is_global_name(raw_name) {
+                    let name_id = self.names.intern(raw_name)?;
+                    scope.emit(InstKind::StoreGlobal(name_id, value))?;
+                } else if scope.is_class() {
+                    let name_id = self.names.intern(raw_name)?;
+                    scope.emit(InstKind::StoreName(name_id, value))?;
+                } else {
+                    match scope.name_class(raw_name) {
+                        Some(NameClass::Cell { cell_slot, .. }) => {
+                            scope.emit(InstKind::StoreCell(CellId(*cell_slot), value))?;
+                        }
+                        Some(NameClass::Free { slot }) => {
+                            scope.emit(InstKind::StoreCell(CellId(*slot), value))?;
+                        }
+                        Some(NameClass::Local { slot }) => {
+                            scope.emit(InstKind::StoreLocal(LocalId(*slot), value))?;
+                        }
+                        Some(NameClass::Builtin) | Some(NameClass::Global { .. }) | None => {
+                            let name_id = self.names.intern(raw_name)?;
+                            scope.emit(InstKind::StoreName(name_id, value))?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Expr::Attribute(attr) if matches!(attr.ctx, ExprContext::Store) => {
+                let obj = self.lower_expr(scope, &attr.value)?;
+                let name = self.names.intern(attr.attr.as_str())?;
+                scope.emit(InstKind::StoreAttr { obj, name, val: value })?;
+                Ok(())
+            }
+            Expr::Subscript(subscript) if matches!(subscript.ctx, ExprContext::Store) => {
+                let obj = self.lower_expr(scope, &subscript.value)?;
+                let index = self.lower_expr(scope, &subscript.slice)?;
+                scope.emit(InstKind::SubscriptSet { obj, index, val: value })?;
+                Ok(())
+            }
+            Expr::List(_) | Expr::Tuple(_) => unsupported_expr("sequence unpack assignment target", target),
+            _ => unsupported_expr("assignment target", target),
         }
     }
 }
 
-struct Scope {
-    kind: ScopeKind,
-    name: String,
-    arity: usize,
-    locals: HashMap<String, u32>,
-    next_local: u32,
+struct BodyScope {
+    info: ScopeInfo,
+    child_used: Vec<bool>,
+    blocks: Vec<Block>,
+    current_id: BlockId,
     insts: Vec<Inst>,
     next_value: u32,
     term: Option<Terminator>,
+    next_block: u32,
 }
 
-impl Scope {
-    fn module(name: &str) -> Self {
-        Self::new(ScopeKind::Module, name, 0)
-    }
-
-    fn function(name: &str, arity: usize) -> Self {
-        Self::new(ScopeKind::Function, name, arity)
-    }
-
-    fn new(kind: ScopeKind, name: &str, arity: usize) -> Self {
-        Self {
-            kind,
-            name: name.to_owned(),
-            arity,
-            locals: HashMap::new(),
-            next_local: 0,
+impl BodyScope {
+    fn new(info: &ScopeInfo) -> Self {
+        let info = info.clone();
+        let child_used = vec![false; info.children.len()];
+        let mut scope = Self {
+            info,
+            child_used,
+            blocks: Vec::new(),
+            current_id: BlockId(0),
             insts: Vec::new(),
             next_value: 0,
             term: None,
-        }
+            next_block: 1,
+        };
+        scope.emit_cell_prologue();
+        scope
     }
 
     fn is_module(&self) -> bool {
-        matches!(self.kind, ScopeKind::Module)
+        matches!(self.info.kind, ScopeKind::Module)
+    }
+
+    fn is_class(&self) -> bool {
+        matches!(self.info.kind, ScopeKind::Class)
     }
 
     fn is_terminated(&self) -> bool {
         self.term.is_some()
     }
 
-    fn declare_local(&mut self, name: &str) -> Result<u32, LowerError> {
-        if let Some(slot) = self.locals.get(name) {
-            return Ok(*slot);
-        }
-
-        let slot = self.next_local;
-        self.next_local = self
-            .next_local
-            .checked_add(1)
-            .ok_or_else(|| LowerError::internal("too many local slots for u32 ids"))?;
-        self.locals.insert(name.to_owned(), slot);
-        Ok(slot)
-    }
-
-    fn local_slot(&self, name: &str) -> Result<u32, LowerError> {
-        self.lookup_local(name)
-            .ok_or_else(|| LowerError::internal(format!("local slot for `{name}` was not declared")))
-    }
-
-    fn lookup_local(&self, name: &str) -> Option<u32> {
-        if self.is_module() {
+    fn local_slot(&self, name: &str) -> Option<LocalId> {
+        if self.is_class() {
             None
         } else {
-            self.locals.get(name).copied()
+            self.info.local_slot(name).map(LocalId)
         }
+    }
+
+    fn name_class(&self, name: &str) -> Option<&NameClass> {
+        self.info.symbol(name).map(|symbol| &symbol.class)
+    }
+
+    fn emit_cell_prologue(&mut self) {
+        for index in 0..self.info.cell_vars.len() {
+            let name = &self.info.cell_vars[index];
+            let local_slot = match self.name_class(name) {
+                Some(NameClass::Cell { local_slot, .. }) => *local_slot,
+                _ => continue,
+            };
+            let result = Value(self.next_value);
+            self.next_value = self
+                .next_value
+                .checked_add(1)
+                .expect("too many SSA values for u32 ids");
+            self.insts.push(Inst::new(result, InstKind::MakeCell(LocalId(local_slot))));
+        }
+    }
+
+    fn closure_slot(&self, name: &str) -> Option<CellId> {
+        self.info.closure_slot(name).map(CellId)
+    }
+
+    fn cell_slot_for_local(&self, local: LocalId) -> Option<CellId> {
+        for index in 0..self.info.cell_vars.len() {
+            let name = &self.info.cell_vars[index];
+            if let Some(NameClass::Cell {
+                local_slot,
+                cell_slot,
+            }) = self.name_class(name)
+            {
+                if *local_slot == local.0 {
+                    return Some(CellId(*cell_slot));
+                }
+            }
+        }
+        None
+    }
+
+    fn rewrite_cell_local_access(&self, kind: InstKind) -> InstKind {
+        match kind {
+            InstKind::LoadLocal(local) => {
+                if let Some(cell) = self.cell_slot_for_local(local) {
+                    InstKind::LoadCell(cell)
+                } else {
+                    InstKind::LoadLocal(local)
+                }
+            }
+            InstKind::StoreLocal(local, value) => {
+                if let Some(cell) = self.cell_slot_for_local(local) {
+                    InstKind::StoreCell(cell, value)
+                } else {
+                    InstKind::StoreLocal(local, value)
+                }
+            }
+            InstKind::DeleteLocal(local) => {
+                if let Some(cell) = self.cell_slot_for_local(local) {
+                    InstKind::DeleteCell(cell)
+                } else {
+                    InstKind::DeleteLocal(local)
+                }
+            }
+            kind => kind,
+        }
+    }
+
+    fn next_child_scope(&mut self, kind: ScopeKind, name: &str) -> Result<ScopeInfo, LowerError> {
+        let index = self
+            .info
+            .children
+            .iter()
+            .enumerate()
+            .find(|(index, child)| {
+                !self.child_used[*index] && child.kind == kind && child.name == name
+            })
+            .map(|(index, _)| index)
+            .ok_or_else(|| {
+                LowerError::internal(format!("scope metadata was not discovered for {name}"))
+            })?;
+        self.child_used[index] = true;
+        Ok(self.info.children[index].clone())
+    }
+
+    fn is_global_name(&self, name: &str) -> bool {
+        self.is_module()
+            || matches!(
+                self.info.symbol(name).map(|symbol| &symbol.class),
+                Some(NameClass::Global { explicit: true })
+            )
+    }
+
+    fn alloc_block(&mut self) -> Result<BlockId, LowerError> {
+        let id = BlockId(self.next_block);
+        self.next_block = self
+            .next_block
+            .checked_add(1)
+            .ok_or_else(|| LowerError::internal("too many basic blocks for u32 ids"))?;
+        Ok(id)
+    }
+
+    fn switch_to(&mut self, id: BlockId) -> Result<(), LowerError> {
+        let term = self
+            .term
+            .take()
+            .ok_or_else(|| LowerError::internal("switching away from unterminated block"))?;
+        let insts = std::mem::take(&mut self.insts);
+        self.blocks.push(Block {
+            id: self.current_id,
+            insts,
+            term,
+        });
+        self.current_id = id;
+        Ok(())
+    }
+
+    fn jump_if_open(&mut self, target: BlockId) -> Result<(), LowerError> {
+        if self.term.is_none() {
+            self.set_term(Terminator::Jump(target))?;
+        }
+        Ok(())
     }
 
     fn emit(&mut self, kind: InstKind) -> Result<Value, LowerError> {
@@ -435,12 +958,13 @@ impl Scope {
             return Err(LowerError::unsupported("instruction after terminator"));
         }
 
+        let kind = self.rewrite_cell_local_access(kind);
         let result = Value(self.next_value);
         self.next_value = self
             .next_value
             .checked_add(1)
             .ok_or_else(|| LowerError::internal("too many SSA values for u32 ids"))?;
-        self.insts.push(Inst { result, kind });
+        self.insts.push(Inst::new(result, kind));
         Ok(result)
     }
 
@@ -460,38 +984,34 @@ impl Scope {
 
         let term = self
             .term
+            .take()
             .ok_or_else(|| LowerError::internal("finished function without terminator"))?;
+        self.blocks.push(Block {
+            id: self.current_id,
+            insts: self.insts,
+            term,
+        });
         Ok(Function {
-            name: self.name,
-            arity: self.arity,
-            blocks: vec![Block {
-                id: BlockId(0),
-                insts: self.insts,
-                term,
-            }],
-            n_locals: self.next_local as usize,
+            name: self.info.name,
+            arity: self.info.parameters.arity(),
+            blocks: self.blocks,
+            n_locals: self.info.locals.len(),
         })
     }
 }
 
-#[derive(Clone, Copy)]
-enum ScopeKind {
-    Module,
-    Function,
-}
-
 fn validate_function_header(def: &StmtFunctionDef) -> Result<(), LowerError> {
     if def.is_async {
-        return Err(LowerError::unsupported("async function definition"));
+        return unsupported_at("async function definition", span_function(def));
     }
     if !def.decorator_list.is_empty() {
-        return Err(LowerError::unsupported("function decorator"));
+        return unsupported_at("function decorator", span_function(def));
     }
     if def.type_params.is_some() {
-        return Err(LowerError::unsupported("function type parameter"));
+        return unsupported_at("function type parameter", span_function(def));
     }
     if def.returns.is_some() {
-        return Err(LowerError::unsupported("function return annotation"));
+        return unsupported_at("function return annotation", span_function(def));
     }
     positional_parameters(&def.parameters)?;
     Ok(())
@@ -510,7 +1030,7 @@ fn positional_parameters(parameters: &Parameters) -> Result<Vec<String>, LowerEr
 
     let mut params = Vec::with_capacity(parameters.posonlyargs.len() + parameters.args.len());
     for parameter in parameters.posonlyargs.iter().chain(&parameters.args) {
-        if parameter.default.is_some() {
+        if parameter.default().is_some() {
             return Err(LowerError::unsupported("default parameter value"));
         }
         if parameter.annotation().is_some() {
@@ -521,38 +1041,76 @@ fn positional_parameters(parameters: &Parameters) -> Result<Vec<String>, LowerEr
     Ok(params)
 }
 
-fn collect_function_locals(body: &[Stmt], scope: &mut Scope) -> Result<(), LowerError> {
-    for stmt in body {
-        match stmt {
-            Stmt::FunctionDef(def) => {
-                scope.declare_local(def.name.as_str())?;
-            }
-            Stmt::Assign(assign) => {
-                for target in &assign.targets {
-                    collect_assignment_target(target, scope)?;
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
+fn unsupported_at<T>(feature: impl Into<String>, span: SourceSpan) -> Result<T, LowerError> {
+    Err(LowerError::unsupported_at(feature, span))
 }
 
-fn collect_assignment_target(target: &Expr, scope: &mut Scope) -> Result<(), LowerError> {
-    match target {
-        Expr::Name(name) if matches!(name.ctx, ExprContext::Store) => {
-            scope.declare_local(name.id.as_str())?;
-            Ok(())
-        }
-        Expr::Name(_) => Err(LowerError::unsupported("non-store name assignment target")),
-        _ => Err(LowerError::unsupported("non-name assignment target")),
+fn unsupported_expr<T>(feature: impl Into<String>, expr: &Expr) -> Result<T, LowerError> {
+    Err(LowerError::unsupported_at(feature, span_expr(expr)))
+}
+
+fn span_function(def: &StmtFunctionDef) -> SourceSpan {
+    span_bounds(def.range.start().to_u32(), def.range.end().to_u32())
+}
+
+fn span_bounds(start: u32, end: u32) -> SourceSpan {
+    SourceSpan::from_bounds(start, end)
+}
+
+fn span_expr(expr: &Expr) -> SourceSpan {
+    match expr {
+        Expr::BoolOp(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::Named(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::BinOp(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::UnaryOp(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::Lambda(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::If(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::Dict(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::Set(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::ListComp(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::SetComp(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::DictComp(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::Generator(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::Await(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::Yield(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::YieldFrom(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::Compare(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::Call(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::FString(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::TString(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::StringLiteral(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::BytesLiteral(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::NumberLiteral(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::BooleanLiteral(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::NoneLiteral(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::EllipsisLiteral(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::Attribute(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::Subscript(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::Starred(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::Name(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::List(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::Tuple(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::Slice(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
+        Expr::IpyEscapeCommand(node) => span_bounds(node.range.start().to_u32(), node.range.end().to_u32()),
     }
 }
+
+mod assign;
+mod func;
+mod control;
+mod class;
+mod strings;
+mod match_;
+mod try_;
+mod generator;
+mod comprehension;
+mod with_;
+mod import;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::InstKind;
+    use crate::ir::{BinOp, InstKind, LocalId, NameId};
 
     #[test]
     fn lowers_phase_a_hello_shape() {
@@ -561,8 +1119,7 @@ mod tests {
 def add(a, b):
     return a + b
 
-print("hello")
-print(add(1, 2))
+print("hello", add(1, 2))
 "#,
         )
         .expect("Phase-A hello source should lower");
@@ -577,48 +1134,41 @@ print(add(1, 2))
         assert_eq!(main.n_locals, 0);
         assert_eq!(main.blocks.len(), 1);
         let main_block = &main.blocks[0];
-        assert_eq!(main_block.id, BlockId(0));
-        assert_eq!(main_block.term, Terminator::Return(Value(11)));
+        assert_eq!(main_block.term, Terminator::Return(Value(9)));
         assert!(matches!(
-            &main_block.insts[0].kind,
+            main_block.insts[0].kind,
             InstKind::MakeFunction {
                 func_index: 1,
-                name_interned: 0,
+                name_interned: NameId(0),
                 arity: 2
             }
         ));
-        assert_eq!(main_block.insts[1].kind, InstKind::StoreGlobal(0, Value(0)));
-        assert_eq!(main_block.insts[2].kind, InstKind::LoadName(1));
+        assert_eq!(main_block.insts[1].kind, InstKind::StoreGlobal(NameId(0), Value(0)));
+        assert_eq!(main_block.insts[2].kind, InstKind::LoadBuiltin(NameId(1)));
         assert_eq!(
             main_block.insts[3].kind,
             InstKind::Const(PyConst::Str("hello".to_owned()))
         );
+        // Module-level function reads use the normal global lookup path; class-body
+        // namespace reads are the cases that deliberately lower through LoadName.
+        assert_eq!(main_block.insts[4].kind, InstKind::LoadGlobal(NameId(0)));
+        assert_eq!(main_block.insts[5].kind, InstKind::Const(PyConst::Int(1)));
+        assert_eq!(main_block.insts[6].kind, InstKind::Const(PyConst::Int(2)));
         assert_eq!(
-            main_block.insts[4].kind,
+            main_block.insts[7].kind,
+            InstKind::Call {
+                callee: Value(4),
+                args: vec![Value(5), Value(6)]
+            }
+        );
+        assert_eq!(
+            main_block.insts[8].kind,
             InstKind::Call {
                 callee: Value(2),
-                args: vec![Value(3)]
+                args: vec![Value(3), Value(7)]
             }
         );
-        assert_eq!(main_block.insts[5].kind, InstKind::LoadName(1));
-        assert_eq!(main_block.insts[6].kind, InstKind::LoadName(0));
-        assert_eq!(main_block.insts[7].kind, InstKind::Const(PyConst::Int(1)));
-        assert_eq!(main_block.insts[8].kind, InstKind::Const(PyConst::Int(2)));
-        assert_eq!(
-            main_block.insts[9].kind,
-            InstKind::Call {
-                callee: Value(6),
-                args: vec![Value(7), Value(8)]
-            }
-        );
-        assert_eq!(
-            main_block.insts[10].kind,
-            InstKind::Call {
-                callee: Value(5),
-                args: vec![Value(9)]
-            }
-        );
-        assert_eq!(main_block.insts[11].kind, InstKind::Const(PyConst::None));
+        assert_eq!(main_block.insts[9].kind, InstKind::Const(PyConst::None));
 
         let add = &module.functions[1];
         assert_eq!(add.name, "add");
@@ -626,8 +1176,8 @@ print(add(1, 2))
         assert_eq!(add.n_locals, 2);
         assert_eq!(add.blocks.len(), 1);
         let add_block = &add.blocks[0];
-        assert_eq!(add_block.insts[0].kind, InstKind::LoadLocal(0));
-        assert_eq!(add_block.insts[1].kind, InstKind::LoadLocal(1));
+        assert_eq!(add_block.insts[0].kind, InstKind::LoadLocal(LocalId(0)));
+        assert_eq!(add_block.insts[1].kind, InstKind::LoadLocal(LocalId(1)));
         assert_eq!(
             add_block.insts[2].kind,
             InstKind::BinaryOp {
@@ -640,15 +1190,135 @@ print(add(1, 2))
     }
 
     #[test]
-    fn rejects_unsupported_construct_with_useful_error() {
-        let err = lower_source(
+    fn nested_closure_uses_full_function_shape_without_local_name_pollution() {
+        let module = lower_source(
             r#"
-if 1:
-    print("nope")
+def outer(x):
+    def inner(y):
+        return x + y
+    return inner
 "#,
         )
-        .expect_err("if statements are outside the Phase-A slice");
+        .expect("nested closure source should lower");
 
-        assert!(err.to_string().contains("if statement"));
+        assert_eq!(
+            module.names,
+            vec!["outer".to_owned()],
+            "purely local closure function and parameter names should not be interned"
+        );
+
+        let outer = module
+            .functions
+            .iter()
+            .find(|function| function.name == "outer")
+            .expect("outer function should be lowered");
+        assert!(
+            outer.blocks[0]
+                .insts
+                .iter()
+                .any(|inst| inst.kind == InstKind::MakeCell(LocalId(0))),
+            "outer should promote captured x from local slot 0 into a cell"
+        );
+        let inner_constructor = outer.blocks[0]
+            .insts
+            .iter()
+            .find(|inst| matches!(
+                &inst.kind,
+                InstKind::MakeFunctionFull { closure, .. }
+                    if closure.as_slice() == &[CellId(0)][..]
+            ))
+            .expect("outer should construct inner with the captured x cell");
+        let InstKind::MakeFunctionFull {
+            code,
+            defaults,
+            kwdefaults,
+            closure,
+            annotations,
+        } = &inner_constructor.kind
+        else {
+            unreachable!("inner constructor was selected by MakeFunctionFull shape");
+        };
+        assert_eq!(closure.as_slice(), &[CellId(0)][..]);
+        assert!(
+            defaults.is_empty(),
+            "plain closure should not synthesize positional defaults"
+        );
+        assert!(
+            kwdefaults.is_empty(),
+            "plain closure should not synthesize keyword defaults"
+        );
+        assert!(
+            annotations.is_empty(),
+            "plain closure should not synthesize annotations"
+        );
+
+        let inner = &module.functions[code.0 as usize];
+        assert_eq!(inner.name, "inner");
+        assert_eq!(inner.arity, 1);
+
+        let inner_block = &inner.blocks[0];
+        let captured_x = inner_block
+            .insts
+            .iter()
+            .find(|inst| inst.kind == InstKind::LoadCell(CellId(0)))
+            .expect("inner should read captured x from closure cell 0");
+        let parameter_y = inner_block
+            .insts
+            .iter()
+            .find(|inst| inst.kind == InstKind::LoadLocal(LocalId(0)))
+            .expect("inner should read y from local slot 0");
+        let add = inner_block
+            .insts
+            .iter()
+            .find(|inst| matches!(
+                &inst.kind,
+                InstKind::BinaryOp {
+                    op: BinOp::Add,
+                    lhs,
+                    rhs,
+                } if *lhs == captured_x.result && *rhs == parameter_y.result
+            ))
+            .expect("inner should add captured x to local y");
+        assert_eq!(inner_block.term, Terminator::Return(add.result));
+    }
+
+    #[test]
+    fn rejects_async_function_def_with_useful_error() {
+        let err = lower_source(
+            r#"
+async def f():
+    return 1
+"#,
+        )
+        .expect_err("async function definitions are outside the executable lowerer slice");
+
+        assert!(matches!(
+            err,
+            LowerError::Unsupported {
+                ref feature,
+                span: Some(_)
+            } if feature == "async function definition"
+        ));
+    }
+
+    #[test]
+    fn scans_direct_dynamic_code_sinks_with_spans() {
+        let sinks = scan_dynamic_sinks_source(
+            r#"
+def f(src):
+    return eval(src)
+
+exec("x = 1")
+compile("1 + 1", "<test>", "eval")
+"#,
+        )
+        .expect("dynamic sink scanning should parse valid Python");
+
+        assert_eq!(
+            sinks.iter().map(|sink| sink.kind).collect::<Vec<_>>(),
+            vec![DynamicCodeKind::Eval, DynamicCodeKind::Exec, DynamicCodeKind::Compile]
+        );
+        assert!(sinks.iter().all(|sink| sink.span.start < sink.span.end));
     }
 }
+
