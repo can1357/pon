@@ -1,0 +1,16 @@
+[package]
+name = "pon-abi"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+free-threading = ["pon-runtime/free-threading", "pon-gc/free-threading"]
+
+[lints]
+workspace = true
+
+[dependencies]
+pon-runtime.workspace = true
+pon-gc.workspace = true
