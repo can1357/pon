@@ -47,8 +47,8 @@ use crate::builtins as runtime_builtins;
 use crate::intern::resolve;
 use crate::feedback::{FeedbackCell, FeedbackVec, TypeTag};
 use crate::object::{
-    PyCodeFn, PyFunction, PyLong, PyNone, PyObject, PyObjectHeader, PyType, PyUnicode, TIER_STATE_QUEUED,
-    TIER_STATE_TIER0, as_object_ptr, is_exact_type,
+    PyCodeFn, PyFunction, PyLong, PyNone, PyObject, PyObjectHeader, PyType, PyUnicode, TIER_STATE_DEFERRED,
+    TIER_STATE_QUEUED, TIER_STATE_TIER0, as_object_ptr, is_exact_type,
 };
 use crate::types::{bool_, float, function, int, type_};
 use crate::types::exc::{ExceptionTypeSet, PyBaseException, is_exception_subclass, trace_base_exception};
@@ -57,11 +57,14 @@ use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set, thread_s
 const TYPE_ID_TYPE: TypeId = TypeId(1);
 
 /// Function-entry hotness threshold for the runtime-side tier-up probe.  The
-/// triggering call reloads the dispatch cell after this probe; keep this high
-/// enough to amortize synchronous tier-1 compilation on short call-heavy kernels.
-pub const TIER1_CALL_THRESHOLD: u32 = 128;
+/// triggering call reloads the dispatch cell after this probe; keeping a small
+/// hotness floor avoids synchronous compilation in one-shot benchmark kernels.
+pub const TIER1_CALL_THRESHOLD: u32 = 16;
+/// Deferred functions must become hot enough to amortize synchronous tier-1
+/// compilation before the runtime asks the backend to try them again.
+pub const TIER1_DEFERRED_CALL_THRESHOLD: u32 = 16;
 /// Loop back-edge hotness threshold for the runtime-side tier-up probe.
-pub const TIER1_LOOP_THRESHOLD: u32 = 900;
+pub const TIER1_LOOP_THRESHOLD: u32 = 10_000;
 
 /// Runtime-to-tier-up backend hook.  The concrete installer lives outside
 /// `pon-runtime`; the runtime calls through this pointer only after CAS-queuing.
@@ -1892,12 +1895,25 @@ fn maybe_queue_tierup(function: *mut PyFunction) {
         return;
     }
     // SAFETY: `function` is a live PyFunction while a runtime call/backedge is
-    // executing.  The CAS ensures one transition from Tier0 to Queued.
+    // executing.  The CAS ensures one transition into the queued state.
     let queued = unsafe {
-        (*function)
-            .tier_state
-            .compare_exchange(TIER_STATE_TIER0, TIER_STATE_QUEUED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        let function_ref = &*function;
+        match function_ref.tier_state.load(Ordering::Acquire) {
+            TIER_STATE_TIER0 => function_ref
+                .tier_state
+                .compare_exchange(TIER_STATE_TIER0, TIER_STATE_QUEUED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            TIER_STATE_DEFERRED
+                if function_ref.hotness.load(Ordering::Acquire) >= TIER1_DEFERRED_CALL_THRESHOLD
+                    || function_ref.loop_hotness.load(Ordering::Acquire) >= TIER1_LOOP_THRESHOLD =>
+            {
+                function_ref
+                    .tier_state
+                    .compare_exchange(TIER_STATE_DEFERRED, TIER_STATE_QUEUED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            }
+            _ => false,
+        }
     };
     if queued {
         // SAFETY: The hook is installed through `pon_tierup_set_hook` with the
@@ -1923,9 +1939,12 @@ pub unsafe extern "C" fn pon_tierup_bump_call(function: *mut PyFunction) {
         return;
     }
     // SAFETY: Non-NULL callers pass a live PyFunction object.
-    let hotness = unsafe { bump_saturating(&(*function).hotness) };
-    if hotness >= TIER1_CALL_THRESHOLD {
-        maybe_queue_tierup(function);
+    let function_ref = unsafe { &*function };
+    let hotness = bump_saturating(&function_ref.hotness);
+    match function_ref.tier_state.load(Ordering::Acquire) {
+        TIER_STATE_TIER0 if hotness >= TIER1_CALL_THRESHOLD => maybe_queue_tierup(function),
+        TIER_STATE_DEFERRED if hotness >= TIER1_DEFERRED_CALL_THRESHOLD => maybe_queue_tierup(function),
+        _ => {}
     }
 }
 
@@ -1938,9 +1957,11 @@ pub unsafe extern "C" fn pon_backedge_poll() {
     }
     // SAFETY: The current-function stack only contains live frames while their
     // compiled entrypoint is executing.
-    let hotness = unsafe { bump_saturating(&(*function).loop_hotness) };
-    if hotness >= TIER1_LOOP_THRESHOLD {
-        maybe_queue_tierup(function);
+    let function_ref = unsafe { &*function };
+    let hotness = bump_saturating(&function_ref.loop_hotness);
+    match function_ref.tier_state.load(Ordering::Acquire) {
+        TIER_STATE_TIER0 | TIER_STATE_DEFERRED if hotness >= TIER1_LOOP_THRESHOLD => maybe_queue_tierup(function),
+        _ => {}
     }
 }
 
