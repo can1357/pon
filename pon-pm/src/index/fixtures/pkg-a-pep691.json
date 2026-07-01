@@ -1,0 +1,20 @@
+{
+  "meta": {
+    "_api-version": "1.0"
+  },
+  "name": "pkg-a",
+  "files": [
+    {
+      "filename": "pkg_a-1.0.0-py3-none-any.whl",
+      "url": "https://files.example/pkg_a-1.0.0-py3-none-any.whl",
+      "hashes": {
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "requires-python": ">=3.8",
+      "dist-info-metadata": {
+        "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "yanked": false
+    }
+  ]
+}

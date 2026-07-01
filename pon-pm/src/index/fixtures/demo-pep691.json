@@ -1,0 +1,42 @@
+{
+  "meta": {
+    "_api-version": "1.0"
+  },
+  "name": "Demo_Pkg",
+  "files": [
+    {
+      "filename": "demo_pkg-1.0.0-py3-none-any.whl",
+      "url": "https://files.example/demo_pkg-1.0.0-py3-none-any.whl",
+      "hashes": {
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "requires-python": ">=3.8",
+      "yanked": false
+    },
+    {
+      "filename": "demo_pkg-0.9.0-py3-none-any.whl",
+      "url": "https://files.example/demo_pkg-0.9.0-py3-none-any.whl",
+      "hashes": {
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "requires-python": ">=3.7",
+      "yanked": "bad metadata"
+    },
+    {
+      "filename": "demo_pkg-1.1.0-cp314-cp314-macosx_14_0_arm64.whl",
+      "url": "https://files.example/demo_pkg-1.1.0-cp314-cp314-macosx_14_0_arm64.whl",
+      "hashes": {
+        "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "requires-python": ">=3.14",
+      "yanked": false
+    },
+    {
+      "filename": "demo_pkg-1.2.0.tar.gz",
+      "url": "https://files.example/demo_pkg-1.2.0.tar.gz",
+      "hashes": {
+        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      }
+    }
+  ]
+}

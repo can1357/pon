@@ -13,6 +13,7 @@ pub enum Error {
     InvalidSpecifier(String),
     UnsupportedArtifact(String),
     Manifest { path: PathBuf, message: String },
+    Index(String),
     Cli(String),
 }
 
@@ -36,7 +37,7 @@ impl fmt::Display for Error {
             Self::InvalidSpecifier(spec) => write!(f, "invalid version specifier `{spec}`"),
             Self::UnsupportedArtifact(message) => f.write_str(message),
             Self::Manifest { path, message } => write!(f, "{}: {message}", path.display()),
-            Self::Cli(message) => f.write_str(message),
+            Self::Index(message) | Self::Cli(message) => f.write_str(message),
         }
     }
 }
@@ -52,6 +53,7 @@ impl std::error::Error for Error {
             | Self::InvalidSpecifier(_)
             | Self::UnsupportedArtifact(_)
             | Self::Manifest { .. }
+            | Self::Index(_)
             | Self::Cli(_) => None,
         }
     }
