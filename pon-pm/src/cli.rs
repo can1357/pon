@@ -231,12 +231,24 @@ fn install_dependencies(
 fn install_record_for(requirement: &str, record: &PackageRecord, index: &impl PackageIndex) -> Result<ResolvedRecord> {
     match &record.kind {
         PackageKind::Pure => {
-            let filename = package_filename(index, &record.name, &record.version)?;
-            Ok(ResolvedRecord::wheel(&record.name, &record.version, filename))
+            if matches!(PackageSource::parse(requirement)?, PackageSource::Path(_)) {
+                if is_sdist_path(requirement) {
+                    Ok(ResolvedRecord::sdist(&record.name, &record.version, requirement))
+                } else {
+                    Ok(ResolvedRecord::local_path(&record.name, &record.version, requirement))
+                }
+            } else {
+                let filename = package_filename(index, &record.name, &record.version)?;
+                Ok(ResolvedRecord::wheel(&record.name, &record.version, filename))
+            }
         }
         PackageKind::Native => {
             if matches!(PackageSource::parse(requirement)?, PackageSource::Path(_)) {
-                Ok(ResolvedRecord::local_path(&record.name, &record.version, requirement))
+                if is_sdist_path(requirement) {
+                    Ok(ResolvedRecord::sdist(&record.name, &record.version, requirement))
+                } else {
+                    Ok(ResolvedRecord::local_path(&record.name, &record.version, requirement))
+                }
             } else {
                 Err(Error::UnsupportedArtifact(format!(
                     "native package `{}` must be installed from a local path",
@@ -246,6 +258,12 @@ fn install_record_for(requirement: &str, record: &PackageRecord, index: &impl Pa
         }
         PackageKind::CAbiRefused { .. } => Err(cabi_error(record)),
     }
+}
+
+fn is_sdist_path(requirement: &str) -> bool {
+    let path = Path::new(requirement);
+    let basename = path.file_name().and_then(|name| name.to_str()).unwrap_or(requirement);
+    basename.ends_with(".tar.gz")
 }
 
 fn package_filename(index: &impl PackageIndex, name: &str, version: &str) -> Result<String> {
@@ -387,6 +405,7 @@ fn usage(program: impl AsRef<str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::install::read_installed_packages;
 
     fn temp_project(name: &str) -> PathBuf {
         let unique = format!(
@@ -467,6 +486,46 @@ mod tests {
         let lock = fs::read_to_string(root.join("pon.lock")).expect("lock");
         assert!(lock.contains("name = \"idna\""));
         assert!(lock.contains("version = \"3.10\""));
+    }
+
+    #[test]
+    fn add_local_sdist_records_raw_path_and_installs_package() {
+        let root = temp_project("add-sdist");
+        let manifest = root.join("pyproject.toml");
+        fs::create_dir_all(&root).expect("root");
+        let sdist_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("sdists")
+            .join("pon-flit-fixture-0.1.0.tar.gz");
+        let raw_path = sdist_path.display().to_string();
+
+        run_from_args([
+            "pon-pm".to_owned(),
+            "add".to_owned(),
+            raw_path.clone(),
+            "--manifest".to_owned(),
+            manifest.display().to_string(),
+        ])
+        .expect("add local sdist");
+
+        let manifest = ProjectManifest::read(&manifest).expect("manifest");
+        let dependencies = manifest.dependencies();
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].raw(), raw_path);
+        assert_eq!(dependencies[0].normalized_name(), "pon-flit-fixture");
+
+        let package_init = root.join(".pon/packages/site-packages/pon_flit_fixture/__init__.py");
+        assert_eq!(
+            fs::read_to_string(&package_init).expect("installed package"),
+            "__version__ = \"0.1.0\"\n"
+        );
+
+        let registry = read_installed_packages(&EnvLayout::new(&root)).expect("registry");
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry[0].name, "pon-flit-fixture");
+        assert_eq!(registry[0].version, "0.1.0");
+        assert_eq!(registry[0].artifact_kind, "wheel");
+        assert_eq!(registry[0].import_names, vec!["pon_flit_fixture"]);
     }
 
     #[test]

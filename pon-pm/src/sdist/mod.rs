@@ -25,12 +25,12 @@ pub fn install_sdist_with_builder(
         )));
     }
     let build_artifact = builder.build(&BuildRequest {
+        env,
         normalized_name: &normalized_name,
         version: &resolved_record.version,
         filename,
     })?;
-    crate::wheel::validate_compatible_wheel(&build_artifact.wheel_filename)?;
-    crate::wheel::install_catalog_package(env, &normalized_name, &resolved_record.version, "sdist")
+    crate::wheel::install_wheel(env, &ResolvedRecord::wheel(&resolved_record.name, &resolved_record.version, &build_artifact.wheel_filename), &build_artifact.wheel_filename)
 }
 
 fn normalized_name_from_sdist(filename: &str) -> Result<String> {
@@ -57,57 +57,69 @@ fn normalized_name_from_sdist(filename: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::install::read_installed_packages;
-    use crate::sdist::build::BuildArtifact;
-
-    struct RecordingBuilder {
-        called: Cell<bool>,
-    }
-
-    impl SdistBuilder for RecordingBuilder {
-        fn build(&self, request: &BuildRequest<'_>) -> Result<BuildArtifact> {
-            self.called.set(true);
-            assert_eq!(request.normalized_name, "flit-core");
-            assert_eq!(request.filename, "flit-core-3.9.0.tar.gz");
-            Ok(BuildArtifact {
-                wheel_filename: format!("flit_core-{}-py3-none-any.whl", request.version),
-            })
-        }
-    }
 
     #[test]
-    fn installs_flit_core_sdist_through_build_seam() {
-        let layout = EnvLayout::new(temp_project("flit-core-sdist"));
-        let record = ResolvedRecord::sdist("flit-core", "3.9.0", "flit-core-3.9.0.tar.gz");
-        let builder = RecordingBuilder {
-            called: Cell::new(false),
-        };
+    fn builds_flit_fixture_sdist_and_installs_wheel_contents() {
+        let layout = EnvLayout::new(temp_project("flit-fixture-sdist"));
+        let filename = fixture_sdist_path("pon-flit-fixture-0.1.0.tar.gz");
+        let filename = filename.display().to_string();
+        let record = ResolvedRecord::sdist("pon-flit-fixture", "0.1.0", &filename);
 
-        let report = install_sdist_with_builder(&layout, &record, "flit-core-3.9.0.tar.gz", &builder).expect("install");
+        let report = install_sdist(&layout, &record, &filename).expect("install sdist");
 
-        assert!(builder.called.get());
-        assert_eq!(report.artifact_kind, "sdist");
-        assert_eq!(report.import_names, vec!["flit_core"]);
-        assert!(layout.site_packages.join("flit_core.py").is_file());
-        let marker = fs::read_to_string(layout.site_packages.join("flit_core.py")).expect("marker");
-        assert!(marker.contains("__version__ = \"3.9.0\""));
+        assert_eq!(report.package_name, "pon-flit-fixture");
+        assert_eq!(report.version, "0.1.0");
+        assert_eq!(report.artifact_kind, "wheel");
+        assert_eq!(report.import_names, vec!["pon_flit_fixture"]);
+
+        let package_init = layout.site_packages.join("pon_flit_fixture/__init__.py");
+        assert_eq!(
+            fs::read_to_string(&package_init).expect("installed package"),
+            "__version__ = \"0.1.0\"\n"
+        );
+
+        let record_path = layout.site_packages.join("pon_flit_fixture-0.1.0.dist-info/RECORD");
+        let record_text = fs::read_to_string(&record_path).expect("installed RECORD");
+        assert!(record_text.contains("pon_flit_fixture/__init__.py,sha256="));
+        assert!(record_text.contains("pon_flit_fixture-0.1.0.dist-info/RECORD,,"));
+
         let registry = read_installed_packages(&layout).expect("registry");
-        assert_eq!(registry[0].artifact_kind, "sdist");
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry[0].name, "pon-flit-fixture");
+        assert_eq!(registry[0].version, "0.1.0");
+        assert_eq!(registry[0].artifact_kind, "wheel");
+        assert_eq!(registry[0].import_names, vec!["pon_flit_fixture"]);
+        assert_eq!(
+            registry[0].record_path,
+            Some(std::path::PathBuf::from("pon_flit_fixture-0.1.0.dist-info/RECORD"))
+        );
     }
 
     #[test]
-    fn rejects_unknown_sdist_catalog_package() {
-        let layout = EnvLayout::new(temp_project("unknown-sdist"));
-        let record = ResolvedRecord::sdist("demo", "1.0", "demo-1.0.tar.gz");
+    fn rejects_setuptools_backend_sdist_with_backend_name() {
+        let layout = EnvLayout::new(temp_project("setuptools-sdist"));
+        let filename = fixture_sdist_path("pon-setuptools-fixture-0.1.0.tar.gz");
+        let filename = filename.display().to_string();
+        let record = ResolvedRecord::sdist("pon-setuptools-fixture", "0.1.0", &filename);
 
-        let error = install_sdist(&layout, &record, "demo-1.0.tar.gz").expect_err("unknown");
+        let error = install_sdist(&layout, &record, &filename).expect_err("unsupported backend");
 
-        assert!(error.to_string().contains("deterministic sdist catalog"));
+        let Error::UnsupportedArtifact(message) = error else {
+            panic!("expected UnsupportedArtifact");
+        };
+        assert!(message.contains("setuptools.build_meta"));
+    }
+
+    fn fixture_sdist_path(filename: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("sdists")
+            .join(filename)
     }
 
     fn temp_project(label: &str) -> std::path::PathBuf {

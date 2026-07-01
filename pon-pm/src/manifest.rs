@@ -19,14 +19,10 @@ impl Requirement {
         }
 
         if raw.starts_with('.') || raw.starts_with('/') || raw.contains(std::path::MAIN_SEPARATOR) {
-            let name = Path::new(raw)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| Error::InvalidRequirement(raw.to_owned()))?;
-            names::validate(name).map_err(|_| Error::InvalidRequirement(raw.to_owned()))?;
+            let normalized_name = path_requirement_name(raw).ok_or_else(|| Error::InvalidRequirement(raw.to_owned()))?;
             return Ok(Self {
                 raw: raw.to_owned(),
-                normalized_name: names::normalize(name),
+                normalized_name,
             });
         }
 
@@ -70,6 +66,16 @@ impl Requirement {
     pub fn normalized_name(&self) -> &str {
         &self.normalized_name
     }
+}
+
+fn path_requirement_name(raw: &str) -> Option<String> {
+    let basename = Path::new(raw).file_name()?.to_str()?;
+    let distribution = basename
+        .strip_suffix(".tar.gz")
+        .and_then(|stem| stem.rsplit_once('-').map(|(name, _version)| name))
+        .unwrap_or(basename);
+    names::validate(distribution).ok()?;
+    Some(names::normalize(distribution))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

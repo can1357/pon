@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use flate2::read::GzDecoder;
 use zip::ZipArchive;
 use zip::result::ZipError;
 
@@ -391,17 +392,111 @@ fn zip_error(label: &str, error: ZipError) -> Error {
 
 fn local_path_record(path: &Path) -> Result<PackageRecord> {
     let basename = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
-    match basename {
-        "fastjson-pon" => Ok(PackageRecord {
+    if basename == "fastjson-pon" {
+        return Ok(PackageRecord {
             name: "fastjson-pon".to_owned(),
             version: "0.1.0".to_owned(),
             kind: PackageKind::Native,
-        }),
-        _ => Err(Error::InvalidRequirement(format!(
+        });
+    }
+
+    let (content, manifest_label) = if basename.ends_with(".tar.gz") {
+        read_sdist_pyproject(path)?
+    } else {
+        let manifest_path = path.join("pyproject.toml");
+        let content = std::fs::read_to_string(&manifest_path).map_err(|_| {
+            Error::InvalidRequirement(format!(
+                "unsupported local package source `{}`",
+                path.display()
+            ))
+        })?;
+        (content, manifest_path.display().to_string())
+    };
+    let name = toml_string(&content, "project", "name")
+        .ok_or_else(|| Error::InvalidRequirement(format!("{manifest_label} is missing [project].name")))?;
+    let version = toml_string(&content, "project", "version")
+        .ok_or_else(|| Error::InvalidRequirement(format!("{manifest_label} is missing [project].version")))?;
+    let kind = if toml_string(&content, "tool.pon.native", "import-name").is_some() {
+        PackageKind::Native
+    } else {
+        PackageKind::Pure
+    };
+    Ok(PackageRecord {
+        name,
+        version,
+        kind,
+    })
+}
+
+fn read_sdist_pyproject(path: &Path) -> Result<(String, String)> {
+    let file = File::open(path).map_err(|_| {
+        Error::InvalidRequirement(format!(
             "unsupported local package source `{}`",
             path.display()
-        ))),
+        ))
+    })?;
+    let decoder = GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+    let mut entries = archive.entries().map_err(|error| {
+        Error::InvalidRequirement(format!("failed to read sdist `{}`: {error}", path.display()))
+    })?;
+    while let Some(entry) = entries.next() {
+        let mut entry = entry.map_err(|error| {
+            Error::InvalidRequirement(format!("failed to read sdist `{}`: {error}", path.display()))
+        })?;
+        let entry_path = entry
+            .path()
+            .map_err(|error| Error::InvalidRequirement(format!("failed to read sdist `{}` member path: {error}", path.display())))?
+            .into_owned();
+        if entry_path.file_name().and_then(|name| name.to_str()) == Some("pyproject.toml") {
+            let manifest_label = format!("{}:{}", path.display(), entry_path.display());
+            let mut content = String::new();
+            entry.read_to_string(&mut content).map_err(|error| {
+                Error::InvalidRequirement(format!(
+                    "failed to read pyproject.toml from sdist `{}`: {error}",
+                    path.display()
+                ))
+            })?;
+            return Ok((content, manifest_label));
+        }
     }
+    Err(Error::InvalidRequirement(format!(
+        "sdist `{}` is missing pyproject.toml",
+        path.display()
+    )))
+}
+
+fn toml_string(content: &str, section: &str, key: &str) -> Option<String> {
+    let mut active_section = "";
+    for raw_line in content.lines() {
+        let line = raw_line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            active_section = line.trim_start_matches('[').trim_end_matches(']').trim();
+            continue;
+        }
+        if active_section != section {
+            continue;
+        }
+        let Some((candidate_key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if candidate_key.trim() == key {
+            return parse_quoted(value.trim()).map(str::to_owned);
+        }
+    }
+    None
+}
+
+fn parse_quoted(value: &str) -> Option<&str> {
+    let quote = value.as_bytes().first().copied()?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    let end = value[1..].find(char::from(quote))? + 1;
+    Some(&value[1..end])
 }
 
 #[cfg(test)]
@@ -410,6 +505,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::index::SimpleJsonIndex;
+    use crate::lock::LockFile;
 
     use super::*;
 
@@ -474,6 +570,11 @@ mod tests {
             resolved.iter().map(|package| package.record.version.as_str()).collect::<Vec<_>>(),
             ["1.0.0", "1.0.0", "1.0.0"]
         );
+        let records = resolved.iter().map(|package| package.record.clone()).collect::<Vec<_>>();
+        let lock = LockFile::from_records(&records).to_string();
+        assert!(lock.contains("name = \"pkg-a\""));
+        assert!(lock.contains("name = \"pkg-b\""));
+        assert!(lock.contains("name = \"pkg-c\""));
     }
 
     #[test]

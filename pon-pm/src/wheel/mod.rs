@@ -46,6 +46,11 @@ const CATALOG_PACKAGES: &[CatalogPackage] = &[
         import_name: "flit_core",
         module_body_prefix: FLIT_CORE_MODULE_PREFIX,
     },
+    CatalogPackage {
+        normalized_name: "pon-flit-fixture",
+        import_name: "pon_flit_fixture",
+        module_body_prefix: "__version__ = ",
+    },
 ];
 
 pub fn install_wheel(env: &EnvLayout, resolved_record: &ResolvedRecord, filename: &str) -> Result<InstallReport> {
