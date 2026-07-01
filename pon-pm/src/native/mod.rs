@@ -62,6 +62,7 @@ pub fn install_local_package(env: &EnvLayout, resolved_record: &ResolvedRecord, 
             version: manifest.version.clone(),
             artifact_kind: "pon-native".to_owned(),
             import_names: vec![manifest.import_name.clone()],
+            record_path: None,
         },
     )?;
     Ok(InstallReport {

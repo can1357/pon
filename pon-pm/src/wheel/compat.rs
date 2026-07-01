@@ -1,11 +1,18 @@
 use std::collections::BTreeSet;
 use std::fmt;
+use std::path::Path;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Tag {
     pub python: String,
     pub abi: String,
     pub platform: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WheelCompatibility {
+    PurePython,
+    CAbiRefused { reason: String },
 }
 
 impl Tag {
@@ -52,6 +59,55 @@ pub fn any_supported(candidate: &[Tag], supported: &BTreeSet<Tag>) -> bool {
     candidate.iter().any(|tag| supported.contains(tag))
 }
 
+#[must_use]
+pub fn classify_tags(candidate: &[Tag], supported: &BTreeSet<Tag>) -> WheelCompatibility {
+    if any_supported(candidate, supported) {
+        WheelCompatibility::PurePython
+    } else {
+        let candidate_tags = candidate.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ");
+        WheelCompatibility::CAbiRefused {
+            reason: format!(
+                "Pon can install pure Python py*-none-any wheels only; candidate tags `{candidate_tags}` target a C ABI or platform wheel"
+            ),
+        }
+    }
+}
+
+#[must_use]
+pub fn classify_root_is_purelib(metadata: &str) -> WheelCompatibility {
+    for line in metadata.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("Root-Is-Purelib") {
+            return if value.trim().eq_ignore_ascii_case("true") {
+                WheelCompatibility::PurePython
+            } else {
+                WheelCompatibility::CAbiRefused {
+                    reason: "wheel metadata Root-Is-Purelib is not true".to_owned(),
+                }
+            };
+        }
+    }
+    WheelCompatibility::CAbiRefused {
+        reason: "wheel metadata omits Root-Is-Purelib".to_owned(),
+    }
+}
+
+#[must_use]
+pub fn classify_archive_member(path: &str) -> WheelCompatibility {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("so" | "pyd" | "dylib") => WheelCompatibility::CAbiRefused {
+            reason: format!("wheel archive contains native extension member `{path}`"),
+        },
+        _ => WheelCompatibility::PurePython,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,5 +124,26 @@ mod tests {
         assert!(any_supported(&tags, &default_supported_tags()));
         let tags = parse_tag_set("cp312", "abi3", "macosx_14_0_arm64");
         assert!(!any_supported(&tags, &default_supported_tags()));
+    }
+
+    #[test]
+    fn classifies_root_is_purelib_metadata() {
+        assert_eq!(
+            classify_root_is_purelib("Wheel-Version: 1.0\nRoot-Is-Purelib: true\n"),
+            WheelCompatibility::PurePython
+        );
+        assert!(matches!(
+            classify_root_is_purelib("Wheel-Version: 1.0\nRoot-Is-Purelib: false\n"),
+            WheelCompatibility::CAbiRefused { .. }
+        ));
+    }
+
+    #[test]
+    fn classifies_native_archive_members() {
+        assert_eq!(classify_archive_member("pkg/__init__.py"), WheelCompatibility::PurePython);
+        assert!(matches!(
+            classify_archive_member("pkg/_speedups.cpython-314-darwin.so"),
+            WheelCompatibility::CAbiRefused { .. }
+        ));
     }
 }
