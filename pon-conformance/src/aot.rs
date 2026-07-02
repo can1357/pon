@@ -388,6 +388,14 @@ fn classify_aot_parity_module(
         }
     };
 
+    if is_runtime_panic(&aot) {
+        return AotParityRecord::new(
+            label.clone(),
+            AotParityStatus::Error,
+            Some(diff_report(&label, "AoT executable", &aot, "python3.14", &reference)),
+        );
+    }
+
     if aot == reference {
         AotParityRecord::new(label, AotParityStatus::Pass, None)
     } else {
@@ -407,6 +415,11 @@ fn refusal_message(build: &RunResult) -> String {
         .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| "AoT compiler refused".to_owned())
+}
+
+fn is_runtime_panic(result: &RunResult) -> bool {
+    let stderr = String::from_utf8_lossy(&result.stderr).to_ascii_lowercase();
+    stderr.contains("panicked at") || (stderr.contains("thread '") && stderr.contains("panicked"))
 }
 
 fn aot_modules(root: &Path, requested_modules: &[PathBuf]) -> Vec<(String, Option<PathBuf>)> {
