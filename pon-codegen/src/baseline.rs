@@ -139,6 +139,7 @@ pub(crate) struct HelperFuncRefs {
     pub(crate) const_complex: FuncRef,
     pub(crate) const_bool: FuncRef,
     pub(crate) const_bytes: FuncRef,
+    pub(crate) const_bigint: FuncRef,
     pub(crate) rich_compare: FuncRef,
     pub(crate) number_unary: FuncRef,
     pub(crate) number_binary: FuncRef,
@@ -227,6 +228,7 @@ pub(crate) struct HelperFuncRefs {
     pub(crate) make_typevar: FuncRef,
     pub(crate) setup_annotations: FuncRef,
     pub(crate) build_class: FuncRef,
+    pub(crate) build_class_full: FuncRef,
     pub(crate) load_build_class: FuncRef,
     pub(crate) store_global: FuncRef,
     pub(crate) none: FuncRef,
@@ -900,6 +902,7 @@ pub(crate) fn declare_helper_refs<M: Module>(module: &mut M, helpers: &HelperRef
         const_complex: module.declare_func_in_func(helpers.const_complex, func),
         const_bool: module.declare_func_in_func(helpers.const_bool, func),
         const_bytes: module.declare_func_in_func(helpers.const_bytes, func),
+        const_bigint: module.declare_func_in_func(helpers.const_bigint, func),
         rich_compare: module.declare_func_in_func(helpers.rich_compare, func),
         number_unary: module.declare_func_in_func(helpers.number_unary, func),
         number_binary: module.declare_func_in_func(helpers.number_binary, func),
@@ -987,6 +990,7 @@ pub(crate) fn declare_helper_refs<M: Module>(module: &mut M, helpers: &HelperRef
         make_typevar: module.declare_func_in_func(helpers.make_typevar, func),
         setup_annotations: module.declare_func_in_func(helpers.setup_annotations, func),
         build_class: module.declare_func_in_func(helpers.build_class, func),
+        build_class_full: module.declare_func_in_func(helpers.build_class_full, func),
         load_build_class: module.declare_func_in_func(helpers.load_build_class, func),
         store_global: module.declare_func_in_func(helpers.store_global, func),
         none: module.declare_func_in_func(helpers.none, func),
@@ -1094,6 +1098,9 @@ pub(crate) fn lower_inst<M: Module>(
         }
         InstKind::Const(PyConst::Bytes(value)) => {
             strings::lower_const_bytes(module, builder, helpers, value, ptr_ty, exception_exit)
+        }
+        InstKind::Const(PyConst::BigInt(value)) => {
+            number::lower_const_bigint(module, builder, helpers, value, ptr_ty, exception_exit)
         }
         InstKind::Const(_) => control::lower_future_value("Const(non Phase-A literal)"),
         InstKind::ConstRef(_) => control::lower_future_value("ConstRef"),
@@ -1467,7 +1474,9 @@ pub(crate) fn lower_inst<M: Module>(
             body,
             name,
             bases,
+            bases_seq,
             keywords,
+            dstar,
             decorators,
             closure,
         } => call::lower_build_class(
@@ -1478,12 +1487,16 @@ pub(crate) fn lower_inst<M: Module>(
             functions,
             names,
             state,
-            *body,
-            *name,
-            bases,
-            keywords,
-            decorators,
-            closure,
+            call::BuildClassArgs {
+                body: *body,
+                name: *name,
+                bases,
+                bases_seq: *bases_seq,
+                keywords,
+                dstar: *dstar,
+                decorators,
+                closure,
+            },
             ptr_ty,
             ptr_bytes,
             exception_exit,
@@ -2601,5 +2614,33 @@ mod tests {
         };
 
         assert!(matches!(compile_error(&ir), CodegenError::Unsupported("non-return terminator")));
+    }
+
+    #[test]
+    fn line_transitions_emit_one_store_per_statement() {
+        // Statement 1 lowers to several instructions (three consts, two
+        // binops) that all share line 1; statement 2 transitions to line 2.
+        let ir = pon_ir::lower_source("x = 1 + 2 + 3\ny = 4\n").expect("line-stamped source lowers");
+        let clif = compiled_clif(&ir, 0);
+
+        // Exactly one `pon_current_line` store per statement-line transition,
+        // deduped across a statement's instruction run.  Boxed locals live in
+        // CLIF variables and globals go through helper calls, so these are the
+        // only plain stores in the lowered body.  Each store line's value
+        // annotation names the recorded line (`store vN, vM  ; vN = <line>`).
+        let stores: Vec<&str> = clif.lines().filter(|line| line.contains("store v")).collect();
+        assert_eq!(stores.len(), 2, "one line store per statement:\n{clif}");
+        assert!(stores[0].ends_with("= 1"), "first store records line 1: {}", stores[0]);
+        assert!(stores[1].ends_with("= 2"), "second store records line 2: {}", stores[1]);
+    }
+
+    #[test]
+    fn line_free_ir_emits_no_line_plumbing() {
+        // Hand-built IR carries `line: 0` everywhere; its emitted code must
+        // stay byte-identical to pre-line-plumbing output (no imported cell,
+        // no stores).
+        let ir = binary_ir(BinOp::Add);
+        let clif = compiled_clif(&ir, 0);
+        assert_eq!(clif.matches("store v").count(), 0, "no line stores for line-free IR:\n{clif}");
     }
 }

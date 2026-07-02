@@ -96,8 +96,6 @@ pub enum LowerError {
         /// Source byte span when the rejected AST node provided one.
         span: Option<SourceSpan>,
     },
-    /// A numeric literal is syntactically valid Python but not representable in Phase A.
-    InvalidInteger(String),
     /// The lowerer hit an internal capacity or consistency limit.
     Internal(String),
 }
@@ -125,9 +123,6 @@ impl LowerError {
         }
     }
 
-    fn invalid_integer(message: impl Into<String>) -> Self {
-        Self::InvalidInteger(message.into())
-    }
 
     fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
@@ -144,9 +139,6 @@ impl Display for LowerError {
                     write!(f, " at byte {}..{}", span.start, span.end)?;
                 }
                 Ok(())
-            }
-            LowerError::InvalidInteger(message) => {
-                write!(f, "unsupported Phase-A integer literal: {message}")
             }
             LowerError::Internal(message) => write!(f, "internal lowering error: {message}"),
         }
@@ -395,7 +387,14 @@ impl LoweringDriver {
         loop_targets: Option<control::LoopTargets>,
     ) -> Result<(), LowerError> {
         if scope.is_terminated() {
-            return Err(LowerError::unsupported("statement after return"));
+            // Unreachable statement in an already-terminated statement list
+            // (dead code after `return`/`raise`/`break`/`continue`).  CPython
+            // compiles such statements and never executes them, so skipping
+            // the lowering is observably identical: scope analysis already
+            // scanned the full AST (bindings and generator-ness are settled),
+            // and nothing here can run.  `def f(): return; yield` — the empty
+            // generator idiom — relies on exactly this.
+            return Ok(());
         }
 
         // Statement-granularity source line for every instruction this
@@ -416,7 +415,7 @@ impl LoweringDriver {
             Stmt::If(stmt) => self.lower_if_stmt(scope, stmt, loop_targets),
             Stmt::Break(stmt) => control::lower_break_with_targets(scope, stmt, loop_targets),
             Stmt::Continue(stmt) => control::lower_continue_with_targets(scope, stmt, loop_targets),
-            Stmt::With(stmt) => with_::lower_with_stmt(self, scope, stmt),
+            Stmt::With(stmt) => with_::lower_with_stmt(self, scope, stmt, loop_targets),
             Stmt::Match(stmt) => match_::lower_match(self, scope, stmt, loop_targets),
             Stmt::Try(stmt) => try_::lower_try(self, scope, stmt, loop_targets),
             Stmt::Import(stmt) => import::lower_import_stmt(self, scope, stmt),
@@ -638,12 +637,13 @@ impl LoweringDriver {
                 scope.emit(InstKind::Const(PyConst::Str(literal.value.to_str().to_owned())))
             }
             Expr::NumberLiteral(literal) => match &literal.value {
-                Number::Int(value) => {
-                    let value = value.as_i64().ok_or_else(|| {
-                        LowerError::invalid_integer(format!("{value} does not fit in i64"))
-                    })?;
-                    scope.emit(InstKind::Const(PyConst::Int(value)))
-                }
+                Number::Int(value) => match value.as_i64() {
+                    Some(value) => scope.emit(InstKind::Const(PyConst::Int(value))),
+                    // Wider than i64: keep the lexer's token (decimal, or
+                    // radix-prefixed for hex/octal/binary) and let the runtime
+                    // parse it into an arbitrary-precision int.
+                    None => scope.emit(InstKind::Const(PyConst::BigInt(value.to_string().into_boxed_str()))),
+                },
                 Number::Float(value) => scope.emit(InstKind::Const(PyConst::Float(*value))),
                 Number::Complex { real, imag } => scope.emit(InstKind::Const(PyConst::Complex {
                     real: *real,

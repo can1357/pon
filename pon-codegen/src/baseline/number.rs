@@ -6,13 +6,14 @@
 
 use cranelift_codegen::ir::{self, InstBuilder};
 use cranelift_frontend::FunctionBuilder;
+use cranelift_module::Module;
 use pon_ir::ir::{BinOp, UnOp, Value as IrValue};
 use pon_runtime::abstract_op::{
     BINARY_ADD, BINARY_AND, BINARY_DIV, BINARY_FLOORDIV, BINARY_LSHIFT, BINARY_MATMUL, BINARY_MOD,
     BINARY_MUL, BINARY_OR, BINARY_POW, BINARY_RSHIFT, BINARY_SUB, BINARY_XOR,
 };
 
-use super::{CodegenError, HelperFuncRefs, LowerState, call_pyobject_helper};
+use super::{CodegenError, HelperFuncRefs, LowerState, call_pyobject_helper, declare_string_data};
 
 /// Lower a Phase-A integer literal through `pon_const_int`.
 pub(crate) fn lower_const_int(
@@ -24,6 +25,21 @@ pub(crate) fn lower_const_int(
 ) -> Result<ir::Value, CodegenError> {
     let arg = builder.ins().iconst(ir::types::I64, value);
     Ok(call_pyobject_helper(builder, helpers.const_int, &[arg], ptr_ty, exception_exit))
+}
+
+/// Lower an oversized integer-literal token through `pon_const_bigint`,
+/// materializing the digit text in the module constant pool.
+pub(crate) fn lower_const_bigint<M: Module>(
+    module: &mut M,
+    builder: &mut FunctionBuilder<'_>,
+    helpers: &HelperFuncRefs,
+    value: &str,
+    ptr_ty: ir::Type,
+    exception_exit: ir::Block,
+) -> Result<ir::Value, CodegenError> {
+    let data_ptr = declare_string_data(module, builder, value, ptr_ty)?;
+    let len = builder.ins().iconst(ptr_ty, value.len() as i64);
+    Ok(call_pyobject_helper(builder, helpers.const_bigint, &[data_ptr, len], ptr_ty, exception_exit))
 }
 
 /// Lower a boolean literal through `pon_const_bool`.

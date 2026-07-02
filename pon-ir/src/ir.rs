@@ -545,10 +545,19 @@ pub enum InstKind {
         body: FuncId,
         /// Interned class name.
         name: NameId,
-        /// Evaluated base classes.
+        /// Evaluated base classes (static fast path; empty when `bases_seq`
+        /// carries the bases).
         bases: Vec<ValueId>,
-        /// Class keyword arguments.
+        /// Dynamic bases: a list value holding ALL bases in evaluation order.
+        /// Set when a base is starred (`class C(*bases)`) or a `**` keyword
+        /// forces the dynamic construction path; `bases` is empty then.
+        bases_seq: Option<ValueId>,
+        /// Class keyword arguments with static names, in source order.
         keywords: Vec<(NameId, ValueId)>,
+        /// Optional `**kwargs` mapping (`class C(**kwds)`), merged after
+        /// `keywords` at runtime exactly like [`InstKind::CallEx::dstar`].
+        /// Lowering guarantees `bases_seq` is `Some` whenever this is.
+        dstar: Option<ValueId>,
         /// Decorators applied after class creation.
         decorators: Vec<ValueId>,
         /// Enclosing-scope cells captured by the class body (free variables
@@ -674,6 +683,10 @@ pub enum Terminator {
 pub enum PyConst {
     /// Python integer fitting in the current immediate representation.
     Int(i64),
+    /// Python integer wider than the immediate `i64` payload, stored as the
+    /// lexer's literal token (decimal or `0b`/`0o`/`0x` prefixed, `_`
+    /// separators allowed) for arbitrary-precision parsing at materialization.
+    BigInt(Box<str>),
     /// Python float stored as an IEEE-754 double.
     Float(f64),
     /// Python complex stored as two IEEE-754 doubles.

@@ -237,7 +237,22 @@ fn emit_annotations_map(
     let mut pairs = Vec::with_capacity(entries.len());
     for (key, annotation) in entries {
         let key = body.emit(InstKind::Const(PyConst::Str(key.clone())))?;
-        let value = driver.lower_expr(body, annotation)?;
+        // PEP 646 `*args: *Ts`: CPython compiles the starred annotation to
+        // `Ts` + `UNPACK_SEQUENCE 1` — iterating the operand yields exactly
+        // the unpacked form (`GenericAlias`/`TypeVarTuple.__iter__` produce
+        // one `Unpack[...]`-shaped item).  Mirror that shape; every other
+        // annotation lowers as a plain expression.
+        let value = if let Expr::Starred(starred) = annotation {
+            let seq = driver.lower_expr(body, &starred.value)?;
+            let unpacked = body.emit(InstKind::UnpackSeq { val: seq, n: 1 })?;
+            let index = body.emit(InstKind::Const(PyConst::Int(0)))?;
+            body.emit(InstKind::SubscriptGet {
+                obj: unpacked,
+                index,
+            })?
+        } else {
+            driver.lower_expr(body, annotation)?
+        };
         pairs.push((key, value));
     }
     body.emit(InstKind::BuildMap { pairs })

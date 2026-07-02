@@ -46,6 +46,24 @@ pub unsafe extern "C" fn pon_const_complex(real: f64, imag: f64) -> *mut PyObjec
     super::catch_object_helper(|| complex_::from_f64s(real, imag))
 }
 
+/// Creates a boxed Python `int` from an integer-literal token wider than
+/// `i64`: `len` UTF-8 bytes at `ptr`, decimal or `0b`/`0o`/`0x` prefixed,
+/// `_` separators allowed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_const_bigint(ptr: *const u8, len: usize) -> *mut PyObject {
+    super::catch_object_helper(|| {
+        if ptr.is_null() {
+            return super::return_null_with_error("bigint literal pointer is null");
+        }
+        // SAFETY: The caller supplies `len` bytes at non-null `ptr`.
+        let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+        let Ok(text) = core::str::from_utf8(bytes) else {
+            return super::return_null_with_error("bigint literal is not valid UTF-8");
+        };
+        int::from_literal_token(text)
+    })
+}
+
 /// Dispatches a Python binary operation and returns NULL with the current
 /// exception set on error.
 #[unsafe(no_mangle)]

@@ -209,9 +209,9 @@ const TYPE_ID_LONG: TypeId = TypeId(2);
 const TYPE_ID_UNICODE: TypeId = TypeId(3);
 const TYPE_ID_FUNCTION: TypeId = TypeId(4);
 const TYPE_ID_NONE: TypeId = TypeId(5);
-const TYPE_ID_EXCEPTION: TypeId = TypeId(6);
+pub(crate) const TYPE_ID_EXCEPTION: TypeId = TypeId(6);
 const TYPE_ID_NOT_IMPLEMENTED: TypeId = TypeId(7);
-const TYPE_ID_EXCEPTION_GROUP: TypeId = TypeId(8);
+pub(crate) const TYPE_ID_EXCEPTION_GROUP: TypeId = TypeId(8);
 const TYPE_ID_ELLIPSIS: TypeId = TypeId(9);
 
 /// Compiled function metadata shared across Phase-B call, frame, and tier-up helpers.
@@ -448,6 +448,15 @@ const PARAMS_BUILD_CLASS_EX: &[AbiTy] = &[
     AbiTy::PyObjectPtrPtr,
     AbiTy::Usize,
 ];
+const PARAMS_BUILD_CLASS_FULL: &[AbiTy] = &[
+    AbiTy::PyObjectPtr,
+    AbiTy::U32,
+    AbiTy::PyObjectPtr,
+    AbiTy::ConstU32Ptr,
+    AbiTy::PyObjectPtrPtr,
+    AbiTy::Usize,
+    AbiTy::PyObjectPtr,
+];
 const PARAMS_LOAD_GLOBAL: &[AbiTy] = &[AbiTy::U32, AbiTy::FeedbackCellPtr];
 const PARAMS_LOAD_BUILTIN: &[AbiTy] = &[AbiTy::U32];
 const PARAMS_LOAD_NAME: &[AbiTy] = &[AbiTy::U32];
@@ -529,6 +538,12 @@ pub static HELPERS: &[HelperDecl] = &[
         symbol: "pon_const_int",
         address: pon_const_int as *const (),
         params: PARAMS_CONST_INT,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_const_bigint",
+        address: number::pon_const_bigint as *const (),
+        params: PARAMS_CONST_STR,
         ret: AbiTy::PyObjectPtr,
     },
     HelperDecl {
@@ -1498,6 +1513,12 @@ pub static HELPERS: &[HelperDecl] = &[
         ret: AbiTy::PyObjectPtr,
     },
     HelperDecl {
+        symbol: "pon_build_class_full",
+        address: pon_build_class_full as *const (),
+        params: PARAMS_BUILD_CLASS_FULL,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
         symbol: "pon_exc_star_enter",
         address: exc::pon_exc_star_enter as *const (),
         params: PARAMS_NONE,
@@ -1718,6 +1739,12 @@ fn init_runtime() -> Result<(), String> {
 
     if should_register_native {
         crate::import::register_native_modules()?;
+        // Eager tuple surface: `collections.namedtuple` captures
+        // `tuple.__new__` at import time (`_tuple_new = tuple.__new__`),
+        // which can happen before any tuple-derived class construction
+        // triggers the lazy install.  Must run after the runtime is stored:
+        // the installer allocates carriers through `with_runtime`.
+        seq::ensure_tuple_subclass_surface();
     }
     Ok(())
 }
@@ -1784,7 +1811,7 @@ fn register_gc_types(heap: &Heap) {
         GcTypeInfo {
             size: mem::size_of::<PyBaseException>(),
             trace: trace_base_exception,
-            finalize: None,
+            finalize: Some(crate::types::exc::finalize_base_exception),
         },
     );
     heap.register_type(
@@ -1792,7 +1819,7 @@ fn register_gc_types(heap: &Heap) {
         GcTypeInfo {
             size: mem::size_of::<crate::types::exc::PyExceptionGroup>(),
             trace: trace_exception_group,
-            finalize: None,
+            finalize: Some(crate::types::exc::finalize_base_exception),
         },
     );
     heap.register_type(
@@ -3110,7 +3137,24 @@ unsafe fn call_code_pointer(
     argc: usize,
 ) -> *mut PyObject {
     if arity != runtime_builtins::variadic_arity() && arity != argc {
-        return return_null_with_error(format!("function expected {arity} arguments, got {argc}"));
+        // A live `__defaults__` override (assigned after creation) can still
+        // satisfy a short call: fill the trailing parameter slots and enter
+        // through the filled argv.  Functions without an override keep the
+        // raw arity check as their only tier-0 cost.
+        let positional = match unsafe { object_arg_slice(argv, argc) } {
+            Ok(values) => values,
+            Err(message) => return return_null_with_error(message),
+        };
+        let Some(mut filled) =
+            function::fill_positional_defaults(function.cast::<PyObject>(), positional, arity)
+        else {
+            return return_null_with_error(format!("function expected {arity} arguments, got {argc}"));
+        };
+        if code.is_null() {
+            return return_null_with_error("function code pointer is null");
+        }
+        let filled_len = filled.len();
+        return unsafe { call_bound_code_pointer(function, code, filled.as_mut_ptr(), filled_len) };
     }
     if code.is_null() {
         return return_null_with_error("function code pointer is null");
@@ -3136,6 +3180,7 @@ unsafe fn call_bound_code_pointer(
     }
 
     let _guard = CurrentFunctionGuard::push(function, argv, argc);
+    let _handled_guard = HandledExcGuard::enter();
     pon_err_clear();
     let entry: PyCodeFn = unsafe { mem::transmute(code) };
     let result = unsafe { entry(argv, argc) };
@@ -3171,6 +3216,32 @@ impl Drop for CurrentFunctionGuard {
                 set_current_line(line);
             }
         }
+    }
+}
+
+/// Save/restore bracket for `PonThreadState::handled_exc` around one
+/// compiled-code call.  The callee inherits the caller's handled exception
+/// (CPython: `sys.exception()` is thread-wide while a handler runs); on
+/// return the caller's view is restored, so a handler parked inside the
+/// callee never leaks into the caller's frame.  The save rides a
+/// thread-state stack (not a guard local) to stay visible to the precise GC
+/// root scan.
+pub(crate) struct HandledExcGuard;
+
+impl HandledExcGuard {
+    pub(crate) fn enter() -> Self {
+        let mut state = thread_state_lock();
+        let current = state.handled_exc;
+        state.handled_exc_saves.push(current);
+        Self
+    }
+}
+
+impl Drop for HandledExcGuard {
+    fn drop(&mut self) {
+        let mut state = thread_state_lock();
+        let restored = state.handled_exc_saves.pop().unwrap_or(ptr::null_mut());
+        state.handled_exc = restored;
     }
 }
 
@@ -3438,7 +3509,20 @@ unsafe fn call_type_from_argv(callee: *mut PyObject, argv: *mut *mut PyObject, a
             } else {
                 let message = args.first().copied().unwrap_or(ptr::null_mut());
                 match exc::alloc_exception_object(runtime, cls, message, ptr::null_mut()) {
-                    Ok(exception) => exception,
+                    Ok(exception) => {
+                        // Multi-argument constructors carry the full tuple:
+                        // `E('x', 'y').args == ('x', 'y')`.  Zero/one-argument
+                        // exceptions keep the allocation-free derived form.
+                        if args.len() >= 2 {
+                            match seq::alloc_tuple_from_slice(runtime, args) {
+                                Ok(tuple) => unsafe {
+                                    (*exception.cast::<PyBaseException>()).args = tuple;
+                                },
+                                Err(message) => return return_null_with_error(message),
+                            }
+                        }
+                        exception
+                    }
                     Err(message) => return_null_with_error(message),
                 }
             }
@@ -3467,6 +3551,15 @@ unsafe fn call_type_from_argv(callee: *mut PyObject, argv: *mut *mut PyObject, a
         let instance = unsafe { new(cls, args_object, ptr::null_mut()) };
         if instance.is_null() {
             return ptr::null_mut();
+        }
+        // Builtin native constructors (tp_new != type_new) perform COMPLETE
+        // construction: the returned object is fully initialized from `args`.
+        // The class-dict `__init__` installed for heap subclasses resolving
+        // through the builtin's MRO (dict/list surfaces) must not run a
+        // second construction pass — `list(map(...))` would re-consume the
+        // exhausted iterator and replace the contents with the empty tail.
+        if new as *const () as usize != type_::type_new as *const () as usize {
+            return instance;
         }
         instance
     } else {
@@ -3636,6 +3729,87 @@ pub unsafe extern "C" fn pon_build_class_ex(
         } else {
             unsafe { core::slice::from_raw_parts(kw_values, kw_count) }.to_vec()
         };
+        for value in &mut values {
+            let original = *value;
+            let normalized = crate::tag::untag_arg(original);
+            if crate::tag::is_small_int(original) && normalized.is_null() {
+                return ptr::null_mut();
+            }
+            *value = normalized;
+        }
+        let keywords = names
+            .iter()
+            .copied()
+            .zip(values.iter().copied())
+            .map(|(name, value)| type_::ClassKeyword { name, value })
+            .collect::<Vec<_>>();
+        unsafe { build_class_with_body(body, &name, &base_vec, &keywords) }
+    })
+}
+
+/// Builds a heap Python class through the dynamic construction path:
+/// bases arrive as one already-splatted list object (`class C(*bases)`) and
+/// the `**kwds` mapping stays whole, flattened here into interned keywords
+/// after the static ones — exactly how `pon_call_ex` materializes call-site
+/// `**` operands.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_build_class_full(
+    body: *mut PyObject,
+    name_interned: u32,
+    bases_seq: *mut PyObject,
+    kw_names: *const u32,
+    kw_values: *mut *mut PyObject,
+    kw_count: usize,
+    dstar: *mut PyObject,
+) -> *mut PyObject {
+    crate::untag_prelude!(body, bases_seq, dstar);
+    catch_object_helper(|| {
+        if let Err(message) = ensure_runtime_initialized() {
+            return return_null_with_error(message);
+        }
+        if bases_seq.is_null() {
+            return return_null_with_error("class bases sequence is null");
+        }
+        if kw_names.is_null() && kw_count != 0 {
+            return return_null_with_error("class keyword names pointer is null");
+        }
+        if kw_values.is_null() && kw_count != 0 {
+            return return_null_with_error("class keyword values pointer is null");
+        }
+        let Some(name) = crate::intern::resolve(name_interned) else {
+            return return_null_with_error(format!("class name id {name_interned} is not interned"));
+        };
+        let mut base_vec = match unsafe { crate::types::function::positional_args_from_star(bases_seq) } {
+            Ok(bases) => bases,
+            Err(message) => return return_null_with_error(message),
+        };
+        for base in &mut base_vec {
+            let original = *base;
+            let normalized = crate::tag::untag_arg(original);
+            if crate::tag::is_small_int(original) && normalized.is_null() {
+                return ptr::null_mut();
+            }
+            *base = normalized;
+        }
+        let mut names = if kw_count == 0 {
+            Vec::new()
+        } else {
+            unsafe { core::slice::from_raw_parts(kw_names, kw_count) }.to_vec()
+        };
+        let mut values = if kw_count == 0 {
+            Vec::new()
+        } else {
+            unsafe { core::slice::from_raw_parts(kw_values, kw_count) }.to_vec()
+        };
+        if !dstar.is_null() {
+            if let Err(message) =
+                unsafe { crate::types::function::extend_keywords_from_mapping(body, dstar, &mut names, &mut values) }
+            {
+                return return_null_with_error(message);
+            }
+        }
+        // Untag AFTER the `**` extend so mapping-sourced values get the same
+        // normalization as static ones (untagging a heap pointer is identity).
         for value in &mut values {
             let original = *value;
             let normalized = crate::tag::untag_arg(original);
@@ -4415,6 +4589,14 @@ pub fn collect() -> Result<(), String> {
                 }
             }
         }
+        if !state.handled_exc.is_null() {
+            roots.push(state.handled_exc.cast::<u8>());
+        }
+        for value in state.handled_exc_saves.iter().copied() {
+            if !value.is_null() {
+                roots.push(value.cast::<u8>());
+            }
+        }
     }
 
     {
@@ -4540,6 +4722,34 @@ fn defining_module_attr(name: u32) -> Option<*mut PyObject> {
     crate::import::module_attr(module, name)
 }
 
+/// Defining module of the compiled call-stack frame `depth` levels above the
+/// caller of a native builtin, for `sys._getframe(depth).f_globals`.
+///
+/// `native_entry` is the builtin's own code pointer (`sys._getframe`): when
+/// the innermost stack entry is that very call it is skipped, so `depth`
+/// counts from the builtin's caller — CPython counts Python frames only, a
+/// C call pushes none.  Entries below the active module's call floor are
+/// suspended behind the import and stay invisible, mirroring
+/// `current_defining_module`.  `None` when the walk runs past the tracked
+/// compiled stack (a module-toplevel frame — callers approximate with the
+/// active module's namespace) or the entry at `depth` carries no
+/// defining-module record (native wrappers).
+pub(crate) fn frame_defining_module_for_depth(depth: usize, native_entry: *const u8) -> Option<u32> {
+    let floor = crate::import::active_module_call_floor();
+    CURRENT_FUNCTION_STACK.with(|stack| {
+        let stack = stack.borrow();
+        let floor = floor.min(stack.len());
+        let visible = &stack[floor..];
+        let skip = usize::from(visible.last().is_some_and(|call| {
+            // SAFETY: Stack entries hold live function objects for the call's duration.
+            let entry = unsafe { (*call.function).entry.load(Ordering::Acquire) };
+            ptr::eq(entry.cast_const(), native_entry)
+        }));
+        let index = visible.len().checked_sub(1 + skip + depth)?;
+        crate::types::function::function_module(visible[index].function.cast::<PyObject>())
+    })
+}
+
 /// Record the defining module for a freshly created function object: the
 /// enclosing function's module when compiled code is executing (nested defs,
 /// decorator-built wrappers), else the actively executing module body.
@@ -4560,6 +4770,48 @@ mod tests {
 
     unsafe extern "C" fn return_none(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
         unsafe { pon_none() }
+    }
+
+    unsafe extern "C" fn getframe_probe(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+        unsafe { pon_none() }
+    }
+
+    #[test]
+    fn frame_defining_module_for_depth_walks_caller_stack() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+            crate::import::install_module("fg_mod_a", []).unwrap();
+            crate::import::install_module("fg_mod_b", []).unwrap();
+
+            crate::import::begin_module_execution("fg_mod_a").unwrap();
+            let fa = pon_make_function(return_none as *const u8, 0, intern("fg_fn_a"));
+            crate::import::end_module_execution("fg_mod_a");
+            crate::import::begin_module_execution("fg_mod_b").unwrap();
+            let fb = pon_make_function(return_none as *const u8, 0, intern("fg_fn_b"));
+            crate::import::end_module_execution("fg_mod_b");
+            // Created outside any module body: carries no defining-module record,
+            // standing in for `sys._getframe`'s own native call entry.
+            let native = pon_make_function(getframe_probe as *const u8, 0, intern("fg_getframe"));
+            assert!(!fa.is_null() && !fb.is_null() && !native.is_null());
+
+            let _call_a = push_current_call(fa.cast::<PyFunction>(), ptr::null_mut(), 0);
+            let _call_b = push_current_call(fb.cast::<PyFunction>(), ptr::null_mut(), 0);
+            let _call_n = push_current_call(native.cast::<PyFunction>(), ptr::null_mut(), 0);
+
+            // Innermost entry IS the probing builtin: skipped, so depth 0 is
+            // its caller and each further depth walks one caller outward.
+            let entry = getframe_probe as *const u8;
+            assert_eq!(frame_defining_module_for_depth(0, entry), Some(intern("fg_mod_b")));
+            assert_eq!(frame_defining_module_for_depth(1, entry), Some(intern("fg_mod_a")));
+            // Past the tracked stack: a module-toplevel frame, no record.
+            assert_eq!(frame_defining_module_for_depth(2, entry), None);
+
+            // No skip when the innermost entry is not the probing builtin —
+            // and an entry without a defining-module record resolves to None.
+            assert_eq!(frame_defining_module_for_depth(0, return_none as *const u8), None);
+            assert_eq!(frame_defining_module_for_depth(1, return_none as *const u8), Some(intern("fg_mod_b")));
+        }
     }
 
     #[test]

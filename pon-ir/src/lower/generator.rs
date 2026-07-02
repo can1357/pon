@@ -737,15 +737,23 @@ fn rewrite_operands(kind: &mut InstKind, f: &mut impl FnMut(&mut Value)) {
         InstKind::ImportFrom { module, .. } | InstKind::ImportStar { module } => f(module),
         InstKind::BuildClass {
             bases,
+            bases_seq,
             keywords,
+            dstar,
             decorators,
             ..
         } => {
             for base in bases {
                 f(base);
             }
+            if let Some(bases_seq) = bases_seq {
+                f(bases_seq);
+            }
             for (_, value) in keywords {
                 f(value);
+            }
+            if let Some(dstar) = dstar {
+                f(dstar);
             }
             for decorator in decorators {
                 f(decorator);

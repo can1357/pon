@@ -30,6 +30,8 @@ pub struct HelperRefs {
     pub const_str: FuncId,
     /// `pon_const_bytes(*const u8, usize) -> *mut PyObject`.
     pub const_bytes: FuncId,
+    /// `pon_const_bigint(*const u8, usize) -> *mut PyObject`.
+    pub const_bigint: FuncId,
     /// `pon_binary_add(*mut PyObject, *mut PyObject) -> *mut PyObject`.
     pub binary_add: FuncId,
     /// `pon_rich_compare(op, lhs, rhs, feedback) -> *mut PyObject`.
@@ -208,6 +210,8 @@ pub struct HelperRefs {
     pub setup_annotations: FuncId,
     /// `pon_build_class_ex(body, name_id, bases, base_count, kw_names, kw_values, kw_count) -> *mut PyObject`.
     pub build_class: FuncId,
+    /// `pon_build_class_full(body, name_id, bases_seq, kw_names, kw_values, kw_count, dstar) -> *mut PyObject`.
+    pub build_class_full: FuncId,
     /// `pon_load_build_class() -> *mut PyObject`.
     pub load_build_class: FuncId,
     /// `pon_store_global(name_id, value) -> *mut PyObject`.
@@ -311,6 +315,7 @@ pub enum HelperId {
     Contains,
     ConstStr,
     ConstBytes,
+    ConstBigint,
     BuildString,
     BuildTemplate,
     BuildTuple,
@@ -381,6 +386,7 @@ pub enum HelperId {
     FunctionSetAnnotate,
     MakeTypeAlias,
     MakeTypeVar,
+    BuildClassFull,
 }
 
 /// Frozen Phase-B helper signature description.
@@ -466,6 +472,15 @@ const P_BUILD_CLASS: &[AbiShape] = &[
     AbiShape::PyObjectPtrPtr,
     AbiShape::Usize,
 ];
+const P_BUILD_CLASS_FULL: &[AbiShape] = &[
+    AbiShape::PyObjectPtr,
+    AbiShape::U32,
+    AbiShape::PyObjectPtr,
+    AbiShape::ConstNamePtr,
+    AbiShape::PyObjectPtrPtr,
+    AbiShape::Usize,
+    AbiShape::PyObjectPtr,
+];
 const P_RAISE: &[AbiShape] = &[AbiShape::PyObjectPtr, AbiShape::PyObjectPtr];
 const P_HANDLER: &[AbiShape] = &[AbiShape::U32, AbiShape::U32, AbiShape::U8];
 const P_IMPORT_NAME: &[AbiShape] = &[AbiShape::U32, AbiShape::ConstNamePtr, AbiShape::Usize, AbiShape::U32];
@@ -486,6 +501,7 @@ pub static PHASE_B_HELPERS: &[HelperSig] = &[
     HelperSig { id: HelperId::Contains, family: HelperFamily::Seq, symbol: "pon_contains", params: P_OBJ_OBJ, ret: AbiShape::I32, feedback_trailing: 0 },
     HelperSig { id: HelperId::ConstStr, family: HelperFamily::Str, symbol: "pon_const_str", params: P_STR_BYTES, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::ConstBytes, family: HelperFamily::Str, symbol: "pon_const_bytes", params: P_STR_BYTES, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
+    HelperSig { id: HelperId::ConstBigint, family: HelperFamily::Number, symbol: "pon_const_bigint", params: P_STR_BYTES, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::BuildString, family: HelperFamily::Str, symbol: "pon_build_string", params: P_STR_PARTS, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::BuildTemplate, family: HelperFamily::Str, symbol: "pon_build_template", params: P_TSTR_PARTS, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::BuildTuple, family: HelperFamily::Seq, symbol: "pon_build_tuple", params: P_OBJ_ARR, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
@@ -556,6 +572,7 @@ pub static PHASE_B_HELPERS: &[HelperSig] = &[
     HelperSig { id: HelperId::FunctionSetAnnotate, family: HelperFamily::Call, symbol: "pon_function_set_annotate", params: P_OBJ_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::MakeTypeAlias, family: HelperFamily::Call, symbol: "pon_make_type_alias", params: P_NAME_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::MakeTypeVar, family: HelperFamily::Call, symbol: "pon_make_typevar", params: P_NAME, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
+    HelperSig { id: HelperId::BuildClassFull, family: HelperFamily::Call, symbol: "pon_build_class_full", params: P_BUILD_CLASS_FULL, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
 ];
 
 /// Look up a frozen Phase-B helper signature by id.
@@ -579,6 +596,7 @@ pub fn declare_helpers<M: Module>(module: &mut M) -> ModuleResult<HelperRefs> {
         const_bool: declare_one(module, "pon_const_bool")?,
         const_str: declare_one(module, "pon_const_str")?,
         const_bytes: declare_one(module, "pon_const_bytes")?,
+        const_bigint: declare_one(module, "pon_const_bigint")?,
         binary_add: declare_one(module, "pon_binary_add")?,
         rich_compare: declare_one(module, "pon_rich_compare")?,
         number_unary: declare_one(module, "pon_number_unary")?,
@@ -668,6 +686,7 @@ pub fn declare_helpers<M: Module>(module: &mut M) -> ModuleResult<HelperRefs> {
         make_typevar: declare_one(module, "pon_make_typevar")?,
         setup_annotations: declare_one(module, "pon_setup_annotations")?,
         build_class: declare_one(module, "pon_build_class_ex")?,
+        build_class_full: declare_one(module, "pon_build_class_full")?,
         load_build_class: declare_one(module, "pon_load_build_class")?,
         store_global: declare_one(module, "pon_store_global")?,
         none: declare_one(module, "pon_none")?,

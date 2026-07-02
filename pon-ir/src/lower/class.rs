@@ -46,23 +46,58 @@ pub(super) fn lower_class_def(
 
     let name = driver.names.intern(stmt.name.as_str())?;
     let mut bases = Vec::new();
+    let mut bases_seq = None;
     let mut keywords = Vec::new();
+    let mut dstar = None;
     if let Some(arguments) = stmt.arguments.as_deref() {
-        bases.reserve(arguments.args.len());
-        for arg in &arguments.args {
-            bases.push(driver.lower_expr(scope, arg)?);
+        let has_starred_base = arguments.args.iter().any(|arg| matches!(arg, Expr::Starred(_)));
+        let has_dstar = arguments.keywords.iter().any(|keyword| keyword.arg.is_none());
+        if has_starred_base || has_dstar {
+            // Dynamic construction path: materialize the bases into a list
+            // exactly like `lower_call` materializes `*args` (`class C(*bs)`
+            // iterates like a call), so codegen can hand the runtime one
+            // sequence object regardless of star placement.
+            let list = scope.emit(InstKind::BuildList { elts: Vec::new() })?;
+            for arg in &arguments.args {
+                if let Expr::Starred(starred) = arg {
+                    let iter = driver.lower_expr(scope, &starred.value)?;
+                    scope.emit(InstKind::ListExtend { list, iter })?;
+                } else {
+                    let item = driver.lower_expr(scope, arg)?;
+                    scope.emit(InstKind::ListAppend { list, item })?;
+                }
+            }
+            bases_seq = Some(list);
+        } else {
+            bases.reserve(arguments.args.len());
+            for arg in &arguments.args {
+                bases.push(driver.lower_expr(scope, arg)?);
+            }
+        }
+        // Keyword `**` materialization mirrors `lower_call`: a single `**`
+        // passes its mapping through, several fold left-to-right into a
+        // fresh map with duplicate detection.  Statically named keywords
+        // keep their interned-name fast path either way.
+        let has_multiple_dstar = arguments
+            .keywords
+            .iter()
+            .filter(|keyword| keyword.arg.is_none())
+            .nth(1)
+            .is_some();
+        if has_multiple_dstar {
+            dstar = Some(scope.emit(InstKind::BuildMap { pairs: Vec::new() })?);
         }
         keywords.reserve(arguments.keywords.len());
         for keyword in &arguments.keywords {
-            let Some(arg_name) = keyword.arg.as_ref() else {
-                return unsupported_at(
-                    "class ** keyword argument",
-                    span_bounds(keyword.range.start().to_u32(), keyword.range.end().to_u32()),
-                );
-            };
-            let key = driver.names.intern(arg_name.as_str())?;
             let value = driver.lower_expr(scope, &keyword.value)?;
-            keywords.push((key, value));
+            if let Some(arg_name) = keyword.arg.as_ref() {
+                let key = driver.names.intern(arg_name.as_str())?;
+                keywords.push((key, value));
+            } else if let Some(map) = dstar {
+                scope.emit(InstKind::DictMergeUnique { map, other: value })?;
+            } else {
+                dstar = Some(value);
+            }
         }
     }
 
@@ -76,7 +111,9 @@ pub(super) fn lower_class_def(
         body: body_id,
         name,
         bases,
+        bases_seq,
         keywords,
+        dstar,
         decorators,
         closure,
     })?;

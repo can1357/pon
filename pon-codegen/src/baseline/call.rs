@@ -174,6 +174,18 @@ fn optional_value(
     }
 }
 
+/// Grouped operands of [`pon_ir::ir::InstKind::BuildClass`].
+pub(crate) struct BuildClassArgs<'a> {
+    pub body: FunctionId,
+    pub name: NameId,
+    pub bases: &'a [IrValue],
+    pub bases_seq: Option<IrValue>,
+    pub keywords: &'a [(NameId, IrValue)],
+    pub dstar: Option<IrValue>,
+    pub decorators: &'a [IrValue],
+    pub closure: &'a [CellId],
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_build_class<M: Module>(
     module: &mut M,
@@ -183,25 +195,20 @@ pub(crate) fn lower_build_class<M: Module>(
     functions: &[Function],
     names: &NameMap,
     state: &LowerState,
-    body: pon_ir::ir::FunctionId,
-    name: NameId,
-    bases: &[IrValue],
-    keywords: &[(NameId, IrValue)],
-    decorators: &[IrValue],
-    closure: &[CellId],
+    class: BuildClassArgs<'_>,
     ptr_ty: ir::Type,
     ptr_bytes: usize,
     exception_exit: ir::Block,
 ) -> Result<ir::Value, CodegenError> {
-    let body = if closure.is_empty() {
+    let body = if class.closure.is_empty() {
         lower_make_function(
             module,
             builder,
             helpers,
             func_ids,
             names,
-            body.0,
-            name.0,
+            class.body.0,
+            class.name.0,
             0,
             ptr_ty,
             exception_exit,
@@ -220,10 +227,10 @@ pub(crate) fn lower_build_class<M: Module>(
             names,
             state,
             MakeFunctionFullArgs {
-                code: body,
+                code: class.body,
                 defaults: &[],
                 kwdefaults: &[],
-                closure,
+                closure: class.closure,
                 annotations: &[],
             },
             ptr_ty,
@@ -231,22 +238,45 @@ pub(crate) fn lower_build_class<M: Module>(
             exception_exit,
         )?
     };
-    let bases_ptr = build_call_argv(builder, helpers, state, bases, ptr_ty, ptr_bytes)?;
-    let base_count = builder.ins().iconst(ptr_ty, bases.len() as i64);
-    let kw_names = build_kw_name_array(builder, names, keywords, ptr_ty)?;
-    let kw_values = build_kw_value_array(builder, state, keywords, ptr_ty, ptr_bytes)?;
-    let kw_count = builder.ins().iconst(ptr_ty, keywords.len() as i64);
-    let runtime_name = builder.ins().iconst(ir::types::I32, i64::from(names.runtime_id(name.0)?));
-    let mut class_value = call_pyobject_helper_consuming(
-        builder,
-        helpers.build_class,
-        &[body, runtime_name, bases_ptr.addr, base_count, kw_names, kw_values.addr, kw_count],
-        &[&bases_ptr, &kw_values],
-        ptr_ty,
-        ptr_bytes,
-        exception_exit,
-    )?;
-    for decorator in decorators.iter().rev().copied() {
+    let kw_names = build_kw_name_array(builder, names, class.keywords, ptr_ty)?;
+    let kw_values = build_kw_value_array(builder, state, class.keywords, ptr_ty, ptr_bytes)?;
+    let kw_count = builder.ins().iconst(ptr_ty, class.keywords.len() as i64);
+    let runtime_name = builder.ins().iconst(ir::types::I32, i64::from(names.runtime_id(class.name.0)?));
+    let mut class_value = if class.bases_seq.is_some() || class.dstar.is_some() {
+        // Dynamic construction (`class C(*bases)` / `class C(**kwds)`):
+        // lowering materialized every base into one list value and kept the
+        // `**` mapping whole; `pon_build_class_full` flattens both at
+        // runtime, mirroring `pon_call_ex`'s star/dstar materialization.
+        let Some(bases_seq) = class.bases_seq else {
+            return Err(CodegenError::Unsupported(
+                "BuildClass dstar without a materialized bases_seq list",
+            ));
+        };
+        let bases_seq = state.value(bases_seq)?;
+        let dstar = optional_value(builder, state, class.dstar, ptr_ty)?;
+        call_pyobject_helper_consuming(
+            builder,
+            helpers.build_class_full,
+            &[body, runtime_name, bases_seq, kw_names, kw_values.addr, kw_count, dstar],
+            &[&kw_values],
+            ptr_ty,
+            ptr_bytes,
+            exception_exit,
+        )?
+    } else {
+        let bases_ptr = build_call_argv(builder, helpers, state, class.bases, ptr_ty, ptr_bytes)?;
+        let base_count = builder.ins().iconst(ptr_ty, class.bases.len() as i64);
+        call_pyobject_helper_consuming(
+            builder,
+            helpers.build_class,
+            &[body, runtime_name, bases_ptr.addr, base_count, kw_names, kw_values.addr, kw_count],
+            &[&bases_ptr, &kw_values],
+            ptr_ty,
+            ptr_bytes,
+            exception_exit,
+        )?
+    };
+    for decorator in class.decorators.iter().rev().copied() {
         let decorator = state.value(decorator)?;
         let slot = builder.create_sized_stack_slot(StackSlotData {
             kind: StackSlotKind::ExplicitSlot,

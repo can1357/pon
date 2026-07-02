@@ -540,12 +540,16 @@ fn push_inst_operands(kind: &InstKind, operands: &mut Vec<IrValue>) {
             body: _,
             name: _,
             bases,
+            bases_seq,
             keywords,
+            dstar,
             decorators,
             closure: _,
         } => {
             operands.extend(bases.iter().copied());
+            operands.extend(bases_seq.iter().copied());
             operands.extend(keywords.iter().map(|(_, value)| *value));
+            operands.extend(dstar.iter().copied());
             operands.extend(decorators.iter().copied());
         }
         InstKind::MakeFunction { .. } => {}

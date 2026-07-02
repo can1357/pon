@@ -90,6 +90,19 @@ pub fn from_i64(value: i64) -> *mut PyObject {
     unsafe { abi::pon_const_int(value) }
 }
 
+/// Boxes the value of a compiler-validated integer-literal token wider than
+/// `i64` (decimal or `0b`/`0o`/`0x` prefixed, `_` separators allowed).
+///
+/// Returns NULL with a `ValueError` set when the token does not parse, which
+/// only happens for callers bypassing the Python lexer.
+#[must_use]
+pub fn from_literal_token(text: &str) -> *mut PyObject {
+    match parse_int_text(text, 0) {
+        Ok(value) => from_bigint(value),
+        Err(message) => raise_value_error(&message),
+    }
+}
+
 /// Extracts an integer payload from exact `int` and `bool` objects.
 #[must_use]
 pub unsafe fn to_bigint_including_bool(object: *mut PyObject) -> Option<BigInt> {
