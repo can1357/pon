@@ -181,7 +181,7 @@ pub fn divmod_objects(left: *mut PyObject, right: *mut PyObject) -> *mut PyObjec
 
 fn divmod_ints(left: &BigInt, right: &BigInt) -> *mut PyObject {
     if right.is_zero() {
-        return raise_value_error("integer division or modulo by zero");
+        return raise_zero_division_error("integer division or modulo by zero");
     }
     let (quotient, remainder) = left.div_mod_floor(right);
     let mut values = [int::from_bigint(quotient), int::from_bigint(remainder)];
@@ -196,7 +196,7 @@ fn divmod_reals(left: NumericValue, right: NumericValue) -> *mut PyObject {
         return raise_type_error("int too large to convert to float");
     };
     if right == 0.0 {
-        return raise_value_error("float divmod()");
+        return raise_zero_division_error("float divmod()");
     }
     let quotient = (left / right).floor();
     let remainder = left - quotient * right;
@@ -262,13 +262,13 @@ fn binary_int(op: NumberOp, left: &BigInt, right: &BigInt) -> *mut PyObject {
         BINARY_MUL => int::from_bigint(left * right),
         BINARY_FLOORDIV => {
             if right.is_zero() {
-                return raise_value_error("integer division by zero");
+                return raise_zero_division_error("integer division by zero");
             }
             int::from_bigint(left.div_floor(right))
         }
         BINARY_MOD => {
             if right.is_zero() {
-                return raise_value_error("integer modulo by zero");
+                return raise_zero_division_error("integer modulo by zero");
             }
             int::from_bigint(left.mod_floor(right))
         }
@@ -279,7 +279,7 @@ fn binary_int(op: NumberOp, left: &BigInt, right: &BigInt) -> *mut PyObject {
         BINARY_OR => int::from_bigint(left | right),
         BINARY_XOR => int::from_bigint(left ^ right),
         BINARY_DIV => match (left.to_f64(), right.to_f64()) {
-            (_, Some(0.0)) => raise_value_error("division by zero"),
+            (_, Some(0.0)) => raise_zero_division_error("division by zero"),
             (Some(left), Some(right)) => float::from_f64(left / right),
             _ => raise_type_error("int too large to convert to float"),
         },
@@ -290,7 +290,7 @@ fn binary_int(op: NumberOp, left: &BigInt, right: &BigInt) -> *mut PyObject {
 fn pow_int(left: &BigInt, right: &BigInt) -> *mut PyObject {
     if right.is_negative() {
         return match (left.to_f64(), right.to_f64()) {
-            (Some(0.0), _) => raise_value_error("0.0 cannot be raised to a negative power"),
+            (Some(0.0), _) => raise_zero_division_error("0.0 cannot be raised to a negative power"),
             (Some(left), Some(right)) => float::from_f64(left.powf(right)),
             _ => raise_type_error("int too large to convert to float"),
         };
@@ -329,21 +329,21 @@ fn binary_float(op: NumberOp, left: NumericValue, right: NumericValue) -> *mut P
         BINARY_MUL => float::from_f64(left * right),
         BINARY_DIV => {
             if right == 0.0 {
-                raise_value_error("float division by zero")
+                raise_zero_division_error("float division by zero")
             } else {
                 float::from_f64(left / right)
             }
         }
         BINARY_FLOORDIV => {
             if right == 0.0 {
-                raise_value_error("float floor division by zero")
+                raise_zero_division_error("float floor division by zero")
             } else {
                 float::from_f64((left / right).floor())
             }
         }
         BINARY_MOD => {
             if right == 0.0 {
-                raise_value_error("float modulo by zero")
+                raise_zero_division_error("float modulo by zero")
             } else {
                 float::from_f64(left - (left / right).floor() * right)
             }
@@ -371,7 +371,7 @@ fn binary_complex(op: NumberOp, left: NumericValue, right: NumericValue) -> *mut
         BINARY_DIV => {
             let denominator = right_real.mul_add(right_real, right_imag * right_imag);
             if denominator == 0.0 {
-                raise_value_error("complex division by zero")
+                raise_zero_division_error("complex division by zero")
             } else {
                 complex_::from_f64s(
                     (left_real * right_real + left_imag * right_imag) / denominator,
@@ -390,7 +390,7 @@ fn pow_complex(left_real: f64, left_imag: f64, right_real: f64, right_imag: f64)
             return complex_::from_f64s(1.0, 0.0);
         }
         if right_real < 0.0 || right_imag != 0.0 {
-            return raise_value_error("0.0 to a negative or complex power");
+            return raise_zero_division_error("0.0 to a negative or complex power");
         }
         return complex_::from_f64s(0.0, 0.0);
     }
@@ -449,6 +449,10 @@ fn raise_type_error(message: &str) -> *mut PyObject {
 
 fn raise_value_error(message: &str) -> *mut PyObject {
     unsafe { crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) }
+}
+
+fn raise_zero_division_error(message: &str) -> *mut PyObject {
+    unsafe { crate::abi::exc::pon_raise_zero_division_error(message.as_ptr(), message.len()) }
 }
 
 fn binary_unsupported_message(op: NumberOp) -> &'static str {

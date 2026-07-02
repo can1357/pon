@@ -646,7 +646,7 @@ unsafe extern "C" fn exception_getattro(object: *mut PyObject, name: *mut PyObje
         }
         "__traceback__" => {
             if exception.traceback.is_null() {
-                unsafe { crate::abi::pon_none() }
+                crate::traceback::new_traceback(ptr::null_mut())
             } else {
                 exception.traceback
             }

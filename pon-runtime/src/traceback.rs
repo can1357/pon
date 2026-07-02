@@ -6,13 +6,57 @@
 //! `PyBaseException` layout.  When a boxed traceback object lands, the records
 //! here are the single cutover point.
 
-use core::ptr;
+use core::{mem, ptr};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use crate::abi::PyFrame;
-use crate::object::PyObject;
-use crate::thread_state::thread_state_lock;
+use crate::object::{PyObject, PyObjectHeader, PyType};
+use crate::thread_state::{pon_err_set, thread_state_lock};
+use crate::types::frame::ensure_frame_type;
 
+
+#[repr(C)]
+struct PyTraceback {
+    ob_base: PyObjectHeader,
+    frame: *mut PyFrame,
+}
+
+fn traceback_type() -> *mut PyType {
+    static TRACEBACK_TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut ty = PyType::new(ptr::null(), "traceback", mem::size_of::<PyTraceback>());
+        ty.tp_getattro = Some(traceback_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *TRACEBACK_TYPE as *mut PyType
+}
+
+fn dummy_frame() -> *mut PyFrame {
+    let frame_type = ensure_frame_type(ptr::null_mut());
+    Box::into_raw(Box::new(PyFrame::new(frame_type, 0, ptr::null_mut())))
+}
+
+#[must_use]
+pub fn new_traceback(frame: *mut PyFrame) -> *mut PyObject {
+    let frame = if frame.is_null() { dummy_frame() } else { frame };
+    Box::into_raw(Box::new(PyTraceback {
+        ob_base: PyObjectHeader::new(traceback_type()),
+        frame,
+    }))
+    .cast::<PyObject>()
+}
+
+unsafe extern "C" fn traceback_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        pon_err_set("traceback attribute name must be str");
+        return ptr::null_mut();
+    };
+    match name {
+        "tb_frame" => unsafe { (*object.cast::<PyTraceback>()).frame.cast::<PyObject>() },
+        "tb_next" => unsafe { crate::abi::pon_none() },
+        "tb_lineno" => unsafe { crate::abi::pon_const_int(0) },
+        _ => unsafe { crate::abi::pon_raise_attribute_error(object, crate::intern::intern(name)) },
+    }
+}
 /// One frame observed while installing an exception in `PonThreadState`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TracebackRecord {

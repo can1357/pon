@@ -434,6 +434,12 @@ pub unsafe extern "C" fn pon_raise_value_error(ptr: *const u8, len: usize) -> *m
     super::catch_object_helper(|| raise_message_exception(ExceptionKind::ValueError, ptr, len))
 }
 
+/// Raises `ZeroDivisionError(message)` and returns NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_raise_zero_division_error(ptr: *const u8, len: usize) -> *mut PyObject {
+    super::catch_object_helper(|| raise_message_exception(ExceptionKind::ZeroDivisionError, ptr, len))
+}
+
 /// Raises `IndexError(message)` and returns NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_raise_index_error(ptr: *const u8, len: usize) -> *mut PyObject {
