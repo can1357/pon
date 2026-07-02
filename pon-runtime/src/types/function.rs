@@ -1416,6 +1416,11 @@ pub(crate) fn bind_native_keywords_for_name(
         "max" => bind_minmax_keywords(positional, keywords, "max"),
         "zip" => bind_zip_keywords(positional, keywords),
         "enumerate" => bind_single_keyword(positional, keywords, "enumerate", "start", 1, 2),
+        // `dict(*args, **kwargs)`: arbitrary keyword names become entries;
+        // the raw pairs ride a trailing marker that `builtin_dict` merges
+        // after the positional mapping/iterable (argparse's
+        // `dict(kwargs, dest=..., option_strings=...)` shape).
+        "dict" => bind_any_keywords(positional, keywords, "dict"),
         // `type.__prepare__(*args, **kwds)` ignores everything it receives,
         // so keyword binding degenerates to dropping the keywords.
         "__prepare__" => Ok(positional.to_vec()),
@@ -1553,7 +1558,7 @@ pub(crate) fn bind_native_keywords_for_name(
         "to_bytes" => {
             bind_optional_named_keywords(positional, keywords, "to_bytes", &["self", "length", "byteorder", "signed"], 3)
         }
-        _ => Err("keyword arguments require Phase-B function metadata".to_owned()),
+        _ => Err(format!("keyword arguments require Phase-B function metadata ('{name}')")),
     }
 }
 

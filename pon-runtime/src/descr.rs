@@ -845,7 +845,19 @@ pub unsafe fn super_lookup(start: *mut PyType, obj: *mut PyObject, owner: *mut P
             return function;
         }
     }
-    raise_attr_error("super attribute was not found")
+    // CPython super_getattro falls back to generic lookup on the proxy
+    // itself; a miss there raises a REAL AttributeError.  A message-only
+    // sentinel would be uncatchable (`except AttributeError` never matches),
+    // which broke importlib's `KeyedRef.__new__` chain outright.
+    let attr = intern::resolve(name).unwrap_or_default();
+    eprintln!(
+        "SUPERDBG start={} owner={} attr={} mro={:?}",
+        unsafe { (*start).name() },
+        unsafe { (*owner).name() },
+        attr,
+        mro.iter().map(|ty| unsafe { (**ty).name() }).collect::<Vec<_>>()
+    );
+    abi::exc::raise_attribute_error_text(&format!("'super' object has no attribute '{attr}'"))
 }
 
 /// `object.__init_subclass__` surrogate: accepts anything, does nothing.
