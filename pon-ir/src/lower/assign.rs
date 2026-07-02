@@ -1,5 +1,5 @@
 use super::*;
-use crate::ir::{BinOp, PyConst};
+use crate::ir::BinOp;
 
 pub(super) fn lower_assign(
     driver: &mut LoweringDriver,
@@ -188,20 +188,10 @@ pub(super) fn lower_ann_assign(
     scope: &mut BodyScope,
     stmt: &ruff_python_ast::StmtAnnAssign,
 ) -> Result<(), LowerError> {
-    if (scope.is_module() || scope.is_class())
-        && let Expr::Name(name) = stmt.target.as_ref()
-        && matches!(name.ctx, ExprContext::Store)
-    {
-        let annotations = scope.emit(InstKind::SetupAnnotations)?;
-        let annotation = driver.lower_expr(scope, &stmt.annotation)?;
-        let key = scope.emit(InstKind::Const(PyConst::Str(name.id.as_str().to_owned())))?;
-        scope.emit(InstKind::SubscriptSet {
-            obj: annotations,
-            index: key,
-            val: annotation,
-        })?;
-    }
-
+    // PEP 649: the annotation expression is NOT evaluated here.  Module and
+    // class name-target annotations were routed into the deferred
+    // `__annotate__` child by scope analysis and evaluate lazily on first
+    // `__annotations__` access; function-local annotations evaluate never.
     if let Some(value) = stmt.value.as_deref() {
         let value = driver.lower_expr(scope, value)?;
         driver.lower_store_target(scope, &stmt.target, value)?;
@@ -209,9 +199,21 @@ pub(super) fn lower_ann_assign(
     Ok(())
 }
 
-pub(super) fn lower_type_alias(stmt: &ruff_python_ast::StmtTypeAlias) -> Result<(), LowerError> {
-    unsupported_at(
-        "type alias statement",
-        span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()),
-    )
+pub(super) fn lower_type_alias(
+    driver: &mut LoweringDriver,
+    scope: &mut BodyScope,
+    stmt: &ruff_python_ast::StmtTypeAlias,
+) -> Result<(), LowerError> {
+    // PEP 695: `type X = expr` synthesizes a zero-argument value thunk (the
+    // `<type_alias>` child claimed by name in statement order) and wraps it
+    // in a `TypeAliasType` that evaluates `expr` on first `__value__` access.
+    let thunk_info = scope.next_child_scope(ScopeKind::Function, scope::TYPE_ALIAS_SCOPE_NAME)?;
+    let thunk = synth::synthesize_type_alias_thunk(driver, scope, thunk_info, &stmt.value)?;
+
+    let Expr::Name(target) = stmt.name.as_ref() else {
+        return unsupported_expr("type alias target", &stmt.name);
+    };
+    let name = driver.names.intern(target.id.as_str())?;
+    let alias = scope.emit(InstKind::MakeTypeAlias { name, thunk })?;
+    driver.lower_store_target(scope, &stmt.name, alias)
 }

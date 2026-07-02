@@ -257,11 +257,15 @@ impl LoweringDriver {
         let main = self.reserve_function("__main__")?;
         let mut body = BodyScope::new(&analysis.root);
 
-        // PEP 649 NOTE (J3, in progress): scope analysis now discovers an
-        // `__annotate__` child at index 0 when the module has variable
-        // annotations; the synthesis/claim of that child lands with the
-        // synth::synthesize_namespace_annotate seam. Until then the child is
-        // simply left unclaimed and the legacy eager path below remains live.
+        // PEP 649: synthesize and store the module `__annotate__` FIRST —
+        // CPython stores it before any user statement (probed via dis on
+        // python3.14: the store precedes imports).  `pon_store_global` bumps
+        // the namespace version, so GlobalIC records stay coherent.
+        if let Some((annotate_info, entries)) = synth::claim_namespace_annotate(&mut body, &module.body)? {
+            let annotate = synth::synthesize_annotate_scope(&mut self, &mut body, annotate_info, &entries)?;
+            let annotate_name = self.names.intern(scope::ANNOTATE_SCOPE_NAME)?;
+            body.emit(InstKind::StoreGlobal(annotate_name, annotate))?;
+        }
 
         for stmt in &module.body {
             self.lower_stmt(&mut body, stmt)?;
@@ -369,7 +373,7 @@ impl LoweringDriver {
             Stmt::Delete(stmt) => assign::lower_delete(stmt),
             Stmt::AugAssign(stmt) => assign::lower_aug_assign_with_driver(self, scope, stmt),
             Stmt::AnnAssign(stmt) => assign::lower_ann_assign(self, scope, stmt),
-            Stmt::TypeAlias(stmt) => assign::lower_type_alias(stmt),
+            Stmt::TypeAlias(stmt) => assign::lower_type_alias(self, scope, stmt),
             Stmt::Raise(stmt) => try_::lower_raise(self, scope, stmt),
             Stmt::Assert(stmt) => control::lower_assert(stmt),
             Stmt::Global(stmt) => import::lower_global(stmt),

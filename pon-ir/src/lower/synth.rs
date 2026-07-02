@@ -1,4 +1,5 @@
 use super::*;
+use crate::ir::CmpOp;
 
 /// Synthesize a Python function object from an already-discovered child scope.
 ///
@@ -8,10 +9,9 @@ use super::*;
 /// [`BodyScope`], appends the IR function, lowers defaults in the enclosing
 /// scope, and emits either `MakeFunction` or `MakeFunctionFull`.
 ///
-/// Future lowering passes should reuse the same seam for implicit or synthetic
-/// function scopes.  In particular, G2 comprehension desugaring will pass a
-/// body callback that emits nested loop IR instead of lowering a statement list,
-/// and G3 `__annotate__` synthesis will use it for annotation-scope functions.
+/// Comprehension desugaring (G2) reuses the same seam with a body callback
+/// that emits nested loop IR, and the PEP 649 `__annotate__` seam below feeds
+/// it a lazily-evaluated annotate function via [`synthesize_annotate_scope`].
 pub(crate) fn synthesize_scope_function(
     driver: &mut LoweringDriver,
     enclosing: &mut BodyScope,
@@ -19,36 +19,40 @@ pub(crate) fn synthesize_scope_function(
     parameters: &Parameters,
     lower_body: impl FnOnce(&mut LoweringDriver, &mut BodyScope) -> Result<(), LowerError>,
 ) -> Result<Value, LowerError> {
-    synthesize_scope_function_with_annotations(driver, enclosing, child_info, parameters, Vec::new(), lower_body)
+    synthesize_scope_function_with_annotate(driver, enclosing, child_info, parameters, None, lower_body)
 }
 
-pub(crate) fn synthesize_scope_function_with_annotations(
+/// [`synthesize_scope_function`] with an optional pre-synthesized PEP 649
+/// `__annotate__` function attached via `FunctionSetAnnotate` after the
+/// function object materializes (before decorators run).
+pub(crate) fn synthesize_scope_function_with_annotate(
     driver: &mut LoweringDriver,
     enclosing: &mut BodyScope,
     child_info: ScopeInfo,
     parameters: &Parameters,
-    annotations: Vec<(NameId, Value)>,
+    annotate: Option<Value>,
     lower_body: impl FnOnce(&mut LoweringDriver, &mut BodyScope) -> Result<(), LowerError>,
 ) -> Result<Value, LowerError> {
     let closure = closure_cells(enclosing, &child_info)?;
-    let mut name_interned =
-        if function_shape_requires_full(parameters, &child_info, &closure, &annotations) {
-            None
-        } else {
-            Some(driver.names.intern(&child_info.name)?)
-        };
+    let mut name_interned = if function_shape_requires_full(parameters, &child_info, &closure) {
+        None
+    } else {
+        Some(driver.names.intern(&child_info.name)?)
+    };
     let function = lower_function_body(driver, &child_info, lower_body)?;
     let defaults = lower_positional_defaults(driver, enclosing, parameters)?;
     let kwdefaults = lower_keyword_defaults(driver, enclosing, parameters)?;
 
-    if needs_full_function(parameters, &child_info, &defaults, &kwdefaults, &closure, &annotations) {
+    let value = if needs_full_function(parameters, &child_info, &defaults, &kwdefaults, &closure) {
         enclosing.emit(InstKind::MakeFunctionFull {
             code: function,
             defaults,
             kwdefaults,
             closure,
-            annotations,
-        })
+            // PEP 649: annotations are never eagerly evaluated; the field is
+            // frozen-ABI legacy and always empty (see `InstKind` docs).
+            annotations: Vec::new(),
+        })?
     } else {
         let name_interned = match name_interned.take() {
             Some(name_interned) => name_interned,
@@ -59,7 +63,231 @@ pub(crate) fn synthesize_scope_function_with_annotations(
             func_index: function.0,
             name_interned,
             arity,
+        })?
+    };
+
+    if let Some(annotate) = annotate {
+        enclosing.emit(InstKind::FunctionSetAnnotate {
+            function: value,
+            annotate,
+        })?;
+    }
+    Ok(value)
+}
+
+/// Synthesize a PEP 649 `__annotate__(format)` function from its claimed
+/// scope-analysis child.
+///
+/// Body shape (pinned against CPython 3.14 probes):
+/// 1. `if format > 2: raise NotImplementedError` (formats 0/-1/1/2 all
+///    VALUE-evaluate; only formats above 2 are rejected),
+/// 2. `MakeTypeVar` prologue binding every visible PEP 695 type parameter,
+/// 3. evaluate each annotation expression and return the `BuildMap` dict.
+pub(crate) fn synthesize_annotate_scope(
+    driver: &mut LoweringDriver,
+    enclosing: &mut BodyScope,
+    child_info: ScopeInfo,
+    entries: &[(String, &Expr)],
+) -> Result<Value, LowerError> {
+    synthesize_lazy_scope(driver, enclosing, child_info, true, |driver, body| {
+        emit_annotations_map(driver, body, entries)
+    })
+}
+
+/// Synthesize a PEP 695 zero-argument type-alias value thunk from its claimed
+/// `<type_alias>` child: `MakeTypeVar` prologue, then return the lazily
+/// evaluated alias value expression.
+pub(crate) fn synthesize_type_alias_thunk(
+    driver: &mut LoweringDriver,
+    enclosing: &mut BodyScope,
+    child_info: ScopeInfo,
+    value: &Expr,
+) -> Result<Value, LowerError> {
+    synthesize_lazy_scope(driver, enclosing, child_info, false, |driver, body| {
+        driver.lower_expr(body, value)
+    })
+}
+
+/// Collect module/class-level variable annotations from `body` and claim the
+/// deferred `__annotate__` child that scope analysis inserted at
+/// `children[0]` for them.
+///
+/// MUST be called BEFORE lowering `body`'s statements: nested annotated
+/// `def`s claim their own `__annotate__` children by name, and claiming the
+/// namespace child first is what keeps the claim order aligned with scope
+/// analysis (which pushes the deferred namespace child ahead of every
+/// statement-discovered child).
+///
+/// Returns `None` when `body` carries no name-target `AnnAssign` (scope
+/// analysis created no child in that case).
+pub(crate) fn claim_namespace_annotate<'a>(
+    scope: &mut BodyScope,
+    body: &'a [Stmt],
+) -> Result<Option<(ScopeInfo, Vec<(String, &'a Expr)>)>, LowerError> {
+    let mut entries = Vec::new();
+    collect_namespace_annotations(body, &mut entries);
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let child_info = scope.next_child_scope(ScopeKind::Function, scope::ANNOTATE_SCOPE_NAME)?;
+    Ok(Some((child_info, entries)))
+}
+
+/// Shared PEP 649/695 lazy-scope materialization: lower the synthesized body
+/// (optional format guard, `MakeTypeVar` prologue, caller-provided result
+/// expression) and emit the function object in the enclosing scope.
+fn synthesize_lazy_scope(
+    driver: &mut LoweringDriver,
+    enclosing: &mut BodyScope,
+    child_info: ScopeInfo,
+    format_guard: bool,
+    lower_result: impl FnOnce(&mut LoweringDriver, &mut BodyScope) -> Result<Value, LowerError>,
+) -> Result<Value, LowerError> {
+    let closure = closure_cells(enclosing, &child_info)?;
+    let type_params = child_info.type_params.clone();
+    let name_interned = driver.names.intern(&child_info.name)?;
+    let arity = child_info.parameters.arity();
+
+    let function = lower_function_body(driver, &child_info, |driver, body| {
+        if format_guard {
+            emit_format_guard(driver, body)?;
+        }
+        emit_type_param_prologue(driver, body, &type_params)?;
+        let result = lower_result(driver, body)?;
+        body.set_term(Terminator::Return(result))
+    })?;
+
+    if closure.is_empty() && child_info.cell_vars.is_empty() {
+        enclosing.emit(InstKind::MakeFunction {
+            func_index: function.0,
+            name_interned,
+            arity,
         })
+    } else {
+        enclosing.emit(InstKind::MakeFunctionFull {
+            code: function,
+            defaults: Vec::new(),
+            kwdefaults: Vec::new(),
+            closure,
+            annotations: Vec::new(),
+        })
+    }
+}
+
+/// `if format > 2: raise NotImplementedError` prologue for `__annotate__`.
+fn emit_format_guard(driver: &mut LoweringDriver, body: &mut BodyScope) -> Result<(), LowerError> {
+    let format_slot = body
+        .local_slot("format")
+        .ok_or_else(|| LowerError::internal("annotate scope is missing its format parameter"))?;
+    let format = body.emit(InstKind::LoadLocal(format_slot))?;
+    let two = body.emit(InstKind::Const(PyConst::Int(2)))?;
+    let gt = body.emit(InstKind::Compare {
+        op: CmpOp::Gt,
+        lhs: format,
+        rhs: two,
+    })?;
+    let cond = body.emit(InstKind::BoolTest { val: gt })?;
+    let raise_block = body.alloc_block()?;
+    let cont_block = body.alloc_block()?;
+    body.set_term(Terminator::CondBranch {
+        cond,
+        then_: raise_block,
+        else_: cont_block,
+    })?;
+
+    body.switch_to(raise_block)?;
+    let exc_name = driver.names.intern("NotImplementedError")?;
+    let exc = body.emit(InstKind::LoadGlobal(exc_name))?;
+    body.emit(InstKind::Raise {
+        exc: Some(exc),
+        cause: None,
+    })?;
+    body.set_term(Terminator::RaiseTerm)?;
+
+    body.switch_to(cont_block)?;
+    Ok(())
+}
+
+/// Bind every visible PEP 695 type parameter as a fresh `MakeTypeVar` local.
+/// `BodyScope::emit` rewrites the store to `StoreCell` for captured params.
+fn emit_type_param_prologue(
+    driver: &mut LoweringDriver,
+    body: &mut BodyScope,
+    type_params: &[String],
+) -> Result<(), LowerError> {
+    for param in type_params {
+        let slot = body.local_slot(param).ok_or_else(|| {
+            LowerError::internal(format!(
+                "type parameter {param} has no local slot in its annotation scope"
+            ))
+        })?;
+        let name = driver.names.intern(param)?;
+        let typevar = body.emit(InstKind::MakeTypeVar { name })?;
+        body.emit(InstKind::StoreLocal(slot, typevar))?;
+    }
+    Ok(())
+}
+
+/// Evaluate annotation entries in source order and build the result dict.
+fn emit_annotations_map(
+    driver: &mut LoweringDriver,
+    body: &mut BodyScope,
+    entries: &[(String, &Expr)],
+) -> Result<Value, LowerError> {
+    let mut pairs = Vec::with_capacity(entries.len());
+    for (key, annotation) in entries {
+        let key = body.emit(InstKind::Const(PyConst::Str(key.clone())))?;
+        let value = driver.lower_expr(body, annotation)?;
+        pairs.push((key, value));
+    }
+    body.emit(InstKind::BuildMap { pairs })
+}
+
+/// Collect name-target `AnnAssign` annotations in source order, recursing
+/// exactly where scope analysis (`scan_stmt`) recurses with the SAME scope:
+/// control-flow statement bodies, but never nested `def`/`class` scopes.
+/// Any divergence from `scan_stmt` here breaks the annotate-child claim.
+fn collect_namespace_annotations<'a>(body: &'a [Stmt], entries: &mut Vec<(String, &'a Expr)>) {
+    for stmt in body {
+        match stmt {
+            Stmt::AnnAssign(assign) => {
+                if let Expr::Name(name) = assign.target.as_ref() {
+                    entries.push((name.id.as_str().to_owned(), assign.annotation.as_ref()));
+                }
+            }
+            Stmt::For(for_stmt) => {
+                collect_namespace_annotations(&for_stmt.body, entries);
+                collect_namespace_annotations(&for_stmt.orelse, entries);
+            }
+            Stmt::While(while_stmt) => {
+                collect_namespace_annotations(&while_stmt.body, entries);
+                collect_namespace_annotations(&while_stmt.orelse, entries);
+            }
+            Stmt::If(if_stmt) => {
+                collect_namespace_annotations(&if_stmt.body, entries);
+                for clause in &if_stmt.elif_else_clauses {
+                    collect_namespace_annotations(&clause.body, entries);
+                }
+            }
+            Stmt::With(with_stmt) => {
+                collect_namespace_annotations(&with_stmt.body, entries);
+            }
+            Stmt::Match(match_stmt) => {
+                for case in &match_stmt.cases {
+                    collect_namespace_annotations(&case.body, entries);
+                }
+            }
+            Stmt::Try(try_stmt) => {
+                collect_namespace_annotations(&try_stmt.body, entries);
+                for handler in &try_stmt.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(handler) = handler;
+                    collect_namespace_annotations(&handler.body, entries);
+                }
+                collect_namespace_annotations(&try_stmt.orelse, entries);
+                collect_namespace_annotations(&try_stmt.finalbody, entries);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -116,12 +344,7 @@ fn closure_cells(scope: &BodyScope, info: &ScopeInfo) -> Result<Vec<CellId>, Low
         .collect()
 }
 
-fn function_shape_requires_full(
-    parameters: &Parameters,
-    info: &ScopeInfo,
-    closure: &[CellId],
-    annotations: &[(NameId, Value)],
-) -> bool {
+fn function_shape_requires_full(parameters: &Parameters, info: &ScopeInfo, closure: &[CellId]) -> bool {
     positional_parameters_have_defaults(parameters)
         || parameters.vararg.is_some()
         || parameters.kwarg.is_some()
@@ -130,7 +353,6 @@ fn function_shape_requires_full(
         || !info.cell_vars.is_empty()
         || info.is_generator
         || info.is_async
-        || !annotations.is_empty()
 }
 
 fn positional_parameters_have_defaults(parameters: &Parameters) -> bool {
@@ -147,7 +369,6 @@ fn needs_full_function(
     defaults: &[Value],
     kwdefaults: &[(NameId, Value)],
     closure: &[CellId],
-    annotations: &[(NameId, Value)],
 ) -> bool {
     !defaults.is_empty()
         || !kwdefaults.is_empty()
@@ -158,7 +379,6 @@ fn needs_full_function(
         || !info.cell_vars.is_empty()
         || info.is_generator
         || info.is_async
-        || !annotations.is_empty()
 }
 
 fn positional_parameters(parameters: &Parameters) -> Result<Vec<String>, LowerError> {

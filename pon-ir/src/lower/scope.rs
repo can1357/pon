@@ -143,6 +143,11 @@ pub struct ScopeInfo {
     pub is_generator: bool,
     /// True for `async def` functions or scopes containing direct `await`.
     pub is_async: bool,
+    /// PEP 695 type-parameter names visible inside this scope, enclosing
+    /// generic parameters first, then the construct's own, in source order.
+    /// Synthesized annotate/alias scopes bind each of these as a plain local
+    /// so lowering can initialize them with `MakeTypeVar` in the prologue.
+    pub type_params: Vec<String>,
 }
 
 impl ScopeInfo {
@@ -990,6 +995,7 @@ fn finalize_scope(mut builder: ScopeBuilder, enclosing_locals: &BTreeSet<String>
         children,
         is_generator: builder.is_generator,
         is_async: builder.is_async,
+        type_params: builder.active_type_params,
     }
 }
 

@@ -5,10 +5,6 @@ pub(super) fn lower_class_def(
     scope: &mut BodyScope,
     stmt: &ruff_python_ast::StmtClassDef,
 ) -> Result<(), LowerError> {
-    if stmt.type_params.is_some() {
-        return unsupported_at("class type parameter", span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()));
-    }
-
     let class_info = scope
         .info
         .child(scope::ScopeKind::Class, stmt.name.as_str())
@@ -23,8 +19,22 @@ pub(super) fn lower_class_def(
 
     let body_id = driver.reserve_function(stmt.name.as_str())?;
     let mut body = BodyScope::new(&class_info);
+
+    // PEP 649: claim the deferred class `__annotate__` child (children[0])
+    // BEFORE lowering nested statements so annotated `def`s inside the body
+    // claim their own `__annotate__` children, but synthesize and store it at
+    // class-body END (CPython stores the class annotate function after the
+    // body executes; probed via dis on python3.14).
+    let namespace_annotate = synth::claim_namespace_annotate(&mut body, &stmt.body)?;
     for nested in &stmt.body {
         driver.lower_stmt(&mut body, nested)?;
+    }
+    if let Some((annotate_info, entries)) = namespace_annotate {
+        if !body.is_terminated() {
+            let annotate = synth::synthesize_annotate_scope(driver, &mut body, annotate_info, &entries)?;
+            let annotate_name = driver.names.intern(scope::ANNOTATE_SCOPE_NAME)?;
+            body.emit(InstKind::StoreName(annotate_name, annotate))?;
+        }
     }
     let body_fn = body.finish()?;
     driver.replace_reserved_function(body_id, body_fn)?;

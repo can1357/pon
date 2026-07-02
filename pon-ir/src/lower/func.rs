@@ -6,24 +6,31 @@ pub(super) fn lower_function_def_stmt(
     scope: &mut BodyScope,
     def: &StmtFunctionDef,
 ) -> Result<(), LowerError> {
-    if def.type_params.is_some() {
-        return unsupported_at("function type parameter", span_function(def));
-    }
-
     let name = def.name.as_str();
-    let function_info = scope.next_child_scope(ScopeKind::Function, name)?;
     let name_interned = if binding_needs_name_id(scope, name) {
         Some(driver.names.intern(name)?)
     } else {
         None
     };
-    let annotations = lower_function_annotations(driver, scope, &def.parameters, def.returns.as_deref())?;
-    let mut value = synth::synthesize_scope_function_with_annotations(
+
+    // PEP 649: scope analysis pushes the `__annotate__` child immediately
+    // BEFORE the def's own Function child, so the claim order here is frozen:
+    // annotate first, def second.
+    let annotate = if scope::function_def_has_annotations(def) {
+        let annotate_info = scope.next_child_scope(ScopeKind::Function, scope::ANNOTATE_SCOPE_NAME)?;
+        let entries = annotation_entries(&def.parameters, def.returns.as_deref());
+        Some(synth::synthesize_annotate_scope(driver, scope, annotate_info, &entries)?)
+    } else {
+        None
+    };
+
+    let function_info = scope.next_child_scope(ScopeKind::Function, name)?;
+    let mut value = synth::synthesize_scope_function_with_annotate(
         driver,
         scope,
         function_info,
         &def.parameters,
-        annotations,
+        annotate,
         |driver, body| {
             for stmt in &def.body {
                 driver.lower_stmt(body, stmt)?;
@@ -41,6 +48,36 @@ pub(super) fn lower_function_def_stmt(
     }
 
     store_function_value(driver, scope, name, name_interned, value)
+}
+
+/// Annotation entries in CPython `__annotate__` evaluation order: positional
+/// parameters, `*args`, keyword-only, `**kwargs` (annotated only), `return`.
+fn annotation_entries<'a>(parameters: &'a Parameters, returns: Option<&'a Expr>) -> Vec<(String, &'a Expr)> {
+    let mut entries = Vec::new();
+    for parameter in parameters.posonlyargs.iter().chain(&parameters.args) {
+        if let Some(annotation) = parameter.annotation() {
+            entries.push((parameter.name().as_str().to_owned(), annotation));
+        }
+    }
+    if let Some(vararg) = parameters.vararg.as_deref() {
+        if let Some(annotation) = vararg.annotation() {
+            entries.push((vararg.name().as_str().to_owned(), annotation));
+        }
+    }
+    for parameter in &parameters.kwonlyargs {
+        if let Some(annotation) = parameter.annotation() {
+            entries.push((parameter.name().as_str().to_owned(), annotation));
+        }
+    }
+    if let Some(kwarg) = parameters.kwarg.as_deref() {
+        if let Some(annotation) = kwarg.annotation() {
+            entries.push((kwarg.name().as_str().to_owned(), annotation));
+        }
+    }
+    if let Some(annotation) = returns {
+        entries.push(("return".to_owned(), annotation));
+    }
+    entries
 }
 
 pub(super) fn lower_call(
@@ -119,62 +156,6 @@ pub(super) fn lower_lambda(
         let value = driver.lower_expr(body, &lambda.body)?;
         body.set_term(Terminator::Return(value))
     })
-}
-
-
-fn lower_function_annotations(
-    driver: &mut LoweringDriver,
-    scope: &mut BodyScope,
-    parameters: &Parameters,
-    returns: Option<&Expr>,
-) -> Result<Vec<(NameId, Value)>, LowerError> {
-    let mut annotations = Vec::new();
-    for parameter in parameters.posonlyargs.iter().chain(&parameters.args) {
-        push_parameter_with_default_annotation(driver, scope, &mut annotations, parameter)?;
-    }
-    if let Some(parameter) = parameters.vararg.as_deref() {
-        push_parameter_annotation(driver, scope, &mut annotations, parameter)?;
-    }
-    for parameter in &parameters.kwonlyargs {
-        push_parameter_with_default_annotation(driver, scope, &mut annotations, parameter)?;
-    }
-    if let Some(parameter) = parameters.kwarg.as_deref() {
-        push_parameter_annotation(driver, scope, &mut annotations, parameter)?;
-    }
-    if let Some(annotation) = returns {
-        let name = driver.names.intern("return")?;
-        let value = driver.lower_expr(scope, annotation)?;
-        annotations.push((name, value));
-    }
-    Ok(annotations)
-}
-
-fn push_parameter_with_default_annotation(
-    driver: &mut LoweringDriver,
-    scope: &mut BodyScope,
-    annotations: &mut Vec<(NameId, Value)>,
-    parameter: &ruff_python_ast::ParameterWithDefault,
-) -> Result<(), LowerError> {
-    if let Some(annotation) = parameter.annotation() {
-        let name = driver.names.intern(parameter.name().as_str())?;
-        let value = driver.lower_expr(scope, annotation)?;
-        annotations.push((name, value));
-    }
-    Ok(())
-}
-
-fn push_parameter_annotation(
-    driver: &mut LoweringDriver,
-    scope: &mut BodyScope,
-    annotations: &mut Vec<(NameId, Value)>,
-    parameter: &ruff_python_ast::Parameter,
-) -> Result<(), LowerError> {
-    if let Some(annotation) = parameter.annotation() {
-        let name = driver.names.intern(parameter.name().as_str())?;
-        let value = driver.lower_expr(scope, annotation)?;
-        annotations.push((name, value));
-    }
-    Ok(())
 }
 
 
