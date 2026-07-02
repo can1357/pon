@@ -1902,6 +1902,25 @@ unsafe fn sequence_constructor(
     alloc_sequence(kind, items)
 }
 
+fn is_builtin_class_name(name: &str) -> bool {
+    matches!(
+        name,
+        "bool"
+            | "bytearray"
+            | "bytes"
+            | "dict"
+            | "float"
+            | "frozenset"
+            | "int"
+            | "list"
+            | "object"
+            | "range"
+            | "set"
+            | "str"
+            | "tuple"
+    )
+}
+
 unsafe fn object_is_instance(object: *mut PyObject, classinfo: *mut PyObject) -> bool {
     if object.is_null() || classinfo.is_null() {
         return false;
@@ -1911,6 +1930,13 @@ unsafe fn object_is_instance(object: *mut PyObject, classinfo: *mut PyObject) ->
             .iter()
             .copied()
             .any(|arg| unsafe { object_is_instance(object, arg) });
+    }
+    if let Some(expected_name) = unsafe { type_object_name(classinfo) }.filter(|name| is_builtin_class_name(name)) {
+        let object_type = unsafe { (*object).ob_type };
+        if object_type.is_null() {
+            return false;
+        }
+        return unsafe { (*object_type).name() == expected_name || ((*object_type).name() == "bool" && expected_name == "int") };
     }
     let classinfo_type = unsafe { (*classinfo).ob_type };
     if !classinfo_type.is_null() && unsafe { (*classinfo_type).name() } == "type" {

@@ -1904,6 +1904,44 @@ unsafe fn call_builtin_type_constructor(
     }
 }
 
+pub(super) unsafe fn call_builtin_type_with_keywords(
+    callee: *mut PyObject,
+    positional: &[*mut PyObject],
+    keywords: function::KeywordArgs<'_>,
+) -> Option<*mut PyObject> {
+    let name = unsafe { builtin_type_callee_name(callee)? };
+    let constructor = builtin_constructor_for_name(name)?;
+    let mut argv = match function::bind_native_keywords_for_name(name, positional, keywords) {
+        Ok(argv) => argv,
+        Err(message) => return Some(return_null_with_error(message)),
+    };
+    Some(unsafe {
+        constructor(
+            if argv.is_empty() { ptr::null_mut() } else { argv.as_mut_ptr() },
+            argv.len(),
+        )
+    })
+}
+
+unsafe fn builtin_type_callee_name(callee: *mut PyObject) -> Option<&'static str> {
+    if callee.is_null() {
+        return None;
+    }
+    let meta = unsafe { (*callee).ob_type };
+    if meta.is_null() || unsafe { (*meta).name() } != "type" {
+        return None;
+    }
+    Some(unsafe { (*callee.cast::<PyType>()).name() })
+}
+
+fn builtin_constructor_for_name(name: &str) -> Option<BuiltinConstructor> {
+    match name {
+        "enumerate" => Some(crate::native::builtins_mod::builtin_enumerate),
+        "zip" => Some(crate::native::builtins_batch::builtin_zip),
+        _ => None,
+    }
+}
+
 fn classmethod_builtin_type() -> *mut PyType {
     static TYPE: LazyLock<usize> = LazyLock::new(|| {
         let mut ty = PyType::new(ptr::null(), "classmethod", mem::size_of::<classmethod::PyClassMethod>());

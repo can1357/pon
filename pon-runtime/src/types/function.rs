@@ -962,7 +962,15 @@ fn bind_native_keywords(
     let Some(name) = function_name(function) else {
         return Err("keyword arguments require Phase-B function metadata".to_owned());
     };
-    match name.as_str() {
+    bind_native_keywords_for_name(&name, positional, keywords)
+}
+
+pub(crate) fn bind_native_keywords_for_name(
+    name: &str,
+    positional: &[*mut PyObject],
+    keywords: KeywordArgs<'_>,
+) -> Result<Vec<*mut PyObject>, String> {
+    match name {
         "sorted" => bind_sorted_keywords(positional, keywords),
         "sum" => bind_single_keyword(positional, keywords, "sum", "start", 1, 2),
         "round" => bind_named_positional_keywords(positional, keywords, "round", &["number", "ndigits"], 1, 2),

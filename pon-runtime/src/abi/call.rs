@@ -70,6 +70,11 @@ pub unsafe extern "C" fn pon_call_ex(
         if function::function_record(callee).is_some() {
             return unsafe { super::call_phase_b_function(callee, positional, keywords, star, dstar) };
         }
+        if star.is_none() && dstar.is_none() {
+            if let Some(result) = unsafe { super::call_builtin_type_with_keywords(callee, positional, keywords) } {
+                return result;
+            }
+        }
         match unsafe { function::call_bound_function(callee, positional, keywords, star, dstar) } {
             Ok(result) => result,
             Err(message) => return_null_with_error(message),

@@ -414,6 +414,10 @@ unsafe fn classify_class_object(cls: *mut PyObject) -> Option<ClassRef> {
     let ty = unsafe { object_type(cls) }?;
     let ty_name = unsafe { (*ty).name() };
     if ty_name == "type" {
+        let name = unsafe { (*cls.cast::<PyType>()).name() };
+        if BUILTIN_CLASS_NAMES.contains(&name) {
+            return Some(ClassRef::Builtin(name.to_owned()));
+        }
         return Some(ClassRef::Type(cls.cast::<PyType>()));
     }
     if ty_name == "function" {
