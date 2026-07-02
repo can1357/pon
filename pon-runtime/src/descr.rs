@@ -204,6 +204,61 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
         let type_name = unsafe { (*object.cast::<PyType>()).name() };
         return unsafe { abi::pon_const_str(type_name.as_ptr(), type_name.len()) };
     }
+    if is_type && name_id == intern::intern("__annotate__") {
+        // PEP 649: `__annotate__` is an own-dict-only class attribute — never
+        // MRO-inherited (probed: `B.__annotate__ is None` for a subclass of
+        // an annotated base).
+        let dict = unsafe { (*object.cast::<PyType>()).tp_dict.cast::<PyClassDict>() };
+        if !dict.is_null() {
+            if let Some(value) = unsafe { (&*dict).get(name_id) } {
+                return value;
+            }
+        }
+        return unsafe { abi::pon_none() };
+    }
+    if is_type && name_id == intern::intern("__annotations__") {
+        // PEP 649 lazy class annotations: own-dict cache hit, else materialize
+        // by calling the class's own `__annotate__(1)` (VALUE format) and
+        // cache into tp_dict.  Never MRO-inherited: each class materializes
+        // its own dict (empty when the class body had no annotations).
+        let ty = object.cast::<PyType>();
+        let dict = unsafe { (*ty).tp_dict.cast::<PyClassDict>() };
+        if !dict.is_null() {
+            if let Some(value) = unsafe { (&*dict).get(name_id) } {
+                return value;
+            }
+        }
+        let annotate = if dict.is_null() {
+            None
+        } else {
+            unsafe { (&*dict).get(intern::intern("__annotate__")) }
+        };
+        let annotations = match annotate {
+            Some(annotate) => {
+                let format = unsafe { abi::pon_const_int(1) };
+                if format.is_null() {
+                    return ptr::null_mut();
+                }
+                let mut argv = [format];
+                let result = unsafe { abi::pon_call(annotate, argv.as_mut_ptr(), 1) };
+                if result.is_null() {
+                    // Propagate NameError/NotImplementedError from the
+                    // annotate body without caching a partial dict.
+                    return ptr::null_mut();
+                }
+                result
+            }
+            None => unsafe { abi::map::pon_build_map(ptr::null_mut(), 0) },
+        };
+        if annotations.is_null() || dict.is_null() {
+            return annotations;
+        }
+        unsafe { (&mut *dict).set(name_id, annotations) };
+        // J0.3 §6 site #1 (type-dict set): the cache insert mutates the class
+        // namespace, so stale replays must re-resolve.
+        sync::type_modified(ty);
+        return annotations;
+    }
 
     // J0.3 capture discipline: the guard version is loaded BEFORE the slow
     // lookup, so a concurrent mutation makes the record miss, never lie.

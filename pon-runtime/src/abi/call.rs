@@ -184,8 +184,13 @@ pub unsafe extern "C" fn pon_make_function_full(
         {
             return return_null_with_error(message);
         }
-        if let Err(message) = unsafe { function::set_function_annotations(object, annotation_names, annotation_values) } {
-            return return_null_with_error(message);
+        // PEP 649: post-cutover IR always passes zero annotations; keep the
+        // eager install only for the legacy non-empty shape so the lazy
+        // `__annotations__` cache stays NULL until first access.
+        if annotation_count > 0 {
+            if let Err(message) = unsafe { function::set_function_annotations(object, annotation_names, annotation_values) } {
+                return return_null_with_error(message);
+            }
         }
         object
     })

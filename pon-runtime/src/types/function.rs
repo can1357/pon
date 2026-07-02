@@ -215,6 +215,10 @@ pub unsafe extern "C" fn function_getattro(function: *mut PyObject, name: *mut P
     if name_id == intern("__annotations__") {
         return unsafe { function_annotations(function) };
     }
+    if name_id == intern("__annotate__") {
+        return function_annotate(function)
+            .unwrap_or_else(|| unsafe { crate::abi::pon_none() });
+    }
     return_null_with_error(format!("function has no attribute '{name_text}'"))
 }
 
@@ -233,18 +237,82 @@ pub unsafe fn set_function_annotations(
     Ok(())
 }
 
+/// PEP 649 side table: function object address -> synthesized `__annotate__`
+/// function object address.  Entries are raw unrooted pointers, the same
+/// accepted pattern as `FUNCTION_RECORDS` defaults/closures.
+static ANNOTATE_FUNCTIONS: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Attach a synthesized PEP 649 `__annotate__` function to `function`.
+pub fn set_function_annotate(function: *mut PyObject, annotate: *mut PyObject) -> Result<(), String> {
+    if function.is_null() {
+        return Err("cannot set __annotate__ on NULL function".to_owned());
+    }
+    if annotate.is_null() {
+        return Err("cannot set NULL __annotate__ function".to_owned());
+    }
+    ANNOTATE_FUNCTIONS
+        .lock()
+        .map_err(|_| "annotate side table is poisoned".to_owned())?
+        .insert(function as usize, annotate as usize);
+    Ok(())
+}
+
+/// C ABI seam for `InstKind::FunctionSetAnnotate`: registers `annotate` as
+/// the PEP 649 `__annotate__` of `function` and returns `function`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_function_set_annotate(
+    function: *mut PyObject,
+    annotate: *mut PyObject,
+) -> *mut PyObject {
+    match set_function_annotate(function, annotate) {
+        Ok(()) => function,
+        Err(message) => return_null_with_error(message),
+    }
+}
+
+/// Return the synthesized `__annotate__` function for `function`, if any.
+#[must_use]
+pub fn function_annotate(function: *mut PyObject) -> Option<*mut PyObject> {
+    ANNOTATE_FUNCTIONS
+        .lock()
+        .ok()
+        .and_then(|table| table.get(&(function as usize)).copied())
+        .map(|address| address as *mut PyObject)
+}
+
+/// Lazy PEP 649 `__annotations__`: return the cached dict, or call
+/// `__annotate__(1)` (VALUE format) once and cache the result.  Functions
+/// without an annotate function cache an empty dict (CPython identity
+/// semantics: `f.__annotations__ is f.__annotations__`).
 unsafe fn function_annotations(function: *mut PyObject) -> *mut PyObject {
-    let function = function.cast::<PyFunction>();
-    let existing = unsafe { (*function).annotations };
+    let function_ref = function.cast::<PyFunction>();
+    let existing = unsafe { (*function_ref).annotations };
     if !existing.is_null() {
         return existing;
     }
-    let annotations = unsafe { crate::abi::map::pon_build_map(ptr::null_mut(), 0) };
+    let annotations = match function_annotate(function) {
+        Some(annotate) => {
+            let format = unsafe { crate::abi::pon_const_int(1) };
+            if format.is_null() {
+                return ptr::null_mut();
+            }
+            let mut argv = [format];
+            let result = unsafe { crate::abi::pon_call(annotate, argv.as_mut_ptr(), 1) };
+            if result.is_null() {
+                // Propagate NameError/NotImplementedError from the annotate
+                // body without caching a partial dict.
+                return ptr::null_mut();
+            }
+            result
+        }
+        None => unsafe { crate::abi::map::pon_build_map(ptr::null_mut(), 0) },
+    };
     if annotations.is_null() {
         return annotations;
     }
     unsafe {
-        (*function).annotations = annotations;
+        (*function_ref).annotations = annotations;
     }
     annotations
 }
