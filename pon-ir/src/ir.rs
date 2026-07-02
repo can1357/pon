@@ -88,6 +88,10 @@ pub struct Function {
     pub arity: usize,
     /// True when this function was produced from `async def` and calls must return a coroutine object.
     pub is_coroutine: bool,
+    /// True when the function body is a generator-family resumable state machine
+    /// (contains `yield`/`yield from`, or was `async def`).  Calls allocate a
+    /// frame and return a generator/coroutine object without running the body.
+    pub is_generator: bool,
     /// Full formal-parameter layout used by Phase-B function binding.
     pub params: ParamLayout,
     /// Function control-flow blocks.
@@ -413,13 +417,33 @@ pub enum InstKind {
         after: usize,
     },
     /// Produce a generator yield value before suspension.
+    ///
+    /// Only exists between AST lowering and the generator state-machine
+    /// transform; the transform replaces every occurrence with a
+    /// [`Terminator::Suspend`] split.  Codegen rejects it.
     Yield { val: ValueId },
     /// Delegate generator control to another iterator.
+    ///
+    /// Like [`InstKind::Yield`], this is transform input only: the state-machine
+    /// transform expands it into a delegation loop around
+    /// [`InstKind::GenDelegateStep`].  Codegen rejects it.
     YieldFrom { iter: ValueId },
     /// Await an awaitable via its `__await__` iterator.
     Await { awaitable: ValueId },
-    /// Finish an eagerly-lowered generator with an explicit StopIteration value.
-    EagerGeneratorReturn { value: ValueId },
+    /// Consume the resume payload of the enclosing generator frame.
+    ///
+    /// Emitted only by the generator transform at resume points: re-raises a
+    /// pending `throw` payload (NULL-routing to the active handler) or produces
+    /// the sent value (`None` when absent) as the yield-expression result.
+    GenResumePayload,
+    /// Forward the frame's resume payload to a `yield from` delegate once.
+    ///
+    /// Returns the next yielded value, or NULL with `StopIteration` pending when
+    /// the delegation finished (the finished value is stashed for
+    /// [`InstKind::GenLastStopValue`]); other exceptions propagate.
+    GenDelegateStep { delegate: ValueId },
+    /// Produce the stashed `StopIteration.value` of the last finished delegation.
+    GenLastStopValue,
     /// Raise an exception, optionally with an explicit cause.
     Raise {
         /// Exception instance or type; `None` means bare `raise`.
@@ -522,9 +546,35 @@ pub enum InstKind {
         /// Closure cells captured by the function.
         closure: Vec<CellId>,
         /// Evaluated annotations by interned name.
+        ///
+        /// PEP 649 cutover: lowering no longer eagerly evaluates annotation
+        /// expressions, so new IR always carries an empty vector here; the
+        /// field is retained only for ABI stability of the frozen
+        /// `pon_make_function_full` helper row.
         annotations: Vec<(NameId, ValueId)>,
     },
+    /// Attach a synthesized PEP 649 `__annotate__` function to a function object.
+    FunctionSetAnnotate {
+        /// Target function object.
+        function: ValueId,
+        /// Synthesized `__annotate__(format)` function object.
+        annotate: ValueId,
+    },
+    /// Build a PEP 695 `TypeAliasType` from a lazy value thunk.
+    MakeTypeAlias {
+        /// Interned alias name (`X` in `type X = ...`).
+        name: NameId,
+        /// Zero-argument thunk that evaluates the alias value on demand.
+        thunk: ValueId,
+    },
+    /// Build a minimal PEP 695 `TypeVar` runtime object by interned name.
+    MakeTypeVar {
+        /// Interned type-parameter name (`T` in `def f[T](...)`).
+        name: NameId,
+    },
     /// Ensure `__annotations__` exists in the active namespace.
+    ///
+    /// Legacy pre-PEP-649 eager path; no longer emitted by lowering.
     SetupAnnotations,
     /// Load Python's `__build_class__` helper.
     LoadBuildClass,

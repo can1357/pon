@@ -16,11 +16,6 @@ pub(super) fn lower_return(
         Some(expr) => driver.lower_expr(scope, expr)?,
         None => scope.emit(InstKind::Const(PyConst::None))?,
     };
-    let value = if scope.info.is_generator || scope.info.is_async {
-        scope.emit(InstKind::EagerGeneratorReturn { value })?
-    } else {
-        value
-    };
     scope.set_term(Terminator::Return(value))
 }
 

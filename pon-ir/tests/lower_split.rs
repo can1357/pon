@@ -261,7 +261,7 @@ def outer(x):
 }
 
 #[test]
-fn generator_return_lowers_to_eager_generator_return_value() {
+fn generator_yield_and_return_lower_to_suspend_state_machine() {
     let module = lower_source(
         r#"
 def inner():
@@ -275,12 +275,29 @@ def inner():
         .iter()
         .find(|function| function.name == "inner")
         .expect("expected lowered functions to include inner");
+    assert!(inner.is_generator, "yield body must be marked as a generator");
+    let suspends: Vec<u32> = inner
+        .blocks
+        .iter()
+        .filter_map(|block| match block.term {
+            Terminator::Suspend { state, .. } => Some(state),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(suspends, vec![1], "one yield owns exactly state 1");
     assert!(
         inner
             .blocks
             .iter()
+            .any(|block| matches!(block.term, Terminator::Return(_))),
+        "explicit return survives as a plain Return terminator; the runtime finish epilogue carries StopIteration.value"
+    );
+    assert!(
+        !inner
+            .blocks
+            .iter()
             .flat_map(|block| &block.insts)
-            .any(|inst| matches!(inst.kind, InstKind::EagerGeneratorReturn { .. })),
-        "explicit return in a generator should preserve StopIteration.value through EagerGeneratorReturn"
+            .any(|inst| matches!(inst.kind, InstKind::Yield { .. } | InstKind::YieldFrom { .. })),
+        "the transform must consume every Yield/YieldFrom marker"
     );
 }
