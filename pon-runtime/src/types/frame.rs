@@ -282,12 +282,12 @@ fn new_frame_globals_dict(frame: *mut PyObject) -> *mut PyObject {
     }
 }
 
-/// Serves `f_locals` and `f_globals` on frame objects (both `PyFrame` and
-/// resumable `GenFrame` allocations share the runtime `frame` type, so this
-/// slot must never read past the shared object header).
+/// Serves `f_locals`, `f_globals`, and `f_code` on frame objects (both
+/// `PyFrame` and resumable `GenFrame` allocations share the runtime `frame`
+/// type, so this slot must never read past the shared object header).
 ///
-/// Wider frame introspection (`f_back`, `f_code`, ...) is intentionally not
-/// served yet and raises `AttributeError`.
+/// Wider frame introspection (`f_back`, ...) is intentionally not served yet
+/// and raises `AttributeError`.
 unsafe extern "C" fn frame_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
     let Some(name) = (unsafe { crate::types::type_::unicode_text(name) }) else {
         pon_err_set("frame attribute name must be str");
@@ -296,6 +296,50 @@ unsafe extern "C" fn frame_getattro(object: *mut PyObject, name: *mut PyObject) 
     match name {
         "f_locals" => new_frame_locals_proxy(),
         "f_globals" => new_frame_globals_dict(object),
+        "f_code" => shared_code_object(),
+        _ => unsafe { crate::abi::pon_raise_attribute_error(object, crate::intern::intern(name)) },
+    }
+}
+
+/// Process-shared synthetic code object served by `frame.f_code`.
+///
+/// pon frames carry no per-function code metadata, so one immortal stand-in
+/// serves every frame: `co_filename` is the `"<pon>"` pseudo-file (angle
+/// brackets make `linecache` treat it as source-less deterministically) and
+/// `co_name` is `"<module>"`.  Together with `tb_lasti == -1` this is the
+/// exact surface `traceback.StackSummary` reads; `co_positions()` stays
+/// unreached.  Unknown attributes raise `AttributeError` so the next
+/// introspection frontier stays loud.
+fn shared_code_object() -> *mut PyObject {
+    static CODE_TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut ty = PyType::new(
+            crate::abi::runtime_type_type().cast_const(),
+            "code",
+            mem::size_of::<crate::object::PyObjectHeader>(),
+        );
+        ty.tp_getattro = Some(code_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    static CODE: LazyLock<usize> = LazyLock::new(|| {
+        Box::into_raw(Box::new(crate::object::PyObjectHeader::new(*CODE_TYPE as *mut PyType))) as usize
+    });
+    *CODE as *mut PyObject
+}
+
+unsafe extern "C" fn code_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name) = (unsafe { crate::types::type_::unicode_text(crate::tag::untag_arg(name)) }) else {
+        pon_err_set("code attribute name must be str");
+        return ptr::null_mut();
+    };
+    match name {
+        // SAFETY: Runtime allocation helper; NULL propagates with the error set.
+        "co_filename" => unsafe { crate::abi::pon_const_str("<pon>".as_ptr(), "<pon>".len()) },
+        // SAFETY: As above.
+        "co_name" | "co_qualname" => unsafe { crate::abi::pon_const_str("<module>".as_ptr(), "<module>".len()) },
+        // 1-based first line of the (synthetic) code block: only anchor
+        // arithmetic in `traceback.StackSummary` consumes it.
+        // SAFETY: Integer boxing helper.
+        "co_firstlineno" => unsafe { crate::abi::pon_const_int(1) },
         _ => unsafe { crate::abi::pon_raise_attribute_error(object, crate::intern::intern(name)) },
     }
 }

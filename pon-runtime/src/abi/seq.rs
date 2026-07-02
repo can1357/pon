@@ -4,7 +4,6 @@
 //! runtime-wide NULL-sentinel convention: fallible object helpers set the thread
 //! state's current error and return NULL, while status helpers return `-1`.
 
-use core::cmp::Ordering;
 use core::ffi::c_int;
 use core::mem;
 use core::ptr;
@@ -1527,13 +1526,10 @@ fn py_hash(object: *mut PyObject) -> Result<isize, String> {
             let text = unicode
                 .as_str()
                 .ok_or_else(|| "unicode object contains invalid UTF-8".to_owned())?;
-            let mut hash = 0xcbf29ce484222325_u64;
-            for byte in text.as_bytes() {
-                hash ^= u64::from(*byte);
-                hash = hash.wrapping_mul(0x100000001b3);
-            }
-            let value = hash as isize;
-            return Ok(if value == -1 { -2 } else { value });
+            // CPython seed-0 value parity, shared with the dict/set paths
+            // (`crate::pyhash`): keeps tuple hashes containing str lanes
+            // bit-identical to CPython.
+            return Ok(crate::pyhash::str_hash(text) as isize);
         }
         if is_exact_type(object, runtime.none_type) {
             return Ok(0x9e3779b97f4a7c15_u64 as isize);
@@ -1570,36 +1566,6 @@ fn tuple_hash_impl(object: *mut PyObject) -> Result<isize, String> {
     acc = acc.wrapping_add((items.len() as u64) ^ (0x27d4eb2f165667c5_u64 ^ 3527539));
     let hash = acc as isize;
     Ok(if hash == -1 { 1546275796 } else { hash })
-}
-
-fn compare_simple(left: *mut PyObject, right: *mut PyObject) -> Result<Ordering, String> {
-    with_runtime(|runtime| unsafe {
-        if is_exact_type(left, runtime.long_type) && is_exact_type(right, runtime.long_type) {
-            return Ok((*left.cast::<PyLong>()).value.cmp(&(*right.cast::<PyLong>()).value));
-        }
-        if is_exact_type(left, runtime.unicode_type) && is_exact_type(right, runtime.unicode_type) {
-            let l = (*left.cast::<PyUnicode>())
-                .as_str()
-                .ok_or_else(|| "left unicode object contains invalid UTF-8".to_owned())?;
-            let r = (*right.cast::<PyUnicode>())
-                .as_str()
-                .ok_or_else(|| "right unicode object contains invalid UTF-8".to_owned())?;
-            return Ok(l.cmp(r));
-        }
-        Err(format!(
-            "'<' not supported between instances of '{}' and '{}'",
-            object_type_name(left),
-            object_type_name(right)
-        ))
-    })
-    .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
-}
-
-fn validate_sortable(values: &[*mut PyObject]) -> Result<(), String> {
-    for window in values.windows(2) {
-        let _ = compare_simple(window[0], window[1])?;
-    }
-    Ok(())
 }
 
 unsafe extern "C" fn list_len_slot(object: *mut PyObject) -> isize {
@@ -1867,6 +1833,10 @@ pub(crate) fn ensure_list_type_methods_installed(ty: *mut PyType) {
         ("__contains__", list_dunder_contains as *const u8),
         ("__eq__", list_dunder_eq as *const u8),
         ("__ne__", list_dunder_ne as *const u8),
+        ("__lt__", list_dunder_lt as *const u8),
+        ("__le__", list_dunder_le as *const u8),
+        ("__gt__", list_dunder_gt as *const u8),
+        ("__ge__", list_dunder_ge as *const u8),
         ("__repr__", list_dunder_repr as *const u8),
     ];
     for (name, code) in natives {
@@ -2069,8 +2039,9 @@ unsafe extern "C" fn tuple_dunder_contains(argv: *mut *mut PyObject, argc: usize
     })
 }
 
-/// `tuple.__eq__(self, other)` / `tuple.__ne__(self, other)` share the
-/// widened sequence comparator; non-tuple operands yield NotImplemented.
+/// `tuple.__eq__`/`__ne__`/`__lt__`/`__le__`/`__gt__`/`__ge__` share the
+/// widened sequence comparator (lexicographic ordering; elements dispatch
+/// through `rich_compare`); non-tuple operands yield NotImplemented.
 unsafe fn tuple_dunder_compare(argv: *mut *mut PyObject, argc: usize, name: &str, op: u8) -> *mut PyObject {
     catch_object_helper(|| {
         let args = match method_args(argv, argc, name) {
@@ -2098,6 +2069,22 @@ unsafe extern "C" fn tuple_dunder_eq(argv: *mut *mut PyObject, argc: usize) -> *
 
 unsafe extern "C" fn tuple_dunder_ne(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     unsafe { tuple_dunder_compare(argv, argc, "tuple.__ne__", RICH_NE) }
+}
+
+unsafe extern "C" fn tuple_dunder_lt(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { tuple_dunder_compare(argv, argc, "tuple.__lt__", RICH_LT) }
+}
+
+unsafe extern "C" fn tuple_dunder_le(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { tuple_dunder_compare(argv, argc, "tuple.__le__", RICH_LE) }
+}
+
+unsafe extern "C" fn tuple_dunder_gt(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { tuple_dunder_compare(argv, argc, "tuple.__gt__", RICH_GT) }
+}
+
+unsafe extern "C" fn tuple_dunder_ge(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { tuple_dunder_compare(argv, argc, "tuple.__ge__", RICH_GE) }
 }
 
 /// `tuple.__hash__(self)`: the structural tuple hash (namedtuples are dict
@@ -2250,6 +2237,10 @@ pub(crate) fn ensure_tuple_type_methods_installed(ty: *mut PyType) {
         ("__contains__", tuple_dunder_contains as *const u8),
         ("__eq__", tuple_dunder_eq as *const u8),
         ("__ne__", tuple_dunder_ne as *const u8),
+        ("__lt__", tuple_dunder_lt as *const u8),
+        ("__le__", tuple_dunder_le as *const u8),
+        ("__gt__", tuple_dunder_gt as *const u8),
+        ("__ge__", tuple_dunder_ge as *const u8),
         ("__hash__", tuple_dunder_hash as *const u8),
         ("__repr__", tuple_dunder_repr as *const u8),
         ("__add__", tuple_dunder_add as *const u8),
@@ -2442,8 +2433,9 @@ unsafe extern "C" fn list_dunder_contains(argv: *mut *mut PyObject, argc: usize)
     })
 }
 
-/// `list.__eq__(self, other)` / `list.__ne__(self, other)` share the
-/// widened sequence comparator; non-list operands yield NotImplemented.
+/// `list.__eq__`/`__ne__`/`__lt__`/`__le__`/`__gt__`/`__ge__` share the
+/// widened sequence comparator (lexicographic ordering; elements dispatch
+/// through `rich_compare`); non-list operands yield NotImplemented.
 unsafe fn list_dunder_compare(argv: *mut *mut PyObject, argc: usize, name: &str, op: u8) -> *mut PyObject {
     catch_object_helper(|| {
         let args = match method_args(argv, argc, name) {
@@ -2471,6 +2463,22 @@ unsafe extern "C" fn list_dunder_eq(argv: *mut *mut PyObject, argc: usize) -> *m
 
 unsafe extern "C" fn list_dunder_ne(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     unsafe { list_dunder_compare(argv, argc, "list.__ne__", RICH_NE) }
+}
+
+unsafe extern "C" fn list_dunder_lt(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { list_dunder_compare(argv, argc, "list.__lt__", RICH_LT) }
+}
+
+unsafe extern "C" fn list_dunder_le(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { list_dunder_compare(argv, argc, "list.__le__", RICH_LE) }
+}
+
+unsafe extern "C" fn list_dunder_gt(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { list_dunder_compare(argv, argc, "list.__gt__", RICH_GT) }
+}
+
+unsafe extern "C" fn list_dunder_ge(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { list_dunder_compare(argv, argc, "list.__ge__", RICH_GE) }
 }
 
 /// `list.__repr__(self)`: Python list display over the embedded storage.
@@ -2728,25 +2736,13 @@ pub unsafe extern "C" fn pon_list_to_tuple(list: *mut PyObject) -> *mut PyObject
     })
 }
 
-/// Stable-sort a list containing simple comparable tier-0 values.
+/// Stable-sort a list in place (`lst.sort()`): the shared rich-compare
+/// `stable_sort`, so tuple/list/user elements order exactly like the
+/// keyword form and `sorted()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_list_sort(list: *mut PyObject) -> *mut PyObject {
     crate::untag_prelude!(list);
-    catch_object_helper(|| {
-        let Some(pylist) = (unsafe { list_cells(list) }) else {
-            return return_null_with_error(format!("list.sort expected list, got {}", object_type_name(list)));
-        };
-        let _guard = crate::sync::begin_critical_section(list);
-        let values = unsafe { pylist.as_mut_slice() };
-        if let Err(message) = validate_sortable(values) {
-            return raise_seq_type_error(message);
-        }
-        values.sort_by(|left, right| compare_simple(*left, *right).unwrap_or(Ordering::Equal));
-        match none_object() {
-            Ok(none) => none,
-            Err(message) => return_null_with_error(message),
-        }
-    })
+    catch_object_helper(|| unsafe { list_sort_with_options(list, ptr::null_mut(), false) })
 }
 
 /// Returns the length of a sequence as a C `isize` status value.

@@ -59,6 +59,7 @@ pub(crate) fn ensure_traceback_type(type_type: *mut PyType) -> *mut PyType {
 
     let mut ty = PyType::new(type_type.cast_const(), "traceback", mem::size_of::<PyTraceback>());
     ty.tp_getattro = Some(traceback_getattro);
+    ty.tp_setattro = Some(traceback_setattro);
     ty.gc_type_id = TYPE_ID_TRACEBACK.0 as usize;
     let ptr = Box::into_raw(Box::new(ty));
     *slot = Some(ptr as usize);
@@ -83,8 +84,39 @@ unsafe extern "C" fn traceback_getattro(object: *mut PyObject, name: *mut PyObje
             }
         }
         "tb_lineno" => unsafe { crate::abi::pon_const_int(entry.lineno) },
+        // No bytecode exists, so no instruction index: -1 routes
+        // `traceback._get_code_position` to its tb_lineno fallback without
+        // ever touching `co_positions()`.
+        "tb_lasti" => unsafe { crate::abi::pon_const_int(-1) },
         _ => unsafe { crate::abi::pon_raise_attribute_error(object, crate::intern::intern(name)) },
     }
+}
+
+/// Allows `tb_next = None | <traceback>` (unittest's `TestResult.
+/// _remove_unittest_tb_frames` truncates chains this way); other attributes
+/// and value types keep CPython's TypeError contract.
+unsafe extern "C" fn traceback_setattro(object: *mut PyObject, name: *mut PyObject, value: *mut PyObject) -> core::ffi::c_int {
+    let Some(name) = (unsafe { crate::types::type_::unicode_text(crate::tag::untag_arg(name)) }) else {
+        pon_err_set("traceback attribute name must be str");
+        return -1;
+    };
+    if name != "tb_next" {
+        pon_err_set(format!("traceback attribute '{name}' is not writable"));
+        return -1;
+    }
+    let value = crate::tag::untag_arg(value);
+    // SAFETY: The runtime dispatches this slot only for PyTraceback instances.
+    let entry = unsafe { &mut *object.cast::<PyTraceback>() };
+    let stored = if value.is_null() || unsafe { crate::types::dict::type_name(value) } == Some("NoneType") {
+        ptr::null_mut()
+    } else if unsafe { (*value).ob_type } == entry.ob_base.ob_type {
+        value
+    } else {
+        pon_err_set("tb_next must be a traceback or None");
+        return -1;
+    };
+    entry.tb_next = stored;
+    0
 }
 
 /// Traces a boxed traceback entry for the runtime GC.

@@ -544,6 +544,18 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
         let type_name = full.rsplit('.').next().unwrap_or(full);
         return unsafe { abi::pon_const_str(type_name.as_ptr(), type_name.len()) };
     }
+    if is_type && name_id == intern::intern("__module__") {
+        // Heap classes carry the defining module in tp_dict (class machinery
+        // stores it from the namespace); static/native types are builtins,
+        // matching CPython's default for C types.
+        let dict = unsafe { (*object.cast::<PyType>()).tp_dict.cast::<PyClassDict>() };
+        if !dict.is_null() {
+            if let Some(value) = unsafe { (&*dict).get(name_id) } {
+                return value;
+            }
+        }
+        return unsafe { abi::pon_const_str("builtins".as_ptr(), "builtins".len()) };
+    }
     if is_type && name_id == intern::intern("__dict__") {
         return unsafe { type_dict_object(object.cast::<PyType>()) };
     }
