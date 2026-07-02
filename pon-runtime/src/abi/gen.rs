@@ -351,8 +351,7 @@ unsafe fn pon_gen_resume(generator: *mut PyObject, sent: *mut PyObject, thrown: 
     // The cast is sound: frame_stack consumers treat entries as opaque
     // identity pointers and never read past the shared PyObjectHeader.
     thread_state_lock().push_frame(frame.cast::<crate::abi::PyFrame>());
-    let _handled_guard = super::HandledExcGuard::enter();
-    pon_err_clear();
+    let _handled_guard = super::HandledExcGuard::enter_clearing_pending();
 
     // 8. Call the compiled body — the ONLY body call site.  The generator's
     // captured function object is pushed as the current call so closure-cell
@@ -701,7 +700,9 @@ pub unsafe extern "C" fn pon_gen_delegate_step(frame: *mut GenFrame, delegate: *
     })
 }
 
-/// Returns an asynchronous iterator via `am_aiter`.
+/// Returns an asynchronous iterator via `am_aiter`, falling back to the
+/// `__aiter__` method for user classes that define the protocol in Python
+/// (mirroring [`pon_await`]'s `__await__` fallback).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_get_aiter(object: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
     crate::untag_prelude!(object);
@@ -717,11 +718,24 @@ pub unsafe extern "C" fn pon_get_aiter(object: *mut PyObject, feedback: *mut Fee
         }
         // SAFETY: `ty` is the object's live type descriptor.
         let slot = unsafe { (*ty).tp_as_async.as_ref().and_then(|methods| methods.am_aiter) };
-        let Some(slot) = slot else {
-            return raise_type_error("object is not an async iterable");
+        let result = if let Some(slot) = slot {
+            // SAFETY: Slot follows the unary object ABI.
+            unsafe { slot(object) }
+        } else {
+            let method = unsafe { abstract_op::get_attr(object, crate::intern::intern("__aiter__")) };
+            if method.is_null() {
+                // CPython GET_AITER parity: a missing `__aiter__` is a
+                // TypeError naming the protocol, not an AttributeError.
+                pon_err_clear();
+                // SAFETY: `ty` is the object's live type descriptor.
+                let type_name = unsafe { (*ty).name() };
+                return raise_type_error(&format!(
+                    "'async for' requires an object with __aiter__ method, got {type_name}"
+                ));
+            }
+            // SAFETY: Bound method invoked through the call ABI.
+            unsafe { super::pon_call(method, ptr::null_mut(), 0) }
         };
-        // SAFETY: Slot follows the unary object ABI.
-        let result = unsafe { slot(object) };
         if result.is_null() && !pon_err_occurred() {
             return super::return_null_with_error("am_aiter returned NULL without setting an exception");
         }

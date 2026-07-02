@@ -21,15 +21,62 @@ const PLATFORM: &str = if cfg!(target_os = "macos") {
     std::env::consts::OS
 };
 
+// ---------------------------------------------------------------------------
+// Interpreter version pin
+//
+// HOST-ORACLE COUPLING: the differential suites compare pon's stdout against
+// the host `python3.14` byte-for-byte, and `corpus/import_sys_version.py`
+// prints the full `sys.version_info` repr, so these constants must equal the
+// HOST oracle's values — currently CPython 3.14.6 — not the vendored stdlib
+// tag (`v3.14.0`, `pon-conformance/vendor/cpython-3.14/REVISION`), which only
+// pins the `Lib/` sources.  Re-pinning after a host `python3.14` upgrade is
+// this one block; `sys.version`, `sys.hexversion`, and `sys.implementation`
+// derive from it below.
+// ---------------------------------------------------------------------------
+
+const VERSION_INFO_MAJOR: i64 = 3;
+const VERSION_INFO_MINOR: i64 = 14;
+const VERSION_INFO_MICRO: i64 = 6;
+const VERSION_INFO_RELEASELEVEL: &str = "final";
+const VERSION_INFO_SERIAL: i64 = 0;
+
+/// CPython `PY_VERSION_HEX` (Include/patchlevel.h): `0xMMmmppRS` with the
+/// release-level nibble `0xF` for 'final' and the serial in the low nibble.
+const HEXVERSION: i64 = (VERSION_INFO_MAJOR << 24)
+    | (VERSION_INFO_MINOR << 16)
+    | (VERSION_INFO_MICRO << 8)
+    | (0xF << 4)
+    | VERSION_INFO_SERIAL;
+
+/// The CPython structseq repr shared by the `version_info.__repr__` slot and
+/// the `sys.implementation` seed text.
+fn format_version_info(major: i64, minor: i64, micro: i64, releaselevel: &str, serial: i64) -> String {
+    format!(
+        "sys.version_info(major={major}, minor={minor}, micro={micro}, releaselevel='{releaselevel}', serial={serial})"
+    )
+}
+
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
     let attrs = [
-        string_attr("version", "3.14.0 (pon)"),
         string_attr(
-            "version_info",
-            "sys.version_info(major=3, minor=14, micro=0, releaselevel='final', serial=0)",
+            "version",
+            &format!("{VERSION_INFO_MAJOR}.{VERSION_INFO_MINOR}.{VERSION_INFO_MICRO} (pon)"),
         ),
-        string_attr("implementation", "namespace(name='pon', version=sys.version_info(major=3, minor=14, micro=0, releaselevel='final', serial=0))"),
-        int_attr("hexversion", 0x030e00f0),
+        version_info_attr(),
+        string_attr(
+            "implementation",
+            &format!(
+                "namespace(name='pon', version={})",
+                format_version_info(
+                    VERSION_INFO_MAJOR,
+                    VERSION_INFO_MINOR,
+                    VERSION_INFO_MICRO,
+                    VERSION_INFO_RELEASELEVEL,
+                    VERSION_INFO_SERIAL,
+                )
+            ),
+        ),
+        int_attr("hexversion", HEXVERSION),
         int_attr("maxsize", i64::MAX),
         string_attr("platform", PLATFORM),
         string_attr("byteorder", if cfg!(target_endian = "little") { "little" } else { "big" }),
@@ -41,9 +88,15 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         // POSIX default-build ABI flags ('' since 3.8's pymalloc-flag drop);
         // `test.support` reads it at import.
         string_attr("abiflags", ""),
+        // Platform library directory name; "lib" on every CPython POSIX
+        // default build (configure can override to lib64, pon never does).
+        // `sysconfig._init_config_vars` reads it while populating config
+        // vars (`_CONFIG_VARS['platlibdir'] = sys.platlibdir`).
+        string_attr("platlibdir", "lib"),
         flags_attr(),
         hash_info_attr(),
         warnoptions_attr(),
+        meta_path_attr(),
         modules_attr(),
         builtin_module_names_attr(),
         function_attr("_getframe", sys_getframe),
@@ -121,10 +174,32 @@ fn builtin_module_names_attr() -> Result<(u32, *mut PyObject), String> {
 /// `sys.warnoptions`: no `-W` options reach an embedded interpreter, so the
 /// list `warnings._processoptions` consumes at import is always empty.
 fn warnoptions_attr() -> Result<(u32, *mut PyObject), String> {
+    empty_list_attr("warnoptions")
+}
+
+/// `sys.meta_path`: the import-protocol finder chain, born empty (CPython's
+/// pre-`_install` state).  pon's native importer resolves `import`
+/// statements itself and never consults this list (documented divergence);
+/// the list serves the vendored `importlib._bootstrap`, whose `_find_spec`
+/// reads it whenever stdlib code routes an import through
+/// `importlib.import_module` (e.g. `sysconfig._get_sysconfigdata`).  CPython
+/// seeds `[BuiltinImporter, FrozenImporter]` via `_bootstrap._install` at
+/// interpreter init; the vendored `importlib/__init__.py` source-fallback
+/// branch only runs `_setup`, so `crate::import::seed_meta_path_finders`
+/// mirrors the `_install` append right after `importlib._bootstrap` first
+/// loads.  `PathFinder` (CPython's third entry, installed by
+/// `_install_external_importers`) is deliberately absent: it lives in
+/// `_bootstrap_external`, whose file-loading machinery pon does not run.
+fn meta_path_attr() -> Result<(u32, *mut PyObject), String> {
+    empty_list_attr("meta_path")
+}
+
+/// A freshly-allocated empty runtime list bound as `sys.<name>`.
+fn empty_list_attr(name: &str) -> Result<(u32, *mut PyObject), String> {
     let object = super::builtins_mod::alloc_list(Vec::new());
     (!object.is_null())
-        .then_some((intern("warnoptions"), object))
-        .ok_or_else(|| "failed to allocate sys.warnoptions".to_owned())
+        .then_some((intern(name), object))
+        .ok_or_else(|| format!("failed to allocate sys.{name}"))
 }
 
 /// `sys.flags` singleton exposing the interpreter flags the vendored stdlib
@@ -208,6 +283,280 @@ unsafe extern "C" fn hash_info_getattro(object: *mut PyObject, name: *mut PyObje
         // SAFETY: Raise helper with the interned attribute name.
         _ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
     }
+}
+
+// ---------------------------------------------------------------------------
+// sys.version_info
+//
+// CPython's `sys.version_info` is a structseq: a tuple subclass with named
+// read-only fields (`major`, `minor`, `micro`, `releaselevel`, `serial`), so
+// indexing, slicing, iteration, len, hashing, and tuple comparison all work
+// through the tuple protocol while attribute reads resolve the same
+// elements.  The vendored stdlib depends on the tuple shape at import time
+// (`sysconfig` builds `f"{sys.version_info[0]}.{sys.version_info[1]}"`; a
+// plain-string stand-in silently produced `'s.y'` paths).  pon builds the
+// same shape through the tuple-embedding heap-class machinery — mirroring
+// `os.terminal_size` — with `major = property(self[0])`-style getters and
+// the CPython structseq repr.
+// ---------------------------------------------------------------------------
+
+type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
+
+/// The `sys.version_info` singleton, built once and reused across import
+/// re-registration (the class and instance both live for the process).
+fn version_info_attr() -> Result<(u32, *mut PyObject), String> {
+    static VERSION_INFO: std::sync::LazyLock<Result<usize, String>> =
+        std::sync::LazyLock::new(|| build_version_info().map(|object| object as usize));
+    VERSION_INFO
+        .clone()
+        .map(|object| (intern("version_info"), object as *mut PyObject))
+}
+
+/// Allocates the singleton: builds the `sys.version_info` class, then calls
+/// it with the pinned five-tuple exactly like `tuple.__new__` construction.
+fn build_version_info() -> Result<*mut PyObject, String> {
+    let class = build_version_info_class()?;
+    // SAFETY: Runtime allocation helpers return NULL with a diagnostic on failure.
+    let releaselevel = unsafe {
+        pon_const_str(VERSION_INFO_RELEASELEVEL.as_ptr(), VERSION_INFO_RELEASELEVEL.len())
+    };
+    if releaselevel.is_null() {
+        return Err("failed to allocate sys.version_info.releaselevel".to_owned());
+    }
+    let mut items = [
+        // SAFETY: Integer boxing helper follows the NULL-sentinel contract.
+        unsafe { pon_const_int(VERSION_INFO_MAJOR) },
+        unsafe { pon_const_int(VERSION_INFO_MINOR) },
+        unsafe { pon_const_int(VERSION_INFO_MICRO) },
+        releaselevel,
+        unsafe { pon_const_int(VERSION_INFO_SERIAL) },
+    ];
+    if items.iter().any(|item| item.is_null()) {
+        return Err("failed to allocate sys.version_info elements".to_owned());
+    }
+    // SAFETY: The slots above are live objects per the call ABI.
+    let values = unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) };
+    if values.is_null() {
+        return Err("failed to allocate the sys.version_info value tuple".to_owned());
+    }
+    let mut argv = [values];
+    // SAFETY: The class is a live tuple-derived heap class; calling it routes
+    // through `tuple.__new__` construction over the iterable argument.
+    let instance = unsafe { crate::abi::pon_call(class, argv.as_mut_ptr(), argv.len()) };
+    if instance.is_null() {
+        let detail = crate::thread_state::pon_err_message().unwrap_or_else(|| "unknown error".to_owned());
+        crate::thread_state::pon_err_clear();
+        return Err(format!("failed to construct sys.version_info: {detail}"));
+    }
+    Ok(instance)
+}
+
+/// `class version_info(tuple)` with the CPython structseq surface: field
+/// properties reading `self[i]` and the `sys.version_info(...)` repr.
+fn build_version_info_class() -> Result<*mut PyObject, String> {
+    // SAFETY: `pon_load_global` returns NULL with a raised NameError on miss.
+    let tuple_class = unsafe { crate::abi::pon_load_global(intern("tuple"), std::ptr::null_mut()) };
+    if tuple_class.is_null() {
+        crate::thread_state::pon_err_clear();
+        return Err("builtin 'tuple' is not registered for sys.version_info".to_owned());
+    }
+    // SAFETY: Same contract for the builtin `property` constructor.
+    let property_class = unsafe { crate::abi::pon_load_global(intern("property"), std::ptr::null_mut()) };
+    if property_class.is_null() {
+        crate::thread_state::pon_err_clear();
+        return Err("builtin 'property' is not registered for sys.version_info".to_owned());
+    }
+    let namespace = crate::types::type_::new_namespace();
+    if namespace.is_null() {
+        return Err("failed to allocate the sys.version_info namespace".to_owned());
+    }
+    class_str_attr(namespace, "__module__", "sys")?;
+    class_str_attr(namespace, "__doc__", "sys.version_info\n\nVersion information as a named tuple.")?;
+    class_function_attr(namespace, "__repr__", version_info_repr)?;
+    for (name, entry) in [
+        ("major", version_info_major as BuiltinFn),
+        ("minor", version_info_minor as BuiltinFn),
+        ("micro", version_info_micro as BuiltinFn),
+        ("releaselevel", version_info_releaselevel as BuiltinFn),
+        ("serial", version_info_serial as BuiltinFn),
+    ] {
+        // SAFETY: Live builtin entry point with the runtime calling convention.
+        let fget = unsafe { pon_make_function(entry as *const u8, 1, intern(name)) };
+        if fget.is_null() {
+            return Err(format!("failed to allocate sys.version_info.{name} getter"));
+        }
+        let mut argv = [fget];
+        // SAFETY: The builtin `property` class is callable with one fget slot.
+        let descriptor = unsafe { crate::abi::pon_call(property_class, argv.as_mut_ptr(), argv.len()) };
+        if descriptor.is_null() {
+            let detail = crate::thread_state::pon_err_message().unwrap_or_else(|| "unknown error".to_owned());
+            crate::thread_state::pon_err_clear();
+            return Err(format!("failed to build sys.version_info.{name} property: {detail}"));
+        }
+        // SAFETY: `new_namespace` returned a live namespace box.
+        unsafe { (&mut *namespace).set(intern(name), descriptor) };
+    }
+    // SAFETY: The base is the live builtin `tuple` class object.
+    let class = unsafe {
+        crate::types::type_::build_class_from_namespace("version_info", &[tuple_class], namespace, &[])
+    };
+    if class.is_null() {
+        let detail = crate::thread_state::pon_err_message().unwrap_or_else(|| "unknown error".to_owned());
+        crate::thread_state::pon_err_clear();
+        return Err(format!("failed to create sys.version_info: {detail}"));
+    }
+    // SAFETY: Freshly built class object owned by this module build; mirror
+    // `pon_build_class`'s ob_type fix-up for a metaclass-less construction.
+    unsafe {
+        if (*class).ob_type.is_null() {
+            (*class).ob_type = crate::abi::runtime_type_type().cast_const();
+        }
+    }
+    Ok(class)
+}
+
+/// Seeds a str-valued class attribute into a class namespace under build.
+fn class_str_attr(
+    namespace: *mut crate::types::type_::PyClassDict,
+    name: &str,
+    value: &str,
+) -> Result<(), String> {
+    // SAFETY: String allocation helper; NULL is checked below.
+    let object = unsafe { pon_const_str(value.as_ptr(), value.len()) };
+    if object.is_null() {
+        return Err(format!("failed to allocate sys.version_info attribute '{name}'"));
+    }
+    // SAFETY: The caller passes a live namespace box.
+    unsafe { (&mut *namespace).set(intern(name), object) };
+    Ok(())
+}
+
+/// Seeds a native-function class attribute into a class namespace under build.
+fn class_function_attr(
+    namespace: *mut crate::types::type_::PyClassDict,
+    name: &str,
+    entry: BuiltinFn,
+) -> Result<(), String> {
+    // SAFETY: Live builtin entry point with the runtime calling convention.
+    let function =
+        unsafe { pon_make_function(entry as *const u8, crate::builtins::variadic_arity(), intern(name)) };
+    if function.is_null() {
+        return Err(format!("failed to allocate sys.version_info method '{name}'"));
+    }
+    // SAFETY: The caller passes a live namespace box.
+    unsafe { (&mut *namespace).set(intern(name), function) };
+    Ok(())
+}
+
+/// Borrows the argv slots as a slice; NULL argv reads as empty.
+unsafe fn call_args<'a>(argv: *mut *mut PyObject, argc: usize) -> &'a [*mut PyObject] {
+    if argv.is_null() || argc == 0 {
+        &[]
+    } else {
+        // SAFETY: The caller passed `argc` live argument slots.
+        unsafe { std::slice::from_raw_parts(argv, argc) }
+    }
+}
+
+/// Shared property-getter body: `self[index]` through subscript dispatch,
+/// which resolves the tuple-embedded heap-class layout.
+unsafe fn version_info_field(argv: *mut *mut PyObject, argc: usize, index: i64, what: &str) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return return_null_with_error(format!("{what} expected only a receiver"));
+    }
+    // SAFETY: Integer boxing helper follows the NULL-sentinel error contract.
+    let key = unsafe { pon_const_int(index) };
+    if key.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: Subscript dispatch resolves the tuple-embedded layout.
+    unsafe { crate::abstract_op::subscript_get(args[0], key) }
+}
+
+/// `version_info.major` property getter: `self[0]`.
+unsafe extern "C" fn version_info_major(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded argument slots per the runtime calling convention.
+    unsafe { version_info_field(argv, argc, 0, "version_info.major") }
+}
+
+/// `version_info.minor` property getter: `self[1]`.
+unsafe extern "C" fn version_info_minor(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded argument slots per the runtime calling convention.
+    unsafe { version_info_field(argv, argc, 1, "version_info.minor") }
+}
+
+/// `version_info.micro` property getter: `self[2]`.
+unsafe extern "C" fn version_info_micro(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded argument slots per the runtime calling convention.
+    unsafe { version_info_field(argv, argc, 2, "version_info.micro") }
+}
+
+/// `version_info.releaselevel` property getter: `self[3]`.
+unsafe extern "C" fn version_info_releaselevel(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded argument slots per the runtime calling convention.
+    unsafe { version_info_field(argv, argc, 3, "version_info.releaselevel") }
+}
+
+/// `version_info.serial` property getter: `self[4]`.
+unsafe extern "C" fn version_info_serial(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded argument slots per the runtime calling convention.
+    unsafe { version_info_field(argv, argc, 4, "version_info.serial") }
+}
+
+/// Reads element `index` of a version_info receiver as an i64.
+unsafe fn version_info_int(argv: *mut *mut PyObject, argc: usize, index: i64, what: &str) -> Result<i64, *mut PyObject> {
+    // SAFETY: Forwarded argument slots per the runtime calling convention.
+    let element = unsafe { version_info_field(argv, argc, index, what) };
+    if element.is_null() {
+        return Err(core::ptr::null_mut());
+    }
+    if crate::tag::is_small_int(element) {
+        return Ok(crate::tag::untag_small_int(element));
+    }
+    // SAFETY: Non-immediate pointers are boxed objects; conversion type-checks.
+    match unsafe { crate::types::int::to_bigint_including_bool(element) } {
+        Some(value) => value.to_i64().ok_or_else(|| return_null_with_error(format!("{what} does not fit in an i64"))),
+        None => Err(return_null_with_error(format!("{what} must be an integer"))),
+    }
+}
+
+/// CPython's structseq repr:
+/// `sys.version_info(major=3, minor=14, micro=6, releaselevel='final', serial=0)`.
+unsafe extern "C" fn version_info_repr(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded argument slots per the runtime calling convention.
+    let major = match unsafe { version_info_int(argv, argc, 0, "version_info.major") } {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    // SAFETY: Same forwarding contract for the remaining elements.
+    let minor = match unsafe { version_info_int(argv, argc, 1, "version_info.minor") } {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    // SAFETY: Same forwarding contract for the remaining elements.
+    let micro = match unsafe { version_info_int(argv, argc, 2, "version_info.micro") } {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    // SAFETY: Same forwarding contract for the remaining elements.
+    let level_object = unsafe { version_info_field(argv, argc, 3, "version_info.releaselevel") };
+    if level_object.is_null() {
+        return core::ptr::null_mut();
+    }
+    let level_object = crate::tag::untag_arg(level_object);
+    let Some(releaselevel) = (unsafe { crate::types::type_::unicode_text(level_object) }) else {
+        return return_null_with_error("version_info.releaselevel must be a str");
+    };
+    // SAFETY: Same forwarding contract for the remaining elements.
+    let serial = match unsafe { version_info_int(argv, argc, 4, "version_info.serial") } {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let text = format_version_info(major, minor, micro, releaselevel, serial);
+    // SAFETY: String allocation helper follows the NULL-sentinel contract.
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
 }
 
 fn int_attr(name: &str, value: i64) -> Result<(u32, *mut PyObject), String> {

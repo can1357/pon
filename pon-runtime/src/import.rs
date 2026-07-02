@@ -360,7 +360,68 @@ fn import_module_by_name(name: &str) -> Result<*mut PyObject, String> {
     if name == "os" {
         ensure_os_path_alias();
     }
+    if name == "importlib._bootstrap" {
+        seed_meta_path_finders();
+    }
     Ok(module)
+}
+
+/// Mirrors `importlib._bootstrap._install`: seeds `sys.meta_path` with
+/// `BuiltinImporter` and `FrozenImporter` right after the bootstrap module
+/// first loads.
+///
+/// CPython's interpreter init execs the frozen bootstrap and immediately
+/// runs `_install(sys, _imp)`, which appends the two finders.  Under pon the
+/// vendored `importlib/__init__.py` takes its source-fallback branch
+/// (`import _frozen_importlib` fails), which calls only `_setup` — no code
+/// path ever runs `_install` — so `_bootstrap._find_spec` would find the
+/// list empty and take `_py_warnings.warn`, and every
+/// `importlib.import_module` of a name pon cannot serve would derail there
+/// instead of raising the CPython `ModuleNotFoundError`.  Appending here,
+/// the moment the class objects exist as module attrs, lands the same end
+/// state at the equivalent init moment.  `_setup` itself never reads
+/// `meta_path`, so running before it (pon) vs after it (CPython) is not
+/// observable.
+///
+/// `PathFinder` (CPython's third finder, appended by the separate
+/// `_install_external_importers` init step from `_bootstrap_external`) is
+/// deliberately not seeded: it would route `importlib.import_module` through
+/// vendored file-system loaders pon does not run.  Documented divergence:
+/// `sys.meta_path` is `[BuiltinImporter, FrozenImporter]` and the classes'
+/// `__module__` is `'importlib._bootstrap'`, not `'_frozen_importlib'`.
+///
+/// The append only fires while the list is still empty: CPython never
+/// re-runs `_install` either, so a re-import after a user cleared
+/// `sys.modules['importlib._bootstrap']` must not grow or reorder a list
+/// the user may have replaced.
+///
+/// Failure policy: mirrors `ensure_os_path_alias` — a missing `sys` module,
+/// `meta_path` binding, bootstrap class, or non-list value leaves the list
+/// untouched and clears any pending diagnostic rather than failing the
+/// `importlib` import; the loud surface is then `_find_spec`'s own
+/// empty-meta_path warning.
+fn seed_meta_path_finders() {
+    let Some(meta_path) = module_attr(intern("sys"), intern("meta_path")) else {
+        return;
+    };
+    if crate::abi::seq::list_len(meta_path) != Some(0) {
+        return;
+    }
+    let bootstrap = intern("importlib._bootstrap");
+    let Some(builtin_importer) = module_attr(bootstrap, intern("BuiltinImporter")) else {
+        return;
+    };
+    let Some(frozen_importer) = module_attr(bootstrap, intern("FrozenImporter")) else {
+        return;
+    };
+    for finder in [builtin_importer, frozen_importer] {
+        if crate::abi::seq::list_append_raw(meta_path, finder).is_err() {
+            break;
+        }
+    }
+    if pon_err_occurred() {
+        pon_err_clear();
+    }
 }
 
 /// CPython's `os.py` executes `import posixpath as path` and publishes
