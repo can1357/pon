@@ -175,6 +175,12 @@ pub(super) fn lower_with_stmt(
         Some(Terminator::Jump(target)) if is_tramp(target) => {
             scope.set_term(Terminator::Jump(target))?;
         }
+        // A redirected syntactic raise: the handler block owns the pop and
+        // the exception-path `__exit__` walk; the departing edge must leave
+        // the record pushed so it joins the dynamic NULL edges consistently.
+        Some(Terminator::Jump(target)) if target == handler_block => {
+            scope.set_term(Terminator::Jump(target))?;
+        }
         term => {
             scope.emit(InstKind::PopExcInfo)?;
             lower_normal_exits(driver, scope, &managers, stmt.is_async)?;
