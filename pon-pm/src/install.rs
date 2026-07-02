@@ -133,18 +133,6 @@ fn install_non_editable_dir(env: &EnvLayout, resolved_record: &ResolvedRecord, p
     }
 }
 
-#[cfg(test)]
-fn legacy_wheel_path(filename: &str) -> PathBuf {
-    let path = Path::new(filename);
-    if path.is_file() {
-        return path.to_path_buf();
-    }
-    let basename = path.file_name().and_then(|name| name.to_str()).unwrap_or(filename);
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures")
-        .join("wheels")
-        .join(basename)
-}
 
 pub fn read_installed_packages(env: &EnvLayout) -> Result<Vec<InstalledPackageRecord>> {
     read_installed_packages_from_path(&env.registry_path)
@@ -558,7 +546,10 @@ mod tests {
     fn remove_uses_record_file_set_and_prunes_empty_parents() {
         let layout = EnvLayout::new(temp_project("remove"));
         let record = ResolvedRecord::wheel("idna", "3.10", "idna-3.10-py3-none-any.whl");
-        let wheel_path = legacy_wheel_path("idna-3.10-py3-none-any.whl");
+        let wheel_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("wheels")
+            .join("idna-3.10-py3-none-any.whl");
         install_wheel(&layout, &record, &wheel_path, None).expect("install");
 
         let removed = remove_installed_package(&layout, "idna").expect("remove");
