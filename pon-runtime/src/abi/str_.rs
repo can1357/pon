@@ -2945,7 +2945,7 @@ mod tests {
             assert!(encoded.is_null());
             assert_eq!(
                 pon_err_message().as_deref(),
-                Some("ascii codec can't encode non-ascii character")
+                Some("UnicodeEncodeError: 'ascii' codec can't encode character '\\xe4' in position 0: ordinal not in range(128)")
             );
             pon_err_clear();
         }
