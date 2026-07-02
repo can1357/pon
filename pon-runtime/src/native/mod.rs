@@ -33,11 +33,13 @@ mod itertools;
 mod math;
 mod opcode_;
 mod os;
+pub(crate) mod pickle;
 mod posix;
 mod random_;
 mod select;
 mod sha2;
 pub(crate) mod signal;
+mod socket_;
 mod sre;
 mod string_mod;
 mod struct_;
@@ -61,9 +63,11 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
     ("_imp", imp::make_module),
     ("_io", io::make_module),
     ("_opcode", opcode_::make_module),
+    ("_pickle", pickle::make_module),
     ("_random", random_::make_module),
     ("_sha2", sha2::make_module),
     ("_signal", signal::make_module),
+    ("_socket", socket_::make_module),
     ("_sre", sre::make_module),
     ("_string", string_mod::make_module),
     ("_struct", struct_::make_module),

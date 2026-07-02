@@ -603,8 +603,6 @@ fn is_unsupported_c_accelerated(name: &str) -> bool {
     matches!(
         name,
         "_json"
-            | "_pickle"
-            | "_socket"
             | "_ssl"
             | "_sqlite3"
             | "_hashlib"
