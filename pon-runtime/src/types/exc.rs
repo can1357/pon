@@ -5,6 +5,7 @@
 //! layout, immortal type descriptors, and hierarchy queries shared by ABI helpers.
 
 use core::mem::{offset_of, size_of};
+use core::ffi::c_int;
 use core::ptr;
 use std::sync::LazyLock;
 
@@ -25,6 +26,14 @@ pub struct PyBaseException {
     pub context: *mut PyObject,
     /// Traceback object slot reserved for the traceback workstream, or NULL.
     pub traceback: *mut PyObject,
+    /// Full positional-argument tuple when the constructor received two or
+    /// more arguments; NULL when `args` derives from `message` (zero or one
+    /// argument), keeping single-value native raise paths allocation-free.
+    pub args: *mut PyObject,
+    /// Lazily created per-instance attribute dictionary, or NULL.
+    pub dict: *mut crate::types::type_::PyClassDict,
+    /// `__suppress_context__`: set by an explicit `raise ... from ...` (PEP 3134).
+    pub suppress_context: bool,
 }
 
 impl PyBaseException {
@@ -43,6 +52,9 @@ impl PyBaseException {
             cause,
             context,
             traceback,
+            args: ptr::null_mut(),
+            dict: ptr::null_mut(),
+            suppress_context: false,
         }
     }
 }
@@ -522,6 +534,7 @@ fn new_exception_type(type_type: *mut PyType, name: &'static str, base: *mut PyT
     let mut ty = PyType::new(type_type.cast_const(), name, size_of::<PyBaseException>());
     ty.tp_base = base;
     ty.tp_getattro = Some(exception_getattro);
+    ty.tp_setattro = Some(exception_setattro);
     Box::into_raw(Box::new(ty))
 }
 
@@ -529,6 +542,7 @@ fn new_exception_group_type(type_type: *mut PyType, name: &'static str, base: *m
     let mut ty = PyType::new(type_type.cast_const(), name, size_of::<PyExceptionGroup>());
     ty.tp_base = base;
     ty.tp_getattro = Some(exception_getattro);
+    ty.tp_setattro = Some(exception_setattro);
     Box::into_raw(Box::new(ty))
 }
 
@@ -586,72 +600,273 @@ pub unsafe fn as_exception_group<'a>(object: *mut PyObject) -> Option<&'a PyExce
     }
 }
 
-unsafe extern "C" fn exception_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+/// `tp_getattro` for boxed exception instances — builtin classes AND
+/// Python-defined subclasses (both share the `PyBaseException` layout).
+///
+/// CPython resolution order with the builtin exception surface acting as
+/// `BaseException`'s own C-level descriptors at the MRO tail: class data
+/// descriptors win, then the fixed field surface (unless shadowed by ANY
+/// class-namespace hit above `BaseException`), then the instance dict, then
+/// non-data class attributes, then the synthesized `BaseException` methods.
+pub(crate) unsafe extern "C" fn exception_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
     let Some(name) = (unsafe { crate::types::type_::unicode_text(name) }) else {
         crate::thread_state::pon_err_set("exception attribute name must be str");
         return ptr::null_mut();
     };
+    let name_id = crate::intern::intern(name);
+    let obj_ty = unsafe { (*object).ob_type.cast_mut() };
+    let class_descr = unsafe { crate::descr::lookup_in_type(obj_ty, name_id) };
+    if unsafe { crate::descr::is_data_descriptor(class_descr) } {
+        return unsafe { crate::descr::descriptor_get(class_descr, object, obj_ty) };
+    }
+    if class_descr.is_null() {
+        if let Some(value) = unsafe { exception_fixed_attr(object, name) } {
+            return value;
+        }
+    }
+    let exception = unsafe { &*object.cast::<PyBaseException>() };
+    if !exception.dict.is_null() {
+        if let Some(value) = unsafe { (&*exception.dict).get(name_id) } {
+            return value;
+        }
+    }
+    if !class_descr.is_null() {
+        return unsafe { crate::descr::descriptor_get(class_descr, object, obj_ty) };
+    }
+    if let Some(method) = unsafe { exception_synth_method(object, name) } {
+        return method;
+    }
+    unsafe { crate::abi::pon_raise_attribute_error(object, name_id) }
+}
+
+/// Serves the fixed `BaseException` instance surface (CPython's C-level
+/// getsets/members): `Some` when `name` belongs to the surface, `None` to let
+/// the caller continue the generic resolution order.
+unsafe fn exception_fixed_attr(object: *mut PyObject, name: &str) -> Option<*mut PyObject> {
     let exception = unsafe { &*object.cast::<PyBaseException>() };
     let is_group = unsafe { is_exception_group_instance(object) };
     match name {
-        "args" => {
-            if is_group {
-                let group = unsafe { &*object.cast::<PyExceptionGroup>() };
-                crate::native::builtins_mod::alloc_tuple(vec![exception.message, group.exceptions])
-            } else if exception.message.is_null() {
-                crate::native::builtins_mod::alloc_tuple(Vec::new())
-            } else {
-                crate::native::builtins_mod::alloc_tuple(vec![exception.message])
-            }
-        }
-        "message" => {
-            if exception.message.is_null() {
+        "args" => Some(if !exception.args.is_null() {
+            exception.args
+        } else if is_group {
+            let group = unsafe { &*object.cast::<PyExceptionGroup>() };
+            crate::native::builtins_mod::alloc_tuple(vec![exception.message, group.exceptions])
+        } else if exception.message.is_null() {
+            crate::native::builtins_mod::alloc_tuple(Vec::new())
+        } else {
+            crate::native::builtins_mod::alloc_tuple(vec![exception.message])
+        }),
+        "message" => Some(if exception.message.is_null() {
+            unsafe { crate::abi::pon_none() }
+        } else {
+            exception.message
+        }),
+        "exceptions" if is_group => Some(unsafe { (&*object.cast::<PyExceptionGroup>()).exceptions }),
+        "split" if is_group => Some(new_exception_group_method(object, EXC_GROUP_METHOD_SPLIT)),
+        "subgroup" if is_group => Some(new_exception_group_method(object, EXC_GROUP_METHOD_SUBGROUP)),
+        "derive" if is_group => Some(new_exception_group_method(object, EXC_GROUP_METHOD_DERIVE)),
+        "value" if unsafe { exception_type_named((*object).ob_type, "StopIteration") } => {
+            Some(if exception.message.is_null() {
                 unsafe { crate::abi::pon_none() }
             } else {
                 exception.message
+            })
+        }
+        "__cause__" => Some(if exception.cause.is_null() {
+            unsafe { crate::abi::pon_none() }
+        } else {
+            exception.cause
+        }),
+        "__context__" => Some(if exception.context.is_null() {
+            unsafe { crate::abi::pon_none() }
+        } else {
+            exception.context
+        }),
+        "__suppress_context__" => Some(crate::types::bool_::from_bool(exception.suppress_context)),
+        "__traceback__" => Some(if exception.traceback.is_null() {
+            unsafe { crate::abi::pon_none() }
+        } else {
+            exception.traceback
+        }),
+        "__class__" => Some(unsafe { (*object).ob_type.cast_mut() }.cast::<PyObject>()),
+        "__dict__" => {
+            let exception = unsafe { &mut *object.cast::<PyBaseException>() };
+            let dict = unsafe { ensure_exception_dict(exception) };
+            Some(unsafe { crate::descr::class_dict_to_dict(dict) })
+        }
+        _ => None,
+    }
+}
+
+/// Returns the instance dict, creating it on first use.
+unsafe fn ensure_exception_dict(exception: &mut PyBaseException) -> *mut crate::types::type_::PyClassDict {
+    if exception.dict.is_null() {
+        exception.dict = crate::types::type_::new_namespace();
+    }
+    exception.dict
+}
+
+/// Synthesizes the `BaseException` method surface (`add_note`,
+/// `with_traceback`) as bound natives; `None` when `name` is not one of them.
+unsafe fn exception_synth_method(object: *mut PyObject, name: &str) -> Option<*mut PyObject> {
+    type Entry = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
+    let entry: Entry = match name {
+        "add_note" => exception_add_note,
+        "with_traceback" => exception_with_traceback,
+        _ => return None,
+    };
+    let function = unsafe { crate::abi::pon_make_function(entry as *const u8, 2, crate::intern::intern(name)) };
+    if function.is_null() {
+        return Some(ptr::null_mut());
+    }
+    match crate::types::method::new_bound_method(function, object) {
+        Ok(method) => Some(method.cast::<PyObject>()),
+        Err(message) => {
+            crate::thread_state::pon_err_set(message);
+            Some(ptr::null_mut())
+        }
+    }
+}
+
+/// `BaseException.add_note(note)` (PEP 678): append to `__notes__`, creating
+/// the list in the instance dict on first use.
+unsafe extern "C" fn exception_add_note(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 2 {
+        crate::thread_state::pon_err_set("add_note() takes exactly one argument");
+        return ptr::null_mut();
+    }
+    let object = unsafe { *argv };
+    let note = crate::tag::untag_arg(unsafe { *argv.add(1) });
+    if unsafe { crate::types::type_::unicode_text(note) }.is_none() {
+        let type_name = unsafe {
+            let ty = if note.is_null() { ptr::null() } else { (*note).ob_type };
+            if ty.is_null() { "object" } else { (*ty).name() }
+        };
+        let message = format!("note must be a str, not '{type_name}'");
+        return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    let exception = unsafe { &mut *object.cast::<PyBaseException>() };
+    let dict = unsafe { ensure_exception_dict(exception) };
+    let notes_id = crate::intern::intern("__notes__");
+    match unsafe { (&*dict).get(notes_id) } {
+        Some(notes) => {
+            if unsafe { crate::abi::seq::pon_list_append(notes, note) }.is_null() {
+                return ptr::null_mut();
             }
         }
-        "exceptions" if is_group => unsafe { (&*object.cast::<PyExceptionGroup>()).exceptions },
-        "split" if is_group => new_exception_group_method(object, EXC_GROUP_METHOD_SPLIT),
-        "subgroup" if is_group => new_exception_group_method(object, EXC_GROUP_METHOD_SUBGROUP),
-        "derive" if is_group => new_exception_group_method(object, EXC_GROUP_METHOD_DERIVE),
-        "value" => {
-            let is_stop_iteration = unsafe {
-                !exception.ob_base.ob_type.is_null()
-                    && (*exception.ob_base.ob_type).name() == "StopIteration"
-            };
-            if is_stop_iteration {
-                if exception.message.is_null() {
-                    unsafe { crate::abi::pon_none() }
-                } else {
-                    exception.message
-                }
-            } else {
-                unsafe { crate::abi::pon_raise_attribute_error(object, crate::intern::intern(name)) }
+        None => {
+            let notes = crate::native::builtins_mod::alloc_list(vec![note]);
+            if notes.is_null() {
+                return ptr::null_mut();
             }
+            unsafe { (&mut *dict).set(notes_id, notes) };
+        }
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+/// `BaseException.with_traceback(tb)`: install `tb` (or clear on None) and
+/// return `self`.
+unsafe extern "C" fn exception_with_traceback(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 2 {
+        crate::thread_state::pon_err_set("with_traceback() takes exactly one argument");
+        return ptr::null_mut();
+    }
+    let object = unsafe { *argv };
+    let tb = crate::tag::untag_arg(unsafe { *argv.add(1) });
+    let exception = unsafe { &mut *object.cast::<PyBaseException>() };
+    if tb.is_null() || tb == unsafe { crate::abi::pon_none() } {
+        exception.traceback = ptr::null_mut();
+        return object;
+    }
+    let is_traceback = unsafe { !(*tb).ob_type.is_null() && (*(*tb).ob_type).name() == "traceback" };
+    if !is_traceback {
+        const MESSAGE: &str = "__traceback__ must be a traceback or None";
+        return unsafe { crate::abi::exc::pon_raise_type_error(MESSAGE.as_ptr(), MESSAGE.len()) };
+    }
+    exception.traceback = tb;
+    object
+}
+
+/// `tp_setattro` for exception instances: fixed-surface names write the
+/// C-level fields (mirroring CPython's `BaseException` getset setters); other
+/// names live in the lazily-created instance dict.
+pub(crate) unsafe extern "C" fn exception_setattro(object: *mut PyObject, name: *mut PyObject, value: *mut PyObject) -> c_int {
+    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        crate::thread_state::pon_err_set("exception attribute name must be str");
+        return -1;
+    };
+    let name_id = crate::intern::intern(name_text);
+    let obj_ty = unsafe { (*object).ob_type.cast_mut() };
+    let descr = unsafe { crate::descr::lookup_in_type(obj_ty, name_id) };
+    if unsafe { crate::descr::is_data_descriptor(descr) } {
+        return unsafe { crate::descr::descriptor_set(descr, object, value) };
+    }
+    let none = unsafe { crate::abi::pon_none() };
+    let exception = unsafe { &mut *object.cast::<PyBaseException>() };
+    match name_text {
+        "args" => {
+            if value.is_null() {
+                crate::thread_state::pon_err_set("args may not be deleted");
+                return -1;
+            }
+            // CPython `BaseException.args` setter: any sequence, stored as a tuple.
+            let mut argv = [value];
+            let tuple = unsafe { crate::native::builtins_mod::builtin_tuple(argv.as_mut_ptr(), 1) };
+            if tuple.is_null() {
+                return -1;
+            }
+            exception.args = tuple;
+            // Keep the legacy single-value slot coherent for diagnostics and
+            // value-carrying readers (StopIteration.value, KeyError repr).
+            let items = unsafe { (*tuple.cast::<crate::types::tuple::PyTuple>()).as_slice() };
+            exception.message = items.first().copied().unwrap_or(ptr::null_mut());
+            0
         }
         "__cause__" => {
-            if exception.cause.is_null() {
-                unsafe { crate::abi::pon_none() }
-            } else {
-                exception.cause
+            exception.cause = if value == none { ptr::null_mut() } else { value };
+            if !value.is_null() {
+                // CPython BaseException_set_cause: assignment implies
+                // `__suppress_context__ = True`.
+                exception.suppress_context = true;
             }
+            0
         }
         "__context__" => {
-            if exception.context.is_null() {
-                unsafe { crate::abi::pon_none() }
-            } else {
-                exception.context
-            }
+            exception.context = if value == none { ptr::null_mut() } else { value };
+            0
+        }
+        "__suppress_context__" => {
+            exception.suppress_context = !value.is_null() && unsafe { crate::abi::pon_is_true(value) } == 1;
+            0
         }
         "__traceback__" => {
-            if exception.traceback.is_null() {
-                unsafe { crate::abi::pon_none() }
+            if value.is_null() || value == none {
+                exception.traceback = ptr::null_mut();
+                return 0;
+            }
+            let is_traceback = unsafe { !(*value).ob_type.is_null() && (*(*value).ob_type).name() == "traceback" };
+            if !is_traceback {
+                crate::thread_state::pon_err_set("__traceback__ must be a traceback or None");
+                return -1;
+            }
+            exception.traceback = value;
+            0
+        }
+        _ => {
+            let dict = unsafe { ensure_exception_dict(exception) };
+            if value.is_null() {
+                if unsafe { (&mut *dict).del(name_id) } {
+                    0
+                } else {
+                    unsafe { crate::abi::pon_raise_attribute_error(object, name_id) };
+                    -1
+                }
             } else {
-                exception.traceback
+                unsafe { (&mut *dict).set(name_id, value) };
+                0
             }
         }
-        _ => unsafe { crate::abi::pon_raise_attribute_error(object, crate::intern::intern(name)) },
     }
 }
 
@@ -761,9 +976,16 @@ pub unsafe extern "C" fn trace_base_exception(object: *mut u8, visitor: &mut dyn
 
     // SAFETY: The GC registered this callback only for `PyBaseException` allocations.
     let exception = unsafe { &*object.cast::<PyBaseException>() };
-    for child in [exception.message, exception.cause, exception.context, exception.traceback] {
+    for child in [exception.message, exception.cause, exception.context, exception.traceback, exception.args] {
         if !child.is_null() {
             visitor(child.cast::<u8>());
+        }
+    }
+    if !exception.dict.is_null() {
+        for (_, value) in unsafe { (&*exception.dict).iter() } {
+            if !value.is_null() {
+                visitor(value.cast::<u8>());
+            }
         }
     }
 }
@@ -781,6 +1003,24 @@ pub unsafe extern "C" fn trace_exception_group(object: *mut u8, visitor: &mut dy
     let group = unsafe { &*object.cast::<PyExceptionGroup>() };
     if !group.exceptions.is_null() {
         visitor(group.exceptions.cast::<u8>());
+    }
+}
+
+/// Releases the Rust-owned instance dictionary of a boxed exception (shared
+/// by plain exceptions and groups, which embed the same prefix).
+///
+/// # Safety
+///
+/// `object` must be NULL or point to a dead `PyBaseException`(-prefixed)
+/// allocation owned by the GC.
+pub unsafe extern "C" fn finalize_base_exception(object: *mut u8) {
+    if object.is_null() {
+        return;
+    }
+    let exception = unsafe { &mut *object.cast::<PyBaseException>() };
+    if !exception.dict.is_null() {
+        unsafe { drop(Box::from_raw(exception.dict)) };
+        exception.dict = ptr::null_mut();
     }
 }
 

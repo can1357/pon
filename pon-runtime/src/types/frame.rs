@@ -5,6 +5,7 @@
 //! suspend-crossing temporary in `locals`.
 
 use core::{mem, ptr};
+use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 use pon_gc::{GcTypeInfo, TypeId};
@@ -21,6 +22,15 @@ pub const FRAME_STATE_EXHAUSTED: u32 = u32::MAX;
 pub const TYPE_ID_FRAME: TypeId = TypeId(32);
 
 static FRAME_TYPE: LazyLock<Mutex<Option<usize>>> = LazyLock::new(|| Mutex::new(None));
+
+/// Frame allocation address → interned defining-module name backing
+/// `f_globals`, mirroring `types::function::FUNCTION_MODULES`.
+/// `sys._getframe` resolves the module from the live compiled call stack at
+/// call time (the stack at a later attribute read no longer describes the
+/// captured depth) and records it here; `finalize_frame` drops the record
+/// with the allocation.  Values are interned name ids, so the table roots no
+/// GC objects.
+static FRAME_MODULES: LazyLock<Mutex<HashMap<usize, u32>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Returns the process-lifetime frame type object, creating it if needed.
 pub fn ensure_frame_type(type_type: *mut PyType) -> *mut PyType {
@@ -127,6 +137,9 @@ pub unsafe extern "C" fn finalize_frame(object: *mut u8) {
         unsafe {
             drop(Box::<[*mut PyObject]>::from_raw(slice));
         }
+    }
+    if let Ok(mut table) = FRAME_MODULES.lock() {
+        table.remove(&(object as usize));
     }
 }
 
@@ -245,9 +258,33 @@ fn new_frame_locals_proxy() -> *mut PyObject {
     }
 }
 
-/// Serves `f_locals` on frame objects (both `PyFrame` and resumable `GenFrame`
-/// allocations share the runtime `frame` type, so this slot must never read
-/// past the shared object header).
+/// Serves `f_globals` on frame objects: the live namespace dict of the
+/// module recorded for the frame at `sys._getframe` time — the same
+/// registered dict `globals()` returns inside that module, so mutations
+/// through it surface as module globals.  Frames without a record
+/// (traceback and generator frames) approximate with the active module's
+/// namespace, mirroring the `f_locals` proxy.
+fn new_frame_globals_dict(frame: *mut PyObject) -> *mut PyObject {
+    let module = FRAME_MODULES
+        .lock()
+        .ok()
+        .and_then(|table| table.get(&(frame as usize)).copied());
+    let Some(module) = module else {
+        // builtin_globals records the thread-state error on failure.
+        return unsafe { crate::dynexec::builtin_globals(ptr::null_mut(), 0) };
+    };
+    match crate::dynexec::module_namespace_dict(module) {
+        Ok(dict) => dict,
+        Err(message) => {
+            pon_err_set(message);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Serves `f_locals` and `f_globals` on frame objects (both `PyFrame` and
+/// resumable `GenFrame` allocations share the runtime `frame` type, so this
+/// slot must never read past the shared object header).
 ///
 /// Wider frame introspection (`f_back`, `f_code`, ...) is intentionally not
 /// served yet and raises `AttributeError`.
@@ -258,13 +295,19 @@ unsafe extern "C" fn frame_getattro(object: *mut PyObject, name: *mut PyObject) 
     };
     match name {
         "f_locals" => new_frame_locals_proxy(),
+        "f_globals" => new_frame_globals_dict(object),
         _ => unsafe { crate::abi::pon_raise_attribute_error(object, crate::intern::intern(name)) },
     }
 }
 
 /// Synthesizes a fresh, empty heap frame of the runtime `frame` type — the
 /// same object family traceback entries carry — for `sys._getframe`.
-pub fn synthesize_frame_object() -> *mut PyObject {
+///
+/// `globals_module` is the interned name of the module whose namespace the
+/// frame's `f_globals` serves, resolved by the caller from the live call
+/// stack; `None` leaves no record and `f_globals` falls back to the active
+/// module's namespace at read time.
+pub fn synthesize_frame_object(globals_module: Option<u32>) -> *mut PyObject {
     let frame_type = ensure_frame_type(crate::abi::runtime_type_type());
     let info = GcTypeInfo {
         size: mem::size_of::<PyFrame>(),
@@ -276,6 +319,11 @@ pub fn synthesize_frame_object() -> *mut PyObject {
             let frame = block.cast::<PyFrame>();
             // SAFETY: `block` is a freshly allocated zeroed block of the right size.
             unsafe { ptr::write(frame, PyFrame::new(frame_type.cast_const(), 0, ptr::null_mut())) };
+            if let Some(module) = globals_module {
+                if let Ok(mut table) = FRAME_MODULES.lock() {
+                    table.insert(frame as usize, module);
+                }
+            }
             frame.cast::<PyObject>()
         }
         Err(message) => {

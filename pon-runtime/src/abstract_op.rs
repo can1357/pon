@@ -920,7 +920,7 @@ fn binary_dunder_names(op: u8) -> Option<(&'static str, &'static str)> {
 /// Calls a Python-level binary dunder resolved from a HEAP class's MRO.
 /// Native receivers report `Missing` (their behavior lives in slots).
 unsafe fn call_binary_dunder(ty: *mut PyType, name: &str, receiver: *mut PyObject, other: *mut PyObject) -> SlotOutcome {
-    if unsafe { (*ty).gc_type_id } != crate::types::type_::TYPE_ID_HEAP_INSTANCE.0 as usize {
+    if !crate::types::type_::type_dispatches_python_dunders(ty.cast_const()) {
         return SlotOutcome::Missing;
     }
     let hook = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern(name)) };
@@ -938,7 +938,7 @@ unsafe fn call_binary_dunder(ty: *mut PyType, name: &str, receiver: *mut PyObjec
 
 /// Calls a Python-level unary dunder resolved from a HEAP class's MRO.
 unsafe fn call_unary_dunder(ty: *mut PyType, name: &str, receiver: *mut PyObject) -> SlotOutcome {
-    if unsafe { (*ty).gc_type_id } != crate::types::type_::TYPE_ID_HEAP_INSTANCE.0 as usize {
+    if !crate::types::type_::type_dispatches_python_dunders(ty.cast_const()) {
         return SlotOutcome::Missing;
     }
     let hook = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern(name)) };

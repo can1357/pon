@@ -82,6 +82,46 @@ pub(crate) fn pending_exception_is(name: &str) -> bool {
     unsafe { crate::types::exc::exception_type_named((*exception).ob_type, name) }
 }
 
+/// Returns true when `ty` derives `BaseException` (raw-MRO walk against the
+/// runtime's builtin hierarchy); false when the runtime is not initialized.
+pub(crate) fn type_derives_base_exception(ty: *const PyType) -> bool {
+    super::with_runtime(|runtime| unsafe {
+        is_exception_subclass(ty, runtime.exception_types.base_exception.cast_const())
+    })
+    .unwrap_or(false)
+}
+
+/// Returns true when `ty` derives `BaseExceptionGroup`.
+pub(crate) fn type_derives_exception_group(ty: *const PyType) -> bool {
+    super::with_runtime(|runtime| unsafe { runtime.exception_types.is_exception_group_type(ty) }).unwrap_or(false)
+}
+
+/// Allocates an exception-layout instance of `cls` with constructor argument
+/// semantics, for instantiation paths outside the dedicated exception call
+/// branch (`type.__new__` on exception-derived heap classes).
+///
+/// Must not be called while the runtime lock is already held.
+pub(crate) fn alloc_exception_instance(cls: *mut PyType, args: &[*mut PyObject]) -> *mut PyObject {
+    match super::with_runtime(|runtime| {
+        let message = args.first().copied().unwrap_or(ptr::null_mut());
+        match alloc_exception_object(runtime, cls, message, ptr::null_mut()) {
+            Ok(exception) => {
+                if args.len() >= 2 {
+                    match super::seq::alloc_tuple_from_slice(runtime, args) {
+                        Ok(tuple) => unsafe { (*exception.cast::<PyBaseException>()).args = tuple },
+                        Err(message) => return super::return_null_with_error(message),
+                    }
+                }
+                exception
+            }
+            Err(message) => super::return_null_with_error(message),
+        }
+    }) {
+        Some(result) => result,
+        None => super::return_null_with_error("runtime is not initialized"),
+    }
+}
+
 fn active_context() -> *mut PyObject {
     pending_exception_object().unwrap_or(ptr::null_mut())
 }
@@ -512,7 +552,13 @@ fn exception_diagnostic(runtime: &Runtime, exception: *mut PyObject) -> String {
     unsafe {
         let ty = (*exception).ob_type;
         let name = if ty.is_null() { "BaseException" } else { (*ty).name() };
-        let message = (*exception.cast::<PyBaseException>()).message;
+        let exception = &*exception.cast::<PyBaseException>();
+        // Multi-argument exceptions stringify as the full args tuple
+        // (CPython `BaseException.__str__` with `len(args) != 1`).
+        if !exception.args.is_null() {
+            return format!("{name}: {}", crate::native::builtins_mod::repr_text(exception.args));
+        }
+        let message = exception.message;
         if !message.is_null() && is_exact_type(message, runtime.unicode_type.cast_const()) {
             if let Some(text) = (*message.cast::<crate::object::PyUnicode>()).as_str() {
                 return format!("{name}: {text}");
@@ -530,6 +576,11 @@ unsafe fn set_exception_links(exception: *mut PyObject, cause: *mut PyObject) {
     // SAFETY: Caller validated that `exception` is a live base-exception instance.
     let exception = unsafe { &mut *exception.cast::<PyBaseException>() };
     exception.cause = cause;
+    if !cause.is_null() {
+        // An explicit `raise ... from ...` (even `from None`) suppresses the
+        // implicit-context display (PEP 409).
+        exception.suppress_context = true;
+    }
     if !context.is_null() && !core::ptr::eq(context, exception as *mut PyBaseException as *mut PyObject) {
         exception.context = context;
     }
@@ -556,6 +607,10 @@ pub unsafe extern "C" fn pon_raise(exc: *mut PyObject, cause: *mut PyObject) -> 
                 }
                 match alloc_exception_object(runtime, ty, ptr::null_mut(), cause) {
                     Ok(exception) => {
+                        if !cause.is_null() {
+                            // SAFETY: Freshly allocated base-exception layout.
+                            unsafe { (*exception.cast::<PyBaseException>()).suppress_context = true };
+                        }
                         raise_current_exception(runtime, exception);
                         ptr::null_mut()
                     }
@@ -626,6 +681,12 @@ pub unsafe extern "C" fn pon_raise_index_error(ptr: *const u8, len: usize) -> *m
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_raise_reference_error(ptr: *const u8, len: usize) -> *mut PyObject {
     super::catch_object_helper(|| raise_message_exception(ExceptionKind::ReferenceError, ptr, len))
+}
+
+/// Raises `OSError(message)` and returns NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_raise_os_error(ptr: *const u8, len: usize) -> *mut PyObject {
+    super::catch_object_helper(|| raise_message_exception(ExceptionKind::OSError, ptr, len))
 }
 
 /// Raises `KeyError(key)` and returns NULL.
@@ -918,6 +979,7 @@ fn alloc_group_like(
             derived.cause = source_group.base.cause;
             derived.context = source_group.base.context;
             derived.traceback = source_group.base.traceback;
+            derived.suppress_context = source_group.base.suppress_context;
         }
     }
     Ok(group)

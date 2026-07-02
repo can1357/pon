@@ -91,14 +91,24 @@ fn null_error(message: impl Into<String>) -> *mut PyObject {
     super::return_null_with_error(message)
 }
 
+/// Typed `TypeError` for dict/set method arity and keyword-shape misuse
+/// (CPython `except TypeError:` must fire) — unless a live boxed exception
+/// is already pending, which stays authoritative.
+fn raise_map_type_error(message: impl AsRef<str>) -> *mut PyObject {
+    if super::exc::pending_exception_object().is_some() {
+        return ptr::null_mut();
+    }
+    super::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::TypeError, message.as_ref())
+}
+
 fn duplicate_keyword_error(key: *mut PyObject) -> *mut PyObject {
     if unsafe { dict::type_name(key) } != Some("str") {
-        return null_error("keywords must be strings");
+        return raise_map_type_error("keywords must be strings");
     }
     let Some(name) = (unsafe { (&*key.cast::<PyUnicode>()).as_str() }) else {
         return null_error("keyword name is not valid UTF-8");
     };
-    null_error(format!("got multiple values for keyword argument '{name}'"))
+    raise_map_type_error(format!("got multiple values for keyword argument '{name}'"))
 }
 
 fn status_error(message: impl Into<String>) -> c_int {
@@ -372,7 +382,7 @@ pub unsafe extern "C" fn pon_subscript_set(object: *mut PyObject, key: *mut PyOb
                 }
             } else if let Some(slot) = unsafe { (*ty).tp_as_sequence.as_ref().and_then(|methods| methods.sq_ass_item) } {
                 if unsafe { dict::type_name(key) } != Some("int") {
-                    return null_error("sequence index must be an int");
+                    return raise_map_type_error("sequence index must be an int");
                 }
                 let index = unsafe { (*key.cast::<PyLong>()).value };
                 let Ok(index) = isize::try_from(index) else {
@@ -596,7 +606,7 @@ pub(crate) unsafe extern "C" fn dict_get_method_trampoline(argv: *mut *mut PyObj
         Err(raised) => return raised,
     };
     if !(args.len() == 2 || args.len() == 3) {
-        return null_error(format!("dict.get() expected 1 or 2 arguments, got {}", args.len().saturating_sub(1)));
+        return raise_map_type_error(format!("dict.get() expected 1 or 2 arguments, got {}", args.len().saturating_sub(1)));
     }
     let default = args.get(2).copied().unwrap_or(ptr::null_mut());
     unsafe { pon_dict_get_method(receiver, args[1], default) }
@@ -611,7 +621,7 @@ let receiver = match ensure_dict_method_receiver(args, "keys") {
     Err(raised) => return raised,
 };
 if args.len() != 1 {
-    return null_error(format!("dict.keys() expected 0 arguments, got {}", args.len().saturating_sub(1)));
+    return raise_map_type_error(format!("dict.keys() expected 0 arguments, got {}", args.len().saturating_sub(1)));
 }
 unsafe { pon_dict_keys(receiver) } }
 
@@ -624,7 +634,7 @@ let receiver = match ensure_dict_method_receiver(args, "values") {
     Err(raised) => return raised,
 };
 if args.len() != 1 {
-    return null_error(format!("dict.values() expected 0 arguments, got {}", args.len().saturating_sub(1)));
+    return raise_map_type_error(format!("dict.values() expected 0 arguments, got {}", args.len().saturating_sub(1)));
 }
 unsafe { pon_dict_values(receiver) } }
 
@@ -637,7 +647,7 @@ let receiver = match ensure_dict_method_receiver(args, "items") {
     Err(raised) => return raised,
 };
 if args.len() != 1 {
-    return null_error(format!("dict.items() expected 0 arguments, got {}", args.len().saturating_sub(1)));
+    return raise_map_type_error(format!("dict.items() expected 0 arguments, got {}", args.len().saturating_sub(1)));
 }
 unsafe { pon_dict_items(receiver) } }
 
@@ -650,7 +660,7 @@ let receiver = match ensure_dict_method_receiver(args, "setdefault") {
     Err(raised) => return raised,
 };
 if !(args.len() == 2 || args.len() == 3) {
-    return null_error(format!("dict.setdefault() expected 1 or 2 arguments, got {}", args.len().saturating_sub(1)));
+    return raise_map_type_error(format!("dict.setdefault() expected 1 or 2 arguments, got {}", args.len().saturating_sub(1)));
 }
 let default = args.get(2).copied().unwrap_or(ptr::null_mut());
 unsafe { pon_dict_setdefault(receiver, args[1], default) } }
@@ -664,7 +674,7 @@ let receiver = match ensure_dict_method_receiver(args, "pop") {
     Err(raised) => return raised,
 };
 if !(args.len() == 2 || args.len() == 3) {
-    return null_error(format!("dict.pop() expected 1 or 2 arguments, got {}", args.len().saturating_sub(1)));
+    return raise_map_type_error(format!("dict.pop() expected 1 or 2 arguments, got {}", args.len().saturating_sub(1)));
 }
 let default = args.get(2).copied().unwrap_or(ptr::null_mut());
 unsafe { pon_dict_pop(receiver, args[1], default) } }
@@ -678,7 +688,7 @@ let receiver = match ensure_dict_method_receiver(args, "update") {
     Err(raised) => return raised,
 };
 if args.len() != 2 {
-    return null_error(format!("dict.update() expected 1 argument, got {}", args.len().saturating_sub(1)));
+    return raise_map_type_error(format!("dict.update() expected 1 argument, got {}", args.len().saturating_sub(1)));
 }
 let updated = unsafe { pon_dict_update(receiver, args[1]) };
 if updated.is_null() {
@@ -698,7 +708,7 @@ pub unsafe fn pon_dict_bound_method(map: *mut PyObject, name: &str) -> *mut PyOb
         "setdefault" => alloc_bound_native_method(map, name, dict_setdefault_method_trampoline),
         "pop" => alloc_bound_native_method(map, name, dict_pop_method_trampoline),
         "update" => alloc_bound_native_method(map, name, dict_update_method_trampoline),
-        _ => null_error(format!("attribute '{name}' was not found")),
+        _ => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
     }
 }
 
@@ -1131,7 +1141,7 @@ unsafe extern "C" fn set_contains_method_trampoline(argv: *mut *mut PyObject, ar
         Err(message) => return null_error(message),
     };
     if args.len() != 2 {
-        return null_error(format!(
+        return raise_map_type_error(format!(
             "set.__contains__() expected 1 argument, got {}",
             args.len().saturating_sub(1)
         ));
@@ -1148,7 +1158,7 @@ unsafe extern "C" fn set_add_method_trampoline(argv: *mut *mut PyObject, argc: u
         Err(message) => return null_error(message),
     };
     if args.len() != 2 {
-        return null_error(format!("set.add() expected 1 argument, got {}", args.len().saturating_sub(1)));
+        return raise_map_type_error(format!("set.add() expected 1 argument, got {}", args.len().saturating_sub(1)));
     }
     let result = unsafe { pon_set_add(args[0], args[1]) };
     if result.is_null() { result } else { map_none() }
@@ -1160,7 +1170,7 @@ unsafe extern "C" fn set_discard_method_trampoline(argv: *mut *mut PyObject, arg
         Err(message) => return null_error(message),
     };
     if args.len() != 2 {
-        return null_error(format!("set.discard() expected 1 argument, got {}", args.len().saturating_sub(1)));
+        return raise_map_type_error(format!("set.discard() expected 1 argument, got {}", args.len().saturating_sub(1)));
     }
     unsafe { pon_set_discard(args[0], args[1]) }
 }
@@ -1171,7 +1181,7 @@ unsafe extern "C" fn set_union_method_trampoline(argv: *mut *mut PyObject, argc:
         Err(message) => return null_error(message),
     };
     if args.len() != 2 {
-        return null_error(format!("set.union() expected 1 argument, got {}", args.len().saturating_sub(1)));
+        return raise_map_type_error(format!("set.union() expected 1 argument, got {}", args.len().saturating_sub(1)));
     }
     unsafe { pon_set_union(args[0], args[1]) }
 }
@@ -1182,7 +1192,7 @@ unsafe extern "C" fn set_intersection_method_trampoline(argv: *mut *mut PyObject
         Err(message) => return null_error(message),
     };
     if args.len() != 2 {
-        return null_error(format!("set.intersection() expected 1 argument, got {}", args.len().saturating_sub(1)));
+        return raise_map_type_error(format!("set.intersection() expected 1 argument, got {}", args.len().saturating_sub(1)));
     }
     unsafe { pon_set_intersection(args[0], args[1]) }
 }
@@ -1193,7 +1203,7 @@ unsafe extern "C" fn set_difference_method_trampoline(argv: *mut *mut PyObject, 
         Err(message) => return null_error(message),
     };
     if args.len() != 2 {
-        return null_error(format!("set.difference() expected 1 argument, got {}", args.len().saturating_sub(1)));
+        return raise_map_type_error(format!("set.difference() expected 1 argument, got {}", args.len().saturating_sub(1)));
     }
     unsafe { pon_set_difference(args[0], args[1]) }
 }
@@ -1204,7 +1214,7 @@ unsafe extern "C" fn set_issubset_method_trampoline(argv: *mut *mut PyObject, ar
         Err(message) => return null_error(message),
     };
     if args.len() != 2 {
-        return null_error(format!("set.issubset() expected 1 argument, got {}", args.len().saturating_sub(1)));
+        return raise_map_type_error(format!("set.issubset() expected 1 argument, got {}", args.len().saturating_sub(1)));
     }
     set_is_subset(args[0], args[1])
 }
@@ -1215,7 +1225,7 @@ unsafe extern "C" fn set_copy_method_trampoline(argv: *mut *mut PyObject, argc: 
         Err(message) => return null_error(message),
     };
     if args.len() != 1 {
-        return null_error(format!("set.copy() expected 0 arguments, got {}", args.len().saturating_sub(1)));
+        return raise_map_type_error(format!("set.copy() expected 0 arguments, got {}", args.len().saturating_sub(1)));
     }
     let receiver = args[0];
     // CPython returns the receiver itself for exact frozensets.
@@ -1239,7 +1249,7 @@ unsafe extern "C" fn set_remove_method_trampoline(argv: *mut *mut PyObject, argc
         Err(message) => return null_error(message),
     };
     if args.len() != 2 {
-        return null_error(format!("set.remove() expected 1 argument, got {}", args.len().saturating_sub(1)));
+        return raise_map_type_error(format!("set.remove() expected 1 argument, got {}", args.len().saturating_sub(1)));
     }
     let _guard = crate::sync::begin_critical_section(args[0]);
     match unsafe { set_::set_remove(args[0], args[1]) } {
@@ -1255,7 +1265,7 @@ unsafe extern "C" fn set_pop_method_trampoline(argv: *mut *mut PyObject, argc: u
         Err(message) => return null_error(message),
     };
     if args.len() != 1 {
-        return null_error(format!("set.pop() expected 0 arguments, got {}", args.len().saturating_sub(1)));
+        return raise_map_type_error(format!("set.pop() expected 0 arguments, got {}", args.len().saturating_sub(1)));
     }
     let _guard = crate::sync::begin_critical_section(args[0]);
     match unsafe { set_::set_pop(args[0]) } {
@@ -1275,7 +1285,7 @@ unsafe extern "C" fn set_clear_method_trampoline(argv: *mut *mut PyObject, argc:
         Err(message) => return null_error(message),
     };
     if args.len() != 1 {
-        return null_error(format!("set.clear() expected 0 arguments, got {}", args.len().saturating_sub(1)));
+        return raise_map_type_error(format!("set.clear() expected 0 arguments, got {}", args.len().saturating_sub(1)));
     }
     let _guard = crate::sync::begin_critical_section(args[0]);
     match unsafe { set_::set_clear(args[0]) } {
@@ -1298,7 +1308,7 @@ pub unsafe fn pon_set_bound_method(set: *mut PyObject, name: &str) -> *mut PyObj
         "remove" => alloc_bound_native_method(set, name, set_remove_method_trampoline),
         "clear" => alloc_bound_native_method(set, name, set_clear_method_trampoline),
         "pop" => alloc_bound_native_method(set, name, set_pop_method_trampoline),
-        _ => null_error(format!("attribute '{name}' was not found")),
+        _ => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
     }
 }
 

@@ -14,9 +14,29 @@ static METHOD_TYPE: OnceLock<usize> = OnceLock::new();
 
 fn method_type() -> *mut PyType {
     *METHOD_TYPE.get_or_init(|| {
-        let ty = Box::new(PyType::new(ptr::null(), "method", mem::size_of::<PyMethod>()));
+        let mut ty = Box::new(PyType::new(ptr::null(), "method", mem::size_of::<PyMethod>()));
+        ty.tp_getattro = Some(method_getattro);
         Box::into_raw(ty) as usize
     }) as *mut PyType
+}
+
+/// `tp_getattro` for bound methods: `__func__`/`__self__` answer from the
+/// pair; every other name forwards to the underlying function (CPython
+/// `method_getattro` parity — methods proxy the function's attribute surface,
+/// e.g. `__doc__`/`__name__` for unittest's TestCase introspection).
+unsafe extern "C" fn method_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        let message = "attribute name must be str";
+        return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    };
+    let method = object.cast::<PyMethod>();
+    if text == "__func__" {
+        return unsafe { (*method).function };
+    }
+    if text == "__self__" {
+        return unsafe { (*method).receiver };
+    }
+    unsafe { crate::abstract_op::get_attr((*method).function, crate::intern::intern(text)) }
 }
 
 /// Receiver/function pair produced by method loading.

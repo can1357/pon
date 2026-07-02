@@ -392,6 +392,29 @@ pub unsafe fn object_equal(left: *mut PyObject, right: *mut PyObject) -> Result<
         return unsafe { object_equal(left_referent, right_referent) };
     }
 
+    // Tuple-storage keying parity across layouts: an exact tuple and a
+    // tuple-subclass instance (namedtuple) with equal contents are the same
+    // dict key, matching CPython's inherited `tuple.__eq__`.  The
+    // exact/exact pair stays in the name-match arm below.
+    if unsafe { crate::types::tuple::is_tuple_subclass_instance(left) }
+        || unsafe { crate::types::tuple::is_tuple_subclass_instance(right) }
+    {
+        let (Some(l), Some(r)) = (
+            unsafe { crate::abi::seq::tuple_storage_slice(left) },
+            unsafe { crate::abi::seq::tuple_storage_slice(right) },
+        ) else {
+            return Ok(false);
+        };
+        if l.len() != r.len() {
+            return Ok(false);
+        }
+        for (a, b) in l.iter().zip(r.iter()) {
+            if !unsafe { object_equal(*a, *b)? } {
+                return Ok(false);
+            }
+        }
+        return Ok(true);
+    }
     match (unsafe { type_name(left) }, unsafe { type_name(right) }) {
         (Some("str"), Some("str")) => {
             let l = unsafe { &*left.cast::<PyUnicode>() };
@@ -495,6 +518,20 @@ unsafe fn numeric_hash_object(object: *mut PyObject) -> Option<isize> {
     unsafe { crate::types::complex_::to_f64s(object).map(|(real, imag)| crate::types::complex_::hash_complex(real, imag)) }
 }
 
+/// Structural tuple hash shared by exact tuples and tuple-subclass
+/// instances: equal contents collide across both layouts (CPython: tuple
+/// subclasses inherit `tuple.__hash__` unless they override it).
+fn structural_tuple_hash(items: &[*mut PyObject]) -> Result<isize, String> {
+    let mut hash: isize = 0x345678;
+    let mut mult: isize = 1_000_003;
+    for &item in items {
+        let item_hash = unsafe { hash_object(item)? };
+        hash = (hash ^ item_hash).wrapping_mul(mult);
+        mult = mult.wrapping_add(82_520_isize.wrapping_add(2 * items.len() as isize));
+    }
+    Ok(hash.wrapping_add(97_531))
+}
+
 fn hash_object_non_numeric(object: *mut PyObject) -> Result<isize, String> {
     // A weakref hashes like its live referent, cached across referent death
     // (CPython `wr_hash`: WeakSet discards dead refs by their cached hash).
@@ -507,6 +544,13 @@ fn hash_object_non_numeric(object: *mut PyObject) -> Result<isize, String> {
     if unsafe { is_dict_subclass_instance(object) } {
         let name = unsafe { type_name(object) }.unwrap_or("dict");
         return Err(format!("unhashable type: '{name}'"));
+    }
+    // Tuple-layout instances (namedtuple) hash structurally like exact
+    // tuples, so both layouts key the same dict slot.
+    if unsafe { crate::types::tuple::is_tuple_subclass_instance(object) } {
+        if let Some(items) = unsafe { crate::abi::seq::tuple_storage_slice(object) } {
+            return structural_tuple_hash(items);
+        }
     }
     let hash = match unsafe { type_name(object) } {
         Some("str") => {
@@ -526,16 +570,7 @@ fn hash_object_non_numeric(object: *mut PyObject) -> Result<isize, String> {
         Some("tuple") => match unsafe { crate::abi::seq::exact_tuple_slice(object) } {
             // Structural tuple hash so equal tuples built at different sites
             // collide; elements recurse through `hash_object`.
-            Some(items) => {
-                let mut hash: isize = 0x345678;
-                let mut mult: isize = 1_000_003;
-                for &item in items {
-                    let item_hash = unsafe { hash_object(item)? };
-                    hash = (hash ^ item_hash).wrapping_mul(mult);
-                    mult = mult.wrapping_add(82_520_isize.wrapping_add(2 * items.len() as isize));
-                }
-                hash.wrapping_add(97_531)
-            }
+            Some(items) => structural_tuple_hash(items)?,
             // Non-PyTuple "tuple" (native representation): prior pointer
             // semantics — identity keying keeps working.
             None => object as usize as isize,
@@ -776,8 +811,7 @@ unsafe extern "C" fn dict_getattro_slot(object: *mut PyObject, name: *mut PyObje
             if !hook.is_null() {
                 return unsafe { crate::descr::descriptor_get(hook, object, ty) };
             }
-            pon_err_set(format!("attribute '{attr}' was not found"));
-            ptr::null_mut()
+            crate::abi::exc::raise_attribute_error_text(&format!("attribute '{attr}' was not found"))
         }
     }
 }

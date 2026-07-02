@@ -1280,7 +1280,9 @@ pub(crate) unsafe fn percent_format(format: *mut PyObject, args: *mut PyObject) 
         Ok(None) => return raise_percent_type_error("descriptor '__mod__' requires a 'str' object"),
         Err(message) => return raise_percent_type_error(&message),
     };
-    let items = (type_name(args) == "tuple").then(|| unsafe { (&*args.cast::<PyTuple>()).as_slice() });
+    // CPython `PyTuple_Check`: tuple SUBCLASS operands (namedtuple) spread as
+    // individual args too; the storage view covers both tuple layouts.
+    let items = unsafe { crate::abi::seq::tuple_storage_slice(args) };
     let (arglen, argidx) = match items {
         Some(items) => (items.len() as isize, 0),
         None => (-1, -2),

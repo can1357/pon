@@ -351,6 +351,7 @@ unsafe fn pon_gen_resume(generator: *mut PyObject, sent: *mut PyObject, thrown: 
     // The cast is sound: frame_stack consumers treat entries as opaque
     // identity pointers and never read past the shared PyObjectHeader.
     thread_state_lock().push_frame(frame.cast::<crate::abi::PyFrame>());
+    let _handled_guard = super::HandledExcGuard::enter();
     pon_err_clear();
 
     // 8. Call the compiled body — the ONLY body call site.  The generator's

@@ -35,6 +35,14 @@ const TYPE_ID_TUPLE: TypeId = TypeId(22);
 const TYPE_ID_RANGE: TypeId = TypeId(23);
 const TYPE_ID_SLICE: TypeId = TypeId(24);
 const TYPE_ID_SEQ_ITER: TypeId = TypeId(25);
+/// Heap-class instances embedding list storage (`PyListSubclassInstance`);
+/// class-instance family next to the dict-subclass id 107 (abi/map.rs) and
+/// the payload-subclass id 108 (types/type_.rs).
+const TYPE_ID_LIST_SUBCLASS_INSTANCE: TypeId = TypeId(109);
+/// Heap-class instances embedding tuple storage (`PyTupleSubclassInstance`,
+/// the `collections.namedtuple` substrate); next free id after the
+/// list-subclass id 109.
+const TYPE_ID_TUPLE_SUBCLASS_INSTANCE: TypeId = TypeId(110);
 
 static LIST_TYPE: OnceLock<usize> = OnceLock::new();
 static TUPLE_TYPE: OnceLock<usize> = OnceLock::new();
@@ -210,6 +218,22 @@ fn register_seq_gc_types(runtime: &Runtime) {
             finalize: None,
         },
     );
+    runtime.heap.register_type(
+        TYPE_ID_LIST_SUBCLASS_INSTANCE,
+        GcTypeInfo {
+            size: mem::size_of::<list::PyListSubclassInstance>(),
+            trace: list::trace_list_subclass_instance,
+            finalize: Some(list::finalize_list_subclass_instance),
+        },
+    );
+    runtime.heap.register_type(
+        TYPE_ID_TUPLE_SUBCLASS_INSTANCE,
+        GcTypeInfo {
+            size: mem::size_of::<tuple::PyTupleSubclassInstance>(),
+            trace: tuple::trace_tuple_subclass_instance,
+            finalize: Some(tuple::finalize_tuple_subclass_instance),
+        },
+    );
 }
 
 fn leak_slots(cap: usize) -> Result<*mut *mut PyObject, String> {
@@ -262,6 +286,86 @@ fn alloc_list_from_slice(runtime: &Runtime, values: &[*mut PyObject]) -> Result<
         );
     }
     Ok(as_object_ptr(object))
+}
+
+/// Allocates a heap instance of a list-derived class: the generic
+/// heap-instance prefix plus empty embedded list storage.
+pub(crate) fn alloc_list_subclass_instance(
+    cls: *mut PyType,
+    instance_dict: *mut type_::PyClassDict,
+    slots: Vec<type_::PySlotValue>,
+) -> Result<*mut PyObject, String> {
+    with_runtime(|runtime| {
+        register_seq_gc_types(runtime);
+        let object = runtime
+            .heap
+            .alloc(mem::size_of::<list::PyListSubclassInstance>(), TYPE_ID_LIST_SUBCLASS_INSTANCE)
+            .cast::<list::PyListSubclassInstance>();
+        unsafe {
+            ptr::write(
+                object,
+                list::PyListSubclassInstance {
+                    base: type_::PyHeapInstance {
+                        ob_base: PyObjectHeader::new(cls),
+                        dict: instance_dict,
+                        slots,
+                        weakrefs: ptr::null_mut(),
+                        finalized: false,
+                    },
+                    storage: list::PyListStorage {
+                        len: 0,
+                        cap: 0,
+                        items: ptr::null_mut(),
+                    },
+                },
+            );
+        }
+        Ok(as_object_ptr(object))
+    })
+    .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
+}
+
+/// Allocates a heap instance of a tuple-derived class: the generic
+/// heap-instance prefix plus embedded tuple storage populated from `values`
+/// (tuples are immutable — contents are fixed at construction, unlike the
+/// list-subclass lane where `list.__init__` fills the empty storage later).
+pub(crate) fn alloc_tuple_subclass_instance(
+    cls: *mut PyType,
+    instance_dict: *mut type_::PyClassDict,
+    slots: Vec<type_::PySlotValue>,
+    values: &[*mut PyObject],
+) -> Result<*mut PyObject, String> {
+    with_runtime(|runtime| {
+        register_seq_gc_types(runtime);
+        let items = leak_slots(values.len())?;
+        if !items.is_null() {
+            unsafe { copy_heap_pointer_slice(items, values) };
+        }
+        let object = runtime
+            .heap
+            .alloc(mem::size_of::<tuple::PyTupleSubclassInstance>(), TYPE_ID_TUPLE_SUBCLASS_INSTANCE)
+            .cast::<tuple::PyTupleSubclassInstance>();
+        unsafe {
+            ptr::write(
+                object,
+                tuple::PyTupleSubclassInstance {
+                    base: type_::PyHeapInstance {
+                        ob_base: PyObjectHeader::new(cls),
+                        dict: instance_dict,
+                        slots,
+                        weakrefs: ptr::null_mut(),
+                        finalized: false,
+                    },
+                    storage: tuple::PyTupleStorage {
+                        len: values.len(),
+                        items,
+                    },
+                },
+            );
+        }
+        Ok(as_object_ptr(object))
+    })
+    .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
 }
 
 pub(crate) fn alloc_tuple_from_slice(runtime: &Runtime, values: &[*mut PyObject]) -> Result<*mut PyObject, String> {
@@ -368,8 +472,65 @@ fn is_list(object: *mut PyObject) -> bool {
     unsafe { !object.is_null() && (*object).ob_type == list_type().cast_const() }
 }
 
+/// Resolves the list cell block of either list layout: the exact seq-family
+/// `PyList` (tail overlay) or a list-subclass heap instance (embedded
+/// storage).  `None` when `object` is neither.
+unsafe fn list_cells_ptr(object: *mut PyObject) -> Option<*mut list::PyListStorage> {
+    if is_list(object) {
+        let cells = unsafe { object.cast::<u8>().add(mem::offset_of!(PyList, len)) };
+        return Some(cells.cast::<list::PyListStorage>());
+    }
+    if unsafe { list::is_list_subclass_instance(object) } {
+        let instance = object.cast::<list::PyListSubclassInstance>();
+        return Some(unsafe { ptr::addr_of_mut!((*instance).storage) });
+    }
+    None
+}
+
+/// Mutable view over [`list_cells_ptr`] for the single-receiver mutation
+/// helpers (the exclusive-receiver contract the raw list helpers assume).
+unsafe fn list_cells<'a>(object: *mut PyObject) -> Option<&'a mut list::PyListStorage> {
+    unsafe { list_cells_ptr(object).map(|cells| &mut *cells) }
+}
+
+/// Returns whether `object` carries concrete list storage: an exact list or
+/// a list-subclass instance.  Dispatch fast paths that must honor user
+/// method overrides keep using the exact [`is_list`] check instead.
+pub(crate) fn has_list_storage(object: *mut PyObject) -> bool {
+    is_list(object) || unsafe { list::is_list_subclass_instance(object) }
+}
+
 fn is_tuple(object: *mut PyObject) -> bool {
     unsafe { !object.is_null() && (*object).ob_type == tuple_type().cast_const() }
+}
+
+/// Resolves the tuple cell block of either tuple layout: the exact
+/// seq-family `PyTuple` (tail overlay) or a tuple-subclass heap instance
+/// (embedded storage).  `None` when `object` is neither.
+unsafe fn tuple_storage_ptr(object: *mut PyObject) -> Option<*mut tuple::PyTupleStorage> {
+    if is_tuple(object) {
+        let cells = unsafe { object.cast::<u8>().add(mem::offset_of!(PyTuple, len)) };
+        return Some(cells.cast::<tuple::PyTupleStorage>());
+    }
+    if unsafe { tuple::is_tuple_subclass_instance(object) } {
+        let instance = object.cast::<tuple::PyTupleSubclassInstance>();
+        return Some(unsafe { ptr::addr_of_mut!((*instance).storage) });
+    }
+    None
+}
+
+/// Immutable items view over [`tuple_storage_ptr`]: the storage slice of an
+/// exact tuple or a tuple-subclass instance, `None` otherwise.  Shared with
+/// sibling modules (percent-format tuple spreading, dict keying).
+pub(crate) unsafe fn tuple_storage_slice<'a>(object: *mut PyObject) -> Option<&'a [*mut PyObject]> {
+    unsafe { tuple_storage_ptr(object).map(|cells| (&*cells).as_slice()) }
+}
+
+/// Returns whether `object` carries concrete tuple storage: an exact tuple
+/// or a tuple-subclass instance.  Dispatch fast paths that must honor user
+/// method overrides keep using the exact [`is_tuple`] check instead.
+pub(crate) fn has_tuple_storage(object: *mut PyObject) -> bool {
+    is_tuple(object) || unsafe { tuple::is_tuple_subclass_instance(object) }
 }
 
 fn is_range(object: *mut PyObject) -> bool {
@@ -475,7 +636,7 @@ unsafe extern "C" fn tuple_richcmp_slot(left: *mut PyObject, right: *mut PyObjec
 }
 
 unsafe fn sequence_richcmp(left: *mut PyObject, right: *mut PyObject, op: c_int, tuple_kind: bool) -> *mut PyObject {
-    let same_kind = if tuple_kind { is_tuple(right) } else { is_list(right) };
+    let same_kind = if tuple_kind { has_tuple_storage(right) } else { has_list_storage(right) };
     if !same_kind {
         return unsafe { super::pon_not_implemented() };
     }
@@ -488,14 +649,26 @@ unsafe fn sequence_richcmp(left: *mut PyObject, right: *mut PyObject, op: c_int,
     }
 
     let left_items = if tuple_kind {
-        unsafe { (&*left.cast::<PyTuple>()).as_slice() }
+        let Some(items) = (unsafe { tuple_storage_slice(left) }) else {
+            return unsafe { super::pon_not_implemented() };
+        };
+        items
     } else {
-        unsafe { (&*left.cast::<PyList>()).as_slice() }
+        let Some(cells) = (unsafe { list_cells_ptr(left) }) else {
+            return unsafe { super::pon_not_implemented() };
+        };
+        unsafe { (&*cells).as_slice() }
     };
     let right_items = if tuple_kind {
-        unsafe { (&*right.cast::<PyTuple>()).as_slice() }
+        let Some(items) = (unsafe { tuple_storage_slice(right) }) else {
+            return unsafe { super::pon_not_implemented() };
+        };
+        items
     } else {
-        unsafe { (&*right.cast::<PyList>()).as_slice() }
+        let Some(cells) = (unsafe { list_cells_ptr(right) }) else {
+            return unsafe { super::pon_not_implemented() };
+        };
+        unsafe { (&*cells).as_slice() }
     };
 
     for index in 0..left_items.len().min(right_items.len()) {
@@ -569,11 +742,11 @@ fn object_len_raw(object: *mut PyObject, allow_mapping: bool) -> Result<usize, S
         return Err("sequence is NULL".to_owned());
     }
     unsafe {
-        if is_list(object) {
-            return Ok((*object.cast::<PyList>()).len);
+        if let Some(cells) = list_cells_ptr(object) {
+            return Ok((*cells).len);
         }
-        if is_tuple(object) {
-            return Ok((*object.cast::<PyTuple>()).len);
+        if let Some(items) = tuple_storage_slice(object) {
+            return Ok(items.len());
         }
         if is_range(object) {
             return Ok((*object.cast::<PyRange>()).len);
@@ -613,18 +786,21 @@ fn object_len_raw(object: *mut PyObject, allow_mapping: bool) -> Result<usize, S
 
 fn list_item_object(object: *mut PyObject, index: isize) -> Result<*mut PyObject, String> {
     unsafe {
-        let list = &*object.cast::<PyList>();
+        let Some(cells) = list_cells_ptr(object) else {
+            return Err(format!("list indexing expected list, got {}", object_type_name(object)));
+        };
+        let list = &*cells;
         let index = normalize_index(index, list.len)?;
         Ok(*list.items.add(index))
     }
 }
 
 fn tuple_item_object(object: *mut PyObject, index: isize) -> Result<*mut PyObject, String> {
-    unsafe {
-        let tuple = &*object.cast::<PyTuple>();
-        let index = normalize_index(index, tuple.len)?;
-        Ok(*tuple.items.add(index))
-    }
+    let Some(items) = (unsafe { tuple_storage_slice(object) }) else {
+        return Err(format!("tuple indexing expected tuple, got {}", object_type_name(object)));
+    };
+    let index = normalize_index(index, items.len())?;
+    Ok(items[index])
 }
 
 fn range_item_value(range: &PyRange, index: isize) -> Result<i64, String> {
@@ -646,10 +822,10 @@ fn sequence_item_raw(object: *mut PyObject, index: isize) -> Result<*mut PyObjec
     if object.is_null() {
         return Err("sequence is NULL".to_owned());
     }
-    if is_list(object) {
+    if has_list_storage(object) {
         return list_item_object(object, index);
     }
-    if is_tuple(object) {
+    if has_tuple_storage(object) {
         return tuple_item_object(object, index);
     }
     if is_range(object) {
@@ -800,7 +976,7 @@ fn sequence_slice_raw(object: *mut PyObject, key: *mut PyObject) -> Result<*mut 
     let len = sequence_len_raw(object)?;
     let indices = unsafe { normalize_slice(&*key.cast::<PySlice>(), len)? };
     let values = sliced_values(object, indices)?;
-    if is_tuple(object) {
+    if has_tuple_storage(object) {
         Ok(crate::native::builtins_mod::alloc_tuple(values))
     } else {
         with_runtime(|runtime| alloc_list_from_slice(runtime, &values))
@@ -808,7 +984,7 @@ fn sequence_slice_raw(object: *mut PyObject, key: *mut PyObject) -> Result<*mut 
     }
 }
 
-fn list_resize(list: &mut PyList, new_cap: usize) -> Result<(), String> {
+fn list_resize(list: &mut list::PyListStorage, new_cap: usize) -> Result<(), String> {
     if new_cap == list.cap {
         return Ok(());
     }
@@ -826,14 +1002,13 @@ fn list_resize(list: &mut PyList, new_cap: usize) -> Result<(), String> {
 }
 
 fn list_append_raw(list_object: *mut PyObject, item: *mut PyObject) -> Result<(), String> {
-    if !is_list(list_object) {
+    let Some(list) = (unsafe { list_cells(list_object) }) else {
         return Err(format!("list append expected list, got {}", object_type_name(list_object)));
-    }
+    };
     if item.is_null() {
         return Err("cannot append NULL to list".to_owned());
     }
     let _guard = crate::sync::begin_critical_section(list_object);
-    let list = unsafe { &mut *list_object.cast::<PyList>() };
     if list.len == list.cap {
         let new_cap = if list.cap == 0 { 4 } else { list.cap.saturating_mul(2) };
         if new_cap <= list.cap {
@@ -847,7 +1022,7 @@ fn list_append_raw(list_object: *mut PyObject, item: *mut PyObject) -> Result<()
 }
 
 
-fn replace_list_contents(list: &mut PyList, values: &[*mut PyObject]) -> Result<(), String> {
+fn replace_list_contents(list: &mut list::PyListStorage, values: &[*mut PyObject]) -> Result<(), String> {
     let new_items = leak_slots(values.len())?;
     if !new_items.is_null() {
         unsafe { copy_heap_pointer_slice(new_items, values) };
@@ -860,11 +1035,10 @@ fn replace_list_contents(list: &mut PyList, values: &[*mut PyObject]) -> Result<
 }
 
 fn list_delete_index_raw(list_object: *mut PyObject, index: isize) -> Result<(), String> {
-    if !is_list(list_object) {
+    let Some(list) = (unsafe { list_cells(list_object) }) else {
         return Err(format!("list deletion expected list, got {}", object_type_name(list_object)));
-    }
+    };
     let _guard = crate::sync::begin_critical_section(list_object);
-    let list = unsafe { &mut *list_object.cast::<PyList>() };
     let index = normalize_index(index, list.len)?;
     unsafe {
         for pos in index..list.len - 1 {
@@ -878,28 +1052,26 @@ fn list_delete_index_raw(list_object: *mut PyObject, index: isize) -> Result<(),
 }
 
 fn list_set_index_raw(list_object: *mut PyObject, index: isize, value: *mut PyObject) -> Result<(), String> {
-    if !is_list(list_object) {
-        return Err(format!("list assignment expected list, got {}", object_type_name(list_object)));
-    }
     if value.is_null() {
         return list_delete_index_raw(list_object, index);
     }
+    let Some(list) = (unsafe { list_cells(list_object) }) else {
+        return Err(format!("list assignment expected list, got {}", object_type_name(list_object)));
+    };
     let _guard = crate::sync::begin_critical_section(list_object);
-    let list = unsafe { &mut *list_object.cast::<PyList>() };
     let index = normalize_index(index, list.len)?;
     unsafe { crate::sync::store_heap_pointer(list.items.add(index), value) };
     Ok(())
 }
 
 fn list_assign_slice_raw(list_object: *mut PyObject, key: *mut PyObject, value: *mut PyObject) -> Result<(), String> {
-    if !is_list(list_object) {
-        return Err(format!("slice assignment expected list, got {}", object_type_name(list_object)));
-    }
     if !is_slice(key) {
         return Err("slice assignment key is not a slice".to_owned());
     }
+    let Some(list) = (unsafe { list_cells(list_object) }) else {
+        return Err(format!("slice assignment expected list, got {}", object_type_name(list_object)));
+    };
     let _guard = crate::sync::begin_critical_section(list_object);
-    let list = unsafe { &mut *list_object.cast::<PyList>() };
     let indices = unsafe { normalize_slice(&*key.cast::<PySlice>(), list.len)? };
     let mut current = unsafe { list.as_slice() }.to_vec();
 
@@ -972,11 +1144,10 @@ fn range_subscript_raw(object: *mut PyObject, key: *mut PyObject) -> Result<*mut
 }
 
 fn list_pop_raw(list_object: *mut PyObject, index: isize) -> Result<*mut PyObject, String> {
-    if !is_list(list_object) {
+    let Some(list) = (unsafe { list_cells(list_object) }) else {
         return Err(format!("list pop expected list, got {}", object_type_name(list_object)));
-    }
+    };
     let _guard = crate::sync::begin_critical_section(list_object);
-    let list = unsafe { &mut *list_object.cast::<PyList>() };
     let index = normalize_index(index, list.len)?;
     let value = unsafe { *list.items.add(index) };
     unsafe {
@@ -991,10 +1162,10 @@ fn list_pop_raw(list_object: *mut PyObject, index: isize) -> Result<*mut PyObjec
 }
 
 fn list_index_raw(list_object: *mut PyObject, needle: *mut PyObject) -> Result<usize, String> {
-    if !is_list(list_object) {
+    let Some(list) = (unsafe { list_cells_ptr(list_object) }) else {
         return Err(format!("list.index expected list, got {}", object_type_name(list_object)));
-    }
-    let list = unsafe { &*list_object.cast::<PyList>() };
+    };
+    let list = unsafe { &*list };
     for (index, item) in unsafe { list.as_slice() }.iter().copied().enumerate() {
         if unsafe { crate::types::dict::object_equal(item, needle)? } {
             return Ok(index);
@@ -1004,10 +1175,10 @@ fn list_index_raw(list_object: *mut PyObject, needle: *mut PyObject) -> Result<u
 }
 
 fn list_count_raw(list_object: *mut PyObject, needle: *mut PyObject) -> Result<usize, String> {
-    if !is_list(list_object) {
+    let Some(list) = (unsafe { list_cells_ptr(list_object) }) else {
         return Err(format!("list.count expected list, got {}", object_type_name(list_object)));
-    }
-    let list = unsafe { &*list_object.cast::<PyList>() };
+    };
+    let list = unsafe { &*list };
     let mut count = 0usize;
     for item in unsafe { list.as_slice() }.iter().copied() {
         if unsafe { crate::types::dict::object_equal(item, needle)? } {
@@ -1018,11 +1189,10 @@ fn list_count_raw(list_object: *mut PyObject, needle: *mut PyObject) -> Result<u
 }
 
 fn tuple_index_raw(tuple_object: *mut PyObject, needle: *mut PyObject) -> Result<usize, String> {
-    if !is_tuple(tuple_object) {
+    let Some(items) = (unsafe { tuple_storage_slice(tuple_object) }) else {
         return Err(format!("tuple.index expected tuple, got {}", object_type_name(tuple_object)));
-    }
-    let tuple = unsafe { &*tuple_object.cast::<PyTuple>() };
-    for (index, item) in unsafe { tuple.as_slice() }.iter().copied().enumerate() {
+    };
+    for (index, item) in items.iter().copied().enumerate() {
         if unsafe { crate::types::dict::object_equal(item, needle)? } {
             return Ok(index);
         }
@@ -1031,12 +1201,11 @@ fn tuple_index_raw(tuple_object: *mut PyObject, needle: *mut PyObject) -> Result
 }
 
 fn tuple_count_raw(tuple_object: *mut PyObject, needle: *mut PyObject) -> Result<usize, String> {
-    if !is_tuple(tuple_object) {
+    let Some(items) = (unsafe { tuple_storage_slice(tuple_object) }) else {
         return Err(format!("tuple.count expected tuple, got {}", object_type_name(tuple_object)));
-    }
-    let tuple = unsafe { &*tuple_object.cast::<PyTuple>() };
+    };
     let mut count = 0usize;
-    for item in unsafe { tuple.as_slice() }.iter().copied() {
+    for item in items.iter().copied() {
         if unsafe { crate::types::dict::object_equal(item, needle)? } {
             count += 1;
         }
@@ -1163,20 +1332,20 @@ unsafe fn list_sort_with_options(list: *mut PyObject, key: *mut PyObject, revers
     if list.is_null() {
         return ptr::null_mut();
     }
-    if !is_list(list) {
+    if !has_list_storage(list) {
         return raise_seq_type_error(format!("list.sort expected list, got {}", object_type_name(list)));
     }
     let mut items = {
         let _guard = crate::sync::begin_critical_section(list);
-        // SAFETY: `list` is a live PyList per the check above.
-        unsafe { (&*list.cast::<PyList>()).as_slice() }.to_vec()
+        // SAFETY: `has_list_storage` proved a resolvable cell block.
+        unsafe { (&*list_cells_ptr(list).expect("storage checked above")).as_slice() }.to_vec()
     };
     if crate::native::builtins_batch::stable_sort(&mut items, key, reverse).is_err() {
         return ptr::null_mut();
     }
     let _guard = crate::sync::begin_critical_section(list);
     // SAFETY: As above; the critical section serializes the write-back.
-    let values = unsafe { (&mut *list.cast::<PyList>()).as_mut_slice() };
+    let values = unsafe { (&mut *list_cells_ptr(list).expect("storage checked above")).as_mut_slice() };
     if values.len() != items.len() {
         let message = "list modified during sort";
         // SAFETY: Typed raise helper with a static message.
@@ -1195,11 +1364,10 @@ unsafe extern "C" fn list_reverse_method(argv: *mut *mut PyObject, argc: usize) 
         if args.len() != 1 {
             return raise_seq_type_error(format!("list.reverse expected 0 arguments, got {}", args.len().saturating_sub(1)));
         }
-        if !is_list(args[0]) {
+        let Some(list) = (unsafe { list_cells(args[0]) }) else {
             return raise_seq_type_error(format!("list.reverse expected list, got {}", object_type_name(args[0])));
-        }
+        };
         let _guard = crate::sync::begin_critical_section(args[0]);
-        let list = unsafe { &mut *args[0].cast::<PyList>() };
         unsafe { list.as_mut_slice() }.reverse();
         seq_none()
     })
@@ -1274,11 +1442,10 @@ unsafe extern "C" fn list_insert_method(argv: *mut *mut PyObject, argc: usize) -
             Ok(index) => index,
             Err(message) => return raise_seq_stream_error(message),
         };
-        if !is_list(args[0]) {
+        let Some(list) = (unsafe { list_cells(args[0]) }) else {
             return raise_seq_type_error(format!("list.insert expected list, got {}", object_type_name(args[0])));
-        }
+        };
         let _guard = crate::sync::begin_critical_section(args[0]);
-        let list = unsafe { &mut *args[0].cast::<PyList>() };
         let len = match isize::try_from(list.len) {
             Ok(len) => len,
             Err(_) => return return_null_with_error("list length is too large"),
@@ -1370,7 +1537,7 @@ fn py_hash(object: *mut PyObject) -> Result<isize, String> {
         if is_exact_type(object, runtime.none_type) {
             return Ok(0x9e3779b97f4a7c15_u64 as isize);
         }
-        if is_tuple(object) {
+        if has_tuple_storage(object) {
             let hash = tuple_hash_impl(object)?;
             return Ok(hash);
         }
@@ -1390,15 +1557,16 @@ fn py_hash(object: *mut PyObject) -> Result<isize, String> {
 }
 
 fn tuple_hash_impl(object: *mut PyObject) -> Result<isize, String> {
-    let tuple = unsafe { &*object.cast::<PyTuple>() };
+    let items = unsafe { tuple_storage_slice(object) }
+        .ok_or_else(|| format!("tuple hash expected tuple, got {}", object_type_name(object)))?;
     let mut acc = 0x27d4eb2f165667c5_u64;
-    for item in unsafe { tuple.as_slice() } {
+    for item in items {
         let lane = py_hash(*item)? as u64;
         acc = acc.wrapping_add(lane.wrapping_mul(0xc2b2ae3d27d4eb4f));
         acc = acc.rotate_left(31);
         acc = acc.wrapping_mul(0x9e3779b185ebca87);
     }
-    acc = acc.wrapping_add((tuple.len as u64) ^ (0x27d4eb2f165667c5_u64 ^ 3527539));
+    acc = acc.wrapping_add((items.len() as u64) ^ (0x27d4eb2f165667c5_u64 ^ 3527539));
     let hash = acc as isize;
     Ok(if hash == -1 { 1546275796 } else { hash })
 }
@@ -1446,12 +1614,11 @@ unsafe extern "C" fn list_len_slot(object: *mut PyObject) -> isize {
 }
 
 unsafe extern "C" fn tuple_len_slot(object: *mut PyObject) -> isize {
-    if !is_tuple(object) {
+    let Some(items) = (unsafe { tuple_storage_slice(object) }) else {
         pon_err_set("tuple length slot received a non-tuple");
         return -1;
-    }
-    let len = unsafe { (*object.cast::<PyTuple>()).len };
-    isize::try_from(len).unwrap_or_else(|_| {
+    };
+    isize::try_from(items.len()).unwrap_or_else(|_| {
         pon_err_set("tuple length exceeds isize");
         -1
     })
@@ -1479,12 +1646,11 @@ unsafe extern "C" fn list_contains_slot(object: *mut PyObject, item: *mut PyObje
 }
 
 unsafe extern "C" fn tuple_contains_slot(object: *mut PyObject, item: *mut PyObject) -> c_int {
-    if !is_tuple(object) {
+    let Some(items) = (unsafe { tuple_storage_slice(object) }) else {
         pon_err_set("tuple contains slot received a non-tuple");
         return -1;
-    }
-    let tuple = unsafe { &*object.cast::<PyTuple>() };
-    contains_slice(unsafe { tuple.as_slice() }, item)
+    };
+    contains_slice(items, item)
 }
 
 fn contains_slice(items: &[*mut PyObject], item: *mut PyObject) -> c_int {
@@ -1523,11 +1689,11 @@ unsafe extern "C" fn range_item_slot(object: *mut PyObject, index: isize) -> *mu
 }
 
 unsafe extern "C" fn tuple_concat_slot(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    if !is_tuple(left) || !is_tuple(right) {
+    let (Some(left_items), Some(right_items)) =
+        (unsafe { tuple_storage_slice(left) }, unsafe { tuple_storage_slice(right) })
+    else {
         return raise_seq_type_error("can only concatenate tuple to tuple");
-    }
-    let left_items = unsafe { (&*left.cast::<PyTuple>()).as_slice() };
-    let right_items = unsafe { (&*right.cast::<PyTuple>()).as_slice() };
+    };
     let mut values = Vec::with_capacity(left_items.len().saturating_add(right_items.len()));
     values.extend_from_slice(left_items);
     values.extend_from_slice(right_items);
@@ -1571,14 +1737,13 @@ unsafe extern "C" fn list_repeat_slot(object: *mut PyObject, count: *mut PyObjec
 }
 
 unsafe extern "C" fn tuple_repeat_slot(object: *mut PyObject, count: *mut PyObject) -> *mut PyObject {
-    if !is_tuple(object) {
+    let Some(items) = (unsafe { tuple_storage_slice(object) }) else {
         return raise_seq_type_error("can only repeat tuple");
-    }
+    };
     let count = match repeat_count_value(count) {
         Ok(count) => count,
         Err(message) => return raise_seq_repeat_error(message),
     };
-    let items = unsafe { (&*object.cast::<PyTuple>()).as_slice() };
     let values = match repeated_values(items, count) {
         Ok(values) => values,
         Err(message) => return return_null_with_error(message),
@@ -1650,7 +1815,7 @@ fn ensure_list_method_receiver(args: &[*mut PyObject], name: &str) -> Result<*mu
     if receiver.is_null() {
         return Err(ptr::null_mut());
     }
-    if !is_list(receiver) {
+    if !has_list_storage(receiver) {
         let ty = unsafe { dict::type_name(receiver) }.unwrap_or("object");
         let message = format!("descriptor '{name}' for 'list' objects doesn't apply to a '{ty}' object");
         return Err(unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) });
@@ -1692,6 +1857,16 @@ pub(crate) fn ensure_list_type_methods_installed(ty: *mut PyType) {
         ("count", list_count_method as *const u8),
         ("insert", list_insert_method as *const u8),
         ("remove", list_remove_method as *const u8),
+        ("__init__", list_dunder_init as *const u8),
+        ("__len__", list_dunder_len as *const u8),
+        ("__getitem__", list_dunder_getitem as *const u8),
+        ("__setitem__", list_dunder_setitem as *const u8),
+        ("__delitem__", list_dunder_delitem as *const u8),
+        ("__iter__", list_dunder_iter as *const u8),
+        ("__contains__", list_dunder_contains as *const u8),
+        ("__eq__", list_dunder_eq as *const u8),
+        ("__ne__", list_dunder_ne as *const u8),
+        ("__repr__", list_dunder_repr as *const u8),
     ];
     for (name, code) in natives {
         let interned = crate::intern::intern(name);
@@ -1710,6 +1885,624 @@ pub(crate) fn ensure_list_type_methods_installed(ty: *mut PyType) {
     // AttrIC guarding the type object.
     crate::sync::register_namespaced_type(ty);
     crate::sync::type_modified(ty);
+}
+
+/// Ensures the global `list` type object carries the full method/dunder
+/// surface list-derived heap classes resolve through their MRO.  Idempotent;
+/// called from class construction when a class linearizes over `list`.
+pub(crate) fn ensure_list_subclass_surface() {
+    if let Some(ty) = crate::native::builtins_mod::builtin_native_type("list") {
+        ensure_list_type_methods_installed(ty);
+    }
+}
+
+/// Unbound-receiver validation for tuple method descriptors reached off the
+/// type (`tuple.index(t, …)`) or through a subclass MRO — mirrors
+/// `ensure_list_method_receiver`.  Returns the untagged receiver, or the
+/// raised NULL sentinel.
+fn ensure_tuple_method_receiver(args: &[*mut PyObject], name: &str) -> Result<*mut PyObject, *mut PyObject> {
+    if args.is_empty() {
+        let message = format!("unbound method tuple.{name}() needs an argument");
+        return Err(unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) });
+    }
+    let receiver = crate::tag::untag_arg(args[0]);
+    if receiver.is_null() {
+        return Err(ptr::null_mut());
+    }
+    if !has_tuple_storage(receiver) {
+        let ty = unsafe { dict::type_name(receiver) }.unwrap_or("object");
+        let message = format!("descriptor '{name}' for 'tuple' objects doesn't apply to a '{ty}' object");
+        return Err(unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) });
+    }
+    Ok(receiver)
+}
+
+/// `tuple.__new__(cls, iterable=())` argument shape: zero or one positional
+/// argument.  Returns the materialized item vector.
+pub(crate) fn tuple_ctor_values(ctor_args: &[*mut PyObject]) -> Result<Vec<*mut PyObject>, String> {
+    if ctor_args.len() > 1 {
+        return Err(format!("tuple expected at most 1 argument, got {}", ctor_args.len()));
+    }
+    match ctor_args.first() {
+        Some(&iterable) => sequence_to_vec(iterable),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// `tuple.__new__` core: build the values, then allocate the layout `cls`
+/// prescribes — the exact seq-family tuple for the builtin, the extended
+/// subclass layout for tuple-derived heap classes.
+pub(crate) fn construct_tuple_for_class(cls: *mut PyType, ctor_args: &[*mut PyObject]) -> Result<*mut PyObject, String> {
+    let values = tuple_ctor_values(ctor_args)?;
+    if unsafe { tuple::type_is_tuple_subclass(cls) } {
+        return unsafe { type_::alloc_tuple_instance_for_class(cls, &values) };
+    }
+    // `cls` is the builtin itself (the global constructor type or the
+    // seq-family instance type): the canonical exact tuple IS the instance.
+    with_runtime(|runtime| alloc_tuple_from_slice(runtime, &values))
+        .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
+}
+
+/// Python-visible `tuple.__new__(cls, iterable=())` staticmethod carrier —
+/// the construction terminus `collections.namedtuple` captures at import
+/// time (`_tuple_new = tuple.__new__`) and every tuple-derived class reaches
+/// through `call_type_from_argv`'s MRO `__new__` lookup.  Tuples are
+/// immutable, so this consumes the iterable completely; the permissive
+/// `object.__init__` leg that follows never re-runs construction.
+unsafe extern "C" fn tuple_dunder_new(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "tuple.__new__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        if args.is_empty() {
+            return raise_seq_type_error("tuple.__new__(): not enough arguments");
+        }
+        let cls = args[0];
+        if unsafe { !type_::is_type_object(cls) } {
+            return raise_seq_type_error("tuple.__new__(X): X is not a type object");
+        }
+        let cls_ty = cls.cast::<PyType>();
+        let is_tuple_subtype = unsafe { tuple::type_is_tuple_subclass(cls_ty) }
+            || unsafe { crate::mro::mro_entries(cls_ty) }.iter().any(|entry| {
+                !entry.is_null()
+                    && unsafe {
+                        (**entry).gc_type_id != type_::TYPE_ID_HEAP_INSTANCE.0 as usize
+                            && (**entry).name() == "tuple"
+                    }
+            });
+        if !is_tuple_subtype {
+            let cls_name = unsafe { (*cls_ty).name() };
+            return raise_seq_type_error(format!("tuple.__new__({cls_name}): {cls_name} is not a subtype of tuple"));
+        }
+        match construct_tuple_for_class(cls_ty, &args[1..]) {
+            Ok(object) => object,
+            Err(message) => raise_seq_type_error(message),
+        }
+    })
+}
+
+/// `tuple.__len__(self)`.
+unsafe extern "C" fn tuple_dunder_len(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "tuple.__len__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_tuple_method_receiver(args, "__len__") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        match sequence_len_raw(receiver) {
+            Ok(len) => unsafe { super::pon_const_int(len as i64) },
+            Err(message) => return_null_with_error(message),
+        }
+    })
+}
+
+/// `tuple.__getitem__(self, index_or_slice)`.
+unsafe extern "C" fn tuple_dunder_getitem(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "tuple.__getitem__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_tuple_method_receiver(args, "__getitem__") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        if args.len() != 2 {
+            return raise_seq_type_error(format!(
+                "tuple.__getitem__ expected 1 argument, got {}",
+                args.len().saturating_sub(1)
+            ));
+        }
+        match tuple_subscript_raw(receiver, args[1]) {
+            Ok(value) => value,
+            Err(message) => return_null_with_sequence_error(message),
+        }
+    })
+}
+
+/// `tuple.__iter__(self)`: an index-tracking sequence iterator over either
+/// tuple layout (`seq_iter_next_slot` reads through the widened raw helpers).
+unsafe extern "C" fn tuple_dunder_iter(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "tuple.__iter__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_tuple_method_receiver(args, "__iter__") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        match with_runtime(|runtime| alloc_seq_iter(runtime, receiver)) {
+            Some(Ok(iterator)) => iterator,
+            Some(Err(message)) => return_null_with_error(message),
+            None => return_null_with_error("runtime is not initialized"),
+        }
+    })
+}
+
+/// `tuple.__contains__(self, item)`.
+unsafe extern "C" fn tuple_dunder_contains(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "tuple.__contains__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_tuple_method_receiver(args, "__contains__") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        if args.len() != 2 {
+            return raise_seq_type_error(format!(
+                "tuple.__contains__ expected 1 argument, got {}",
+                args.len().saturating_sub(1)
+            ));
+        }
+        match tuple_count_raw(receiver, args[1]) {
+            Ok(count) => unsafe { super::number::pon_const_bool(i32::from(count != 0)) },
+            Err(message) => raise_seq_stream_error(message),
+        }
+    })
+}
+
+/// `tuple.__eq__(self, other)` / `tuple.__ne__(self, other)` share the
+/// widened sequence comparator; non-tuple operands yield NotImplemented.
+unsafe fn tuple_dunder_compare(argv: *mut *mut PyObject, argc: usize, name: &str, op: u8) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, name) {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_tuple_method_receiver(args, name.trim_start_matches("tuple.")) {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        if args.len() != 2 {
+            return raise_seq_type_error(format!("{name} expected 1 argument, got {}", args.len().saturating_sub(1)));
+        }
+        let other = crate::tag::untag_arg(args[1]);
+        if other.is_null() {
+            return ptr::null_mut();
+        }
+        unsafe { sequence_richcmp(receiver, other, c_int::from(op), true) }
+    })
+}
+
+unsafe extern "C" fn tuple_dunder_eq(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { tuple_dunder_compare(argv, argc, "tuple.__eq__", RICH_EQ) }
+}
+
+unsafe extern "C" fn tuple_dunder_ne(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { tuple_dunder_compare(argv, argc, "tuple.__ne__", RICH_NE) }
+}
+
+/// `tuple.__hash__(self)`: the structural tuple hash (namedtuples are dict
+/// keys; equal contents must collide across both layouts).
+unsafe extern "C" fn tuple_dunder_hash(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "tuple.__hash__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_tuple_method_receiver(args, "__hash__") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        match tuple_hash_impl(receiver) {
+            Ok(hash) => unsafe { super::pon_const_int(hash as i64) },
+            Err(message) => return_null_with_error(message),
+        }
+    })
+}
+
+/// `tuple.__repr__(self)`: Python tuple display over either storage layout,
+/// with the single-element trailing comma (`(1,)`).
+unsafe extern "C" fn tuple_dunder_repr(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "tuple.__repr__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_tuple_method_receiver(args, "__repr__") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        let Some(items) = (unsafe { tuple_storage_slice(receiver) }) else {
+            return raise_seq_type_error(format!("tuple.__repr__ expected tuple, got {}", object_type_name(receiver)));
+        };
+        let mut out = String::from("(");
+        for (index, item) in items.iter().copied().enumerate() {
+            if index != 0 {
+                out.push_str(", ");
+            }
+            match crate::native::builtins_mod::try_repr_text(item) {
+                Ok(text) => out.push_str(&text),
+                Err(()) => return ptr::null_mut(),
+            }
+        }
+        if items.len() == 1 {
+            out.push(',');
+        }
+        out.push(')');
+        unsafe { crate::abi::pon_const_str(out.as_ptr(), out.len()) }
+    })
+}
+
+/// `tuple.__add__(self, other)`: concatenation over either storage layout;
+/// the result is always an exact tuple (CPython `sq_concat`).
+unsafe extern "C" fn tuple_dunder_add(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "tuple.__add__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_tuple_method_receiver(args, "__add__") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        if args.len() != 2 {
+            return raise_seq_type_error(format!(
+                "tuple.__add__ expected 1 argument, got {}",
+                args.len().saturating_sub(1)
+            ));
+        }
+        let other = crate::tag::untag_arg(args[1]);
+        if other.is_null() {
+            return ptr::null_mut();
+        }
+        unsafe { tuple_concat_slot(receiver, other) }
+    })
+}
+
+/// `tuple.__mul__(self, count)` / `tuple.__rmul__(self, count)`: repetition
+/// over either storage layout; the result is always an exact tuple.
+unsafe fn tuple_dunder_repeat(argv: *mut *mut PyObject, argc: usize, name: &str) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, name) {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_tuple_method_receiver(args, name.trim_start_matches("tuple.")) {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        if args.len() != 2 {
+            return raise_seq_type_error(format!("{name} expected 1 argument, got {}", args.len().saturating_sub(1)));
+        }
+        unsafe { tuple_repeat_slot(receiver, args[1]) }
+    })
+}
+
+unsafe extern "C" fn tuple_dunder_mul(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { tuple_dunder_repeat(argv, argc, "tuple.__mul__") }
+}
+
+unsafe extern "C" fn tuple_dunder_rmul(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { tuple_dunder_repeat(argv, argc, "tuple.__rmul__") }
+}
+
+/// One-shot installer for the builtin `tuple` type object's `tp_dict`
+/// surface: the method/dunder set tuple-derived heap classes resolve through
+/// their MRO, plus the Python-visible `tuple.__new__` staticmethod carrier
+/// `collections.namedtuple` captures at import time (`_tuple_new`).
+///
+/// `ty` is the GLOBAL `tuple` type object — distinct from the seq-family
+/// instance type returned by [`tuple_type`]; the trampolines validate the
+/// instance layout themselves.  Existing `tp_dict` entries are kept.
+pub(crate) fn ensure_tuple_type_methods_installed(ty: *mut PyType) {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if ty.is_null() || INSTALLED.load(AtomicOrdering::SeqCst) {
+        return;
+    }
+    // Pre-runtime call sites must not latch a no-op install: the function
+    // allocations below need a live runtime.
+    if crate::abi::runtime_type_type().is_null() {
+        return;
+    }
+    if INSTALLED.swap(true, AtomicOrdering::SeqCst) {
+        return;
+    }
+    let namespace = unsafe { (*ty).tp_dict.cast::<type_::PyClassDict>() };
+    let namespace = if namespace.is_null() { type_::new_namespace() } else { namespace };
+    // `__new__` is a staticmethod carrier (CPython: implicitly static), so
+    // `tuple.__new__` and `cls.__new__` lookups never bind the receiver.
+    let new_name = crate::intern::intern("__new__");
+    if unsafe { (&*namespace).get(new_name) }.is_none() {
+        if let Ok(function) = alloc_native_seq_function("__new__", tuple_dunder_new) {
+            let descriptor =
+                unsafe { crate::types::classmethod::new_staticmethod(super::staticmethod_builtin_type(), function) };
+            if !descriptor.is_null() {
+                unsafe { (&mut *namespace).set(new_name, descriptor.cast::<PyObject>()) };
+            }
+        }
+    }
+    let natives: &[(&str, *const u8)] = &[
+        ("count", tuple_count_method as *const u8),
+        ("index", tuple_index_method as *const u8),
+        ("__len__", tuple_dunder_len as *const u8),
+        ("__getitem__", tuple_dunder_getitem as *const u8),
+        ("__iter__", tuple_dunder_iter as *const u8),
+        ("__contains__", tuple_dunder_contains as *const u8),
+        ("__eq__", tuple_dunder_eq as *const u8),
+        ("__ne__", tuple_dunder_ne as *const u8),
+        ("__hash__", tuple_dunder_hash as *const u8),
+        ("__repr__", tuple_dunder_repr as *const u8),
+        ("__add__", tuple_dunder_add as *const u8),
+        ("__mul__", tuple_dunder_mul as *const u8),
+        ("__rmul__", tuple_dunder_rmul as *const u8),
+    ];
+    for (name, code) in natives {
+        let interned = crate::intern::intern(name);
+        if unsafe { (&*namespace).get(interned) }.is_some() {
+            continue;
+        }
+        let function = unsafe { crate::abi::pon_make_function(*code, crate::builtins::variadic_arity(), interned) };
+        if !function.is_null() {
+            unsafe { (&mut *namespace).set(interned, function) };
+        }
+    }
+    unsafe {
+        (*ty).tp_dict = namespace.cast::<PyObject>();
+    }
+    // GC rooting for the namespace values plus IC invalidation for any
+    // AttrIC guarding the type object.
+    crate::sync::register_namespaced_type(ty);
+    crate::sync::type_modified(ty);
+}
+
+/// Ensures the global `tuple` type object carries the method/dunder/`__new__`
+/// surface tuple-derived heap classes resolve through their MRO.  Idempotent;
+/// called eagerly at runtime bootstrap (collections captures `tuple.__new__`
+/// at import time) and from class construction when a class linearizes over
+/// `tuple`.
+pub(crate) fn ensure_tuple_subclass_surface() {
+    if let Some(ty) = crate::native::builtins_mod::builtin_native_type("tuple") {
+        ensure_tuple_type_methods_installed(ty);
+    }
+}
+
+/// `list.__init__(self, iterable=())`: replaces the receiver's contents,
+/// CPython's list-init semantics for both exact lists and subclasses.
+unsafe extern "C" fn list_dunder_init(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.__init__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_list_method_receiver(args, "__init__") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        if args.len() > 2 {
+            return raise_seq_type_error(format!("list expected at most 1 argument, got {}", args.len().saturating_sub(1)));
+        }
+        let values = if args.len() == 2 {
+            match sequence_to_vec(args[1]) {
+                Ok(values) => values,
+                Err(message) => return raise_seq_type_error(message),
+            }
+        } else {
+            Vec::new()
+        };
+        let Some(cells) = (unsafe { list_cells(receiver) }) else {
+            return raise_seq_type_error(format!("list.__init__ expected list, got {}", object_type_name(receiver)));
+        };
+        let _guard = crate::sync::begin_critical_section(receiver);
+        match replace_list_contents(cells, &values) {
+            Ok(()) => seq_none(),
+            Err(message) => return_null_with_error(message),
+        }
+    })
+}
+
+/// `list.__len__(self)`.
+unsafe extern "C" fn list_dunder_len(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.__len__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_list_method_receiver(args, "__len__") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        match sequence_len_raw(receiver) {
+            Ok(len) => unsafe { super::pon_const_int(len as i64) },
+            Err(message) => return_null_with_error(message),
+        }
+    })
+}
+
+/// `list.__getitem__(self, index_or_slice)`.
+unsafe extern "C" fn list_dunder_getitem(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.__getitem__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_list_method_receiver(args, "__getitem__") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        if args.len() != 2 {
+            return raise_seq_type_error(format!("list.__getitem__ expected 1 argument, got {}", args.len().saturating_sub(1)));
+        }
+        match list_subscript_raw(receiver, args[1]) {
+            Ok(value) => value,
+            Err(message) => return_null_with_sequence_error(message),
+        }
+    })
+}
+
+/// `list.__setitem__(self, index_or_slice, value)`.
+unsafe extern "C" fn list_dunder_setitem(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.__setitem__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_list_method_receiver(args, "__setitem__") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        if args.len() != 3 {
+            return raise_seq_type_error(format!("list.__setitem__ expected 2 arguments, got {}", args.len().saturating_sub(1)));
+        }
+        match list_ass_subscript_raw(receiver, args[1], args[2]) {
+            Ok(()) => seq_none(),
+            Err(message) => return_null_with_sequence_error(message),
+        }
+    })
+}
+
+/// `list.__delitem__(self, index_or_slice)`.
+unsafe extern "C" fn list_dunder_delitem(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.__delitem__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_list_method_receiver(args, "__delitem__") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        if args.len() != 2 {
+            return raise_seq_type_error(format!("list.__delitem__ expected 1 argument, got {}", args.len().saturating_sub(1)));
+        }
+        match list_ass_subscript_raw(receiver, args[1], ptr::null_mut()) {
+            Ok(()) => seq_none(),
+            Err(message) => return_null_with_sequence_error(message),
+        }
+    })
+}
+
+/// `list.__iter__(self)`: a live index-tracking sequence iterator, so
+/// mutations during iteration are observed like CPython's list_iterator.
+unsafe extern "C" fn list_dunder_iter(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.__iter__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_list_method_receiver(args, "__iter__") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        match with_runtime(|runtime| alloc_seq_iter(runtime, receiver)) {
+            Some(Ok(iterator)) => iterator,
+            Some(Err(message)) => return_null_with_error(message),
+            None => return_null_with_error("runtime is not initialized"),
+        }
+    })
+}
+
+/// `list.__contains__(self, item)`.
+unsafe extern "C" fn list_dunder_contains(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.__contains__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_list_method_receiver(args, "__contains__") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        if args.len() != 2 {
+            return raise_seq_type_error(format!("list.__contains__ expected 1 argument, got {}", args.len().saturating_sub(1)));
+        }
+        match list_count_raw(receiver, args[1]) {
+            Ok(count) => unsafe { super::number::pon_const_bool(i32::from(count != 0)) },
+            Err(message) => raise_seq_stream_error(message),
+        }
+    })
+}
+
+/// `list.__eq__(self, other)` / `list.__ne__(self, other)` share the
+/// widened sequence comparator; non-list operands yield NotImplemented.
+unsafe fn list_dunder_compare(argv: *mut *mut PyObject, argc: usize, name: &str, op: u8) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, name) {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_list_method_receiver(args, name.trim_start_matches("list.")) {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        if args.len() != 2 {
+            return raise_seq_type_error(format!("{name} expected 1 argument, got {}", args.len().saturating_sub(1)));
+        }
+        let other = crate::tag::untag_arg(args[1]);
+        if other.is_null() {
+            return ptr::null_mut();
+        }
+        unsafe { sequence_richcmp(receiver, other, c_int::from(op), false) }
+    })
+}
+
+unsafe extern "C" fn list_dunder_eq(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { list_dunder_compare(argv, argc, "list.__eq__", RICH_EQ) }
+}
+
+unsafe extern "C" fn list_dunder_ne(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { list_dunder_compare(argv, argc, "list.__ne__", RICH_NE) }
+}
+
+/// `list.__repr__(self)`: Python list display over the embedded storage.
+unsafe extern "C" fn list_dunder_repr(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.__repr__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_list_method_receiver(args, "__repr__") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        let items = {
+            let _guard = crate::sync::begin_critical_section(receiver);
+            match unsafe { list_cells_ptr(receiver) } {
+                Some(cells) => unsafe { (&*cells).as_slice() }.to_vec(),
+                None => return raise_seq_type_error(format!("list.__repr__ expected list, got {}", object_type_name(receiver))),
+            }
+        };
+        let mut out = String::from("[");
+        for (index, item) in items.iter().copied().enumerate() {
+            if index != 0 {
+                out.push_str(", ");
+            }
+            match crate::native::builtins_mod::try_repr_text(item) {
+                Ok(text) => out.push_str(&text),
+                Err(()) => return ptr::null_mut(),
+            }
+        }
+        out.push(']');
+        unsafe { crate::abi::pon_const_str(out.as_ptr(), out.len()) }
+    })
 }
 
 unsafe extern "C" fn tuple_getattro_slot(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
@@ -1852,6 +2645,7 @@ pub unsafe extern "C" fn pon_build_range(start: *mut PyObject, stop: *mut PyObje
         let step_value = if is_none(step) { 1 } else { match long_value(step) { Ok(value) => value, Err(message) => return raise_seq_type_error(message) } };
         match with_runtime(|runtime| alloc_range(runtime, start_value, stop_value, step_value)) {
             Some(Ok(object)) => object,
+            Some(Err(message)) if message == "range() arg 3 must not be zero" => raise_typed(ExceptionKind::ValueError, &message),
             Some(Err(message)) => return_null_with_error(message),
             None => return_null_with_error("runtime is not initialized"),
         }
@@ -1938,11 +2732,10 @@ pub unsafe extern "C" fn pon_list_to_tuple(list: *mut PyObject) -> *mut PyObject
 pub unsafe extern "C" fn pon_list_sort(list: *mut PyObject) -> *mut PyObject {
     crate::untag_prelude!(list);
     catch_object_helper(|| {
-        if !is_list(list) {
+        let Some(pylist) = (unsafe { list_cells(list) }) else {
             return return_null_with_error(format!("list.sort expected list, got {}", object_type_name(list)));
-        }
+        };
         let _guard = crate::sync::begin_critical_section(list);
-        let pylist = unsafe { &mut *list.cast::<PyList>() };
         let values = unsafe { pylist.as_mut_slice() };
         if let Err(message) = validate_sortable(values) {
             return raise_seq_type_error(message);

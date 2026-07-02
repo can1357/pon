@@ -139,6 +139,22 @@ pub struct ClassKeyword {
 /// GC type id for Python heap instances allocated by [`type_new`].
 pub const TYPE_ID_HEAP_INSTANCE: TypeId = TypeId(10);
 
+/// Returns true when instances of `ty` belong to the Python class-instance
+/// family whose MRO may carry Python-level dunder hooks: plain heap instances
+/// (including dict/payload extended layouts, which share the id) plus
+/// BaseException-derived heap classes (boxed-exception layout, stamped by
+/// `construct_class`).
+#[must_use]
+pub fn type_dispatches_python_dunders(ty: *const PyType) -> bool {
+    if ty.is_null() {
+        return false;
+    }
+    let id = unsafe { (*ty).gc_type_id };
+    id == TYPE_ID_HEAP_INSTANCE.0 as usize
+        || id == crate::abi::TYPE_ID_EXCEPTION.0 as usize
+        || id == crate::abi::TYPE_ID_EXCEPTION_GROUP.0 as usize
+}
+
 fn raise_object(message: impl Into<String>) -> *mut PyObject {
     pon_err_set(message);
     ptr::null_mut()
@@ -252,6 +268,20 @@ pub(crate) unsafe fn alloc_payload_instance_for_class(cls: *mut PyType, value: *
         ptr::null_mut()
     };
     unsafe { abi::alloc_payload_subclass_instance(cls, dict, slot_storage(cls), value) }
+}
+
+/// Allocate a tuple-subclass instance of `cls` carrying `values`, with the
+/// instance dict/slot storage `cls` prescribes (`tuple.__new__` carrier path).
+pub(crate) unsafe fn alloc_tuple_instance_for_class(
+    cls: *mut PyType,
+    values: &[*mut PyObject],
+) -> Result<*mut PyObject, String> {
+    let dict = if unsafe { (*cls).tp_dictoffset != 0 } {
+        new_namespace()
+    } else {
+        ptr::null_mut()
+    };
+    crate::abi::seq::alloc_tuple_subclass_instance(cls, dict, slot_storage(cls), values)
 }
 
 /// Best-effort extraction of UTF-8 text from a runtime string object.
@@ -1017,14 +1047,44 @@ unsafe fn construct_class(
     // (`dict::type_is_dict_subclass`), and the dict type's method surface must
     // exist before MRO lookups on the new class can resolve through it.
     let embeds_dict = unsafe { crate::types::dict::class_bases_embed_dict(base_types) };
+    // Classes deriving BaseException share the boxed-exception instance layout
+    // (their instances are built by the exception allocators, never
+    // `alloc_heap_instance`); basicsize and gc_type_id are the layout markers.
+    let derives_exception = base_types
+        .iter()
+        .any(|base| crate::abi::exc::type_derives_base_exception(base.cast_const()));
+    let derives_exception_group = derives_exception
+        && base_types
+            .iter()
+            .any(|base| crate::abi::exc::type_derives_exception_group(base.cast_const()));
     let instance_size = if embeds_dict {
         crate::types::dict::ensure_dict_subclass_methods_installed();
         mem::size_of::<crate::types::dict::PyDictSubclassInstance>()
+    } else if unsafe { crate::types::list::class_bases_embed_list(base_types) } {
+        // Classes linearizing over the builtin `list` embed native list
+        // storage in their instances; the distinct basicsize is the layout
+        // marker (`list::type_is_list_subclass`), and the list type's
+        // method/dunder surface must exist before MRO lookups on the new
+        // class can resolve through it.
+        crate::abi::seq::ensure_list_subclass_surface();
+        mem::size_of::<crate::types::list::PyListSubclassInstance>()
+    } else if unsafe { crate::types::tuple::class_bases_embed_tuple(base_types) } {
+        // Classes linearizing over the builtin `tuple` embed native tuple
+        // storage in their instances; the distinct basicsize is the layout
+        // marker (`tuple::type_is_tuple_subclass`), and the tuple type's
+        // method/dunder/`__new__` surface must exist before MRO lookups on
+        // the new class can resolve through it.
+        crate::abi::seq::ensure_tuple_subclass_surface();
+        mem::size_of::<crate::types::tuple::PyTupleSubclassInstance>()
     } else if unsafe { class_bases_embed_payload(base_types) } {
         // Classes linearizing over `str`/`int` embed a canonical payload
         // slot; the distinct basicsize is the layout marker
         // (`type_is_payload_subclass`).
         mem::size_of::<PyPayloadSubclassInstance>()
+    } else if derives_exception_group {
+        mem::size_of::<crate::types::exc::PyExceptionGroup>()
+    } else if derives_exception {
+        mem::size_of::<crate::types::exc::PyBaseException>()
     } else {
         mem::size_of::<PyHeapInstance>()
     };
@@ -1033,11 +1093,21 @@ unsafe fn construct_class(
     ty.tp_bases = ptr::null_mut();
     ty.tp_dict = namespace.cast::<PyObject>();
     ty.tp_dictoffset = if namespace_allows_dict(base_types, &slot_spec) { 1 } else { 0 };
-    ty.tp_getattro = Some(descr::generic_get_attr);
-    ty.tp_setattro = Some(descr::generic_set_attr);
+    if derives_exception {
+        ty.tp_getattro = Some(crate::types::exc::exception_getattro);
+        ty.tp_setattro = Some(crate::types::exc::exception_setattro);
+        ty.gc_type_id = if derives_exception_group {
+            crate::abi::TYPE_ID_EXCEPTION_GROUP.0 as usize
+        } else {
+            crate::abi::TYPE_ID_EXCEPTION.0 as usize
+        };
+    } else {
+        ty.tp_getattro = Some(descr::generic_get_attr);
+        ty.tp_setattro = Some(descr::generic_set_attr);
+        ty.gc_type_id = TYPE_ID_HEAP_INSTANCE.0 as usize;
+    }
     ty.tp_new = Some(type_new);
     ty.tp_init = Some(type_init);
-    ty.gc_type_id = TYPE_ID_HEAP_INSTANCE.0 as usize;
 
     let ty = Box::into_raw(Box::new(ty));
     // GC visibility: the type box is malloc'd, so the collector can only keep
@@ -1113,6 +1183,18 @@ fn install_slot_descriptors(ty: *mut PyType, namespace: *mut PyClassDict, spec: 
     }
 }
 
+/// Returns true when `object`'s class marks the boxed-exception instance
+/// layout (builtin exception classes leave `gc_type_id` unset; heap classes
+/// deriving `BaseException` are stamped by `construct_class`).
+unsafe fn instance_uses_exception_layout(object: *mut PyObject) -> bool {
+    let ty = unsafe { object_type(object) };
+    !ty.is_null()
+        && matches!(
+            unsafe { (*ty).gc_type_id },
+            id if id == crate::abi::TYPE_ID_EXCEPTION.0 as usize || id == crate::abi::TYPE_ID_EXCEPTION_GROUP.0 as usize
+        )
+}
+
 unsafe fn is_member_descriptor(value: *mut PyObject) -> bool {
     !value.is_null()
         && crate::tag::is_heap(value)
@@ -1142,6 +1224,11 @@ unsafe extern "C" fn member_descriptor_get(descr: *mut PyObject, obj: *mut PyObj
     }
     if obj.is_null() {
         return descr;
+    }
+    // Exception-layout receivers carry no slot storage: refuse cleanly
+    // instead of misreading the boxed-exception fields as a PyHeapInstance.
+    if unsafe { instance_uses_exception_layout(obj) } {
+        return raise_object("__slots__ on BaseException subclasses is not supported");
     }
     let descr = unsafe { &*descr.cast::<PyMemberDescriptor>() };
     let obj_ty = unsafe { object_type(obj) };
@@ -1180,6 +1267,10 @@ unsafe extern "C" fn member_descriptor_set(descr: *mut PyObject, obj: *mut PyObj
         pon_err_set("descriptor does not apply to this object");
         return -1;
     }
+    if unsafe { instance_uses_exception_layout(obj) } {
+        pon_err_set("__slots__ on BaseException subclasses is not supported");
+        return -1;
+    }
     let instance = obj.cast::<PyHeapInstance>();
     match descr.kind {
         PyMemberKind::Slot => {
@@ -1199,7 +1290,7 @@ unsafe extern "C" fn member_descriptor_set(descr: *mut PyObject, obj: *mut PyObj
 
 /// Generic `type.__new__` used for ordinary Python classes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn type_new(cls: *mut PyType, _args: *mut PyObject, _kwargs: *mut PyObject) -> *mut PyObject {
+pub unsafe extern "C" fn type_new(cls: *mut PyType, args: *mut PyObject, _kwargs: *mut PyObject) -> *mut PyObject {
     if cls.is_null() {
         return raise_object("cannot instantiate NULL type");
     }
@@ -1218,6 +1309,21 @@ pub unsafe extern "C" fn type_new(cls: *mut PyType, _args: *mut PyObject, _kwarg
             }
         }
     }
+    // Exception-derived classes never use the heap-instance layout: route to
+    // the boxed-exception allocator so every instance is attribute- and
+    // raise-compatible (`E('x').args`, `raise E(...)`).
+    if crate::abi::exc::type_derives_base_exception(cls.cast_const()) {
+        if crate::abi::exc::type_derives_exception_group(cls.cast_const()) {
+            const MESSAGE: &str = "exception groups must be created by calling the class with (message, exceptions)";
+            unsafe { abi::exc::pon_raise_type_error(MESSAGE.as_ptr(), MESSAGE.len()) };
+            return ptr::null_mut();
+        }
+        let ctor_args = match unsafe { positional_args_from_object(args) } {
+            Ok(ctor_args) => ctor_args,
+            Err(message) => return raise_object(message),
+        };
+        return crate::abi::exc::alloc_exception_instance(cls, &ctor_args);
+    }
     let dict = if unsafe { (*cls).tp_dictoffset != 0 } {
         new_namespace()
     } else {
@@ -1228,6 +1334,31 @@ pub unsafe extern "C" fn type_new(cls: *mut PyType, _args: *mut PyObject, _kwarg
         // Dict-derived classes allocate the extended layout: heap-instance
         // prefix plus embedded dict storage.
         return match crate::abi::map::alloc_dict_subclass_instance(cls, dict, slots) {
+            Ok(object) => object,
+            Err(message) => raise_object(message),
+        };
+    }
+    if unsafe { crate::types::list::type_is_list_subclass(cls) } {
+        // List-derived classes allocate the extended layout: heap-instance
+        // prefix plus empty embedded list storage.
+        return match crate::abi::seq::alloc_list_subclass_instance(cls, dict, slots) {
+            Ok(object) => object,
+            Err(message) => raise_object(message),
+        };
+    }
+    if unsafe { crate::types::tuple::type_is_tuple_subclass(cls) } {
+        // Tuple-derived classes inherit `tuple.__new__` construction: the
+        // instance embeds the iterable's items at allocation time (tuples
+        // are immutable — no `__init__` leg populates them later).
+        let ctor_args = match unsafe { positional_args_from_object(args) } {
+            Ok(ctor_args) => ctor_args,
+            Err(message) => return raise_object(message),
+        };
+        let values = match crate::abi::seq::tuple_ctor_values(&ctor_args) {
+            Ok(values) => values,
+            Err(message) => return raise_object(message),
+        };
+        return match crate::abi::seq::alloc_tuple_subclass_instance(cls, dict, slots, &values) {
             Ok(object) => object,
             Err(message) => raise_object(message),
         };
@@ -1568,6 +1699,18 @@ pub unsafe extern "C" fn type_call(cls_obj: *mut PyObject, args: *mut PyObject, 
     let instance = unsafe { new(cls, args, kwargs) };
     if instance.is_null() {
         return ptr::null_mut();
+    }
+
+    // Builtin native constructors (tp_new != type_new) perform COMPLETE
+    // construction: the returned object is fully initialized from `args`.
+    // The class-dict `__init__` installed for heap subclasses resolving
+    // through the builtin's MRO (dict/list surfaces) must not run a second
+    // construction pass here — `list(map(...))` would re-consume the
+    // exhausted iterator and replace the contents with the empty tail.
+    // Constructed heap classes always carry `tp_new == type_new`, so their
+    // Python-level `__init__` chains still dispatch below.
+    if new as *const () as usize != type_new as *const () as usize {
+        return instance;
     }
 
     let init_name = intern::intern("__init__");

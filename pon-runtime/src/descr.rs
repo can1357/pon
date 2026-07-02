@@ -75,7 +75,7 @@ unsafe fn object_type_display(object: *mut PyObject) -> String {
     }
 }
 
-unsafe fn class_dict_to_dict(class_dict: *mut PyClassDict) -> *mut PyObject {
+pub(crate) unsafe fn class_dict_to_dict(class_dict: *mut PyClassDict) -> *mut PyObject {
     if class_dict.is_null() {
         return ptr::null_mut();
     }
@@ -402,7 +402,7 @@ pub unsafe fn descriptor_set(descr: *mut PyObject, obj: *mut PyObject, value: *m
 }
 
 #[must_use]
-unsafe fn is_data_descriptor(descr: *mut PyObject) -> bool {
+pub(crate) unsafe fn is_data_descriptor(descr: *mut PyObject) -> bool {
     if descr.is_null() {
         return false;
     }
@@ -514,11 +514,25 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
     }
 
     let is_type = unsafe { is_type_object(object) };
-    if is_type && name_id == intern::intern("__name__") {
+    if is_type && (name_id == intern::intern("__name__") || name_id == intern::intern("__qualname__")) {
+        // An explicit class-body assignment (`__qualname__ = ...`) lands in
+        // tp_dict and wins over the synthetic value, matching CPython.
+        let dict = unsafe { (*object.cast::<PyType>()).tp_dict.cast::<PyClassDict>() };
+        if !dict.is_null() {
+            if let Some(value) = unsafe { (&*dict).get(name_id) } {
+                return value;
+            }
+        }
         let full = unsafe { (*object.cast::<PyType>()).name() };
         // CPython `type.__name__`: static tp_names are dotted
         // (`collections.deque`); the getter exposes only the tail component,
         // while `repr(type)` keeps the full dotted path.
+        //
+        // `__qualname__`: CPython's compiler threads lexical nesting into the
+        // class body (`Outer.Inner`, `f.<locals>.C`); pon's frontend carries
+        // no nesting info anywhere in the pipeline, so nested classes degrade
+        // to their bare `__name__` here. Top-level classes (the common case,
+        // and all unittest needs) are exact.
         let type_name = full.rsplit('.').next().unwrap_or(full);
         return unsafe { abi::pon_const_str(type_name.as_ptr(), type_name.len()) };
     }
@@ -550,6 +564,18 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
         // PEP 649: `__annotate__` is an own-dict-only class attribute — never
         // MRO-inherited (probed: `B.__annotate__ is None` for a subclass of
         // an annotated base).
+        let dict = unsafe { (*object.cast::<PyType>()).tp_dict.cast::<PyClassDict>() };
+        if !dict.is_null() {
+            if let Some(value) = unsafe { (&*dict).get(name_id) } {
+                return value;
+            }
+        }
+        return unsafe { abi::pon_none() };
+    }
+    if is_type && name_id == intern::intern("__doc__") {
+        // CPython `type.__doc__` getset: the class's OWN tp_dict entry or
+        // None — docstrings are never MRO-inherited (`class B(A): pass` has
+        // `B.__doc__ is None` even when A carries one).
         let dict = unsafe { (*object.cast::<PyType>()).tp_dict.cast::<PyClassDict>() };
         if !dict.is_null() {
             if let Some(value) = unsafe { (&*dict).get(name_id) } {
@@ -671,6 +697,23 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
         return unsafe { descriptor_get(class_descr, object, obj_ty) };
     }
 
+    // CPython `slot_tp_getattr_hook`: once regular resolution misses on an
+    // instance receiver, a Python-level `__getattr__` on the type is the
+    // last-chance fallback (`_WritelnDecorator`-style delegation wrappers).
+    let getattr_hook = unsafe { lookup_in_type(obj_ty, intern::intern("__getattr__")) };
+    if !getattr_hook.is_null() {
+        let bound = unsafe { descriptor_get(getattr_hook, object, obj_ty) };
+        if bound.is_null() {
+            return ptr::null_mut();
+        }
+        let spelling = intern::resolve(name_id).unwrap_or_else(|| format!("<interned:{name_id}>"));
+        let name_object = unsafe { abi::pon_const_str(spelling.as_ptr(), spelling.len()) };
+        if name_object.is_null() {
+            return ptr::null_mut();
+        }
+        let mut argv = [name_object];
+        return unsafe { abi::pon_call(bound, argv.as_mut_ptr(), 1) };
+    }
     unsafe { abi::pon_raise_attribute_error(object, name_id) }
 }
 
