@@ -626,6 +626,305 @@ fn value_equal(lhs: *mut PyObject, rhs: *mut PyObject) -> Result<bool, ()> {
     }
 }
 
+/// `tp_richcmp` for deque: element-wise `==`/`!=` against another deque;
+/// everything else (ordering, foreign operands) is NotImplemented so the
+/// dispatcher applies identity/reflected fallbacks like CPython.
+unsafe extern "C" fn deque_richcmp_slot(left: *mut PyObject, right: *mut PyObject, op: c_int) -> *mut PyObject {
+    let want_equal = match u8::try_from(op) {
+        Ok(RICH_EQ) => true,
+        Ok(RICH_NE) => false,
+        // SAFETY: Singleton accessor.
+        _ => return unsafe { abi::pon_not_implemented() },
+    };
+    let (lhs, rhs) = (untag(left), untag(right));
+    if unsafe { as_deque(lhs).is_none() || as_deque(rhs).is_none() } {
+        // SAFETY: Singleton accessor.
+        return unsafe { abi::pon_not_implemented() };
+    }
+    let (lhs, rhs) = (lhs.cast::<PyDeque>(), rhs.cast::<PyDeque>());
+    let equal = if lhs == rhs {
+        true
+    } else {
+        // Snapshots: `value_equal` re-enters Python, which may mutate either
+        // deque mid-comparison.
+        // SAFETY: Both layouts were proved by `as_deque` above.
+        let a = unsafe { (*lhs).entries.iter().copied().collect::<Vec<_>>() };
+        let b = unsafe { (*rhs).entries.iter().copied().collect::<Vec<_>>() };
+        if a.len() == b.len() {
+            let mut all = true;
+            for (x, y) in a.into_iter().zip(b) {
+                match value_equal(x, y) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        all = false;
+                        break;
+                    }
+                    Err(()) => return ptr::null_mut(),
+                }
+            }
+            all
+        } else {
+            false
+        }
+    };
+    // SAFETY: Boolean constant allocator.
+    unsafe { abi::pon_const_bool(c_int::from(equal == want_equal)) }
+}
+
+/// `sq_contains` for deque: linear equality scan (`pon_contains` protocol:
+/// 1 found, 0 absent, -1 error with the exception pending).
+unsafe extern "C" fn deque_contains_slot(object: *mut PyObject, item: *mut PyObject) -> c_int {
+    let Some(deque) = (unsafe { as_deque(object) }) else {
+        let _ = fail("deque contains receiver is invalid");
+        return -1;
+    };
+    let needle = untag(item);
+    // Snapshot: `value_equal` re-enters Python, which may mutate the deque.
+    let entries = deque.entries.iter().copied().collect::<Vec<_>>();
+    for entry in entries {
+        match value_equal(entry, needle) {
+            Ok(true) => return 1,
+            Ok(false) => {}
+            Err(()) => return -1,
+        }
+    }
+    0
+}
+
+/// `deque.index(x[, start[, stop]])` with CPython's negative-index wrap and
+/// clamping; a miss raises CPython 3.14's fixed-text ValueError.
+unsafe extern "C" fn deque_index_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (deque, args) = match unsafe { deque_receiver_and_args(argv, argc, "index") } {
+        Ok(pair) => pair,
+        Err(raised) => return raised,
+    };
+    if args.is_empty() || args.len() > 3 {
+        return raise_type_error("index() takes 1 to 3 arguments");
+    }
+    let needle = untag(args[0]);
+    let len = deque.entries.len() as i64;
+    let mut bounds = [0i64, len];
+    for (slot, &value) in bounds.iter_mut().zip(&args[1..]) {
+        let Some(mut index) = int_of(untag(value)) else {
+            return raise_type_error("an integer is required");
+        };
+        if index < 0 {
+            index += len;
+        }
+        *slot = index.clamp(0, len);
+    }
+    let [start, stop] = bounds;
+    // Snapshot: `value_equal` re-enters Python, which may mutate the deque.
+    let entries = deque.entries.iter().copied().collect::<Vec<_>>();
+    for index in start..stop {
+        match value_equal(entries[index as usize], needle) {
+            // SAFETY: Runtime allocation helper.
+            Ok(true) => return unsafe { abi::pon_const_int(index) },
+            Ok(false) => {}
+            Err(()) => return ptr::null_mut(),
+        }
+    }
+    abi::exc::raise_kind_error_text(ExceptionKind::ValueError, "deque.index(x): x not in deque")
+}
+
+// ---------------------------------------------------------------------------
+// defaultdict
+//
+// A real dict-layout heap class assembled through the same machinery as a
+// Python-level `class defaultdict(dict)`: instances are
+// `PyDictSubclassInstance` (full native dict protocol, GC-heap allocated and
+// traced), `default_factory` lives in the instance attribute dict (readable
+// and writable like CPython's member), and misses reach
+// `defaultdict.__missing__` through the hook in `pon_dict_get_item`.
+
+const DEFAULT_FACTORY: &str = "default_factory";
+
+/// Reads `default_factory` straight from the instance attribute dict
+/// (CPython reads the C member).  NULL means "unset", which callers treat
+/// exactly like `None`.
+unsafe fn defaultdict_factory(receiver: *mut PyObject) -> *mut PyObject {
+    let instance = receiver.cast::<crate::types::type_::PyHeapInstance>();
+    // SAFETY: The caller proved the dict-subclass layout, whose prefix is
+    // `PyHeapInstance`.
+    let dict = unsafe { (*instance).dict };
+    if dict.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: Instance attribute dicts are live `PyClassDict` boxes.
+    unsafe { (&*dict).get(intern(DEFAULT_FACTORY)) }.unwrap_or(ptr::null_mut())
+}
+
+/// Receiver prologue shared by the defaultdict methods.
+unsafe fn defaultdict_receiver_and_args<'a>(
+    argv: *mut *mut PyObject,
+    argc: usize,
+    method: &str,
+) -> Result<(*mut PyObject, &'a [*mut PyObject]), *mut PyObject> {
+    let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+        return Err(fail(format!("defaultdict.{method} received a NULL argv pointer")));
+    };
+    let Some((&receiver, rest)) = args.split_first() else {
+        return Err(fail(format!("defaultdict.{method} requires a receiver")));
+    };
+    let receiver = untag(receiver);
+    if receiver.is_null() || unsafe { !crate::types::dict::is_dict_subclass_instance(receiver) } {
+        return Err(raise_type_error(&format!(
+            "descriptor '{method}' requires a 'collections.defaultdict' object"
+        )));
+    }
+    Ok((receiver, rest))
+}
+
+/// `defaultdict.__init__(self, default_factory=None, mapping_or_iterable=None)`.
+unsafe extern "C" fn defaultdict_init_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (receiver, args) = match unsafe { defaultdict_receiver_and_args(argv, argc, "__init__") } {
+        Ok(pair) => pair,
+        Err(raised) => return raised,
+    };
+    if args.len() > 2 {
+        return raise_type_error("defaultdict expected at most 2 arguments");
+    }
+    let factory = match args.first().copied().map(untag) {
+        None => none(),
+        Some(value) if value == none() => none(),
+        Some(value) => {
+            // Mirrors the `callable` builtin's predicate; tagged immediates
+            // are never callable and must not reach `type_name`.
+            let callable = !crate::tag::is_small_int(value)
+                && matches!(
+                    unsafe { crate::types::dict::type_name(value) },
+                    Some("function" | "method" | "type")
+                );
+            if !callable {
+                return raise_type_error("first argument must be callable or None");
+            }
+            value
+        }
+    };
+    let instance = receiver.cast::<crate::types::type_::PyHeapInstance>();
+    // SAFETY: `defaultdict_receiver_and_args` proved the heap-instance prefix.
+    let mut dict = unsafe { (*instance).dict };
+    if dict.is_null() {
+        dict = crate::types::type_::new_namespace();
+        // SAFETY: Prefix write on the proved layout.
+        unsafe { (*instance).dict = dict };
+    }
+    // SAFETY: Instance attribute dicts are live `PyClassDict` boxes.
+    unsafe { (&mut *dict).set(intern(DEFAULT_FACTORY), factory) };
+    if let Some(&source) = args.get(1) {
+        let source = untag(source);
+        let mut pairs = Vec::new();
+        // SAFETY: Update-pair collection follows the error-sentinel contract.
+        if unsafe { super::builtins_mod::collect_dict_update_pairs(source, &mut pairs) }.is_err() {
+            return ptr::null_mut();
+        }
+        for pair in pairs.chunks_exact(2) {
+            // SAFETY: Receiver embeds dict storage; helper self-normalizes.
+            if unsafe { crate::abi::map::pon_dict_set_item_status(receiver, pair[0], pair[1]) } < 0 {
+                return ptr::null_mut();
+            }
+        }
+    }
+    none()
+}
+
+/// `defaultdict.__missing__(self, key)`: no factory raises `KeyError(key)`;
+/// otherwise the factory result is INSERTED under `key`, then returned.
+unsafe extern "C" fn defaultdict_missing_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (receiver, args) = match unsafe { defaultdict_receiver_and_args(argv, argc, "__missing__") } {
+        Ok(pair) => pair,
+        Err(raised) => return raised,
+    };
+    let &[key] = args else {
+        return raise_type_error("__missing__() takes exactly one argument");
+    };
+    let factory = unsafe { defaultdict_factory(receiver) };
+    if factory.is_null() || factory == none() {
+        // SAFETY: Raise helper self-normalizes the key.
+        return unsafe { abi::exc::pon_raise_key_error(key) };
+    }
+    // SAFETY: Call helper follows the NULL-sentinel error contract.
+    let value = unsafe { abi::pon_call(factory, ptr::null_mut(), 0) };
+    if value.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: Receiver embeds dict storage; helper self-normalizes.
+    if unsafe { crate::abi::map::pon_dict_set_item_status(receiver, key, value) } < 0 {
+        return ptr::null_mut();
+    }
+    value
+}
+
+/// `repr(defaultdict)` -> `defaultdict(<factory>, {...})`.
+unsafe extern "C" fn defaultdict_repr_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (receiver, _) = match unsafe { defaultdict_receiver_and_args(argv, argc, "__repr__") } {
+        Ok(pair) => pair,
+        Err(raised) => return raised,
+    };
+    let factory = unsafe { defaultdict_factory(receiver) };
+    let factory_repr = if factory.is_null() {
+        "None".to_owned()
+    } else {
+        super::builtins_mod::repr_text(factory)
+    };
+    // No-dispatch repr renders the embedded dict storage as `{...}` without
+    // re-entering this `__repr__`.
+    let storage_repr = match super::builtins_mod::repr_text_no_dispatch(receiver) {
+        Ok(text) => text,
+        Err(()) => return ptr::null_mut(),
+    };
+    alloc_str_object(&format!("defaultdict({factory_repr}, {storage_repr})"))
+}
+
+/// Builds (once) the `collections.defaultdict` heap class: base `dict`, a
+/// namespace of native methods, C3 MRO, and GC rooting all through
+/// `build_class_from_namespace` — exactly what a Python-level
+/// `class defaultdict(dict)` would get.
+fn defaultdict_type() -> Result<*mut PyObject, String> {
+    static TYPE: Mutex<usize> = Mutex::new(0);
+    let mut slot = TYPE.lock().unwrap_or_else(|poison| poison.into_inner());
+    if *slot != 0 {
+        return Ok(*slot as *mut PyObject);
+    }
+    let type_type = abi::runtime_type_type();
+    if type_type.is_null() {
+        return Err("runtime type type is not initialized".to_owned());
+    }
+    let dict_type = crate::types::dict::dict_type(type_type);
+    let namespace = crate::types::type_::new_namespace();
+    let natives: &[(&str, BuiltinFn)] = &[
+        ("__init__", defaultdict_init_method),
+        ("__missing__", defaultdict_missing_method),
+        ("__repr__", defaultdict_repr_method),
+    ];
+    for &(method, entry) in natives {
+        let interned = intern(method);
+        // SAFETY: `entry` is a live builtin entry point with the runtime
+        // calling convention.
+        let function = unsafe { abi::pon_make_function(entry as *const u8, VARIADIC_ARITY, interned) };
+        if function.is_null() {
+            return Err(format!("failed to allocate defaultdict.{method}"));
+        }
+        // SAFETY: Freshly built namespace box.
+        unsafe { (&mut *namespace).set(interned, function) };
+    }
+    // SAFETY: The dict type is a live type object; the namespace was built above.
+    let class = unsafe {
+        crate::types::type_::build_class_from_namespace(
+            "collections.defaultdict",
+            &[dict_type.cast::<PyObject>()],
+            namespace,
+            &[],
+        )
+    };
+    if class.is_null() {
+        pon_err_clear();
+        return Err("failed to construct collections.defaultdict".to_owned());
+    }
+    *slot = class as usize;
+    Ok(class)
+}
+
 // ---------------------------------------------------------------------------
 
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
@@ -635,10 +934,12 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
     if name_obj.is_null() {
         return Err("failed to allocate _collections.__name__".to_owned());
     }
+    let defaultdict = defaultdict_type()?;
     install_module(
         name,
         vec![
             (intern("__name__"), name_obj),
+            (intern("defaultdict"), defaultdict),
             (intern("deque"), deque_type().cast::<PyObject>()),
         ],
     )
