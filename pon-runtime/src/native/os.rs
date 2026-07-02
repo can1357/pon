@@ -364,14 +364,53 @@ type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObjec
 /// trailing positional None slot.
 const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("close", os_close, 1),
+    ("getcwd", os_getcwd, 0),
     ("lstat", os_lstat, crate::native::builtins_mod::VARIADIC_ARITY),
     ("open", os_open, crate::native::builtins_mod::VARIADIC_ARITY),
     ("read", os_read, 2),
+    ("readlink", os_readlink, 1),
     ("rmdir", os_rmdir, 1),
     ("scandir", os_scandir, 1),
     ("unlink", os_unlink, 1),
     ("write", os_write, 2),
 ];
+
+/// `os.getcwd()` over `std::env::current_dir` (`sysconfig` calls it at
+/// module scope via `_safe_realpath(os.getcwd())`).  Non-UTF-8 components
+/// are decoded lossily rather than with CPython's `surrogateescape`.
+unsafe extern "C" fn os_getcwd(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+    match std::env::current_dir() {
+        Ok(path) => {
+            let text = path.to_string_lossy();
+            // SAFETY: String allocation helper follows the NULL-sentinel contract.
+            unsafe { pon_const_str(text.as_ptr(), text.len()) }
+        }
+        Err(error) => raise_errno(error.raw_os_error().unwrap_or(libc::EIO), None),
+    }
+}
+
+/// `os.readlink(path)` over `std::fs::read_link` (`posixpath.realpath`'s
+/// symlink resolution, reached from `sysconfig._safe_realpath`).  Non-link
+/// paths surface the host errno (EINVAL) like `readlink(2)`.
+unsafe extern "C" fn os_readlink(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return crate::abi::return_null_with_error("os.readlink expected one argument");
+    }
+    let path = match path_arg(args[0], "readlink") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    match std::fs::read_link(&path) {
+        Ok(target) => {
+            let text = target.to_string_lossy();
+            // SAFETY: String allocation helper follows the NULL-sentinel contract.
+            unsafe { pon_const_str(text.as_ptr(), text.len()) }
+        }
+        Err(error) => raise_errno(error.raw_os_error().unwrap_or(libc::EIO), Some(&path)),
+    }
+}
 
 /// Borrows the argv slots as a slice; NULL argv reads as empty.
 unsafe fn call_args<'a>(argv: *mut *mut PyObject, argc: usize) -> &'a [*mut PyObject] {
