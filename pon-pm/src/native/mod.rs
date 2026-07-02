@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::install::{
     InstallReport, InstalledPackageRecord, ResolvedRecord, upsert_installed_package, validate_registry_field,
 };
-use crate::manifest::PyProject;
+use crate::pyproject::PyProject;
 use crate::names;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

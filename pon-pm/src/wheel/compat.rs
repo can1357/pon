@@ -45,18 +45,54 @@ pub fn parse_tag_set(python: &str, abi: &str, platform: &str) -> Vec<Tag> {
     tags
 }
 
+const CURRENT_PYTHON_MINOR: u8 = 14;
+
+fn supported_python_rank(python: &str) -> Option<u8> {
+    if python == "py3" {
+        return Some(0);
+    }
+
+    let minor = python.strip_prefix("py3")?;
+    if minor.is_empty() || (minor.len() > 1 && minor.starts_with('0')) {
+        return None;
+    }
+    let minor = minor.parse::<u8>().ok()?;
+    if minor <= CURRENT_PYTHON_MINOR {
+        Some(minor + 1)
+    } else {
+        None
+    }
+}
+
+#[must_use]
+pub fn supported_tag_rank(tag: &Tag) -> Option<u8> {
+    if tag.abi == "none" && tag.platform == "any" {
+        supported_python_rank(&tag.python)
+    } else {
+        None
+    }
+}
+
+#[must_use]
+pub fn best_supported_tag_rank(candidate: &[Tag]) -> Option<u8> {
+    candidate.iter().filter_map(supported_tag_rank).max()
+}
+
 #[must_use]
 pub fn default_supported_tags() -> BTreeSet<Tag> {
     let mut tags = BTreeSet::new();
     tags.insert(Tag::new("py3", "none", "any"));
-    tags.insert(Tag::new("py2", "none", "any"));
-    tags.insert(Tag::new("py2.py3", "none", "any"));
+    for minor in 0..=CURRENT_PYTHON_MINOR {
+        tags.insert(Tag::new(format!("py3{minor}"), "none", "any"));
+    }
     tags
 }
 
 #[must_use]
 pub fn any_supported(candidate: &[Tag], supported: &BTreeSet<Tag>) -> bool {
-    candidate.iter().any(|tag| supported.contains(tag))
+    candidate
+        .iter()
+        .any(|tag| supported.contains(tag) && supported_tag_rank(tag).is_some())
 }
 
 #[must_use]
@@ -119,11 +155,45 @@ mod tests {
     }
 
     #[test]
-    fn detects_supported_pure_python_tag() {
-        let tags = parse_tag_set("py3", "none", "any");
-        assert!(any_supported(&tags, &default_supported_tags()));
-        let tags = parse_tag_set("cp312", "abi3", "macosx_14_0_arm64");
-        assert!(!any_supported(&tags, &default_supported_tags()));
+    fn detects_supported_pure_python_tags() {
+        let supported = default_supported_tags();
+        for python in ["py3", "py30", "py39", "py310", "py314"] {
+            let tags = parse_tag_set(python, "none", "any");
+            assert!(any_supported(&tags, &supported), "{python}-none-any should be supported");
+        }
+
+        let py2_only = parse_tag_set("py2", "none", "any");
+        assert!(!supported.contains(&Tag::new("py2", "none", "any")));
+        assert!(!any_supported(&py2_only, &supported));
+
+        let py2_py3 = parse_tag_set("py2.py3", "none", "any");
+        assert!(any_supported(&py2_py3, &supported));
+
+        for tags in [
+            parse_tag_set("py315", "none", "any"),
+            parse_tag_set("cp312", "abi3", "macosx_14_0_arm64"),
+            parse_tag_set("py314", "cp314", "any"),
+            parse_tag_set("py314", "none", "macosx_14_0_arm64"),
+        ] {
+            assert!(!any_supported(&tags, &supported));
+        }
+    }
+
+    #[test]
+    fn ranks_supported_python_tags_by_specificity() {
+        let py3 = supported_tag_rank(&Tag::new("py3", "none", "any")).unwrap();
+        let py312 = supported_tag_rank(&Tag::new("py312", "none", "any")).unwrap();
+        let py313 = supported_tag_rank(&Tag::new("py313", "none", "any")).unwrap();
+        let py314 = supported_tag_rank(&Tag::new("py314", "none", "any")).unwrap();
+
+        assert!(py314 > py313);
+        assert!(py313 > py312);
+        assert!(py312 > py3);
+        assert_eq!(
+            best_supported_tag_rank(&parse_tag_set("py3.py312.py314", "none", "any")),
+            Some(py314)
+        );
+        assert_eq!(best_supported_tag_rank(&parse_tag_set("py2", "none", "any")), None);
     }
 
     #[test]

@@ -6,17 +6,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::env::EnvLayout;
 use crate::error::{Error, Result};
-use crate::index::{PackageIndex, SelectedIndex};
+use crate::index::{DEFAULT_INDEX_URL, PackageIndex, SelectedIndex};
 use crate::install::{ResolvedRecord, install_package, remove_installed_package};
 use crate::lock::LockFile;
-use crate::manifest::{ProjectManifest, Requirement, remove_dependency};
+use crate::pyproject::PyProject;
+use crate::requirement::{RequirementInput, parse_requirement_input};
 use crate::resolve::provider::{ResolveProvider, ResolvedPackage};
-use crate::resolve::source::{PackageKind, PackageRecord, PackageSource};
+use crate::resolve::source::{PackageKind, PackageRecord};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProjectOptions {
     manifest_path: PathBuf,
     index_url: Option<String>,
+    extra_index_urls: Vec<String>,
 }
 
 static INLINE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -36,15 +38,15 @@ pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()> {
                 .next()
                 .ok_or_else(|| Error::Cli(format!("missing requirement\n{}", usage(&program))))?;
             let options = parse_project_options(args)?;
-            add_command(&options.manifest_path, &requirement, options.index_url.as_deref())
+            add_command(&options.manifest_path, &requirement, options.index_url.as_deref(), &options.extra_index_urls)
         }
         Some("install") => {
             let options = parse_project_options(args)?;
-            install_command(&options.manifest_path, options.index_url.as_deref())
+            install_command(&options.manifest_path, options.index_url.as_deref(), &options.extra_index_urls)
         }
         Some("lock") => {
             let options = parse_project_options(args)?;
-            lock_command(&options.manifest_path, options.index_url.as_deref())
+            lock_command(&options.manifest_path, options.index_url.as_deref(), &options.extra_index_urls)
         }
         Some("remove") => {
             let name = args
@@ -55,8 +57,8 @@ pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()> {
         }
         Some("list") => {
             let manifest = parse_manifest_flag(args)?;
-            for dependency in ProjectManifest::read(&manifest)?.dependencies() {
-                println!("{}", dependency.raw());
+            for dependency in PyProject::read(&manifest)?.dependencies() {
+                println!("{dependency}");
             }
             Ok(())
         }
@@ -78,21 +80,23 @@ pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()> {
 fn init_command(args: impl Iterator<Item = String>) -> Result<()> {
     let manifest_path = parse_manifest_flag(args)?;
     let layout = layout_for_manifest(&manifest_path);
-    let manifest = ProjectManifest::read(&manifest_path)?;
-    manifest.write()?;
+    let mut pyproject = PyProject::read(&manifest_path)?;
+    let dependencies = pyproject.dependencies();
+    pyproject.set_dependency_strings(dependencies.iter().map(String::as_str));
+    pyproject.write()?;
     layout.create_dirs()?;
     println!("initialized {}", manifest_path.display());
     Ok(())
 }
 
-fn add_command(manifest_path: &Path, requirement: &str, index_url: Option<&str>) -> Result<()> {
+fn add_command(manifest_path: &Path, requirement: &str, index_url: Option<&str>, extra_index_urls: &[String]) -> Result<()> {
     let layout = layout_for_manifest(manifest_path);
-    let index = selected_index(&layout, index_url);
+    let index = selected_index(manifest_path, &layout, index_url, extra_index_urls)?;
     let resolved = resolve_requirement(&index, requirement)?;
     reject_cabi_package(&resolved)?;
 
-    let mut manifest = ProjectManifest::read(manifest_path)?;
-    let changed = manifest.add(Requirement::for_resolved_package(requirement, &resolved.name)?);
+    let mut manifest = PyProject::read(manifest_path)?;
+    let changed = manifest.add_dependency(requirement)?;
     manifest.write()?;
 
     let dependencies = resolve_manifest(&manifest, &index)?;
@@ -107,10 +111,10 @@ fn add_command(manifest_path: &Path, requirement: &str, index_url: Option<&str>)
     Ok(())
 }
 
-fn install_command(manifest_path: &Path, index_url: Option<&str>) -> Result<()> {
-    let manifest = ProjectManifest::read(manifest_path)?;
+fn install_command(manifest_path: &Path, index_url: Option<&str>, extra_index_urls: &[String]) -> Result<()> {
+    let manifest = PyProject::read(manifest_path)?;
     let layout = layout_for_manifest(manifest_path);
-    let index = selected_index(&layout, index_url);
+    let index = selected_index(manifest_path, &layout, index_url, extra_index_urls)?;
     let dependencies = resolve_manifest(&manifest, &index)?;
     install_dependencies(&layout, &dependencies, &index)?;
     write_lock(&layout, &dependencies)?;
@@ -119,10 +123,11 @@ fn install_command(manifest_path: &Path, index_url: Option<&str>) -> Result<()> 
 }
 
 fn remove_command(manifest_path: &Path, name: &str) -> Result<()> {
-    let changed = remove_dependency(manifest_path, name)?;
-    let manifest = ProjectManifest::read(manifest_path)?;
+    let mut manifest = PyProject::read(manifest_path)?;
+    let changed = manifest.remove_dependency (name)?;
+    manifest.write()?;
     let layout = layout_for_manifest(manifest_path);
-    let index = selected_index(&layout, None);
+    let index = selected_index(manifest_path, &layout, None, &[])?;
     let dependencies = resolve_manifest(&manifest, &index)?;
     let removed = remove_installed_package(&layout, name)?;
     write_lock(&layout, &dependencies)?;
@@ -139,10 +144,10 @@ fn remove_command(manifest_path: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn lock_command(manifest_path: &Path, index_url: Option<&str>) -> Result<()> {
-    let manifest = ProjectManifest::read(manifest_path)?;
+fn lock_command(manifest_path: &Path, index_url: Option<&str>, extra_index_urls: &[String]) -> Result<()> {
+    let manifest = PyProject::read(manifest_path)?;
     let layout = layout_for_manifest(manifest_path);
-    let index = selected_index(&layout, index_url);
+    let index = selected_index(manifest_path, &layout, index_url, extra_index_urls)?;
     let dependencies = resolve_manifest(&manifest, &index)?;
     write_lock(&layout, &dependencies)?;
     println!("wrote {}", layout.project_root.join("pon.lock").display());
@@ -180,13 +185,9 @@ fn run_inline_code(layout: &EnvLayout, code: &str, extra_env: Vec<(OsString, OsS
     result
 }
 
-fn resolve_manifest(manifest: &ProjectManifest, index: &impl PackageIndex) -> Result<Vec<ResolvedPackage>> {
-    let requirements = manifest
-        .dependencies()
-        .into_iter()
-        .map(|requirement| requirement.raw())
-        .collect::<Vec<_>>();
-    let dependencies = ResolveProvider::new(index).resolve_requirements(requirements)?;
+fn resolve_manifest(manifest: &PyProject, index: &impl PackageIndex) -> Result<Vec<ResolvedPackage>> {
+    let requirements = manifest.dependencies();
+    let dependencies = ResolveProvider::new(index).resolve_requirements(requirements.iter().map(String::as_str))?;
     for dependency in &dependencies {
         reject_cabi_package(&dependency.record)?;
     }
@@ -194,26 +195,7 @@ fn resolve_manifest(manifest: &ProjectManifest, index: &impl PackageIndex) -> Re
 }
 
 fn resolve_requirement(index: &impl PackageIndex, requirement: &str) -> Result<PackageRecord> {
-    let (source, specifier) = split_requirement(requirement);
-    ResolveProvider::new(index).resolve_input(source, specifier)
-}
-
-fn split_requirement(requirement: &str) -> (&str, &str) {
-    let requirement = requirement.trim();
-    if PackageSource::parse(requirement).is_ok_and(|source| matches!(source, PackageSource::Path(_))) {
-        return (requirement, "");
-    }
-    if let Some(index) = requirement.char_indices().find_map(|(index, ch)| {
-        if matches!(ch, '<' | '>' | '=' | '!' | '~') || ch.is_whitespace() {
-            Some(index)
-        } else {
-            None
-        }
-    }) {
-        (requirement[..index].trim(), requirement[index..].trim())
-    } else {
-        (requirement, "")
-    }
+    ResolveProvider::new(index).resolve_input(requirement, "")
 }
 
 fn install_dependencies(
@@ -229,9 +211,10 @@ fn install_dependencies(
 }
 
 fn install_record_for(requirement: &str, record: &PackageRecord, index: &impl PackageIndex) -> Result<ResolvedRecord> {
+    let is_path = matches!(parse_requirement_input(requirement)?, RequirementInput::Path { .. });
     match &record.kind {
         PackageKind::Pure => {
-            if matches!(PackageSource::parse(requirement)?, PackageSource::Path(_)) {
+            if is_path {
                 if is_sdist_path(requirement) {
                     Ok(ResolvedRecord::sdist(&record.name, &record.version, requirement))
                 } else {
@@ -243,7 +226,7 @@ fn install_record_for(requirement: &str, record: &PackageRecord, index: &impl Pa
             }
         }
         PackageKind::Native => {
-            if matches!(PackageSource::parse(requirement)?, PackageSource::Path(_)) {
+            if is_path {
                 if is_sdist_path(requirement) {
                     Ok(ResolvedRecord::sdist(&record.name, &record.version, requirement))
                 } else {
@@ -361,6 +344,7 @@ fn parse_project_options(args: impl Iterator<Item = String>) -> Result<ProjectOp
     let mut options = ProjectOptions {
         manifest_path: PathBuf::from("pyproject.toml"),
         index_url: None,
+        extra_index_urls: Vec::new(),
     };
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -377,18 +361,42 @@ fn parse_project_options(args: impl Iterator<Item = String>) -> Result<ProjectOp
                     .ok_or_else(|| Error::Cli("missing URL after --index-url".to_owned()))?;
                 options.index_url = Some(value);
             }
+            "--extra-index-url" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| Error::Cli("missing URL after --extra-index-url".to_owned()))?;
+                options.extra_index_urls.push(value);
+            }
             _ => return Err(Error::Cli(format!("unexpected argument `{arg}`"))),
         }
     }
     Ok(options)
 }
 
-fn selected_index(layout: &EnvLayout, index_url: Option<&str>) -> SelectedIndex {
+fn selected_index(
+    manifest_path: &Path,
+    layout: &EnvLayout,
+    index_url: Option<&str>,
+    extra_index_urls: &[String],
+) -> Result<SelectedIndex> {
     let pon_home = env::var_os("PON_HOME").map_or_else(|| layout.pon_dir.clone(), PathBuf::from);
-    index_url
+    let configured_url = index_url
         .map(str::to_owned)
-        .or_else(|| env::var("PON_INDEX_URL").ok().filter(|url| !url.trim().is_empty()))
-        .map_or_else(SelectedIndex::catalog, |url| SelectedIndex::simple_json(url, &pon_home))
+        .or_else(|| env::var("PON_INDEX_URL").ok().filter(|url| !url.trim().is_empty()));
+    let base_url = match configured_url {
+        Some(url) => url,
+        None => PyProject::read(manifest_path)?
+            .tool_pon_index_url()
+            .map_or_else(|| DEFAULT_INDEX_URL.to_owned(), str::to_owned),
+    };
+    if base_url == "catalog:" {
+        Ok(SelectedIndex::catalog())
+    } else {
+        let mut index_urls = Vec::with_capacity(extra_index_urls.len() + 1);
+        index_urls.push(base_url);
+        index_urls.extend(extra_index_urls.iter().cloned());
+        Ok(SelectedIndex::simple_json(index_urls, pon_home))
+    }
 }
 
 fn reject_extra(extra: Option<String>, command: &str) -> Result<()> {
@@ -402,7 +410,7 @@ fn reject_extra(extra: Option<String>, command: &str) -> Result<()> {
 fn usage(program: impl AsRef<str>) -> String {
     let program = program.as_ref();
     format!(
-        "usage: {program} init [--manifest <pyproject.toml>]\n       {program} add <requirement-or-path> [--manifest <pyproject.toml>] [--index-url <url>]\n       {program} install [--manifest <pyproject.toml>] [--index-url <url>]\n       {program} lock [--manifest <pyproject.toml>] [--index-url <url>]\n       {program} run <file>\n       {program} run -c <code>\n       {program} remove <name> [--manifest <pyproject.toml>]\n       {program} list [--manifest <pyproject.toml>]\n       {program} env [project-root]"
+        "usage: {program} init [--manifest <pyproject.toml>]\n       {program} add <requirement-or-path> [--manifest <pyproject.toml>] [--index-url <url>] [--extra-index-url <url> ...]\n       {program} install [--manifest <pyproject.toml>] [--index-url <url>] [--extra-index-url <url> ...]\n       {program} lock [--manifest <pyproject.toml>] [--index-url <url>] [--extra-index-url <url> ...]\n       {program} run <file>\n       {program} run -c <code>\n       {program} remove <name> [--manifest <pyproject.toml>]\n       {program} list [--manifest <pyproject.toml>]\n       {program} env [project-root]"
     )
 }
 
@@ -435,18 +443,29 @@ mod tests {
     }
 
     #[test]
-    fn project_options_accept_index_url_for_resolving_commands() {
+    fn project_options_accept_index_urls_for_resolving_commands() {
         let args = [
             "--manifest".to_owned(),
             "demo.toml".to_owned(),
             "--index-url".to_owned(),
             "https://packages.example/simple/".to_owned(),
+            "--extra-index-url".to_owned(),
+            "https://mirror-one.example/simple/".to_owned(),
+            "--extra-index-url".to_owned(),
+            "https://mirror-two.example/simple/".to_owned(),
         ]
         .into_iter();
         let options = parse_project_options(args).expect("options");
 
         assert_eq!(options.manifest_path, PathBuf::from("demo.toml"));
         assert_eq!(options.index_url.as_deref(), Some("https://packages.example/simple/"));
+        assert_eq!(
+            options.extra_index_urls,
+            vec![
+                "https://mirror-one.example/simple/".to_owned(),
+                "https://mirror-two.example/simple/".to_owned()
+            ]
+        );
     }
 
     #[test]
@@ -481,6 +500,8 @@ mod tests {
             "idna".to_owned(),
             "--manifest".to_owned(),
             manifest.display().to_string(),
+            "--index-url".to_owned(),
+            "catalog:".to_owned(),
         ])
         .expect("add");
 
@@ -509,14 +530,18 @@ mod tests {
             raw_path.clone(),
             "--manifest".to_owned(),
             manifest.display().to_string(),
+            "--index-url".to_owned(),
+            "catalog:".to_owned(),
         ])
         .expect("add local sdist");
 
-        let manifest = ProjectManifest::read(&manifest).expect("manifest");
-        let dependencies = manifest.dependencies();
+        let pyproject = PyProject::read(&manifest).expect("manifest");
+        let dependencies = pyproject.dependencies();
         assert_eq!(dependencies.len(), 1);
-        assert_eq!(dependencies[0].raw(), raw_path);
-        assert_eq!(dependencies[0].normalized_name(), "pon-flit-fixture");
+        assert_eq!(dependencies[0], raw_path);
+        let input = crate::requirement::parse_requirement_input(&dependencies[0]).expect("requirement");
+        let normalized_name = crate::requirement::normalized_name_of(&input, root.as_path()).expect("normalized name");
+        assert_eq!(normalized_name, "pon-flit-fixture");
 
         let package_init = root.join(".pon/packages/site-packages/pon_flit_fixture/__init__.py");
         assert_eq!(
@@ -543,6 +568,8 @@ mod tests {
             "idna".to_owned(),
             "--manifest".to_owned(),
             manifest.display().to_string(),
+            "--index-url".to_owned(),
+            "catalog:".to_owned(),
         ])
         .expect("add");
 
@@ -575,6 +602,8 @@ mod tests {
             "numpy".to_owned(),
             "--manifest".to_owned(),
             manifest.display().to_string(),
+            "--index-url".to_owned(),
+            "catalog:".to_owned(),
         ])
         .expect_err("numpy must be refused");
         let message = error.to_string();

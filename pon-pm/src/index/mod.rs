@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use crate::error::{Error, Result};
@@ -6,9 +7,11 @@ use crate::names;
 use crate::resolve::source::PackageKind;
 use pep440_rs::{Version, VersionSpecifiers};
 
+pub mod download;
+mod html;
 mod simple_json;
 
-pub use simple_json::{SimpleJsonIndex, parse_project_json};
+pub use simple_json::{MultiIndex, SimpleJsonIndex, parse_project_json};
 
 pub const DEFAULT_INDEX_URL: &str = "https://pypi.org/simple/";
 pub const NO_OB_REFCNT_C_ABI_REFUSAL: &str =
@@ -83,6 +86,8 @@ pub trait PackageIndex {
     fn distribution_metadata(&self, _file: &ProjectFile) -> Result<Option<String>> {
         Ok(None)
     }
+
+    fn fetch_artifact(&self, file: &ProjectFile) -> Result<PathBuf>;
 }
 
 impl<T: PackageIndex + ?Sized> PackageIndex for &T {
@@ -93,12 +98,16 @@ impl<T: PackageIndex + ?Sized> PackageIndex for &T {
     fn distribution_metadata(&self, file: &ProjectFile) -> Result<Option<String>> {
         (**self).distribution_metadata(file)
     }
+
+    fn fetch_artifact(&self, file: &ProjectFile) -> Result<PathBuf> {
+        (**self).fetch_artifact(file)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SelectedIndex {
     Catalog(CatalogIndex),
-    SimpleJson(SimpleJsonIndex),
+    SimpleJson(MultiIndex),
 }
 
 impl SelectedIndex {
@@ -108,11 +117,17 @@ impl SelectedIndex {
     }
 
     #[must_use]
-    pub fn simple_json(index_url: impl Into<String>, pon_home: impl Into<std::path::PathBuf>) -> Self {
-        Self::SimpleJson(SimpleJsonIndex::with_cache_dir(
-            index_url,
-            pon_home.into().join("index/simple-json"),
-        ))
+    pub fn simple_json<I, U>(index_urls: I, pon_home: impl Into<PathBuf>) -> Self
+    where
+        I: IntoIterator<Item = U>,
+        U: Into<String>,
+    {
+        let cache_dir = pon_home.into().join("cache/http");
+        let indexes = index_urls
+            .into_iter()
+            .map(|url| SimpleJsonIndex::with_cache_dir(url, cache_dir.clone()))
+            .collect();
+        Self::SimpleJson(MultiIndex::new(indexes))
     }
 }
 
@@ -128,6 +143,13 @@ impl PackageIndex for SelectedIndex {
         match self {
             Self::Catalog(index) => index.distribution_metadata(file),
             Self::SimpleJson(index) => index.distribution_metadata(file),
+        }
+    }
+
+    fn fetch_artifact(&self, file: &ProjectFile) -> Result<PathBuf> {
+        match self {
+            Self::Catalog(index) => index.fetch_artifact(file),
+            Self::SimpleJson(index) => index.fetch_artifact(file),
         }
     }
 }
@@ -173,6 +195,45 @@ impl PackageIndex for CatalogIndex {
             )),
             _ => None,
         })
+    }
+
+    fn fetch_artifact(&self, file: &ProjectFile) -> Result<PathBuf> {
+        let filename_path = Path::new(&file.filename);
+        if filename_path.is_file() {
+            return Ok(filename_path.to_path_buf());
+        }
+
+        if let Some(path) = file_url_path(&file.url).filter(|path| path.is_file()) {
+            return Ok(path);
+        }
+
+        let basename = filename_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(file.filename.as_str());
+        for fixture_kind in ["wheels", "sdists"] {
+            let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures")
+                .join(fixture_kind)
+                .join(basename);
+            if fixture_path.is_file() {
+                return Ok(fixture_path);
+            }
+        }
+
+        Err(Error::UnsupportedArtifact(format!(
+            "artifact `{}` is not available in the bundled Pon fixtures",
+            file.filename
+        )))
+    }
+}
+
+fn file_url_path(url: &str) -> Option<PathBuf> {
+    let path = url.strip_prefix("file://")?;
+    if let Some(path) = path.strip_prefix("localhost/") {
+        Some(PathBuf::from(format!("/{path}")))
+    } else {
+        Some(PathBuf::from(path))
     }
 }
 

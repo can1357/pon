@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::env::EnvLayout;
 use crate::error::{Error, Result};
 use crate::install::{InstallReport, InstalledPackageRecord, ResolvedRecord, upsert_installed_package};
-use crate::manifest::PyProject;
+use crate::pyproject::PyProject;
 use crate::names;
 
 struct LocalPythonManifest {

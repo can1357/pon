@@ -20,6 +20,66 @@ pub enum RequirementInput {
     Url { url: pep508_rs::VerbatimUrl },
 }
 
+impl RequirementInput {
+    /// Return `true` when this input is a full PEP 508 requirement.
+    pub fn is_pep508(&self) -> bool {
+        matches!(self, Self::Pep508(_))
+    }
+
+    /// Return the parsed PEP 508 requirement, if this input is PEP 508.
+    pub fn as_pep508(&self) -> Option<&pep508_rs::Requirement> {
+        match self {
+            Self::Pep508(requirement) => Some(requirement),
+            _ => None,
+        }
+    }
+
+    /// Return `true` when this input is a local path or archive requirement.
+    pub fn is_path(&self) -> bool {
+        matches!(self, Self::Path { .. })
+    }
+
+    /// Return the local path and editable flag, if this input is path-backed.
+    pub fn as_path(&self) -> Option<(&Path, bool)> {
+        match self {
+            Self::Path { path, editable } => Some((path.as_path(), *editable)),
+            _ => None,
+        }
+    }
+
+    /// Return `true` when this input is a bare URL requirement.
+    pub fn is_url(&self) -> bool {
+        matches!(self, Self::Url { .. })
+    }
+
+    /// Return the bare URL, if this input was supplied without a `name @` prefix.
+    pub fn as_url(&self) -> Option<&pep508_rs::VerbatimUrl> {
+        match self {
+            Self::Url { url } => Some(url),
+            _ => None,
+        }
+    }
+
+    /// Return `true` when this input is a local path marked editable.
+    pub fn is_editable(&self) -> bool {
+        matches!(self, Self::Path { editable: true, .. })
+    }
+
+    /// Set the editable flag on a local path requirement.
+    ///
+    /// Returns `true` when the input is path-backed. For PEP 508 and bare URL
+    /// inputs the value is left unchanged and `false` is returned so callers can
+    /// report the appropriate CLI or requirements-file error.
+    pub fn set_editable(&mut self, editable: bool) -> bool {
+        if let Self::Path { editable: flag, .. } = self {
+            *flag = editable;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Parse one raw requirement string using pon's Phase-0 classification order.
 ///
 /// Bare HTTP(S), `file://`, and `git+` strings become [`RequirementInput::Url`].
@@ -246,6 +306,31 @@ mod tests {
         };
         assert_eq!(path, PathBuf::from("./vendor/pkg"));
         assert!(!editable);
+    }
+
+    #[test]
+    fn exposes_variant_helpers() {
+        let pep508 = parse_requirement_input("demo>=1").expect("requirement");
+        assert!(pep508.is_pep508());
+        assert!(pep508.as_pep508().is_some());
+        assert!(!pep508.is_path());
+        assert!(pep508.as_path().is_none());
+        assert!(!pep508.is_url());
+        assert!(pep508.as_url().is_none());
+
+        let mut path_input = parse_requirement_input("./vendor/pkg").expect("path");
+        let (path, editable) = path_input.as_path().expect("path helper");
+        assert_eq!(path, Path::new("./vendor/pkg"));
+        assert!(!editable);
+        assert!(path_input.set_editable(true));
+        assert!(path_input.is_path());
+        assert!(path_input.is_editable());
+
+        let mut url_input = parse_requirement_input("https://example.com/demo-1.0.zip").expect("url");
+        assert!(url_input.is_url());
+        assert!(url_input.as_url().is_some());
+        assert!(!url_input.set_editable(true));
+        assert!(!url_input.is_editable());
     }
 
     #[test]

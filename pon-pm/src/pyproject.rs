@@ -6,6 +6,7 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, Value, 
 
 use crate::error::{Error, Result};
 use crate::names;
+use crate::requirement::{normalized_name_of, parse_requirement_input};
 
 #[derive(Clone)]
 pub struct PyProject {
@@ -165,7 +166,7 @@ impl PyProject {
     }
 
     pub fn add_dependency(&mut self, raw: &str) -> Result<bool> {
-        let normalized = dependency_normalized_name(raw)?;
+        let normalized = dependency_normalized_name(raw, &self.base_dir())?;
         let mut dependencies = self.dependency_map()?;
         let added = dependencies.insert(normalized, raw.trim().to_owned()).is_none();
         self.set_dependency_strings(dependencies.values().map(String::as_str));
@@ -203,7 +204,7 @@ impl PyProject {
     fn dependency_map(&self) -> Result<BTreeMap<String, String>> {
         let mut dependencies = BTreeMap::new();
         for raw in self.dependencies() {
-            dependencies.insert(dependency_normalized_name(&raw)?, raw);
+            dependencies.insert(dependency_normalized_name(&raw, &self.base_dir())?, raw);
         }
         Ok(dependencies)
     }
@@ -345,39 +346,99 @@ fn string_array_values(array: &Array) -> impl Iterator<Item = String> + '_ {
     array.iter().filter_map(|value| value.as_str().map(str::to_owned))
 }
 
-fn dependency_normalized_name(raw: &str) -> Result<String> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Err(Error::InvalidRequirement(raw.to_owned()));
-    }
-
-    if raw.starts_with('.') || raw.starts_with('/') || raw.contains(std::path::MAIN_SEPARATOR) {
-        return path_requirement_name(raw).ok_or_else(|| Error::InvalidRequirement(raw.to_owned()));
-    }
-
-    let name_end = raw
-        .char_indices()
-        .find_map(|(index, ch)| {
-            if matches!(ch, '[' | '<' | '>' | '=' | '!' | '~' | ';' | '@') || ch.is_whitespace() {
-                Some(index)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(raw.len());
-    let name = &raw[..name_end];
-    names::validate(name).map_err(|_| Error::InvalidRequirement(raw.to_owned()))?;
-    Ok(names::normalize(name))
+fn dependency_normalized_name(raw: &str, base_dir: &Path) -> Result<String> {
+    let input = parse_requirement_input(raw.trim())?;
+    normalized_name_of(&input, base_dir)
 }
 
-fn path_requirement_name(raw: &str) -> Option<String> {
-    let basename = Path::new(raw).file_name()?.to_str()?;
-    let distribution = basename
-        .strip_suffix(".tar.gz")
-        .or_else(|| basename.strip_suffix(".zip"))
-        .or_else(|| basename.strip_suffix(".whl"))
-        .and_then(|stem| stem.rsplit_once('-').map(|(name, _version)| name))
-        .unwrap_or(basename);
-    names::validate(distribution).ok()?;
-    Some(names::normalize(distribution))
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use crate::requirement::{normalized_name_of, parse_requirement_input};
+
+    use super::PyProject;
+
+    fn temp_path(name: &str) -> PathBuf {
+        let unique = format!(
+            "pon-pm-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        std::env::temp_dir().join(unique).join("pyproject.toml")
+    }
+
+    fn normalized_name(raw: &str) -> String {
+        let input = parse_requirement_input(raw).expect("requirement");
+        normalized_name_of(&input, Path::new(".")).expect("normalized name")
+    }
+
+    #[test]
+    fn reads_project_dependencies() {
+        let content = r#"[project]
+name = "demo"
+dependencies = [
+    "Requests>=2",
+    'friendly_bard',
+]
+"#;
+        let pyproject = PyProject::from_str("pyproject.toml", content).expect("pyproject");
+        let mut deps = pyproject
+            .dependencies()
+            .into_iter()
+            .map(|raw| (normalized_name(&raw), raw))
+            .collect::<Vec<_>>();
+        deps.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            deps,
+            vec![
+                ("friendly-bard".to_owned(), "friendly_bard".to_owned()),
+                ("requests".to_owned(), "Requests>=2".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn add_and_remove_dependency_rewrites_project_block() {
+        let path = temp_path("rewrite");
+        fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        fs::write(
+            &path,
+            "[build-system]\nrequires = []\n\n[project]\nname = \"demo\"\n",
+        )
+        .expect("write");
+
+        let mut pyproject = PyProject::read(&path).expect("read");
+        assert!(pyproject.add_dependency("Requests>=2").expect("add"));
+        assert!(pyproject.add_dependency("friendly_bard").expect("add second"));
+        pyproject.write().expect("write");
+
+        let content = fs::read_to_string(&path).expect("content");
+        assert!(content.contains("[build-system]\nrequires = []"));
+        assert!(content.contains("name = \"demo\""));
+        assert!(content.contains("\"friendly_bard\""));
+        assert!(content.contains("\"Requests>=2\""));
+
+        let mut pyproject = PyProject::read(&path).expect("read");
+        assert!(pyproject.remove_dependency("requests").expect("remove"));
+        pyproject.write().expect("write");
+
+        let pyproject = PyProject::read(&path).expect("read");
+        let deps = pyproject.dependencies();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(normalized_name(&deps[0]), "friendly-bard");
+    }
+
+    #[test]
+    fn replacing_same_normalized_name_is_not_additive() {
+        let mut pyproject = PyProject::empty("pyproject.toml");
+        assert!(pyproject.add_dependency("Requests>=2").expect("add"));
+        assert!(!pyproject.add_dependency("requests>=3").expect("replace"));
+        assert_eq!(pyproject.dependencies(), vec!["requests>=3".to_owned()]);
+    }
 }
+

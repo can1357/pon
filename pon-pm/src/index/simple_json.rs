@@ -13,31 +13,41 @@ use pep440_rs::{Version, VersionSpecifiers};
 use crate::wheel::compat::{any_supported, default_supported_tags};
 use crate::wheel::filename::WheelFilename;
 
+use super::download::{HashPolicy, download_artifact};
+use super::html::parse_project_html;
 use super::{DistInfoMetadata, NO_OB_REFCNT_C_ABI_REFUSAL, PackageIndex, ProjectFile, ProjectPage};
 
-const SIMPLE_JSON_ACCEPT: &str = "application/vnd.pypi.simple.v1+json";
-const CACHE_SUBDIR: &str = "index/simple-json";
+const SIMPLE_JSON_ACCEPT: &str =
+    "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html;q=0.2, text/html;q=0.1";
+const CACHE_SUBDIR: &str = "cache/http";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SimpleJsonIndex {
     base_url: String,
     cache_dir: PathBuf,
+    artifact_cache_dir: PathBuf,
 }
 
 impl SimpleJsonIndex {
     #[must_use]
     pub fn new(base_url: impl Into<String>) -> Self {
+        let cache_dir = default_cache_dir();
+        let artifact_cache_dir = artifact_cache_dir_for(&cache_dir);
         Self {
             base_url: base_url.into(),
-            cache_dir: default_cache_dir(),
+            cache_dir,
+            artifact_cache_dir,
         }
     }
 
     #[must_use]
     pub fn with_cache_dir(base_url: impl Into<String>, cache_dir: impl Into<PathBuf>) -> Self {
+        let cache_dir = cache_dir.into();
+        let artifact_cache_dir = artifact_cache_dir_for(&cache_dir);
         Self {
             base_url: base_url.into(),
-            cache_dir: cache_dir.into(),
+            cache_dir,
+            artifact_cache_dir,
         }
     }
 
@@ -49,6 +59,11 @@ impl SimpleJsonIndex {
     #[must_use]
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
+    }
+
+    #[must_use]
+    pub fn artifact_cache_dir(&self) -> &Path {
+        &self.artifact_cache_dir
     }
 
     #[must_use]
@@ -68,8 +83,8 @@ impl SimpleJsonIndex {
         if !path.is_file() {
             return Ok(None);
         }
-        let body = fs::read_to_string(path)?;
-        parse_project_json(&body)
+        let body = fs::read_to_string(&path)?;
+        parse_project_response(&url, &body, None)
     }
 
     fn fetch_project(&self, normalized_name: &str) -> Result<Option<ProjectPage>> {
@@ -79,18 +94,29 @@ impl SimpleJsonIndex {
 
         if cache_is_fresh(&cache_path, &metadata_path)? {
             let body = fs::read_to_string(&cache_path)?;
-            return parse_project_json(&body);
+            return parse_project_response(&url, &body, None);
         }
 
-        match fetch_simple_json(&url) {
-            Ok(FetchOutcome::Found { body, etag, max_age }) => {
+        let etag = cached_etag(&cache_path, &metadata_path)?;
+        match fetch_simple_json(&url, etag.as_deref()) {
+            Ok(FetchOutcome::Found {
+                body,
+                etag,
+                max_age,
+                content_type,
+            }) => {
                 write_cache_entry(&cache_path, &metadata_path, &body, etag.as_deref(), max_age)?;
-                parse_project_json(&body)
+                parse_project_response(&url, &body, content_type.as_deref())
+            }
+            Ok(FetchOutcome::NotModified) => {
+                refresh_cache_metadata(&metadata_path)?;
+                let body = fs::read_to_string(&cache_path)?;
+                parse_project_response(&url, &body, None)
             }
             Ok(FetchOutcome::NotFound) => Ok(None),
             Err(error) if cache_path.is_file() => {
                 let body = fs::read_to_string(cache_path)?;
-                parse_project_json(&body).map_err(|parse_error| {
+                parse_project_response(&url, &body, None).map_err(|parse_error| {
                     Error::Index(format!(
                         "failed to fetch `{url}` ({error}) and cached response could not be parsed: {parse_error}"
                     ))
@@ -112,10 +138,15 @@ impl SimpleJsonIndex {
             return fs::read_to_string(&cache_path).map(Some).map_err(Error::from);
         }
 
-        match fetch_simple_json(&url) {
-            Ok(FetchOutcome::Found { body, etag, max_age }) => {
+        let etag = cached_etag(&cache_path, &metadata_path)?;
+        match fetch_simple_json(&url, etag.as_deref()) {
+            Ok(FetchOutcome::Found { body, etag, max_age, .. }) => {
                 write_cache_entry(&cache_path, &metadata_path, &body, etag.as_deref(), max_age)?;
                 Ok(Some(body))
+            }
+            Ok(FetchOutcome::NotModified) => {
+                refresh_cache_metadata(&metadata_path)?;
+                fs::read_to_string(&cache_path).map(Some).map_err(Error::from)
             }
             Ok(FetchOutcome::NotFound) => Ok(None),
             Err(_error) if cache_path.is_file() => fs::read_to_string(cache_path).map(Some).map_err(Error::from),
@@ -133,6 +164,83 @@ impl PackageIndex for SimpleJsonIndex {
     fn distribution_metadata(&self, file: &ProjectFile) -> Result<Option<String>> {
         self.fetch_distribution_metadata(file)
     }
+
+    fn fetch_artifact(&self, file: &ProjectFile) -> Result<PathBuf> {
+        download_artifact(
+            &self.artifact_cache_dir,
+            &file.url,
+            &file.filename,
+            &HashPolicy::Index(&file.hashes),
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiIndex {
+    indexes: Vec<SimpleJsonIndex>,
+}
+
+impl MultiIndex {
+    #[must_use]
+    pub fn new(indexes: Vec<SimpleJsonIndex>) -> Self {
+        Self { indexes }
+    }
+
+    #[must_use]
+    pub fn indexes(&self) -> &[SimpleJsonIndex] {
+        &self.indexes
+    }
+
+    #[must_use]
+    pub fn into_indexes(self) -> Vec<SimpleJsonIndex> {
+        self.indexes
+    }
+
+    fn index_for_file(&self, file: &ProjectFile) -> Option<&SimpleJsonIndex> {
+        self.indexes
+            .iter()
+            .find(|index| file.url.starts_with(index.base_url()))
+            .or_else(|| self.indexes.first())
+    }
+}
+
+impl PackageIndex for MultiIndex {
+    fn lookup(&self, name: &str) -> Result<Option<ProjectPage>> {
+        let normalized_name = validate_normalized_name(name)?;
+        let mut merged: Option<ProjectPage> = None;
+
+        for index in &self.indexes {
+            let Some(page) = index.fetch_project(&normalized_name)? else {
+                continue;
+            };
+            if page.name != normalized_name {
+                return Err(Error::Index(format!(
+                    "simple index returned project `{}` for request `{normalized_name}`",
+                    page.name
+                )));
+            }
+            match &mut merged {
+                Some(existing) => existing.files.extend(page.files),
+                None => merged = Some(page),
+            }
+        }
+
+        Ok(merged)
+    }
+
+    fn distribution_metadata(&self, file: &ProjectFile) -> Result<Option<String>> {
+        match self.index_for_file(file) {
+            Some(index) => index.distribution_metadata(file),
+            None => Ok(None),
+        }
+    }
+
+    fn fetch_artifact(&self, file: &ProjectFile) -> Result<PathBuf> {
+        let Some(index) = self.index_for_file(file) else {
+            return Err(Error::Index("no simple indexes are configured".to_owned()));
+        };
+        index.fetch_artifact(file)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -141,13 +249,20 @@ enum FetchOutcome {
         body: String,
         etag: Option<String>,
         max_age: Option<Duration>,
+        content_type: Option<String>,
     },
+    NotModified,
     NotFound,
 }
 
-fn fetch_simple_json(url: &str) -> Result<FetchOutcome> {
-    let response = match ureq::get(url).header("Accept", SIMPLE_JSON_ACCEPT).call() {
+fn fetch_simple_json(url: &str, etag: Option<&str>) -> Result<FetchOutcome> {
+    let mut request = ureq::get(url).header("Accept", SIMPLE_JSON_ACCEPT);
+    if let Some(etag) = etag {
+        request = request.header("If-None-Match", etag);
+    }
+    let response = match request.call() {
         Ok(response) => response,
+        Err(ureq::Error::StatusCode(304)) => return Ok(FetchOutcome::NotModified),
         Err(ureq::Error::StatusCode(404)) => return Ok(FetchOutcome::NotFound),
         Err(error) => return Err(Error::Index(format!("failed to fetch simple index `{url}`: {error}"))),
     };
@@ -162,12 +277,22 @@ fn fetch_simple_json(url: &str) -> Result<FetchOutcome> {
         .get("cache-control")
         .and_then(|value| value.to_str().ok())
         .and_then(parse_max_age);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     let mut response = response;
     let body = response
         .body_mut()
         .read_to_string()
         .map_err(|error| Error::Index(format!("failed to read simple index response `{url}`: {error}")))?;
-    Ok(FetchOutcome::Found { body, etag, max_age })
+    Ok(FetchOutcome::Found {
+        body,
+        etag,
+        max_age,
+        content_type,
+    })
 }
 
 #[derive(Deserialize)]
@@ -250,10 +375,44 @@ pub fn parse_project_json(body: &str) -> Result<Option<ProjectPage>> {
     }))
 }
 
+fn parse_project_response(url: &str, body: &str, content_type: Option<&str>) -> Result<Option<ProjectPage>> {
+    let content_type = content_type.unwrap_or_default().to_ascii_lowercase();
+    let trimmed = body.trim_start();
+    if content_type.contains("html") || trimmed.starts_with('<') {
+        return parse_project_html(url, body);
+    }
+
+    match parse_project_json(body) {
+        Ok(page) => Ok(page),
+        Err(_error) if !content_type.is_empty() && !content_type.contains("json") => parse_project_html(url, body),
+        Err(error) => Err(error),
+    }
+}
+
 fn project_file_from_response(file: SimpleFileResponse) -> Option<ProjectFile> {
-    let version = version_from_filename(&file.filename)?;
-    let kind = classify_package_file(&file.filename);
-    let (requires_python, requires_python_invalid) = match file.requires_python {
+    project_file_from_parts(
+        file.filename,
+        file.url,
+        file.hashes,
+        file.requires_python,
+        file.yanked.and_then(YankedValue::into_reason),
+        file.core_metadata
+            .or(file.dist_info_metadata)
+            .and_then(MetadataValue::into_metadata),
+    )
+}
+
+pub(super) fn project_file_from_parts(
+    filename: String,
+    url: String,
+    hashes: BTreeMap<String, String>,
+    requires_python: Option<String>,
+    yanked: Option<String>,
+    dist_info_metadata: Option<DistInfoMetadata>,
+) -> Option<ProjectFile> {
+    let version = version_from_filename(&filename)?;
+    let kind = classify_package_file(&filename);
+    let (requires_python, requires_python_invalid) = match requires_python {
         Some(raw) => match VersionSpecifiers::from_str(raw.trim()) {
             Ok(specifiers) => (Some(specifiers), false),
             Err(_) => (None, true),
@@ -261,23 +420,23 @@ fn project_file_from_response(file: SimpleFileResponse) -> Option<ProjectFile> {
         None => (None, false),
     };
     Some(ProjectFile {
-        filename: file.filename,
-        url: file.url,
+        filename,
+        url,
         version,
         kind,
-        hashes: file.hashes,
+        hashes,
         requires_python,
         requires_python_invalid,
-        yanked: file.yanked.and_then(YankedValue::into_reason),
-        dist_info_metadata: file
-            .core_metadata
-            .or(file.dist_info_metadata)
-            .and_then(MetadataValue::into_metadata),
+        yanked,
+        dist_info_metadata,
     })
 }
 
 fn classify_package_file(filename: &str) -> PackageKind {
     let Ok(wheel) = WheelFilename::parse(filename) else {
+        if filename.ends_with(".tar.gz") || filename.ends_with(".zip") {
+            return PackageKind::Pure;
+        }
         return PackageKind::Native;
     };
     if any_supported(&wheel.tags(), &default_supported_tags()) {
@@ -323,6 +482,20 @@ fn default_cache_dir() -> PathBuf {
     pon_home.join(CACHE_SUBDIR)
 }
 
+fn artifact_cache_dir_for(cache_dir: &Path) -> PathBuf {
+    let is_default_http_leaf = cache_dir.file_name().and_then(|name| name.to_str()) == Some("http")
+        && cache_dir
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some("cache");
+    if is_default_http_leaf {
+        cache_dir.parent().expect("checked parent").to_path_buf()
+    } else {
+        cache_dir.to_path_buf()
+    }
+}
+
 fn write_cache_entry(
     cache_path: &Path,
     metadata_path: &Path,
@@ -338,6 +511,27 @@ fn write_cache_entry(
     let max_age_secs = max_age.map_or(0, |duration| duration.as_secs());
     let etag = etag.unwrap_or_default();
     fs::write(metadata_path, format!("fetched_at={fetched_at}\nmax_age={max_age_secs}\netag={etag}\n"))?;
+    Ok(())
+}
+
+fn cached_etag(cache_path: &Path, metadata_path: &Path) -> Result<Option<String>> {
+    if !cache_path.is_file() {
+        return Ok(None);
+    }
+    let Ok(metadata) = fs::read_to_string(metadata_path) else {
+        return Ok(None);
+    };
+    Ok(metadata_value(&metadata, "etag")
+        .filter(|etag| !etag.is_empty())
+        .map(str::to_owned))
+}
+
+fn refresh_cache_metadata(metadata_path: &Path) -> Result<()> {
+    let metadata = fs::read_to_string(metadata_path).unwrap_or_default();
+    let max_age = metadata_value(&metadata, "max_age").unwrap_or("0");
+    let etag = metadata_value(&metadata, "etag").unwrap_or_default();
+    let fetched_at = unix_now_secs()?;
+    fs::write(metadata_path, format!("fetched_at={fetched_at}\nmax_age={max_age}\netag={etag}\n"))?;
     Ok(())
 }
 
@@ -421,7 +615,7 @@ mod tests {
         assert_eq!(project.files[2].kind, PackageKind::CAbiRefused {
             reason: NO_OB_REFCNT_C_ABI_REFUSAL.to_owned(),
         });
-        assert_eq!(project.files[3].kind, PackageKind::Native);
+        assert_eq!(project.files[3].kind, PackageKind::Pure);
     }
 
     #[test]
