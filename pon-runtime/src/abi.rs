@@ -4893,6 +4893,11 @@ pub fn collect() -> Result<(), String> {
     for value in crate::native::atexit::gc_held_roots() {
         roots.push(value.cast::<u8>());
     }
+    // Buffer exporters held by live native `PickleBuffer` instances,
+    // mirroring `_contextvars`.
+    for value in crate::native::pickle::gc_held_roots() {
+        roots.push(value.cast::<u8>());
+    }
     // Module attribute values held by the import registry (module objects are
     // immortal leaked boxes marking cannot traverse) plus the `sys.modules`
     // dict: every module-scope binding in every module.

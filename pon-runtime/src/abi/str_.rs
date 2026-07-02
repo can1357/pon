@@ -492,7 +492,7 @@ fn install_bytes_slots() -> Result<(), String> {
     Ok(())
 }
 
-fn install_memoryview_slots() -> Result<(), String> {
+pub(crate) fn install_memoryview_slots() -> Result<(), String> {
     if let Err(message) = super::ensure_runtime_initialized() {
         return Err(message);
     }
@@ -528,14 +528,50 @@ unsafe extern "C" fn memoryview_getattro(object: *mut PyObject, name: *mut PyObj
     let Some(name) = (unsafe { type_::unicode_text(name) }) else {
         return super::return_null_with_error("memoryview attribute name must be str");
     };
+    // Methods stay reachable on released views (`release` is idempotent and
+    // `__exit__` re-releases; the entries raise on use where CPython does).
     match name {
-        "tobytes" => bound_memoryview_method(object, name, memoryview_tobytes_entry),
-        "cast" => bound_memoryview_method(object, name, memoryview_cast_entry),
-        "tolist" => bound_memoryview_method(object, name, memoryview_tolist_entry),
-        "itemsize" => unsafe { super::pon_const_int((*object.cast::<memoryview_type::PyMemoryView>()).itemsize() as i64) },
-        "readonly" => unsafe { super::pon_const_bool(i32::from((*object.cast::<memoryview_type::PyMemoryView>()).readonly)) },
+        "tobytes" => return bound_memoryview_method(object, name, memoryview_tobytes_entry),
+        "cast" => return bound_memoryview_method(object, name, memoryview_cast_entry),
+        "tolist" => return bound_memoryview_method(object, name, memoryview_tolist_entry),
+        "release" => return bound_memoryview_method(object, name, memoryview_release_entry),
+        "__enter__" => return bound_memoryview_method(object, name, memoryview_enter_entry),
+        "__exit__" => return bound_memoryview_method(object, name, memoryview_exit_entry),
+        _ => {}
+    }
+    // SAFETY: The runtime only installs this slot on memoryview objects.
+    let view = unsafe { &*object.cast::<memoryview_type::PyMemoryView>() };
+    if view.released {
+        return raise_value_error(memoryview_type::RELEASED_ERROR);
+    }
+    let itemsize = view.itemsize();
+    match name {
+        "itemsize" => unsafe { super::pon_const_int(itemsize as i64) },
+        "readonly" => unsafe { super::pon_const_bool(i32::from(view.readonly)) },
+        "nbytes" => unsafe { super::pon_const_int(view.len as i64) },
+        "ndim" => unsafe { super::pon_const_int(1) },
+        // pon memoryviews are flat contiguous byte windows by construction.
+        "contiguous" | "c_contiguous" | "f_contiguous" => unsafe { super::pon_const_bool(1) },
+        "format" => {
+            let format = [view.format];
+            // SAFETY: `format` holds one ASCII byte accepted by `item_width`.
+            unsafe { super::pon_const_str(format.as_ptr(), format.len()) }
+        }
+        "shape" => memoryview_extent_tuple(view.len / itemsize.max(1)),
+        "strides" => memoryview_extent_tuple(itemsize),
         _ => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
     }
+}
+
+/// Allocates the 1-d `(extent,)` tuple backing `shape`/`strides`.
+fn memoryview_extent_tuple(extent: usize) -> *mut PyObject {
+    // SAFETY: Runtime allocation helpers; NULL propagates with the error set.
+    let mut items = [unsafe { super::pon_const_int(extent as i64) }];
+    if items[0].is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: `items` holds one live slot for the duration of the call.
+    unsafe { super::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) }
 }
 
 fn bytes_method_entry_for_name(name: &str) -> Option<unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject> {
@@ -1485,6 +1521,9 @@ unsafe extern "C" fn memoryview_cast_entry(argv: *mut *mut PyObject, argc: usize
         Err(message) => return raise_type_error(message),
     };
     let view = unsafe { &*receiver.cast::<memoryview_type::PyMemoryView>() };
+    if view.released {
+        return raise_value_error(memoryview_type::RELEASED_ERROR);
+    }
     match memoryview_type::cast(view, &format) {
         Ok(cast_view) => as_object_ptr(cast_view),
         Err(message) => super::return_null_with_error(message),
@@ -1503,6 +1542,9 @@ unsafe extern "C" fn memoryview_tolist_entry(argv: *mut *mut PyObject, argc: usi
         return super::return_null_with_error("memoryview.tolist receiver must be a memoryview");
     }
     let view = unsafe { &*receiver.cast::<memoryview_type::PyMemoryView>() };
+    if view.released {
+        return raise_value_error(memoryview_type::RELEASED_ERROR);
+    }
     let values = match unsafe { memoryview_type::tolist(view) } {
         Ok(values) => values,
         Err(message) => return super::return_null_with_error(message),
@@ -1512,6 +1554,70 @@ unsafe extern "C" fn memoryview_tolist_entry(argv: *mut *mut PyObject, argc: usi
         objects.push(unsafe { super::pon_const_int(value) });
     }
     unsafe { super::seq::pon_build_list(objects.as_mut_ptr(), objects.len()) }
+}
+
+/// Shared receiver downcast for the release/context-manager entries.
+unsafe fn memoryview_receiver<'a>(
+    args: &[*mut PyObject],
+    name: &str,
+) -> Result<&'a mut memoryview_type::PyMemoryView, *mut PyObject> {
+    let Some(&receiver) = args.first() else {
+        return Err(super::return_null_with_error(format!("memoryview.{name} missing receiver")));
+    };
+    if receiver.is_null() || !memoryview_type::is_memoryview_type(unsafe { (*receiver).ob_type }) {
+        return Err(super::return_null_with_error(format!("memoryview.{name} receiver must be a memoryview")));
+    }
+    // SAFETY: The type check above proved the layout.
+    Ok(unsafe { &mut *receiver.cast::<memoryview_type::PyMemoryView>() })
+}
+
+/// `memoryview.release()`: flag the view released; idempotent.  The window
+/// pointers are left intact — the exporter is still alive through `base` —
+/// so racing readers never see a dangling pointer, only the raised guard.
+unsafe extern "C" fn memoryview_release_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = raw_args(argv, argc) else {
+        return super::return_null_with_error("memoryview.release argv pointer is null");
+    };
+    if args.len() != 1 {
+        return raise_type_error("memoryview.release expected no arguments");
+    }
+    let view = match unsafe { memoryview_receiver(args, "release") } {
+        Ok(view) => view,
+        Err(raised) => return raised,
+    };
+    view.released = true;
+    unsafe { super::pon_none() }
+}
+
+/// `memoryview.__enter__()`: the view itself; released views refuse entry.
+unsafe extern "C" fn memoryview_enter_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = raw_args(argv, argc) else {
+        return super::return_null_with_error("memoryview.__enter__ argv pointer is null");
+    };
+    if args.len() != 1 {
+        return raise_type_error("memoryview.__enter__ expected no arguments");
+    }
+    let view = match unsafe { memoryview_receiver(args, "__enter__") } {
+        Ok(view) => view,
+        Err(raised) => return raised,
+    };
+    if view.released {
+        return raise_value_error(memoryview_type::RELEASED_ERROR);
+    }
+    args[0]
+}
+
+/// `memoryview.__exit__(exc_type, exc, tb)`: release and never suppress.
+unsafe extern "C" fn memoryview_exit_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = raw_args(argv, argc) else {
+        return super::return_null_with_error("memoryview.__exit__ argv pointer is null");
+    };
+    let view = match unsafe { memoryview_receiver(args, "__exit__") } {
+        Ok(view) => view,
+        Err(raised) => return raised,
+    };
+    view.released = true;
+    unsafe { super::pon_none() }
 }
 
 unsafe fn bytes_method_entry(method: BytesMethodId, argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -2853,7 +2959,16 @@ pub unsafe extern "C" fn builtin_memoryview(argv: *mut *mut PyObject, argc: usiz
         if argc != 1 { return raise_type_error("memoryview() expected exactly one argument"); }
         let Some(args) = raw_args(argv, argc) else { return super::return_null_with_error("memoryview() received a null argv pointer"); };
         if let Err(message) = install_memoryview_slots() { return super::return_null_with_error(message); }
-        match unsafe { memoryview_type::boxed_memoryview_from_object(args[0]) } { Ok(view) => as_object_ptr(view), Err(message) => raise_type_error(message) }
+        // PickleBuffer exporters are handled by the `_pickle` seed (fresh
+        // B-format view or the released-buffer ValueError).
+        if let Some(result) = crate::native::pickle::memoryview_over_picklebuffer(args[0]) { return result; }
+        match unsafe { memoryview_type::boxed_memoryview_from_object(args[0]) } {
+            Ok(view) => as_object_ptr(view),
+            // Kind split: a released source is a state error (CPython raises
+            // ValueError), everything else is a type error.
+            Err(message) if message == memoryview_type::RELEASED_ERROR => raise_value_error(&message),
+            Err(message) => raise_type_error(message),
+        }
     })
 }
 
@@ -2955,12 +3070,15 @@ fn bytearray_assign_slice(object: *mut PyObject, key: *mut PyObject, replacement
 
 fn memoryview_bytes(object: *mut PyObject) -> Result<Vec<u8>, String> {
     if object.is_null() || !memoryview_type::is_memoryview_type(unsafe { (*object).ob_type }) { return Err("expected memoryview object".to_owned()); }
+    let view = unsafe { &*object.cast::<memoryview_type::PyMemoryView>() };
+    if view.released { return Err(memoryview_type::RELEASED_ERROR.to_owned()); }
     Ok(unsafe { memoryview_type::tobytes(object.cast::<memoryview_type::PyMemoryView>()) })
 }
 
 fn memoryview_item_object(object: *mut PyObject, index: isize) -> Result<*mut PyObject, String> {
     if object.is_null() || !memoryview_type::is_memoryview_type(unsafe { (*object).ob_type }) { return Err("expected memoryview object".to_owned()); }
     let view = unsafe { &*object.cast::<memoryview_type::PyMemoryView>() };
+    if view.released { return Err(memoryview_type::RELEASED_ERROR.to_owned()); }
     let itemsize = view.itemsize();
     let index = normalize_byte_index(index, view.len / itemsize)?;
     let bytes = unsafe { view.as_slice() };
@@ -2979,6 +3097,7 @@ fn memoryview_slice_object(object: *mut PyObject, key: *mut PyObject) -> Result<
     if let Err(message) = install_memoryview_slots() { return Err(message); }
     if object.is_null() || !memoryview_type::is_memoryview_type(unsafe { (*object).ob_type }) { return Err("expected memoryview object".to_owned()); }
     let view = unsafe { &*object.cast::<memoryview_type::PyMemoryView>() };
+    if view.released { return Err(memoryview_type::RELEASED_ERROR.to_owned()); }
     if view.itemsize() != 1 { return Err("memoryview slicing is only supported for byte views".to_owned()); }
     let indices = normalize_str_slice(unsafe { &*key.cast::<PySlice>() }, view.len)?;
     if indices.step == 1 {
@@ -2996,6 +3115,7 @@ fn memoryview_slice_object(object: *mut PyObject, key: *mut PyObject) -> Result<
 fn memoryview_set_index(object: *mut PyObject, index: isize, value: u8) -> Result<(), String> {
     if object.is_null() || !memoryview_type::is_memoryview_type(unsafe { (*object).ob_type }) { return Err("expected memoryview object".to_owned()); }
     let view = unsafe { &mut *object.cast::<memoryview_type::PyMemoryView>() };
+    if view.released { return Err(memoryview_type::RELEASED_ERROR.to_owned()); }
     if view.itemsize() != 1 { return Err("memoryview writes are only supported for byte views".to_owned()); }
     let index = normalize_byte_index(index, view.len)?;
     let bytes = unsafe { view.as_mut_slice()? };
@@ -3006,6 +3126,7 @@ fn memoryview_set_index(object: *mut PyObject, index: isize, value: u8) -> Resul
 fn memoryview_assign_slice(object: *mut PyObject, key: *mut PyObject, replacement: &[u8]) -> Result<(), String> {
     if object.is_null() || !memoryview_type::is_memoryview_type(unsafe { (*object).ob_type }) { return Err("expected memoryview object".to_owned()); }
     let view = unsafe { &mut *object.cast::<memoryview_type::PyMemoryView>() };
+    if view.released { return Err(memoryview_type::RELEASED_ERROR.to_owned()); }
     if view.itemsize() != 1 { return Err("memoryview writes are only supported for byte views".to_owned()); }
     let indices = normalize_str_slice(unsafe { &*key.cast::<PySlice>() }, view.len)?;
     if replacement.len() != indices.len { return Err("memoryview assignment length mismatch".to_owned()); }
@@ -3169,6 +3290,12 @@ fn expect_bytes_like(value: *mut PyObject) -> Result<Vec<u8>, String> {
     }
     if memoryview_type::is_memoryview_type(ty) {
         return memoryview_bytes(value);
+    }
+    // PickleBuffer exporters (the `_pickle` seed) are bytes-like: `bytes(pb)`
+    // and every bytes-API argument slot accept them like CPython's buffer
+    // protocol does.
+    if let Some(result) = crate::native::pickle::picklebuffer_bytes(value) {
+        return result;
     }
     Err("expected bytes-like object".to_owned())
 }
