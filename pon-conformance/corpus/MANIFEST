@@ -78,3 +78,14 @@ pon-conformance/corpus/cpython/textnum_literal_raw_unicode_escapes.py
 pon-conformance/corpus/cpython/textnum_str_replace_find.py
 pon-conformance/corpus/cpython/textnum_str_split_join.py
 pon-conformance/corpus/cpython/textnum_str_strip_case_title.py
+pon-conformance/corpus/cpython/str_methods_full.py
+pon-conformance/corpus/cpython/bytes_full.py
+pon-conformance/corpus/cpython/memoryview_basic.py
+pon-conformance/corpus/cpython/dynexec.py
+pon-conformance/corpus/cpython/globals_locals.py
+pon-conformance/corpus/cpython/del_stmt.py
+pon-conformance/corpus/cpython/descriptors2.py
+pon-conformance/corpus/cpython/richcmp.py
+pon-conformance/corpus/cpython/builtins_math.py
+pon-conformance/corpus/cpython/builtins_seq.py
+pon-conformance/corpus/cpython/builtins_lazy.py

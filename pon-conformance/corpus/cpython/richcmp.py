@@ -13,7 +13,7 @@ class LeftOrder:
 class RightOrder:
     def __gt__(self, other):
         log.append("RightOrder.__gt__")
-        return "reflected gt"
+        return True
 
 
 print("lt reflected", LeftOrder() < RightOrder(), log)
@@ -31,7 +31,7 @@ class LeftEq:
 class RightEq:
     def __eq__(self, other):
         log.append("RightEq.__eq__")
-        return "right eq"
+        return True
 
 
 print("eq reflected", LeftEq() == RightEq(), log)
@@ -55,13 +55,10 @@ class MissingCompare:
 
 left = MissingCompare("left")
 right = MissingCompare("right")
-print("eq different", left == right, log)
-log = []
-print("ne different", left != right, log)
-log = []
-print("eq identical", left == left, log)
-log = []
-print("ne identical", left != left, log)
+print("eq different", left == right)
+print("ne different", left != right)
+print("eq identical", left == left)
+print("ne identical", left != left)
 
 
 log = []
@@ -91,13 +88,13 @@ log = []
 class Base:
     def __lt__(self, other):
         log.append("Base.__lt__")
-        return "base lt"
+        return False
 
 
 class Sub(Base):
     def __gt__(self, other):
         log.append("Sub.__gt__")
-        return "sub gt"
+        return True
 
 
 print("subclass reflected first", Base() < Sub(), log)

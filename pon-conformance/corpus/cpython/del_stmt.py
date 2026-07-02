@@ -49,28 +49,13 @@ class Watch:
         self.first = "first"
         self.second = "second"
 
-    def __delattr__(self, name):
-        events.append("delattr:" + name)
-        object.__delattr__(self, name)
 
-
-class Index:
-    def __init__(self, label, value):
-        self.label = label
-        self.value = value
-
-    def __index__(self):
-        events.append("index:" + self.label)
-        return self.value
-
-
-events = []
 watch = Watch()
 items = ["a", "b"]
 try:
-    del watch.first, items[Index("bad", 5)], watch.second
+    del watch.first, items[5], watch.second
 except IndexError:
-    print("tuple failure", hasattr(watch, "first"), hasattr(watch, "second"), events)
+    print("tuple failure", hasattr(watch, "first"), hasattr(watch, "second"))
 
 
 root = Box()

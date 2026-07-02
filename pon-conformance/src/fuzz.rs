@@ -150,8 +150,8 @@ pub fn run_fuzz_suite(root: &Path, opts: &FuzzOptions) -> Result<FuzzSummary> {
     }
 
     let pon_binary = suite::ensure_pon_cli(root)?;
-    let target_dir = suite::target_dir(root)?;
-    let run_dir = target_dir
+    let run_dir = root
+        .join("target")
         .join(RUNNER_DIR)
         .join(format!("seed-{}-count-{}", opts.seed, opts.count));
     let temp_dir = run_dir.join("tmp");
@@ -593,14 +593,14 @@ fn stderr_class(stderr: &[u8]) -> String {
         if trimmed.is_empty() {
             continue;
         }
+        let parts = trimmed.split(':').map(str::trim).collect::<Vec<_>>();
+        for class in parts.iter().take(parts.len().saturating_sub(1)).rev() {
+            if is_exception_class(class) {
+                return (*class).to_owned();
+            }
+        }
         if trimmed.to_ascii_lowercase().contains("unsupported") {
             return "unsupported".to_owned();
-        }
-        if let Some((head, _)) = trimmed.split_once(':') {
-            let class = head.trim();
-            if is_exception_class(class) {
-                return class.to_owned();
-            }
         }
         return trimmed
             .split_whitespace()

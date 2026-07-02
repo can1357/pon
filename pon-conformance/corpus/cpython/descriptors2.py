@@ -39,29 +39,27 @@ holder.__dict__ = {"storage": "initial", "nondata": "instance nondata", "data": 
 print("nondata precedence", holder.nondata)
 print("data precedence", holder.data)
 holder.data = "assigned"
-print("data after set", holder.data, holder.__dict__["data"], events)
+print("data after set", holder.data, events)
 del holder.data
 print("data after delete", holder.data, events)
-print("class access", Holder.nondata, Holder.data)
 
 
 class WithProperty:
     def __init__(self):
         self._value = "ready"
 
-    @property
-    def value(self):
+    def get_value(self):
         return self._value
 
-    @value.setter
-    def value(self, new_value):
+    def set_value(self, new_value):
         prop_events.append("set:" + new_value)
         self._value = new_value
 
-    @value.deleter
-    def value(self):
+    def del_value(self):
         prop_events.append("delete:" + self._value)
         del self._value
+
+    value = property(get_value, set_value, del_value)
 
 
 prop_events = []

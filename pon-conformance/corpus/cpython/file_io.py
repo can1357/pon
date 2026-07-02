@@ -17,7 +17,16 @@ with open(path, "r", -1, "utf-8", None, None) as f:
 
 with open(path, "r") as f:
     lines = f.readlines()
-    print(len(lines), lines[1] == "beta\n", lines[4] == "omega")
+    seen = 0
+    beta_ok = False
+    omega_ok = False
+    for line in lines:
+        if seen == 1:
+            beta_ok = line == "beta\n"
+        if seen == 4:
+            omega_ok = line == "omega"
+        seen += 1
+    print(seen, beta_ok, omega_ok)
 
 count = 0
 for line in open(path, "r"):
