@@ -31,6 +31,7 @@ if [ "$MODE" = "full" ]; then
   run ftstress cargo run -q -p pon-conformance --features free-threading -- --suite ft-stress
   run bench    cargo run -q -p pon-conformance -- --bench
   run tier0diff env PON_TIER0_ONLY=1 cargo run -q -p pon-conformance -- --suite cpython --check-floor
+  run fuzz     cargo run -q -p pon-conformance -- --suite fuzz --seed 42 --count 200 --jobs 8
 fi
 
 echo "GATE-SUMMARY: $([ $FAIL -eq 0 ] && echo ALL-GREEN || echo RED)"

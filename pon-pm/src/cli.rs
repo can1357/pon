@@ -14,7 +14,6 @@ use sha2::{Digest, Sha256};
 
 use crate::env::EnvLayout;
 use crate::error::{Error, Result};
-use crate::index::download::{download_artifact, HashPolicy};
 use crate::index::{DEFAULT_INDEX_URL, PackageIndex, SelectedIndex};
 use crate::install::{
     install_package, read_installed_packages, remove_installed_package, InstalledPackageRecord, ResolvedRecord,
@@ -26,7 +25,7 @@ use crate::names;
 use crate::pyproject::{PonSource, PyProject};
 use crate::requirement::{normalized_name_of, parse_requirement_input, RequirementInput};
 use crate::requirements::{parse_requirements_file, RequirementEntry, RequirementsFile};
-use crate::resolve::provider::PonProvider;
+use crate::resolve::provider::{PonProvider, ResolveProvider};
 use crate::resolve::source::{IndexSource, PackageKind, PackageRecord};
 use crate::resolve::{resolve_root, Resolution, ResolvedArtifact, ResolvedDist};
 
@@ -187,7 +186,7 @@ struct EnvArgs {
 }
 
 #[derive(Clone, Debug)]
-struct RequirementSpec {
+struct InputRequirement {
     raw: String,
     input: RequirementInput,
     hashes: Vec<String>,
@@ -195,7 +194,7 @@ struct RequirementSpec {
 
 #[derive(Clone, Debug, Default)]
 struct CollectedInputs {
-    requirements: Vec<RequirementSpec>,
+    requirements: Vec<InputRequirement>,
     constraints: Vec<PathBuf>,
     index_url: Option<String>,
     extra_index_urls: Vec<String>,
@@ -269,10 +268,7 @@ fn add_command(args: AddArgs) -> Result<()> {
         no_deps: false,
         constraints: HashMap::new(),
     };
-    let added_resolution = resolve_requirement_specs(&index, &requirements, &options, &layout.project_root)?;
-    for dist in &added_resolution {
-        reject_cabi_dist(dist)?;
-    }
+    reject_cabi_roots(&index, &requirements, allow_prerelease)?;
 
     let mut manifest = PyProject::read(&manifest_path)?;
     let mut changed = false;
@@ -341,7 +337,7 @@ fn install_command(args: InstallArgs) -> Result<()> {
 fn install_explicit_requirements(
     layout: &EnvLayout,
     index: &impl PackageIndex,
-    requirements: &[RequirementSpec],
+    requirements: &[InputRequirement],
     options: &ResolveOptions,
     hash_mode: bool,
     dry_run: bool,
@@ -469,6 +465,12 @@ fn lock_command(args: LockArgs) -> Result<()> {
     Ok(())
 }
 
+fn strip_arg_delimiter(args: &mut Vec<String>, index: usize) {
+    if args.get(index).is_some_and(|arg| arg == "--") {
+        args.remove(index);
+    }
+}
+
 fn run_command(mut args: RunArgs) -> Result<()> {
     let layout = discover_layout()?;
     layout.create_dirs()?;
@@ -483,9 +485,7 @@ fn run_command(mut args: RunArgs) -> Result<()> {
     }
 
     if let Some(entry) = args.entry {
-        if args.args.first().is_some_and(|arg| arg == "--") {
-            args.args.remove(0);
-        }
+        strip_arg_delimiter(&mut args.args, 0);
         let (module, attr) = entry
             .split_once(':')
             .filter(|(module, attr)| !module.is_empty() && !attr.is_empty())
@@ -501,9 +501,7 @@ fn run_command(mut args: RunArgs) -> Result<()> {
         return Err(Error::Cli("missing file or `-c <code>` for `run`".to_owned()));
     };
     let mut argv = args.args;
-    if argv.is_empty() {
-        argv.push(file.clone());
-    }
+    strip_arg_delimiter(&mut argv, 1);
     pon_cli::run_file_with_env(file.as_str(), extra_env, &argv).map_err(|error| Error::Cli(format!("{error:#}")))
 }
 
@@ -672,7 +670,7 @@ fn resolve_manifest(manifest: &PyProject, index: &impl PackageIndex, options: &R
 
 fn resolve_requirement_specs(
     index: &impl PackageIndex,
-    requirements: &[RequirementSpec],
+    requirements: &[InputRequirement],
     options: &ResolveOptions,
     project_root: &Path,
 ) -> Result<Vec<ResolvedDist>> {
@@ -729,7 +727,7 @@ fn merge_requirements_file(collected: &mut CollectedInputs, file: RequirementsFi
     Ok(())
 }
 
-fn requirement_spec_from_cli(raw: &str, editable: bool, project_root: &Path) -> Result<RequirementSpec> {
+fn requirement_spec_from_cli(raw: &str, editable: bool, project_root: &Path) -> Result<InputRequirement> {
     let mut input = parse_requirement_input(raw)?;
     if editable {
         if !input.set_editable(true) {
@@ -747,22 +745,22 @@ fn requirement_spec_from_cli(raw: &str, editable: bool, project_root: &Path) -> 
             editable: true,
         };
     }
-    Ok(RequirementSpec {
+    Ok(InputRequirement {
         raw: requirement_input_to_raw(&input),
         input,
         hashes: Vec::new(),
     })
 }
 
-fn requirement_spec_from_entry(entry: RequirementEntry) -> Result<RequirementSpec> {
-    Ok(RequirementSpec {
+fn requirement_spec_from_entry(entry: RequirementEntry) -> Result<InputRequirement> {
+    Ok(InputRequirement {
         raw: requirement_input_to_raw(&entry.input),
         input: entry.input,
         hashes: entry.hashes,
     })
 }
 
-fn manifest_requirement_specs(manifest: &PyProject) -> Result<Vec<RequirementSpec>> {
+fn manifest_requirement_specs(manifest: &PyProject) -> Result<Vec<InputRequirement>> {
     let sources = manifest.sources();
     let base_dir = manifest_base_dir(manifest);
     manifest
@@ -772,7 +770,7 @@ fn manifest_requirement_specs(manifest: &PyProject) -> Result<Vec<RequirementSpe
         .collect()
 }
 
-fn manifest_requirement_spec(raw: &str, sources: &BTreeMap<String, PonSource>, base_dir: &Path) -> Result<RequirementSpec> {
+fn manifest_requirement_spec(raw: &str, sources: &BTreeMap<String, PonSource>, base_dir: &Path) -> Result<InputRequirement> {
     let input = parse_requirement_input(raw)?;
     let name = names::normalize(&normalized_name_of(&input, base_dir)?);
     if let Some(source) = sources.get(&name) {
@@ -789,21 +787,21 @@ fn manifest_requirement_spec(raw: &str, sources: &BTreeMap<String, PonSource>, b
                 message: format!("[tool.pon.sources].{name} must specify exactly one of `path` or `git`"),
             });
         };
-        return Ok(RequirementSpec {
+        return Ok(InputRequirement {
             raw: requirement_input_to_raw(&source_input),
             input: source_input,
             hashes: Vec::new(),
         });
     }
 
-    Ok(RequirementSpec {
+    Ok(InputRequirement {
         raw: raw.to_owned(),
         input,
         hashes: Vec::new(),
     })
 }
 
-fn persist_dependency(manifest: &mut PyProject, requirement: &RequirementSpec, project_root: &Path) -> Result<bool> {
+fn persist_dependency(manifest: &mut PyProject, requirement: &InputRequirement, project_root: &Path) -> Result<bool> {
     if let Some((name, source)) = source_for_requirement(requirement, project_root)? {
         let changed = manifest.add_dependency(&name)?;
         manifest.set_source(&name, &source);
@@ -813,7 +811,7 @@ fn persist_dependency(manifest: &mut PyProject, requirement: &RequirementSpec, p
     }
 }
 
-fn source_for_requirement(requirement: &RequirementSpec, project_root: &Path) -> Result<Option<(String, PonSource)>> {
+fn source_for_requirement(requirement: &InputRequirement, project_root: &Path) -> Result<Option<(String, PonSource)>> {
     match &requirement.input {
         RequirementInput::Path { path, editable } => {
             let name = normalized_name_of(&requirement.input, project_root)?;
@@ -925,7 +923,7 @@ fn merge_constraint(
 }
 
 fn enforce_hash_mode(
-    requirements: &[RequirementSpec],
+    requirements: &[InputRequirement],
     hash_mode: bool,
     project_root: &Path,
     dependencies: &[ResolvedDist],
@@ -1064,60 +1062,7 @@ fn install_locked_packages(layout: &EnvLayout, lock: &LockFile) -> Result<usize>
 }
 
 fn locked_package_record(layout: &EnvLayout, package: &crate::lock::LockedPackage) -> Result<ResolvedRecord> {
-    if let Some(wheel) = package.wheels.first() {
-        let path = download_locked_artifact(layout, &wheel.name, &wheel.url, &wheel.hashes)?;
-        return Ok(ResolvedRecord::wheel(package.name.clone(), package.version.clone(), path));
-    }
-    if let Some(sdist) = &package.sdist {
-        let path = download_locked_artifact(layout, &sdist.name, &sdist.url, &sdist.hashes)?;
-        return Ok(ResolvedRecord::sdist(package.name.clone(), package.version.clone(), path));
-    }
-    if let Some(directory) = &package.directory {
-        let path = if directory.path.is_absolute() {
-            directory.path.clone()
-        } else {
-            layout.project_root.join(&directory.path)
-        };
-        return Ok(ResolvedRecord::dir(
-            package.name.clone(),
-            package.version.clone(),
-            path,
-            directory.editable,
-        ));
-    }
-    if let Some(vcs) = &package.vcs {
-        if vcs.vcs_type != "git" {
-            return Err(Error::InvalidRequirement(format!(
-                "unsupported VCS scheme `{}`; only git is supported",
-                vcs.vcs_type
-            )));
-        }
-        let checkout = crate::vcs::fetch_git(&cache_root(layout), &vcs.url, vcs.requested_revision.as_deref())?;
-        return Ok(ResolvedRecord::dir(
-            package.name.clone(),
-            package.version.clone(),
-            checkout.dir,
-            false,
-        ));
-    }
-    Err(Error::Cli(format!(
-        "pon.lock package `{}` has no installable artifact",
-        package.name
-    )))
-}
-
-fn download_locked_artifact(
-    layout: &EnvLayout,
-    filename: &str,
-    url: &str,
-    hashes: &BTreeMap<String, String>,
-) -> Result<PathBuf> {
-    let required = hash_entries_from_lock(hashes);
-    if required.is_empty() {
-        download_artifact(&cache_root(layout), url, filename, &HashPolicy::Index(hashes))
-    } else {
-        download_artifact(&cache_root(layout), url, filename, &HashPolicy::Required(&required))
-    }
+    package.to_resolved_record(&layout.project_root, &cache_root(layout))
 }
 
 fn download_resolved_artifact(
@@ -1204,11 +1149,14 @@ fn artifact_label(path: &Path) -> &str {
     path.file_name().and_then(|name| name.to_str()).unwrap_or("artifact")
 }
 
-fn hash_entries_from_lock(hashes: &BTreeMap<String, String>) -> Vec<String> {
-    hashes
-        .iter()
-        .map(|(algorithm, hash)| format!("{algorithm}:{hash}"))
-        .collect()
+
+fn reject_cabi_roots(index: &impl PackageIndex, requirements: &[InputRequirement], allow_prerelease: bool) -> Result<()> {
+    let resolver = ResolveProvider::new(index).with_allow_prerelease(allow_prerelease);
+    for requirement in requirements {
+        let record = resolver.resolve_input(&requirement.raw, "")?;
+        reject_cabi_package(&record)?;
+    }
+    Ok(())
 }
 
 fn reject_cabi_package(record: &PackageRecord) -> Result<()> {
@@ -1367,7 +1315,7 @@ fn requirement_input_to_raw(input: &RequirementInput) -> String {
 
 fn apply_editable_overrides(
     dependencies: &mut [ResolvedDist],
-    requirements: &[RequirementSpec],
+    requirements: &[InputRequirement],
     project_root: &Path,
 ) -> Result<()> {
     let mut editables = HashMap::<String, PathBuf>::new();
@@ -1610,7 +1558,7 @@ mod tests {
         let Command::Install(options) = cli.command else {
             panic!("install command");
         };
-        assert_eq!(options.requirements, vec!["requests==2.32.0"]);
+        assert_eq!(options.requirements, vec!["requests==2.32.0".to_owned()]);
         assert_eq!(options.requirement_files, vec![PathBuf::from("requirements.txt")]);
         assert_eq!(options.constraint_files, vec![PathBuf::from("constraints.txt")]);
         assert_eq!(options.editables, vec![PathBuf::from("./pkg")]);
@@ -1620,6 +1568,88 @@ mod tests {
         assert!(options.dry_run);
         assert!(options.frozen);
         assert!(options.no_index);
+    }
+
+    #[test]
+    fn hash_mode_rejects_unpinned_missing_hash_unverifiable_and_unlisted_transitives() {
+        let root = temp_project("hash-mode");
+        fs::create_dir_all(&root).expect("root");
+        let cases = [
+            (
+                input_requirement("demo>=1", ["sha256:abc"]),
+                Vec::new(),
+                "in --require-hashes mode, all requirements must be pinned with ==: `demo>=1`",
+            ),
+            (
+                input_requirement("demo==1", []),
+                Vec::new(),
+                "in --require-hashes mode, all requirements must have a --hash: `demo==1`",
+            ),
+            (
+                editable_requirement("./pkg"),
+                Vec::new(),
+                "cannot verify hashes for editable requirement `-e ./pkg`",
+            ),
+            (
+                input_requirement("git+https://example.test/demo.git@v1", ["sha256:abc"]),
+                Vec::new(),
+                "cannot verify hashes for VCS requirement `git+https://example.test/demo.git@v1`",
+            ),
+            (
+                input_requirement("demo==1", ["sha256:abc"]),
+                vec![resolved_dist("demo"), resolved_dist("dep")],
+                "in --require-hashes mode, all transitive dependencies must be listed: missing `dep`",
+            ),
+        ];
+
+        for (requirement, dependencies, expected) in cases {
+            let error = enforce_hash_mode(&[requirement], true, &root, &dependencies)
+                .expect_err("hash mode should reject invalid input");
+            assert_eq!(error.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn hash_mode_maps_pinned_registry_requirements_to_hashes() {
+        let root = temp_project("hash-ok");
+        fs::create_dir_all(&root).expect("root");
+        let requirements = [
+            input_requirement("demo==1", ["sha256:aaa"]),
+            input_requirement("demo==1", ["sha256:bbb"]),
+        ];
+
+        let hashes = enforce_hash_mode(&requirements, true, &root, &[resolved_dist("demo")])
+            .expect("hash mode")
+            .expect("hashes");
+
+        assert_eq!(
+            hashes.get("demo").expect("demo hashes"),
+            &vec!["sha256:aaa".to_owned(), "sha256:bbb".to_owned()]
+        );
+    }
+
+    #[test]
+    fn clap_accepts_run_file_args_and_entry_args_without_runtime_execution() {
+        let file_cli = Cli::try_parse_from(["pon-pm", "run", "app.py", "--", "-x", "value"])
+            .expect("parse file run");
+        let Command::Run(file_run) = file_cli.command else {
+            panic!("run command");
+        };
+        let mut file_args = file_run.args.clone();
+        strip_arg_delimiter(&mut file_args, 1);
+        assert_eq!(file_run.code, None);
+        assert_eq!(file_run.entry, None);
+        assert_eq!(file_args, vec!["app.py".to_owned(), "-x".to_owned(), "value".to_owned()]);
+
+        let entry_cli = Cli::try_parse_from(["pon-pm", "run", "--entry", "demo_pkg.cli:main", "--", "a", "b"])
+            .expect("parse entry run");
+        let Command::Run(entry_run) = entry_cli.command else {
+            panic!("run command");
+        };
+        let mut entry_args = entry_run.args.clone();
+        strip_arg_delimiter(&mut entry_args, 0);
+        assert_eq!(entry_run.entry.as_deref(), Some("demo_pkg.cli:main"));
+        assert_eq!(entry_args, vec!["a".to_owned(), "b".to_owned()]);
     }
 
     #[test]
@@ -1778,5 +1808,38 @@ mod tests {
         assert!(env["PONPATH"].contains("/tmp/project/.pon/packages/site-packages"));
         assert_eq!(env["PONPATH"], env["PON_IMPORT_PATH"]);
         assert_eq!(env["PON_NATIVE_MODULE_REGISTRY"], "/tmp/project/.pon/native/registry.tsv");
+    }
+
+    fn input_requirement<const N: usize>(raw: &str, hashes: [&str; N]) -> InputRequirement {
+        InputRequirement {
+            raw: raw.to_owned(),
+            input: parse_requirement_input(raw).expect("requirement"),
+            hashes: hashes.into_iter().map(str::to_owned).collect(),
+        }
+    }
+
+    fn editable_requirement(raw: &str) -> InputRequirement {
+        InputRequirement {
+            raw: format!("-e {raw}"),
+            input: RequirementInput::Path {
+                path: PathBuf::from(raw),
+                editable: true,
+            },
+            hashes: vec!["sha256:abc".to_owned()],
+        }
+    }
+
+    fn resolved_dist(name: &str) -> ResolvedDist {
+        ResolvedDist {
+            name: name.to_owned(),
+            version: Version::from_str("1").expect("version"),
+            kind: PackageKind::Pure,
+            artifact: ResolvedArtifact::Dir {
+                path: PathBuf::from("/unused"),
+                editable: false,
+            },
+            dependencies: Vec::new(),
+            marker: None,
+        }
     }
 }

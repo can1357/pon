@@ -1,3 +1,5 @@
+//! Entry-point script parsing for wheel installation.
+
 use crate::error::{Error, Result};
 
 /// A console or GUI script declared by wheel `entry_points.txt` metadata.

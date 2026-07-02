@@ -804,7 +804,14 @@ fn unwrap_exc_star_rest(was_naked: bool, rest: *mut PyObject) -> *mut PyObject {
     }
 }
 
-/// Splits the current exception group against `types`.
+/// Conservatively splits the current exception against `types` (legacy representative flavor).
+///
+/// Pin J0.6 §4.1/§6.5: this current-exception flavor stays conservative until the
+/// `CheckExcStar` lowering is retired — an actual group is returned wholly as the
+/// match when the group itself satisfies `types`; otherwise the whole pending
+/// exception is returned through `out_rest`. Non-groups never report a fake
+/// successful match; the recursive PEP 654 split belongs to `.split()`/`.subgroup()`
+/// and `pon_exc_star_match`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_exc_group_split(types: *mut PyObject, out_rest: *mut *mut PyObject) -> *mut PyObject {
     crate::untag_prelude!(types);
@@ -822,17 +829,17 @@ pub unsafe extern "C" fn pon_exc_group_split(types: *mut PyObject, out_rest: *mu
         if current.is_null() {
             return ptr::null_mut();
         }
-        if is_diagnostic_sentinel(current) {
+        if is_diagnostic_sentinel(current) || unsafe { !is_exception_group_instance(current) } {
             unsafe { *out_rest = current };
             return ptr::null_mut();
         }
-        match super::with_runtime(|runtime| split_exception(runtime, current, &cond)) {
-            Some(Ok(split)) => {
-                unsafe { *out_rest = split.rest };
-                split.matched
+        match condition_matches(&cond, current) {
+            Ok(true) => current,
+            Ok(false) => {
+                unsafe { *out_rest = current };
+                ptr::null_mut()
             }
-            Some(Err(())) => ptr::null_mut(),
-            None => super::return_null_with_error("runtime is not initialized"),
+            Err(()) => ptr::null_mut(),
         }
     })
 }
@@ -881,10 +888,28 @@ pub unsafe extern "C" fn pon_match_exc(exc_type: *mut PyObject) -> *mut PyObject
 }
 
 /// Legacy representative `except*` split; retained for older IR.
+///
+/// Rides the conservative [`pon_exc_group_split`]: returns the whole active group
+/// on a whole-group match, `None` on a miss, and NULL only when the split itself
+/// raised. It never touches the `exc_star_stack`, so `CheckExcStar` sites without
+/// an `ExcStarEnter` bracket keep working until Pin J0.6 §6.5 retires them.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_check_exc_star(exc_types: *mut PyObject) -> *mut PyObject {
     crate::untag_prelude!(exc_types);
-    unsafe { pon_exc_star_match(exc_types) }
+    super::catch_object_helper(|| {
+        let before = thread_state_lock().current_exc;
+        let mut rest = ptr::null_mut();
+        let matched = unsafe { pon_exc_group_split(exc_types, &mut rest) };
+        if !matched.is_null() {
+            return matched;
+        }
+        let after = thread_state_lock().current_exc;
+        if core::ptr::eq(before, after) {
+            unsafe { super::pon_none() }
+        } else {
+            ptr::null_mut()
+        }
+    })
 }
 
 /// Enter an `except*` dispatcher for the pending exception.

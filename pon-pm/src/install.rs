@@ -651,6 +651,48 @@ mod tests {
         assert_eq!(report.import_names, vec!["idna".to_owned()]);
     }
 
+    #[test]
+    fn editable_install_links_source_and_uninstall_removes_only_link() {
+        let layout = EnvLayout::new(temp_project("editable-env"));
+        let source = temp_project("editable-src");
+        let package_root = source.join("src/demo_pkg");
+        fs::create_dir_all(&package_root).expect("package root");
+        fs::write(
+            source.join("pyproject.toml"),
+            "[project]\nname = \"demo-pkg\"\nversion = \"1.0\"\n",
+        )
+        .expect("pyproject");
+        fs::write(package_root.join("__init__.py"), "VALUE = 1\n").expect("source module");
+        let record = ResolvedRecord::dir("demo-pkg", "1.0", &source, true);
+
+        let report = install_package(&layout, &record).expect("editable install");
+
+        assert_eq!(report.package_name, "demo-pkg");
+        assert_eq!(report.artifact_kind, "editable");
+        assert_eq!(report.import_names, vec!["demo_pkg".to_owned()]);
+        let installed_import = layout.site_packages.join("demo_pkg");
+        #[cfg(unix)]
+        assert!(
+            fs::symlink_metadata(&installed_import)
+                .expect("installed import metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(installed_import.join("__init__.py")).expect("linked source"),
+            "VALUE = 1\n"
+        );
+
+        let removed = remove_installed_package(&layout, "demo-pkg").expect("remove editable");
+
+        assert_eq!(removed.expect("removed").artifact_kind, "editable");
+        assert!(!installed_import.exists());
+        assert_eq!(
+            fs::read_to_string(package_root.join("__init__.py")).expect("source intact"),
+            "VALUE = 1\n"
+        );
+    }
+
     fn temp_project(label: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)

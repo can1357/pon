@@ -1366,6 +1366,23 @@ mod tests {
         assert_eq!(versions.get("c").map(String::as_str), Some("2.0"));
     }
 
+    #[test]
+    fn pubgrub_conflict_report_names_root_and_transitive_constraints() {
+        let mut source = StaticSource::default();
+        source.add("a", "1.0", ["c<2"]);
+        source.add("c", "1.0", []);
+        source.add("c", "2.0", []);
+        let provider = PonProvider::from_requirements(&source, ["a", "c>=2"]).expect("provider");
+
+        let error = resolve_root(&provider).expect_err("conflict should be reported");
+        let message = error.to_string();
+
+        assert!(message.contains("a"));
+        assert!(message.contains("c"));
+        assert!(message.contains("1.0"), "{message}");
+        assert!(message.contains("2.0"), "{message}");
+    }
+
     fn cached_chain_index() -> SimpleJsonIndex {
         let root = temp_project("chain-index");
         let cache = root.join("cache");

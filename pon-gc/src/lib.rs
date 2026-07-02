@@ -25,7 +25,17 @@ pub const IMMEDIATE_TAG_MASK: usize = 0b11;
 /// Low-two-bits pattern of every real GC heap pointer candidate.
 pub const IMMEDIATE_TAG_HEAP: usize = 0b00;
 
-static EXTERNAL_STACK_BASE: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
+/// Conservative stack boundary plus the thread that captured it.
+///
+/// The boundary is an address inside the capturing thread's native stack, so a
+/// scan range derived from it is only meaningful on that same thread.  Reads
+/// from any other thread see NULL, which disables conservative scanning there.
+struct ExternalStackBase {
+    base: usize,
+    owner: Option<std::thread::ThreadId>,
+}
+
+static EXTERNAL_STACK_BASE: Mutex<ExternalStackBase> = Mutex::new(ExternalStackBase { base: 0, owner: None });
 
 /// Precise stack-root enumerator installed by runtimes with stack maps.
 ///
@@ -41,14 +51,26 @@ static PRECISE_STACK_ROOTS: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 /// Runtimes that enter generated code from a native frame should set this to an
 /// address in that entry frame before collections can run. A NULL base disables
 /// conservative stack scanning, preserving the existing explicit-root-only path.
+///
+/// The boundary is owned by the calling thread: only that thread observes it
+/// through [`external_stack_base`], because a range between the current stack
+/// pointer and another thread's stack is not a scannable interval.
 pub fn set_external_stack_base(base: *mut u8) {
-    EXTERNAL_STACK_BASE.store(base, Ordering::SeqCst);
+    let mut slot = EXTERNAL_STACK_BASE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    slot.base = base as usize;
+    slot.owner = if base.is_null() { None } else { Some(std::thread::current().id()) };
 }
 
-/// Returns the currently supplied conservative stack boundary.
+/// Returns the conservative stack boundary captured by the current thread.
+///
+/// Threads other than the one that supplied the boundary observe NULL.
 #[must_use]
 pub fn external_stack_base() -> *mut u8 {
-    EXTERNAL_STACK_BASE.load(Ordering::SeqCst)
+    let slot = EXTERNAL_STACK_BASE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match slot.owner {
+        Some(owner) if owner == std::thread::current().id() => slot.base as *mut u8,
+        _ => ptr::null_mut(),
+    }
 }
 
 /// C ABI hook for runtimes that cannot call the Rust wrapper directly.
