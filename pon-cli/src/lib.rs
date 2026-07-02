@@ -1,7 +1,7 @@
 #![doc = "Library-first entry points for running and building Pon programs."]
 
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{CString, OsString};
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -11,7 +11,7 @@ use pon_ir::lower_source;
 use pon_jit::JitEngine;
 use pon_runtime::dynexec::{DynCodeMode, DynCompileRequest, DynExecuteRequest, set_dynamic_code_hooks};
 use pon_runtime::import::{SourceModuleRequest, active_module_attr, begin_module_execution, cached_module, end_module_execution, install_module, set_source_module_loader};
-use pon_runtime::{PyObject, intern, pon_none, pon_runtime_init};
+use pon_runtime::{PyObject, intern, pon_none, pon_runtime_init, pon_sys_set_argv};
 
 pub mod build;
 
@@ -43,8 +43,15 @@ pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()> {
 }
 
 /// Runs one Pon/Python source file through the JIT backend using the current process environment.
+///
+/// The runtime receives a `sys.argv` containing the source path as argv[0].
 pub fn run_file(path: impl AsRef<Path>) -> Result<()> {
     let path = path.as_ref();
+    let argv = vec![path.to_string_lossy().into_owned()];
+    run_file_with_env(path, std::iter::empty::<(OsString, OsString)>(), &argv)
+}
+
+fn run_file_inner(path: &Path, argv: &[String]) -> Result<()> {
     let source = fs::read_to_string(path)
         .with_context(|| format!("failed to read UTF-8 source `{}`", path.display()))?;
     let mut script_path_guard = EnvOverlay::new();
@@ -61,6 +68,21 @@ pub fn run_file(path: impl AsRef<Path>) -> Result<()> {
     set_dynamic_code_hooks(validate_dynamic_source, execute_dynamic_source);
     let init_status = unsafe { pon_runtime_init() };
     if init_status != 0 {
+        bail!("runtime initialization failed");
+    }
+    let mut argv_cstrings = Vec::with_capacity(argv.len());
+    for arg in argv {
+        let c_arg = match CString::new(arg.as_str()) {
+            Ok(c_arg) => c_arg,
+            Err(_) => bail!("argv contains NUL byte"),
+        };
+        argv_cstrings.push(c_arg);
+    }
+    let argv_ptrs = argv_cstrings
+        .iter()
+        .map(|arg| arg.as_ptr().cast::<u8>())
+        .collect::<Vec<_>>();
+    if unsafe { pon_sys_set_argv(argv_ptrs.len() as i32, argv_ptrs.as_ptr()) } != 0 {
         bail!("runtime initialization failed");
     }
     install_module("__main__", []).map_err(anyhow::Error::msg)?;
@@ -85,7 +107,24 @@ fn load_source_module(request: SourceModuleRequest<'_>) -> std::result::Result<*
 fn dynexec_source(source: &str, mode: DynCodeMode) -> String {
     match mode {
         DynCodeMode::Eval => format!("__pon_dyn_eval_result = ({source})\n"),
-        DynCodeMode::Exec | DynCodeMode::Single => source.to_owned(),
+        DynCodeMode::Exec => source.to_owned(),
+        DynCodeMode::Single => dynexec_single_source(source),
+    }
+}
+
+fn dynexec_single_source(source: &str) -> String {
+    let display_source = format!(
+        concat!(
+            "__pon_dyn_single_result = ({})\n",
+            "if __pon_dyn_single_result is not None:\n",
+            "    print(repr(__pon_dyn_single_result))\n",
+        ),
+        source
+    );
+    if lower_source(&display_source).is_ok() {
+        display_source
+    } else {
+        source.to_owned()
     }
 }
 
@@ -125,8 +164,13 @@ fn execute_dynamic_source(request: DynExecuteRequest<'_>) -> std::result::Result
 ///
 /// This is the library-first hook used by package-manager delegation when it
 /// needs to expose managed import roots or a native-module registry without
-/// changing the `pon run <file>` command-line behavior.
-pub fn run_file_with_env<I, K, V>(path: impl AsRef<Path>, extra_env: I) -> Result<()>
+/// changing the `pon run <file>` command-line behavior. The provided `argv`
+/// slice is installed as runtime `sys.argv` after runtime initialization.
+pub fn run_file_with_env<I, K, V>(
+    path: impl AsRef<Path>,
+    extra_env: I,
+    argv: &[String],
+) -> Result<()>
 where
     I: IntoIterator<Item = (K, V)>,
     K: Into<OsString>,
@@ -136,7 +180,7 @@ where
     for (key, value) in extra_env {
         guard.set(key.into(), value.into());
     }
-    run_file(path)
+    run_file_inner(path.as_ref(), argv)
 }
 
 struct EnvOverlay {

@@ -114,23 +114,6 @@ pub const BYTES_METHOD_POP: BytesMethodId = 44;
 pub const BYTES_METHOD_REMOVE: BytesMethodId = 45;
 pub const BYTES_METHOD_CLEAR: BytesMethodId = 46;
 
-const TEMPLATE_LITERAL_CONVERSION: u8 = u8::MAX;
-
-#[repr(C)]
-struct PyTemplate {
-    ob_base: PyObjectHeader,
-    strings: *mut PyObject,
-    interpolations: *mut PyObject,
-}
-
-#[repr(C)]
-struct PyInterpolation {
-    ob_base: PyObjectHeader,
-    value: *mut PyObject,
-    expression: *mut PyObject,
-    conversion: *mut PyObject,
-    format_spec: *mut PyObject,
-}
 
 #[repr(C)]
 struct PyStrTranslateTable {
@@ -138,28 +121,10 @@ struct PyStrTranslateTable {
     table: str_type::TranslationTable,
 }
 
-static TEMPLATE_TYPE: OnceLock<usize> = OnceLock::new();
-static INTERPOLATION_TYPE: OnceLock<usize> = OnceLock::new();
 static STR_TRANSLATE_TABLE_TYPE: OnceLock<usize> = OnceLock::new();
 
 fn runtime_type_type() -> *mut PyType {
     super::with_runtime(|runtime| runtime._type_type).unwrap_or(ptr::null_mut())
-}
-
-fn template_type() -> *mut PyType {
-    *TEMPLATE_TYPE.get_or_init(|| {
-        let mut ty = Box::new(PyType::new(runtime_type_type(), "Template", mem::size_of::<PyTemplate>()));
-        ty.tp_getattro = Some(template_getattro);
-        Box::into_raw(ty) as usize
-    }) as *mut PyType
-}
-
-fn interpolation_type() -> *mut PyType {
-    *INTERPOLATION_TYPE.get_or_init(|| {
-        let mut ty = Box::new(PyType::new(runtime_type_type(), "Interpolation", mem::size_of::<PyInterpolation>()));
-        ty.tp_getattro = Some(interpolation_getattro);
-        Box::into_raw(ty) as usize
-    }) as *mut PyType
 }
 
 fn str_translate_table_type() -> *mut PyType {
@@ -169,31 +134,6 @@ fn str_translate_table_type() -> *mut PyType {
     }) as *mut PyType
 }
 
-unsafe extern "C" fn template_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
-    let Some(name) = (unsafe { type_::unicode_text(name) }) else {
-        return super::return_null_with_error("template attribute name must be str");
-    };
-    let template = unsafe { &*object.cast::<PyTemplate>() };
-    match name {
-        "strings" => template.strings,
-        "interpolations" => template.interpolations,
-        _ => super::return_null_with_error(format!("attribute '{name}' was not found")),
-    }
-}
-
-unsafe extern "C" fn interpolation_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
-    let Some(name) = (unsafe { type_::unicode_text(name) }) else {
-        return super::return_null_with_error("interpolation attribute name must be str");
-    };
-    let interpolation = unsafe { &*object.cast::<PyInterpolation>() };
-    match name {
-        "value" => interpolation.value,
-        "expression" => interpolation.expression,
-        "conversion" => interpolation.conversion,
-        "format_spec" => interpolation.format_spec,
-        _ => super::return_null_with_error(format!("attribute '{name}' was not found")),
-    }
-}
 
 /// Sequence protocol table for `str`, exposing `+` through `sq_concat`.
 ///
@@ -205,6 +145,7 @@ static STR_SEQUENCE_METHODS: LazyLock<usize> = LazyLock::new(|| {
     let methods = PySequenceMethods {
         sq_length: Some(str_len_slot),
         sq_concat: Some(pon_str_concat),
+        sq_repeat: Some(str_repeat_slot),
         sq_item: Some(str_item_slot),
         ..PySequenceMethods::EMPTY
     };
@@ -503,8 +444,15 @@ unsafe extern "C" fn bytes_subscript_slot(object: *mut PyObject, key: *mut PyObj
     }
 }
 
+unsafe extern "C" fn str_repeat_slot(object: *mut PyObject, count_object: *mut PyObject) -> *mut PyObject {
+    match repeat_count_value(count_object) {
+        Ok(count) => unsafe { pon_str_repeat(object, count) },
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
 unsafe extern "C" fn bytes_repeat_slot(object: *mut PyObject, count_object: *mut PyObject) -> *mut PyObject {
-    match str_long_value(count_object).and_then(|value| isize::try_from(value).map_err(|_| "repeat count is out of range".to_owned())) {
+    match repeat_count_value(count_object) {
         Ok(count) => unsafe { pon_bytes_repeat(object, count) },
         Err(message) => super::return_null_with_error(message),
     }
@@ -555,7 +503,7 @@ unsafe extern "C" fn bytearray_ass_subscript_slot(object: *mut PyObject, key: *m
 }
 
 unsafe extern "C" fn bytearray_repeat_slot(object: *mut PyObject, count_object: *mut PyObject) -> *mut PyObject {
-    match str_long_value(count_object).and_then(|value| isize::try_from(value).map_err(|_| "repeat count is out of range".to_owned())) {
+    match repeat_count_value(count_object) {
         Ok(count) => unsafe { pon_bytearray_repeat(object, count) },
         Err(message) => super::return_null_with_error(message),
     }
@@ -1141,80 +1089,6 @@ fn render_fstring(parts: *const super::FStrPartRaw, len: usize) -> Result<String
 }
 
 
-fn build_template(parts: *const super::TStrPartRaw, len: usize) -> Result<*mut PyObject, String> {
-    let parts = raw_template_parts(parts, len)?;
-    let mut strings = Vec::new();
-    let mut interpolations = Vec::new();
-    let mut pending_literal = String::new();
-
-    for part in parts {
-        if part.conversion == TEMPLATE_LITERAL_CONVERSION {
-            pending_literal.push_str(&expect_str(part.value)?);
-            continue;
-        }
-        if part.value.is_null() {
-            pending_literal.push_str(raw_utf8(part.literal, part.literal_len)?);
-            continue;
-        }
-        strings.push(boxed_str(&pending_literal)?);
-        pending_literal.clear();
-        interpolations.push(boxed_interpolation(part)?);
-    }
-    strings.push(boxed_str(&pending_literal)?);
-
-    let object = Box::into_raw(Box::new(PyTemplate {
-        ob_base: PyObjectHeader::new(template_type()),
-        strings: crate::native::builtins_mod::alloc_tuple(strings),
-        interpolations: crate::native::builtins_mod::alloc_tuple(interpolations),
-    }));
-    Ok(as_object_ptr(object))
-}
-
-fn boxed_interpolation(part: &super::TStrPartRaw) -> Result<*mut PyObject, String> {
-    let expression = if part.expression_interned == 0 {
-        boxed_str("")?
-    } else {
-        let Some(text) = crate::intern::resolve(part.expression_interned) else {
-            return Err(format!("template interpolation expression id {} is not interned", part.expression_interned));
-        };
-        boxed_str(&text)?
-    };
-    let conversion = conversion_object(part.conversion)?;
-    let format_spec = if part.format_spec.is_null() {
-        unsafe { super::pon_none() }
-    } else {
-        part.format_spec
-    };
-    if format_spec.is_null() {
-        return Err("failed to allocate template interpolation format_spec".to_owned());
-    }
-    let object = Box::into_raw(Box::new(PyInterpolation {
-        ob_base: PyObjectHeader::new(interpolation_type()),
-        value: part.value,
-        expression,
-        conversion,
-        format_spec,
-    }));
-    Ok(as_object_ptr(object))
-}
-
-fn conversion_object(conversion: u8) -> Result<*mut PyObject, String> {
-    match conversion {
-        0 => {
-            let none = unsafe { super::pon_none() };
-            if none.is_null() {
-                Err("failed to allocate template interpolation conversion".to_owned())
-            } else {
-                Ok(none)
-            }
-        }
-        b's' => boxed_str("s"),
-        b'r' => boxed_str("r"),
-        b'a' => boxed_str("a"),
-        _ => Err("unsupported template-string conversion".to_owned()),
-    }
-}
-
 fn boxed_str(text: &str) -> Result<*mut PyObject, String> {
     let object = alloc_str_object(text);
     if object.is_null() {
@@ -1224,203 +1098,11 @@ fn boxed_str(text: &str) -> Result<*mut PyObject, String> {
     }
 }
 
-fn format_value_to_text(value: *mut PyObject, conversion: u8, format_spec: *mut PyObject) -> Result<String, String> {
-    if format_spec.is_null() {
-        return match conversion {
-            0 | b's' => object_to_str(value),
-            b'r' => object_to_repr(value),
-            b'a' => Ok(str_type::escape_non_ascii(&object_to_repr(value)?)),
-            _ => Err("unsupported f-string conversion".to_owned()),
-        };
-    }
-
-    let spec = expect_str(format_spec)?;
-    match conversion {
-        0 => format_object_with_spec(value, &spec),
-        b's' => apply_format_spec(&object_to_str(value)?, &spec, FormatValueKind::Text),
-        b'r' => apply_format_spec(&object_to_repr(value)?, &spec, FormatValueKind::Text),
-        b'a' => apply_format_spec(&str_type::escape_non_ascii(&object_to_repr(value)?), &spec, FormatValueKind::Text),
-        _ => Err("unsupported f-string conversion".to_owned()),
-    }
-}
 
 pub(crate) fn format_object_with_spec(value: *mut PyObject, spec: &str) -> Result<String, String> {
     super::format::format_object_with_spec(value, spec)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FormatValueKind {
-    Text,
-    Number,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FormatAlign {
-    Left,
-    Right,
-    Center,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ParsedFormatSpec {
-    fill: char,
-    align: Option<FormatAlign>,
-    zero: bool,
-    width: Option<usize>,
-    precision: Option<usize>,
-    ty: Option<char>,
-}
-
-impl ParsedFormatSpec {
-    fn parse(spec: &str) -> Result<Self, String> {
-        let mut chars = spec.chars().peekable();
-        let mut fill = ' ';
-        let mut align = None;
-        let mut zero = false;
-
-        let mut clone = chars.clone();
-        let first = clone.next();
-        let second = clone.next();
-        if let (Some(fill_ch), Some(align_ch)) = (first, second) {
-            if let Some(parsed) = parse_align(align_ch) {
-                fill = fill_ch;
-                align = Some(parsed);
-                chars.next();
-                chars.next();
-            }
-        }
-        if align.is_none() {
-            if let Some(parsed) = chars.peek().copied().and_then(parse_align) {
-                align = Some(parsed);
-                chars.next();
-            }
-        }
-        if chars.peek() == Some(&'0') {
-            zero = true;
-            fill = '0';
-            if align.is_none() {
-                align = Some(FormatAlign::Right);
-            }
-            chars.next();
-        }
-
-        let width = parse_digits(&mut chars)?;
-        let precision = if chars.peek() == Some(&'.') {
-            chars.next();
-            Some(parse_digits(&mut chars)?.unwrap_or(0))
-        } else {
-            None
-        };
-        let ty = chars.next();
-        if chars.next().is_some() {
-            return Err("unsupported format specification".to_owned());
-        }
-        if let Some(ty) = ty {
-            if !matches!(ty, 'd' | 'f' | 's') {
-                return Err("unsupported format specification".to_owned());
-            }
-        }
-        Ok(Self {
-            fill,
-            align,
-            zero,
-            width,
-            precision,
-            ty,
-        })
-    }
-}
-
-fn parse_align(ch: char) -> Option<FormatAlign> {
-    match ch {
-        '<' => Some(FormatAlign::Left),
-        '>' => Some(FormatAlign::Right),
-        '^' => Some(FormatAlign::Center),
-        _ => None,
-    }
-}
-
-fn parse_digits(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<Option<usize>, String> {
-    let mut value = 0usize;
-    let mut saw_digit = false;
-    while let Some(ch) = chars.peek().copied() {
-        if !ch.is_ascii_digit() {
-            break;
-        }
-        saw_digit = true;
-        let digit = ch.to_digit(10).expect("ASCII digit") as usize;
-        value = value
-            .checked_mul(10)
-            .and_then(|value| value.checked_add(digit))
-            .ok_or_else(|| "format width is too large".to_owned())?;
-        chars.next();
-    }
-    Ok(saw_digit.then_some(value))
-}
-
-fn apply_format_spec(value: &str, spec: &str, kind: FormatValueKind) -> Result<String, String> {
-    let parsed = ParsedFormatSpec::parse(spec)?;
-    if !matches!(parsed.ty, None | Some('s')) {
-        return Err("unsupported format specification".to_owned());
-    }
-    let value = if let Some(precision) = parsed.precision {
-        truncate_to_precision(value, precision)
-    } else {
-        value.to_owned()
-    };
-    apply_parsed_format(&value, parsed, kind)
-}
-
-fn apply_parsed_format(value: &str, spec: ParsedFormatSpec, kind: FormatValueKind) -> Result<String, String> {
-    let Some(width) = spec.width else {
-        return Ok(value.to_owned());
-    };
-    let len = str_type::codepoint_len(value);
-    let pad = width.saturating_sub(len);
-    if pad == 0 {
-        return Ok(value.to_owned());
-    }
-    let align = spec.align.unwrap_or(match kind {
-        FormatValueKind::Text => FormatAlign::Left,
-        FormatValueKind::Number => FormatAlign::Right,
-    });
-    if spec.zero && align == FormatAlign::Right && value.starts_with(['-', '+']) {
-        let mut out = String::with_capacity(value.len() + pad);
-        out.push_str(&value[..1]);
-        push_fill(&mut out, spec.fill, pad);
-        out.push_str(&value[1..]);
-        return Ok(out);
-    }
-    let mut out = String::with_capacity(value.len() + pad * spec.fill.len_utf8());
-    match align {
-        FormatAlign::Left => {
-            out.push_str(value);
-            push_fill(&mut out, spec.fill, pad);
-        }
-        FormatAlign::Right => {
-            push_fill(&mut out, spec.fill, pad);
-            out.push_str(value);
-        }
-        FormatAlign::Center => {
-            let left = pad / 2;
-            let right = pad - left;
-            push_fill(&mut out, spec.fill, left);
-            out.push_str(value);
-            push_fill(&mut out, spec.fill, right);
-        }
-    }
-    Ok(out)
-}
-
-fn push_fill(out: &mut String, fill: char, count: usize) {
-    for _ in 0..count {
-        out.push(fill);
-    }
-}
-
-fn truncate_to_precision(value: &str, precision: usize) -> String {
-    value.chars().take(precision).collect()
-}
 
 fn object_to_i64(value: *mut PyObject) -> Option<i64> {
     if value.is_null() {
@@ -1435,12 +1117,6 @@ fn object_to_i64(value: *mut PyObject) -> Option<i64> {
     .flatten()
 }
 
-fn object_to_f64(value: *mut PyObject) -> Option<f64> {
-    if let Some(value) = unsafe { crate::types::float::to_f64(value) } {
-        return Some(value);
-    }
-    object_to_i64(value).map(|value| value as f64)
-}
 
 fn str_split_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
     let (sep, maxsplit) = match str_split_args(args, "str.split") {
@@ -2424,6 +2100,14 @@ fn str_long_value(value: *mut PyObject) -> Result<i64, String> {
     .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
 }
 
+fn repeat_count_value(value: *mut PyObject) -> Result<isize, String> {
+    let index = unsafe { super::number::pon_index(value) };
+    if index.is_null() {
+        return Err("repeat count must be an integer".to_owned());
+    }
+    isize::try_from(str_long_value(index)?).map_err(|_| "repeat count is out of range".to_owned())
+}
+
 fn str_index_value(value: *mut PyObject) -> Result<isize, String> {
     isize::try_from(str_long_value(value)?).map_err(|_| "string index is out of range for this platform".to_owned())
 }
@@ -2523,51 +2207,6 @@ fn expect_bytes_like(value: *mut PyObject) -> Result<Vec<u8>, String> {
     Err("expected bytes-like object".to_owned())
 }
 
-fn object_to_str(value: *mut PyObject) -> Result<String, String> {
-    if value.is_null() {
-        return Err("cannot format NULL object".to_owned());
-    }
-    let ty = unsafe { (*value).ob_type };
-    if bytes_type::is_bytes_type(ty) || bytearray_type::is_bytearray_type(ty) {
-        return object_to_repr(value);
-    }
-    super::format_object_for_print(value)
-}
-
-fn object_to_repr(value: *mut PyObject) -> Result<String, String> {
-    if value.is_null() {
-        return Err("cannot repr NULL object".to_owned());
-    }
-    let ty = unsafe { (*value).ob_type };
-    if bytes_type::is_bytes_type(ty) {
-        let bytes = unsafe { &*value.cast::<bytes_type::PyBytes>() };
-        return Ok(bytes_type::repr(unsafe { bytes.as_slice() }));
-    }
-    if bytearray_type::is_bytearray_type(ty) {
-        let bytearray = unsafe { &*value.cast::<bytearray_type::PyByteArray>() };
-        return Ok(bytearray_type::repr(bytearray.as_slice()));
-    }
-    if let Err(message) = super::ensure_runtime_initialized() {
-        return Err(message);
-    }
-    super::with_runtime(|runtime| unsafe {
-        if is_exact_type(value, runtime.unicode_type) {
-            let unicode = &*value.cast::<PyUnicode>();
-            return unicode
-                .as_str()
-                .map(str_type::repr)
-                .ok_or_else(|| "unicode object contains invalid UTF-8".to_owned());
-        }
-        if is_exact_type(value, runtime.long_type) {
-            return Ok((*value.cast::<PyLong>()).value.to_string());
-        }
-        if is_exact_type(value, runtime.none_type) {
-            return Ok("None".to_owned());
-        }
-        super::format_object_for_print(value)
-    })
-    .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
-}
 
 fn raw_bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
     if ptr.is_null() {
@@ -2601,16 +2240,6 @@ fn raw_fstring_parts<'a>(parts: *const super::FStrPartRaw, len: usize) -> Result
     Ok(unsafe { core::slice::from_raw_parts(parts, len) })
 }
 
-fn raw_template_parts<'a>(parts: *const super::TStrPartRaw, len: usize) -> Result<&'a [super::TStrPartRaw], String> {
-    if parts.is_null() {
-        return if len == 0 {
-            Ok(&[])
-        } else {
-            Err("template-string parts pointer is null".to_owned())
-        };
-    }
-    Ok(unsafe { core::slice::from_raw_parts(parts, len) })
-}
 
 #[cfg(test)]
 mod tests {

@@ -465,9 +465,6 @@ pub unsafe extern "C" fn builtin_eval(argv: *mut *mut PyObject, argc: usize) -> 
         Err(message) => return return_null_with_error(message),
     };
     let code_object = if let Some(code) = unsafe { as_code_object(args[0]) } {
-        if code.mode != DynCodeMode::Eval {
-            return return_null_with_error("eval() arg 1 must be an expression code object");
-        }
         code
     } else {
         let Some(source) = (unsafe { str_text(args[0]) }) else {

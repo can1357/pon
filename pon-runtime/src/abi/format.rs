@@ -202,7 +202,7 @@ pub(crate) unsafe fn build_template_from_raw(parts: *const TStrPartRaw, len: usi
     }
     strings.push(boxed_str(&pending_literal)?);
 
-    Ok(template_from_parts(strings, interpolations))
+    template_from_parts(strings, interpolations)
 }
 
 fn format_str(value: &str, spec: &str) -> Result<String, String> {
@@ -243,6 +243,12 @@ fn format_int(value: &BigInt, spec: &str) -> Result<String, String> {
         'x' | 'X' => 16,
         _ => return Err(format!("unknown format code '{ty}' for object of type 'int'")),
     };
+    if ty == 'n' && parsed.grouping.is_some() {
+        return Err(format!("Cannot specify '{}' with 'n'.", parsed.grouping.unwrap()));
+    }
+    if parsed.grouping == Some(',') && radix != 10 {
+        return Err(format!("Cannot specify ',' with '{ty}'."));
+    }
     let negative = value.sign() == Sign::Minus;
     let mut digits = value.abs().to_str_radix(radix);
     if ty == 'X' {
@@ -282,8 +288,10 @@ fn format_char(value: &BigInt, spec: &ParsedFormatSpec) -> Result<String, String
 
 fn format_float(value: f64, spec: &str) -> Result<String, String> {
     let parsed = ParsedFormatSpec::parse(spec)?;
-    if parsed.grouping == Some('_') && matches!(parsed.ty, Some('n')) {
-        return Err("Cannot specify '_' with 'n'".to_owned());
+    if matches!(parsed.ty, Some('n')) {
+        if let Some(grouping) = parsed.grouping {
+            return Err(format!("Cannot specify '{grouping}' with 'n'."));
+        }
     }
     let ty = parsed.ty.unwrap_or('\0');
     if !matches!(ty, '\0' | 'e' | 'E' | 'f' | 'F' | 'g' | 'G' | 'n' | '%') {
@@ -299,12 +307,12 @@ fn format_float(value: f64, spec: &str) -> Result<String, String> {
     let mut suffix = "";
     let mut body = match ty {
         '\0' => float_type::repr_f64(abs),
-        'e' | 'E' => format_float_exp(abs, precision, ty == 'E'),
-        'f' | 'F' => format_float_fixed(abs, precision, ty == 'F'),
+        'e' | 'E' => format_float_exp(abs, precision, ty == 'E', parsed.alternate),
+        'f' | 'F' => format_float_fixed(abs, precision, ty == 'F', parsed.alternate),
         'g' | 'G' | 'n' => format_float_general(abs, precision, parsed.alternate, ty == 'G'),
         '%' => {
             suffix = "%";
-            format_float_fixed(abs * 100.0, precision, false)
+            format_float_fixed(abs * 100.0, precision, false, parsed.alternate)
         }
         _ => unreachable!(),
     };
@@ -318,24 +326,32 @@ fn format_float(value: f64, spec: &str) -> Result<String, String> {
     apply_number_width(sign, "", &body, suffix, &parsed)
 }
 
-fn format_float_fixed(value: f64, precision: usize, uppercase_special: bool) -> String {
+fn format_float_fixed(value: f64, precision: usize, uppercase_special: bool, alternate: bool) -> String {
     if value.is_nan() {
         return if uppercase_special { "NAN".to_owned() } else { "nan".to_owned() };
     }
     if value.is_infinite() {
         return if uppercase_special { "INF".to_owned() } else { "inf".to_owned() };
     }
-    format!("{value:.precision$}")
+    let mut text = format!("{value:.precision$}");
+    if alternate {
+        ensure_float_decimal(&mut text);
+    }
+    text
 }
 
-fn format_float_exp(value: f64, precision: usize, uppercase: bool) -> String {
+fn format_float_exp(value: f64, precision: usize, uppercase: bool, alternate: bool) -> String {
     if value.is_nan() {
         return if uppercase { "NAN".to_owned() } else { "nan".to_owned() };
     }
     if value.is_infinite() {
         return if uppercase { "INF".to_owned() } else { "inf".to_owned() };
     }
-    let text = format!("{value:.precision$e}");
+    let mut text = format!("{value:.precision$e}");
+    if alternate {
+        ensure_float_decimal(&mut text);
+    }
+    normalize_float_exponent(&mut text, 'e');
     if uppercase { text.to_uppercase() } else { text }
 }
 
@@ -358,14 +374,44 @@ fn format_float_general(value: f64, precision: usize, alternate: bool, uppercase
     };
     if !alternate {
         trim_float_zeros(&mut text);
-    } else if !text.contains('.') {
-        if let Some(exp_pos) = text.find('e') {
-            text.insert(exp_pos, '.');
-        } else {
-            text.push('.');
-        }
+    } else {
+        ensure_float_decimal(&mut text);
+    }
+    if use_exp {
+        normalize_float_exponent(&mut text, 'e');
     }
     if uppercase { text.to_uppercase() } else { text }
+}
+
+fn ensure_float_decimal(text: &mut String) {
+    let end = text.find('e').or_else(|| text.find('E')).unwrap_or(text.len());
+    if !text[..end].contains('.') {
+        text.insert(end, '.');
+    }
+}
+
+fn normalize_float_exponent(text: &mut String, marker: char) {
+    let Some(exp_pos) = text.find('e').or_else(|| text.find('E')) else {
+        return;
+    };
+    let exponent = &text[exp_pos + 1..];
+    let (sign, digits) = if let Some(rest) = exponent.strip_prefix('-') {
+        ('-', rest)
+    } else if let Some(rest) = exponent.strip_prefix('+') {
+        ('+', rest)
+    } else {
+        ('+', exponent)
+    };
+    let digits = digits.trim_start_matches('0');
+    let digits = if digits.is_empty() { "0" } else { digits };
+    let mut normalized = String::with_capacity(4 + digits.len());
+    normalized.push(marker);
+    normalized.push(sign);
+    if digits.len() == 1 {
+        normalized.push('0');
+    }
+    normalized.push_str(digits);
+    text.replace_range(exp_pos.., &normalized);
 }
 
 fn trim_float_zeros(text: &mut String) {
@@ -880,21 +926,29 @@ unsafe fn concat_templates(left: *mut PyObject, right: *mut PyObject) -> Result<
     let mut interpolations = Vec::with_capacity(left_interps.len() + right_interps.len());
     interpolations.extend_from_slice(left_interps);
     interpolations.extend_from_slice(right_interps);
-    Ok(template_from_parts(strings, interpolations))
+    template_from_parts(strings, interpolations)
 }
 
-fn template_from_parts(strings: Vec<*mut PyObject>, interpolations: Vec<*mut PyObject>) -> *mut PyObject {
+fn template_from_parts(strings: Vec<*mut PyObject>, interpolations: Vec<*mut PyObject>) -> Result<*mut PyObject, String> {
     let values = interpolations
         .iter()
         .map(|interp| unsafe { (*interp.cast::<PyInterpolation>()).value })
         .collect::<Vec<_>>();
+    let strings_tuple = template_tuple(&strings)?;
+    let values_tuple = template_tuple(&values)?;
+    let interpolations_tuple = template_tuple(&interpolations)?;
     let object = Box::into_raw(Box::new(PyTemplate {
         ob_base: PyObjectHeader::new(template_type()),
-        strings: crate::native::builtins_mod::alloc_tuple(strings),
-        values: crate::native::builtins_mod::alloc_tuple(values),
-        interpolations: crate::native::builtins_mod::alloc_tuple(interpolations),
+        strings: strings_tuple,
+        values: values_tuple,
+        interpolations: interpolations_tuple,
     }));
-    as_object_ptr(object)
+    Ok(as_object_ptr(object))
+}
+
+fn template_tuple(items: &[*mut PyObject]) -> Result<*mut PyObject, String> {
+    super::with_runtime(|runtime| super::seq::alloc_tuple_from_slice(runtime, items))
+        .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
 }
 
 fn boxed_interpolation(part: &TStrPartRaw) -> Result<*mut PyObject, String> {
