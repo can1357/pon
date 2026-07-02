@@ -515,7 +515,11 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
 
     let is_type = unsafe { is_type_object(object) };
     if is_type && name_id == intern::intern("__name__") {
-        let type_name = unsafe { (*object.cast::<PyType>()).name() };
+        let full = unsafe { (*object.cast::<PyType>()).name() };
+        // CPython `type.__name__`: static tp_names are dotted
+        // (`collections.deque`); the getter exposes only the tail component,
+        // while `repr(type)` keeps the full dotted path.
+        let type_name = full.rsplit('.').next().unwrap_or(full);
         return unsafe { abi::pon_const_str(type_name.as_ptr(), type_name.len()) };
     }
     if is_type && name_id == intern::intern("__dict__") {
@@ -799,7 +803,30 @@ pub unsafe fn super_lookup(start: *mut PyType, obj: *mut PyObject, owner: *mut P
             }
         }
     }
+    // CPython parity: `object.__init_subclass__` is a no-op classmethod that
+    // pon's builtin object type dict never materializes, so the chained
+    // `super().__init_subclass__(*args, **kwargs)` every cooperative hook
+    // ends with (unittest.TestCase) exhausts the MRO and lands here.
+    if intern::resolve(name).as_deref() == Some("__init_subclass__") {
+        // SAFETY: Live builtin entry point with the runtime calling convention.
+        let function = unsafe {
+            abi::pon_make_function(
+                object_init_subclass_noop as *const u8,
+                crate::builtins::variadic_arity(),
+                name,
+            )
+        };
+        if !function.is_null() {
+            return function;
+        }
+    }
     raise_attr_error("super attribute was not found")
+}
+
+/// `object.__init_subclass__` surrogate: accepts anything, does nothing.
+unsafe extern "C" fn object_init_subclass_noop(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+    // SAFETY: Singleton accessor.
+    unsafe { abi::pon_none() }
 }
 
 /// Python-level metaclass hook (`__instancecheck__`/`__subclasscheck__`)
