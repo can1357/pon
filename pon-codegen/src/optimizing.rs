@@ -90,8 +90,14 @@ pub enum LoweringStep {
 }
 
 /// Build an optimizing plan for the largest currently typed region in `function`.
+///
+/// Generator/coroutine bodies are excluded: they compile through the pin J0.1
+/// two-function baseline scheme only (tier-1 generator regions are O5 scope).
 #[must_use]
 pub fn plan_function(function: &Function) -> Option<OptimizingPlan> {
+    if function.is_generator {
+        return None;
+    }
     region::find_maximal_typed_region(function).map(|region| plan_region(function, region))
 }
 

@@ -35,6 +35,9 @@ pub(crate) fn lower_terminator(
 ) -> Result<(), CodegenError> {
     match term {
         Terminator::Return(value) => {
+            if state.gen_ctx.is_some() {
+                return super::r#gen::lower_gen_return(builder, state, helpers, *value);
+            }
             let value = state.value(*value)?;
             builder.ins().return_(&[value]);
             Ok(())
@@ -43,9 +46,9 @@ pub(crate) fn lower_terminator(
             lower_raise_term(builder, helpers, ptr_ty, exception_exit);
             Ok(())
         }
-        Terminator::Suspend { .. } => Err(CodegenError::Unsupported(
-            "generator suspension terminator requires generator frame lowering",
-        )),
+        Terminator::Suspend { state: suspend_state, val, .. } => {
+            super::r#gen::lower_suspend(builder, state, helpers, ptr_ty, *suspend_state, *val)
+        }
         Terminator::Jump(_)
         | Terminator::Branch { .. }
         | Terminator::CondBranch { .. }
@@ -67,6 +70,9 @@ pub(crate) fn lower_terminator_with_blocks(
 ) -> Result<(), CodegenError> {
     match term {
         Terminator::Return(value) => {
+            if state.gen_ctx.is_some() {
+                return super::r#gen::lower_gen_return(builder, state, helpers, *value);
+            }
             let value = state.value(*value)?;
             builder.ins().return_(&[value]);
             Ok(())
@@ -109,9 +115,9 @@ pub(crate) fn lower_terminator_with_blocks(
             lower_raise_term(builder, helpers, ptr_ty, exception_exit);
             Ok(())
         }
-        Terminator::Suspend { .. } => Err(CodegenError::Unsupported(
-            "generator suspension terminator requires generator frame lowering",
-        )),
+        Terminator::Suspend { state: suspend_state, val, .. } => {
+            super::r#gen::lower_suspend(builder, state, helpers, ptr_ty, *suspend_state, *val)
+        }
         Terminator::Unreachable => Err(CodegenError::Unsupported("unreachable terminator")),
         _ => Err(CodegenError::Unsupported("unknown future terminator")),
     }

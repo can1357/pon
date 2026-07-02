@@ -3,7 +3,7 @@
 use cranelift_codegen::ir::{self, InstBuilder, StackSlotData, StackSlotKind};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_module::{DataDescription, FuncId, Module};
-use pon_ir::ir::{CellId, Function, FunctionId, InstKind, NameId, Value as IrValue};
+use pon_ir::ir::{CellId, Function, FunctionId, NameId, Value as IrValue};
 
 use super::{
     CodegenError, HelperFuncRefs, LowerState, NameMap, build_call_argv, call_pyobject_helper,
@@ -306,15 +306,12 @@ fn declare_code_info<M: Module>(
 }
 
 fn code_flags(target: &Function) -> u32 {
+    // The state-machine transform consumes every Yield/YieldFrom marker, so
+    // the IR flags are the only source of truth for generator-ness.
     if target.is_coroutine {
         return pon_runtime::abi::call::CODE_FLAG_COROUTINE;
     }
-    if target
-        .blocks
-        .iter()
-        .flat_map(|block| &block.insts)
-        .any(|inst| matches!(inst.kind, InstKind::Yield { .. } | InstKind::YieldFrom { .. }))
-    {
+    if target.is_generator {
         pon_runtime::abi::call::CODE_FLAG_GENERATOR
     } else {
         0
