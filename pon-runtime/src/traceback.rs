@@ -1,101 +1,107 @@
-//! Minimal traceback recording for NULL-sentinel exception paths.
+//! Boxed Python traceback objects for NULL-sentinel exception paths.
 //!
-//! Phase B does not yet expose a boxed Python traceback type.  This module keeps
-//! the runtime-visible frame observations in a side table so raising helpers can
-//! record the active frame without changing the GC object model or the public
-//! `PyBaseException` layout.  When a boxed traceback object lands, the records
-//! here are the single cutover point.
+//! Raising helpers in `abi::exc` snapshot the active Python call stack into a
+//! `tb_next`-linked `PyTraceback` chain and store it on the exception instance
+//! (`PyBaseException.traceback`), so `exc.__traceback__` observes CPython's
+//! None-or-chain contract.  Entries stay minimal until the line-table
+//! workstream lands: each carries a synthesized heap frame and `tb_lineno == 0`
+//! (pon-ir instructions carry no source locations yet, so no raise or call site
+//! can know its line at runtime).
 
 use core::{mem, ptr};
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::{LazyLock, Mutex};
 
-use crate::abi::PyFrame;
+use pon_gc::TypeId;
+
 use crate::object::{PyObject, PyObjectHeader, PyType};
-use crate::thread_state::{pon_err_set, thread_state_lock};
-use crate::types::frame::ensure_frame_type;
+use crate::thread_state::pon_err_set;
 
+/// GC type id reserved for boxed traceback objects; sits in the WS-GEN frame
+/// family next to `crate::types::frame::TYPE_ID_FRAME`.
+pub(crate) const TYPE_ID_TRACEBACK: TypeId = TypeId(34);
 
+/// Boxed traceback chain entry mirroring CPython's `tb_next`-linked layout.
+///
+/// The head of a chain is the outermost observed frame; `tb_next` descends
+/// toward the raise site (CPython's most-recent-call-last order).
 #[repr(C)]
-struct PyTraceback {
+pub(crate) struct PyTraceback {
     ob_base: PyObjectHeader,
-    frame: *mut PyFrame,
+    /// Next (deeper, toward the raise site) entry, or NULL at the raise site.
+    pub(crate) tb_next: *mut PyObject,
+    /// Frame observed for this entry; non-NULL by construction.
+    pub(crate) frame: *mut PyObject,
+    /// Source line of this entry; `0` until the line-table workstream lands.
+    pub(crate) lineno: i64,
 }
 
-fn traceback_type() -> *mut PyType {
-    static TRACEBACK_TYPE: LazyLock<usize> = LazyLock::new(|| {
-        let mut ty = PyType::new(ptr::null(), "traceback", mem::size_of::<PyTraceback>());
-        ty.tp_getattro = Some(traceback_getattro);
-        Box::into_raw(Box::new(ty)) as usize
-    });
-    *TRACEBACK_TYPE as *mut PyType
+impl PyTraceback {
+    /// Builds a chain-entry payload for placement into runtime-allocated memory.
+    #[must_use]
+    pub(crate) fn new(ty: *const PyType, frame: *mut PyObject, lineno: i64, tb_next: *mut PyObject) -> Self {
+        Self {
+            ob_base: PyObjectHeader::new(ty),
+            tb_next,
+            frame,
+            lineno,
+        }
+    }
 }
 
-fn dummy_frame() -> *mut PyFrame {
-    let frame_type = ensure_frame_type(ptr::null_mut());
-    Box::into_raw(Box::new(PyFrame::new(frame_type, 0, ptr::null_mut())))
+static TRACEBACK_TYPE: LazyLock<Mutex<Option<usize>>> = LazyLock::new(|| Mutex::new(None));
+
+/// Returns the process-lifetime traceback type object, creating it if needed.
+pub(crate) fn ensure_traceback_type(type_type: *mut PyType) -> *mut PyType {
+    let mut slot = TRACEBACK_TYPE.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(existing) = *slot {
+        return existing as *mut PyType;
+    }
+
+    let mut ty = PyType::new(type_type.cast_const(), "traceback", mem::size_of::<PyTraceback>());
+    ty.tp_getattro = Some(traceback_getattro);
+    ty.gc_type_id = TYPE_ID_TRACEBACK.0 as usize;
+    let ptr = Box::into_raw(Box::new(ty));
+    *slot = Some(ptr as usize);
+    ptr
 }
 
-#[must_use]
-pub fn new_traceback(frame: *mut PyFrame) -> *mut PyObject {
-    let frame = if frame.is_null() { dummy_frame() } else { frame };
-    Box::into_raw(Box::new(PyTraceback {
-        ob_base: PyObjectHeader::new(traceback_type()),
-        frame,
-    }))
-    .cast::<PyObject>()
-}
-
+/// Serves `tb_frame`/`tb_next`/`tb_lineno` on traceback chain entries.
 unsafe extern "C" fn traceback_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
     let Some(name) = (unsafe { crate::types::type_::unicode_text(name) }) else {
         pon_err_set("traceback attribute name must be str");
         return ptr::null_mut();
     };
+    // SAFETY: The runtime dispatches this slot only for PyTraceback instances.
+    let entry = unsafe { &*object.cast::<PyTraceback>() };
     match name {
-        "tb_frame" => unsafe { (*object.cast::<PyTraceback>()).frame.cast::<PyObject>() },
-        "tb_next" => unsafe { crate::abi::pon_none() },
-        "tb_lineno" => unsafe { crate::abi::pon_const_int(0) },
+        "tb_frame" => entry.frame,
+        "tb_next" => {
+            if entry.tb_next.is_null() {
+                unsafe { crate::abi::pon_none() }
+            } else {
+                entry.tb_next
+            }
+        }
+        "tb_lineno" => unsafe { crate::abi::pon_const_int(entry.lineno) },
         _ => unsafe { crate::abi::pon_raise_attribute_error(object, crate::intern::intern(name)) },
     }
 }
-/// One frame observed while installing an exception in `PonThreadState`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TracebackRecord {
-    /// Exception object being installed, or NULL for diagnostic-only errors.
-    pub exception: *mut PyObject,
-    /// Active Python frame at the point the error was recorded.
-    pub frame: *mut PyFrame,
-}
 
-unsafe impl Send for TracebackRecord {}
-
-static TRACEBACK_RECORDS: LazyLock<Mutex<Vec<TracebackRecord>>> = LazyLock::new(|| Mutex::new(Vec::new()));
-
-fn records_lock() -> MutexGuard<'static, Vec<TracebackRecord>> {
-    TRACEBACK_RECORDS.lock().unwrap_or_else(|poison| poison.into_inner())
-}
-
-/// Records the current frame for a newly installed NULL-sentinel exception path.
+/// Traces a boxed traceback entry for the runtime GC.
 ///
-/// The helper intentionally does nothing when no Python frame is active: Phase-A
-/// top-level helpers run outside a managed frame, and recording a synthetic NULL
-/// frame would be indistinguishable from missing traceback information.
-pub fn record_current_frame(exception: *mut PyObject) {
-    let frame = thread_state_lock().current_frame().unwrap_or(ptr::null_mut());
-    if frame.is_null() {
+/// # Safety
+///
+/// `object` must be NULL or point at a live `PyTraceback` allocation.
+pub(crate) unsafe extern "C" fn trace_traceback(object: *mut u8, visitor: &mut dyn FnMut(*mut u8)) {
+    if object.is_null() {
         return;
     }
-    records_lock().push(TracebackRecord { exception, frame });
-}
-
-/// Returns a snapshot of recorded traceback frames.
-#[cfg(test)]
-#[must_use]
-pub fn records() -> Vec<TracebackRecord> {
-    records_lock().clone()
-}
-
-/// Clears the traceback side table.
-#[cfg(test)]
-pub fn clear_records() {
-    records_lock().clear();
+    // SAFETY: The GC registered this callback only for `PyTraceback` allocations.
+    let entry = unsafe { &*object.cast::<PyTraceback>() };
+    if !entry.tb_next.is_null() {
+        visitor(entry.tb_next.cast::<u8>());
+    }
+    if !entry.frame.is_null() {
+        visitor(entry.frame.cast::<u8>());
+    }
 }

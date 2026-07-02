@@ -165,6 +165,9 @@ impl TierUpDriver {
             }));
     }
 
+    /// Synchronous compile+install used only by tier-up unit tests; the
+    /// production path goes through `enqueue` and the background worker.
+    #[cfg(test)]
     unsafe fn compile_and_install(&self, function: *mut PyFunction) {
         let Some(request) = (unsafe { self.prepare_request(function, CompileReason::Call) }) else {
             return;

@@ -5,22 +5,24 @@
 //! return `-1` on helper misuse.  No native unwinding crosses the C ABI.
 
 use core::ffi::c_int;
+use core::mem::size_of;
 use core::ptr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-#[path = "../traceback.rs"]
-mod traceback;
+use pon_gc::GcTypeInfo;
 
 use crate::intern;
 use crate::object::{PyObject, PyType, as_object_ptr, is_exact_type};
 use crate::thread_state::{ExcStarFrame, pon_err_clear, pon_err_occurred, pon_err_set_object, thread_state_lock};
+use crate::traceback::{PyTraceback, TYPE_ID_TRACEBACK, ensure_traceback_type, trace_traceback};
 use crate::types::exc::{
     EXC_GROUP_METHOD_DERIVE, EXC_GROUP_METHOD_SPLIT, EXC_GROUP_METHOD_SUBGROUP, ExceptionKind, PyBaseException,
     PyExceptionGroup, as_exception_group, is_exception_group_instance, is_exception_instance, is_exception_subclass,
 };
+use crate::types::frame::{TYPE_ID_FRAME, ensure_frame_type, finalize_frame, trace_frame};
 use crate::types::tuple::PyTuple;
 
-use super::{HandlerInfo, Runtime, TYPE_ID_EXCEPTION, TYPE_ID_EXCEPTION_GROUP};
+use super::{HandlerInfo, PyFrame, Runtime, TYPE_ID_EXCEPTION, TYPE_ID_EXCEPTION_GROUP};
 
 /// Exception-handler kind selector; concrete values are assigned by lowering.
 pub type HandlerKind = u8;
@@ -130,19 +132,90 @@ fn alloc_exception_group_from_members(
     alloc_exception_group_object(runtime, ty, message, exceptions, ptr::null_mut())
 }
 
-fn install_current_exception(exception: *mut PyObject, diagnostic: String) {
-    traceback::record_current_frame(exception);
-    pon_err_set_object(exception, diagnostic);
+/// Snapshots the active Python call stack into a traceback chain on `exception`.
+///
+/// CPython appends one entry per frame the exception propagates through; pon's
+/// NULL-return unwinding has no per-frame hook, so the whole chain (module
+/// level plus one entry per active compiled Python call) is materialized at
+/// raise time instead.  A raised-again exception keeps its previous chain as
+/// the deeper suffix, matching CPython's most-recent-call-last ordering.
+///
+/// Known divergences (best effort until the line-table workstream lands):
+/// frames above the eventual handler are indistinguishable from propagated
+/// frames, native builtin shims count as one call level, generator resume
+/// frames are not counted, and `tb_lineno` stays `0` because pon-ir carries no
+/// source locations.
+fn attach_current_traceback(runtime: &Runtime, exception: *mut PyObject) {
+    if exception.is_null() || is_diagnostic_sentinel(exception) {
+        return;
+    }
+    runtime.heap.register_type(
+        TYPE_ID_TRACEBACK,
+        GcTypeInfo {
+            size: size_of::<PyTraceback>(),
+            trace: trace_traceback,
+            finalize: None,
+        },
+    );
+    // Frames may be allocated before any generator ran; mirror the legacy
+    // registration in `abi::gen` (`register_type` replaces idempotently).
+    runtime.heap.register_type(
+        TYPE_ID_FRAME,
+        GcTypeInfo {
+            size: size_of::<PyFrame>(),
+            trace: trace_frame,
+            finalize: Some(finalize_frame),
+        },
+    );
+    let frame_type = ensure_frame_type(runtime._type_type);
+    let traceback_type = ensure_traceback_type(runtime._type_type);
+    let python_calls = super::CURRENT_FUNCTION_STACK.with(|stack| stack.borrow().len());
+
+    // SAFETY: Raise-path callers pass a live boxed exception instance.
+    let slot = unsafe { &mut (*exception.cast::<PyBaseException>()).traceback };
+    let mut next = *slot;
+    // Innermost (raise site) first: its tb_next is the surviving prior chain;
+    // the last-built entry is the outermost frame and becomes the new head.
+    for _ in 0..=python_calls {
+        let frame = runtime.heap.alloc(size_of::<PyFrame>(), TYPE_ID_FRAME).cast::<PyFrame>();
+        // SAFETY: `frame` points to a freshly allocated zeroed block of the right size.
+        unsafe { ptr::write(frame, PyFrame::new(frame_type.cast_const(), 0, ptr::null_mut())) };
+        let entry = runtime
+            .heap
+            .alloc(size_of::<PyTraceback>(), TYPE_ID_TRACEBACK)
+            .cast::<PyTraceback>();
+        // SAFETY: `entry` points to a freshly allocated zeroed block of the right size.
+        unsafe {
+            ptr::write(
+                entry,
+                PyTraceback::new(traceback_type.cast_const(), frame.cast::<PyObject>(), 0, next),
+            );
+        }
+        next = entry.cast::<PyObject>();
+    }
+    *slot = next;
 }
 
+/// Installs `exception` as pending WITHOUT touching its traceback.
+///
+/// Restore-flavored paths (`pon_exc_restore`, `except*` bookkeeping) reinstall
+/// exceptions that already own their chain; CPython appends traceback entries
+/// only on raise, so only [`raise_current_exception`] attaches.
 fn set_current_exception(runtime: &Runtime, exception: *mut PyObject) {
-    install_current_exception(exception, exception_diagnostic(runtime, exception));
+    pon_err_set_object(exception, exception_diagnostic(runtime, exception));
+}
+
+/// Raise-flavored install: appends the current-stack traceback segment first.
+fn raise_current_exception(runtime: &Runtime, exception: *mut PyObject) {
+    attach_current_traceback(runtime, exception);
+    set_current_exception(runtime, exception);
 }
 
 fn raise_builtin_value(runtime: &Runtime, kind: ExceptionKind, value: *mut PyObject, diagnostic: String) -> *mut PyObject {
     match alloc_exception_object(runtime, runtime.exception_types.get(kind), value, ptr::null_mut()) {
         Ok(exception) => {
-            install_current_exception(exception, diagnostic);
+            attach_current_traceback(runtime, exception);
+            pon_err_set_object(exception, diagnostic);
             ptr::null_mut()
         }
         Err(message) => super::return_null_with_error(message),
@@ -380,7 +453,7 @@ pub unsafe extern "C" fn pon_raise(exc: *mut PyObject, cause: *mut PyObject) -> 
                 }
                 match alloc_exception_object(runtime, ty, ptr::null_mut(), cause) {
                     Ok(exception) => {
-                        set_current_exception(runtime, exception);
+                        raise_current_exception(runtime, exception);
                         ptr::null_mut()
                     }
                     Err(message) => super::return_null_with_error(message),
@@ -394,7 +467,7 @@ pub unsafe extern "C" fn pon_raise(exc: *mut PyObject, cause: *mut PyObject) -> 
                 unsafe {
                     set_exception_links(exc, cause);
                 }
-                set_current_exception(runtime, exc);
+                raise_current_exception(runtime, exc);
                 ptr::null_mut()
             }
         }) {
@@ -1222,7 +1295,6 @@ mod tests {
         thread_state_lock().handler_chain.clear();
         thread_state_lock().frame_stack.clear();
         thread_state_lock().exc_star_stack.clear();
-        traceback::clear_records();
     }
 
     fn exception_types() -> crate::types::exc::ExceptionTypeSet {
@@ -1392,20 +1464,67 @@ mod tests {
         }
     }
 
+    fn traceback_chain_len(exception: *mut PyObject) -> usize {
+        let mut length = 0;
+        let mut entry = unsafe { (*exception.cast::<PyBaseException>()).traceback };
+        while !entry.is_null() {
+            length += 1;
+            entry = unsafe { (*entry.cast::<crate::traceback::PyTraceback>()).tb_next };
+        }
+        length
+    }
+
     #[test]
-    fn raising_records_active_frame_for_traceback_cutover() {
+    fn raising_attaches_module_level_traceback_chain() {
         let _guard = test_state_lock();
         unsafe {
             reset_exception_state();
-            let frame = core::ptr::NonNull::<super::super::PyFrame>::dangling().as_ptr();
-            thread_state_lock().push_frame(frame);
 
             assert!(pon_raise_value_error(b"with frame".as_ptr(), 10).is_null());
 
-            let records = traceback::records();
-            assert_eq!(records.len(), 1);
-            assert_eq!(records[0].frame, frame);
-            assert_eq!(records[0].exception, thread_state_lock().current_exc);
+            let exception = thread_state_lock().current_exc;
+            let head = (*exception.cast::<PyBaseException>()).traceback;
+            assert!(!head.is_null());
+            let entry = &*head.cast::<crate::traceback::PyTraceback>();
+            assert!(!entry.frame.is_null());
+            assert_eq!(entry.lineno, 0);
+            assert!(entry.tb_next.is_null());
+            reset_exception_state();
+        }
+    }
+
+    #[test]
+    fn raising_snapshots_one_entry_per_active_python_call() {
+        let _guard = test_state_lock();
+        unsafe {
+            reset_exception_state();
+            let function = core::ptr::NonNull::<crate::object::PyFunction>::dangling().as_ptr();
+            let outer = super::super::push_current_call(function, ptr::null_mut(), 0);
+            let inner = super::super::push_current_call(function, ptr::null_mut(), 0);
+
+            assert!(pon_raise_value_error(b"deep".as_ptr(), 4).is_null());
+            drop(inner);
+            drop(outer);
+
+            let exception = thread_state_lock().current_exc;
+            assert_eq!(traceback_chain_len(exception), 3);
+            reset_exception_state();
+        }
+    }
+
+    #[test]
+    fn raising_again_appends_a_traceback_segment() {
+        let _guard = test_state_lock();
+        unsafe {
+            reset_exception_state();
+            assert!(pon_raise_value_error(b"origin".as_ptr(), 6).is_null());
+            let exception = thread_state_lock().current_exc;
+            assert_eq!(traceback_chain_len(exception), 1);
+
+            pon_err_clear();
+            assert!(pon_raise(exception, ptr::null_mut()).is_null());
+            assert_eq!(thread_state_lock().current_exc, exception);
+            assert_eq!(traceback_chain_len(exception), 2);
             reset_exception_state();
         }
     }

@@ -220,6 +220,7 @@ fn install_source_root(source: &SourceRoot, destination: &Path, destination_rela
 
 enum LinkOutcome {
     Linked,
+    #[cfg_attr(unix, allow(dead_code, reason = "constructed only by the windows and fallback create_editable_link impls"))]
     Copied,
 }
 

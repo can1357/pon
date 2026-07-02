@@ -314,7 +314,7 @@ fn extract_script_member(
     let installed = rewrite_python_shebang(original);
     write_file(destination, &installed)?;
     chmod_executable(destination)?;
-    Ok(record_entry_from_bytes(
+    Ok(RecordEntry::from_bytes(
         record_path_for_destination(env, destination)?,
         &installed,
     ))
@@ -610,11 +610,6 @@ fn path_component_to_string(component: &std::ffi::OsStr) -> Result<String> {
     })
 }
 
-fn record_entry_from_bytes(path: String, bytes: &[u8]) -> RecordEntry {
-    let digest = Sha256::digest(bytes);
-    record_entry_from_digest(path, bytes.len() as u64, &digest)
-}
-
 fn record_entry_from_digest(path: String, size: u64, digest: impl AsRef<[u8]>) -> RecordEntry {
     RecordEntry {
         path,
@@ -628,7 +623,7 @@ fn write_recorded_file(path: &Path, record_path: String, content: &[u8], executa
     if executable {
         chmod_executable(path)?;
     }
-    Ok(record_entry_from_bytes(record_path, content))
+    Ok(RecordEntry::from_bytes(record_path, content))
 }
 
 fn write_file(path: &Path, content: &[u8]) -> Result<()> {

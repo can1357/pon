@@ -105,11 +105,6 @@ impl PyProject {
         })
     }
 
-    pub(crate) fn build_system_has_key(&self, key: &str) -> bool {
-        self.table_like_at(&["build-system"])
-            .is_some_and(|table| table.contains_key(key))
-    }
-
     #[must_use]
     pub fn tool_pon_index_url(&self) -> Option<&str> {
         self.string_at(&["tool", "pon", "index-url"])
