@@ -166,14 +166,14 @@ impl TierUpDriver {
     }
 
     unsafe fn compile_and_install(&self, function: *mut PyFunction) {
-        let Some(request) = unsafe { self.prepare_request(function, CompileReason::Call) } else {
+        let Some(request) = (unsafe { self.prepare_request(function, CompileReason::Call) }) else {
             return;
         };
         process_request(&self.shared, &self.pins, &self.shutting_down, request);
     }
 
     unsafe fn enqueue(&self, function: *mut PyFunction, reason: CompileReason) {
-        let Some(request) = unsafe { self.prepare_request(function, reason) } else {
+        let Some(request) = (unsafe { self.prepare_request(function, reason) }) else {
             return;
         };
         let Some(tx) = self.compile_tx.as_ref() else {

@@ -326,6 +326,7 @@ unsafe fn is_mapping_pattern_candidate(subject: *mut PyObject) -> bool {
 /// The ABI-level `pon_get_len` export is owned by `seq`; keep this Rust-level
 /// shim pointed at that implementation so the runtime exposes a single symbol.
 pub unsafe extern "C" fn pon_match_get_len(subject: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
+    crate::untag_prelude!(subject);
     unsafe { super::seq::pon_get_len(subject, feedback) }
 }
 

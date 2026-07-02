@@ -594,6 +594,7 @@ pub unsafe fn pon_dict_bound_method(map: *mut PyObject, name: &str) -> *mut PyOb
 /// Returns a bound `dict.get` method object for attribute lookup.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_get_bound_method(map: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(map);
     unsafe { pon_dict_bound_method(map, "get") }
 }
 
@@ -726,6 +727,7 @@ pub unsafe extern "C" fn pon_set_add(set: *mut PyObject, item: *mut PyObject) ->
 /// Discards an element from a set and returns None.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_set_discard(set: *mut PyObject, item: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(set, item);
     super::catch_object_helper(|| {
         let _guard = crate::sync::begin_critical_section(set);
         match unsafe { set_::set_discard(set, item) } {

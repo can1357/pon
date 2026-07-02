@@ -210,6 +210,7 @@ fn divmod_reals(left: NumericValue, right: NumericValue) -> *mut PyObject {
 /// exception and returns `NaN`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_number_as_f64(object: *mut PyObject) -> f64 {
+    crate::untag_prelude!(err = f64::NAN; object);
     match super::catch_object_helper(|| {
         unsafe {
             install_runtime_int_slots(object);

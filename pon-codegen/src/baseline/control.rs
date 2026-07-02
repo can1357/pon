@@ -211,6 +211,7 @@ fn emit_osr_poll_and_transfer(
         kind: StackSlotKind::ExplicitSlot,
         size: size.try_into().map_err(|_| CodegenError::OffsetTooLarge { offset: size })?,
         align_shift: 3,
+        key: None,
     });
     builder.ins().stack_store(header, slot, 0);
     let count = builder.ins().iconst(ir::types::I32, live_count as i64);
