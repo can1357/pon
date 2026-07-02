@@ -1600,6 +1600,10 @@ mod tests {
     use super::*;
     use crate::ir::{BinOp, InstKind, LocalId, NameId};
 
+    fn insts_of(function: &Function) -> impl Iterator<Item = &Inst> + '_ {
+        function.blocks.iter().flat_map(|block| &block.insts)
+    }
+
     #[test]
     fn lowers_phase_a_hello_shape() {
         let module = lower_source(
@@ -2017,6 +2021,206 @@ f(y)
                 .all(|inst| inst.line == 0),
             "sourceless lowering must stamp line 0 everywhere"
         );
+    }
+
+    #[test]
+    fn lowers_async_list_comprehension_with_async_iteration_protocol() {
+        let module = lower_source(
+            r#"
+async def f(src):
+    return [x * 2 async for x in src]
+"#,
+        )
+        .expect("async list comprehension inside async def should lower");
+
+        let listcomp = module
+            .functions
+            .iter()
+            .find(|function| function.name == "<listcomp>")
+            .expect("async comprehension should synthesize a child function");
+        assert!(
+            listcomp.is_coroutine,
+            "an async comprehension body must run as a coroutine"
+        );
+        assert!(
+            listcomp.is_generator,
+            "an async comprehension body must be a resumable state machine"
+        );
+
+        let outer = module
+            .functions
+            .iter()
+            .find(|function| function.name == "f")
+            .expect("enclosing async function should lower");
+        assert!(
+            insts_of(outer).any(|inst| matches!(inst.kind, InstKind::GetAIter { .. })),
+            "an async first clause must acquire the outer iterator with GetAIter in the enclosing scope"
+        );
+        assert!(
+            insts_of(outer).any(|inst| matches!(inst.kind, InstKind::Await { .. })),
+            "the enclosing scope must await the comprehension coroutine call"
+        );
+
+        let handler_block = listcomp
+            .blocks
+            .iter()
+            .find(|block| {
+                block
+                    .insts
+                    .iter()
+                    .any(|inst| matches!(inst.kind, InstKind::MatchExc { .. }))
+            })
+            .expect("the async advance must lower a protected handler with an exception match");
+        let stop_load = handler_block
+            .insts
+            .iter()
+            .find(|inst| matches!(
+                &inst.kind,
+                InstKind::LoadBuiltin(name) if module.names[name.0 as usize] == "StopAsyncIteration"
+            ))
+            .expect("the handler block must load the StopAsyncIteration builtin");
+        assert!(
+            handler_block.insts.iter().any(|inst| matches!(
+                &inst.kind,
+                InstKind::MatchExc { exc_type } if *exc_type == stop_load.result
+            )),
+            "the handler must match the active exception against StopAsyncIteration"
+        );
+    }
+
+    #[test]
+    fn async_comprehension_with_sync_first_clause_uses_sync_outer_iterator() {
+        let module = lower_source(
+            r#"
+async def f(src, g):
+    return [await g(x) for x in src]
+"#,
+        )
+        .expect("await inside a sync-clause comprehension should lower");
+
+        let outer = module
+            .functions
+            .iter()
+            .find(|function| function.name == "f")
+            .expect("enclosing async function should lower");
+        assert!(
+            insts_of(outer).any(|inst| matches!(inst.kind, InstKind::GetIter { .. })),
+            "a sync first clause must acquire the outer iterator with GetIter"
+        );
+        assert!(
+            !insts_of(outer).any(|inst| matches!(inst.kind, InstKind::GetAIter { .. })),
+            "a sync first clause must not acquire an async iterator"
+        );
+
+        let listcomp = module
+            .functions
+            .iter()
+            .find(|function| function.name == "<listcomp>")
+            .expect("comprehension should synthesize a child function");
+        assert!(
+            listcomp.is_coroutine,
+            "await inside the comprehension body must make the child a coroutine"
+        );
+    }
+
+    #[test]
+    fn lowers_async_for_with_stop_async_iteration_handler() {
+        let module = lower_source(
+            r#"
+async def f(src):
+    async for x in src:
+        pass
+
+def g(src):
+    for x in src:
+        pass
+"#,
+        )
+        .expect("async for inside async def should lower");
+
+        let async_fn = module
+            .functions
+            .iter()
+            .find(|function| function.name == "f")
+            .expect("async function should lower");
+        assert!(
+            insts_of(async_fn).any(|inst| matches!(inst.kind, InstKind::GetAIter { .. })),
+            "async for must acquire its iterator with GetAIter"
+        );
+        assert!(
+            insts_of(async_fn).any(|inst| matches!(inst.kind, InstKind::MatchExc { .. })),
+            "the async advance must lower a protected handler with an exception match"
+        );
+
+        let sync_fn = module
+            .functions
+            .iter()
+            .find(|function| function.name == "g")
+            .expect("sync control function should lower");
+        assert!(
+            !insts_of(sync_fn).any(|inst| matches!(
+                inst.kind,
+                InstKind::GetAIter { .. } | InstKind::MatchExc { .. } | InstKind::Await { .. }
+            )),
+            "a plain for loop must not lower any async-iteration protocol"
+        );
+    }
+
+    #[test]
+    fn rejects_async_constructs_in_unsupported_scopes_with_exact_features() {
+        let cases = [
+            (
+                "async def f(y):\n    return (x async for x in y)\n",
+                "async generator expressions",
+            ),
+            (
+                "def f(y):\n    async for x in y:\n        pass\n",
+                "'async for' outside async function",
+            ),
+            (
+                "def f(y):\n    return [x async for x in y]\n",
+                "asynchronous comprehension outside of an asynchronous function",
+            ),
+        ];
+        for (source, expected_feature) in cases {
+            let err = lower_source(source)
+                .expect_err("source should be rejected during lowering");
+            match err {
+                LowerError::Unsupported { feature, .. } => assert_eq!(
+                    feature, expected_feature,
+                    "wrong unsupported-feature message for source:\n{source}"
+                ),
+                other => panic!("expected Unsupported for source:\n{source}\ngot {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn nested_async_comprehension_marks_enclosing_comprehension_coroutine() {
+        let module = lower_source(
+            r#"
+async def f(xs, ys):
+    return [[y async for y in ys] for x in xs]
+"#,
+        )
+        .expect("nested async comprehension inside async def should lower");
+
+        let listcomps: Vec<_> = module
+            .functions
+            .iter()
+            .filter(|function| function.name == "<listcomp>")
+            .collect();
+        assert_eq!(
+            listcomps.len(),
+            2,
+            "both comprehension levels should synthesize child functions"
+        );
+        for listcomp in listcomps {
+            assert!(
+                listcomp.is_coroutine,
+                "a nested async comprehension must mark the enclosing comprehension scope async"
+            );
+        }
     }
 }
 
