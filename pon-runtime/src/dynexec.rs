@@ -544,7 +544,7 @@ pub unsafe extern "C" fn builtin_locals(argv: *mut *mut PyObject, argc: usize) -
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn builtin___import__(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+pub unsafe extern "C" fn builtin_dunder_import(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let args = match argv_slice(argv, argc, "__import__") {
         Ok(args) => args,
         Err(message) => return return_null_with_error(message),

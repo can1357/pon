@@ -28,6 +28,12 @@ impl PyTuple {
         if self.len == 0 {
             &[]
         } else {
+            debug_assert!(
+                !self.items.is_null() && self.items.is_aligned(),
+                "PyTuple::as_slice: items pointer {:p} (len {}) is null or misaligned — a tagged or uninitialized tuple reached iteration",
+                self.items,
+                self.len,
+            );
             unsafe { core::slice::from_raw_parts(self.items, self.len) }
         }
     }

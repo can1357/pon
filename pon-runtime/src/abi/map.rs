@@ -18,7 +18,6 @@ pub type MapStatus = i32;
 
 const TYPE_ID_DICT: TypeId = TypeId(101);
 const TYPE_ID_DICT_ITER: TypeId = TypeId(102);
-const TYPE_ID_DICT_ITEM: TypeId = TypeId(103);
 const TYPE_ID_SET: TypeId = TypeId(104);
 const TYPE_ID_SET_ITER: TypeId = TypeId(105);
 const TYPE_ID_FROZENSET: TypeId = TypeId(106);
@@ -37,14 +36,6 @@ fn register_map_types(runtime: &super::Runtime) {
         GcTypeInfo {
             size: mem::size_of::<dict::PyDictIter>(),
             trace: dict::trace_dict_iter,
-            finalize: None,
-        },
-    );
-    runtime.heap.register_type(
-        TYPE_ID_DICT_ITEM,
-        GcTypeInfo {
-            size: mem::size_of::<dict::PyDictItem>(),
-            trace: dict::trace_dict_item,
             finalize: None,
         },
     );
@@ -79,6 +70,13 @@ fn ensure_runtime_for_map() -> Result<(), String> {
 }
 
 fn null_error(message: impl Into<String>) -> *mut PyObject {
+    let message = message.into();
+    // Hash failures must surface as catchable TypeError objects (CPython:
+    // `except TypeError` around `d[[1]] = 1`), not opaque diagnostics. Covers
+    // both the bare hash message and the dict-key/set-element wrapped form.
+    if message.starts_with("unhashable type") || message.starts_with("cannot use '") {
+        return unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
     super::return_null_with_error(message)
 }
 
@@ -93,7 +91,8 @@ fn duplicate_keyword_error(key: *mut PyObject) -> *mut PyObject {
 }
 
 fn status_error(message: impl Into<String>) -> c_int {
-    super::return_minus_one_with_error(message)
+    let _ = null_error(message);
+    -1
 }
 
 fn raise_key_error(key: *mut PyObject) -> *mut PyObject {
@@ -118,16 +117,6 @@ fn alloc_dict_iter(runtime: &super::Runtime, source: *mut PyObject, kind: dict::
         .alloc(mem::size_of::<dict::PyDictIter>(), TYPE_ID_DICT_ITER)
         .cast::<dict::PyDictIter>();
     unsafe { dict::init_dict_iter(object, dict::dict_iter_type(runtime._type_type), source, kind) };
-    as_object_ptr(object)
-}
-
-fn alloc_dict_item(runtime: &super::Runtime, key: *mut PyObject, value: *mut PyObject) -> *mut PyObject {
-    register_map_types(runtime);
-    let object = runtime
-        .heap
-        .alloc(mem::size_of::<dict::PyDictItem>(), TYPE_ID_DICT_ITEM)
-        .cast::<dict::PyDictItem>();
-    unsafe { dict::init_dict_item(object, dict::dict_item_type(runtime._type_type), key, value) };
     as_object_ptr(object)
 }
 
@@ -706,7 +695,13 @@ pub unsafe extern "C" fn pon_dict_iter_next(iterator: *mut PyObject) -> *mut PyO
         match iter.kind {
             dict::DictIterKind::Keys => entry.key,
             dict::DictIterKind::Values => entry.value,
-            dict::DictIterKind::Items => crate::native::builtins_mod::alloc_tuple(vec![entry.key, entry.value]),
+            dict::DictIterKind::Items => {
+                match super::with_runtime(|runtime| super::seq::alloc_tuple_from_slice(runtime, &[entry.key, entry.value])) {
+                    Some(Ok(pair)) => pair,
+                    Some(Err(message)) => return null_error(message),
+                    None => return null_error("runtime is not initialized"),
+                }
+            }
         }
     })
 }
@@ -722,6 +717,50 @@ pub unsafe extern "C" fn pon_set_add(set: *mut PyObject, item: *mut PyObject) ->
             Err(message) => null_error(message),
         }
     })
+}
+
+/// Adds every element of `iterable` to `set` and returns the receiver.
+///
+/// Backs `InstKind::SetUpdate` for starred set displays (`{*a, b}`): items
+/// are added one at a time AS the iterable is advanced, so hash/eq side
+/// effects interleave with iteration exactly like CPython's `SET_UPDATE`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_set_update(set: *mut PyObject, iterable: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(set, iterable);
+    let iter = unsafe { super::iter::pon_get_iter(iterable, ptr::null_mut()) };
+    if iter.is_null() {
+        // Mirror `sequence_to_vec`: iterables without `tp_iter` (indexed
+        // sequences such as str) fall back to materialized indexing.
+        if crate::thread_state::pon_err_occurred() {
+            crate::thread_state::pon_err_clear();
+        }
+        let values = match super::seq::sequence_to_vec(iterable) {
+            Ok(values) => values,
+            Err(message) => return null_error(message),
+        };
+        for item in values {
+            if unsafe { pon_set_add(set, item) }.is_null() {
+                return ptr::null_mut();
+            }
+        }
+        return set;
+    }
+    loop {
+        let item = unsafe { super::iter::pon_iter_next(iter, ptr::null_mut()) };
+        if item.is_null() {
+            // Exhaustion convention shared with `sequence_to_vec`: a NULL from
+            // `pon_iter_next` ends iteration and clears any pending marker.
+            if crate::thread_state::pon_err_occurred() {
+                crate::thread_state::pon_err_clear();
+            }
+            return set;
+        }
+        // Delegates per-element semantics (untag, critical section, error
+        // path) to the existing SetAdd helper.
+        if unsafe { pon_set_add(set, item) }.is_null() {
+            return ptr::null_mut();
+        }
+    }
 }
 
 /// Discards an element from a set and returns None.
@@ -906,22 +945,33 @@ pub unsafe extern "C" fn pon_set_difference(left: *mut PyObject, right: *mut PyO
 }
 
 fn set_is_subset(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    let left_entries = match unsafe { set_::entries_snapshot(left) } {
-        Ok(entries) => entries,
-        Err(message) => return null_error(message),
+    let result = unsafe {
+        set_::entries_snapshot(left).and_then(|left_entries| {
+            let right_entries = set_::entries_snapshot(right)?;
+            set_::entries_subset(&left_entries, &right_entries)
+        })
     };
-    let right_entries = match unsafe { set_::entries_snapshot(right) } {
-        Ok(entries) => entries,
-        Err(message) => return null_error(message),
-    };
-    for item in left_entries {
-        match unsafe { set_::find_element_index(&right_entries, item) } {
-            Ok(Some(_)) => {}
-            Ok(None) => return unsafe { super::number::pon_const_bool(0) },
-            Err(message) => return null_error(message),
-        }
+    match result {
+        Ok(value) => unsafe { super::number::pon_const_bool(c_int::from(value)) },
+        Err(message) => null_error(message),
     }
-    unsafe { super::number::pon_const_bool(1) }
+}
+
+unsafe extern "C" fn set_contains_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match map_method_args(argv, argc, "set.__contains__") {
+        Ok(args) => args,
+        Err(message) => return null_error(message),
+    };
+    if args.len() != 2 {
+        return null_error(format!(
+            "set.__contains__() expected 1 argument, got {}",
+            args.len().saturating_sub(1)
+        ));
+    }
+    match unsafe { set_::set_contains(args[0], args[1]) } {
+        Ok(value) => unsafe { super::number::pon_const_bool(c_int::from(value)) },
+        Err(message) => null_error(message),
+    }
 }
 
 unsafe extern "C" fn set_add_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -1000,6 +1050,7 @@ pub unsafe fn pon_set_bound_method(set: *mut PyObject, name: &str) -> *mut PyObj
         "intersection" => alloc_bound_native_method(set, name, set_intersection_method_trampoline),
         "difference" => alloc_bound_native_method(set, name, set_difference_method_trampoline),
         "issubset" => alloc_bound_native_method(set, name, set_issubset_method_trampoline),
+        "__contains__" => alloc_bound_native_method(set, name, set_contains_method_trampoline),
         _ => null_error(format!("attribute '{name}' was not found")),
     }
 }

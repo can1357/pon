@@ -49,6 +49,7 @@ pub fn set_type(type_type: *const PyType) -> *mut PyType {
         ty.tp_as_sequence = Box::into_raw(Box::new(sequence));
         ty.tp_as_number = Box::into_raw(Box::new(number));
         ty.tp_iter = Some(set_iter_slot);
+        ty.tp_richcmp = Some(set_richcmp_slot);
         ty.tp_getattro = Some(set_getattro_slot);
         Box::into_raw(Box::new(ty)) as usize
     });
@@ -63,6 +64,7 @@ pub fn set_iter_type(type_type: *const PyType) -> *mut PyType {
     static TYPE: LazyLock<usize> = LazyLock::new(|| {
         let mut ty = PyType::new(ptr::null(), "set_iterator", size_of::<PySetIter>());
         ty.tp_iternext = Some(set_iter_next_slot);
+        ty.tp_iter = Some(set_iter_identity_slot);
         Box::into_raw(Box::new(ty)) as usize
     });
     let ty = *TYPE as *mut PyType;
@@ -232,6 +234,53 @@ pub unsafe fn set_equal(left: *mut PyObject, right: *mut PyObject) -> Result<boo
     Ok(true)
 }
 
+/// Returns whether every element of `left_entries` is present in `right_entries`.
+pub unsafe fn entries_subset(left_entries: &[*mut PyObject], right_entries: &[*mut PyObject]) -> Result<bool, String> {
+    for item in left_entries {
+        if unsafe { find_element_index(right_entries, *item)? }.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Shared `tp_richcmp` slot for sets and frozensets.
+///
+/// Implements CPython's content-based subset/superset comparison semantics
+/// across both set flavors; a non-set right operand defers with
+/// `NotImplemented` so reflected dispatch and the identity fallback can run.
+pub unsafe extern "C" fn set_richcmp_slot(left: *mut PyObject, right: *mut PyObject, op: c_int) -> *mut PyObject {
+    if unsafe { !is_any_set(left) || !is_any_set(right) } {
+        return unsafe { crate::abi::pon_not_implemented() };
+    }
+    match unsafe { set_richcmp_bool(left, right, op) } {
+        Ok(value) => unsafe { crate::abi::pon_const_bool(c_int::from(value)) },
+        Err(message) => crate::abi::return_null_with_error(message),
+    }
+}
+
+unsafe fn set_richcmp_bool(left: *mut PyObject, right: *mut PyObject, op: c_int) -> Result<bool, String> {
+    use crate::abstract_op::{RICH_EQ, RICH_GE, RICH_GT, RICH_LE, RICH_LT, RICH_NE};
+
+    let left_entries = unsafe { entries_snapshot(left)? };
+    let right_entries = unsafe { entries_snapshot(right)? };
+    let op = u8::try_from(op).map_err(|_| "unknown rich comparison operation".to_owned())?;
+    match op {
+        RICH_EQ | RICH_NE => {
+            let equal = left_entries.len() == right_entries.len()
+                && unsafe { entries_subset(&left_entries, &right_entries)? };
+            Ok(if op == RICH_EQ { equal } else { !equal })
+        }
+        RICH_LE => unsafe { entries_subset(&left_entries, &right_entries) },
+        RICH_GE => unsafe { entries_subset(&right_entries, &left_entries) },
+        RICH_LT => Ok(left_entries.len() < right_entries.len()
+            && unsafe { entries_subset(&left_entries, &right_entries)? }),
+        RICH_GT => Ok(right_entries.len() < left_entries.len()
+            && unsafe { entries_subset(&right_entries, &left_entries)? }),
+        _ => Err("unknown rich comparison operation".to_owned()),
+    }
+}
+
 /// Adds every element from `other_entries` into `target_entries`.
 pub unsafe fn insert_unique_entries(target_entries: &mut Vec<*mut PyObject>, other_entries: &[*mut PyObject]) -> Result<(), String> {
     for item in other_entries {
@@ -342,6 +391,11 @@ unsafe extern "C" fn set_iter_slot(object: *mut PyObject) -> *mut PyObject {
     unsafe { crate::abi::map::pon_set_iter(object) }
 }
 
+/// `iter(it) is it`: set iterators are their own iterator.
+unsafe extern "C" fn set_iter_identity_slot(iterator: *mut PyObject) -> *mut PyObject {
+    iterator
+}
+
 unsafe extern "C" fn set_iter_next_slot(iterator: *mut PyObject) -> *mut PyObject {
     unsafe { crate::abi::map::pon_set_iter_next(iterator) }
 }
@@ -363,7 +417,7 @@ unsafe extern "C" fn set_getattro_slot(object: *mut PyObject, name: *mut PyObjec
         return crate::abi::return_null_with_error("set attribute name must be str");
     };
     match name {
-        "add" | "discard" | "union" | "intersection" | "difference" | "issubset" => unsafe {
+        "add" | "discard" | "union" | "intersection" | "difference" | "issubset" | "__contains__" => unsafe {
             crate::abi::map::pon_set_bound_method(object, name)
         },
         _ => crate::abi::return_null_with_error(format!("attribute '{name}' was not found")),

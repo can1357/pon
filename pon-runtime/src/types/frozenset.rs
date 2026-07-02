@@ -42,6 +42,8 @@ pub fn frozenset_type(type_type: *const PyType) -> *mut PyType {
         ty.tp_as_sequence = Box::into_raw(Box::new(sequence));
         ty.tp_as_number = Box::into_raw(Box::new(number));
         ty.tp_iter = Some(frozenset_iter_slot);
+        ty.tp_richcmp = Some(crate::types::set_::set_richcmp_slot);
+        ty.tp_getattro = Some(frozenset_getattro_slot);
         Box::into_raw(Box::new(ty)) as usize
     });
     let ty = *TYPE as *mut PyType;
@@ -157,18 +159,20 @@ pub unsafe fn frozenset_hash_value(object: *mut PyObject) -> Result<isize, Strin
         return Ok(set.hash);
     }
 
-    // Order-independent hash combiner based on CPython's frozenset shape but kept
-    // intentionally small for the Phase-B hashable-key domain.
-    let mut hash = 0x1927_8617_isize ^ ((set.entries.len() as isize).wrapping_mul(0x9e37_79b9));
+    // Order-independent, content-based combiner mirroring CPython's
+    // frozenset_hash shape so equal frozensets hash equal regardless of
+    // insertion order.
+    let mut mixed: usize = 0;
     for item in &set.entries {
-        let item_hash = unsafe { hash_object(*item)? };
-        hash ^= item_hash
-            .wrapping_add(0x9e37_79b9)
-            .wrapping_add(hash << 6)
-            .wrapping_add(hash >> 2);
+        let item_hash = unsafe { hash_object(*item)? } as usize;
+        mixed ^= shuffle_bits(item_hash);
     }
+    mixed ^= set.entries.len().wrapping_add(1).wrapping_mul(1_927_868_237);
+    mixed ^= (mixed >> 11) ^ (mixed >> 25);
+    mixed = mixed.wrapping_mul(69069).wrapping_add(907_133_923);
+    let mut hash = mixed as isize;
     if hash == -1 {
-        hash = -2;
+        hash = 590_923_713;
     }
     set.hash = hash;
     set.hash_computed = true;
@@ -195,6 +199,23 @@ unsafe extern "C" fn frozenset_hash_slot(object: *mut PyObject) -> isize {
     match unsafe { frozenset_hash_value(object) } {
         Ok(hash) => hash,
         Err(_) => -1,
+    }
+}
+
+/// Disperses element-hash bit patterns before XOR combination (CPython shape).
+fn shuffle_bits(hash: usize) -> usize {
+    ((hash ^ 89_869_747) ^ (hash << 16)).wrapping_mul(3_644_798_167)
+}
+
+unsafe extern "C" fn frozenset_getattro_slot(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        return crate::abi::return_null_with_error("frozenset attribute name must be str");
+    };
+    match name {
+        "union" | "intersection" | "difference" | "issubset" | "__contains__" => unsafe {
+            crate::abi::map::pon_set_bound_method(object, name)
+        },
+        _ => crate::abi::return_null_with_error(format!("attribute '{name}' was not found")),
     }
 }
 

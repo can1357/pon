@@ -102,6 +102,16 @@ fn tuple_type() -> *mut PyType {
     (*TUPLE_TYPE.get().expect("tuple type initialized")) as *mut PyType
 }
 
+/// Returns the elements of an exact seq-family `PyTuple`, or `None` when
+/// `object` is not one (e.g. the native builtins_mod tuple representation,
+/// which shares the "tuple" type name but not the `PyTuple` layout).
+pub(crate) unsafe fn exact_tuple_slice<'a>(object: *mut PyObject) -> Option<&'a [*mut PyObject]> {
+    if object.is_null() || unsafe { (*object).ob_type } != tuple_type().cast_const() {
+        return None;
+    }
+    Some(unsafe { (*object.cast::<PyTuple>()).as_slice() })
+}
+
 fn range_type() -> *mut PyType {
     RANGE_TYPE.get_or_init(|| {
         let sequence = Box::leak(Box::new(PySequenceMethods {
@@ -1698,6 +1708,34 @@ pub unsafe extern "C" fn pon_list_extend(list: *mut PyObject, iterable: *mut PyO
             }
         }
         list
+    })
+}
+
+/// Converts a display-staging list into a tuple preserving element order.
+///
+/// Backs `InstKind::ListToTuple`, the final step of starred tuple displays
+/// (`(*a, b)`), mirroring CPython's `INTRINSIC_LIST_TO_TUPLE`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_list_to_tuple(list: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(list);
+    catch_object_helper(|| {
+        if !is_list(list) {
+            return return_null_with_error(format!("tuple conversion expected list, got {}", object_type_name(list)));
+        }
+        // SAFETY: `is_list` proved the cast; staging lists own `len` live items.
+        let values: &[*mut PyObject] = unsafe {
+            let list = list.cast::<PyList>();
+            if (*list).items.is_null() {
+                &[]
+            } else {
+                core::slice::from_raw_parts((*list).items.cast_const(), (*list).len)
+            }
+        };
+        match with_runtime(|runtime| alloc_tuple_from_slice(runtime, values)) {
+            Some(Ok(object)) => object,
+            Some(Err(message)) => return_null_with_error(message),
+            None => return_null_with_error("runtime is not initialized"),
+        }
     })
 }
 

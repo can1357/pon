@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-#[path = "../src/native/sre/mod.rs"]
+// The VM keeps its full API for the in-crate `_sre` wrapper; this standalone
+// include only exercises the fixture-facing subset.
+#[allow(dead_code)]
+#[path = "../src/native/sre/vm.rs"]
 mod sre;
 
 const FIXTURES: &str = include_str!("../src/native/sre/fixtures.json");

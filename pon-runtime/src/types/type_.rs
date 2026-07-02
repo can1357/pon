@@ -775,6 +775,34 @@ unsafe fn call_init_subclass(ty: *mut PyType, base_types: &[*mut PyType], keywor
     !result.is_null()
 }
 
+/// Canonicalizes a helper-family "shadow" builtin type object (identified by
+/// its missing metatype) to the installed builtin global of the same name, so
+/// `type(x)` preserves identity (`type([]) is list`) and attribute access on
+/// the result works.  Properly constructed types — user classes and installed
+/// builtins — carry a metatype and pass through untouched.
+unsafe fn canonical_type_object(ty: *mut PyType) -> *mut PyType {
+    if ty.is_null() || !unsafe { (*ty).ob_base.ob_type.is_null() } {
+        return ty;
+    }
+    let name = unsafe { (*ty).name() };
+    if let Some(global) = abi::runtime_global(intern::intern(name)) {
+        let meta = unsafe { (*global).ob_type };
+        if !meta.is_null() && unsafe { (*meta).name() } == "type" {
+            let global_ty = global.cast::<PyType>();
+            if unsafe { (*global_ty).name() } == name {
+                return global_ty;
+            }
+        }
+    }
+    // No installed global under this name: repair the missing metatype in
+    // place so attribute access (`.__name__`, ...) works on the shadow type.
+    let meta = abi::runtime_type_type();
+    if !meta.is_null() {
+        unsafe { (*ty).ob_base.ob_type = meta };
+    }
+    ty
+}
+
 pub unsafe fn builtin_type(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let args = match unsafe { raw_arg_slice(argv, argc) } {
         Ok(args) => args,
@@ -790,7 +818,7 @@ pub unsafe fn builtin_type(argv: *mut *mut PyObject, argc: usize) -> *mut PyObje
             if ty.is_null() {
                 return raise_object("type() argument has no type");
             }
-            ty.cast::<PyObject>()
+            unsafe { canonical_type_object(ty) }.cast::<PyObject>()
         }
         3 => unsafe { build_class_from_type_args(args[0], args[1], args[2]) },
         n => raise_object(format!("type() takes 1 or 3 arguments, got {n}")),

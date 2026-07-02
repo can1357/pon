@@ -134,6 +134,219 @@ fn str_translate_table_type() -> *mut PyType {
     }) as *mut PyType
 }
 
+/// Iterator over an immutable bytes payload, yielding ints like CPython.
+#[repr(C)]
+struct PyBytesIter {
+    ob_base: PyObjectHeader,
+    /// Borrowed pointer to the boxed bytes receiver (a leaked, non-GC allocation).
+    bytes: *mut PyObject,
+    index: usize,
+}
+
+/// Process-lifetime `bytes_iterator` type so `type(iter(b''))` is stable.
+static BYTES_ITER_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let mut ty = PyType::new(runtime_type_type(), "bytes_iterator", mem::size_of::<PyBytesIter>());
+    ty.tp_iter = Some(bytes_iter_identity_slot);
+    ty.tp_iternext = Some(bytes_iter_next_slot);
+    Box::into_raw(Box::new(ty)) as usize
+});
+
+fn bytes_iter_type() -> *mut PyType {
+    *BYTES_ITER_TYPE as *mut PyType
+}
+
+unsafe extern "C" fn bytes_iter_slot(object: *mut PyObject) -> *mut PyObject {
+    if object.is_null() || !bytes_type::is_bytes_type(unsafe { (*object).ob_type }) {
+        return super::return_null_with_error("bytes iterator slot received a non-bytes receiver");
+    }
+    Box::into_raw(Box::new(PyBytesIter {
+        ob_base: PyObjectHeader::new(bytes_iter_type()),
+        bytes: object,
+        index: 0,
+    }))
+    .cast::<PyObject>()
+}
+
+unsafe extern "C" fn bytes_iter_identity_slot(object: *mut PyObject) -> *mut PyObject {
+    object
+}
+
+unsafe extern "C" fn bytes_iter_next_slot(object: *mut PyObject) -> *mut PyObject {
+    if object.is_null() || unsafe { (*object).ob_type } != bytes_iter_type().cast_const() {
+        return super::return_null_with_error("bytes iterator next slot received a non-iterator");
+    }
+    let iter = unsafe { &mut *object.cast::<PyBytesIter>() };
+    let data = unsafe { (*iter.bytes.cast::<bytes_type::PyBytes>()).as_slice() };
+    let Some(byte) = data.get(iter.index).copied() else {
+        return unsafe { super::exc::pon_raise_stop_iteration(ptr::null_mut()) };
+    };
+    iter.index += 1;
+    unsafe { super::pon_const_int(i64::from(byte)) }
+}
+
+/// Iterator over a mutable bytearray payload; the backing buffer is re-read on
+/// every step so mutation during iteration behaves like CPython.
+#[repr(C)]
+struct PyByteArrayIter {
+    ob_base: PyObjectHeader,
+    /// Borrowed pointer to the boxed bytearray receiver (a leaked, non-GC allocation).
+    bytearray: *mut PyObject,
+    index: usize,
+}
+
+/// Process-lifetime `bytearray_iterator` type so `type(iter(bytearray()))` is stable.
+static BYTEARRAY_ITER_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let mut ty = PyType::new(runtime_type_type(), "bytearray_iterator", mem::size_of::<PyByteArrayIter>());
+    ty.tp_iter = Some(bytes_iter_identity_slot);
+    ty.tp_iternext = Some(bytearray_iter_next_slot);
+    Box::into_raw(Box::new(ty)) as usize
+});
+
+fn bytearray_iter_type() -> *mut PyType {
+    *BYTEARRAY_ITER_TYPE as *mut PyType
+}
+
+unsafe extern "C" fn bytearray_iter_slot(object: *mut PyObject) -> *mut PyObject {
+    if object.is_null() || !bytearray_type::is_bytearray_type(unsafe { (*object).ob_type }) {
+        return super::return_null_with_error("bytearray iterator slot received a non-bytearray receiver");
+    }
+    Box::into_raw(Box::new(PyByteArrayIter {
+        ob_base: PyObjectHeader::new(bytearray_iter_type()),
+        bytearray: object,
+        index: 0,
+    }))
+    .cast::<PyObject>()
+}
+
+unsafe extern "C" fn bytearray_iter_next_slot(object: *mut PyObject) -> *mut PyObject {
+    if object.is_null() || unsafe { (*object).ob_type } != bytearray_iter_type().cast_const() {
+        return super::return_null_with_error("bytearray iterator next slot received a non-iterator");
+    }
+    let iter = unsafe { &mut *object.cast::<PyByteArrayIter>() };
+    let data = unsafe { (*iter.bytearray.cast::<bytearray_type::PyByteArray>()).as_slice() };
+    let Some(byte) = data.get(iter.index).copied() else {
+        return unsafe { super::exc::pon_raise_stop_iteration(ptr::null_mut()) };
+    };
+    iter.index += 1;
+    unsafe { super::pon_const_int(i64::from(byte)) }
+}
+
+/// Borrows the payload of an exact bytes or bytearray object without copying.
+unsafe fn borrow_bytes_like<'a>(value: *mut PyObject) -> Option<&'a [u8]> {
+    if value.is_null() {
+        return None;
+    }
+    let ty = unsafe { (*value).ob_type };
+    if bytes_type::is_bytes_type(ty) {
+        return Some(unsafe { (*value.cast::<bytes_type::PyBytes>()).as_slice() });
+    }
+    if bytearray_type::is_bytearray_type(ty) {
+        return Some(unsafe { (*value.cast::<bytearray_type::PyByteArray>()).as_slice() });
+    }
+    None
+}
+
+/// `tp_richcmp` for bytes: CPython lexicographic ordering against bytes-like
+/// operands; a non-bytes operand defers with `NotImplemented` so reflected
+/// dispatch and the identity fallback can run.
+unsafe extern "C" fn bytes_richcmp_slot(left: *mut PyObject, right: *mut PyObject, op: c_int) -> *mut PyObject {
+    use crate::abstract_op::{RICH_EQ, RICH_GE, RICH_GT, RICH_LE, RICH_LT, RICH_NE};
+
+    let (Some(left), Some(right)) = (unsafe { borrow_bytes_like(left) }, unsafe { borrow_bytes_like(right) }) else {
+        return unsafe { super::pon_not_implemented() };
+    };
+    let result = match u8::try_from(op) {
+        Ok(RICH_EQ) => left == right,
+        Ok(RICH_NE) => left != right,
+        Ok(RICH_LT) => left < right,
+        Ok(RICH_LE) => left <= right,
+        Ok(RICH_GT) => left > right,
+        Ok(RICH_GE) => left >= right,
+        _ => return super::return_null_with_error("unknown rich comparison operation"),
+    };
+    unsafe { super::pon_const_bool(c_int::from(result)) }
+}
+
+/// `sq_contains` for bytes: an int member in `range(0, 256)` or a bytes-like
+/// subsequence, per CPython.
+unsafe extern "C" fn bytes_contains_slot(object: *mut PyObject, item: *mut PyObject) -> c_int {
+    let Some(haystack) = (unsafe { borrow_bytes_like(object) }) else {
+        crate::thread_state::pon_err_set("bytes contains slot received a non-bytes receiver");
+        return -1;
+    };
+    if let Some(value) = object_to_i64(item) {
+        if !(0..=255).contains(&value) {
+            let message = "byte must be in range(0, 256)";
+            unsafe { super::exc::pon_raise_value_error(message.as_ptr(), message.len()) };
+            return -1;
+        }
+        return c_int::from(haystack.contains(&(value as u8)));
+    }
+    if let Some(needle) = unsafe { borrow_bytes_like(item) } {
+        return c_int::from(needle.is_empty() || haystack.windows(needle.len()).any(|window| window == needle));
+    }
+    let type_name = unsafe { crate::types::dict::type_name(item) }.unwrap_or("object");
+    let message = format!("a bytes-like object is required, not '{type_name}'");
+    unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    -1
+}
+
+/// Iterator over an immutable str payload, yielding one-code-point strings.
+#[repr(C)]
+struct PyStrIter {
+    ob_base: PyObjectHeader,
+    /// Borrowed pointer to the str receiver (runtime-heap unicode allocation).
+    text: *mut PyObject,
+    /// Byte offset of the next code point within the UTF-8 payload.
+    byte_index: usize,
+}
+
+/// Process-lifetime `str_iterator` type so `type(iter(''))` is stable.
+static STR_ITER_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let mut ty = PyType::new(runtime_type_type(), "str_iterator", mem::size_of::<PyStrIter>());
+    ty.tp_iter = Some(str_iter_identity_slot);
+    ty.tp_iternext = Some(str_iter_next_slot);
+    Box::into_raw(Box::new(ty)) as usize
+});
+
+fn str_iter_type() -> *mut PyType {
+    *STR_ITER_TYPE as *mut PyType
+}
+
+unsafe extern "C" fn str_iter_identity_slot(object: *mut PyObject) -> *mut PyObject {
+    object
+}
+
+unsafe extern "C" fn str_iter_slot(object: *mut PyObject) -> *mut PyObject {
+    let is_str = !object.is_null()
+        && super::with_runtime(|runtime| unsafe { is_exact_type(object, runtime.unicode_type) }).unwrap_or(false);
+    if !is_str {
+        return super::return_null_with_error("str iterator slot received a non-str receiver");
+    }
+    Box::into_raw(Box::new(PyStrIter {
+        ob_base: PyObjectHeader::new(str_iter_type()),
+        text: object,
+        byte_index: 0,
+    }))
+    .cast::<PyObject>()
+}
+
+unsafe extern "C" fn str_iter_next_slot(object: *mut PyObject) -> *mut PyObject {
+    if object.is_null() || unsafe { (*object).ob_type } != str_iter_type().cast_const() {
+        return super::return_null_with_error("str iterator next slot received a non-iterator");
+    }
+    let iter = unsafe { &mut *object.cast::<PyStrIter>() };
+    let Some(text) = (unsafe { (*iter.text.cast::<PyUnicode>()).as_str() }) else {
+        return super::return_null_with_error("unicode object contains invalid UTF-8");
+    };
+    let Some(ch) = text.get(iter.byte_index..).and_then(|rest| rest.chars().next()) else {
+        return unsafe { super::exc::pon_raise_stop_iteration(ptr::null_mut()) };
+    };
+    iter.byte_index += ch.len_utf8();
+    let mut buf = [0u8; 4];
+    alloc_str_object(ch.encode_utf8(&mut buf))
+}
+
 
 /// Sequence protocol table for `str`, exposing `+` through `sq_concat`.
 ///
@@ -147,6 +360,7 @@ static STR_SEQUENCE_METHODS: LazyLock<usize> = LazyLock::new(|| {
         sq_concat: Some(pon_str_concat),
         sq_repeat: Some(str_repeat_slot),
         sq_item: Some(str_item_slot),
+        sq_iter: Some(str_iter_slot),
         ..PySequenceMethods::EMPTY
     };
     Box::into_raw(Box::new(methods)) as usize
@@ -179,6 +393,7 @@ static BYTES_SEQUENCE_METHODS: LazyLock<usize> = LazyLock::new(|| {
         sq_concat: Some(pon_bytes_concat),
         sq_repeat: Some(bytes_repeat_slot),
         sq_item: Some(bytes_item_slot),
+        sq_contains: Some(bytes_contains_slot),
         ..PySequenceMethods::EMPTY
     };
     Box::into_raw(Box::new(methods)) as usize
@@ -200,6 +415,7 @@ static BYTEARRAY_SEQUENCE_METHODS: LazyLock<usize> = LazyLock::new(|| {
         sq_repeat: Some(bytearray_repeat_slot),
         sq_item: Some(bytearray_item_slot),
         sq_ass_item: Some(bytearray_ass_item_slot),
+        sq_contains: Some(bytes_contains_slot),
         ..PySequenceMethods::EMPTY
     };
     Box::into_raw(Box::new(methods)) as usize
@@ -241,9 +457,13 @@ fn install_bytes_slots() -> Result<(), String> {
         (*bytes_type::bytes_type()).tp_getattro = Some(bytes_getattro);
         (*bytes_type::bytes_type()).tp_as_sequence = *BYTES_SEQUENCE_METHODS as *mut PySequenceMethods;
         (*bytes_type::bytes_type()).tp_as_mapping = *BYTES_MAPPING_METHODS as *mut PyMappingMethods;
+        (*bytes_type::bytes_type()).tp_iter = Some(bytes_iter_slot);
+        (*bytes_type::bytes_type()).tp_richcmp = Some(bytes_richcmp_slot);
         (*bytearray_type::bytearray_type()).tp_getattro = Some(bytearray_getattro);
         (*bytearray_type::bytearray_type()).tp_as_sequence = *BYTEARRAY_SEQUENCE_METHODS as *mut PySequenceMethods;
         (*bytearray_type::bytearray_type()).tp_as_mapping = *BYTEARRAY_MAPPING_METHODS as *mut PyMappingMethods;
+        (*bytearray_type::bytearray_type()).tp_iter = Some(bytearray_iter_slot);
+        (*bytearray_type::bytearray_type()).tp_richcmp = Some(bytes_richcmp_slot);
     }
     Ok(())
 }
@@ -1881,6 +2101,88 @@ fn bytearray_clear_method(receiver: *mut PyObject, args: &[*mut PyObject]) -> *m
     if !args.is_empty() { return super::return_null_with_error("bytearray.clear expected no arguments"); }
     match bytearray_object_mut(receiver) { Ok(array) => bytearray_type::clear(array), Err(message) => return super::return_null_with_error(message) }
     unsafe { super::pon_none() }
+}
+
+/// Collects an iterable of ints in `range(0, 256)` for the `bytes()` constructor.
+fn bytes_items_from_iterable(iterable: *mut PyObject) -> Option<Vec<u8>> {
+    let iter = unsafe { super::iter::pon_get_iter(iterable, ptr::null_mut()) };
+    if iter.is_null() {
+        if crate::thread_state::pon_err_occurred() {
+            crate::thread_state::pon_err_clear();
+        }
+        let type_name = unsafe { crate::types::dict::type_name(iterable) }.unwrap_or("object");
+        let message = format!("cannot convert '{type_name}' object to bytes");
+        unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+        return None;
+    }
+    let mut out = Vec::new();
+    loop {
+        let item = unsafe { super::iter::pon_iter_next(iter, ptr::null_mut()) };
+        if item.is_null() {
+            // Exhaustion convention shared with `pon_set_update`: a NULL from
+            // `pon_iter_next` ends iteration and clears the pending marker.
+            if crate::thread_state::pon_err_occurred() {
+                crate::thread_state::pon_err_clear();
+            }
+            return Some(out);
+        }
+        let Some(value) = object_to_i64(item) else {
+            let type_name = unsafe { crate::types::dict::type_name(item) }.unwrap_or("object");
+            let message = format!("'{type_name}' object cannot be interpreted as an integer");
+            unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+            return None;
+        };
+        if !(0..=255).contains(&value) {
+            let message = "bytes must be in range(0, 256)";
+            unsafe { super::exc::pon_raise_value_error(message.as_ptr(), message.len()) };
+            return None;
+        }
+        out.push(value as u8);
+    }
+}
+
+/// Implements the CPython `bytes()` constructor forms: no args, int count,
+/// bytes-like copy, iterable of ints, and str+encoding.
+pub unsafe extern "C" fn builtin_bytes(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    super::catch_object_helper(|| {
+        if let Err(message) = install_bytes_slots() {
+            return super::return_null_with_error(message);
+        }
+        let Some(args) = raw_args(argv, argc) else {
+            return super::return_null_with_error("bytes() received a null argv pointer");
+        };
+        let bytes = match args.len() {
+            0 => Vec::new(),
+            1 => {
+                if unsafe { crate::types::dict::type_name(args[0]) } == Some("str") {
+                    let message = "string argument without an encoding";
+                    return unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+                }
+                if let Some(count) = object_to_i64(args[0]) {
+                    if count < 0 {
+                        let message = "negative count";
+                        return unsafe { super::exc::pon_raise_value_error(message.as_ptr(), message.len()) };
+                    }
+                    vec![0; count as usize]
+                } else if let Ok(bytes) = expect_bytes_like(args[0]) {
+                    bytes
+                } else {
+                    match bytes_items_from_iterable(args[0]) {
+                        Some(bytes) => bytes,
+                        None => return ptr::null_mut(),
+                    }
+                }
+            }
+            2 | 3 => {
+                let text = match expect_str(args[0]) { Ok(text) => text, Err(message) => return super::return_null_with_error(message) };
+                let encoding = match expect_str(args[1]) { Ok(text) => text, Err(message) => return super::return_null_with_error(message) };
+                let errors = match args.get(2).copied().map(expect_str).transpose() { Ok(Some(text)) => text, Ok(None) => "strict".to_owned(), Err(message) => return super::return_null_with_error(message) };
+                match bytes_type::encode(&text, &encoding, &errors) { Ok(bytes) => bytes, Err(message) => return super::return_null_with_error(message) }
+            }
+            _ => return super::return_null_with_error("bytes() expected at most three arguments"),
+        };
+        as_object_ptr(bytes_type::boxed_bytes(&bytes))
+    })
 }
 
 pub unsafe extern "C" fn builtin_bytearray(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {

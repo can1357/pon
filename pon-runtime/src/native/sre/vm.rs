@@ -551,6 +551,10 @@ impl Match {
         self.lastgroup.as_deref()
     }
 
+    pub fn groupindex(&self) -> &BTreeMap<String, usize> {
+        &self.groupindex
+    }
+
     fn findall_groups(&self) -> Vec<Option<MatchedValue>> {
         if self.spans.len() == 1 {
             vec![self.group(0)]

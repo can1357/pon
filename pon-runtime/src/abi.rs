@@ -1459,9 +1459,21 @@ pub static HELPERS: &[HelperDecl] = &[
         params: PARAMS_NONE,
         ret: AbiTy::PyObjectPtr,
     },
+    HelperDecl {
+        symbol: "pon_list_to_tuple",
+        address: seq::pon_list_to_tuple as *const (),
+        params: PARAMS_OBJ,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_set_update",
+        address: map::pon_set_update as *const (),
+        params: PARAMS_BINARY_ADD,
+        ret: AbiTy::PyObjectPtr,
+    },
 ];
 
-struct Runtime {
+pub(crate) struct Runtime {
     heap: Heap,
     _type_type: *mut PyType,
     long_type: *mut PyType,
@@ -1498,6 +1510,11 @@ pub(crate) fn runtime_is_initialized() -> bool {
 
 pub(crate) fn runtime_type_type() -> *mut PyType {
     with_runtime(|runtime| runtime._type_type).unwrap_or(ptr::null_mut())
+}
+
+/// Non-raising lookup of an installed runtime builtin global.
+pub(crate) fn runtime_global(name: u32) -> Option<*mut PyObject> {
+    with_runtime(|runtime| runtime.globals.get(&name).copied()).flatten()
 }
 
 pub(crate) fn alloc_heap_instance(
@@ -1843,8 +1860,6 @@ fn register_builtin_type_globals(runtime: &mut Runtime) {
         for (name, constructor) in [
             ("list", builtin_list_new as NewFunc),
             ("tuple", builtin_tuple_new as NewFunc),
-            ("dict", builtin_dict_new as NewFunc),
-            ("set", builtin_set_new as NewFunc),
             ("range", builtin_range_new as NewFunc),
             ("enumerate", builtin_enumerate_new as NewFunc),
             ("zip", builtin_zip_new as NewFunc),
@@ -1857,6 +1872,28 @@ fn register_builtin_type_globals(runtime: &mut Runtime) {
                 install_builtin_type(runtime, name, ty, Some(constructor), object_type);
             }
         }
+
+        install_builtin_type(
+            runtime,
+            "dict",
+            crate::types::dict::dict_type(runtime._type_type),
+            Some(builtin_dict_new),
+            object_type,
+        );
+        install_builtin_type(
+            runtime,
+            "set",
+            crate::types::set_::set_type(runtime._type_type),
+            Some(builtin_set_new),
+            object_type,
+        );
+        install_builtin_type(
+            runtime,
+            "frozenset",
+            crate::types::frozenset::frozenset_type(runtime._type_type),
+            Some(builtin_frozenset_new),
+            object_type,
+        );
     }
 }
 
@@ -2032,6 +2069,10 @@ unsafe extern "C" fn builtin_dict_new(_cls: *mut PyType, args: *mut PyObject, kw
 
 unsafe extern "C" fn builtin_set_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
     unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_set) }
+}
+
+unsafe extern "C" fn builtin_frozenset_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_frozenset) }
 }
 
 unsafe extern "C" fn builtin_range_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
@@ -3081,6 +3122,7 @@ pub unsafe extern "C" fn pon_delete_global(name_interned: u32) -> *mut PyObject 
         })
         .unwrap_or(false);
         if removed_module_attr || removed_global {
+            crate::dynexec::sync_global_delete_for_active_module(name_interned);
             unsafe { pon_none() }
         } else {
             let name = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
@@ -3502,6 +3544,23 @@ pub fn collect() -> Result<(), String> {
     // object finalizers call back into ABI helpers without deadlocking.
     unsafe { (&*heap).collect(&mut roots) };
     Ok(())
+}
+
+/// Allocates a zeroed GC block for a crate-internal boxed-object family whose
+/// allocation site lives outside `abi` (frames and frame-locals proxies
+/// synthesized by `sys._getframe`).
+///
+/// Registers `info` for `type_id` first; `Heap::register_type` replaces
+/// idempotently, mirroring the raise-path registration in `abi::exc`. Callers
+/// `ptr::write` the payload into the returned block. Not an ABI helper: no
+/// `HELPERS` row, never visible to compiled code.
+pub(crate) fn alloc_gc_object(type_id: TypeId, info: GcTypeInfo) -> Result<*mut u8, String> {
+    let size = info.size;
+    with_runtime(|runtime| {
+        runtime.heap.register_type(type_id, info);
+        runtime.heap.alloc(size, type_id)
+    })
+    .ok_or_else(|| "runtime is not initialized".to_owned())
 }
 
 #[cfg(test)]

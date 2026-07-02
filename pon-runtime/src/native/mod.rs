@@ -20,6 +20,7 @@ pub(crate) use crate::import::install_module;
 mod gc;
 mod io;
 mod os;
+mod sre;
 mod sys;
 mod thread;
 mod time;
@@ -31,6 +32,7 @@ mod weakref;
 /// factories must be self-contained and never rely on another row having run.
 pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>)] = &[
     ("_io", io::make_module),
+    ("_sre", sre::make_module),
     ("_thread", thread::make_module),
     ("_weakref", weakref::make_underscore_module),
     ("builtins", builtins_mod::make_module),

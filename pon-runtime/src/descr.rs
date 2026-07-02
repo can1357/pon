@@ -120,7 +120,7 @@ unsafe fn type_dict_object(ty: *mut PyType) -> *mut PyObject {
         return out;
     }
     if unsafe { (*ty).name() } == "dict" {
-        let fromkeys = unsafe { synthetic_builtin_descriptor() };
+        let fromkeys = crate::native::builtins_mod::dict_fromkeys_function();
         if unsafe { !set_str_key(out, "fromkeys", fromkeys) } {
             return ptr::null_mut();
         }
@@ -133,6 +133,9 @@ unsafe fn synthetic_type_attr(ty: *mut PyType, name_id: u32) -> *mut PyObject {
         return ptr::null_mut();
     }
     let type_name = unsafe { (*ty).name() };
+    if type_name == "dict" && name_id == intern::intern("fromkeys") {
+        return crate::native::builtins_mod::dict_fromkeys_function();
+    }
     let is_known_descriptor = (type_name == "object" && name_id == intern::intern("__init__"))
         || (type_name == "str" && name_id == intern::intern("join"));
     if is_known_descriptor {

@@ -11,7 +11,8 @@ use core::ffi::c_int;
 use std::io::{self, Write};
 use std::ptr;
 use std::sync::{LazyLock, OnceLock};
-use num_traits::ToPrimitive;
+use num_bigint::BigInt;
+use num_traits::{Signed, ToPrimitive, Zero};
 
 use crate::abi::{self, pon_get_iter, pon_iter_next};
 use crate::intern::{intern, resolve};
@@ -87,7 +88,7 @@ pub fn for_each_builtin(mut f: impl FnMut(&'static str, usize, *const u8)) {
     builtin!("compile", VARIADIC_ARITY, builtin_compile);
     builtin!("eval", VARIADIC_ARITY, builtin_eval);
     builtin!("exec", VARIADIC_ARITY, builtin_exec);
-    builtin!("__import__", VARIADIC_ARITY, builtin___import__);
+    builtin!("__import__", VARIADIC_ARITY, builtin_dunder_import);
     builtin!("vars", VARIADIC_ARITY, super::builtins_batch::builtin_vars);
     builtin!("ord", 1, super::builtins_batch::builtin_ord);
     builtin!("bin", 1, super::builtins_batch::builtin_bin);
@@ -96,6 +97,7 @@ pub fn for_each_builtin(mut f: impl FnMut(&'static str, usize, *const u8)) {
     builtin!("reversed", 1, super::builtins_batch::builtin_reversed);
     builtin!("bytearray", VARIADIC_ARITY, builtin_bytearray);
     builtin!("memoryview", 1, builtin_memoryview);
+    builtin!("frozenset", VARIADIC_ARITY, builtin_frozenset);
 }
 
 pub(crate) fn make_module() -> Result<*mut PyObject, String> {
@@ -194,8 +196,6 @@ pub(crate) fn make_module() -> Result<*mut PyObject, String> {
 enum SequenceKind {
     List,
     Tuple,
-    Set,
-    Dict,
 }
 
 #[derive(Debug)]
@@ -203,6 +203,8 @@ enum NativePayload {
     Sequence { kind: SequenceKind, items: Vec<*mut PyObject> },
     Range { start: i64, stop: i64, step: i64 },
     RangeIterator { current: i64, stop: i64, step: i64 },
+    LongRange { start: BigInt, stop: BigInt, step: BigInt },
+    LongRangeIterator { current: BigInt, stop: BigInt, step: BigInt },
     VecIterator { items: Vec<*mut PyObject>, index: usize },
     Enumerate { iter: *mut PyObject, index: i64 },
     Zip { iters: Vec<*mut PyObject> },
@@ -223,8 +225,6 @@ unsafe impl Send for NativeObject {}
 
 static LIST_TYPE: OnceLock<usize> = OnceLock::new();
 static TUPLE_TYPE: OnceLock<usize> = OnceLock::new();
-static SET_TYPE: OnceLock<usize> = OnceLock::new();
-static DICT_TYPE: OnceLock<usize> = OnceLock::new();
 static RANGE_TYPE: OnceLock<usize> = OnceLock::new();
 static RANGE_ITER_TYPE: OnceLock<usize> = OnceLock::new();
 static SEQ_ITER_TYPE: OnceLock<usize> = OnceLock::new();
@@ -247,6 +247,18 @@ static CALL_SENTINEL_ITER_TYPE: LazyLock<usize> = LazyLock::new(|| {
     let mut ty = Box::new(PyType::new(
         ptr::null(),
         "callable_iterator",
+        std::mem::size_of::<NativeObject>(),
+    ));
+    ty.tp_iter = Some(identity_iter_slot);
+    ty.tp_iternext = Some(native_next_slot);
+    ty.tp_bool = Some(native_bool_slot);
+    ty.tp_hash = Some(native_hash_slot);
+    Box::into_raw(ty) as usize
+});
+static LONGRANGE_ITER_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let mut ty = Box::new(PyType::new(
+        ptr::null(),
+        "longrange_iterator",
         std::mem::size_of::<NativeObject>(),
     ));
     ty.tp_iter = Some(identity_iter_slot);
@@ -288,13 +300,6 @@ fn tuple_type() -> *mut PyType {
     ty
 }
 
-fn set_type() -> *mut PyType {
-    type_from(&SET_TYPE, "set", Some(sequence_iter_slot), None)
-}
-
-fn dict_type() -> *mut PyType {
-    type_from(&DICT_TYPE, "dict", Some(sequence_iter_slot), None)
-}
 
 fn range_type() -> *mut PyType {
     type_from(&RANGE_TYPE, "range", Some(range_iter_slot), None)
@@ -302,6 +307,10 @@ fn range_type() -> *mut PyType {
 
 fn range_iter_type() -> *mut PyType {
     type_from(&RANGE_ITER_TYPE, "range_iterator", Some(identity_iter_slot), Some(native_next_slot))
+}
+
+fn longrange_iter_type() -> *mut PyType {
+    *LONGRANGE_ITER_TYPE as *mut PyType
 }
 
 fn seq_iter_type() -> *mut PyType {
@@ -348,8 +357,6 @@ pub(crate) fn builtin_native_type(name: &str) -> Option<*mut PyType> {
         "object" => placeholder_type(),
         "list" => list_type(),
         "tuple" => tuple_type(),
-        "dict" => dict_type(),
-        "set" => set_type(),
         "range" => range_type(),
         "enumerate" => enumerate_type(),
         "zip" => zip_type(),
@@ -406,8 +413,6 @@ fn alloc_sequence(kind: SequenceKind, items: Vec<*mut PyObject>) -> *mut PyObjec
     let ty = match kind {
         SequenceKind::List => list_type(),
         SequenceKind::Tuple => tuple_type(),
-        SequenceKind::Set => set_type(),
-        SequenceKind::Dict => dict_type(),
     };
     alloc_native(NativePayload::Sequence { kind, items }, ty)
 }
@@ -435,6 +440,14 @@ fn alloc_range_iter(current: i64, stop: i64, step: i64) -> *mut PyObject {
     alloc_native(NativePayload::RangeIterator { current, stop, step }, range_iter_type())
 }
 
+fn alloc_longrange(start: BigInt, stop: BigInt, step: BigInt) -> *mut PyObject {
+    alloc_native(NativePayload::LongRange { start, stop, step }, range_type())
+}
+
+fn alloc_longrange_iter(current: BigInt, stop: BigInt, step: BigInt) -> *mut PyObject {
+    alloc_native(NativePayload::LongRangeIterator { current, stop, step }, longrange_iter_type())
+}
+
 fn alloc_placeholder(name: &'static str) -> *mut PyObject {
     alloc_native(NativePayload::Placeholder(name), placeholder_type())
 }
@@ -450,10 +463,9 @@ unsafe fn as_native<'a>(object: *mut PyObject) -> Option<&'a mut NativeObject> {
     let native_ty = [
         list_type(),
         tuple_type(),
-        set_type(),
-        dict_type(),
         range_type(),
         range_iter_type(),
+        longrange_iter_type(),
         seq_iter_type(),
         enumerate_type(),
         zip_type(),
@@ -490,11 +502,11 @@ unsafe extern "C" fn range_iter_slot(object: *mut PyObject) -> *mut PyObject {
     let Some(native) = (unsafe { as_native(object) }) else {
         return fail("range iterator receiver is not native");
     };
-    let (start, stop, step) = match &native.payload {
-        NativePayload::Range { start, stop, step } => (*start, *stop, *step),
-        _ => return fail("range iterator receiver is not a range"),
-    };
-    alloc_range_iter(start, stop, step)
+    match &native.payload {
+        NativePayload::Range { start, stop, step } => alloc_range_iter(*start, *stop, *step),
+        NativePayload::LongRange { start, stop, step } => alloc_longrange_iter(start.clone(), stop.clone(), step.clone()),
+        _ => fail("range iterator receiver is not a range"),
+    }
 }
 
 unsafe extern "C" fn native_next_slot(object: *mut PyObject) -> *mut PyObject {
@@ -509,6 +521,15 @@ unsafe extern "C" fn native_next_slot(object: *mut PyObject) -> *mut PyObject {
             let value = *current;
             *current += *step;
             unsafe { abi::pon_const_int(value) }
+        }
+        NativePayload::LongRangeIterator { current, stop, step } => {
+            let done = if step.is_positive() { *current >= *stop } else { *current <= *stop };
+            if done {
+                return stop_iteration();
+            }
+            let value = current.clone();
+            *current += &*step;
+            crate::types::int::from_bigint(value)
         }
         NativePayload::VecIterator { items, index } => {
             let Some(value) = items.get(*index).copied() else {
@@ -602,6 +623,9 @@ unsafe extern "C" fn native_bool_slot(object: *mut PyObject) -> i32 {
         NativePayload::Sequence { items, .. } => if items.is_empty() { 0 } else { 1 },
         NativePayload::Range { start, stop, step } => {
             if (*step > 0 && *start < *stop) || (*step < 0 && *start > *stop) { 1 } else { 0 }
+        }
+        NativePayload::LongRange { start, stop, step } => {
+            if (step.is_positive() && *start < *stop) || (step.is_negative() && *start > *stop) { 1 } else { 0 }
         }
         _ => 1,
     }
@@ -736,8 +760,8 @@ pub unsafe extern "C" fn builtin_exec(argv: *mut *mut PyObject, argc: usize) -> 
     unsafe { crate::dynexec::builtin_exec(argv, argc) }
 }
 
-pub unsafe extern "C" fn builtin___import__(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    unsafe { crate::dynexec::builtin___import__(argv, argc) }
+pub unsafe extern "C" fn builtin_dunder_import(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { crate::dynexec::builtin_dunder_import(argv, argc) }
 }
 
 
@@ -757,38 +781,42 @@ pub unsafe extern "C" fn builtin_range(argv: *mut *mut PyObject, argc: usize) ->
     };
     let (start, stop, step) = match args.len() {
         1 => {
-            let Ok(stop) = arg_i64(args[0], "range") else {
+            let Ok(stop) = arg_bigint(args[0]) else {
                 return ptr::null_mut();
             };
-            (0, stop, 1)
+            (BigInt::from(0), stop, BigInt::from(1))
         }
         2 => {
-            let Ok(start) = arg_i64(args[0], "range") else {
+            let Ok(start) = arg_bigint(args[0]) else {
                 return ptr::null_mut();
             };
-            let Ok(stop) = arg_i64(args[1], "range") else {
+            let Ok(stop) = arg_bigint(args[1]) else {
                 return ptr::null_mut();
             };
-            (start, stop, 1)
+            (start, stop, BigInt::from(1))
         }
         3 => {
-            let Ok(step) = arg_i64(args[2], "range") else {
+            let Ok(step) = arg_bigint(args[2]) else {
                 return ptr::null_mut();
             };
-            if step == 0 {
-                return fail("range() arg 3 must not be zero");
+            if step.is_zero() {
+                let message = "range() arg 3 must not be zero";
+                return unsafe { crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) };
             }
-            let Ok(start) = arg_i64(args[0], "range") else {
+            let Ok(start) = arg_bigint(args[0]) else {
                 return ptr::null_mut();
             };
-            let Ok(stop) = arg_i64(args[1], "range") else {
+            let Ok(stop) = arg_bigint(args[1]) else {
                 return ptr::null_mut();
             };
             (start, stop, step)
         }
         _ => return fail(format!("range() expected 1 to 3 arguments, got {}", args.len())),
     };
-    alloc_range(start, stop, step)
+    match (start.to_i64(), stop.to_i64(), step.to_i64()) {
+        (Some(start), Some(stop), Some(step)) => alloc_range(start, stop, step),
+        _ => alloc_longrange(start, stop, step),
+    }
 }
 
 pub unsafe extern "C" fn builtin_iter(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -938,6 +966,23 @@ pub unsafe extern "C" fn builtin_hash(argv: *mut *mut PyObject, argc: usize) -> 
         crate::types::complex_::hash_complex(real, imag) as i64
     } else if crate::types::typealias::is_union_type(args[0]) {
         crate::types::typealias::union_hash(args[0]) as i64
+    } else if unsafe { crate::types::frozenset::is_frozenset(args[0]) } {
+        match unsafe { crate::types::frozenset::frozenset_hash_value(args[0]) } {
+            Ok(hash) => hash as i64,
+            Err(message) => return fail(message),
+        }
+    } else if unsafe { crate::types::set_::is_set(args[0]) } {
+        return fail("unhashable type: 'set'");
+    } else if matches!(
+        unsafe { crate::types::dict::type_name(args[0]) },
+        Some("bytes" | "dict" | "list" | "bytearray")
+    ) {
+        // `hash_object` owns the content-hash (bytes) and the CPython
+        // `unhashable type: '...'` rejections (dict/list/bytearray).
+        match unsafe { crate::types::dict::hash_object(args[0]) } {
+            Ok(hash) => hash as i64,
+            Err(message) => return fail(message),
+        }
     } else {
         stable_hash(&repr_text(args[0]))
     };
@@ -1156,13 +1201,7 @@ pub unsafe extern "C" fn builtin_pow(argv: *mut *mut PyObject, argc: usize) -> *
 }
 
 pub unsafe extern "C" fn builtin_bytes(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    let Some(args) = (unsafe { argv_slice(argv, argc) }) else {
-        return fail("bytes() received a null argv pointer");
-    };
-    if args.len() > 1 {
-        return fail(format!("bytes() expected at most 1 argument, got {}", args.len()));
-    }
-    alloc_placeholder("bytes")
+    unsafe { crate::abi::str_::builtin_bytes(argv, argc) }
 }
 pub unsafe extern "C" fn builtin_bytearray(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     unsafe { crate::abi::str_::builtin_bytearray(argv, argc) }
@@ -1243,13 +1282,131 @@ pub unsafe extern "C" fn builtin_dict(argv: *mut *mut PyObject, argc: usize) -> 
         return fail("dict() received a null argv pointer");
     };
     if args.len() > 1 {
-        return fail(format!("dict() expected at most 1 argument, got {}", args.len()));
+        return fail(format!("dict expected at most 1 argument, got {}", args.len()));
     }
-    alloc_sequence(SequenceKind::Dict, Vec::new())
+    let mut pairs = Vec::new();
+    if let Some(&source) = args.first() {
+        if unsafe { collect_dict_update_pairs(source, &mut pairs) }.is_err() {
+            return ptr::null_mut();
+        }
+    }
+    unsafe { abi::map::pon_build_map(pairs.as_mut_ptr(), pairs.len() / 2) }
+}
+
+/// Flattens `source` into `[k0, v0, k1, v1, ...]` per CPython's dict-update
+/// protocol: exact dicts copy entries in insertion order; anything else must be
+/// an iterable of length-2 iterables. On failure the CPython-shaped
+/// TypeError/ValueError is already raised and `Err(())` is returned.
+unsafe fn collect_dict_update_pairs(source: *mut PyObject, pairs: &mut Vec<*mut PyObject>) -> Result<(), ()> {
+    if unsafe { crate::types::dict::is_dict(source) } {
+        let entries = match unsafe { crate::types::dict::dict_entries_snapshot(source) } {
+            Ok(entries) => entries,
+            Err(message) => {
+                let _ = fail(message);
+                return Err(());
+            }
+        };
+        pairs.reserve(entries.len() * 2);
+        for entry in entries {
+            pairs.push(entry.key);
+            pairs.push(entry.value);
+        }
+        return Ok(());
+    }
+    let Ok(elements) = collect_iterable(source) else {
+        let name = unsafe { crate::types::dict::type_name(source) }.unwrap_or("object");
+        let message = format!("'{name}' object is not iterable");
+        let _ = unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+        return Err(());
+    };
+    pairs.reserve(elements.len() * 2);
+    for (index, element) in elements.into_iter().enumerate() {
+        let Ok(pair) = collect_iterable(element) else {
+            // CPython 3.14 surfaces the bare iteration failure here (no
+            // element index): `dict([42])` -> TypeError: object is not iterable
+            let message = "object is not iterable";
+            let _ = unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+            return Err(());
+        };
+        if pair.len() != 2 {
+            let message = format!(
+                "dictionary update sequence element #{index} has length {}; 2 is required",
+                pair.len()
+            );
+            let _ = unsafe { crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) };
+            return Err(());
+        }
+        pairs.extend(pair);
+    }
+    Ok(())
+}
+
+/// `dict.fromkeys(iterable, value=None)`. A classmethod in CPython, so the
+/// callable is a plain function: the receiver (type or instance) never joins
+/// `argv`, and the result is always an exact runtime dict.
+pub unsafe extern "C" fn builtin_dict_fromkeys(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { argv_slice(argv, argc) }) else {
+        return fail("fromkeys() received a null argv pointer");
+    };
+    if args.is_empty() {
+        return fail("fromkeys expected at least 1 argument, got 0");
+    }
+    if args.len() > 2 {
+        return fail(format!("fromkeys expected at most 2 arguments, got {}", args.len()));
+    }
+    let value = args.get(1).copied().unwrap_or_else(|| unsafe { abi::pon_none() });
+    let keys = match collect_iterable(args[0]) {
+        Ok(keys) => keys,
+        Err(message) => return fail(message),
+    };
+    let mut pairs = Vec::with_capacity(keys.len() * 2);
+    for key in keys {
+        pairs.push(key);
+        pairs.push(value);
+    }
+    unsafe { abi::map::pon_build_map(pairs.as_mut_ptr(), pairs.len() / 2) }
+}
+
+/// Returns the plain function object backing `dict.fromkeys`.
+pub(crate) fn dict_fromkeys_function() -> *mut PyObject {
+    unsafe { abi::pon_make_function(builtin_dict_fromkeys as *const u8, VARIADIC_ARITY, intern("fromkeys")) }
 }
 
 pub unsafe extern "C" fn builtin_set(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    unsafe { sequence_constructor(argv, argc, SequenceKind::Set, "set") }
+    unsafe { set_flavor_constructor(argv, argc, "set") }
+}
+
+pub unsafe extern "C" fn builtin_frozenset(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { argv_slice(argv, argc) }) else {
+        return fail("frozenset() received a null argv pointer");
+    };
+    if args.len() == 1 && unsafe { crate::types::frozenset::is_frozenset(args[0]) } {
+        return args[0];
+    }
+    unsafe { set_flavor_constructor(argv, argc, "frozenset") }
+}
+
+/// Builds a real runtime set/frozenset from an optional iterable argument.
+unsafe fn set_flavor_constructor(argv: *mut *mut PyObject, argc: usize, name: &str) -> *mut PyObject {
+    let Some(args) = (unsafe { argv_slice(argv, argc) }) else {
+        return fail(format!("{name}() received a null argv pointer"));
+    };
+    if args.len() > 1 {
+        return fail(format!("{name}() expected at most 1 argument, got {}", args.len()));
+    }
+    let mut items = if args.is_empty() {
+        Vec::new()
+    } else {
+        match collect_iterable(args[0]) {
+            Ok(items) => items,
+            Err(message) => return fail(message),
+        }
+    };
+    if name == "frozenset" {
+        unsafe { abi::map::pon_build_frozenset(items.as_mut_ptr(), items.len()) }
+    } else {
+        unsafe { abi::map::pon_build_set(items.as_mut_ptr(), items.len()) }
+    }
 }
 
 pub unsafe extern "C" fn builtin_slice(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -1409,7 +1566,15 @@ pub fn repr_text(object: *mut PyObject) -> String {
                         format!("range({start}, {stop}, {step})")
                     }
                 }
+                NativePayload::LongRange { start, stop, step } => {
+                    if *step == BigInt::from(1) {
+                        format!("range({start}, {stop})")
+                    } else {
+                        format!("range({start}, {stop}, {step})")
+                    }
+                }
                 NativePayload::RangeIterator { .. } => "<range_iterator object>".to_owned(),
+                NativePayload::LongRangeIterator { .. } => "<longrange_iterator object>".to_owned(),
                 NativePayload::VecIterator { .. } => "<list_iterator object>".to_owned(),
                 NativePayload::Enumerate { .. } => "<enumerate object>".to_owned(),
                 NativePayload::Zip { .. } => "<zip object>".to_owned(),
@@ -1458,6 +1623,24 @@ pub fn repr_text(object: *mut PyObject) -> String {
                 let view = object.cast::<crate::types::memoryview::PyMemoryView>();
                 return format!("<memory at {}>", crate::types::bytes_::repr(&crate::types::memoryview::tobytes(view)));
             }
+            if name == "set" {
+                if let Ok(entries) = crate::types::set_::entries_snapshot(object) {
+                    return if entries.is_empty() {
+                        "set()".to_owned()
+                    } else {
+                        format!("{{{}}}", join_repr(&entries))
+                    };
+                }
+            }
+            if name == "frozenset" {
+                if let Ok(entries) = crate::types::frozenset::entries_snapshot(object) {
+                    return if entries.is_empty() {
+                        "frozenset()".to_owned()
+                    } else {
+                        format!("frozenset({{{}}})", join_repr(&entries))
+                    };
+                }
+            }
             return format!("<{name} object>");
         }
     }
@@ -1474,14 +1657,6 @@ fn format_sequence(kind: SequenceKind, items: &[*mut PyObject]) -> String {
                 format!("({})", join_repr(items))
             }
         }
-        SequenceKind::Set => {
-            if items.is_empty() {
-                "set()".to_owned()
-            } else {
-                format!("{{{}}}", join_repr(items))
-            }
-        }
-        SequenceKind::Dict => "{}".to_owned(),
     }
 }
 
@@ -1609,6 +1784,10 @@ unsafe fn type_name(object: *mut PyObject) -> Option<&'static str> {
         "list" => "list",
         "tuple" => "tuple",
         "set" => "set",
+        "frozenset" => "frozenset",
+        "bytes" => "bytes",
+        "bytearray" => "bytearray",
+        "memoryview" => "memoryview",
         "dict" => "dict",
         "range" => "range",
         "range_iterator" => "range_iterator",
@@ -1629,6 +1808,20 @@ fn is_none(object: *mut PyObject) -> bool {
 
 fn arg_i64(object: *mut PyObject, owner: &str) -> Result<i64, *mut PyObject> {
     object_to_i64(object).ok_or_else(|| fail(format!("{owner}() expected int argument")))
+}
+
+/// Coerces a range bound to a `BigInt`, accepting exact ints and bools like
+/// CPython; other objects raise a CPython-shaped, catchable `TypeError`.
+fn arg_bigint(object: *mut PyObject) -> Result<BigInt, *mut PyObject> {
+    if object.is_null() {
+        return Err(fail("range() expected int argument"));
+    }
+    if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(object) } {
+        return Ok(value);
+    }
+    let name = unsafe { crate::types::dict::type_name(object) }.unwrap_or("object");
+    let message = format!("'{name}' object cannot be interpreted as an integer");
+    Err(unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) })
 }
 
 unsafe fn type_object(object: *mut PyObject) -> Option<*mut PyType> {
@@ -1686,6 +1879,9 @@ fn length(object: *mut PyObject) -> Result<i64, String> {
             return match &native.payload {
                 NativePayload::Sequence { items, .. } => Ok(items.len() as i64),
                 NativePayload::Range { start, stop, step } => Ok(range_len(*start, *stop, *step)),
+                NativePayload::LongRange { start, stop, step } => longrange_len(start, stop, step)
+                    .to_i64()
+                    .ok_or_else(|| "Python int too large to convert to C ssize_t".to_owned()),
                 _ => Err("object of this native type has no len()".to_owned()),
             };
         }
@@ -1721,6 +1917,19 @@ fn range_len(start: i64, stop: i64, step: i64) -> i64 {
         0
     } else {
         ((start - stop - 1) / -step) + 1
+    }
+}
+
+fn longrange_len(start: &BigInt, stop: &BigInt, step: &BigInt) -> BigInt {
+    let (diff, step_abs) = if step.is_positive() {
+        (stop - start, step.clone())
+    } else {
+        (start - stop, -step.clone())
+    };
+    if diff.is_positive() {
+        (diff + &step_abs - BigInt::from(1)) / step_abs
+    } else {
+        BigInt::from(0)
     }
 }
 
