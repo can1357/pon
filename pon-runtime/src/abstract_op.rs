@@ -83,6 +83,19 @@ pub unsafe fn binary_op(op: u8, a: *mut PyObject, b: *mut PyObject) -> *mut PyOb
         return raise_type_error("right operand is NULL or has no type");
     };
 
+    if op == BINARY_MUL {
+        match unsafe { try_sequence_repeat(left_type, a, b) } {
+            SlotOutcome::Value(value) => return value,
+            SlotOutcome::Error => return ptr::null_mut(),
+            SlotOutcome::Missing | SlotOutcome::NotImplemented => {}
+        }
+        match unsafe { try_sequence_repeat(right_type, b, a) } {
+            SlotOutcome::Value(value) => return value,
+            SlotOutcome::Error => return ptr::null_mut(),
+            SlotOutcome::Missing | SlotOutcome::NotImplemented => {}
+        }
+    }
+
     let same_type = left_type == right_type;
     let left_forward_slot = unsafe { forward_binary_slot(left_type, op) };
     let right_reflected_slot = if same_type {
@@ -684,6 +697,11 @@ unsafe fn unicode_bytes(value: &PyUnicode) -> &[u8] {
     } else {
         unsafe { core::slice::from_raw_parts(value.data, value.len) }
     }
+}
+
+unsafe fn try_sequence_repeat(ty: *mut PyType, sequence: *mut PyObject, count: *mut PyObject) -> SlotOutcome {
+    let slot = unsafe { (*ty).tp_as_sequence.as_ref().and_then(|methods| methods.sq_repeat) };
+    unsafe { call_binary_slot(slot, sequence, count) }
 }
 
 fn same_richcmp_slot(left: Option<RichCmpFunc>, right: Option<RichCmpFunc>) -> bool {

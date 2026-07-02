@@ -233,6 +233,7 @@ pub unsafe extern "C" fn pon_cell_get(cell_object: *mut PyObject) -> *mut PyObje
     crate::untag_prelude!(cell_object);
     catch_object_helper(|| match unsafe { cell::cell_get(cell_object.cast::<cell::PyCell>()) } {
         Ok(value) => value,
+        Err(message) if message.contains("before assignment") => super::exc::raise_name_error_text(&message),
         Err(message) => return_null_with_error(message),
     })
 }

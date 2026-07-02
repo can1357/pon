@@ -187,6 +187,17 @@ pub(super) fn raise_name_error_text(text: &str) -> *mut PyObject {
     }
 }
 
+/// Raises a typed `IndexError(text)` for failed sequence indexes.
+pub(super) fn raise_index_error_text(text: &str) -> *mut PyObject {
+    match ensure_runtime_for_exc() {
+        Ok(()) => match super::with_runtime(|runtime| raise_builtin_text(runtime, ExceptionKind::IndexError, text)) {
+            Some(result) => result,
+            None => super::return_null_with_error("runtime is not initialized"),
+        },
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
 fn raise_message_exception(kind: ExceptionKind, ptr: *const u8, len: usize) -> *mut PyObject {
     let bytes = match bytes_from_raw(ptr, len) {
         Ok(bytes) => bytes,
@@ -226,23 +237,72 @@ pub(super) fn is_type_object(runtime: &Runtime, object: *mut PyObject) -> bool {
 fn exception_kind_name(kind: ExceptionKind) -> &'static str {
     match kind {
         ExceptionKind::BaseException => "BaseException",
+        ExceptionKind::BaseExceptionGroup => "BaseExceptionGroup",
+        ExceptionKind::GeneratorExit => "GeneratorExit",
+        ExceptionKind::KeyboardInterrupt => "KeyboardInterrupt",
+        ExceptionKind::SystemExit => "SystemExit",
         ExceptionKind::Exception => "Exception",
-        ExceptionKind::ImportError => "ImportError",
-        ExceptionKind::EOFError => "EOFError",
-        ExceptionKind::TypeError => "TypeError",
-        ExceptionKind::ValueError => "ValueError",
-        ExceptionKind::KeyError => "KeyError",
-        ExceptionKind::IndexError => "IndexError",
+        ExceptionKind::ArithmeticError => "ArithmeticError",
+        ExceptionKind::FloatingPointError => "FloatingPointError",
+        ExceptionKind::OverflowError => "OverflowError",
+        ExceptionKind::ZeroDivisionError => "ZeroDivisionError",
+        ExceptionKind::AssertionError => "AssertionError",
         ExceptionKind::AttributeError => "AttributeError",
+        ExceptionKind::BufferError => "BufferError",
+        ExceptionKind::EOFError => "EOFError",
+        ExceptionKind::ImportError => "ImportError",
+        ExceptionKind::ModuleNotFoundError => "ModuleNotFoundError",
+        ExceptionKind::LookupError => "LookupError",
+        ExceptionKind::IndexError => "IndexError",
+        ExceptionKind::KeyError => "KeyError",
+        ExceptionKind::MemoryError => "MemoryError",
         ExceptionKind::NameError => "NameError",
         ExceptionKind::UnboundLocalError => "UnboundLocalError",
-        ExceptionKind::NotImplementedError => "NotImplementedError",
-        ExceptionKind::StopIteration => "StopIteration",
-        ExceptionKind::GeneratorExit => "GeneratorExit",
-        ExceptionKind::RuntimeError => "RuntimeError",
         ExceptionKind::OSError => "OSError",
-        ExceptionKind::AssertionError => "AssertionError",
-        ExceptionKind::BaseExceptionGroup => "BaseExceptionGroup",
+        ExceptionKind::BlockingIOError => "BlockingIOError",
+        ExceptionKind::ChildProcessError => "ChildProcessError",
+        ExceptionKind::ConnectionError => "ConnectionError",
+        ExceptionKind::BrokenPipeError => "BrokenPipeError",
+        ExceptionKind::ConnectionAbortedError => "ConnectionAbortedError",
+        ExceptionKind::ConnectionRefusedError => "ConnectionRefusedError",
+        ExceptionKind::ConnectionResetError => "ConnectionResetError",
+        ExceptionKind::FileExistsError => "FileExistsError",
+        ExceptionKind::FileNotFoundError => "FileNotFoundError",
+        ExceptionKind::InterruptedError => "InterruptedError",
+        ExceptionKind::IsADirectoryError => "IsADirectoryError",
+        ExceptionKind::NotADirectoryError => "NotADirectoryError",
+        ExceptionKind::PermissionError => "PermissionError",
+        ExceptionKind::ProcessLookupError => "ProcessLookupError",
+        ExceptionKind::TimeoutError => "TimeoutError",
+        ExceptionKind::ReferenceError => "ReferenceError",
+        ExceptionKind::RuntimeError => "RuntimeError",
+        ExceptionKind::NotImplementedError => "NotImplementedError",
+        ExceptionKind::PythonFinalizationError => "PythonFinalizationError",
+        ExceptionKind::RecursionError => "RecursionError",
+        ExceptionKind::StopAsyncIteration => "StopAsyncIteration",
+        ExceptionKind::StopIteration => "StopIteration",
+        ExceptionKind::SyntaxError => "SyntaxError",
+        ExceptionKind::IndentationError => "IndentationError",
+        ExceptionKind::TabError => "TabError",
+        ExceptionKind::SystemError => "SystemError",
+        ExceptionKind::TypeError => "TypeError",
+        ExceptionKind::ValueError => "ValueError",
+        ExceptionKind::UnicodeError => "UnicodeError",
+        ExceptionKind::UnicodeDecodeError => "UnicodeDecodeError",
+        ExceptionKind::UnicodeEncodeError => "UnicodeEncodeError",
+        ExceptionKind::UnicodeTranslateError => "UnicodeTranslateError",
+        ExceptionKind::Warning => "Warning",
+        ExceptionKind::BytesWarning => "BytesWarning",
+        ExceptionKind::DeprecationWarning => "DeprecationWarning",
+        ExceptionKind::EncodingWarning => "EncodingWarning",
+        ExceptionKind::FutureWarning => "FutureWarning",
+        ExceptionKind::ImportWarning => "ImportWarning",
+        ExceptionKind::PendingDeprecationWarning => "PendingDeprecationWarning",
+        ExceptionKind::ResourceWarning => "ResourceWarning",
+        ExceptionKind::RuntimeWarning => "RuntimeWarning",
+        ExceptionKind::SyntaxWarning => "SyntaxWarning",
+        ExceptionKind::UnicodeWarning => "UnicodeWarning",
+        ExceptionKind::UserWarning => "UserWarning",
         ExceptionKind::ExceptionGroup => "ExceptionGroup",
     }
 }
@@ -633,21 +693,22 @@ fn group_members(group: *mut PyObject) -> Result<Vec<*mut PyObject>, ()> {
     Ok(unsafe { tuple.as_slice() }.to_vec())
 }
 
-fn alloc_group_like(source: *mut PyObject, members: &[*mut PyObject], copy_metadata: bool) -> Result<*mut PyObject, ()> {
+fn alloc_group_like(
+    runtime: &Runtime,
+    source: *mut PyObject,
+    members: &[*mut PyObject],
+    copy_metadata: bool,
+) -> Result<*mut PyObject, ()> {
     let Some(source_group) = (unsafe { as_exception_group(source) }) else {
         super::return_null_with_error("derive source is not an exception group");
         return Err(());
     };
     let ty = source_group.base.ob_base.ob_type.cast_mut();
     let message = source_group.base.message;
-    let group = match super::with_runtime(|runtime| alloc_exception_group_from_members(runtime, ty, message, members)) {
-        Some(Ok(group)) => group,
-        Some(Err(message)) => {
+    let group = match alloc_exception_group_from_members(runtime, ty, message, members) {
+        Ok(group) => group,
+        Err(message) => {
             super::return_null_with_error(message);
-            return Err(());
-        }
-        None => {
-            super::return_null_with_error("runtime is not initialized");
             return Err(());
         }
     };
@@ -662,7 +723,7 @@ fn alloc_group_like(source: *mut PyObject, members: &[*mut PyObject], copy_metad
     Ok(group)
 }
 
-fn split_exception(node: *mut PyObject, cond: &SplitCond) -> Result<SplitOutcome, ()> {
+fn split_exception(runtime: &Runtime, node: *mut PyObject, cond: &SplitCond) -> Result<SplitOutcome, ()> {
     if condition_matches(cond, node)? {
         return Ok(SplitOutcome {
             matched: node,
@@ -679,7 +740,7 @@ fn split_exception(node: *mut PyObject, cond: &SplitCond) -> Result<SplitOutcome
     let mut matched_parts = Vec::new();
     let mut rest_parts = Vec::new();
     for child in group_members(node)? {
-        let split = split_exception(child, cond)?;
+        let split = split_exception(runtime, child, cond)?;
         if !split.matched.is_null() {
             matched_parts.push(split.matched);
         }
@@ -691,12 +752,12 @@ fn split_exception(node: *mut PyObject, cond: &SplitCond) -> Result<SplitOutcome
     let matched = if matched_parts.is_empty() {
         ptr::null_mut()
     } else {
-        alloc_group_like(node, &matched_parts, true)?
+        alloc_group_like(runtime, node, &matched_parts, true)?
     };
     let rest = if rest_parts.is_empty() {
         ptr::null_mut()
     } else {
-        alloc_group_like(node, &rest_parts, true)?
+        alloc_group_like(runtime, node, &rest_parts, true)?
     };
     Ok(SplitOutcome { matched, rest })
 }
@@ -759,12 +820,13 @@ pub unsafe extern "C" fn pon_exc_group_split(types: *mut PyObject, out_rest: *mu
             unsafe { *out_rest = current };
             return ptr::null_mut();
         }
-        match split_exception(current, &cond) {
-            Ok(split) => {
+        match super::with_runtime(|runtime| split_exception(runtime, current, &cond)) {
+            Some(Ok(split)) => {
                 unsafe { *out_rest = split.rest };
                 split.matched
             }
-            Err(()) => ptr::null_mut(),
+            Some(Err(())) => ptr::null_mut(),
+            None => super::return_null_with_error("runtime is not initialized"),
         }
     })
 }
@@ -851,7 +913,7 @@ fn exc_star_split_current(runtime: &Runtime, rest: *mut PyObject, cond: &SplitCo
     } else {
         rest
     };
-    let mut split = split_exception(subject, cond)?;
+    let mut split = split_exception(runtime, subject, cond)?;
     split.rest = unwrap_exc_star_rest(was_naked, split.rest);
     Ok(split)
 }
@@ -1052,9 +1114,10 @@ pub unsafe fn call_exception_group_method(receiver: *mut PyObject, kind: u8, arg
                 Ok(cond) => cond,
                 Err(result) => return result,
             };
-            let split = match split_exception(receiver, &cond) {
-                Ok(split) => split,
-                Err(()) => return ptr::null_mut(),
+            let split = match super::with_runtime(|runtime| split_exception(runtime, receiver, &cond)) {
+                Some(Ok(split)) => split,
+                Some(Err(())) => return ptr::null_mut(),
+                None => return super::return_null_with_error("runtime is not initialized"),
             };
             if kind == EXC_GROUP_METHOD_SUBGROUP {
                 none_or_object(split.matched)
@@ -1075,9 +1138,10 @@ pub unsafe fn call_exception_group_method(receiver: *mut PyObject, kind: u8, arg
             if values.is_empty() {
                 return raise_type_error_text("second argument (exceptions) must be a non-empty sequence");
             }
-            match alloc_group_like(receiver, &values, false) {
-                Ok(group) => group,
-                Err(()) => ptr::null_mut(),
+            match super::with_runtime(|runtime| alloc_group_like(runtime, receiver, &values, false)) {
+                Some(Ok(group)) => group,
+                Some(Err(())) => ptr::null_mut(),
+                None => super::return_null_with_error("runtime is not initialized"),
             }
         }
         _ => raise_type_error_text("unknown ExceptionGroup method"),

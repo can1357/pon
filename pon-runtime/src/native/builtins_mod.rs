@@ -7,6 +7,7 @@
 //! type modules grow full CPython-compatible implementations.
 
 use std::cmp::Ordering;
+use core::ffi::c_int;
 use std::io::{self, Write};
 use std::ptr;
 use std::sync::{LazyLock, OnceLock};
@@ -108,19 +109,75 @@ pub(crate) fn make_module() -> Result<*mut PyObject, String> {
     });
     for exception_name in [
         "BaseException",
+        "BaseExceptionGroup",
+        "GeneratorExit",
+        "KeyboardInterrupt",
+        "SystemExit",
         "Exception",
+        "ArithmeticError",
+        "FloatingPointError",
+        "OverflowError",
+        "ZeroDivisionError",
+        "AssertionError",
+        "AttributeError",
+        "BufferError",
+        "EOFError",
         "ImportError",
+        "ModuleNotFoundError",
+        "LookupError",
+        "IndexError",
+        "KeyError",
+        "MemoryError",
+        "NameError",
+        "UnboundLocalError",
+        "OSError",
+        "BlockingIOError",
+        "ChildProcessError",
+        "ConnectionError",
+        "BrokenPipeError",
+        "ConnectionAbortedError",
+        "ConnectionRefusedError",
+        "ConnectionResetError",
+        "FileExistsError",
+        "FileNotFoundError",
+        "InterruptedError",
+        "IsADirectoryError",
+        "NotADirectoryError",
+        "PermissionError",
+        "ProcessLookupError",
+        "TimeoutError",
+        "ReferenceError",
+        "RuntimeError",
+        "NotImplementedError",
+        "PythonFinalizationError",
+        "RecursionError",
+        "StopAsyncIteration",
+        "StopIteration",
+        "SyntaxError",
+        "IndentationError",
+        "TabError",
+        "SystemError",
         "TypeError",
         "ValueError",
-        "KeyError",
-        "IndexError",
-        "AttributeError",
-        "StopIteration",
-        "RuntimeError",
-        "OSError",
-        "AssertionError",
-        "BaseExceptionGroup",
+        "UnicodeError",
+        "UnicodeDecodeError",
+        "UnicodeEncodeError",
+        "UnicodeTranslateError",
+        "Warning",
+        "BytesWarning",
+        "DeprecationWarning",
+        "EncodingWarning",
+        "FutureWarning",
+        "ImportWarning",
+        "PendingDeprecationWarning",
+        "ResourceWarning",
+        "RuntimeWarning",
+        "SyntaxWarning",
+        "UnicodeWarning",
+        "UserWarning",
         "ExceptionGroup",
+        "EnvironmentError",
+        "IOError",
     ] {
         let name = crate::intern::intern(exception_name);
         let value = unsafe { abi::pon_load_global(name, core::ptr::null_mut()) };
@@ -216,11 +273,19 @@ fn type_from(
 }
 
 fn list_type() -> *mut PyType {
-    type_from(&LIST_TYPE, "list", Some(sequence_iter_slot), None)
+    let ty = type_from(&LIST_TYPE, "list", Some(sequence_iter_slot), None);
+    unsafe {
+        (*ty).tp_richcmp = Some(native_list_richcmp_slot);
+    }
+    ty
 }
 
 fn tuple_type() -> *mut PyType {
-    type_from(&TUPLE_TYPE, "tuple", Some(sequence_iter_slot), None)
+    let ty = type_from(&TUPLE_TYPE, "tuple", Some(sequence_iter_slot), None);
+    unsafe {
+        (*ty).tp_richcmp = Some(native_tuple_richcmp_slot);
+    }
+    ty
 }
 
 fn set_type() -> *mut PyType {
@@ -264,7 +329,11 @@ fn call_sentinel_iter_type() -> *mut PyType {
 
 
 fn placeholder_type() -> *mut PyType {
-    type_from(&PLACEHOLDER_TYPE, "object", None, None)
+    let ty = type_from(&PLACEHOLDER_TYPE, "object", None, None);
+    unsafe {
+        (*ty).tp_getattro = Some(placeholder_getattro_slot);
+    }
+    ty
 }
 
 fn property_type() -> *mut PyType {
@@ -274,6 +343,56 @@ fn property_type() -> *mut PyType {
 fn super_type() -> *mut PyType {
     *SUPER_TYPE as *mut PyType
 }
+pub(crate) fn builtin_native_type(name: &str) -> Option<*mut PyType> {
+    Some(match name {
+        "object" => placeholder_type(),
+        "list" => list_type(),
+        "tuple" => tuple_type(),
+        "dict" => dict_type(),
+        "set" => set_type(),
+        "range" => range_type(),
+        "enumerate" => enumerate_type(),
+        "zip" => zip_type(),
+        "map" => map_type(),
+        "filter" => filter_type(),
+        "property" => property_type(),
+        "super" => super_type(),
+        _ => return None,
+    })
+}
+
+unsafe extern "C" fn placeholder_getattro_slot(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        return fail("object attribute name must be str");
+    };
+    match name {
+        "__str__" | "__repr__" => bound_placeholder_method(object, name, placeholder_str_method),
+        _ => fail(format!("attribute '{name}' was not found")),
+    }
+}
+
+fn bound_placeholder_method(
+    receiver: *mut PyObject,
+    name: &str,
+    entry: unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject,
+) -> *mut PyObject {
+    let function = unsafe { abi::pon_make_function(entry as *const u8, VARIADIC_ARITY, intern(name)) };
+    if function.is_null() {
+        return ptr::null_mut();
+    }
+    match crate::types::method::new_bound_method(function, receiver) {
+        Ok(method) => method.cast::<PyObject>(),
+        Err(message) => fail(message),
+    }
+}
+
+unsafe extern "C" fn placeholder_str_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { exact_args(argv, argc, 1, "object.__str__") }) else {
+        return ptr::null_mut();
+    };
+    alloc_str(&repr_text(args[0]))
+}
+
 
 fn alloc_native(payload: NativePayload, ty: *mut PyType) -> *mut PyObject {
     Box::into_raw(Box::new(NativeObject {
@@ -491,6 +610,92 @@ unsafe extern "C" fn native_bool_slot(object: *mut PyObject) -> i32 {
 unsafe extern "C" fn native_hash_slot(object: *mut PyObject) -> isize {
     stable_hash(&repr_text(object)) as isize
 }
+unsafe extern "C" fn native_list_richcmp_slot(left: *mut PyObject, right: *mut PyObject, op: c_int) -> *mut PyObject {
+    unsafe { native_sequence_richcmp(left, right, op, SequenceKind::List) }
+}
+
+unsafe extern "C" fn native_tuple_richcmp_slot(left: *mut PyObject, right: *mut PyObject, op: c_int) -> *mut PyObject {
+    unsafe { native_sequence_richcmp(left, right, op, SequenceKind::Tuple) }
+}
+
+unsafe fn native_sequence_richcmp(
+    left: *mut PyObject,
+    right: *mut PyObject,
+    op: c_int,
+    kind: SequenceKind,
+) -> *mut PyObject {
+    let Some(left_items) = (unsafe { native_sequence_items(left, kind) }) else {
+        return unsafe { abi::pon_not_implemented() };
+    };
+    let Some(right_items) = (unsafe { native_sequence_items(right, kind) }) else {
+        return unsafe { abi::pon_not_implemented() };
+    };
+    let Ok(op) = u8::try_from(op) else {
+        return fail("unknown rich comparison operation");
+    };
+    if !matches!(
+        op,
+        crate::abstract_op::RICH_LT
+            | crate::abstract_op::RICH_LE
+            | crate::abstract_op::RICH_EQ
+            | crate::abstract_op::RICH_NE
+            | crate::abstract_op::RICH_GT
+            | crate::abstract_op::RICH_GE
+    ) {
+        return fail("unknown rich comparison operation");
+    }
+
+    for index in 0..left_items.len().min(right_items.len()) {
+        let equal = unsafe {
+            abi::pon_rich_compare(
+                crate::abstract_op::RICH_EQ,
+                left_items[index],
+                right_items[index],
+                ptr::null_mut(),
+            )
+        };
+        if equal.is_null() {
+            return ptr::null_mut();
+        }
+        let is_equal = match unsafe { truth(equal) } {
+            Ok(value) => value,
+            Err(message) => return fail(message),
+        };
+        if !is_equal {
+            return match op {
+                crate::abstract_op::RICH_EQ => unsafe { abi::number::pon_const_bool(0) },
+                crate::abstract_op::RICH_NE => unsafe { abi::number::pon_const_bool(1) },
+                crate::abstract_op::RICH_LT
+                | crate::abstract_op::RICH_LE
+                | crate::abstract_op::RICH_GT
+                | crate::abstract_op::RICH_GE => unsafe {
+                    abi::pon_rich_compare(op, left_items[index], right_items[index], ptr::null_mut())
+                },
+                _ => unreachable!(),
+            };
+        }
+    }
+
+    let result = match op {
+        crate::abstract_op::RICH_EQ => left_items.len() == right_items.len(),
+        crate::abstract_op::RICH_NE => left_items.len() != right_items.len(),
+        crate::abstract_op::RICH_LT => left_items.len() < right_items.len(),
+        crate::abstract_op::RICH_LE => left_items.len() <= right_items.len(),
+        crate::abstract_op::RICH_GT => left_items.len() > right_items.len(),
+        crate::abstract_op::RICH_GE => left_items.len() >= right_items.len(),
+        _ => unreachable!(),
+    };
+    unsafe { abi::number::pon_const_bool(i32::from(result)) }
+}
+
+unsafe fn native_sequence_items(object: *mut PyObject, kind: SequenceKind) -> Option<Vec<*mut PyObject>> {
+    let native = unsafe { as_native(object) }?;
+    match &native.payload {
+        NativePayload::Sequence { kind: actual, items } if *actual == kind => Some(items.clone()),
+        _ => None,
+    }
+}
+
 
 pub unsafe extern "C" fn builtin_print(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let Some(args) = (unsafe { argv_slice(argv, argc) }) else {

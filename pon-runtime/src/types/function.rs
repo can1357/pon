@@ -15,9 +15,9 @@ use std::sync::{LazyLock, Mutex};
 
 use crate::abi::{CodeInfo, ParamSpec, return_null_with_error};
 use crate::intern::{self, intern, resolve};
-use crate::object::{PyCodeFn, PyFunction, PyObject, PyUnicode};
+use crate::object::{PyCodeFn, PyFunction, PyObject, PyObjectHeader, PyType, PyUnicode};
 use crate::thread_state::{pon_err_clear, pon_err_occurred};
-use crate::types::{dict, list::PyList, tuple::PyTuple};
+use crate::types::{dict, list::PyList, tuple::PyTuple, type_::{self, PyClassDict}};
 
 static FUNCTION_RECORDS: LazyLock<Mutex<HashMap<usize, FunctionRecord>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -115,6 +115,269 @@ pub struct KeywordArgs<'a> {
     pub values: &'a [*mut PyObject],
 }
 
+const CPY_CO_OPTIMIZED: u32 = 0x01;
+const CPY_CO_NEWLOCALS: u32 = 0x02;
+const CPY_CO_VARARGS: u32 = 0x04;
+const CPY_CO_VARKEYWORDS: u32 = 0x08;
+const CPY_CO_GENERATOR: u32 = 0x20;
+const CPY_CO_COROUTINE: u32 = 0x80;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FunctionCodeMetadata {
+    name_interned: u32,
+    n_locals: u32,
+    flags: u32,
+    params: Option<OwnedParamSpec>,
+}
+
+#[repr(C)]
+struct PyFunctionCodeObject {
+    ob_base: PyObjectHeader,
+    metadata: FunctionCodeMetadata,
+}
+
+#[repr(C)]
+struct PyFunctionGetSetDescriptor {
+    ob_base: PyObjectHeader,
+    name: u32,
+}
+
+fn function_code_type() -> *mut PyType {
+    static CODE_TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut ty = PyType::new(ptr::null(), "code", mem::size_of::<PyFunctionCodeObject>());
+        ty.tp_getattro = Some(function_code_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *CODE_TYPE as *mut PyType
+}
+
+fn function_getset_descriptor_type() -> *mut PyType {
+    static DESCRIPTOR_TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut ty = PyType::new(ptr::null(), "getset_descriptor", mem::size_of::<PyFunctionGetSetDescriptor>());
+        ty.tp_descr_get = Some(function_getset_descr_get);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *DESCRIPTOR_TYPE as *mut PyType
+}
+
+/// Install Python-visible function/code descriptor metadata on the runtime's
+/// singleton `function` type.
+///
+/// The compiler only needs a lightweight code-object shell here: stdlib modules
+/// such as `types` and `inspect` probe `__code__` for identity and signature
+/// metadata, while execution continues to use the raw entrypoint in
+/// [`PyFunction`].
+pub unsafe fn install_function_type_attrs(function_type: *mut PyType, type_type: *mut PyType) {
+    if function_type.is_null() {
+        return;
+    }
+    let code_type = function_code_type();
+    let descriptor_type = function_getset_descriptor_type();
+    unsafe {
+        (*code_type).ob_base.ob_type = type_type;
+        (*descriptor_type).ob_base.ob_type = type_type;
+    }
+
+    let dict = unsafe {
+        if (*function_type).tp_dict.is_null() {
+            let dict = type_::new_namespace();
+            (*function_type).tp_dict = dict.cast::<PyObject>();
+            dict
+        } else {
+            (*function_type).tp_dict.cast::<PyClassDict>()
+        }
+    };
+    for attr in [
+        "__code__",
+        "__globals__",
+        "__defaults__",
+        "__kwdefaults__",
+        "__closure__",
+        "__annotations__",
+        "__annotate__",
+    ] {
+        let name = intern(attr);
+        let descriptor = Box::into_raw(Box::new(PyFunctionGetSetDescriptor {
+            ob_base: PyObjectHeader::new(descriptor_type),
+            name,
+        }))
+        .cast::<PyObject>();
+        unsafe { (&mut *dict).set(name, descriptor) };
+    }
+}
+
+unsafe extern "C" fn function_getset_descr_get(
+    descr: *mut PyObject,
+    obj: *mut PyObject,
+    _owner: *mut PyObject,
+) -> *mut PyObject {
+    if descr.is_null() {
+        return return_null_with_error("function descriptor is NULL");
+    }
+    if obj.is_null() {
+        return descr;
+    }
+    let obj_ty = unsafe { (*obj).ob_type };
+    if !obj_ty.is_null() && unsafe { (*obj_ty).name() == "type" } {
+        return descr;
+    }
+    let name = unsafe { (*descr.cast::<PyFunctionGetSetDescriptor>()).name };
+    function_attr_by_id(obj, name).unwrap_or_else(|| return_null_with_error("unknown function descriptor"))
+}
+
+fn const_str(text: &str) -> *mut PyObject {
+    unsafe { crate::abi::pon_const_str(text.as_ptr(), text.len()) }
+}
+
+fn const_name(name: u32) -> *mut PyObject {
+    let text = resolve(name).unwrap_or_else(|| format!("<interned:{name}>"));
+    const_str(&text)
+}
+
+fn empty_tuple() -> *mut PyObject {
+    unsafe { crate::abi::seq::pon_build_tuple(ptr::null_mut(), 0) }
+}
+
+fn tuple_from_names(names: impl IntoIterator<Item = u32>) -> *mut PyObject {
+    let mut values = Vec::new();
+    for name in names {
+        let value = const_name(name);
+        if value.is_null() {
+            return ptr::null_mut();
+        }
+        values.push(value);
+    }
+    unsafe {
+        crate::abi::seq::pon_build_tuple(
+            if values.is_empty() { ptr::null_mut() } else { values.as_mut_ptr() },
+            values.len(),
+        )
+    }
+}
+
+fn tuple_from_objects(mut values: Vec<*mut PyObject>) -> *mut PyObject {
+    unsafe {
+        crate::abi::seq::pon_build_tuple(
+            if values.is_empty() { ptr::null_mut() } else { values.as_mut_ptr() },
+            values.len(),
+        )
+    }
+}
+
+fn code_metadata_for_function(function: *mut PyObject) -> FunctionCodeMetadata {
+    if let Some(record) = function_record(function) {
+        return FunctionCodeMetadata {
+            name_interned: record.name_interned,
+            n_locals: record.n_locals,
+            flags: record.flags,
+            params: record.params,
+        };
+    }
+    let function_ref = unsafe { &*function.cast::<PyFunction>() };
+    FunctionCodeMetadata {
+        name_interned: function_ref.name_interned,
+        n_locals: u32::try_from(function_ref.arity).unwrap_or(u32::MAX),
+        flags: 0,
+        params: None,
+    }
+}
+
+fn alloc_code_object(function: *mut PyObject) -> *mut PyObject {
+    if function.is_null() {
+        return return_null_with_error("cannot read __code__ from NULL function");
+    }
+    Box::into_raw(Box::new(PyFunctionCodeObject {
+        ob_base: PyObjectHeader::new(function_code_type()),
+        metadata: code_metadata_for_function(function),
+    }))
+    .cast::<PyObject>()
+}
+
+fn cpython_code_flags(metadata: &FunctionCodeMetadata) -> u32 {
+    let mut flags = CPY_CO_OPTIMIZED | CPY_CO_NEWLOCALS;
+    if metadata.params.as_ref().and_then(|params| params.varargs_name).is_some() {
+        flags |= CPY_CO_VARARGS;
+    }
+    if metadata.params.as_ref().and_then(|params| params.varkw_name).is_some() {
+        flags |= CPY_CO_VARKEYWORDS;
+    }
+    if metadata.flags & crate::abi::call::CODE_FLAG_GENERATOR != 0 {
+        flags |= CPY_CO_GENERATOR;
+    }
+    if metadata.flags & crate::abi::call::CODE_FLAG_COROUTINE != 0 {
+        flags |= CPY_CO_COROUTINE;
+    }
+    flags
+}
+
+fn code_varnames(metadata: &FunctionCodeMetadata) -> *mut PyObject {
+    let Some(params) = metadata.params.as_ref() else {
+        return empty_tuple();
+    };
+    let names = params
+        .names
+        .iter()
+        .copied()
+        .chain(params.varargs_name)
+        .chain(params.varkw_name);
+    tuple_from_names(names)
+}
+
+unsafe extern "C" fn function_code_getattro(code: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    if code.is_null() || name.is_null() {
+        return return_null_with_error("code attribute lookup received NULL");
+    }
+    let Some(name_text) = (unsafe { (&*name.cast::<PyUnicode>()).as_str() }) else {
+        return return_null_with_error("code attribute name is not valid UTF-8");
+    };
+    let name_id = intern(name_text);
+    let metadata = unsafe { &(*code.cast::<PyFunctionCodeObject>()).metadata };
+    if name_id == intern("__class__") {
+        return function_code_type().cast::<PyObject>();
+    }
+    if name_id == intern("co_flags") {
+        return unsafe { crate::abi::pon_const_int(i64::from(cpython_code_flags(metadata))) };
+    }
+    if name_id == intern("co_argcount") {
+        let value = metadata.params.as_ref().map_or(0, OwnedParamSpec::positional_arity);
+        return unsafe { crate::abi::pon_const_int(value as i64) };
+    }
+    if name_id == intern("co_posonlyargcount") {
+        let value = metadata.params.as_ref().map_or(0, |params| params.positional_only_count);
+        return unsafe { crate::abi::pon_const_int(value as i64) };
+    }
+    if name_id == intern("co_kwonlyargcount") {
+        let value = metadata.params.as_ref().map_or(0, |params| params.keyword_only_count);
+        return unsafe { crate::abi::pon_const_int(value as i64) };
+    }
+    if name_id == intern("co_nlocals") {
+        return unsafe { crate::abi::pon_const_int(i64::from(metadata.n_locals)) };
+    }
+    if name_id == intern("co_varnames") {
+        return code_varnames(metadata);
+    }
+    if name_id == intern("co_name") || name_id == intern("co_qualname") {
+        return const_name(metadata.name_interned);
+    }
+    if name_id == intern("co_filename") {
+        return const_str("<pon>");
+    }
+    if name_id == intern("co_firstlineno") || name_id == intern("co_stacksize") {
+        return unsafe { crate::abi::pon_const_int(1) };
+    }
+    if name_id == intern("co_consts")
+        || name_id == intern("co_names")
+        || name_id == intern("co_freevars")
+        || name_id == intern("co_cellvars")
+    {
+        return empty_tuple();
+    }
+    if name_id == intern("co_code") || name_id == intern("co_lnotab") {
+        return const_str("");
+    }
+    return_null_with_error(format!("code object has no attribute '{name_text}'"))
+}
+
 /// Register Phase-B metadata for an already allocated `PyFunction`.
 pub fn register_function_record(
     function: *mut PyObject,
@@ -196,6 +459,69 @@ pub fn function_record(function: *mut PyObject) -> Option<FunctionRecord> {
         .and_then(|records| records.get(&(function as usize)).cloned())
 }
 
+fn function_attr_by_id(function: *mut PyObject, name_id: u32) -> Option<*mut PyObject> {
+    if name_id == intern("__class__") {
+        let ty = unsafe { (*function.cast::<PyFunction>()).ob_base.ob_type };
+        return Some(ty.cast_mut().cast::<PyObject>());
+    }
+    if name_id == intern("__name__") || name_id == intern("__qualname__") {
+        return Some(const_name(unsafe { (*function.cast::<PyFunction>()).name_interned }));
+    }
+    if name_id == intern("__code__") {
+        return Some(alloc_code_object(function));
+    }
+    if name_id == intern("__globals__") {
+        return Some(unsafe { crate::dynexec::builtin_globals(ptr::null_mut(), 0) });
+    }
+    if name_id == intern("__defaults__") {
+        let Some(record) = function_record(function) else {
+            return Some(unsafe { crate::abi::pon_none() });
+        };
+        if record.defaults.is_empty() {
+            return Some(unsafe { crate::abi::pon_none() });
+        }
+        return Some(tuple_from_objects(record.defaults()));
+    }
+    if name_id == intern("__kwdefaults__") {
+        let Some(record) = function_record(function) else {
+            return Some(unsafe { crate::abi::pon_none() });
+        };
+        if record.kwdefaults.is_empty() {
+            return Some(unsafe { crate::abi::pon_none() });
+        }
+        let mut pairs = Vec::with_capacity(record.kwdefaults.len() * 2);
+        for (name, value) in record.kwdefaults {
+            let key = const_name(name);
+            if key.is_null() {
+                return Some(ptr::null_mut());
+            }
+            pairs.push(key);
+            pairs.push(value as *mut PyObject);
+        }
+        return Some(unsafe { crate::abi::map::pon_build_map(pairs.as_mut_ptr(), pairs.len() / 2) });
+    }
+    if name_id == intern("__closure__") {
+        let Some(record) = function_record(function) else {
+            return Some(unsafe { crate::abi::pon_none() });
+        };
+        let closure = record.closure();
+        if closure.is_empty() {
+            return Some(unsafe { crate::abi::pon_none() });
+        }
+        return Some(tuple_from_objects(closure));
+    }
+    if name_id == intern("__annotations__") {
+        return Some(unsafe { function_annotations(function) });
+    }
+    if name_id == intern("__annotate__") {
+        return Some(function_annotate(function).unwrap_or_else(|| unsafe { crate::abi::pon_none() }));
+    }
+    if name_id == intern("__dict__") {
+        return Some(unsafe { crate::abi::map::pon_build_map(ptr::null_mut(), 0) });
+    }
+    None
+}
+
 /// Attribute lookup for function metadata exposed at Python level.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn function_getattro(function: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
@@ -206,17 +532,8 @@ pub unsafe extern "C" fn function_getattro(function: *mut PyObject, name: *mut P
         return return_null_with_error("function attribute name is not valid UTF-8");
     };
     let name_id = intern(name_text);
-    if name_id == intern("__name__") {
-        let fname = resolve(unsafe { (*function.cast::<PyFunction>()).name_interned })
-            .unwrap_or_else(|| "<lambda>".to_owned());
-        return unsafe { crate::abi::pon_const_str(fname.as_ptr(), fname.len()) };
-    }
-    if name_id == intern("__annotations__") {
-        return unsafe { function_annotations(function) };
-    }
-    if name_id == intern("__annotate__") {
-        return function_annotate(function)
-            .unwrap_or_else(|| unsafe { crate::abi::pon_none() });
+    if let Some(value) = function_attr_by_id(function, name_id) {
+        return value;
     }
     return_null_with_error(format!("function has no attribute '{name_text}'"))
 }

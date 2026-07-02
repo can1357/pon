@@ -15,7 +15,7 @@ use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set, pon_err_
 use crate::types::type_::{self, PyHeapInstance};
 
 /// GC type id for weakref.ref objects once the ref object itself moves into the heap.
-pub const TYPE_ID_WEAKREF: TypeId = TypeId(9);
+pub const TYPE_ID_WEAKREF: TypeId = TypeId(11);
 
 #[repr(C)]
 #[derive(Debug)]
@@ -311,4 +311,71 @@ pub unsafe extern "C" fn finalize_heap_instance(object: *mut u8) {
         instance.dict = ptr::null_mut();
     }
     unsafe { ptr::drop_in_place(&mut instance.slots) };
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::abi::{collect, pon_call, pon_make_function, pon_none, pon_runtime_init};
+    use crate::thread_state::{pon_err_clear, test_state_lock};
+
+    static DEL_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static WEAKREF_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn del_marker(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+        assert_eq!(argc, 1, "__del__ should be called as a bound method");
+        DEL_CALLS.fetch_add(1, Ordering::SeqCst);
+        unsafe { pon_none() }
+    }
+
+    unsafe extern "C" fn weakref_callback(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+        assert_eq!(argc, 1, "weakref callback receives the ref object");
+        assert!(!argv.is_null());
+        let referent = unsafe { weakref_call(*argv, ptr::null_mut(), ptr::null_mut()) };
+        assert_eq!(referent, unsafe { pon_none() });
+        WEAKREF_CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        unsafe { pon_none() }
+    }
+
+    #[test]
+    fn heap_instance_collection_runs_del_once_and_clears_weakrefs() {
+        let _guard = test_state_lock();
+        DEL_CALLS.store(0, Ordering::SeqCst);
+        WEAKREF_CALLBACKS.store(0, Ordering::SeqCst);
+
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+            pon_err_clear();
+
+            let namespace = type_::new_namespace();
+            let del = pon_make_function(del_marker as *const u8, 1, intern::intern("__del__"));
+            assert!(!del.is_null());
+            (&mut *namespace).set(intern::intern("__del__"), del);
+            let cls = type_::build_class_from_namespace("WeakFinalized", &[], namespace, &[]);
+            assert!(!cls.is_null());
+
+            let object = type_::type_new(cls.cast::<PyType>(), ptr::null_mut(), ptr::null_mut());
+            assert!(!object.is_null());
+            assert_eq!((*object.cast::<PyHeapInstance>()).weakrefs, ptr::null_mut());
+
+            let callback = pon_make_function(weakref_callback as *const u8, 1, intern::intern("weakref_callback"));
+            assert!(!callback.is_null());
+            let mut args = [object, callback];
+            let weakref = pon_call(weakref_ref_type(), args.as_mut_ptr(), args.len());
+            assert!(!weakref.is_null());
+            assert_eq!((*object.cast::<PyHeapInstance>()).weakrefs, weakref);
+            assert_eq!(pon_call(weakref, ptr::null_mut(), 0), object);
+
+            collect().expect("collection should complete");
+            assert_eq!(DEL_CALLS.load(Ordering::SeqCst), 1);
+            assert_eq!(WEAKREF_CALLBACKS.load(Ordering::SeqCst), 1);
+            assert_eq!(pon_call(weakref, ptr::null_mut(), 0), pon_none());
+
+            collect().expect("second collection should complete");
+            assert_eq!(DEL_CALLS.load(Ordering::SeqCst), 1);
+            assert_eq!(WEAKREF_CALLBACKS.load(Ordering::SeqCst), 1);
+        }
+    }
 }

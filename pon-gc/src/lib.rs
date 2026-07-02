@@ -684,6 +684,7 @@ impl HeapState {
         let old_allocations = std::mem::take(&mut self.allocations);
         let old_mark_states = std::mem::take(&mut self.mark_states);
         let mut survivors = Vec::with_capacity(old_allocations.len());
+        let mut unreachable = Vec::new();
 
         self.spans.clear();
         self.large_fallbacks.clear();
@@ -694,21 +695,28 @@ impl HeapState {
                 .is_some_and(|mark_state| mark_state.is_reached())
             {
                 survivors.push(allocation);
-                continue;
+            } else {
+                unreachable.push(allocation);
             }
+        }
 
+        for allocation in &unreachable {
             if let Some(finalize) = self
                 .types
                 .get(&allocation.type_id)
                 .and_then(|info| info.finalize)
             {
-                // SAFETY: The object is unreachable and still allocated; this
-                // is the single finalizer call before freeing the allocation.
+                // SAFETY: The object is unreachable and still allocated.  All
+                // unreachable allocation storage remains live until the
+                // deallocation pass below, so finalizers may safely inspect
+                // other unreachable objects they still reference.
                 unsafe {
                     finalize(allocation.start.as_ptr());
                 }
             }
+        }
 
+        for allocation in unreachable {
             // SAFETY: Every allocation record was created from `alloc_zeroed`
             // with the same layout and has not yet been deallocated.
             unsafe {

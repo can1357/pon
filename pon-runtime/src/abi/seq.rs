@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 
 use pon_gc::{GcTypeInfo, TypeId};
 
+use crate::abstract_op::{self, RICH_EQ, RICH_GE, RICH_GT, RICH_LE, RICH_LT, RICH_NE};
 use crate::feedback::FeedbackCell;
 use crate::object::{PyLong, PyMappingMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType, PyUnicode, as_object_ptr, is_exact_type};
 use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set};
@@ -45,7 +46,7 @@ fn list_type() -> *mut PyType {
         let sequence = Box::leak(Box::new(PySequenceMethods {
             sq_length: Some(list_len_slot),
             sq_concat: None,
-            sq_repeat: None,
+            sq_repeat: Some(list_repeat_slot),
             sq_item: Some(list_item_slot),
             sq_ass_item: Some(list_ass_item_slot),
             sq_contains: Some(list_contains_slot),
@@ -60,6 +61,7 @@ fn list_type() -> *mut PyType {
             mp_ass_subscript: Some(list_ass_subscript_slot),
         }));
         let mut ty = PyType::new(ptr::null(), "list", mem::size_of::<PyList>());
+        ty.tp_richcmp = Some(list_richcmp_slot);
         ty.tp_as_sequence = sequence;
         ty.tp_as_mapping = mapping;
         ty.tp_getattro = Some(list_getattro_slot);
@@ -74,7 +76,7 @@ fn tuple_type() -> *mut PyType {
         let sequence = Box::leak(Box::new(PySequenceMethods {
             sq_length: Some(tuple_len_slot),
             sq_concat: Some(tuple_concat_slot),
-            sq_repeat: None,
+            sq_repeat: Some(tuple_repeat_slot),
             sq_item: Some(tuple_item_slot),
             sq_ass_item: None,
             sq_contains: Some(tuple_contains_slot),
@@ -90,6 +92,7 @@ fn tuple_type() -> *mut PyType {
         }));
         let mut ty = PyType::new(ptr::null(), "tuple", mem::size_of::<PyTuple>());
         ty.tp_hash = Some(tuple_hash_slot);
+        ty.tp_richcmp = Some(tuple_richcmp_slot);
         ty.tp_as_sequence = sequence;
         ty.tp_as_mapping = mapping;
         ty.tp_getattro = Some(tuple_getattro_slot);
@@ -383,6 +386,27 @@ fn object_type_name(object: *mut PyObject) -> String {
         }
     }
 }
+fn is_sequence_index_error(message: &str) -> bool {
+    message == "sequence index out of range"
+}
+
+fn return_null_with_sequence_error(message: String) -> *mut PyObject {
+    if is_sequence_index_error(&message) {
+        super::exc::raise_index_error_text(&message)
+    } else {
+        return_null_with_error(message)
+    }
+}
+
+fn return_minus_one_with_sequence_error(message: String) -> c_int {
+    if is_sequence_index_error(&message) {
+        super::exc::raise_index_error_text(&message);
+        -1
+    } else {
+        return_minus_one_with_error(message)
+    }
+}
+
 
 fn is_none(object: *mut PyObject) -> bool {
     with_runtime(|runtime| unsafe { is_exact_type(object, runtime.none_type) }).unwrap_or(false)
@@ -391,7 +415,70 @@ fn is_none(object: *mut PyObject) -> bool {
 fn none_object() -> Result<*mut PyObject, String> {
     with_runtime(|runtime| as_object_ptr(runtime.none)).ok_or_else(|| "runtime is not initialized".to_owned())
 }
+unsafe extern "C" fn list_richcmp_slot(left: *mut PyObject, right: *mut PyObject, op: c_int) -> *mut PyObject {
+    unsafe { sequence_richcmp(left, right, op, false) }
+}
 
+unsafe extern "C" fn tuple_richcmp_slot(left: *mut PyObject, right: *mut PyObject, op: c_int) -> *mut PyObject {
+    unsafe { sequence_richcmp(left, right, op, true) }
+}
+
+unsafe fn sequence_richcmp(left: *mut PyObject, right: *mut PyObject, op: c_int, tuple_kind: bool) -> *mut PyObject {
+    let same_kind = if tuple_kind { is_tuple(right) } else { is_list(right) };
+    if !same_kind {
+        return unsafe { super::pon_not_implemented() };
+    }
+
+    let Ok(op) = u8::try_from(op) else {
+        return return_null_with_error("unknown rich comparison operation");
+    };
+    if !matches!(op, RICH_LT | RICH_LE | RICH_EQ | RICH_NE | RICH_GT | RICH_GE) {
+        return return_null_with_error("unknown rich comparison operation");
+    }
+
+    let left_items = if tuple_kind {
+        unsafe { (&*left.cast::<PyTuple>()).as_slice() }
+    } else {
+        unsafe { (&*left.cast::<PyList>()).as_slice() }
+    };
+    let right_items = if tuple_kind {
+        unsafe { (&*right.cast::<PyTuple>()).as_slice() }
+    } else {
+        unsafe { (&*right.cast::<PyList>()).as_slice() }
+    };
+
+    for index in 0..left_items.len().min(right_items.len()) {
+        let equal = unsafe { abstract_op::rich_compare(RICH_EQ, left_items[index], right_items[index]) };
+        if equal.is_null() {
+            return ptr::null_mut();
+        }
+        let truth = unsafe { abstract_op::is_true(equal) };
+        if truth < 0 {
+            return ptr::null_mut();
+        }
+        if truth == 0 {
+            return match op {
+                RICH_EQ => unsafe { super::number::pon_const_bool(0) },
+                RICH_NE => unsafe { super::number::pon_const_bool(1) },
+                RICH_LT | RICH_LE | RICH_GT | RICH_GE => unsafe {
+                    abstract_op::rich_compare(op, left_items[index], right_items[index])
+                },
+                _ => unreachable!(),
+            };
+        }
+    }
+
+    let result = match op {
+        RICH_EQ => left_items.len() == right_items.len(),
+        RICH_NE => left_items.len() != right_items.len(),
+        RICH_LT => left_items.len() < right_items.len(),
+        RICH_LE => left_items.len() <= right_items.len(),
+        RICH_GT => left_items.len() > right_items.len(),
+        RICH_GE => left_items.len() >= right_items.len(),
+        _ => unreachable!(),
+    };
+    unsafe { super::number::pon_const_bool(i32::from(result)) }
+}
 fn long_value(object: *mut PyObject) -> Result<i64, String> {
     if object.is_null() {
         return Err("integer operand is NULL".to_owned());
@@ -1344,6 +1431,64 @@ unsafe extern "C" fn tuple_concat_slot(left: *mut PyObject, right: *mut PyObject
     crate::native::builtins_mod::alloc_tuple(values)
 }
 
+unsafe extern "C" fn list_repeat_slot(object: *mut PyObject, count: *mut PyObject) -> *mut PyObject {
+    if !is_list(object) {
+        return return_null_with_error("can only repeat list");
+    }
+    let count = match repeat_count_value(count) {
+        Ok(count) => count,
+        Err(message) => return return_null_with_error(message),
+    };
+    let items = unsafe { (&*object.cast::<PyList>()).as_slice() };
+    let values = match repeated_values(items, count) {
+        Ok(values) => values,
+        Err(message) => return return_null_with_error(message),
+    };
+    match with_runtime(|runtime| alloc_list_from_slice(runtime, &values)) {
+        Some(Ok(object)) => object,
+        Some(Err(message)) => return_null_with_error(message),
+        None => return_null_with_error("runtime is not initialized"),
+    }
+}
+
+unsafe extern "C" fn tuple_repeat_slot(object: *mut PyObject, count: *mut PyObject) -> *mut PyObject {
+    if !is_tuple(object) {
+        return return_null_with_error("can only repeat tuple");
+    }
+    let count = match repeat_count_value(count) {
+        Ok(count) => count,
+        Err(message) => return return_null_with_error(message),
+    };
+    let items = unsafe { (&*object.cast::<PyTuple>()).as_slice() };
+    let values = match repeated_values(items, count) {
+        Ok(values) => values,
+        Err(message) => return return_null_with_error(message),
+    };
+    crate::native::builtins_mod::alloc_tuple(values)
+}
+
+fn repeat_count_value(count: *mut PyObject) -> Result<usize, String> {
+    let index = unsafe { super::number::pon_index(count) };
+    if index.is_null() {
+        return Err("repeat count must be an integer".to_owned());
+    }
+    let count = long_value(index)?;
+    if count <= 0 {
+        Ok(0)
+    } else {
+        usize::try_from(count).map_err(|_| "repeat count is out of range".to_owned())
+    }
+}
+
+fn repeated_values(items: &[*mut PyObject], count: usize) -> Result<Vec<*mut PyObject>, String> {
+    let total = items.len().checked_mul(count).ok_or_else(|| "repeated sequence is too large".to_owned())?;
+    let mut out = Vec::with_capacity(total);
+    for _ in 0..count {
+        out.extend_from_slice(items);
+    }
+    Ok(out)
+}
+
 unsafe extern "C" fn list_getattro_slot(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
     let name = match attr_name(name) {
         Ok(name) => name,
@@ -1419,35 +1564,35 @@ unsafe extern "C" fn seq_iter_next_slot(object: *mut PyObject) -> *mut PyObject 
 unsafe extern "C" fn list_ass_item_slot(object: *mut PyObject, index: isize, value: *mut PyObject) -> c_int {
     match list_set_index_raw(object, index, value) {
         Ok(()) => 0,
-        Err(message) => return_minus_one_with_error(message),
+        Err(message) => return_minus_one_with_sequence_error(message),
     }
 }
 
 unsafe extern "C" fn list_subscript_slot(object: *mut PyObject, key: *mut PyObject) -> *mut PyObject {
     match list_subscript_raw(object, key) {
         Ok(value) => value,
-        Err(message) => return_null_with_error(message),
+        Err(message) => return_null_with_sequence_error(message),
     }
 }
 
 unsafe extern "C" fn tuple_subscript_slot(object: *mut PyObject, key: *mut PyObject) -> *mut PyObject {
     match tuple_subscript_raw(object, key) {
         Ok(value) => value,
-        Err(message) => return_null_with_error(message),
+        Err(message) => return_null_with_sequence_error(message),
     }
 }
 
 unsafe extern "C" fn range_subscript_slot(object: *mut PyObject, key: *mut PyObject) -> *mut PyObject {
     match range_subscript_raw(object, key) {
         Ok(value) => value,
-        Err(message) => return_null_with_error(message),
+        Err(message) => return_null_with_sequence_error(message),
     }
 }
 
 unsafe extern "C" fn list_ass_subscript_slot(object: *mut PyObject, key: *mut PyObject, value: *mut PyObject) -> c_int {
     match list_ass_subscript_raw(object, key, value) {
         Ok(()) => 0,
-        Err(message) => return_minus_one_with_error(message),
+        Err(message) => return_minus_one_with_sequence_error(message),
     }
 }
 
@@ -1618,12 +1763,12 @@ pub unsafe extern "C" fn pon_seq_get_item(object: *mut PyObject, index_or_slice:
         if is_slice(index_or_slice) {
             match sequence_slice_raw(object, index_or_slice) {
                 Ok(value) => value,
-                Err(message) => return_null_with_error(message),
+                Err(message) => return_null_with_sequence_error(message),
             }
         } else {
             match sequence_item_raw(object, match index_value(index_or_slice) { Ok(index) => index, Err(message) => return return_null_with_error(message) }) {
                 Ok(value) => value,
-                Err(message) => return_null_with_error(message),
+                Err(message) => return_null_with_sequence_error(message),
             }
         }
     })
@@ -1635,7 +1780,7 @@ pub unsafe extern "C" fn pon_seq_set_item(object: *mut PyObject, index_or_slice:
     crate::untag_prelude!(err = -1; object, index_or_slice, value);
     catch_status_helper(|| match list_ass_subscript_raw(object, index_or_slice, value) {
         Ok(()) => 0,
-        Err(message) => return_minus_one_with_error(message),
+        Err(message) => return_minus_one_with_sequence_error(message),
     })
 }
 

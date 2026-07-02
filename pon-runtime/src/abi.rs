@@ -49,10 +49,10 @@ use crate::builtins as runtime_builtins;
 use crate::intern::resolve;
 use crate::feedback::{FeedbackCell, FeedbackVec, GlobalIC, TypeTag};
 use crate::object::{
-    PyCodeFn, PyFunction, PyLong, PyNone, PyObject, PyObjectHeader, PyType, PyUnicode, TIER_STATE_DEFERRED,
+    NewFunc, PyCodeFn, PyFunction, PyLong, PyNone, PyObject, PyObjectHeader, PyType, PyUnicode, TIER_STATE_DEFERRED,
     TIER_STATE_DISABLED, TIER_STATE_QUEUED, TIER_STATE_TIER0, TIER_STATE_TIER1, as_object_ptr, is_exact_type,
 };
-use crate::types::{bool_, float, function, int, type_};
+use crate::types::{bool_, bytearray_, bytes_, classmethod, complex_, float, function, int, memoryview, type_};
 use crate::types::exc::{ExceptionTypeSet, PyBaseException, is_exception_subclass, trace_base_exception, trace_exception_group};
 use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set, thread_state_lock};
 
@@ -148,9 +148,10 @@ const TYPE_ID_LONG: TypeId = TypeId(2);
 const TYPE_ID_UNICODE: TypeId = TypeId(3);
 const TYPE_ID_FUNCTION: TypeId = TypeId(4);
 const TYPE_ID_NONE: TypeId = TypeId(5);
-const TYPE_ID_NOT_IMPLEMENTED: TypeId = TypeId(7);
 const TYPE_ID_EXCEPTION: TypeId = TypeId(6);
-pub(crate) const TYPE_ID_EXCEPTION_GROUP: TypeId = TypeId(8);
+const TYPE_ID_NOT_IMPLEMENTED: TypeId = TypeId(7);
+const TYPE_ID_EXCEPTION_GROUP: TypeId = TypeId(8);
+const TYPE_ID_ELLIPSIS: TypeId = TypeId(9);
 
 /// Compiled function metadata shared across Phase-B call, frame, and tier-up helpers.
 ///
@@ -1468,10 +1469,12 @@ struct Runtime {
     function_type: *mut PyType,
     none_type: *mut PyType,
     not_implemented_type: *mut PyType,
+    ellipsis_type: *mut PyType,
     exception_types: ExceptionTypeSet,
     none: *mut PyNone,
     not_implemented: *mut PyNone,
     globals: HashMap<u32, *mut PyObject>,
+    ellipsis: *mut PyNone,
     class_namespace_stack: Vec<*mut type_::PyClassDict>,
 }
 
@@ -1546,6 +1549,7 @@ fn init_runtime() -> Result<(), String> {
             let mut function_type = Box::new(PyType::new(type_type, "function", mem::size_of::<PyFunction>()));
             function_type.tp_descr_get = Some(function::function_descr_get);
             function_type.tp_getattro = Some(function::function_getattro);
+            unsafe { function::install_function_type_attrs(function_type.as_mut(), type_type) };
             let function_type = Box::into_raw(function_type);
             let none_type = Box::into_raw(Box::new(PyType::new(type_type, "NoneType", mem::size_of::<PyNone>())));
             let not_implemented_type = Box::into_raw(Box::new(PyType::new(
@@ -1553,6 +1557,7 @@ fn init_runtime() -> Result<(), String> {
                 "NotImplementedType",
                 mem::size_of::<PyNone>(),
             )));
+            let ellipsis_type = Box::into_raw(Box::new(PyType::new(type_type, "ellipsis", mem::size_of::<PyNone>())));
             let exception_types = ExceptionTypeSet::new(type_type);
 
             // SAFETY: The leaked type object remains valid for the process lifetime.
@@ -1580,6 +1585,17 @@ fn init_runtime() -> Result<(), String> {
                     },
                 );
             }
+            let ellipsis = heap.alloc(mem::size_of::<PyNone>(), TYPE_ID_ELLIPSIS).cast::<PyNone>();
+            // SAFETY: `ellipsis` points to a freshly allocated zeroed block of the right size.
+            unsafe {
+                ptr::write(
+                    ellipsis,
+                    PyNone {
+                        ob_base: PyObjectHeader::new(ellipsis_type),
+                    },
+                );
+            }
+
 
 
             let mut runtime = Runtime {
@@ -1590,9 +1606,11 @@ fn init_runtime() -> Result<(), String> {
                 function_type,
                 none_type,
                 not_implemented_type,
+                ellipsis_type,
                 exception_types,
                 none,
                 not_implemented,
+                ellipsis,
                 globals: HashMap::new(),
                 class_namespace_stack: Vec::new(),
             };
@@ -1652,6 +1670,14 @@ fn register_gc_types(heap: &Heap) {
     );
     heap.register_type(
         TYPE_ID_NOT_IMPLEMENTED,
+        GcTypeInfo {
+            size: mem::size_of::<PyNone>(),
+            trace: trace_no_refs,
+            finalize: None,
+        },
+    );
+    heap.register_type(
+        TYPE_ID_ELLIPSIS,
         GcTypeInfo {
             size: mem::size_of::<PyNone>(),
             trace: trace_no_refs,
@@ -1738,9 +1764,13 @@ fn register_builtins(runtime: &mut Runtime) -> Result<(), String> {
             runtime.globals.insert(name, function);
         }
     });
+    register_builtin_type_globals(runtime);
     runtime
         .globals
         .insert(crate::intern::intern("NotImplemented"), as_object_ptr(runtime.not_implemented));
+    runtime
+        .globals
+        .insert(crate::intern::intern("Ellipsis"), as_object_ptr(runtime.ellipsis));
     register_exception_builtins(runtime);
     if runtime.globals.contains_key(&runtime_builtins::print_name_interned()) && runtime.globals.contains_key(&crate::intern::intern("ValueError")) {
         Ok(())
@@ -1756,6 +1786,249 @@ fn register_exception_builtins(runtime: &mut Runtime) {
         }
         let name = unsafe { (*ty).name() };
         runtime.globals.insert(crate::intern::intern(name), ty.cast::<PyObject>());
+    }
+    for (alias, ty) in [
+        ("EnvironmentError", runtime.exception_types.os_error),
+        ("IOError", runtime.exception_types.os_error),
+    ] {
+        runtime.globals.insert(crate::intern::intern(alias), ty.cast::<PyObject>());
+    }
+}
+
+fn register_builtin_type_globals(runtime: &mut Runtime) {
+    let Some(object_type) = crate::native::builtins_mod::builtin_native_type("object") else {
+        return;
+    };
+    unsafe {
+        install_builtin_type(runtime, "object", object_type, Some(builtin_object_new), object_type);
+        install_builtin_type(runtime, "type", runtime._type_type, Some(builtin_type_new), object_type);
+        install_builtin_type(runtime, "int", runtime.long_type, Some(builtin_int_new), object_type);
+        install_builtin_type(runtime, "str", runtime.unicode_type, Some(builtin_str_new), object_type);
+
+        let bool_type = (*bool_::from_bool(false)).ob_type.cast_mut();
+        install_builtin_type(runtime, "bool", bool_type, Some(builtin_bool_new), object_type);
+
+        let float_sample = float::from_f64(0.0);
+        let float_type = (*float_sample).ob_type.cast_mut();
+        install_builtin_type(runtime, "float", float_type, Some(builtin_float_new), object_type);
+
+        let complex_sample = complex_::from_f64s(0.0, 0.0);
+        let complex_type = (*complex_sample).ob_type.cast_mut();
+        install_builtin_type(runtime, "complex", complex_type, Some(builtin_complex_new), object_type);
+
+        install_builtin_type(runtime, "bytes", bytes_::bytes_type(), Some(builtin_bytes_new), object_type);
+        install_builtin_type(runtime, "bytearray", bytearray_::bytearray_type(), Some(builtin_bytearray_new), object_type);
+        install_builtin_type(runtime, "memoryview", memoryview::memoryview_type(), Some(builtin_memoryview_new), object_type);
+        install_builtin_type(
+            runtime,
+            "classmethod",
+            classmethod_builtin_type(),
+            Some(builtin_classmethod_new),
+            object_type,
+        );
+        install_builtin_type(
+            runtime,
+            "staticmethod",
+            staticmethod_builtin_type(),
+            Some(builtin_staticmethod_new),
+            object_type,
+        );
+
+        for (name, constructor) in [
+            ("list", builtin_list_new as NewFunc),
+            ("tuple", builtin_tuple_new as NewFunc),
+            ("dict", builtin_dict_new as NewFunc),
+            ("set", builtin_set_new as NewFunc),
+            ("range", builtin_range_new as NewFunc),
+            ("enumerate", builtin_enumerate_new as NewFunc),
+            ("zip", builtin_zip_new as NewFunc),
+            ("map", builtin_map_new as NewFunc),
+            ("filter", builtin_filter_new as NewFunc),
+            ("property", builtin_property_new as NewFunc),
+            ("super", builtin_super_new as NewFunc),
+        ] {
+            if let Some(ty) = crate::native::builtins_mod::builtin_native_type(name) {
+                install_builtin_type(runtime, name, ty, Some(constructor), object_type);
+            }
+        }
+    }
+}
+
+unsafe fn install_builtin_type(
+    runtime: &mut Runtime,
+    name: &'static str,
+    ty: *mut PyType,
+    constructor: Option<NewFunc>,
+    object_type: *mut PyType,
+) {
+    if ty.is_null() {
+        return;
+    }
+    unsafe {
+        (*ty).ob_base.ob_type = runtime._type_type;
+        if ty != object_type && (*ty).tp_base.is_null() {
+            (*ty).tp_base = object_type;
+        }
+        if let Some(constructor) = constructor {
+            (*ty).tp_new = Some(constructor);
+        }
+        runtime.globals.insert(crate::intern::intern(name), ty.cast::<PyObject>());
+    }
+}
+
+type BuiltinConstructor = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
+
+unsafe fn call_builtin_type_constructor(
+    args: *mut PyObject,
+    kwargs: *mut PyObject,
+    constructor: BuiltinConstructor,
+) -> *mut PyObject {
+    if !kwargs.is_null() {
+        return return_null_with_error("builtin type keyword arguments are not supported yet");
+    }
+    let mut positional = match unsafe { type_::positional_args_from_object(args) } {
+        Ok(positional) => positional,
+        Err(message) => return return_null_with_error(message),
+    };
+    unsafe {
+        constructor(
+            if positional.is_empty() { ptr::null_mut() } else { positional.as_mut_ptr() },
+            positional.len(),
+        )
+    }
+}
+
+fn classmethod_builtin_type() -> *mut PyType {
+    static TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut ty = PyType::new(ptr::null(), "classmethod", mem::size_of::<classmethod::PyClassMethod>());
+        classmethod::install_classmethod_slots(&mut ty);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *TYPE as *mut PyType
+}
+
+fn staticmethod_builtin_type() -> *mut PyType {
+    static TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut ty = PyType::new(ptr::null(), "staticmethod", mem::size_of::<classmethod::PyStaticMethod>());
+        classmethod::install_staticmethod_slots(&mut ty);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *TYPE as *mut PyType
+}
+
+unsafe fn exact_one_descriptor_arg(
+    args: *mut PyObject,
+    kwargs: *mut PyObject,
+    name: &str,
+) -> Result<*mut PyObject, *mut PyObject> {
+    if !kwargs.is_null() {
+        return Err(return_null_with_error(format!("{name} keyword arguments are not supported yet")));
+    }
+    let positional = match unsafe { type_::positional_args_from_object(args) } {
+        Ok(positional) => positional,
+        Err(message) => return Err(return_null_with_error(message)),
+    };
+    if positional.len() != 1 {
+        return Err(return_null_with_error(format!("{name} expected 1 argument, got {}", positional.len())));
+    }
+    Ok(positional[0])
+}
+
+unsafe extern "C" fn builtin_type_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_type) }
+}
+
+unsafe extern "C" fn builtin_object_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_object) }
+}
+
+unsafe extern "C" fn builtin_int_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_int) }
+}
+
+unsafe extern "C" fn builtin_str_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_str) }
+}
+
+unsafe extern "C" fn builtin_bool_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_bool) }
+}
+
+unsafe extern "C" fn builtin_float_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_float) }
+}
+
+unsafe extern "C" fn builtin_complex_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_complex) }
+}
+
+unsafe extern "C" fn builtin_bytes_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_bytes) }
+}
+
+unsafe extern "C" fn builtin_bytearray_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_bytearray) }
+}
+
+unsafe extern "C" fn builtin_memoryview_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_memoryview) }
+}
+
+unsafe extern "C" fn builtin_list_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_list) }
+}
+
+unsafe extern "C" fn builtin_tuple_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_tuple) }
+}
+
+unsafe extern "C" fn builtin_dict_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_dict) }
+}
+
+unsafe extern "C" fn builtin_set_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_set) }
+}
+
+unsafe extern "C" fn builtin_range_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_range) }
+}
+
+unsafe extern "C" fn builtin_enumerate_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_enumerate) }
+}
+
+unsafe extern "C" fn builtin_zip_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_zip) }
+}
+
+unsafe extern "C" fn builtin_map_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_map) }
+}
+
+unsafe extern "C" fn builtin_filter_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_filter) }
+}
+
+unsafe extern "C" fn builtin_property_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_property) }
+}
+
+unsafe extern "C" fn builtin_super_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_super) }
+}
+
+unsafe extern "C" fn builtin_classmethod_new(cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    match unsafe { exact_one_descriptor_arg(args, kwargs, "classmethod()") } {
+        Ok(callable) => unsafe { classmethod::new_classmethod(cls, callable) },
+        Err(error) => error,
+    }
+}
+
+unsafe extern "C" fn builtin_staticmethod_new(cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    match unsafe { exact_one_descriptor_arg(args, kwargs, "staticmethod()") } {
+        Ok(callable) => unsafe { classmethod::new_staticmethod(cls, callable) },
+        Err(error) => error,
     }
 }
 
@@ -3056,6 +3329,9 @@ pub fn format_object_for_print(value: *mut PyObject) -> Result<String, String> {
             if is_exact_type(value, runtime.not_implemented_type) {
                 return Ok("NotImplemented".to_owned());
             }
+            if is_exact_type(value, runtime.ellipsis_type) {
+                return Ok("Ellipsis".to_owned());
+            }
             Ok(crate::native::builtins_mod::str_text(value))
         }
     })
@@ -3100,10 +3376,12 @@ pub fn collect() -> Result<(), String> {
     let Some(runtime) = slot.as_mut() else {
         return Err("runtime is not initialized".to_owned());
     };
+    let heap = (&runtime.heap) as *const Heap;
 
-    let mut roots = Vec::with_capacity(runtime.globals.len() + 3);
+    let mut roots = Vec::with_capacity(runtime.globals.len() + 4);
     roots.push(runtime.none.cast::<u8>());
     roots.push(runtime.not_implemented.cast::<u8>());
+    roots.push(runtime.ellipsis.cast::<u8>());
     for value in runtime.globals.values().copied() {
         roots.push(value.cast::<u8>());
     }
@@ -3159,10 +3437,26 @@ pub fn collect() -> Result<(), String> {
             roots.push(value.cast::<u8>());
         }
     }
+    let current_function = current_function_object();
+    if !current_function.is_null() {
+        roots.push(current_function.cast::<u8>());
+    }
+    for (function, self_arg) in current_call_snapshots() {
+        if !function.is_null() {
+            roots.push(function.cast::<u8>());
+        }
+        if !self_arg.is_null() {
+            roots.push(self_arg.cast::<u8>());
+        }
+    }
     extend_tierup_roots(&mut roots);
 
     let mut roots = LocalRoots { roots };
-    runtime.heap.collect(&mut roots);
+    drop(slot);
+    // SAFETY: `heap` points into the process-lifetime runtime slot.  The slot
+    // is not cleared after initialization; dropping the runtime mutex here lets
+    // object finalizers call back into ABI helpers without deadlocking.
+    unsafe { (&*heap).collect(&mut roots) };
     Ok(())
 }
 

@@ -17,6 +17,7 @@ use crate::object::PyObject;
 
 pub(crate) use crate::import::install_module;
 
+mod gc;
 mod io;
 mod os;
 mod sys;
@@ -31,7 +32,9 @@ mod weakref;
 pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>)] = &[
     ("_io", io::make_module),
     ("_thread", thread::make_module),
+    ("_weakref", weakref::make_underscore_module),
     ("builtins", builtins_mod::make_module),
+    ("gc", gc::make_module),
     ("os", os::make_module),
     ("sys", sys::make_module),
     ("time", time::make_module),

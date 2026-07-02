@@ -91,6 +91,56 @@ unsafe fn class_dict_to_dict(class_dict: *mut PyClassDict) -> *mut PyObject {
     out
 }
 
+unsafe fn synthetic_builtin_descriptor() -> *mut PyObject {
+    unsafe { abi::pon_load_global(intern::intern("len"), ptr::null_mut()) }
+}
+
+unsafe fn set_str_key(dict: *mut PyObject, name: &str, value: *mut PyObject) -> bool {
+    if dict.is_null() || value.is_null() {
+        return false;
+    }
+    let key = unsafe { abi::pon_const_str(name.as_ptr(), name.len()) };
+    if key.is_null() {
+        return false;
+    }
+    unsafe { abi::map::pon_dict_set_item_status(dict, key, value) >= 0 }
+}
+
+unsafe fn type_dict_object(ty: *mut PyType) -> *mut PyObject {
+    if ty.is_null() {
+        return ptr::null_mut();
+    }
+    let dict = unsafe { (*ty).tp_dict.cast::<PyClassDict>() };
+    let out = if dict.is_null() {
+        unsafe { abi::map::pon_build_map(ptr::null_mut(), 0) }
+    } else {
+        unsafe { class_dict_to_dict(dict) }
+    };
+    if out.is_null() {
+        return out;
+    }
+    if unsafe { (*ty).name() } == "dict" {
+        let fromkeys = unsafe { synthetic_builtin_descriptor() };
+        if unsafe { !set_str_key(out, "fromkeys", fromkeys) } {
+            return ptr::null_mut();
+        }
+    }
+    out
+}
+
+unsafe fn synthetic_type_attr(ty: *mut PyType, name_id: u32) -> *mut PyObject {
+    if ty.is_null() {
+        return ptr::null_mut();
+    }
+    let type_name = unsafe { (*ty).name() };
+    let is_known_descriptor = (type_name == "object" && name_id == intern::intern("__init__"))
+        || (type_name == "str" && name_id == intern::intern("join"));
+    if is_known_descriptor {
+        return unsafe { synthetic_builtin_descriptor() };
+    }
+    ptr::null_mut()
+}
+
 unsafe fn set_instance_dict(object: *mut PyObject, value: *mut PyObject) -> c_int {
     let instance = object.cast::<PyHeapInstance>();
     if unsafe { (*instance).dict.is_null() } {
@@ -355,6 +405,15 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
     if is_type && name_id == intern::intern("__name__") {
         let type_name = unsafe { (*object.cast::<PyType>()).name() };
         return unsafe { abi::pon_const_str(type_name.as_ptr(), type_name.len()) };
+    }
+    if is_type && name_id == intern::intern("__dict__") {
+        return unsafe { type_dict_object(object.cast::<PyType>()) };
+    }
+    if is_type {
+        let value = unsafe { synthetic_type_attr(object.cast::<PyType>(), name_id) };
+        if !value.is_null() {
+            return value;
+        }
     }
     if is_type && name_id == intern::intern("__annotate__") {
         // PEP 649: `__annotate__` is an own-dict-only class attribute — never

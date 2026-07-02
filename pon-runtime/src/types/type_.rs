@@ -123,7 +123,7 @@ pub struct ClassKeyword {
 }
 
 /// GC type id for Python heap instances allocated by [`type_new`].
-pub const TYPE_ID_HEAP_INSTANCE: TypeId = TypeId(7);
+pub const TYPE_ID_HEAP_INSTANCE: TypeId = TypeId(10);
 
 fn raise_object(message: impl Into<String>) -> *mut PyObject {
     pon_err_set(message);
@@ -278,7 +278,8 @@ unsafe fn select_metaclass(bases: &[*mut PyType], explicit: *mut PyObject) -> Op
     } else if unsafe { is_type_object(explicit) } {
         explicit.cast::<PyType>()
     } else {
-        pon_err_set("metaclass must be a type");
+        let message = "metaclass must be a type";
+        unsafe { abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
         return None;
     };
 
@@ -298,7 +299,8 @@ unsafe fn select_metaclass(bases: &[*mut PyType], explicit: *mut PyObject) -> Op
             winner = base_meta;
             continue;
         }
-        pon_err_set("metaclass conflict: the metaclass of a derived class must be a (non-strict) subclass of the metaclasses of all its bases");
+        let message = "metaclass conflict: the metaclass of a derived class must be a (non-strict) subclass of the metaclasses of all its bases";
+        unsafe { abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
         return None;
     }
     Some(winner)
@@ -365,12 +367,14 @@ unsafe fn validate_slot_layout(namespace: &PyClassDict, bases: &[*mut PyType], s
     for slot in &spec.names {
         if namespace.get(*slot).is_some() {
             let spelling = intern::resolve(*slot).unwrap_or_else(|| format!("<interned:{slot}>"));
-            pon_err_set(format!("'{spelling}' in __slots__ conflicts with class variable"));
+            let message = format!("'{spelling}' in __slots__ conflicts with class variable");
+            unsafe { abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
             return false;
         }
     }
     if spec.declared && spec.wants_dict && bases.iter().any(|base| unsafe { !base.is_null() && (**base).tp_dictoffset != 0 }) {
-        pon_err_set("__dict__ slot disallowed: we already got one");
+        let message = "__dict__ slot disallowed: we already got one";
+        unsafe { abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
         return false;
     }
     let slotted_bases = bases
@@ -379,7 +383,8 @@ unsafe fn validate_slot_layout(namespace: &PyClassDict, bases: &[*mut PyType], s
         .filter(|base| unsafe { own_slot_count(*base) != 0 })
         .count();
     if slotted_bases > 1 {
-        pon_err_set("multiple bases have instance lay-out conflict");
+        let message = "multiple bases have instance lay-out conflict";
+        unsafe { abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
         return false;
     }
     true

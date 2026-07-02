@@ -73,23 +73,72 @@ pub const EXC_GROUP_METHOD_DERIVE: u8 = 2;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExceptionKind {
     BaseException,
+    BaseExceptionGroup,
+    GeneratorExit,
+    KeyboardInterrupt,
+    SystemExit,
     Exception,
-    ImportError,
+    ArithmeticError,
+    FloatingPointError,
+    OverflowError,
+    ZeroDivisionError,
+    AssertionError,
+    AttributeError,
+    BufferError,
     EOFError,
-    TypeError,
-    ValueError,
-    KeyError,
+    ImportError,
+    ModuleNotFoundError,
+    LookupError,
     IndexError,
+    KeyError,
+    MemoryError,
     NameError,
     UnboundLocalError,
-    NotImplementedError,
-    AttributeError,
-    StopIteration,
-    GeneratorExit,
-    RuntimeError,
     OSError,
-    AssertionError,
-    BaseExceptionGroup,
+    BlockingIOError,
+    ChildProcessError,
+    ConnectionError,
+    BrokenPipeError,
+    ConnectionAbortedError,
+    ConnectionRefusedError,
+    ConnectionResetError,
+    FileExistsError,
+    FileNotFoundError,
+    InterruptedError,
+    IsADirectoryError,
+    NotADirectoryError,
+    PermissionError,
+    ProcessLookupError,
+    TimeoutError,
+    ReferenceError,
+    RuntimeError,
+    NotImplementedError,
+    PythonFinalizationError,
+    RecursionError,
+    StopAsyncIteration,
+    StopIteration,
+    SyntaxError,
+    IndentationError,
+    TabError,
+    SystemError,
+    TypeError,
+    ValueError,
+    UnicodeError,
+    UnicodeDecodeError,
+    UnicodeEncodeError,
+    UnicodeTranslateError,
+    Warning,
+    BytesWarning,
+    DeprecationWarning,
+    EncodingWarning,
+    FutureWarning,
+    ImportWarning,
+    PendingDeprecationWarning,
+    ResourceWarning,
+    RuntimeWarning,
+    SyntaxWarning,
+    UnicodeWarning,
+    UserWarning,
     ExceptionGroup,
 }
 
@@ -97,23 +146,72 @@ pub enum ExceptionKind {
 #[derive(Clone, Copy, Debug)]
 pub struct ExceptionTypeSet {
     pub base_exception: *mut PyType,
+    pub base_exception_group: *mut PyType,
+    pub generator_exit: *mut PyType,
+    pub keyboard_interrupt: *mut PyType,
+    pub system_exit: *mut PyType,
     pub exception: *mut PyType,
-    pub import_error: *mut PyType,
-    pub eof_error: *mut PyType,
-    pub type_error: *mut PyType,
-    pub value_error: *mut PyType,
-    pub key_error: *mut PyType,
-    pub index_error: *mut PyType,
+    pub arithmetic_error: *mut PyType,
+    pub floating_point_error: *mut PyType,
+    pub overflow_error: *mut PyType,
+    pub zero_division_error: *mut PyType,
+    pub assertion_error: *mut PyType,
     pub attribute_error: *mut PyType,
+    pub buffer_error: *mut PyType,
+    pub eof_error: *mut PyType,
+    pub import_error: *mut PyType,
+    pub module_not_found_error: *mut PyType,
+    pub lookup_error: *mut PyType,
+    pub index_error: *mut PyType,
+    pub key_error: *mut PyType,
+    pub memory_error: *mut PyType,
     pub name_error: *mut PyType,
     pub unbound_local_error: *mut PyType,
-    pub not_implemented_error: *mut PyType,
-    pub stop_iteration: *mut PyType,
-    pub generator_exit: *mut PyType,
-    pub runtime_error: *mut PyType,
     pub os_error: *mut PyType,
-    pub assertion_error: *mut PyType,
-    pub base_exception_group: *mut PyType,
+    pub blocking_io_error: *mut PyType,
+    pub child_process_error: *mut PyType,
+    pub connection_error: *mut PyType,
+    pub broken_pipe_error: *mut PyType,
+    pub connection_aborted_error: *mut PyType,
+    pub connection_refused_error: *mut PyType,
+    pub connection_reset_error: *mut PyType,
+    pub file_exists_error: *mut PyType,
+    pub file_not_found_error: *mut PyType,
+    pub interrupted_error: *mut PyType,
+    pub is_a_directory_error: *mut PyType,
+    pub not_a_directory_error: *mut PyType,
+    pub permission_error: *mut PyType,
+    pub process_lookup_error: *mut PyType,
+    pub timeout_error: *mut PyType,
+    pub reference_error: *mut PyType,
+    pub runtime_error: *mut PyType,
+    pub not_implemented_error: *mut PyType,
+    pub python_finalization_error: *mut PyType,
+    pub recursion_error: *mut PyType,
+    pub stop_async_iteration: *mut PyType,
+    pub stop_iteration: *mut PyType,
+    pub syntax_error: *mut PyType,
+    pub indentation_error: *mut PyType,
+    pub tab_error: *mut PyType,
+    pub system_error: *mut PyType,
+    pub type_error: *mut PyType,
+    pub value_error: *mut PyType,
+    pub unicode_error: *mut PyType,
+    pub unicode_decode_error: *mut PyType,
+    pub unicode_encode_error: *mut PyType,
+    pub unicode_translate_error: *mut PyType,
+    pub warning: *mut PyType,
+    pub bytes_warning: *mut PyType,
+    pub deprecation_warning: *mut PyType,
+    pub encoding_warning: *mut PyType,
+    pub future_warning: *mut PyType,
+    pub import_warning: *mut PyType,
+    pub pending_deprecation_warning: *mut PyType,
+    pub resource_warning: *mut PyType,
+    pub runtime_warning: *mut PyType,
+    pub syntax_warning: *mut PyType,
+    pub unicode_warning: *mut PyType,
+    pub user_warning: *mut PyType,
     pub exception_group: *mut PyType,
 }
 
@@ -122,44 +220,142 @@ impl ExceptionTypeSet {
     #[must_use]
     pub fn new(type_type: *mut PyType) -> Self {
         let base_exception = new_exception_type(type_type, "BaseException", ptr::null_mut());
+        let base_exception_group = new_exception_group_type(type_type, "BaseExceptionGroup", base_exception);
+        let generator_exit = new_exception_type(type_type, "GeneratorExit", base_exception);
+        let keyboard_interrupt = new_exception_type(type_type, "KeyboardInterrupt", base_exception);
+        let system_exit = new_exception_type(type_type, "SystemExit", base_exception);
         let exception = new_exception_type(type_type, "Exception", base_exception);
-        let import_error = new_exception_type(type_type, "ImportError", exception);
-        let eof_error = new_exception_type(type_type, "EOFError", exception);
-        let type_error = new_exception_type(type_type, "TypeError", exception);
-        let value_error = new_exception_type(type_type, "ValueError", exception);
-        let key_error = new_exception_type(type_type, "KeyError", exception);
-        let index_error = new_exception_type(type_type, "IndexError", exception);
+        let arithmetic_error = new_exception_type(type_type, "ArithmeticError", exception);
+        let floating_point_error = new_exception_type(type_type, "FloatingPointError", arithmetic_error);
+        let overflow_error = new_exception_type(type_type, "OverflowError", arithmetic_error);
+        let zero_division_error = new_exception_type(type_type, "ZeroDivisionError", arithmetic_error);
+        let assertion_error = new_exception_type(type_type, "AssertionError", exception);
         let attribute_error = new_exception_type(type_type, "AttributeError", exception);
+        let buffer_error = new_exception_type(type_type, "BufferError", exception);
+        let eof_error = new_exception_type(type_type, "EOFError", exception);
+        let import_error = new_exception_type(type_type, "ImportError", exception);
+        let module_not_found_error = new_exception_type(type_type, "ModuleNotFoundError", import_error);
+        let lookup_error = new_exception_type(type_type, "LookupError", exception);
+        let index_error = new_exception_type(type_type, "IndexError", lookup_error);
+        let key_error = new_exception_type(type_type, "KeyError", lookup_error);
+        let memory_error = new_exception_type(type_type, "MemoryError", exception);
         let name_error = new_exception_type(type_type, "NameError", exception);
         let unbound_local_error = new_exception_type(type_type, "UnboundLocalError", name_error);
+        let os_error = new_exception_type(type_type, "OSError", exception);
+        let blocking_io_error = new_exception_type(type_type, "BlockingIOError", os_error);
+        let child_process_error = new_exception_type(type_type, "ChildProcessError", os_error);
+        let connection_error = new_exception_type(type_type, "ConnectionError", os_error);
+        let broken_pipe_error = new_exception_type(type_type, "BrokenPipeError", connection_error);
+        let connection_aborted_error = new_exception_type(type_type, "ConnectionAbortedError", connection_error);
+        let connection_refused_error = new_exception_type(type_type, "ConnectionRefusedError", connection_error);
+        let connection_reset_error = new_exception_type(type_type, "ConnectionResetError", connection_error);
+        let file_exists_error = new_exception_type(type_type, "FileExistsError", os_error);
+        let file_not_found_error = new_exception_type(type_type, "FileNotFoundError", os_error);
+        let interrupted_error = new_exception_type(type_type, "InterruptedError", os_error);
+        let is_a_directory_error = new_exception_type(type_type, "IsADirectoryError", os_error);
+        let not_a_directory_error = new_exception_type(type_type, "NotADirectoryError", os_error);
+        let permission_error = new_exception_type(type_type, "PermissionError", os_error);
+        let process_lookup_error = new_exception_type(type_type, "ProcessLookupError", os_error);
+        let timeout_error = new_exception_type(type_type, "TimeoutError", os_error);
+        let reference_error = new_exception_type(type_type, "ReferenceError", exception);
         let runtime_error = new_exception_type(type_type, "RuntimeError", exception);
         let not_implemented_error = new_exception_type(type_type, "NotImplementedError", runtime_error);
+        let python_finalization_error = new_exception_type(type_type, "PythonFinalizationError", runtime_error);
+        let recursion_error = new_exception_type(type_type, "RecursionError", runtime_error);
+        let stop_async_iteration = new_exception_type(type_type, "StopAsyncIteration", exception);
         let stop_iteration = new_exception_type(type_type, "StopIteration", exception);
-        let generator_exit = new_exception_type(type_type, "GeneratorExit", base_exception);
-        let os_error = new_exception_type(type_type, "OSError", exception);
-        let assertion_error = new_exception_type(type_type, "AssertionError", exception);
-        let base_exception_group = new_exception_group_type(type_type, "BaseExceptionGroup", base_exception);
+        let syntax_error = new_exception_type(type_type, "SyntaxError", exception);
+        let indentation_error = new_exception_type(type_type, "IndentationError", syntax_error);
+        let tab_error = new_exception_type(type_type, "TabError", indentation_error);
+        let system_error = new_exception_type(type_type, "SystemError", exception);
+        let type_error = new_exception_type(type_type, "TypeError", exception);
+        let value_error = new_exception_type(type_type, "ValueError", exception);
+        let unicode_error = new_exception_type(type_type, "UnicodeError", value_error);
+        let unicode_decode_error = new_exception_type(type_type, "UnicodeDecodeError", unicode_error);
+        let unicode_encode_error = new_exception_type(type_type, "UnicodeEncodeError", unicode_error);
+        let unicode_translate_error = new_exception_type(type_type, "UnicodeTranslateError", unicode_error);
+        let warning = new_exception_type(type_type, "Warning", exception);
+        let bytes_warning = new_exception_type(type_type, "BytesWarning", warning);
+        let deprecation_warning = new_exception_type(type_type, "DeprecationWarning", warning);
+        let encoding_warning = new_exception_type(type_type, "EncodingWarning", warning);
+        let future_warning = new_exception_type(type_type, "FutureWarning", warning);
+        let import_warning = new_exception_type(type_type, "ImportWarning", warning);
+        let pending_deprecation_warning = new_exception_type(type_type, "PendingDeprecationWarning", warning);
+        let resource_warning = new_exception_type(type_type, "ResourceWarning", warning);
+        let runtime_warning = new_exception_type(type_type, "RuntimeWarning", warning);
+        let syntax_warning = new_exception_type(type_type, "SyntaxWarning", warning);
+        let unicode_warning = new_exception_type(type_type, "UnicodeWarning", warning);
+        let user_warning = new_exception_type(type_type, "UserWarning", warning);
         let exception_group = new_exception_group_type(type_type, "ExceptionGroup", base_exception_group);
 
         Self {
             base_exception,
+            base_exception_group,
+            generator_exit,
+            keyboard_interrupt,
+            system_exit,
             exception,
-            import_error,
-            eof_error,
-            type_error,
-            value_error,
-            key_error,
-            index_error,
+            arithmetic_error,
+            floating_point_error,
+            overflow_error,
+            zero_division_error,
+            assertion_error,
             attribute_error,
+            buffer_error,
+            eof_error,
+            import_error,
+            module_not_found_error,
+            lookup_error,
+            index_error,
+            key_error,
+            memory_error,
             name_error,
             unbound_local_error,
-            not_implemented_error,
-            stop_iteration,
-            generator_exit,
-            runtime_error,
             os_error,
-            assertion_error,
-            base_exception_group,
+            blocking_io_error,
+            child_process_error,
+            connection_error,
+            broken_pipe_error,
+            connection_aborted_error,
+            connection_refused_error,
+            connection_reset_error,
+            file_exists_error,
+            file_not_found_error,
+            interrupted_error,
+            is_a_directory_error,
+            not_a_directory_error,
+            permission_error,
+            process_lookup_error,
+            timeout_error,
+            reference_error,
+            runtime_error,
+            not_implemented_error,
+            python_finalization_error,
+            recursion_error,
+            stop_async_iteration,
+            stop_iteration,
+            syntax_error,
+            indentation_error,
+            tab_error,
+            system_error,
+            type_error,
+            value_error,
+            unicode_error,
+            unicode_decode_error,
+            unicode_encode_error,
+            unicode_translate_error,
+            warning,
+            bytes_warning,
+            deprecation_warning,
+            encoding_warning,
+            future_warning,
+            import_warning,
+            pending_deprecation_warning,
+            resource_warning,
+            runtime_warning,
+            syntax_warning,
+            unicode_warning,
+            user_warning,
             exception_group,
         }
     }
@@ -169,49 +365,147 @@ impl ExceptionTypeSet {
     pub fn get(self, kind: ExceptionKind) -> *mut PyType {
         match kind {
             ExceptionKind::BaseException => self.base_exception,
+            ExceptionKind::BaseExceptionGroup => self.base_exception_group,
+            ExceptionKind::GeneratorExit => self.generator_exit,
+            ExceptionKind::KeyboardInterrupt => self.keyboard_interrupt,
+            ExceptionKind::SystemExit => self.system_exit,
             ExceptionKind::Exception => self.exception,
-            ExceptionKind::ImportError => self.import_error,
-            ExceptionKind::EOFError => self.eof_error,
-            ExceptionKind::TypeError => self.type_error,
-            ExceptionKind::ValueError => self.value_error,
-            ExceptionKind::KeyError => self.key_error,
-            ExceptionKind::IndexError => self.index_error,
+            ExceptionKind::ArithmeticError => self.arithmetic_error,
+            ExceptionKind::FloatingPointError => self.floating_point_error,
+            ExceptionKind::OverflowError => self.overflow_error,
+            ExceptionKind::ZeroDivisionError => self.zero_division_error,
+            ExceptionKind::AssertionError => self.assertion_error,
             ExceptionKind::AttributeError => self.attribute_error,
+            ExceptionKind::BufferError => self.buffer_error,
+            ExceptionKind::EOFError => self.eof_error,
+            ExceptionKind::ImportError => self.import_error,
+            ExceptionKind::ModuleNotFoundError => self.module_not_found_error,
+            ExceptionKind::LookupError => self.lookup_error,
+            ExceptionKind::IndexError => self.index_error,
+            ExceptionKind::KeyError => self.key_error,
+            ExceptionKind::MemoryError => self.memory_error,
             ExceptionKind::NameError => self.name_error,
             ExceptionKind::UnboundLocalError => self.unbound_local_error,
-            ExceptionKind::NotImplementedError => self.not_implemented_error,
-            ExceptionKind::StopIteration => self.stop_iteration,
-            ExceptionKind::GeneratorExit => self.generator_exit,
-            ExceptionKind::RuntimeError => self.runtime_error,
             ExceptionKind::OSError => self.os_error,
-            ExceptionKind::AssertionError => self.assertion_error,
-            ExceptionKind::BaseExceptionGroup => self.base_exception_group,
+            ExceptionKind::BlockingIOError => self.blocking_io_error,
+            ExceptionKind::ChildProcessError => self.child_process_error,
+            ExceptionKind::ConnectionError => self.connection_error,
+            ExceptionKind::BrokenPipeError => self.broken_pipe_error,
+            ExceptionKind::ConnectionAbortedError => self.connection_aborted_error,
+            ExceptionKind::ConnectionRefusedError => self.connection_refused_error,
+            ExceptionKind::ConnectionResetError => self.connection_reset_error,
+            ExceptionKind::FileExistsError => self.file_exists_error,
+            ExceptionKind::FileNotFoundError => self.file_not_found_error,
+            ExceptionKind::InterruptedError => self.interrupted_error,
+            ExceptionKind::IsADirectoryError => self.is_a_directory_error,
+            ExceptionKind::NotADirectoryError => self.not_a_directory_error,
+            ExceptionKind::PermissionError => self.permission_error,
+            ExceptionKind::ProcessLookupError => self.process_lookup_error,
+            ExceptionKind::TimeoutError => self.timeout_error,
+            ExceptionKind::ReferenceError => self.reference_error,
+            ExceptionKind::RuntimeError => self.runtime_error,
+            ExceptionKind::NotImplementedError => self.not_implemented_error,
+            ExceptionKind::PythonFinalizationError => self.python_finalization_error,
+            ExceptionKind::RecursionError => self.recursion_error,
+            ExceptionKind::StopAsyncIteration => self.stop_async_iteration,
+            ExceptionKind::StopIteration => self.stop_iteration,
+            ExceptionKind::SyntaxError => self.syntax_error,
+            ExceptionKind::IndentationError => self.indentation_error,
+            ExceptionKind::TabError => self.tab_error,
+            ExceptionKind::SystemError => self.system_error,
+            ExceptionKind::TypeError => self.type_error,
+            ExceptionKind::ValueError => self.value_error,
+            ExceptionKind::UnicodeError => self.unicode_error,
+            ExceptionKind::UnicodeDecodeError => self.unicode_decode_error,
+            ExceptionKind::UnicodeEncodeError => self.unicode_encode_error,
+            ExceptionKind::UnicodeTranslateError => self.unicode_translate_error,
+            ExceptionKind::Warning => self.warning,
+            ExceptionKind::BytesWarning => self.bytes_warning,
+            ExceptionKind::DeprecationWarning => self.deprecation_warning,
+            ExceptionKind::EncodingWarning => self.encoding_warning,
+            ExceptionKind::FutureWarning => self.future_warning,
+            ExceptionKind::ImportWarning => self.import_warning,
+            ExceptionKind::PendingDeprecationWarning => self.pending_deprecation_warning,
+            ExceptionKind::ResourceWarning => self.resource_warning,
+            ExceptionKind::RuntimeWarning => self.runtime_warning,
+            ExceptionKind::SyntaxWarning => self.syntax_warning,
+            ExceptionKind::UnicodeWarning => self.unicode_warning,
+            ExceptionKind::UserWarning => self.user_warning,
             ExceptionKind::ExceptionGroup => self.exception_group,
         }
     }
 
     /// Returns every core builtin exception type required by B05-EXC-CORE and wave-2 compat.
     #[must_use]
-    pub fn core_types(self) -> [(ExceptionKind, *mut PyType); 19] {
+    pub fn core_types(self) -> [(ExceptionKind, *mut PyType); 68] {
         [
             (ExceptionKind::BaseException, self.base_exception),
+            (ExceptionKind::BaseExceptionGroup, self.base_exception_group),
+            (ExceptionKind::GeneratorExit, self.generator_exit),
+            (ExceptionKind::KeyboardInterrupt, self.keyboard_interrupt),
+            (ExceptionKind::SystemExit, self.system_exit),
             (ExceptionKind::Exception, self.exception),
-            (ExceptionKind::ImportError, self.import_error),
-            (ExceptionKind::EOFError, self.eof_error),
-            (ExceptionKind::TypeError, self.type_error),
-            (ExceptionKind::ValueError, self.value_error),
-            (ExceptionKind::KeyError, self.key_error),
-            (ExceptionKind::IndexError, self.index_error),
+            (ExceptionKind::ArithmeticError, self.arithmetic_error),
+            (ExceptionKind::FloatingPointError, self.floating_point_error),
+            (ExceptionKind::OverflowError, self.overflow_error),
+            (ExceptionKind::ZeroDivisionError, self.zero_division_error),
+            (ExceptionKind::AssertionError, self.assertion_error),
             (ExceptionKind::AttributeError, self.attribute_error),
+            (ExceptionKind::BufferError, self.buffer_error),
+            (ExceptionKind::EOFError, self.eof_error),
+            (ExceptionKind::ImportError, self.import_error),
+            (ExceptionKind::ModuleNotFoundError, self.module_not_found_error),
+            (ExceptionKind::LookupError, self.lookup_error),
+            (ExceptionKind::IndexError, self.index_error),
+            (ExceptionKind::KeyError, self.key_error),
+            (ExceptionKind::MemoryError, self.memory_error),
             (ExceptionKind::NameError, self.name_error),
             (ExceptionKind::UnboundLocalError, self.unbound_local_error),
-            (ExceptionKind::NotImplementedError, self.not_implemented_error),
-            (ExceptionKind::StopIteration, self.stop_iteration),
-            (ExceptionKind::GeneratorExit, self.generator_exit),
-            (ExceptionKind::RuntimeError, self.runtime_error),
             (ExceptionKind::OSError, self.os_error),
-            (ExceptionKind::AssertionError, self.assertion_error),
-            (ExceptionKind::BaseExceptionGroup, self.base_exception_group),
+            (ExceptionKind::BlockingIOError, self.blocking_io_error),
+            (ExceptionKind::ChildProcessError, self.child_process_error),
+            (ExceptionKind::ConnectionError, self.connection_error),
+            (ExceptionKind::BrokenPipeError, self.broken_pipe_error),
+            (ExceptionKind::ConnectionAbortedError, self.connection_aborted_error),
+            (ExceptionKind::ConnectionRefusedError, self.connection_refused_error),
+            (ExceptionKind::ConnectionResetError, self.connection_reset_error),
+            (ExceptionKind::FileExistsError, self.file_exists_error),
+            (ExceptionKind::FileNotFoundError, self.file_not_found_error),
+            (ExceptionKind::InterruptedError, self.interrupted_error),
+            (ExceptionKind::IsADirectoryError, self.is_a_directory_error),
+            (ExceptionKind::NotADirectoryError, self.not_a_directory_error),
+            (ExceptionKind::PermissionError, self.permission_error),
+            (ExceptionKind::ProcessLookupError, self.process_lookup_error),
+            (ExceptionKind::TimeoutError, self.timeout_error),
+            (ExceptionKind::ReferenceError, self.reference_error),
+            (ExceptionKind::RuntimeError, self.runtime_error),
+            (ExceptionKind::NotImplementedError, self.not_implemented_error),
+            (ExceptionKind::PythonFinalizationError, self.python_finalization_error),
+            (ExceptionKind::RecursionError, self.recursion_error),
+            (ExceptionKind::StopAsyncIteration, self.stop_async_iteration),
+            (ExceptionKind::StopIteration, self.stop_iteration),
+            (ExceptionKind::SyntaxError, self.syntax_error),
+            (ExceptionKind::IndentationError, self.indentation_error),
+            (ExceptionKind::TabError, self.tab_error),
+            (ExceptionKind::SystemError, self.system_error),
+            (ExceptionKind::TypeError, self.type_error),
+            (ExceptionKind::ValueError, self.value_error),
+            (ExceptionKind::UnicodeError, self.unicode_error),
+            (ExceptionKind::UnicodeDecodeError, self.unicode_decode_error),
+            (ExceptionKind::UnicodeEncodeError, self.unicode_encode_error),
+            (ExceptionKind::UnicodeTranslateError, self.unicode_translate_error),
+            (ExceptionKind::Warning, self.warning),
+            (ExceptionKind::BytesWarning, self.bytes_warning),
+            (ExceptionKind::DeprecationWarning, self.deprecation_warning),
+            (ExceptionKind::EncodingWarning, self.encoding_warning),
+            (ExceptionKind::FutureWarning, self.future_warning),
+            (ExceptionKind::ImportWarning, self.import_warning),
+            (ExceptionKind::PendingDeprecationWarning, self.pending_deprecation_warning),
+            (ExceptionKind::ResourceWarning, self.resource_warning),
+            (ExceptionKind::RuntimeWarning, self.runtime_warning),
+            (ExceptionKind::SyntaxWarning, self.syntax_warning),
+            (ExceptionKind::UnicodeWarning, self.unicode_warning),
+            (ExceptionKind::UserWarning, self.user_warning),
             (ExceptionKind::ExceptionGroup, self.exception_group),
         ]
     }
