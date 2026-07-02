@@ -15,6 +15,9 @@ use crate::types::{bytearray_, bytes_};
 
 pub const READONLY_WRITE_ERROR: &str = "cannot modify read-only memory";
 
+/// CPython's diagnostic for any operation on a released view.
+pub const RELEASED_ERROR: &str = "operation forbidden on released memoryview object";
+
 /// Boxed Python `memoryview` over a contiguous byte window.
 #[repr(C)]
 #[derive(Debug)]
@@ -32,6 +35,9 @@ pub struct PyMemoryView {
     /// Element format code: `b'B'` for plain byte views, `b'I'` after
     /// `cast('I')`.  Only codes accepted by [`item_width`] are stored.
     pub format: u8,
+    /// Whether `release()` (or `__exit__`) ran; every subsequent buffer
+    /// operation raises `ValueError` with [`RELEASED_ERROR`].
+    pub released: bool,
 }
 
 impl PyMemoryView {
@@ -97,6 +103,7 @@ pub fn boxed_memoryview_from_raw(base: *mut PyObject, data: *mut u8, len: usize,
         len,
         readonly,
         format,
+        released: false,
     }))
 }
 
@@ -117,6 +124,9 @@ pub unsafe fn boxed_memoryview_from_object(object: *mut PyObject) -> Result<*mut
     }
     if is_memoryview_type(ty) {
         let view = unsafe { &*object.cast::<PyMemoryView>() };
+        if view.released {
+            return Err(RELEASED_ERROR.to_owned());
+        }
         return Ok(boxed_memoryview_from_raw(view.base, view.data, view.len, view.readonly, view.format));
     }
     Err("memoryview() argument must be a bytes-like object".to_owned())
