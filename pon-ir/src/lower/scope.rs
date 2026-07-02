@@ -697,22 +697,8 @@ fn scan_expr(expr: &Expr, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
                 scan_expr(&keyword.value, scope)?;
             }
         }
-        Expr::FString(expr) => {
-            for element in expr.value.elements() {
-                if let ruff_python_ast::InterpolatedStringElement::Interpolation(interpolation) = element
-                {
-                    scan_expr(&interpolation.expression, scope)?;
-                }
-            }
-        }
-        Expr::TString(expr) => {
-            for element in expr.value.elements() {
-                if let ruff_python_ast::InterpolatedStringElement::Interpolation(interpolation) = element
-                {
-                    scan_expr(&interpolation.expression, scope)?;
-                }
-            }
-        }
+        Expr::FString(expr) => scan_interpolated_elements(expr.value.elements(), scope)?,
+        Expr::TString(expr) => scan_interpolated_elements(expr.value.elements(), scope)?,
         Expr::Attribute(expr) => scan_expr(&expr.value, scope)?,
         Expr::Subscript(expr) => {
             scan_expr(&expr.value, scope)?;
@@ -747,6 +733,21 @@ fn scan_expr(expr: &Expr, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
         | Expr::NoneLiteral(_)
         | Expr::EllipsisLiteral(_)
         | Expr::IpyEscapeCommand(_) => {}
+    }
+    Ok(())
+}
+
+fn scan_interpolated_elements<'a>(
+    elements: impl IntoIterator<Item = &'a ruff_python_ast::InterpolatedStringElement>,
+    scope: &mut ScopeBuilder,
+) -> Result<(), LowerError> {
+    for element in elements {
+        if let ruff_python_ast::InterpolatedStringElement::Interpolation(interpolation) = element {
+            scan_expr(&interpolation.expression, scope)?;
+            if let Some(format_spec) = interpolation.format_spec.as_deref() {
+                scan_interpolated_elements(format_spec.elements.iter(), scope)?;
+            }
+        }
     }
     Ok(())
 }

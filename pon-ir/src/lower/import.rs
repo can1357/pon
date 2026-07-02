@@ -155,6 +155,7 @@ pub(crate) fn is_known_builtin_name(name: &str) -> bool {
             | "max"
             | "min"
             | "next"
+            | "NotImplemented"
             | "object"
             | "pow"
             | "print"

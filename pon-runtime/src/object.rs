@@ -831,6 +831,14 @@ pub struct PyFunction {
     pub feedback: UnsafeCell<Option<FeedbackVec>>,
     /// Opaque tier-1 code owner installed by the tier-up backend.
     pub tier1: UnsafeCell<Option<Tier1Code>>,
+    /// OSR entry for `osr_loop_header`, or NULL while no OSR body is installed.
+    pub osr_entry: AtomicPtr<u8>,
+    /// IR BlockId.0 the installed OSR entry targets.
+    pub osr_loop_header: AtomicU32,
+    /// Fast-path-to-cold-twin transfers observed in the current tier-1 epoch.
+    pub deopt_count: AtomicU32,
+    /// Completed tier-1 epochs that later thrashed and reset to tier-0.
+    pub tier_epoch: AtomicU8,
 }
 
 impl core::fmt::Debug for PyFunction {
@@ -844,6 +852,10 @@ impl core::fmt::Debug for PyFunction {
             .field("hotness", &self.hotness.load(core::sync::atomic::Ordering::Relaxed))
             .field("loop_hotness", &self.loop_hotness.load(core::sync::atomic::Ordering::Relaxed))
             .field("tier_state", &self.tier_state.load(core::sync::atomic::Ordering::Relaxed))
+            .field("osr_entry", &self.osr_entry.load(core::sync::atomic::Ordering::Relaxed))
+            .field("osr_loop_header", &self.osr_loop_header.load(core::sync::atomic::Ordering::Relaxed))
+            .field("deopt_count", &self.deopt_count.load(core::sync::atomic::Ordering::Relaxed))
+            .field("tier_epoch", &self.tier_epoch.load(core::sync::atomic::Ordering::Relaxed))
             .field("annotations", &self.annotations)
             .finish_non_exhaustive()
     }
@@ -865,6 +877,10 @@ impl PyFunction {
             annotations: ptr::null_mut(),
             feedback: UnsafeCell::new(None),
             tier1: UnsafeCell::new(None),
+            osr_entry: AtomicPtr::new(ptr::null_mut()),
+            osr_loop_header: AtomicU32::new(0),
+            deopt_count: AtomicU32::new(0),
+            tier_epoch: AtomicU8::new(0),
         }
     }
 }

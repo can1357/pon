@@ -466,8 +466,18 @@ pub enum InstKind {
     PopExcInfo,
     /// Test whether the active exception matches an exception type.
     MatchExc { exc_type: ValueId },
-    /// Split an exception group for `except*` handling.
+    /// Legacy representative `except*` split; retained until helper-table consumers migrate.
     CheckExcStar { exc_types: ValueId },
+    /// Enter an `except*` dispatcher for the pending exception.
+    ExcStarEnter,
+    /// Split the active `except*` remainder against one clause type expression.
+    ExcStarMatch { exc_types: ValueId },
+    /// Mark the current `except*` clause body as completed without raising.
+    ExcStarBodyOk,
+    /// Mark the current `except*` clause body as having raised.
+    ExcStarBodyRaised,
+    /// Finish an `except*` dispatcher, installing any remainder/raised group.
+    ExcStarFinish,
     /// Load the current active exception object.
     GetCurrentExc,
     /// Build an exception group from exception values.
@@ -748,6 +758,8 @@ pub enum TStrPart {
     Interp {
         /// Value to interpolate.
         value: ValueId,
+        /// Source spelling of the interpolation expression for PEP 750 metadata.
+        expression: String,
         /// Conversion byte such as `b's'`, `b'r'`, or zero for no conversion.
         conversion: u8,
         /// Optional pre-lowered format-spec value.

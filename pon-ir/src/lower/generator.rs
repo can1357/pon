@@ -614,7 +614,9 @@ fn rewrite_operands(kind: &mut InstKind, f: &mut impl FnMut(&mut Value)) {
             }
         }
         InstKind::MatchExc { exc_type } => f(exc_type),
-        InstKind::CheckExcStar { exc_types } => f(exc_types),
+        InstKind::CheckExcStar { exc_types } | InstKind::ExcStarMatch { exc_types } => f(exc_types),
+        InstKind::ExcStarEnter | InstKind::ExcStarBodyOk | InstKind::ExcStarBodyRaised |
+        InstKind::ExcStarFinish => {}
         InstKind::BuildExcGroup { excs } => {
             for exc in excs {
                 f(exc);

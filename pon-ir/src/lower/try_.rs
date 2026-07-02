@@ -105,21 +105,42 @@ fn lower_finally(
     }
 }
 
+fn store_handler_name_value(
+    driver: &mut LoweringDriver,
+    scope: &mut BodyScope,
+    name: &ruff_python_ast::Identifier,
+    value: Value,
+) -> Result<(), LowerError> {
+    let raw_name = name.as_str();
+    if scope.is_global_name(raw_name) {
+        let name_id = driver.names.intern(raw_name)?;
+        scope.emit(InstKind::StoreGlobal(name_id, value))?;
+    } else if let Some(slot) = scope.local_slot(raw_name) {
+        scope.emit(InstKind::StoreLocal(slot, value))?;
+    } else {
+        let name_id = driver.names.intern(raw_name)?;
+        scope.emit(InstKind::StoreName(name_id, value))?;
+    }
+    Ok(())
+}
+
 fn bind_handler_name(
     driver: &mut LoweringDriver,
     scope: &mut BodyScope,
     name: &ruff_python_ast::Identifier,
 ) -> Result<(), LowerError> {
     let current = scope.emit(InstKind::GetCurrentExc)?;
-    let raw_name = name.as_str();
-    if scope.is_global_name(raw_name) {
-        let name_id = driver.names.intern(raw_name)?;
-        scope.emit(InstKind::StoreGlobal(name_id, current))?;
-    } else if let Some(slot) = scope.local_slot(raw_name) {
-        scope.emit(InstKind::StoreLocal(slot, current))?;
-    } else {
-        let name_id = driver.names.intern(raw_name)?;
-        scope.emit(InstKind::StoreName(name_id, current))?;
+    store_handler_name_value(driver, scope, name, current)
+}
+
+fn clear_handler_name(
+    driver: &mut LoweringDriver,
+    scope: &mut BodyScope,
+    name: Option<&ruff_python_ast::Identifier>,
+) -> Result<(), LowerError> {
+    if let Some(name) = name {
+        let none = scope.emit(InstKind::Const(PyConst::None))?;
+        store_handler_name_value(driver, scope, name, none)?;
     }
     Ok(())
 }
@@ -144,12 +165,139 @@ fn lower_handler_header(
     Ok(())
 }
 
+fn lower_exc_star_clause(
+    driver: &mut LoweringDriver,
+    scope: &mut BodyScope,
+    handler: &ruff_python_ast::ExceptHandlerExceptHandler,
+    next_head: BlockId,
+) -> Result<(), LowerError> {
+    let Some(type_) = handler.type_.as_deref() else {
+        return Err(LowerError::parse("expected one or more exception types after except*"));
+    };
+
+    let body_block = scope.alloc_block()?;
+    let raised_block = scope.alloc_block()?;
+    let exc_types = driver.lower_expr(scope, type_)?;
+    let matched = scope.emit(InstKind::ExcStarMatch { exc_types })?;
+    let cond = scope.emit(InstKind::BoolTest { val: matched })?;
+    scope.set_term(Terminator::CondBranch {
+        cond,
+        then_: body_block,
+        else_: next_head,
+    })?;
+
+    scope.switch_to(body_block)?;
+    if let Some(name) = handler.name.as_ref() {
+        bind_handler_name(driver, scope, name)?;
+    }
+    let saved_exc = scope.emit(InstKind::GetCurrentExc)?;
+    let saved_slot = scope.alloc_temp_local();
+    scope.emit(InstKind::StoreLocal(saved_slot, saved_exc))?;
+    scope.emit(InstKind::PushExcInfo {
+        target: raised_block,
+        stack_depth: 0,
+        kind: 1,
+    })?;
+    let previous_reraise = scope.reraise_exc;
+    scope.reraise_exc = Some(saved_slot);
+    let body_start = scope.blocks.len();
+    lower_stmt_list_preserving_term(driver, scope, &handler.body)?;
+    redirect_raise_terms(scope, body_start, raised_block);
+    scope.reraise_exc = previous_reraise;
+
+    match scope.term.take() {
+        Some(Terminator::Jump(target)) if target == raised_block => {}
+        Some(term) => {
+            scope.emit(InstKind::PopExcInfo)?;
+            clear_handler_name(driver, scope, handler.name.as_ref())?;
+            scope.emit(InstKind::ExcStarBodyOk)?;
+            scope.set_term(term)?;
+        }
+        None => {
+            scope.emit(InstKind::PopExcInfo)?;
+            clear_handler_name(driver, scope, handler.name.as_ref())?;
+            scope.emit(InstKind::ExcStarBodyOk)?;
+            scope.set_term(Terminator::Jump(next_head))?;
+        }
+    }
+
+    scope.switch_to(raised_block)?;
+    scope.emit(InstKind::PopExcInfo)?;
+    clear_handler_name(driver, scope, handler.name.as_ref())?;
+    scope.emit(InstKind::ExcStarBodyRaised)?;
+    scope.set_term(Terminator::Jump(next_head))?;
+    scope.switch_to(next_head)?;
+    Ok(())
+}
+
+fn lower_exc_star_handlers(
+    driver: &mut LoweringDriver,
+    scope: &mut BodyScope,
+    stmt: &ruff_python_ast::StmtTry,
+    finish_block: BlockId,
+) -> Result<(), LowerError> {
+    for handler in &stmt.handlers {
+        let ruff_python_ast::ExceptHandler::ExceptHandler(handler) = handler;
+        let next_head = scope.alloc_block()?;
+        lower_exc_star_clause(driver, scope, handler, next_head)?;
+    }
+    scope.set_term(Terminator::Jump(finish_block))?;
+    Ok(())
+}
+
+fn lower_try_star(
+    driver: &mut LoweringDriver,
+    scope: &mut BodyScope,
+    stmt: &ruff_python_ast::StmtTry,
+) -> Result<(), LowerError> {
+    let dispatch_block = scope.alloc_block()?;
+    let finish_block = scope.alloc_block()?;
+    let done_block = scope.alloc_block()?;
+    scope.emit(InstKind::PushExcInfo {
+        target: dispatch_block,
+        stack_depth: 0,
+        kind: 1,
+    })?;
+    let protected_start = scope.blocks.len();
+    lower_stmt_list_preserving_term(driver, scope, &stmt.body)?;
+
+    let redirected = redirect_raise_terms(scope, protected_start, dispatch_block);
+    if !redirected && scope.term.is_some() {
+        let body_term = scope.term.take();
+        scope.emit(InstKind::PopExcInfo)?;
+        return lower_finally(driver, scope, &stmt.finalbody, body_term);
+    }
+
+    if scope.term.is_none() {
+        scope.emit(InstKind::PopExcInfo)?;
+        let normal_term = lower_stmt_list(driver, scope, &stmt.orelse)?;
+        lower_finally(driver, scope, &stmt.finalbody, normal_term)?;
+        scope.jump_if_open(done_block)?;
+    }
+
+    scope.switch_to(dispatch_block)?;
+    scope.emit(InstKind::PopExcInfo)?;
+    scope.emit(InstKind::ExcStarEnter)?;
+    lower_exc_star_handlers(driver, scope, stmt, finish_block)?;
+
+    scope.switch_to(finish_block)?;
+    scope.emit(InstKind::ExcStarFinish)?;
+    lower_finally(driver, scope, &stmt.finalbody, None)?;
+    scope.jump_if_open(done_block)?;
+    scope.switch_to(done_block)?;
+    Ok(())
+}
+
 
 pub(super) fn lower_try(
     driver: &mut LoweringDriver,
     scope: &mut BodyScope,
     stmt: &ruff_python_ast::StmtTry,
 ) -> Result<(), LowerError> {
+    if stmt.is_star {
+        return lower_try_star(driver, scope, stmt);
+    }
+
     if stmt.handlers.is_empty() {
         if stmt.finalbody.is_empty() {
             let body_term = lower_stmt_list(driver, scope, &stmt.body)?;

@@ -40,11 +40,15 @@ fn lower_f_string_parts<'a>(
                 });
             }
             InterpolatedStringElement::Interpolation(interpolation) => {
-                if interpolation.debug_text.is_some() {
-                    return unsupported_at(
-                        "debug f-string interpolation",
-                        span_bounds(interpolation.range.start().to_u32(), interpolation.range.end().to_u32()),
-                    );
+                let expression = interpolation_expression_text(driver, &interpolation.expression);
+                if let Some(debug) = &interpolation.debug_text {
+                    let debug_literal = format!("{}{}{}=", debug.leading, expression, debug.trailing);
+                    let value = scope.emit(InstKind::Const(PyConst::Str(debug_literal)))?;
+                    parts.push(FStrPart::Interp {
+                        value,
+                        conversion: 0,
+                        format_spec: None,
+                    });
                 }
                 let value = driver.lower_expr(scope, &interpolation.expression)?;
                 let format_spec = interpolation
@@ -54,9 +58,16 @@ fn lower_f_string_parts<'a>(
                     .transpose()?
                     .map(|parts| scope.emit(InstKind::BuildString { parts }))
                     .transpose()?;
+                let conversion = interpolation.conversion.to_byte().unwrap_or_else(|| {
+                    if interpolation.debug_text.is_some() && format_spec.is_none() {
+                        b'r'
+                    } else {
+                        0
+                    }
+                });
                 parts.push(FStrPart::Interp {
                     value,
-                    conversion: interpolation.conversion.to_byte().unwrap_or(0),
+                    conversion,
                     format_spec,
                 });
             }
@@ -77,16 +88,22 @@ fn lower_t_string_parts<'a>(
                 let value = scope.emit(InstKind::Const(PyConst::Str(literal.value.to_string())))?;
                 parts.push(TStrPart::Interp {
                     value,
+                    expression: String::new(),
                     conversion: TEMPLATE_LITERAL_CONVERSION,
                     format_spec: None,
                 });
             }
             InterpolatedStringElement::Interpolation(interpolation) => {
-                if interpolation.debug_text.is_some() {
-                    return unsupported_at(
-                        "debug t-string interpolation",
-                        span_bounds(interpolation.range.start().to_u32(), interpolation.range.end().to_u32()),
-                    );
+                let expression = interpolation_expression_text(driver, &interpolation.expression);
+                if let Some(debug) = &interpolation.debug_text {
+                    let debug_literal = format!("{}{}{}=", debug.leading, expression, debug.trailing);
+                    let value = scope.emit(InstKind::Const(PyConst::Str(debug_literal)))?;
+                    parts.push(TStrPart::Interp {
+                        value,
+                        expression: String::new(),
+                        conversion: TEMPLATE_LITERAL_CONVERSION,
+                        format_spec: None,
+                    });
                 }
                 let value = driver.lower_expr(scope, &interpolation.expression)?;
                 let format_spec = interpolation
@@ -96,13 +113,25 @@ fn lower_t_string_parts<'a>(
                     .transpose()?
                     .map(|parts| scope.emit(InstKind::BuildString { parts }))
                     .transpose()?;
+                let conversion = interpolation.conversion.to_byte().unwrap_or_else(|| {
+                    if interpolation.debug_text.is_some() && format_spec.is_none() {
+                        b'r'
+                    } else {
+                        0
+                    }
+                });
                 parts.push(TStrPart::Interp {
                     value,
-                    conversion: interpolation.conversion.to_byte().unwrap_or(0),
+                    expression,
+                    conversion,
                     format_spec,
                 });
             }
         }
     }
     Ok(parts)
+}
+
+fn interpolation_expression_text(driver: &LoweringDriver, expression: &ruff_python_ast::Expr) -> String {
+    driver.expr_source(expression).unwrap_or("<expr>").to_owned()
 }

@@ -453,6 +453,34 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn rejects_each_dynamic_code_builtin_with_construct_and_location() {
+        let root = temp_root("dynamic-message");
+        fs::create_dir_all(&root).expect("temp root should be creatable");
+        let resolver = PathImportResolver::default();
+
+        for (file_name, source, construct, line, column) in [
+            ("eval_sink.py", "print(eval('1 + 1'))\n", "eval", 1, 7),
+            ("exec_sink.py", "x = 0\nexec('x = 1')\n", "exec", 2, 1),
+            ("compile_sink.py", "code = compile('1', '<dyn>', 'eval')\n", "compile", 1, 8),
+        ] {
+            let path = root.join(file_name);
+            fs::write(&path, source).expect("dynamic sink fixture should be writable");
+            let err = module_closure(&path, &resolver).expect_err("dynamic sink should be rejected");
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!("`{construct}` reached statically")),
+                "message should name construct {construct}: {message}"
+            );
+            assert!(
+                message.contains(&format!(":{line}:{column}")),
+                "message should include source location {line}:{column}: {message}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
 
     #[test]
     fn records_dynamic_import_api_without_following_it() {

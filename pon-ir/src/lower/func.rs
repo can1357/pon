@@ -85,6 +85,10 @@ pub(super) fn lower_call(
     scope: &mut BodyScope,
     call: &ruff_python_ast::ExprCall,
 ) -> Result<Value, LowerError> {
+    if is_builtin_locals_snapshot(scope, call) {
+        return lower_locals_snapshot(scope);
+    }
+
     let callee = driver.lower_expr(scope, &call.func)?;
     let has_starred = call.arguments.args.iter().any(|arg| matches!(arg, Expr::Starred(_)));
     let mut args = Vec::with_capacity(call.arguments.args.len());
@@ -142,6 +146,30 @@ pub(super) fn lower_call(
             dstar,
         })
     }
+}
+
+fn is_builtin_locals_snapshot(scope: &BodyScope, call: &ruff_python_ast::ExprCall) -> bool {
+    if !scope.is_function_like()
+        || !call.arguments.args.is_empty()
+        || !call.arguments.keywords.is_empty()
+    {
+        return false;
+    }
+    let Expr::Name(callee) = call.func.as_ref() else {
+        return false;
+    };
+    callee.id.as_str() == "locals" && matches!(scope.name_class("locals"), Some(NameClass::Builtin))
+}
+
+fn lower_locals_snapshot(scope: &mut BodyScope) -> Result<Value, LowerError> {
+    let items = scope.locals_snapshot_items();
+    let mut pairs = Vec::with_capacity(items.len());
+    for (name, slot) in items {
+        let key = scope.emit(InstKind::Const(PyConst::Str(name)))?;
+        let value = scope.emit(InstKind::LoadLocal(slot))?;
+        pairs.push((key, value));
+    }
+    scope.emit(InstKind::BuildMap { pairs })
 }
 
 pub(super) fn lower_lambda(

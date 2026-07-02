@@ -157,7 +157,9 @@ impl Error for LowerError {}
 /// Parse and lower Python source into IR.
 pub fn lower_source(source: &str) -> Result<Module, LowerError> {
     let parsed = parse_module_source(source)?;
-    lower_module(&parsed)
+    LoweringDriver::with_source(source)
+        .lower_module(&parsed)
+        .map(desugar_module)
 }
 
 /// Lower a Ruff module AST into IR while preserving the Phase-A executable slice.
@@ -242,6 +244,7 @@ impl NameTable {
 pub(crate) struct LoweringDriver {
     functions: Vec<Function>,
     names: NameTable,
+    source: Option<String>,
 }
 
 impl LoweringDriver {
@@ -249,7 +252,25 @@ impl LoweringDriver {
         Self {
             functions: Vec::new(),
             names: NameTable::default(),
+            source: None,
         }
+    }
+
+    fn with_source(source: &str) -> Self {
+        Self {
+            functions: Vec::new(),
+            names: NameTable::default(),
+            source: Some(source.to_owned()),
+        }
+    }
+
+    pub(crate) fn source_slice(&self, span: SourceSpan) -> Option<&str> {
+        let source = self.source.as_deref()?;
+        source.get(span.start as usize..span.end as usize)
+    }
+
+    pub(crate) fn expr_source(&self, expr: &Expr) -> Option<&str> {
+        self.source_slice(span_expr(expr))
     }
 
     fn lower_module(mut self, module: &ModModule) -> Result<Module, LowerError> {
@@ -370,7 +391,7 @@ impl LoweringDriver {
             Stmt::Try(stmt) => try_::lower_try(self, scope, stmt),
             Stmt::Import(stmt) => import::lower_import_stmt(self, scope, stmt),
             Stmt::ImportFrom(stmt) => import::lower_import_from_stmt(self, scope, stmt),
-            Stmt::Delete(stmt) => assign::lower_delete(stmt),
+            Stmt::Delete(stmt) => assign::lower_delete(self, scope, stmt),
             Stmt::AugAssign(stmt) => assign::lower_aug_assign_with_driver(self, scope, stmt),
             Stmt::AnnAssign(stmt) => assign::lower_ann_assign(self, scope, stmt),
             Stmt::TypeAlias(stmt) => assign::lower_type_alias(self, scope, stmt),
@@ -912,15 +933,17 @@ impl LoweringDriver {
             let name_id = self.names.intern(raw_name)?;
             scope.emit(InstKind::StoreName(name_id, value))?;
         } else {
-            match scope.name_class(raw_name) {
-                Some(NameClass::Cell { cell_slot, .. }) => {
-                    scope.emit(InstKind::StoreCell(CellId(*cell_slot), value))?;
+            match scope.name_class(raw_name).cloned() {
+                Some(NameClass::Cell { cell_slot, local_slot }) => {
+                    scope.emit(InstKind::StoreCell(CellId(cell_slot), value))?;
+                    scope.mark_local_defined(local_slot);
                 }
                 Some(NameClass::Free { slot }) => {
-                    scope.emit(InstKind::StoreCell(CellId(*slot), value))?;
+                    scope.emit(InstKind::StoreCell(CellId(slot), value))?;
                 }
                 Some(NameClass::Local { slot }) => {
-                    scope.emit(InstKind::StoreLocal(LocalId(*slot), value))?;
+                    scope.emit(InstKind::StoreLocal(LocalId(slot), value))?;
+                    scope.mark_local_defined(slot);
                 }
                 Some(NameClass::Builtin) | Some(NameClass::Global { .. }) | None => {
                     let name_id = self.names.intern(raw_name)?;
@@ -935,6 +958,7 @@ impl LoweringDriver {
 pub(crate) struct BodyScope {
     info: ScopeInfo,
     child_used: Vec<bool>,
+    defined_locals: Vec<bool>,
     blocks: Vec<Block>,
     current_id: BlockId,
     insts: Vec<Inst>,
@@ -951,9 +975,11 @@ impl BodyScope {
     fn new(info: &ScopeInfo) -> Self {
         let info = info.clone();
         let child_used = vec![false; info.children.len()];
+        let defined_locals = info.locals.iter().map(|local| local.is_parameter).collect();
         let mut scope = Self {
             info,
             child_used,
+            defined_locals,
             blocks: Vec::new(),
             current_id: BlockId(0),
             insts: Vec::new(),
@@ -986,6 +1012,30 @@ impl BodyScope {
         } else {
             self.info.local_slot(name).map(LocalId)
         }
+    }
+
+    fn is_function_like(&self) -> bool {
+        matches!(self.info.kind, ScopeKind::Function | ScopeKind::Comprehension)
+    }
+
+    fn mark_local_defined(&mut self, slot: u32) {
+        if let Some(defined) = self.defined_locals.get_mut(slot as usize) {
+            *defined = true;
+        }
+    }
+
+    fn locals_snapshot_items(&self) -> Vec<(String, LocalId)> {
+        self.info
+            .locals
+            .iter()
+            .filter(|local| {
+                self.defined_locals
+                    .get(local.slot as usize)
+                    .copied()
+                    .unwrap_or(false)
+            })
+            .map(|local| (local.name.clone(), LocalId(local.slot)))
+            .collect()
     }
 
     fn name_class(&self, name: &str) -> Option<&NameClass> {
@@ -1681,6 +1731,38 @@ async def f():
             .blocks
             .iter()
             .any(|block| matches!(block.term, Terminator::Return(_))));
+    }
+
+    #[test]
+    fn lowers_function_locals_call_to_snapshot_dict() {
+        let module = lower_source(
+            r#"
+def f(a):
+    b = 3
+    return locals()
+"#,
+        )
+        .expect("function locals() should lower to a snapshot dict");
+
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name == "f")
+            .expect("function should lower");
+        let block = &function.blocks[0];
+        assert!(
+            block
+                .insts
+                .iter()
+                .any(|inst| matches!(&inst.kind, InstKind::BuildMap { pairs } if pairs.len() == 2)),
+            "locals() should snapshot the defined parameter and local"
+        );
+        assert!(
+            !block.insts.iter().any(|inst| {
+                matches!(&inst.kind, InstKind::LoadBuiltin(name) if module.names[name.0 as usize] == "locals")
+            }),
+            "function-scope locals() must not call the module-scope builtin"
+        );
     }
 
     #[test]

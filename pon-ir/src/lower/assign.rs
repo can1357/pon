@@ -13,11 +13,83 @@ pub(super) fn lower_assign(
     Ok(())
 }
 
-pub(super) fn lower_delete(stmt: &ruff_python_ast::StmtDelete) -> Result<(), LowerError> {
-    unsupported_at(
-        "delete statement",
-        span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()),
-    )
+pub(super) fn lower_delete(
+    driver: &mut LoweringDriver,
+    scope: &mut BodyScope,
+    stmt: &ruff_python_ast::StmtDelete,
+) -> Result<(), LowerError> {
+    for target in &stmt.targets {
+        lower_delete_target(driver, scope, target)?;
+    }
+    Ok(())
+}
+
+fn lower_delete_target(
+    driver: &mut LoweringDriver,
+    scope: &mut BodyScope,
+    target: &Expr,
+) -> Result<(), LowerError> {
+    match target {
+        Expr::Name(name) if matches!(name.ctx, ExprContext::Del) => {
+            lower_delete_name(driver, scope, name.id.as_str())
+        }
+        Expr::Attribute(attr) if matches!(attr.ctx, ExprContext::Del) => {
+            let obj = driver.lower_expr(scope, &attr.value)?;
+            let name = driver.names.intern(attr.attr.as_str())?;
+            scope.emit(InstKind::DeleteAttr { obj, name })?;
+            Ok(())
+        }
+        Expr::Subscript(subscript) if matches!(subscript.ctx, ExprContext::Del) => {
+            let obj = driver.lower_expr(scope, &subscript.value)?;
+            let index = driver.lower_expr(scope, &subscript.slice)?;
+            scope.emit(InstKind::SubscriptDel { obj, index })?;
+            Ok(())
+        }
+        Expr::Tuple(tuple) => {
+            for elt in &tuple.elts {
+                lower_delete_target(driver, scope, elt)?;
+            }
+            Ok(())
+        }
+        Expr::List(list) => {
+            for elt in &list.elts {
+                lower_delete_target(driver, scope, elt)?;
+            }
+            Ok(())
+        }
+        _ => unsupported_expr("delete target", target),
+    }
+}
+
+fn lower_delete_name(
+    driver: &mut LoweringDriver,
+    scope: &mut BodyScope,
+    raw_name: &str,
+) -> Result<(), LowerError> {
+    if scope.is_global_name(raw_name) {
+        let name = driver.names.intern(raw_name)?;
+        scope.emit(InstKind::DeleteGlobal(name))?;
+    } else if scope.is_class() {
+        let name = driver.names.intern(raw_name)?;
+        scope.emit(InstKind::DeleteName(name))?;
+    } else {
+        match scope.name_class(raw_name).cloned() {
+            Some(NameClass::Cell { cell_slot, .. }) => {
+                scope.emit(InstKind::DeleteCell(CellId(cell_slot)))?;
+            }
+            Some(NameClass::Free { slot }) => {
+                scope.emit(InstKind::DeleteCell(CellId(slot)))?;
+            }
+            Some(NameClass::Local { slot }) => {
+                scope.emit(InstKind::DeleteLocal(LocalId(slot)))?;
+            }
+            Some(NameClass::Builtin) | Some(NameClass::Global { .. }) | None => {
+                let name = driver.names.intern(raw_name)?;
+                scope.emit(InstKind::DeleteName(name))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
