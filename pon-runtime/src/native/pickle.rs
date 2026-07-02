@@ -228,7 +228,7 @@ unsafe extern "C" fn picklebuffer_new(_cls: *mut PyType, args: *mut PyObject, kw
         }
         return alloc_picklebuffer(source, view.data, view.len, view.readonly);
     }
-    if let Some(buffer) = (unsafe { as_picklebuffer(source) }) {
+    if let Some(buffer) = unsafe { as_picklebuffer(source) } {
         if buffer.base.is_null() {
             // SAFETY: Typed raise helper; the message bytes are copied.
             return unsafe { abi::exc::pon_raise_value_error(RELEASED_ERROR.as_ptr(), RELEASED_ERROR.len()) };
