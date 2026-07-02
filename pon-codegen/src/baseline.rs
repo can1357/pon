@@ -516,9 +516,94 @@ pub fn compile_osr_function<M: Module>(
     Ok(())
 }
 
-/// Lower every IR block of `ir` into its mapped CLIF block, tracking the
-/// static exception-handler routing (`PushExcInfo`/`PopExcInfo`) across the
-/// linear block walk.
+type ExceptionTargetStack = Vec<BlockId>;
+
+fn merge_exception_entry_stack(
+    entries: &mut HashMap<BlockId, ExceptionTargetStack>,
+    worklist: &mut VecDeque<BlockId>,
+    block: BlockId,
+    stack: &[BlockId],
+) -> Result<(), CodegenError> {
+    if let Some(existing) = entries.get(&block) {
+        if existing == stack {
+            return Ok(());
+        }
+        return Err(CodegenError::Unsupported("inconsistent exception handler stack at block join"));
+    }
+    entries.insert(block, stack.to_vec());
+    worklist.push_back(block);
+    Ok(())
+}
+
+fn exception_successors(term: &Terminator, stack: &[BlockId]) -> Vec<BlockId> {
+    match term {
+        Terminator::Jump(target) => vec![*target],
+        Terminator::Branch {
+            then_blk, else_blk, ..
+        } => vec![*then_blk, *else_blk],
+        Terminator::CondBranch { then_, else_, .. } => vec![*then_, *else_],
+        Terminator::ForLoop { body, done, .. } => vec![*body, *done],
+        Terminator::Suspend { resume, .. } => vec![*resume],
+        Terminator::RaiseTerm => stack.last().copied().into_iter().collect(),
+        Terminator::Return(_) | Terminator::Unreachable => Vec::new(),
+        _ => Vec::new(),
+    }
+}
+
+fn block_exception_entry_stacks(ir: &Function) -> Result<HashMap<BlockId, ExceptionTargetStack>, CodegenError> {
+    let Some(entry) = ir.blocks.first().map(|block| block.id) else {
+        return Ok(HashMap::new());
+    };
+    let blocks = ir.blocks.iter().map(|block| (block.id, block)).collect::<HashMap<_, _>>();
+    let mut entries = HashMap::new();
+    let mut worklist = VecDeque::new();
+    entries.insert(entry, Vec::new());
+    worklist.push_back(entry);
+
+    while let Some(block_id) = worklist.pop_front() {
+        let block = *blocks
+            .get(&block_id)
+            .ok_or(CodegenError::Unsupported("exception stack references missing block"))?;
+        let mut stack = entries.get(&block_id).cloned().unwrap_or_default();
+        for inst in &block.insts {
+            match &inst.kind {
+                InstKind::PushExcInfo { target, .. } => {
+                    stack.push(*target);
+                    merge_exception_entry_stack(&mut entries, &mut worklist, *target, &stack)?;
+                }
+                InstKind::PopExcInfo => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+        for successor in exception_successors(&block.term, &stack) {
+            merge_exception_entry_stack(&mut entries, &mut worklist, successor, &stack)?;
+        }
+    }
+
+    Ok(entries)
+}
+
+fn exception_exit_from_stack(
+    stack: &[BlockId],
+    block_map: &[(BlockId, ir::Block)],
+    exception_exit: ir::Block,
+    missing_message: &'static str,
+) -> Result<ir::Block, CodegenError> {
+    let Some(target) = stack.last() else {
+        return Ok(exception_exit);
+    };
+    block_map
+        .iter()
+        .find_map(|(id, clif)| (*id == *target).then_some(*clif))
+        .ok_or(CodegenError::Unsupported(missing_message))
+}
+
+
+/// Lower every IR block of `ir` into its mapped CLIF block, deriving the
+/// active exception-handler route for each block from the IR CFG instead of
+/// leaking `PushExcInfo`/`PopExcInfo` effects across the linear block walk.
 ///
 /// `prefilled_entry` is the CLIF block that IR block 0 maps to when the
 /// caller already switched to it and emitted a prologue (the non-generator
@@ -541,8 +626,7 @@ pub(crate) fn lower_function_blocks<M: Module>(
     feedback_base_gv: Option<ir::GlobalValue>,
     prefilled_entry: Option<ir::Block>,
 ) -> Result<(), CodegenError> {
-    let mut exception_target_stack = Vec::new();
-    let mut current_exception_exit = exception_exit;
+    let exception_entry_stacks = block_exception_entry_stacks(ir)?;
 
     for block in &ir.blocks {
         let clif_block = block_map
@@ -552,6 +636,13 @@ pub(crate) fn lower_function_blocks<M: Module>(
         if Some(clif_block) != prefilled_entry {
             builder.switch_to_block(clif_block);
         }
+        let mut exception_target_stack = exception_entry_stacks.get(&block.id).cloned().unwrap_or_default();
+        let mut current_exception_exit = exception_exit_from_stack(
+            &exception_target_stack,
+            block_map,
+            exception_exit,
+            "exception handler target block",
+        )?;
         for inst in &block.insts {
             // J0.3: materialize this site's static feedback-cell address
             // (base + slot * FEEDBACK_CELL_SIZE) for specializable ops.
@@ -581,16 +672,23 @@ pub(crate) fn lower_function_blocks<M: Module>(
                         ptr_ty,
                         current_exception_exit,
                     )?;
-                    let handler = block_map
-                        .iter()
-                        .find_map(|(id, clif)| (*id == *target).then_some(*clif))
-                        .ok_or(CodegenError::Unsupported("exception handler target block"))?;
-                    exception_target_stack.push(current_exception_exit);
-                    current_exception_exit = handler;
+                    exception_target_stack.push(*target);
+                    current_exception_exit = exception_exit_from_stack(
+                        &exception_target_stack,
+                        block_map,
+                        exception_exit,
+                        "exception handler target block",
+                    )?;
                     value
                 }
                 InstKind::PopExcInfo => {
-                    let previous_exception_exit = exception_target_stack.pop().unwrap_or(exception_exit);
+                    exception_target_stack.pop();
+                    let previous_exception_exit = exception_exit_from_stack(
+                        &exception_target_stack,
+                        block_map,
+                        exception_exit,
+                        "exception handler target block",
+                    )?;
                     let value = exc::lower_pop_exc_info(
                         builder,
                         helper_refs.pop_exc_info,
@@ -654,8 +752,7 @@ fn lower_function_blocks_subset<M: Module>(
     feedback_base_gv: Option<ir::GlobalValue>,
     reachable: &HashSet<BlockId>,
 ) -> Result<(), CodegenError> {
-    let mut exception_target_stack = Vec::new();
-    let mut current_exception_exit = exception_exit;
+    let exception_entry_stacks = block_exception_entry_stacks(ir)?;
 
     for block in &ir.blocks {
         if !reachable.contains(&block.id) {
@@ -666,6 +763,13 @@ fn lower_function_blocks_subset<M: Module>(
             .find_map(|(id, clif)| (*id == block.id).then_some(*clif))
             .ok_or(CodegenError::Unsupported("missing OSR basic block"))?;
         builder.switch_to_block(clif_block);
+        let mut exception_target_stack = exception_entry_stacks.get(&block.id).cloned().unwrap_or_default();
+        let mut current_exception_exit = exception_exit_from_stack(
+            &exception_target_stack,
+            block_map,
+            exception_exit,
+            "OSR exception handler target block",
+        )?;
         for inst in &block.insts {
             let feedback_cell = match (inst.feedback_slot, feedback_base_gv) {
                 (Some(slot), Some(gv)) => {
@@ -693,16 +797,23 @@ fn lower_function_blocks_subset<M: Module>(
                         ptr_ty,
                         current_exception_exit,
                     )?;
-                    let handler = block_map
-                        .iter()
-                        .find_map(|(id, clif)| (*id == *target).then_some(*clif))
-                        .ok_or(CodegenError::Unsupported("OSR exception handler target block"))?;
-                    exception_target_stack.push(current_exception_exit);
-                    current_exception_exit = handler;
+                    exception_target_stack.push(*target);
+                    current_exception_exit = exception_exit_from_stack(
+                        &exception_target_stack,
+                        block_map,
+                        exception_exit,
+                        "OSR exception handler target block",
+                    )?;
                     value
                 }
                 InstKind::PopExcInfo => {
-                    let previous_exception_exit = exception_target_stack.pop().unwrap_or(exception_exit);
+                    exception_target_stack.pop();
+                    let previous_exception_exit = exception_exit_from_stack(
+                        &exception_target_stack,
+                        block_map,
+                        exception_exit,
+                        "OSR exception handler target block",
+                    )?;
                     let value = exc::lower_pop_exc_info(
                         builder,
                         helper_refs.pop_exc_info,
