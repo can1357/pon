@@ -24,6 +24,35 @@ use crate::types::{dict, list::PyList, tuple::PyTuple, type_::{self, PyClassDict
 static FUNCTION_RECORDS: LazyLock<Mutex<HashMap<usize, FunctionRecord>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Live `__defaults__`/`__kwdefaults__` overrides installed by attribute
+/// assignment after function creation (`f.__defaults__ = ...`).
+///
+/// Fields hold raw object addresses (a validated tuple/dict payload or the
+/// `None` singleton for a cleared slot) — the same accepted pattern as
+/// [`FUNCTION_RECORDS`].  `None` in a field means that attribute was never
+/// assigned, so creation-time metadata stays authoritative.  A side table
+/// (not a `PyFunction` field) keeps `bind_arguments`' documented contract of
+/// never dereferencing the function pointer itself; entries are cleared by
+/// the GC dealloc hook via [`unregister_function_record`].
+#[derive(Clone, Copy, Debug, Default)]
+struct DefaultsOverride {
+    defaults: Option<usize>,
+    kwdefaults: Option<usize>,
+}
+
+static FUNCTION_DEFAULT_OVERRIDES: LazyLock<Mutex<HashMap<usize, DefaultsOverride>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Snapshot of the live defaults overrides for `function` (both slots
+/// `None` when nothing was ever assigned).
+fn defaults_override(function: *mut PyObject) -> DefaultsOverride {
+    FUNCTION_DEFAULT_OVERRIDES
+        .lock()
+        .ok()
+        .and_then(|table| table.get(&(function as usize)).copied())
+        .unwrap_or_default()
+}
+
 /// Owned Phase-B metadata for a boxed function.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionRecord {
@@ -93,6 +122,11 @@ pub fn visit_function_gc_refs(function: *mut PyObject, visitor: &mut dyn FnMut(*
         if !object.is_null() {
             visitor(object);
         }
+    }
+    drop(records);
+    let override_ = defaults_override(function);
+    for stored in [override_.defaults, override_.kwdefaults].into_iter().flatten() {
+        visitor(stored as *mut u8);
     }
 }
 
@@ -472,10 +506,15 @@ pub fn set_function_closure(function: *mut PyObject, closure: &[*mut PyObject]) 
     Ok(())
 }
 
-/// Remove side-table metadata for a function object.
+/// Remove side-table metadata for a function object (Phase-B record and any
+/// live defaults overrides), so a reused allocation address can never
+/// resurrect stale metadata.
 pub fn unregister_function_record(function: *mut PyObject) {
     if let Ok(mut records) = FUNCTION_RECORDS.lock() {
         records.remove(&(function as usize));
+    }
+    if let Ok(mut overrides) = FUNCTION_DEFAULT_OVERRIDES.lock() {
+        overrides.remove(&(function as usize));
     }
 }
 
@@ -516,6 +555,12 @@ fn function_attr_by_id(function: *mut PyObject, name_id: u32) -> Option<*mut PyO
         return Some(unsafe { crate::dynexec::builtin_globals(ptr::null_mut(), 0) });
     }
     if name_id == intern("__defaults__") {
+        if let Some(stored) = defaults_override(function).defaults {
+            // Live override installed by `f.__defaults__ = ...`: reads return
+            // the assigned object itself (tuple identity preserved) or `None`
+            // after clearing.
+            return Some(stored as *mut PyObject);
+        }
         let Some(record) = function_record(function) else {
             return Some(unsafe { crate::abi::pon_none() });
         };
@@ -525,6 +570,9 @@ fn function_attr_by_id(function: *mut PyObject, name_id: u32) -> Option<*mut PyO
         return Some(tuple_from_objects(record.defaults()));
     }
     if name_id == intern("__kwdefaults__") {
+        if let Some(stored) = defaults_override(function).kwdefaults {
+            return Some(stored as *mut PyObject);
+        }
         let Some(record) = function_record(function) else {
             return Some(unsafe { crate::abi::pon_none() });
         };
@@ -604,6 +652,49 @@ unsafe fn ensure_function_attr_dict(function: *mut PyObject) -> *mut PyObject {
     dict
 }
 
+/// `f.__defaults__ = value` / `del f.__defaults__` (CPython
+/// `func_set_defaults`): only a tuple — subclasses included, matching
+/// `PyTuple_Check` — or `None` is accepted; `None` and deletion clear the
+/// defaults entirely.  The stored object immediately drives both attribute
+/// reads and call-time binding.
+unsafe fn store_defaults_override(function: *mut PyObject, value: *mut PyObject) -> c_int {
+    let none = unsafe { crate::abi::pon_none() };
+    let stored = if value.is_null() || value == none {
+        none
+    } else if crate::abi::seq::has_tuple_storage(value) {
+        value
+    } else {
+        let message = "__defaults__ must be set to a tuple object";
+        let _ = unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+        return -1;
+    };
+    if let Ok(mut table) = FUNCTION_DEFAULT_OVERRIDES.lock() {
+        table.entry(function as usize).or_default().defaults = Some(stored as usize);
+    }
+    0
+}
+
+/// `f.__kwdefaults__ = value` / deletion (CPython `func_set_kwdefaults`):
+/// only a dict — subclasses included, matching `PyDict_Check` — or `None`
+/// is accepted; `None` and deletion clear the keyword-only defaults
+/// entirely.
+unsafe fn store_kwdefaults_override(function: *mut PyObject, value: *mut PyObject) -> c_int {
+    let none = unsafe { crate::abi::pon_none() };
+    let stored = if value.is_null() || value == none {
+        none
+    } else if unsafe { dict::has_dict_storage(value) } {
+        value
+    } else {
+        let message = "__kwdefaults__ must be set to a dict object";
+        let _ = unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+        return -1;
+    };
+    if let Ok(mut table) = FUNCTION_DEFAULT_OVERRIDES.lock() {
+        table.entry(function as usize).or_default().kwdefaults = Some(stored as usize);
+    }
+    0
+}
+
 /// Attribute lookup for function metadata exposed at Python level.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn function_getattro(function: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
@@ -618,7 +709,7 @@ pub unsafe extern "C" fn function_getattro(function: *mut PyObject, name: *mut P
     // matching CPython where the function `__dict__` backs arbitrary
     // attributes.  `__dict__` itself stays a pseudo-getset served below and is
     // never looked up inside the dict.
-    if name_id != intern("__dict__") {
+    if name_id != intern("__dict__") && name_id != intern("__defaults__") && name_id != intern("__kwdefaults__") {
         let dict = unsafe { (*function.cast::<PyFunction>()).attr_dict };
         if !dict.is_null() {
             let key = const_str(name_text);
@@ -658,6 +749,12 @@ pub unsafe extern "C" fn function_setattro(function: *mut PyObject, name: *mut P
         pon_err_set("function attribute name is not valid UTF-8");
         return -1;
     };
+    if name_text == "__defaults__" {
+        return unsafe { store_defaults_override(function, value) };
+    }
+    if name_text == "__kwdefaults__" {
+        return unsafe { store_kwdefaults_override(function, value) };
+    }
     if name_text == "__dict__" {
         if value.is_null() {
             pon_err_set("function's dictionary may not be deleted");
@@ -1003,6 +1100,75 @@ unsafe fn build_kwargs_dict(pairs: &[(u32, *mut PyObject)]) -> Result<*mut PyObj
     }
 }
 
+/// Values of the live `__defaults__` override as object addresses, or `None`
+/// while creation-time defaults stay authoritative (never assigned).  A
+/// cleared override (`= None` / deletion) yields an empty vector.
+fn defaults_override_values(function: *mut PyObject) -> Option<Vec<usize>> {
+    let stored = defaults_override(function).defaults? as *mut PyObject;
+    if stored == unsafe { crate::abi::pon_none() } {
+        return Some(Vec::new());
+    }
+    // The store path validated tuple storage (exact tuple or tuple-subclass
+    // instance), so the layout-safe view is always available; treat an
+    // impossible mismatch as cleared rather than reading a wrong layout.
+    let Some(values) = (unsafe { crate::abi::seq::tuple_storage_slice(stored) }) else {
+        debug_assert!(false, "__defaults__ override stored without tuple storage");
+        return Some(Vec::new());
+    };
+    Some(values.iter().map(|value| *value as usize).collect())
+}
+
+/// Keyword-only defaults from the live `__kwdefaults__` override, keyed by
+/// interned parameter name, or `None` while the creation-time record stays
+/// authoritative.
+fn kwdefaults_override_map(function: *mut PyObject) -> Result<Option<BTreeMap<u32, usize>>, String> {
+    let Some(stored) = defaults_override(function).kwdefaults else {
+        return Ok(None);
+    };
+    let stored = stored as *mut PyObject;
+    if stored == unsafe { crate::abi::pon_none() } {
+        return Ok(Some(BTreeMap::new()));
+    }
+    let mut map = BTreeMap::new();
+    for entry in unsafe { dict::dict_entries_snapshot(stored)? } {
+        if unsafe { dict::type_name(entry.key) } != Some("str") {
+            return Err("__kwdefaults__ keys must be strings".to_owned());
+        }
+        let Some(name_text) = (unsafe { (&*entry.key.cast::<PyUnicode>()).as_str() }) else {
+            return Err("__kwdefaults__ key is not valid UTF-8".to_owned());
+        };
+        map.insert(intern::intern(name_text), entry.value as usize);
+    }
+    Ok(Some(map))
+}
+
+/// Fills trailing positional slots of an arity-only (Phase-A) call from the
+/// live `__defaults__` override, using CPython tail alignment (an over-long
+/// tuple leaves its head unused).  Returns `None` when no override is
+/// installed, the call is not short, or required parameters are still
+/// missing, so callers keep their original arity diagnostics.
+#[must_use]
+pub fn fill_positional_defaults(
+    function: *mut PyObject,
+    positional: &[*mut PyObject],
+    arity: usize,
+) -> Option<Vec<*mut PyObject>> {
+    if positional.len() >= arity {
+        return None;
+    }
+    let defaults = defaults_override_values(function)?;
+    let default_start = arity as isize - defaults.len() as isize;
+    if (positional.len() as isize) < default_start {
+        return None;
+    }
+    let mut filled = Vec::with_capacity(arity);
+    filled.extend_from_slice(positional);
+    for index in positional.len()..arity {
+        filled.push(defaults[(index as isize - default_start) as usize] as *mut PyObject);
+    }
+    Some(filled)
+}
+
 /// Bind a call into the compiled function's argv/local-slot order.
 pub fn bind_arguments(
     function: *mut PyObject,
@@ -1094,12 +1260,18 @@ pub fn bind_arguments(
         bound[slot] = unsafe { build_kwargs_dict(&varkw_pairs) }?;
     }
 
-    let default_start = positional_arity.saturating_sub(record.defaults.len());
+    // A live `__defaults__` override REPLACES creation-time defaults
+    // entirely (CPython: assignment swaps the whole tuple; `None` clears).
+    let defaults_override = defaults_override_values(function);
+    let defaults: &[usize] = defaults_override.as_deref().unwrap_or(&record.defaults);
+    // CPython tail alignment: defaults cover the LAST `defaults.len()`
+    // positional parameters; an over-long live tuple leaves its head unused.
+    let default_start = positional_arity as isize - defaults.len() as isize;
     for index in 0..positional_arity {
         if bound[index].is_null() {
-            if index >= default_start {
-                let default_index = index - default_start;
-                if let Some(default) = record.defaults.get(default_index) {
+            let default_index = index as isize - default_start;
+            if default_index >= 0 {
+                if let Some(default) = defaults.get(default_index as usize) {
                     bound[index] = *default as *mut PyObject;
                 }
             }
@@ -1110,12 +1282,14 @@ pub fn bind_arguments(
         }
     }
 
+    let kwdefaults_override = kwdefaults_override_map(function)?;
+    let kwdefaults: &BTreeMap<u32, usize> = kwdefaults_override.as_ref().unwrap_or(&record.kwdefaults);
     let keyword_start = positional_arity;
     let keyword_end = keyword_start + params.keyword_only_count;
     for index in keyword_start..keyword_end {
         if bound[index].is_null() {
             let name = params.names.get(index).copied().unwrap_or(0);
-            if let Some(default) = record.kwdefaults.get(&name) {
+            if let Some(default) = kwdefaults.get(&name) {
                 bound[index] = *default as *mut PyObject;
             } else {
                 return Err(format!(
@@ -1152,6 +1326,7 @@ pub unsafe fn call_bound_function(
         return Err("function code pointer is null".to_owned());
     }
     let _guard = crate::abi::push_current_call(function.cast::<PyFunction>(), argv.as_mut_ptr(), argv.len());
+    let _handled_guard = crate::abi::HandledExcGuard::enter();
     pon_err_clear();
     // SAFETY: Function entrypoints are emitted with the compiled-code ABI.
     let entry: PyCodeFn = unsafe { mem::transmute(code) };
@@ -1185,6 +1360,15 @@ fn bind_phase_a_arguments(
     }
     let arity = unsafe { (*function.cast::<PyFunction>()).arity };
     if arity != crate::builtins::variadic_arity() && positional.len() != arity {
+        // A live `__defaults__` override can still satisfy a short call.
+        if let Some(filled) = fill_positional_defaults(function, positional, arity) {
+            for (index, value) in filled.iter().enumerate() {
+                if value.is_null() {
+                    return Err(format!("positional argument {index} is NULL"));
+                }
+            }
+            return Ok(filled);
+        }
         return Err(format!("function expected {arity} arguments, got {}", positional.len()));
     }
     for (index, value) in positional.iter().enumerate() {
@@ -1769,4 +1953,719 @@ mod tests {
         unregister_function_record(function);
     }
 
+    /// Contract: a `__defaults__` tuple assigned after creation drives
+    /// Phase-B binding (CPython `func_set_defaults`), and
+    /// `unregister_function_record` removes the override so a fresh record at
+    /// the same address never resurrects it.
+    #[test]
+    fn live_defaults_override_drives_binding_and_is_cleared_by_unregister() {
+        let _guard = crate::thread_state::test_state_lock();
+        unsafe {
+            assert_eq!(crate::abi::pon_runtime_init(), 0);
+            pon_err_clear();
+            let function = crate::abi::pon_make_function(
+                dummy_entry as *const u8,
+                3,
+                intern("live_defaults_override_case"),
+            );
+            assert!(!function.is_null());
+            let names = [intern("lo_a"), intern("lo_b"), intern("lo_c")];
+            let params = ParamSpec {
+                names: names.as_ptr(),
+                total_param_count: names.len() as u32,
+                positional_only_count: 0,
+                positional_count: 3,
+                keyword_only_count: 0,
+                varargs_name: 0,
+                varkw_name: 0,
+            };
+            let code = CodeInfo {
+                entry: dummy_entry as *const u8,
+                params: &params,
+                name_interned: intern("live_defaults_override_case"),
+                n_locals: 3,
+                n_feedback: 0,
+                flags: 0,
+            };
+            register_function_record(function, &code, &[], &[], &[], &[]).unwrap();
+
+            let arg_a = const_str("lo_value_a");
+            let val_b = const_str("lo_value_b");
+            let val_c = const_str("lo_value_c");
+            let defaults_name = const_str("__defaults__");
+            assert!(!arg_a.is_null() && !val_b.is_null() && !val_c.is_null());
+            assert!(!defaults_name.is_null());
+            let override_tuple = tuple_from_objects(vec![val_b, val_c]);
+            assert!(!override_tuple.is_null());
+            assert_eq!(function_setattro(function, defaults_name, override_tuple), 0);
+
+            let bound = bind_arguments(
+                function,
+                &[arg_a],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(bound, vec![arg_a, val_b, val_c]);
+
+            // Unregistering drops the override entry too: a fresh record at
+            // the same address starts without defaults again.
+            unregister_function_record(function);
+            register_function_record(function, &code, &[], &[], &[], &[]).unwrap();
+            let err = bind_arguments(
+                function,
+                &[arg_a],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(err.contains("missing required positional argument"), "got {err:?}");
+            unregister_function_record(function);
+        }
+    }
+
+    /// Contract: an assigned `__defaults__` tuple REPLACES creation-time
+    /// defaults wholesale — a shorter override un-defaults the parameters the
+    /// creation tuple used to cover.
+    #[test]
+    fn defaults_override_replaces_creation_defaults_wholesale() {
+        let _guard = crate::thread_state::test_state_lock();
+        unsafe {
+            assert_eq!(crate::abi::pon_runtime_init(), 0);
+            pon_err_clear();
+            let function = crate::abi::pon_make_function(
+                dummy_entry as *const u8,
+                3,
+                intern("replace_defaults_case"),
+            );
+            assert!(!function.is_null());
+            let names = [intern("rd_a"), intern("rd_b"), intern("rd_c")];
+            let params = ParamSpec {
+                names: names.as_ptr(),
+                total_param_count: names.len() as u32,
+                positional_only_count: 0,
+                positional_count: 3,
+                keyword_only_count: 0,
+                varargs_name: 0,
+                varkw_name: 0,
+            };
+            let code = CodeInfo {
+                entry: dummy_entry as *const u8,
+                params: &params,
+                name_interned: intern("replace_defaults_case"),
+                n_locals: 3,
+                n_feedback: 0,
+                flags: 0,
+            };
+            let creation_b = const_str("rd_creation_b");
+            let creation_c = const_str("rd_creation_c");
+            register_function_record(function, &code, &[creation_b, creation_c], &[], &[], &[])
+                .unwrap();
+
+            let arg_a = const_str("rd_arg_a");
+            let arg_b = const_str("rd_arg_b");
+            // Creation defaults stay authoritative until an assignment lands.
+            let bound = bind_arguments(
+                function,
+                &[arg_a],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(bound, vec![arg_a, creation_b, creation_c]);
+
+            let override_c = const_str("rd_override_c");
+            let defaults_name = const_str("__defaults__");
+            let override_tuple = tuple_from_objects(vec![override_c]);
+            assert!(!override_tuple.is_null());
+            assert_eq!(function_setattro(function, defaults_name, override_tuple), 0);
+
+            // The 1-tuple now covers only the LAST parameter...
+            let bound = bind_arguments(
+                function,
+                &[arg_a, arg_b],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(bound, vec![arg_a, arg_b, override_c]);
+            // ...and `rd_b` is no longer defaulted at all (no fallback to the
+            // creation tuple).
+            let err = bind_arguments(
+                function,
+                &[arg_a],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(err.contains("missing required positional argument"), "got {err:?}");
+            unregister_function_record(function);
+        }
+    }
+
+    /// Contract: `__defaults__` reads return the assigned object itself
+    /// (pointer identity, even with a record holding different creation
+    /// defaults), an empty tuple stays readable while defaulting nothing, and
+    /// `None` clears the slot with reads reporting `None`.
+    #[test]
+    fn defaults_override_reads_back_identically_and_clears_via_none_or_empty_tuple() {
+        let _guard = crate::thread_state::test_state_lock();
+        unsafe {
+            assert_eq!(crate::abi::pon_runtime_init(), 0);
+            pon_err_clear();
+            let function = crate::abi::pon_make_function(
+                dummy_entry as *const u8,
+                3,
+                intern("clear_defaults_case"),
+            );
+            assert!(!function.is_null());
+            let names = [intern("cd_a"), intern("cd_b"), intern("cd_c")];
+            let params = ParamSpec {
+                names: names.as_ptr(),
+                total_param_count: names.len() as u32,
+                positional_only_count: 0,
+                positional_count: 3,
+                keyword_only_count: 0,
+                varargs_name: 0,
+                varkw_name: 0,
+            };
+            let code = CodeInfo {
+                entry: dummy_entry as *const u8,
+                params: &params,
+                name_interned: intern("clear_defaults_case"),
+                n_locals: 3,
+                n_feedback: 0,
+                flags: 0,
+            };
+            let creation_b = const_str("cd_creation_b");
+            let creation_c = const_str("cd_creation_c");
+            register_function_record(function, &code, &[creation_b, creation_c], &[], &[], &[])
+                .unwrap();
+
+            let arg_a = const_str("cd_arg_a");
+            let override_b = const_str("cd_override_b");
+            let override_c = const_str("cd_override_c");
+            let defaults_name = const_str("__defaults__");
+            let override_tuple = tuple_from_objects(vec![override_b, override_c]);
+            assert!(!override_tuple.is_null());
+            assert_eq!(function_setattro(function, defaults_name, override_tuple), 0);
+            // Read-your-write identity: the assigned tuple object itself
+            // comes back, not a rebuild of the record's creation defaults.
+            assert_eq!(function_getattro(function, defaults_name), override_tuple);
+            let bound = bind_arguments(
+                function,
+                &[arg_a],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(bound, vec![arg_a, override_b, override_c]);
+
+            // An empty tuple defaults nothing (creation defaults stay dead)
+            // but reads still return that exact tuple.
+            let empty = empty_tuple();
+            assert!(!empty.is_null());
+            assert_eq!(function_setattro(function, defaults_name, empty), 0);
+            let err = bind_arguments(
+                function,
+                &[arg_a],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(err.contains("missing required positional argument"), "got {err:?}");
+            assert_eq!(function_getattro(function, defaults_name), empty);
+
+            // `None` clears: binding still fails, reads report None.
+            let none = crate::abi::pon_none();
+            assert!(!none.is_null());
+            assert_eq!(function_setattro(function, defaults_name, none), 0);
+            let err = bind_arguments(
+                function,
+                &[arg_a],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(err.contains("missing required positional argument"), "got {err:?}");
+            assert_eq!(function_getattro(function, defaults_name), none);
+            unregister_function_record(function);
+        }
+    }
+
+    /// Contract: an override tuple longer than the positional arity aligns to
+    /// the TAIL (CPython semantics) — the unused head is skipped, never bound.
+    #[test]
+    fn overlong_defaults_override_aligns_to_trailing_positional_slots() {
+        let _guard = crate::thread_state::test_state_lock();
+        unsafe {
+            assert_eq!(crate::abi::pon_runtime_init(), 0);
+            pon_err_clear();
+            let function = crate::abi::pon_make_function(
+                dummy_entry as *const u8,
+                3,
+                intern("tail_align_case"),
+            );
+            assert!(!function.is_null());
+            let names = [intern("ta_a"), intern("ta_b"), intern("ta_c")];
+            let params = ParamSpec {
+                names: names.as_ptr(),
+                total_param_count: names.len() as u32,
+                positional_only_count: 0,
+                positional_count: 3,
+                keyword_only_count: 0,
+                varargs_name: 0,
+                varkw_name: 0,
+            };
+            let code = CodeInfo {
+                entry: dummy_entry as *const u8,
+                params: &params,
+                name_interned: intern("tail_align_case"),
+                n_locals: 3,
+                n_feedback: 0,
+                flags: 0,
+            };
+            register_function_record(function, &code, &[], &[], &[], &[]).unwrap();
+
+            let d0 = const_str("ta_d0");
+            let d1 = const_str("ta_d1");
+            let d2 = const_str("ta_d2");
+            let d3 = const_str("ta_d3");
+            let d4 = const_str("ta_d4");
+            let defaults_name = const_str("__defaults__");
+            let override_tuple = tuple_from_objects(vec![d0, d1, d2, d3, d4]);
+            assert!(!override_tuple.is_null());
+            assert_eq!(function_setattro(function, defaults_name, override_tuple), 0);
+
+            let bound = bind_arguments(
+                function,
+                &[],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(bound, vec![d2, d3, d4]);
+
+            let arg_a = const_str("ta_arg_a");
+            let bound = bind_arguments(
+                function,
+                &[arg_a],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(bound, vec![arg_a, d3, d4]);
+            unregister_function_record(function);
+        }
+    }
+
+    /// Contract: a Phase-A function (arity only, no record) honors a live
+    /// `__defaults__` override for short calls, both through `bind_arguments`
+    /// and via `fill_positional_defaults` directly; the filler declines while
+    /// no override was ever assigned or when required slots stay uncovered.
+    #[test]
+    fn phase_a_short_call_fills_trailing_slots_from_defaults_override() {
+        let _guard = crate::thread_state::test_state_lock();
+        unsafe {
+            assert_eq!(crate::abi::pon_runtime_init(), 0);
+            pon_err_clear();
+            let function = crate::abi::pon_make_function(
+                dummy_entry as *const u8,
+                3,
+                intern("phase_a_fill_case"),
+            );
+            assert!(!function.is_null());
+
+            let arg_a = const_str("pa_arg_a");
+            // Never-assigned override: the filler declines so callers keep
+            // their original arity diagnostics.
+            assert!(fill_positional_defaults(function, &[arg_a], 3).is_none());
+
+            let val_x = const_str("pa_val_x");
+            let val_y = const_str("pa_val_y");
+            let defaults_name = const_str("__defaults__");
+            let override_tuple = tuple_from_objects(vec![val_x, val_y]);
+            assert!(!override_tuple.is_null());
+            assert_eq!(function_setattro(function, defaults_name, override_tuple), 0);
+
+            let bound = bind_arguments(
+                function,
+                &[arg_a],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(bound, vec![arg_a, val_x, val_y]);
+            assert_eq!(
+                fill_positional_defaults(function, &[arg_a], 3),
+                Some(vec![arg_a, val_x, val_y])
+            );
+
+            // The first slot is not covered by the 2-tuple: still an arity
+            // error, not a partial fill.
+            let err = bind_arguments(
+                function,
+                &[],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(err.contains("function expected 3 arguments, got 0"), "got {err:?}");
+            unregister_function_record(function);
+        }
+    }
+
+    /// Contract: `__defaults__` accepts only tuple/None and `__kwdefaults__`
+    /// only dict/None — a rejected assignment returns -1, leaves the CPython
+    /// error message pending, and installs NOTHING (creation defaults stay
+    /// authoritative).
+    #[test]
+    fn setattro_rejects_non_tuple_defaults_and_non_dict_kwdefaults() {
+        let _guard = crate::thread_state::test_state_lock();
+        unsafe {
+            assert_eq!(crate::abi::pon_runtime_init(), 0);
+            pon_err_clear();
+            let function = crate::abi::pon_make_function(
+                dummy_entry as *const u8,
+                1,
+                intern("validate_override_case"),
+            );
+            assert!(!function.is_null());
+            let names = [intern("vd_a")];
+            let params = ParamSpec {
+                names: names.as_ptr(),
+                total_param_count: names.len() as u32,
+                positional_only_count: 0,
+                positional_count: 1,
+                keyword_only_count: 0,
+                varargs_name: 0,
+                varkw_name: 0,
+            };
+            let code = CodeInfo {
+                entry: dummy_entry as *const u8,
+                params: &params,
+                name_interned: intern("validate_override_case"),
+                n_locals: 1,
+                n_feedback: 0,
+                flags: 0,
+            };
+            let creation_a = const_str("vd_creation_a");
+            register_function_record(function, &code, &[creation_a], &[], &[], &[]).unwrap();
+
+            let defaults_name = const_str("__defaults__");
+            let mut list_items = [const_str("vd_list_item")];
+            let list = crate::abi::seq::pon_build_list(list_items.as_mut_ptr(), 1);
+            assert!(!list.is_null());
+            assert_eq!(function_setattro(function, defaults_name, list), -1);
+            assert!(pon_err_occurred());
+            let message = crate::thread_state::pon_err_message().unwrap_or_default();
+            assert!(
+                message.contains("__defaults__ must be set to a tuple object"),
+                "got {message:?}"
+            );
+            pon_err_clear();
+            // The rejected assignment stored no override: the creation
+            // default still fills the slot (a buggy store-as-cleared would
+            // make this bind fail).
+            let bound = bind_arguments(
+                function,
+                &[],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(bound, vec![creation_a]);
+
+            let kwdefaults_name = const_str("__kwdefaults__");
+            let not_a_dict = tuple_from_objects(vec![creation_a]);
+            assert!(!not_a_dict.is_null());
+            assert_eq!(function_setattro(function, kwdefaults_name, not_a_dict), -1);
+            assert!(pon_err_occurred());
+            let message = crate::thread_state::pon_err_message().unwrap_or_default();
+            assert!(
+                message.contains("__kwdefaults__ must be set to a dict object"),
+                "got {message:?}"
+            );
+            pon_err_clear();
+            unregister_function_record(function);
+        }
+    }
+
+    /// Contract: a `__kwdefaults__` dict assigned after creation overrides
+    /// the creation-time keyword-only default, and assigning `None` clears it
+    /// so the parameter becomes required again.
+    #[test]
+    fn kwdefaults_override_drives_keyword_only_binding_until_cleared() {
+        let _guard = crate::thread_state::test_state_lock();
+        unsafe {
+            assert_eq!(crate::abi::pon_runtime_init(), 0);
+            pon_err_clear();
+            let function = crate::abi::pon_make_function(
+                dummy_entry as *const u8,
+                2,
+                intern("kwdefaults_override_case"),
+            );
+            assert!(!function.is_null());
+            let flag_name = intern("kw_flag_param");
+            let names = [intern("kw_pos_param"), flag_name];
+            let params = ParamSpec {
+                names: names.as_ptr(),
+                total_param_count: names.len() as u32,
+                positional_only_count: 0,
+                positional_count: 1,
+                keyword_only_count: 1,
+                varargs_name: 0,
+                varkw_name: 0,
+            };
+            let code = CodeInfo {
+                entry: dummy_entry as *const u8,
+                params: &params,
+                name_interned: intern("kwdefaults_override_case"),
+                n_locals: 2,
+                n_feedback: 0,
+                flags: 0,
+            };
+            let creation_val = const_str("kw_creation_value");
+            register_function_record(function, &code, &[], &[flag_name], &[creation_val], &[])
+                .unwrap();
+
+            let arg_pos = const_str("kw_pos_value");
+            let bound = bind_arguments(
+                function,
+                &[arg_pos],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(bound, vec![arg_pos, creation_val]);
+
+            let override_val = const_str("kw_override_value");
+            let mut pairs = [const_str("kw_flag_param"), override_val];
+            let override_dict = crate::abi::map::pon_build_map(pairs.as_mut_ptr(), 1);
+            assert!(!override_dict.is_null());
+            let kwdefaults_name = const_str("__kwdefaults__");
+            assert_eq!(function_setattro(function, kwdefaults_name, override_dict), 0);
+            let bound = bind_arguments(
+                function,
+                &[arg_pos],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(bound, vec![arg_pos, override_val]);
+
+            // Clearing makes the keyword-only parameter required again — no
+            // fallback to the creation-time default.
+            let none = crate::abi::pon_none();
+            assert_eq!(function_setattro(function, kwdefaults_name, none), 0);
+            let err = bind_arguments(
+                function,
+                &[arg_pos],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("missing 1 required keyword-only argument"),
+                "got {err:?}"
+            );
+            unregister_function_record(function);
+        }
+    }
+
+    /// Contract: `__defaults__` accepts a REAL tuple-subclass instance
+    /// (`PyTuple_Check` semantics, not exact-tuple): assignment returns 0,
+    /// reads return the very same object, and binding fills trailing slots
+    /// from the subclass's embedded tuple storage — the layout-safe
+    /// `tuple_storage_slice` view, where a blind `PyTuple` cast would
+    /// misread the heap-instance layout.
+    #[test]
+    fn defaults_override_accepts_tuple_subclass_instance_and_binds_from_its_storage() {
+        let _guard = crate::thread_state::test_state_lock();
+        unsafe {
+            assert_eq!(crate::abi::pon_runtime_init(), 0);
+            pon_err_clear();
+            // A real heap class linearizing over builtin `tuple`
+            // (`class TsdDefaults(tuple): pass`) and an instance through
+            // `type_new` — the same path `TsdDefaults((b, c))` takes.
+            let tuple_base = crate::native::builtins_mod::builtin_native_type("tuple")
+                .expect("builtin tuple type");
+            let cls = crate::types::type_::build_class_from_namespace(
+                "TsdDefaults",
+                &[tuple_base.cast::<PyObject>()],
+                crate::types::type_::new_namespace(),
+                &[],
+            )
+            .cast::<PyType>();
+            assert!(!cls.is_null());
+            assert!(crate::types::tuple::type_is_tuple_subclass(cls));
+
+            let val_b = const_str("tsd_val_b");
+            let val_c = const_str("tsd_val_c");
+            let payload = tuple_from_objects(vec![val_b, val_c]);
+            assert!(!payload.is_null());
+            let ctor_args = tuple_from_objects(vec![payload]);
+            assert!(!ctor_args.is_null());
+            let instance = crate::types::type_::type_new(cls, ctor_args, ptr::null_mut());
+            assert!(!instance.is_null());
+            assert!(crate::types::tuple::is_tuple_subclass_instance(instance));
+
+            let function = crate::abi::pon_make_function(
+                dummy_entry as *const u8,
+                3,
+                intern("tsd_subclass_defaults_case"),
+            );
+            assert!(!function.is_null());
+            let names = [intern("tsd_a"), intern("tsd_b"), intern("tsd_c")];
+            let params = ParamSpec {
+                names: names.as_ptr(),
+                total_param_count: names.len() as u32,
+                positional_only_count: 0,
+                positional_count: 3,
+                keyword_only_count: 0,
+                varargs_name: 0,
+                varkw_name: 0,
+            };
+            let code = CodeInfo {
+                entry: dummy_entry as *const u8,
+                params: &params,
+                name_interned: intern("tsd_subclass_defaults_case"),
+                n_locals: 3,
+                n_feedback: 0,
+                flags: 0,
+            };
+            register_function_record(function, &code, &[], &[], &[], &[]).unwrap();
+
+            let defaults_name = const_str("__defaults__");
+            assert!(!defaults_name.is_null());
+            // The widened validation accepts tuple STORAGE: a pre-widening
+            // exact-`PyTuple` gate returned -1 for this instance.
+            assert_eq!(function_setattro(function, defaults_name, instance), 0);
+            // Identity read-back of the subclass instance itself.
+            assert_eq!(function_getattro(function, defaults_name), instance);
+
+            // One supplied arg; the trailing two slots come from the SUBCLASS
+            // storage elements.
+            let arg_a = const_str("tsd_arg_a");
+            let bound = bind_arguments(
+                function,
+                &[arg_a],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(bound, vec![arg_a, val_b, val_c]);
+            unregister_function_record(function);
+        }
+    }
+
+    /// Contract: `__kwdefaults__` accepts a REAL dict-subclass instance
+    /// (`PyDict_Check` semantics, not exact-dict): assignment returns 0,
+    /// reads return the very same object, and keyword-only binding consults
+    /// the subclass's embedded dict storage entries.
+    #[test]
+    fn kwdefaults_override_accepts_dict_subclass_instance_for_keyword_only_binding() {
+        let _guard = crate::thread_state::test_state_lock();
+        unsafe {
+            assert_eq!(crate::abi::pon_runtime_init(), 0);
+            pon_err_clear();
+            // A real heap class linearizing over builtin `dict`
+            // (`class KsdDict(dict): pass`); `type_new` allocates the empty
+            // embedded storage and `dict_insert` populates it.
+            let type_type = crate::abi::runtime_type_type();
+            assert!(!type_type.is_null());
+            let dict_base = dict::dict_type(type_type);
+            let cls = crate::types::type_::build_class_from_namespace(
+                "KsdDict",
+                &[dict_base.cast::<PyObject>()],
+                crate::types::type_::new_namespace(),
+                &[],
+            )
+            .cast::<PyType>();
+            assert!(!cls.is_null());
+            let instance = crate::types::type_::type_new(cls, ptr::null_mut(), ptr::null_mut());
+            assert!(!instance.is_null());
+            assert!(dict::is_dict_subclass_instance(instance));
+            let override_val = const_str("ksd_override_value");
+            dict::dict_insert(instance, const_str("ksd_flag_param"), override_val).unwrap();
+
+            let function = crate::abi::pon_make_function(
+                dummy_entry as *const u8,
+                2,
+                intern("ksd_subclass_kwdefaults_case"),
+            );
+            assert!(!function.is_null());
+            let flag_name = intern("ksd_flag_param");
+            let names = [intern("ksd_pos_param"), flag_name];
+            let params = ParamSpec {
+                names: names.as_ptr(),
+                total_param_count: names.len() as u32,
+                positional_only_count: 0,
+                positional_count: 1,
+                keyword_only_count: 1,
+                varargs_name: 0,
+                varkw_name: 0,
+            };
+            let code = CodeInfo {
+                entry: dummy_entry as *const u8,
+                params: &params,
+                name_interned: intern("ksd_subclass_kwdefaults_case"),
+                n_locals: 2,
+                n_feedback: 0,
+                flags: 0,
+            };
+            register_function_record(function, &code, &[], &[], &[], &[]).unwrap();
+
+            // No creation-time kwdefault: the keyword-only parameter is
+            // required, so the successful bind below can only come from the
+            // subclass override.
+            let arg_pos = const_str("ksd_pos_value");
+            let err = bind_arguments(
+                function,
+                &[arg_pos],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("missing 1 required keyword-only argument"),
+                "got {err:?}"
+            );
+
+            let kwdefaults_name = const_str("__kwdefaults__");
+            // The widened validation accepts dict STORAGE: a pre-widening
+            // exact-dict gate returned -1 for this instance.
+            assert_eq!(function_setattro(function, kwdefaults_name, instance), 0);
+            assert_eq!(function_getattro(function, kwdefaults_name), instance);
+
+            let bound = bind_arguments(
+                function,
+                &[arg_pos],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(bound, vec![arg_pos, override_val]);
+            unregister_function_record(function);
+        }
+    }
 }
