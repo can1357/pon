@@ -11,6 +11,7 @@
         "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
       },
       "requires-python": ">=3.8",
+      "core-metadata": true,
       "yanked": false
     }
   ]

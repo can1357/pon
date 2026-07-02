@@ -1,10 +1,13 @@
 pub mod compat;
 pub mod filename;
 pub(crate) mod record;
+pub(crate) mod scripts;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use base64::Engine as _;
@@ -15,45 +18,34 @@ use zip::result::ZipError;
 
 use crate::env::EnvLayout;
 use crate::error::{Error, Result};
-use crate::install::{InstallReport, InstalledPackageRecord, ResolvedRecord, upsert_installed_package};
+use crate::install::{
+    InstallReport, InstalledPackageRecord, ResolvedRecord, direct_url::DirectUrl, upsert_installed_package,
+};
 
-use self::compat::{WheelCompatibility, classify_archive_member, classify_root_is_purelib, classify_tags, default_supported_tags};
+use self::compat::{
+    WheelCompatibility, classify_archive_member, classify_root_is_purelib, classify_tags, default_supported_tags,
+};
 use self::filename::WheelFilename;
-use self::record::{RecordEntry, parse_record};
-
-struct CatalogPackage {
-    normalized_name: &'static str,
-    import_name: &'static str,
-    module_body_prefix: &'static str,
-}
+use self::record::{RecordEntry, parse_record, write_record};
+use self::scripts::{EntryPoint, parse_entry_points};
 
 struct WheelInspection {
     record_path: PathBuf,
     record_text: String,
+    top_level_text: Option<String>,
+    entry_points_text: Option<String>,
 }
 
-const IDNA_MODULE_PREFIX: &str = "def encode(value):\n    return value.encode(\"idna\")\n\n__version__ = ";
-const FLIT_CORE_MODULE_PREFIX: &str = "__version__ = ";
-
-const CATALOG_PACKAGES: &[CatalogPackage] = &[
-    CatalogPackage {
-        normalized_name: "idna",
-        import_name: "idna",
-        module_body_prefix: IDNA_MODULE_PREFIX,
-    },
-    CatalogPackage {
-        normalized_name: "flit-core",
-        import_name: "flit_core",
-        module_body_prefix: FLIT_CORE_MODULE_PREFIX,
-    },
-    CatalogPackage {
-        normalized_name: "pon-flit-fixture",
-        import_name: "pon_flit_fixture",
-        module_body_prefix: "__version__ = ",
-    },
-];
-
-pub fn install_wheel(env: &EnvLayout, resolved_record: &ResolvedRecord, filename: &str) -> Result<InstallReport> {
+pub fn install_wheel(
+    env: &EnvLayout,
+    resolved_record: &ResolvedRecord,
+    wheel_path: &Path,
+    direct_url: Option<&DirectUrl>,
+) -> Result<InstallReport> {
+    let filename = wheel_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::InvalidWheelFilename(wheel_path.display().to_string()))?;
     let wheel = validate_compatible_wheel(filename)?;
     let normalized_record_name = resolved_record.normalized_name();
     if wheel.normalized_distribution != normalized_record_name {
@@ -62,57 +54,88 @@ pub fn install_wheel(env: &EnvLayout, resolved_record: &ResolvedRecord, filename
             wheel.normalized_distribution, normalized_record_name
         )));
     }
-    let source_path = wheel_source_path(filename)?;
-    let mut archive = open_archive(&source_path, filename)?;
+
+    let mut archive = open_archive(wheel_path, filename)?;
     let inspection = inspect_archive(filename, &mut archive)?;
-    let record_entries = parse_record(&inspection.record_text, &inspection.record_path.display().to_string())?;
-    let package = catalog_package(&normalized_record_name)?;
+    let parsed_record_entries = parse_record(&inspection.record_text, &inspection.record_path.display().to_string())?;
+    let dist_info_dir = dist_info_dir(&inspection.record_path, filename)?;
+    let record_path = dist_info_dir.join("RECORD");
 
     env.create_dirs()?;
-    extract_archive(env, filename, &mut archive, &record_entries)?;
+    let mut installed_record_entries = extract_archive(
+        env,
+        filename,
+        &wheel,
+        &mut archive,
+        &parsed_record_entries,
+        &record_path,
+    )?;
+
+    let import_names = import_names(&inspection.top_level_text, &installed_record_entries);
+
+    installed_record_entries.push(write_recorded_file(
+        &env.site_packages.join(&dist_info_dir).join("INSTALLER"),
+        path_to_record_string(&dist_info_dir.join("INSTALLER"))?,
+        b"pon-pm\n",
+        false,
+    )?);
+
+    if let Some(direct_url) = direct_url {
+        let mut direct_url_json = direct_url.to_json()?;
+        if !direct_url_json.ends_with('\n') {
+            direct_url_json.push('\n');
+        }
+        installed_record_entries.push(write_recorded_file(
+            &env.site_packages.join(&dist_info_dir).join("direct_url.json"),
+            path_to_record_string(&dist_info_dir.join("direct_url.json"))?,
+            direct_url_json.as_bytes(),
+            false,
+        )?);
+    }
+
+    if let Some(entry_points_text) = &inspection.entry_points_text {
+        let entry_points = parse_entry_points(entry_points_text, &format!("{filename} entry_points.txt"))?;
+        for entry_point in entry_points
+            .console_scripts
+            .iter()
+            .chain(entry_points.gui_scripts.iter())
+        {
+            let script_entry = write_entry_point_script(
+                env,
+                filename,
+                &normalized_record_name,
+                &resolved_record.version,
+                entry_point,
+            )?;
+            installed_record_entries.retain(|entry| entry.path != script_entry.path);
+            installed_record_entries.push(script_entry);
+        }
+    }
+
+    installed_record_entries.push(RecordEntry {
+        path: path_to_record_string(&record_path)?,
+        hash: None,
+        size: None,
+    });
+    let record_text = write_record(&installed_record_entries);
+    write_file(&env.site_packages.join(&record_path), record_text.as_bytes())?;
+
     upsert_installed_package(
         env,
         InstalledPackageRecord {
             name: normalized_record_name.clone(),
             version: resolved_record.version.clone(),
             artifact_kind: "wheel".to_owned(),
-            import_names: vec![package.import_name.to_owned()],
-            record_path: Some(inspection.record_path),
+            import_names: import_names.clone(),
+            record_path: Some(record_path),
         },
     )?;
+
     Ok(InstallReport {
         package_name: normalized_record_name,
         version: resolved_record.version.clone(),
         artifact_kind: "wheel".to_owned(),
-        import_names: vec![package.import_name.to_owned()],
-    })
-}
-
-pub fn install_catalog_package(
-    env: &EnvLayout,
-    normalized_name: &str,
-    version: &str,
-    artifact_kind: &str,
-) -> Result<InstallReport> {
-    let package = catalog_package(normalized_name)?;
-
-    env.create_dirs()?;
-    materialize_import_marker(env, package, version)?;
-    upsert_installed_package(
-        env,
-        InstalledPackageRecord {
-            name: normalized_name.to_owned(),
-            version: version.to_owned(),
-            artifact_kind: artifact_kind.to_owned(),
-            import_names: vec![package.import_name.to_owned()],
-            record_path: None,
-        },
-    )?;
-    Ok(InstallReport {
-        package_name: normalized_name.to_owned(),
-        version: version.to_owned(),
-        artifact_kind: artifact_kind.to_owned(),
-        import_names: vec![package.import_name.to_owned()],
+        import_names,
     })
 }
 
@@ -121,36 +144,6 @@ pub fn validate_compatible_wheel(filename: &str) -> Result<WheelFilename> {
     match classify_tags(&wheel.tags(), &default_supported_tags()) {
         WheelCompatibility::PurePython => Ok(wheel),
         WheelCompatibility::CAbiRefused { reason } => Err(cabi_refused(filename, &reason)),
-    }
-}
-
-fn catalog_package(normalized_name: &str) -> Result<&'static CatalogPackage> {
-    CATALOG_PACKAGES
-        .iter()
-        .find(|package| package.normalized_name == normalized_name)
-        .ok_or_else(|| {
-            Error::UnsupportedArtifact(format!(
-                "package `{normalized_name}` is not in the deterministic Pon package catalog"
-            ))
-        })
-}
-
-fn wheel_source_path(filename: &str) -> Result<PathBuf> {
-    let path = Path::new(filename);
-    if path.is_file() {
-        return Ok(path.to_path_buf());
-    }
-    let basename = path.file_name().and_then(|name| name.to_str()).unwrap_or(filename);
-    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures")
-        .join("wheels")
-        .join(basename);
-    if fixture_path.is_file() {
-        Ok(fixture_path)
-    } else {
-        Err(Error::UnsupportedArtifact(format!(
-            "wheel `{filename}` is not available in the bundled Pon wheel fixtures"
-        )))
     }
 }
 
@@ -163,6 +156,8 @@ fn inspect_archive(filename: &str, archive: &mut ZipArchive<File>) -> Result<Whe
     let mut wheel_metadata = None;
     let mut record_path = None;
     let mut record_text = None;
+    let mut top_level_text = None;
+    let mut entry_points_text = None;
 
     for index in 0..archive.len() {
         let mut member = archive.by_index(index).map_err(|error| zip_error(filename, error))?;
@@ -171,6 +166,7 @@ fn inspect_archive(filename: &str, archive: &mut ZipArchive<File>) -> Result<Whe
             WheelCompatibility::PurePython => {}
             WheelCompatibility::CAbiRefused { reason } => return Err(cabi_refused(filename, &reason)),
         }
+
         if member_name.ends_with(".dist-info/WHEEL") {
             let mut metadata = String::new();
             member.read_to_string(&mut metadata)?;
@@ -180,11 +176,21 @@ fn inspect_archive(filename: &str, archive: &mut ZipArchive<File>) -> Result<Whe
             member.read_to_string(&mut text)?;
             record_path = Some(safe_site_relative_path(&member_name)?);
             record_text = Some(text);
+        } else if member_name.ends_with(".dist-info/top_level.txt") {
+            let mut text = String::new();
+            member.read_to_string(&mut text)?;
+            top_level_text = Some(text);
+        } else if member_name.ends_with(".dist-info/entry_points.txt") {
+            let mut text = String::new();
+            member.read_to_string(&mut text)?;
+            entry_points_text = Some(text);
         }
     }
 
     let metadata = wheel_metadata.ok_or_else(|| {
-        Error::UnsupportedArtifact(format!("wheel `{filename}` does not contain a .dist-info/WHEEL member"))
+        Error::UnsupportedArtifact(format!(
+            "wheel `{filename}` does not contain a .dist-info/WHEEL member"
+        ))
     })?;
     match classify_root_is_purelib(&metadata) {
         WheelCompatibility::PurePython => {}
@@ -193,52 +199,286 @@ fn inspect_archive(filename: &str, archive: &mut ZipArchive<File>) -> Result<Whe
 
     Ok(WheelInspection {
         record_path: record_path.ok_or_else(|| {
-            Error::UnsupportedArtifact(format!("wheel `{filename}` does not contain a .dist-info/RECORD member"))
+            Error::UnsupportedArtifact(format!(
+                "wheel `{filename}` does not contain a .dist-info/RECORD member"
+            ))
         })?,
         record_text: record_text.expect("record path and text are set together"),
+        top_level_text,
+        entry_points_text,
     })
 }
 
 fn extract_archive(
     env: &EnvLayout,
     filename: &str,
+    wheel: &WheelFilename,
     archive: &mut ZipArchive<File>,
     record_entries: &[RecordEntry],
-) -> Result<()> {
-    let records = record_entries
+    record_path: &Path,
+) -> Result<Vec<RecordEntry>> {
+    let record_by_path = record_entries
         .iter()
         .map(|entry| (entry.path.as_str(), entry))
         .collect::<BTreeMap<_, _>>();
+    let dist_info_dir = dist_info_dir(record_path, filename)?;
+    let generated_installer = dist_info_dir.join("INSTALLER");
+    let generated_direct_url = dist_info_dir.join("direct_url.json");
+    let mut installed_entries = Vec::new();
 
     for index in 0..archive.len() {
         let mut member = archive.by_index(index).map_err(|error| zip_error(filename, error))?;
         let member_name = member.name().to_owned();
         let relative_path = safe_site_relative_path(&member_name)?;
-        let destination = env.site_packages.join(&relative_path);
+        let destination = archive_destination(env, filename, wheel, &member_name, &relative_path)?;
 
         if member.is_dir() {
             fs::create_dir_all(&destination)?;
             continue;
         }
 
-        let Some(record_entry) = records.get(member_name.as_str()).copied() else {
+        let Some(record_entry) = record_by_path.get(member_name.as_str()).copied() else {
             return Err(Error::UnsupportedArtifact(format!(
                 "wheel `{filename}` member `{member_name}` is missing from RECORD"
             )));
         };
 
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
+        if relative_path == record_path {
+            continue;
         }
-        let mut out = File::create(&destination)?;
-        let mut hasher = Sha256::new();
-        let copied = copy_and_hash(&mut member, &mut out, &mut hasher)?;
-        if let Err(error) = verify_record_entry(filename, record_entry, copied, hasher.finalize()) {
-            let _ = fs::remove_file(&destination);
-            return Err(error);
+
+        if relative_path == generated_installer || relative_path == generated_direct_url {
+            verify_recorded_member(filename, record_entry, &mut member)?;
+            continue;
+        }
+
+        if data_scheme(wheel, &member_name) == Some("scripts") {
+            installed_entries.push(extract_script_member(
+                env,
+                filename,
+                record_entry,
+                &mut member,
+                &destination,
+            )?);
+        } else {
+            installed_entries.push(extract_regular_member(
+                env,
+                filename,
+                record_entry,
+                &mut member,
+                &destination,
+            )?);
         }
     }
-    Ok(())
+
+    Ok(installed_entries)
+}
+
+fn extract_regular_member(
+    env: &EnvLayout,
+    filename: &str,
+    record_entry: &RecordEntry,
+    reader: &mut impl Read,
+    destination: &Path,
+) -> Result<RecordEntry> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut out = File::create(destination)?;
+    let mut hasher = Sha256::new();
+    let copied = copy_and_hash(reader, &mut out, &mut hasher)?;
+    let digest = hasher.finalize();
+    if let Err(error) = verify_record_entry(filename, record_entry, copied, &digest) {
+        let _ = fs::remove_file(destination);
+        return Err(error);
+    }
+    Ok(record_entry_from_digest(
+        record_path_for_destination(env, destination)?,
+        copied,
+        &digest,
+    ))
+}
+
+fn extract_script_member(
+    env: &EnvLayout,
+    filename: &str,
+    record_entry: &RecordEntry,
+    reader: &mut impl Read,
+    destination: &Path,
+) -> Result<RecordEntry> {
+    let mut original = Vec::new();
+    reader.read_to_end(&mut original)?;
+    let original_digest = Sha256::digest(&original);
+    verify_record_entry(filename, record_entry, original.len() as u64, &original_digest)?;
+
+    let installed = rewrite_python_shebang(original);
+    write_file(destination, &installed)?;
+    chmod_executable(destination)?;
+    Ok(record_entry_from_bytes(
+        record_path_for_destination(env, destination)?,
+        &installed,
+    ))
+}
+
+fn verify_recorded_member(filename: &str, record_entry: &RecordEntry, reader: &mut impl Read) -> Result<()> {
+    let mut sink = std::io::sink();
+    let mut hasher = Sha256::new();
+    let copied = copy_and_hash(reader, &mut sink, &mut hasher)?;
+    let digest = hasher.finalize();
+    verify_record_entry(filename, record_entry, copied, &digest)
+}
+
+fn archive_destination(
+    env: &EnvLayout,
+    filename: &str,
+    wheel: &WheelFilename,
+    member_name: &str,
+    relative_path: &Path,
+) -> Result<PathBuf> {
+    let Some((scheme, rest)) = data_member_parts(wheel, member_name)? else {
+        return Ok(env.site_packages.join(relative_path));
+    };
+    let rest = if rest.is_empty() {
+        PathBuf::new()
+    } else {
+        safe_site_relative_path(rest)?
+    };
+    match scheme {
+        "purelib" | "platlib" => Ok(env.site_packages.join(rest)),
+        "scripts" => Ok(env.scripts_dir.join(rest)),
+        "data" => Ok(env.pon_dir.join(rest)),
+        "headers" => Ok(env.pon_dir.join("include").join(&wheel.normalized_distribution).join(rest)),
+        _ => Err(Error::UnsupportedArtifact(format!(
+            "wheel `{filename}` has unsupported data scheme `{scheme}`"
+        ))),
+    }
+}
+
+fn data_scheme<'a>(wheel: &WheelFilename, member_name: &'a str) -> Option<&'a str> {
+    data_member_parts(wheel, member_name).ok().flatten().map(|(scheme, _)| scheme)
+}
+
+fn data_member_parts<'a>(
+    wheel: &WheelFilename,
+    member_name: &'a str,
+) -> Result<Option<(&'a str, &'a str)>> {
+    let data_prefix = format!("{}-{}.data/", wheel.distribution, wheel.version);
+    let Some(rest) = member_name.strip_prefix(&data_prefix) else {
+        return Ok(None);
+    };
+    let Some((scheme, rest)) = rest.split_once('/') else {
+        return Err(Error::UnsupportedArtifact(format!(
+            "wheel member `{member_name}` has a malformed .data path"
+        )));
+    };
+    if scheme.is_empty() {
+        return Err(Error::UnsupportedArtifact(format!(
+            "wheel member `{member_name}` has a malformed .data path"
+        )));
+    }
+    Ok(Some((scheme, rest)))
+}
+
+fn write_entry_point_script(
+    env: &EnvLayout,
+    filename: &str,
+    dist: &str,
+    version: &str,
+    entry_point: &EntryPoint,
+) -> Result<RecordEntry> {
+    let script_name = safe_script_name(filename, &entry_point.name)?;
+    let target = format!("{}:{}", entry_point.module, entry_point.attr);
+    if target.contains('\'') {
+        return Err(Error::UnsupportedArtifact(format!(
+            "wheel `{filename}` entry point `{}` contains an unsupported quote",
+            entry_point.name
+        )));
+    }
+    let content = format!(
+        "#!/bin/sh\n# generated by pon-pm; console script for {dist} {version}\nexec \"${{PON_PM:-pon-pm}}\" run --entry '{target}' -- \"$@\"\n"
+    );
+    let path = env.scripts_dir.join(script_name);
+    let record_path = record_path_for_destination(env, &path)?;
+    write_recorded_file(&path, record_path, content.as_bytes(), true)
+}
+
+fn safe_script_name(filename: &str, name: &str) -> Result<PathBuf> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') {
+        return Err(Error::UnsupportedArtifact(format!(
+            "wheel `{filename}` entry point script name `{name}` is not safe"
+        )));
+    }
+    let path = Path::new(name);
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(path.to_path_buf()),
+        _ => Err(Error::UnsupportedArtifact(format!(
+            "wheel `{filename}` entry point script name `{name}` is not safe"
+        ))),
+    }
+}
+
+fn import_names(top_level_text: &Option<String>, record_entries: &[RecordEntry]) -> Vec<String> {
+    if let Some(top_level_text) = top_level_text {
+        let names = dedupe_preserving_order(
+            top_level_text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned),
+        );
+        if !names.is_empty() {
+            return names;
+        }
+    }
+    import_names_from_record(record_entries)
+}
+
+fn import_names_from_record(entries: &[RecordEntry]) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        let path = Path::new(&entry.path);
+        let mut components = path.components();
+        let Some(Component::Normal(first)) = components.next() else {
+            continue;
+        };
+        let Some(first) = first.to_str() else {
+            continue;
+        };
+        if first.ends_with(".dist-info") || first.ends_with(".data") {
+            continue;
+        }
+        match components.next() {
+            Some(Component::Normal(second)) if second.to_str() == Some("__init__.py") => {
+                names.insert(first.to_owned());
+            }
+            None if first.ends_with(".py") => {
+                names.insert(first.trim_end_matches(".py").to_owned());
+            }
+            _ => {}
+        }
+    }
+    names.into_iter().collect()
+}
+
+fn dedupe_preserving_order(names: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut out = Vec::new();
+    for name in names {
+        if seen.insert(name.clone()) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+fn dist_info_dir(record_path: &Path, filename: &str) -> Result<PathBuf> {
+    record_path.parent().map(Path::to_path_buf).ok_or_else(|| {
+        Error::UnsupportedArtifact(format!(
+            "wheel `{filename}` RECORD path `{}` is not inside a .dist-info directory",
+            record_path.display()
+        ))
+    })
 }
 
 fn copy_and_hash(reader: &mut impl Read, writer: &mut impl Write, hasher: &mut Sha256) -> Result<u64> {
@@ -261,13 +501,13 @@ fn verify_record_entry(
     copied: u64,
     digest: impl AsRef<[u8]>,
 ) -> Result<()> {
-    if let Some(size) = record_entry.size {
-        if size != copied {
-            return Err(Error::UnsupportedArtifact(format!(
-                "wheel `{filename}` member `{}` failed RECORD size verification: expected {size}, got {copied}",
-                record_entry.path
-            )));
-        }
+    if let Some(size) = record_entry.size
+        && copied != size
+    {
+        return Err(Error::UnsupportedArtifact(format!(
+            "wheel `{filename}` member `{}` failed RECORD size verification: expected {size}, got {copied}",
+            record_entry.path
+        )));
     }
     let Some(hash) = &record_entry.hash else {
         return Ok(());
@@ -300,7 +540,10 @@ fn safe_site_relative_path(path: &str) -> Result<PathBuf> {
     }
     let path = Path::new(path);
     if path.is_absolute() {
-        return Err(Error::UnsupportedArtifact(format!("unsafe wheel member path `{}`", path.display())));
+        return Err(Error::UnsupportedArtifact(format!(
+            "unsafe wheel member path `{}`",
+            path.display()
+        )));
     }
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -308,14 +551,118 @@ fn safe_site_relative_path(path: &str) -> Result<PathBuf> {
             Component::Normal(part) => out.push(part),
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(Error::UnsupportedArtifact(format!("unsafe wheel member path `{}`", path.display())));
+                return Err(Error::UnsupportedArtifact(format!(
+                    "unsafe wheel member path `{}`",
+                    path.display()
+                )));
             }
         }
     }
     if out.as_os_str().is_empty() {
-        return Err(Error::UnsupportedArtifact(format!("unsafe wheel member path `{}`", path.display())));
+        return Err(Error::UnsupportedArtifact(format!(
+            "unsafe wheel member path `{}`",
+            path.display()
+        )));
     }
     Ok(out)
+}
+
+fn record_path_for_destination(env: &EnvLayout, destination: &Path) -> Result<String> {
+    if let Ok(relative) = destination.strip_prefix(&env.site_packages) {
+        return path_to_record_string(relative);
+    }
+    if let Ok(relative) = destination.strip_prefix(&env.pon_dir) {
+        return path_to_record_string(&Path::new("..").join("..").join(relative));
+    }
+    Err(Error::UnsupportedArtifact(format!(
+        "installed wheel path `{}` is outside the pon environment",
+        destination.display()
+    )))
+}
+
+fn path_to_record_string(path: &Path) -> Result<String> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => parts.push(path_component_to_string(part)?),
+            Component::ParentDir => parts.push("..".to_owned()),
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(Error::UnsupportedArtifact(format!(
+                    "RECORD path `{}` is not relative",
+                    path.display()
+                )));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(Error::UnsupportedArtifact("RECORD path is empty".to_owned()));
+    }
+    Ok(parts.join("/"))
+}
+
+fn path_component_to_string(component: &std::ffi::OsStr) -> Result<String> {
+    component.to_str().map(ToOwned::to_owned).ok_or_else(|| {
+        Error::UnsupportedArtifact(format!(
+            "wheel installed path component `{}` is not valid UTF-8",
+            component.to_string_lossy()
+        ))
+    })
+}
+
+fn record_entry_from_bytes(path: String, bytes: &[u8]) -> RecordEntry {
+    let digest = Sha256::digest(bytes);
+    record_entry_from_digest(path, bytes.len() as u64, &digest)
+}
+
+fn record_entry_from_digest(path: String, size: u64, digest: impl AsRef<[u8]>) -> RecordEntry {
+    RecordEntry {
+        path,
+        hash: Some(format!("sha256={}", URL_SAFE_NO_PAD.encode(digest.as_ref()))),
+        size: Some(size),
+    }
+}
+
+fn write_recorded_file(path: &Path, record_path: String, content: &[u8], executable: bool) -> Result<RecordEntry> {
+    write_file(path, content)?;
+    if executable {
+        chmod_executable(path)?;
+    }
+    Ok(record_entry_from_bytes(record_path, content))
+}
+
+fn write_file(path: &Path, content: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, content)?;
+    Ok(())
+}
+
+fn rewrite_python_shebang(mut bytes: Vec<u8>) -> Vec<u8> {
+    if !bytes.starts_with(b"#!python") {
+        return bytes;
+    }
+    let mut rewritten = b"#!/usr/bin/env -S pon-pm run".to_vec();
+    if let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') {
+        rewritten.extend_from_slice(&bytes[newline..]);
+    }
+    bytes.clear();
+    rewritten
+}
+
+fn chmod_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 fn cabi_refused(filename: &str, reason: &str) -> Error {
@@ -328,42 +675,6 @@ fn zip_error(filename: &str, error: ZipError) -> Error {
     Error::UnsupportedArtifact(format!("invalid wheel archive `{filename}`: {error}"))
 }
 
-fn materialize_import_marker(env: &EnvLayout, package: &CatalogPackage, version: &str) -> Result<()> {
-    let module_body = format!("{}{:?}\n", package.module_body_prefix, version);
-    let module_path = env.site_packages.join(format!("{}.py", package.import_name));
-    write_file(&module_path, &module_body)?;
-
-    let package_dir = env.site_packages.join(package.import_name);
-    fs::create_dir_all(&package_dir)?;
-    write_file(&package_dir.join("__init__.py"), &module_body)?;
-    write_file(
-        &package_dir.join("__pon_package__.txt"),
-        &format!(
-            "name={}\nversion={}\nimport-name={}\nartifact=pure\n",
-            package.normalized_name, version, package.import_name
-        ),
-    )?;
-
-    let dist_info_dir = env
-        .site_packages
-        .join(format!("{}-{}.dist-info", package.import_name, version));
-    fs::create_dir_all(&dist_info_dir)?;
-    write_file(
-        &dist_info_dir.join("METADATA"),
-        &format!("Name: {}\nVersion: {}\n", package.normalized_name, version),
-    )?;
-    write_file(&dist_info_dir.join("INSTALLER"), "pon\n")?;
-    Ok(())
-}
-
-fn write_file(path: &Path, content: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, content)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -374,9 +685,10 @@ mod tests {
     #[test]
     fn installs_idna_pure_wheel_by_extracting_fixture_and_registry_record() {
         let layout = EnvLayout::new(temp_project("idna-wheel"));
+        let wheel_path = fixture_wheel("idna-3.10-py3-none-any.whl");
         let record = ResolvedRecord::wheel("idna", "3.10", "idna-3.10-py3-none-any.whl");
 
-        let report = install_wheel(&layout, &record, "idna-3.10-py3-none-any.whl").expect("install");
+        let report = install_wheel(&layout, &record, &wheel_path, None).expect("install");
 
         assert_eq!(report.import_names, vec!["idna"]);
         assert!(layout.site_packages.join("idna").join("__init__.py").is_file());
@@ -394,9 +706,10 @@ mod tests {
     #[test]
     fn installs_flit_core_pure_wheel_by_extracting_fixture() {
         let layout = EnvLayout::new(temp_project("flit-core-wheel"));
+        let wheel_path = fixture_wheel("flit_core-3.12.0-py3-none-any.whl");
         let record = ResolvedRecord::wheel("flit-core", "3.12.0", "flit_core-3.12.0-py3-none-any.whl");
 
-        install_wheel(&layout, &record, "flit_core-3.12.0-py3-none-any.whl").expect("install");
+        install_wheel(&layout, &record, &wheel_path, None).expect("install");
 
         let marker = fs::read_to_string(layout.site_packages.join("flit_core").join("__init__.py")).expect("marker");
         assert!(marker.contains("__version__ = \"3.12.0\""));
@@ -405,8 +718,9 @@ mod tests {
     #[test]
     fn remove_round_trip_deletes_record_files_and_empty_parents() {
         let layout = EnvLayout::new(temp_project("remove-wheel"));
+        let wheel_path = fixture_wheel("idna-3.10-py3-none-any.whl");
         let record = ResolvedRecord::wheel("idna", "3.10", "idna-3.10-py3-none-any.whl");
-        install_wheel(&layout, &record, "idna-3.10-py3-none-any.whl").expect("install");
+        install_wheel(&layout, &record, &wheel_path, None).expect("install");
 
         let removed = remove_installed_package(&layout, "IDNA").expect("remove");
 
@@ -448,9 +762,9 @@ mod tests {
             ],
         );
         let layout = EnvLayout::new(root.join("project"));
-        let record = ResolvedRecord::wheel("demo", "1.0", wheel_path.display().to_string());
+        let record = ResolvedRecord::wheel("demo", "1.0", "demo-1.0-py3-none-any.whl");
 
-        let error = install_wheel(&layout, &record, &wheel_path.display().to_string()).expect_err("native member");
+        let error = install_wheel(&layout, &record, &wheel_path, None).expect_err("native member");
 
         let message = error.to_string();
         assert!(message.contains("ob_refcnt"));
@@ -476,6 +790,13 @@ mod tests {
         zip.write_all(record_rows.join("\n").as_bytes()).expect("record body");
         zip.write_all(b"\n").expect("record newline");
         zip.finish().expect("finish");
+    }
+
+    fn fixture_wheel(filename: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures")
+            .join("wheels")
+            .join(filename)
     }
 
     fn temp_project(label: &str) -> std::path::PathBuf {

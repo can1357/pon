@@ -705,6 +705,22 @@ impl PinnedArtifact {
 }
 
 fn pin_local_path(path: &Path, editable: bool) -> Result<PinnedCandidate> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest_relative = manifest_dir.join(path);
+    let workspace_relative = manifest_dir
+        .parent()
+        .map(|parent| parent.join(path))
+        .unwrap_or_else(|| path.to_path_buf());
+    let path = if path.exists() {
+        path.to_path_buf()
+    } else if manifest_relative.exists() {
+        manifest_relative
+    } else if workspace_relative.exists() {
+        workspace_relative
+    } else {
+        path.to_path_buf()
+    };
+    let path = path.as_path();
     let (pyproject, artifact) = if path.is_dir() {
         let manifest_path = path.join("pyproject.toml");
         if !manifest_path.is_file() {

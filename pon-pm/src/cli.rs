@@ -10,9 +10,9 @@ use crate::index::{DEFAULT_INDEX_URL, PackageIndex, SelectedIndex};
 use crate::install::{ResolvedRecord, install_package, remove_installed_package};
 use crate::lock::LockFile;
 use crate::pyproject::PyProject;
-use crate::requirement::{RequirementInput, parse_requirement_input};
-use crate::resolve::provider::{ResolveProvider, ResolvedPackage};
-use crate::resolve::source::{PackageKind, PackageRecord};
+use crate::resolve::provider::{PonProvider, ResolveProvider};
+use crate::resolve::source::{IndexSource, PackageKind, PackageRecord};
+use crate::resolve::{ResolvedArtifact, ResolvedDist, resolve_root};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProjectOptions {
@@ -167,31 +167,70 @@ fn run_command(mut args: impl Iterator<Item = String>) -> Result<()> {
             .next()
             .ok_or_else(|| Error::Cli("missing code after `run -c`".to_owned()))?;
         reject_extra(args.next(), "run")?;
-        return run_inline_code(&layout, &code, extra_env);
+        let argv = [String::from("-c")];
+        return run_inline_code(&layout, &code, extra_env, &argv);
     }
 
-    reject_extra(args.next(), "run")?;
-    pon_cli::run_file_with_env(first, extra_env).map_err(|error| Error::Cli(format!("{error:#}")))
+    if first == "--entry" {
+        let entry = args
+            .next()
+            .ok_or_else(|| Error::Cli("missing entry point after `run --entry`".to_owned()))?;
+        let mut entry_args = args.collect::<Vec<_>>();
+        if entry_args.first().is_some_and(|arg| arg == "--") {
+            entry_args.remove(0);
+        }
+        let (module, attr) = entry
+            .split_once(':')
+            .filter(|(module, attr)| !module.is_empty() && !attr.is_empty())
+            .ok_or_else(|| Error::Cli("entry point must be `<module>:<attr>`".to_owned()))?;
+        let code = format!("import {module} as _pon_entry\n_pon_entry.{attr}()\n");
+        let mut argv = Vec::with_capacity(entry_args.len() + 1);
+        argv.push(entry);
+        argv.extend(entry_args);
+        return run_inline_code(&layout, &code, extra_env, &argv);
+    }
+
+    let mut argv = Vec::with_capacity(args.size_hint().0 + 1);
+    argv.push(first.clone());
+    argv.extend(args);
+    pon_cli::run_file_with_env(first.as_str(), extra_env, &argv).map_err(|error| Error::Cli(format!("{error:#}")))
 }
 
-fn run_inline_code(layout: &EnvLayout, code: &str, extra_env: Vec<(OsString, OsString)>) -> Result<()> {
+fn run_inline_code(
+    layout: &EnvLayout,
+    code: &str,
+    extra_env: Vec<(OsString, OsString)>,
+    argv: &[String],
+) -> Result<()> {
     let run_dir = layout.pon_dir.join("run");
     fs::create_dir_all(&run_dir)?;
     let counter = INLINE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let path = run_dir.join(format!("inline-{}-{counter}.py", std::process::id()));
     fs::write(&path, code)?;
-    let result = pon_cli::run_file_with_env(&path, extra_env).map_err(|error| Error::Cli(format!("{error:#}")));
+    let result = pon_cli::run_file_with_env(&path, extra_env, argv)
+        .map_err(|error| Error::Cli(format!("{error:#}")));
     let _ = fs::remove_file(path);
     result
 }
 
-fn resolve_manifest(manifest: &PyProject, index: &impl PackageIndex) -> Result<Vec<ResolvedPackage>> {
+fn resolve_manifest(manifest: &PyProject, index: &impl PackageIndex) -> Result<Vec<ResolvedDist>> {
     let requirements = manifest.dependencies();
-    let dependencies = ResolveProvider::new(index).resolve_requirements(requirements.iter().map(String::as_str))?;
-    for dependency in &dependencies {
+    let legacy_dependencies = ResolveProvider::new(index).resolve_requirements(requirements.iter().map(String::as_str))?;
+    for dependency in &legacy_dependencies {
         reject_cabi_package(&dependency.record)?;
     }
+
+    let dependencies = resolve_dists(index, requirements.iter().map(String::as_str))?;
+    for dependency in &dependencies {
+        reject_cabi_dist(dependency)?;
+    }
     Ok(dependencies)
+}
+
+fn resolve_dists<'a>(index: &impl PackageIndex, requirements: impl IntoIterator<Item = &'a str>) -> Result<Vec<ResolvedDist>> {
+    let source = IndexSource::new(index);
+    let provider = PonProvider::from_requirements(&source, requirements)?;
+    resolve_root(&provider).map(|resolution| resolution.dists)
 }
 
 fn resolve_requirement(index: &impl PackageIndex, requirement: &str) -> Result<PackageRecord> {
@@ -200,76 +239,56 @@ fn resolve_requirement(index: &impl PackageIndex, requirement: &str) -> Result<P
 
 fn install_dependencies(
     layout: &EnvLayout,
-    dependencies: &[ResolvedPackage],
+    dependencies: &[ResolvedDist],
     index: &impl PackageIndex,
 ) -> Result<()> {
     for dependency in dependencies {
-        let install_record = install_record_for(&dependency.raw, &dependency.record, index)?;
+        let install_record = install_record_for(dependency, index)?;
         install_package(layout, &install_record)?;
     }
     Ok(())
 }
 
-fn install_record_for(requirement: &str, record: &PackageRecord, index: &impl PackageIndex) -> Result<ResolvedRecord> {
-    let is_path = matches!(parse_requirement_input(requirement)?, RequirementInput::Path { .. });
-    match &record.kind {
-        PackageKind::Pure => {
-            if is_path {
-                if is_sdist_path(requirement) {
-                    Ok(ResolvedRecord::sdist(&record.name, &record.version, requirement))
-                } else {
-                    Ok(ResolvedRecord::local_path(&record.name, &record.version, requirement))
-                }
-            } else {
-                let filename = package_filename(index, &record.name, &record.version)?;
-                Ok(ResolvedRecord::wheel(&record.name, &record.version, filename))
-            }
+fn install_record_for(dist: &ResolvedDist, index: &impl PackageIndex) -> Result<ResolvedRecord> {
+    if dist.kind.is_refused() {
+        return Err(cabi_error(&package_record_from_dist(dist)));
+    }
+
+    let version = dist.version.to_string();
+    match &dist.artifact {
+        ResolvedArtifact::Wheel(file) => {
+            let path = index.fetch_artifact(file)?;
+            Ok(ResolvedRecord::wheel(dist.name.clone(), version, path))
         }
-        PackageKind::Native => {
-            if is_path {
-                if is_sdist_path(requirement) {
-                    Ok(ResolvedRecord::sdist(&record.name, &record.version, requirement))
-                } else {
-                    Ok(ResolvedRecord::local_path(&record.name, &record.version, requirement))
-                }
-            } else {
-                Err(Error::UnsupportedArtifact(format!(
-                    "native package `{}` must be installed from a local path",
-                    record.name
-                )))
-            }
+        ResolvedArtifact::Sdist(file) => {
+            let path = index.fetch_artifact(file)?;
+            Ok(ResolvedRecord::sdist(dist.name.clone(), version, path))
         }
-        PackageKind::CAbiRefused { .. } => Err(cabi_error(record)),
+        ResolvedArtifact::Dir { path, editable } => {
+            Ok(ResolvedRecord::dir(dist.name.clone(), version, path.clone(), *editable))
+        }
+        ResolvedArtifact::Vcs { dir, .. } => Ok(ResolvedRecord::dir(dist.name.clone(), version, dir.clone(), false)),
     }
 }
 
-fn is_sdist_path(requirement: &str) -> bool {
-    let path = Path::new(requirement);
-    let basename = path.file_name().and_then(|name| name.to_str()).unwrap_or(requirement);
-    basename.ends_with(".tar.gz")
-}
-
-fn package_filename(index: &impl PackageIndex, name: &str, version: &str) -> Result<String> {
-    let project = index
-        .lookup(name)?
-        .ok_or_else(|| Error::InvalidRequirement(format!("unknown package `{name}`")))?;
-    let parsed_version = version.parse::<pep440_rs::Version>().ok();
-    project
-        .files
-        .into_iter()
-        .find(|file| {
-            parsed_version.as_ref().is_some_and(|version| &file.version == version)
-                && matches!(file.kind, PackageKind::Pure)
-        })
-        .map(|file| file.filename)
-        .ok_or_else(|| Error::UnsupportedArtifact(format!("no installable pure-Python artifact for `{name}` {version}")))
-}
 
 fn reject_cabi_package(record: &PackageRecord) -> Result<()> {
     if record.kind.is_refused() {
         Err(cabi_error(record))
     } else {
         Ok(())
+    }
+}
+
+fn reject_cabi_dist(dist: &ResolvedDist) -> Result<()> {
+    reject_cabi_package(&package_record_from_dist(dist))
+}
+
+fn package_record_from_dist(dist: &ResolvedDist) -> PackageRecord {
+    PackageRecord {
+        name: dist.name.clone(),
+        version: dist.version.to_string(),
+        kind: dist.kind.clone(),
     }
 }
 
@@ -284,11 +303,11 @@ fn cabi_error(record: &PackageRecord) -> Error {
     ))
 }
 
-fn write_lock(layout: &EnvLayout, dependencies: &[ResolvedPackage]) -> Result<()> {
+fn write_lock(layout: &EnvLayout, dependencies: &[ResolvedDist]) -> Result<()> {
     fs::create_dir_all(&layout.project_root)?;
     let records = dependencies
         .iter()
-        .map(|dependency| dependency.record.clone())
+        .map(package_record_from_dist)
         .collect::<Vec<_>>();
     LockFile::from_records(&records).write_to_path(layout.project_root.join("pon.lock"))
 }
@@ -410,7 +429,7 @@ fn reject_extra(extra: Option<String>, command: &str) -> Result<()> {
 fn usage(program: impl AsRef<str>) -> String {
     let program = program.as_ref();
     format!(
-        "usage: {program} init [--manifest <pyproject.toml>]\n       {program} add <requirement-or-path> [--manifest <pyproject.toml>] [--index-url <url>] [--extra-index-url <url> ...]\n       {program} install [--manifest <pyproject.toml>] [--index-url <url>] [--extra-index-url <url> ...]\n       {program} lock [--manifest <pyproject.toml>] [--index-url <url>] [--extra-index-url <url> ...]\n       {program} run <file>\n       {program} run -c <code>\n       {program} remove <name> [--manifest <pyproject.toml>]\n       {program} list [--manifest <pyproject.toml>]\n       {program} env [project-root]"
+        "usage: {program} init [--manifest <pyproject.toml>]\n       {program} add <requirement-or-path> [--manifest <pyproject.toml>] [--index-url <url>] [--extra-index-url <url> ...]\n       {program} install [--manifest <pyproject.toml>] [--index-url <url>] [--extra-index-url <url> ...]\n       {program} lock [--manifest <pyproject.toml>] [--index-url <url>] [--extra-index-url <url> ...]\n       {program} run <file> [args...]\n       {program} run -c <code>\n       {program} run --entry <module:attr> -- [args...]\n       {program} remove <name> [--manifest <pyproject.toml>]\n       {program} list [--manifest <pyproject.toml>]\n       {program} env [project-root]"
     )
 }
 
