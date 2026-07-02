@@ -134,3 +134,11 @@ pon-conformance/corpus/cpython/set_element_errors.py
 corpus/import_as_submodule.py
 pon-conformance/corpus/cpython/container_identity.py
 pon-conformance/corpus/cpython/except_multibase.py
+pon-conformance/corpus/cpython/traceback_lineno.py
+pon-conformance/corpus/cpython/catchable_native_errors.py
+pon-conformance/corpus/cpython/exception_subclass_attrs.py
+pon-conformance/corpus/cpython/list_subclass.py
+pon-conformance/corpus/cpython/frame_globals.py
+pon-conformance/corpus/cpython/function_defaults_assign.py
+pon-conformance/corpus/cpython/tuple_subclass.py
+pon-conformance/corpus/cpython/class_kwargs_starred.py
