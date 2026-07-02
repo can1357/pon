@@ -192,6 +192,12 @@ pub fn analyze_function_def(def: &StmtFunctionDef) -> Result<ScopeInfo, LowerErr
     Ok(finalize_scope(builder, &BTreeSet::new()))
 }
 
+/// Reserved scope name for synthesized PEP 649 `__annotate__` functions.
+pub const ANNOTATE_SCOPE_NAME: &str = "__annotate__";
+
+/// Reserved scope name for synthesized PEP 695 type-alias value thunks.
+pub const TYPE_ALIAS_SCOPE_NAME: &str = "<type_alias>";
+
 #[derive(Clone, Debug)]
 struct ScopeBuilder {
     kind: ScopeKind,
@@ -209,6 +215,13 @@ struct ScopeBuilder {
     children: Vec<ScopeBuilder>,
     is_generator: bool,
     is_async: bool,
+    /// PEP 695 type-parameter names visible to annotation scopes created
+    /// inside this scope: enclosing generic parameters first, then this
+    /// construct's own parameters, in source order.
+    active_type_params: Vec<String>,
+    /// Deferred `__annotate__` child accumulating module/class-level
+    /// `AnnAssign` annotation expressions (PEP 649).
+    annotate: Option<Box<ScopeBuilder>>,
 }
 
 impl ScopeBuilder {
@@ -229,6 +242,8 @@ impl ScopeBuilder {
             children: Vec::new(),
             is_generator: false,
             is_async,
+            active_type_params: Vec::new(),
+            annotate: None,
         }
     }
 
@@ -249,6 +264,33 @@ impl ScopeBuilder {
     fn declare_nonlocal(&mut self, name: &str) {
         self.nonlocal_decl.insert(name.to_owned());
     }
+
+    /// Return the deferred module/class `__annotate__` child, creating it on
+    /// first use with the current active type parameters bound as locals.
+    fn annotate_child(&mut self) -> &mut ScopeBuilder {
+        if self.annotate.is_none() {
+            let child = annotate_builder(ANNOTATE_SCOPE_NAME, &self.active_type_params);
+            self.annotate = Some(Box::new(child));
+        }
+        self.annotate.as_mut().expect("annotate child was just created")
+    }
+}
+
+/// Build the scope for a synthesized function-like annotation/alias thunk.
+///
+/// The scope binds `type_params` as ordinary non-parameter locals so lowering
+/// can initialize them with `MakeTypeVar` before evaluating any expression.
+fn annotate_builder(name: &str, type_params: &[String]) -> ScopeBuilder {
+    let mut builder = ScopeBuilder::new(ScopeKind::Function, name, false);
+    if name == ANNOTATE_SCOPE_NAME {
+        builder.params.push("format".to_owned());
+        builder.bind("format");
+    }
+    for param in type_params {
+        builder.bind(param);
+    }
+    builder.active_type_params = type_params.to_vec();
+    builder
 }
 
 fn function_builder(def: &StmtFunctionDef) -> Result<ScopeBuilder, LowerError> {
@@ -300,13 +342,24 @@ fn scan_stmt(stmt: &Stmt, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
             for decorator in &def.decorator_list {
                 scan_expr(&decorator.expression, scope)?;
             }
-            if let Some(returns) = def.returns.as_deref() {
-                scan_expr(returns, scope)?;
-            }
-            scan_parameter_defaults_and_annotations(&def.parameters, scope)?;
+            scan_parameter_defaults(&def.parameters, scope)?;
             scope.bind(def.name.as_str());
 
+            let own_type_params = type_param_names(def.type_params.as_deref());
+            let mut active = scope.active_type_params.clone();
+            active.extend(own_type_params.iter().cloned());
+
+            if function_def_has_annotations(def) {
+                let mut annotate = annotate_builder(ANNOTATE_SCOPE_NAME, &active);
+                if let Some(returns) = def.returns.as_deref() {
+                    scan_expr(returns, &mut annotate)?;
+                }
+                scan_parameter_annotations(&def.parameters, &mut annotate)?;
+                scope.children.push(annotate);
+            }
+
             let mut child = function_builder(def)?;
+            child.active_type_params = active;
             scan_body(&def.body, &mut child)?;
             scope.children.push(child);
         }
@@ -324,7 +377,12 @@ fn scan_stmt(stmt: &Stmt, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
             }
             scope.bind(def.name.as_str());
 
+            let own_type_params = type_param_names(def.type_params.as_deref());
+            let mut active = scope.active_type_params.clone();
+            active.extend(own_type_params.iter().cloned());
+
             let mut child = ScopeBuilder::new(ScopeKind::Class, def.name.as_str(), false);
+            child.active_type_params = active;
             scan_body(&def.body, &mut child)?;
             scope.children.push(child);
         }
@@ -340,7 +398,11 @@ fn scan_stmt(stmt: &Stmt, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
         }
         Stmt::TypeAlias(alias) => {
             bind_target(&alias.name, scope)?;
-            scan_expr(&alias.value, scope)?;
+            let mut active = scope.active_type_params.clone();
+            active.extend(type_param_names(alias.type_params.as_deref()));
+            let mut thunk = annotate_builder(TYPE_ALIAS_SCOPE_NAME, &active);
+            scan_expr(&alias.value, &mut thunk)?;
+            scope.children.push(thunk);
         }
         Stmt::Assign(assign) => {
             scan_expr(&assign.value, scope)?;
@@ -354,7 +416,13 @@ fn scan_stmt(stmt: &Stmt, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
             bind_target(&assign.target, scope)?;
         }
         Stmt::AnnAssign(assign) => {
-            scan_expr(&assign.annotation, scope)?;
+            if matches!(scope.kind, ScopeKind::Module | ScopeKind::Class)
+                && matches!(assign.target.as_ref(), Expr::Name(_))
+            {
+                scan_expr(&assign.annotation, scope.annotate_child())?;
+            } else {
+                scan_expr(&assign.annotation, scope)?;
+            }
             if let Some(value) = assign.value.as_deref() {
                 scan_expr(value, scope)?;
             }
@@ -457,22 +525,20 @@ fn scan_stmt(stmt: &Stmt, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
     Ok(())
 }
 
-fn scan_parameter_defaults_and_annotations(
-    parameters: &Parameters,
-    scope: &mut ScopeBuilder,
-) -> Result<(), LowerError> {
-    for parameter in parameters.posonlyargs.iter().chain(&parameters.args) {
+fn scan_parameter_defaults(parameters: &Parameters, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
+    for parameter in parameters.posonlyargs.iter().chain(&parameters.args).chain(&parameters.kwonlyargs) {
         if let Some(default) = parameter.default() {
             scan_expr(default, scope)?;
-        }
-        if let Some(annotation) = parameter.annotation() {
-            scan_expr(annotation, scope)?;
         }
     }
-    for parameter in &parameters.kwonlyargs {
-        if let Some(default) = parameter.default() {
-            scan_expr(default, scope)?;
-        }
+    Ok(())
+}
+
+/// Scan every parameter annotation into the (annotate) scope, in the same
+/// order lowering later evaluates them: positional, `*args`, keyword-only,
+/// `**kwargs`.
+fn scan_parameter_annotations(parameters: &Parameters, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
+    for parameter in parameters.posonlyargs.iter().chain(&parameters.args) {
         if let Some(annotation) = parameter.annotation() {
             scan_expr(annotation, scope)?;
         }
@@ -482,12 +548,51 @@ fn scan_parameter_defaults_and_annotations(
             scan_expr(annotation, scope)?;
         }
     }
+    for parameter in &parameters.kwonlyargs {
+        if let Some(annotation) = parameter.annotation() {
+            scan_expr(annotation, scope)?;
+        }
+    }
     if let Some(kwarg) = parameters.kwarg.as_deref() {
         if let Some(annotation) = kwarg.annotation() {
             scan_expr(annotation, scope)?;
         }
     }
     Ok(())
+}
+
+/// True when a `def` carries any parameter or return annotation.
+pub(crate) fn function_def_has_annotations(def: &StmtFunctionDef) -> bool {
+    def.returns.is_some() || parameters_have_annotations(&def.parameters)
+}
+
+fn parameters_have_annotations(parameters: &Parameters) -> bool {
+    parameters
+        .posonlyargs
+        .iter()
+        .chain(&parameters.args)
+        .chain(&parameters.kwonlyargs)
+        .any(|parameter| parameter.annotation().is_some())
+        || parameters
+            .vararg
+            .as_deref()
+            .is_some_and(|parameter| parameter.annotation().is_some())
+        || parameters
+            .kwarg
+            .as_deref()
+            .is_some_and(|parameter| parameter.annotation().is_some())
+}
+
+/// Names of PEP 695 type parameters in source order.
+pub(crate) fn type_param_names(type_params: Option<&ruff_python_ast::TypeParams>) -> Vec<String> {
+    let Some(type_params) = type_params else {
+        return Vec::new();
+    };
+    type_params
+        .type_params
+        .iter()
+        .map(|param| param.name().as_str().to_owned())
+        .collect()
 }
 
 fn scan_expr(expr: &Expr, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
@@ -514,7 +619,7 @@ fn scan_expr(expr: &Expr, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
         Expr::Lambda(expr) => {
             let mut child = ScopeBuilder::new(ScopeKind::Function, "<lambda>", false);
             if let Some(parameters) = expr.parameters.as_deref() {
-                scan_parameter_defaults_and_annotations(parameters, scope)?;
+                scan_parameter_defaults(parameters, scope)?;
                 fill_parameters(parameters, &mut child)?;
             }
             scan_expr(&expr.body, &mut child)?;
@@ -769,6 +874,9 @@ fn import_binding_name(name: &Identifier, asname: Option<&Identifier>) -> String
 }
 
 fn finalize_scope(mut builder: ScopeBuilder, enclosing_locals: &BTreeSet<String>) -> ScopeInfo {
+    if let Some(annotate) = builder.annotate.take() {
+        builder.children.insert(0, *annotate);
+    }
     let local_names = local_names(&builder);
     let mut child_enclosing = enclosing_locals.clone();
     if matches!(builder.kind, ScopeKind::Function | ScopeKind::Comprehension) {
