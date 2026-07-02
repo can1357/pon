@@ -149,7 +149,7 @@ impl Default for HeapConfig {
 /// Source of raw root pointers for a collection cycle.
 ///
 /// Implementors enumerate every pointer-sized value that should keep a managed
-/// allocation alive.  Roots may point to the start or interior of an allocation.
+/// allocation alive. Roots may point to the start or interior of an allocation.
 pub trait RootSource {
     /// Calls `visitor` for every root value currently visible to the runtime.
     fn for_each_root(&mut self, visitor: &mut dyn FnMut(*mut u8));
@@ -1006,12 +1006,13 @@ fn size_class_for(size: usize) -> usize {
     size.max(1).next_multiple_of(DEFAULT_HEAP_ALIGNMENT)
 }
 
-fn mark_pointer(state: &mut HeapState, mark_queue: &mut MarkQueue, pointer: *mut u8) -> bool {
-    if pointer.addr() & IMMEDIATE_TAG_MASK != IMMEDIATE_TAG_HEAP {
-        return false;
-    }
+fn is_tagged_non_heap_candidate(pointer: *mut u8) -> bool {
+    pointer.addr() & IMMEDIATE_TAG_MASK != IMMEDIATE_TAG_HEAP
+}
 
+fn mark_pointer(state: &mut HeapState, mark_queue: &mut MarkQueue, pointer: *mut u8) -> bool {
     let Some(classification) = state.classify_pointer(pointer) else {
+        let _is_immediate = is_tagged_non_heap_candidate(pointer);
         return false;
     };
     let PointerClassification {
@@ -1079,6 +1080,7 @@ mod tests {
             }
         }
     }
+
 
     unsafe extern "C" fn no_trace(_object: *mut u8, _visitor: &mut dyn FnMut(*mut u8)) {}
 
@@ -1353,7 +1355,7 @@ mod tests {
     }
 
     #[test]
-    fn tagged_root_aliasing_allocation_address_is_filtered_before_classification() {
+    fn tag_like_interior_root_preserves_allocation_after_classification() {
         static FINALIZED: AtomicUsize = AtomicUsize::new(0);
 
         unsafe extern "C" fn finalize(_object: *mut u8) {
@@ -1369,8 +1371,8 @@ mod tests {
 
         heap.collect(&mut Roots(vec![odd_alias, reserved_alias]));
 
-        assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
-        assert!(heap.lock_state().allocations.is_empty());
+        assert_eq!(FINALIZED.load(Ordering::SeqCst), 0);
+        assert!(!heap.lock_state().allocations.is_empty());
     }
 
     #[repr(C)]
