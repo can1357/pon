@@ -258,6 +258,7 @@ static CALL_SENTINEL_ITER_TYPE: LazyLock<usize> = LazyLock::new(|| {
     ));
     ty.tp_iter = Some(identity_iter_slot);
     ty.tp_iternext = Some(native_next_slot);
+    ty.tp_getattro = Some(crate::abstract_op::iterator_dunder_getattro);
     ty.tp_bool = Some(native_bool_slot);
     ty.tp_hash = Some(native_hash_slot);
     Box::into_raw(ty) as usize
@@ -270,6 +271,7 @@ static LONGRANGE_ITER_TYPE: LazyLock<usize> = LazyLock::new(|| {
     ));
     ty.tp_iter = Some(identity_iter_slot);
     ty.tp_iternext = Some(native_next_slot);
+    ty.tp_getattro = Some(crate::abstract_op::iterator_dunder_getattro);
     ty.tp_bool = Some(native_bool_slot);
     ty.tp_hash = Some(native_hash_slot);
     Box::into_raw(ty) as usize
@@ -285,6 +287,9 @@ fn type_from(
         let mut ty = Box::new(PyType::new(ptr::null(), name, std::mem::size_of::<NativeObject>()));
         ty.tp_iter = iter;
         ty.tp_iternext = iternext;
+        if iternext.is_some() {
+            ty.tp_getattro = Some(crate::abstract_op::iterator_dunder_getattro);
+        }
         ty.tp_bool = Some(native_bool_slot);
         ty.tp_hash = Some(native_hash_slot);
         Box::into_raw(ty) as usize
@@ -2291,7 +2296,38 @@ unsafe fn is_callable_object(object: *mut PyObject) -> bool {
 }
 
 
+/// The builtin classmethod/staticmethod carrier type objects, from the
+/// runtime global table (NULL entries when the runtime is not initialized
+/// never match).
+fn carrier_types() -> [*mut PyType; 2] {
+    let lookup = |name: &str| {
+        abi::runtime_global(crate::intern::intern(name))
+            .map_or(core::ptr::null_mut(), |object| object.cast::<PyType>())
+    };
+    [lookup("classmethod"), lookup("staticmethod")]
+}
+
+/// The wrapped callable when `value` is a classmethod/staticmethod carrier
+/// (exact type match against `carrier_types`).  Zero-arg `super()` must see
+/// through carriers: class creation implicitly wraps a plain-function
+/// `__new__` in a staticmethod (`wrap_dunder_new_as_staticmethod`), and
+/// `classmethod(f)`/`staticmethod(f)` store carriers in the class dict while
+/// the executing frame holds the naked function.
+fn carrier_payload(value: *mut PyObject, carrier_types: &[*mut PyType; 2]) -> Option<*mut PyObject> {
+    if !crate::tag::is_heap(value) {
+        return None;
+    }
+    let ty = unsafe { (*value).ob_type.cast_mut() };
+    if ty.is_null() || !carrier_types.contains(&ty) {
+        return None;
+    }
+    // SAFETY: Carrier layout verified above; PyClassMethod and PyStaticMethod
+    // carry the wrapped callable at the same offset.
+    Some(unsafe { (*value.cast::<crate::types::classmethod::PyClassMethod>()).callable })
+}
+
 fn find_defining_class(function: *mut PyObject, ty: *mut PyType) -> Option<*mut PyType> {
+    let carriers = carrier_types();
     for class in unsafe { crate::mro::mro_entries(ty) } {
         if class.is_null() {
             continue;
@@ -2301,7 +2337,7 @@ fn find_defining_class(function: *mut PyObject, ty: *mut PyType) -> Option<*mut 
             continue;
         }
         let dict = unsafe { &*dict.cast::<crate::types::type_::PyClassDict>() };
-        if dict.iter().any(|(_, value)| value == function) {
+        if dict.iter().any(|(_, value)| value == function || carrier_payload(value, &carriers) == Some(function)) {
             return Some(class);
         }
     }
@@ -2337,8 +2373,10 @@ fn infer_zero_arg_super() -> Result<(*mut PyType, *mut PyObject), String> {
 }
 
 fn length(object: *mut PyObject) -> Result<i64, String> {
-    if let Some(text) = object_to_string(object) {
-        return Ok(text.len() as i64);
+    // `len(str)` counts Unicode code points, not UTF-8 bytes; read through
+    // payload subclasses and never treat exception messages as sized.
+    if let Some(text) = unsafe { crate::types::type_::unicode_text(object) } {
+        return Ok(crate::types::str_::codepoint_len(text) as i64);
     }
     unsafe {
         if let Some(native) = as_native(object) {
@@ -2348,7 +2386,7 @@ fn length(object: *mut PyObject) -> Result<i64, String> {
                 NativePayload::LongRange { start, stop, step } => longrange_len(start, stop, step)
                     .to_i64()
                     .ok_or_else(|| "Python int too large to convert to C ssize_t".to_owned()),
-                _ => Err("object of this native type has no len()".to_owned()),
+                _ => Err(len_type_error(object)),
             };
         }
         let ty = (*object).ob_type;
@@ -2390,7 +2428,15 @@ fn length(object: *mut PyObject) -> Result<i64, String> {
             }
         }
     }
-    Err("object has no len()".to_owned())
+    Err(len_type_error(object))
+}
+
+/// CPython text for unsized receivers: `object of type 'X' has no len()`.
+fn len_type_error(object: *mut PyObject) -> String {
+    let name = unsafe {
+        if object.is_null() || (*object).ob_type.is_null() { "object" } else { (*(*object).ob_type).name() }
+    };
+    format!("object of type '{name}' has no len()")
 }
 
 fn range_len(start: i64, stop: i64, step: i64) -> i64 {

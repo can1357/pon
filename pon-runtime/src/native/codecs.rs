@@ -169,6 +169,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
     module_fn("decode", decode_entry)?;
     module_fn("register_error", register_error_entry)?;
     module_fn("lookup_error", lookup_error_entry)?;
+    module_fn("_unregister_error", unregister_error_entry)?;
 
     let utf_8_encode = module_fn("utf_8_encode", utf_8_encode_entry)?;
     let utf_8_decode = module_fn("utf_8_decode", utf_8_decode_entry)?;
@@ -852,6 +853,45 @@ unsafe extern "C" fn lookup_error_entry(argv: *mut *mut PyObject, argc: usize) -
         Some(handler) => handler as *mut PyObject,
         None => raise_kind(ExceptionKind::LookupError, &format!("unknown error handler name '{name}'")),
     }
+}
+
+/// Built-in error handler names refused by `_unregister_error`, mirroring
+/// CPython's `codecs_builtin_error_handlers` table (the same eight seeded
+/// into `state.error_handlers` by [`make_module`]).
+const BUILTIN_ERROR_HANDLERS: [&str; 8] = [
+    "strict",
+    "ignore",
+    "replace",
+    "backslashreplace",
+    "xmlcharrefreplace",
+    "namereplace",
+    "surrogateescape",
+    "surrogatepass",
+];
+
+/// `_codecs._unregister_error(name)`: removes a handler registered through
+/// `register_error`, returning whether one was removed.  Built-in handler
+/// names raise ValueError (CPython `_PyCodec_UnregisterError` parity).
+unsafe extern "C" fn unregister_error_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+        return fail("_codecs._unregister_error received a NULL argv pointer");
+    };
+    let &[name] = args else {
+        return raise_type_error("_unregister_error() takes exactly one argument");
+    };
+    let name = match str_arg(name, "name") {
+        Ok(text) => text,
+        Err(message) => return raise_type_error(&message),
+    };
+    if BUILTIN_ERROR_HANDLERS.contains(&name) {
+        return raise_kind(
+            ExceptionKind::ValueError,
+            &format!("cannot un-register built-in error handler '{name}'"),
+        );
+    }
+    let removed = state().error_handlers.remove(name).is_some();
+    // SAFETY: Boolean constant allocator.
+    unsafe { abi::pon_const_bool(removed.into()) }
 }
 
 // ---------------------------------------------------------------------------

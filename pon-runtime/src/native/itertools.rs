@@ -282,7 +282,56 @@ fn iterator_type(name: &'static str, size: usize, next: UnaryFunc) -> usize {
     let mut ty = PyType::new(abi::runtime_type_type().cast_const(), name, size);
     ty.tp_iter = Some(identity_iter);
     ty.tp_iternext = Some(next);
+    ty.tp_getattro = Some(iterator_getattro);
     Box::into_raw(Box::new(ty)) as usize
+}
+
+/// `tp_getattro` shared by the itertools iterator types: `threading` binds
+/// `_count(1).__next__` as its name-counter factory at import, so the
+/// iterator slots must be reachable as bound methods; every other name
+/// raises AttributeError.
+unsafe extern "C" fn iterator_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let name = untag(name);
+    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        return raise_type_error("attribute name must be str");
+    };
+    let entry: BuiltinFn = match name_text {
+        "__next__" => iterator_next_method,
+        "__iter__" => iterator_iter_method,
+        // SAFETY: Raise helper with the interned attribute name.
+        _ => return unsafe { abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
+    };
+    // SAFETY: `entry` is a live builtin entry point with the runtime calling convention.
+    let function = unsafe { abi::pon_make_function(entry as *const u8, VARIADIC_ARITY, intern(name_text)) };
+    if function.is_null() {
+        return ptr::null_mut();
+    }
+    match crate::types::method::new_bound_method(function, object) {
+        Ok(method) => method.cast::<PyObject>(),
+        Err(message) => {
+            crate::thread_state::pon_err_set(message);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Bound `iterator.__next__()`: forwards to the runtime iterator protocol
+/// (pon iterator slots raise their own typed `StopIteration`).
+unsafe extern "C" fn iterator_next_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 1 || argv.is_null() {
+        return raise_type_error(&format!("__next__() takes no arguments ({} given)", argc.saturating_sub(1)));
+    }
+    // SAFETY: The call helper supplies `argv` with at least one entry.
+    unsafe { pon_iter_next(*argv, ptr::null_mut()) }
+}
+
+/// Bound `iterator.__iter__()`: identity, mirroring the `tp_iter` slot.
+unsafe extern "C" fn iterator_iter_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 1 || argv.is_null() {
+        return raise_type_error(&format!("__iter__() takes no arguments ({} given)", argc.saturating_sub(1)));
+    }
+    // SAFETY: The call helper supplies `argv` with at least one entry.
+    unsafe { *argv }
 }
 
 fn alloc_object<T>(value: T) -> *mut PyObject {

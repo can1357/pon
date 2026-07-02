@@ -57,6 +57,15 @@ pub unsafe extern "C" fn builtin_dir(argv: *mut *mut PyObject, argc: usize) -> *
             Ok(values) => values.into_iter().map(name_text).collect(),
             Err(message) => return raise_type_error(&message),
         }
+    } else if let Some(namespace) = crate::import::module_namespace_for_object(args[0]) {
+        // Module arm: CPython's `module.__dir__` returns `list(module.__dict__)`.
+        // Module attrs live on the module object (mirrored into the registered
+        // namespace dict), not in any class dict, so the fallback below would
+        // see nothing.
+        match namespace.and_then(|dict| unsafe { names_from_mapping(dict) }) {
+            Ok(names) => names,
+            Err(message) => return raise_type_error(&message),
+        }
     } else {
         names_for_object(args[0])
     };
@@ -248,23 +257,110 @@ pub unsafe extern "C" fn builtin_sum(argv: *mut *mut PyObject, argc: usize) -> *
         return raise_type_error(&format!("sum() takes at most 2 arguments ({} given)", args.len()));
     }
     let mut total = args.get(1).copied().unwrap_or_else(|| int::from_i64(0));
-    if is_string_like(total) {
-        return raise_type_error("sum() can't sum strings [use ''.join(seq) instead]");
+    // Only the start value is type-checked; a string-like item surfaces the
+    // generic `+` TypeError instead, as in CPython.
+    match type_name(total) {
+        "str" => return raise_type_error("sum() can't sum strings [use ''.join(seq) instead]"),
+        "bytes" => return raise_type_error("sum() can't sum bytes [use b''.join(seq) instead]"),
+        "bytearray" => return raise_type_error("sum() can't sum bytearray [use b''.join(seq) instead]"),
+        _ => {}
     }
     let items = match collect_iterable(args[0]) {
         Ok(items) => items,
         Err(message) => return raise_type_error(&message),
     };
-    for item in items {
-        if is_string_like(item) {
-            return raise_type_error("sum() can't sum strings [use ''.join(seq) instead]");
+    let mut items = items.into_iter().map(crate::tag::untag_arg);
+
+    // Exact-int phase: exact ints and bools accumulate as a BigInt (CPython
+    // keeps a C long and escapes to object adds on overflow; both routes are
+    // exact, so the only observable transition is the first non-int item).
+    if unsafe { int::is_exact_int(total) } {
+        let Some(mut int_total) = (unsafe { int::to_bigint(total) }) else {
+            return raise_type_error("sum() start is not an int");
+        };
+        loop {
+            let Some(item) = items.next() else {
+                return int::from_bigint(int_total);
+            };
+            if let Some(value) = unsafe { sum_exact_int_item(item) } {
+                int_total += value;
+                continue;
+            }
+            // First non-int item: box the subtotal and add generically; an
+            // exact-float result rides the float fast path below (CPython's
+            // fall-through between its typed loops).
+            total = unsafe { abi::number::pon_binary_op(abstract_op::BINARY_ADD, int::from_bigint(int_total), item, ptr::null_mut()) };
+            if total.is_null() {
+                return ptr::null_mut();
+            }
+            total = crate::tag::untag_arg(total);
+            break;
         }
+    }
+
+    // Exact-float phase: Neumaier-compensated summation (gh-100425). Ints
+    // that fit an i64 fold in uncompensated, exactly as CPython's loop does.
+    if unsafe { float::is_exact_float(total) } {
+        let mut f_result = unsafe { float::to_f64(total) }.unwrap_or(0.0);
+        let mut c = 0.0f64;
+        loop {
+            let Some(item) = items.next() else {
+                // Skip a zero or non-finite carry so inf/overflowed sums are
+                // not converted to NaN by the compensation.
+                if c != 0.0 && c.is_finite() {
+                    f_result += c;
+                }
+                return float::from_f64(f_result);
+            };
+            if unsafe { float::is_exact_float(item) } {
+                let x = unsafe { float::to_f64(item) }.unwrap_or(f64::NAN);
+                let t = f_result + x;
+                c += if f_result.abs() >= x.abs() { (f_result - t) + x } else { (x - t) + f_result };
+                f_result = t;
+                continue;
+            }
+            if let Some(value) = unsafe { object_to_integer(item) }.and_then(|value| value.to_i64()) {
+                #[allow(clippy::cast_precision_loss)] // CPython folds via `(double)value`.
+                {
+                    f_result += value as f64;
+                }
+                continue;
+            }
+            // Non-numeric item: flush the compensation and fall back to the
+            // generic loop for the rest, as CPython does.
+            if c != 0.0 && c.is_finite() {
+                f_result += c;
+            }
+            total = unsafe { abi::number::pon_binary_op(abstract_op::BINARY_ADD, float::from_f64(f_result), item, ptr::null_mut()) };
+            if total.is_null() {
+                return ptr::null_mut();
+            }
+            total = crate::tag::untag_arg(total);
+            break;
+        }
+    }
+
+    for item in items {
         total = unsafe { abi::number::pon_binary_op(abstract_op::BINARY_ADD, total, item, ptr::null_mut()) };
         if total.is_null() {
             return ptr::null_mut();
         }
+        total = crate::tag::untag_arg(total);
     }
     total
+}
+
+/// An item `sum`'s exact-int phase folds: exact ints and bools, matching
+/// CPython's `PyLong_CheckExact(item) || PyBool_Check(item)` gate (subclasses
+/// take the generic route so their `__radd__` stays observable).
+unsafe fn sum_exact_int_item(item: *mut PyObject) -> Option<BigInt> {
+    if let Some(value) = unsafe { bool_::to_bool(item) } {
+        return Some(BigInt::from(i64::from(value)));
+    }
+    if unsafe { int::is_exact_int(item) } {
+        return unsafe { int::to_bigint(item) };
+    }
+    None
 }
 
 pub unsafe extern "C" fn builtin_sorted(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -505,7 +601,7 @@ unsafe fn radix_builtin(argv: *mut *mut PyObject, argc: usize, name: &str, radix
 
 fn divmod_int(left: &BigInt, right: &BigInt) -> *mut PyObject {
     if right.is_zero() {
-        return raise_value_error("division by zero");
+        return raise_zero_division_error("division by zero");
     }
     let q = left.div_floor(right);
     let r = left.mod_floor(right);
@@ -520,7 +616,7 @@ fn divmod_float(left: NumberValue, right: NumberValue) -> *mut PyObject {
         return raise_type_error("int too large to convert to float");
     };
     if right == 0.0 {
-        return raise_value_error("division by zero");
+        return raise_zero_division_error("division by zero");
     }
     let q = (left / right).floor();
     let r = left - q * right;
@@ -854,9 +950,6 @@ unsafe fn object_to_string(object: *mut PyObject) -> Option<String> {
     unsafe { type_::unicode_text(object).map(ToOwned::to_owned) }
 }
 
-fn is_string_like(object: *mut PyObject) -> bool {
-    matches!(type_name(object), "str" | "bytes" | "bytearray")
-}
 
 fn type_name(object: *mut PyObject) -> &'static str {
     if object.is_null() {
@@ -901,4 +994,8 @@ fn raise_type_error(message: &str) -> *mut PyObject {
 
 fn raise_value_error(message: &str) -> *mut PyObject {
     unsafe { abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) }
+}
+
+fn raise_zero_division_error(message: &str) -> *mut PyObject {
+    unsafe { abi::exc::pon_raise_zero_division_error(message.as_ptr(), message.len()) }
 }

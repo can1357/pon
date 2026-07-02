@@ -89,6 +89,13 @@ fn run_file_inner(path: &Path, argv: &[String]) -> Result<()> {
     let mut engine = JitEngine::new();
     begin_module_execution("__main__").map_err(anyhow::Error::msg)?;
     let result = engine.run(&module).context("JIT execution failed");
+    // CPython finalization order: atexit callbacks run once `__main__`
+    // finishes (normally or raising) but before module teardown
+    // (`Py_FinalizeEx` calls them before destroying modules), so hooks still
+    // see live module state.  On the error path the uncaught report is
+    // printed by `main()` after this returns, so callback output precedes it
+    // — pon's uncaught shape already diverges from CPython there.
+    pon_runtime::native::atexit::run_exit_callbacks();
     end_module_execution("__main__");
     result?;
     io::stdout().flush().context("failed to flush stdout")
