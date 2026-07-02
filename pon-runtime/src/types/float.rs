@@ -230,3 +230,90 @@ fn make_number_methods() -> PyNumberMethods {
 fn raise_type_error(message: &str) -> *mut PyObject {
     unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) }
 }
+
+// ---------------------------------------------------------------------------
+// float type-object surface
+// ---------------------------------------------------------------------------
+
+/// One-shot installer for the builtin `float` type object's `tp_dict`
+/// surface — currently `__getformat__`, a classmethod in CPython, carried
+/// static-style around a receiverless entry exactly like `bytes.fromhex`
+/// (`abi::str_::install_binary_type_methods`).  `ty` is the GLOBAL `float`
+/// type object ([`FLOAT_TYPE`], registered by
+/// `abi::register_builtin_type_globals`); `descr::synthetic_type_attr`
+/// triggers this on first type-level attribute access, and existing
+/// `tp_dict` entries are kept.
+pub(crate) fn ensure_float_type_methods_installed(ty: *mut PyType) {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if ty.is_null() || INSTALLED.load(AtomicOrdering::SeqCst) {
+        return;
+    }
+    // Pre-runtime call sites must not latch a no-op install: the function
+    // allocations below need a live runtime.
+    if crate::abi::runtime_type_type().is_null() {
+        return;
+    }
+    if INSTALLED.swap(true, AtomicOrdering::SeqCst) {
+        return;
+    }
+    let namespace = unsafe { (*ty).tp_dict.cast::<crate::types::type_::PyClassDict>() };
+    let namespace = if namespace.is_null() { crate::types::type_::new_namespace() } else { namespace };
+    let interned = crate::intern::intern("__getformat__");
+    if unsafe { (&*namespace).get(interned) }.is_none() {
+        // SAFETY: Live builtin entry point with the runtime calling convention.
+        let function = unsafe {
+            crate::abi::pon_make_function(
+                float_getformat_entry as *const u8,
+                crate::builtins::variadic_arity(),
+                interned,
+            )
+        };
+        if !function.is_null() {
+            // SAFETY: Staticmethod carrier over the fresh receiverless entry.
+            let descriptor = unsafe {
+                crate::types::classmethod::new_staticmethod(crate::abi::staticmethod_builtin_type(), function)
+            };
+            if !descriptor.is_null() {
+                unsafe { (&mut *namespace).set(interned, descriptor) };
+            }
+        }
+    }
+    unsafe {
+        (*ty).tp_dict = namespace.cast::<PyObject>();
+    }
+    // GC rooting for the namespace values plus IC invalidation for any
+    // AttrIC guarding the type object.
+    crate::sync::register_namespaced_type(ty);
+    crate::sync::type_modified(ty);
+}
+
+/// `float.__getformat__(typestr)`: `'IEEE, little-endian'` /
+/// `'IEEE, big-endian'` selected by target endianness — Rust `f64`/`f32` are
+/// IEEE 754 by definition, so the CPython "unknown" detection arm cannot
+/// occur.  Message texts mirror the CPython 3.14 oracle byte-for-byte; the
+/// staticmethod carrier means no receiver reaches the entry (type-level and
+/// instance-level access both pass the format string alone).
+unsafe extern "C" fn float_getformat_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 1 {
+        return raise_type_error(&format!("float.__getformat__() takes exactly one argument ({argc} given)"));
+    }
+    // SAFETY: One live argument slot per the check above; tagged immediates
+    // box through `untag_arg` so the type-name probe below reads a header.
+    let argument = crate::tag::untag_arg(unsafe { *argv });
+    if argument.is_null() {
+        return ptr::null_mut();
+    }
+    let Some(kind) = (unsafe { crate::types::type_::unicode_text(argument) }) else {
+        let got = unsafe { crate::types::dict::type_name(argument) }.unwrap_or("object");
+        return raise_type_error(&format!("__getformat__() argument must be str, not {got}"));
+    };
+    if kind != "double" && kind != "float" {
+        const MESSAGE: &str = "__getformat__() argument 1 must be 'double' or 'float'";
+        // SAFETY: Raise helper with a static message.
+        return unsafe { crate::abi::exc::pon_raise_value_error(MESSAGE.as_ptr(), MESSAGE.len()) };
+    }
+    const FORMAT: &str = if cfg!(target_endian = "little") { "IEEE, little-endian" } else { "IEEE, big-endian" };
+    // SAFETY: Runtime string allocation helper; NULL on failure with the error set.
+    unsafe { crate::abi::pon_const_str(FORMAT.as_ptr(), FORMAT.len()) }
+}
