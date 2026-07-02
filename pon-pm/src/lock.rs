@@ -2,12 +2,17 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::io::ErrorKind;
 use std::str::FromStr;
 
 use sha2::{Digest, Sha256};
 use toml_edit::{ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value, value};
 
 use crate::error::{Error, Result};
+use crate::index::download::{HashPolicy, download_artifact};
+use crate::install::{PackageArtifact, ResolvedRecord, direct_url::DirectUrl};
+use crate::pyproject::PyProject;
+use crate::vcs;
 use crate::index::ProjectFile;
 use crate::resolve::source::{PackageKind, PackageRecord};
 use crate::resolve::{Resolution, ResolvedArtifact, ResolvedDist};
@@ -15,6 +20,7 @@ use crate::resolve::{Resolution, ResolvedArtifact, ResolvedDist};
 pub const LOCK_VERSION: &str = "1.0";
 pub const CREATED_BY: &str = concat!("pon-pm ", env!("CARGO_PKG_VERSION"));
 pub const DEFAULT_REQUIRES_PYTHON: &str = ">=3.14";
+pub const LOCK_FILE_NAME: &str = "pon.lock";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LockFile {
@@ -78,6 +84,29 @@ impl LockFile {
     }
 
     #[must_use]
+    pub fn from_resolution_for_pyproject(resolution: &Resolution, pyproject: &PyProject) -> Self {
+        Self::from_resolution(
+            resolution,
+            DEFAULT_REQUIRES_PYTHON,
+            compute_project_input_hash(pyproject),
+        )
+    }
+
+    #[must_use]
+    pub fn from_resolution_with_project_options(
+        resolution: &Resolution,
+        pyproject: &PyProject,
+        index_url: Option<&str>,
+        allow_prerelease: Option<bool>,
+    ) -> Self {
+        Self::from_resolution(
+            resolution,
+            DEFAULT_REQUIRES_PYTHON,
+            compute_project_input_hash_with_overrides(pyproject, index_url, allow_prerelease),
+        )
+    }
+
+    #[must_use]
     pub fn is_stale(&self, expected_input_hash: &str) -> bool {
         self.input_hash != expected_input_hash
     }
@@ -97,6 +126,63 @@ impl LockFile {
 
     pub fn read_from_path(path: impl AsRef<Path>) -> Result<Self> {
         fs::read_to_string(path)?.parse()
+    }
+
+    pub fn write_to_project_root(&self, project_root: impl AsRef<Path>) -> Result<()> {
+        self.write_to_path(lock_path(project_root))
+    }
+
+    pub fn read_from_project_root(project_root: impl AsRef<Path>) -> Result<Option<Self>> {
+        match fs::read_to_string(lock_path(project_root)) {
+            Ok(contents) => contents.parse().map(Some),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn read_frozen_from_project_root(project_root: impl AsRef<Path>) -> Result<Self> {
+        Self::read_from_project_root(project_root)?.ok_or_else(missing_frozen_lock_error)
+    }
+
+    pub fn read_for_install(
+        project_root: impl AsRef<Path>,
+        expected_input_hash: &str,
+        frozen: bool,
+    ) -> Result<Option<Self>> {
+        let Some(lock) = Self::read_from_project_root(project_root)? else {
+            return if frozen {
+                Err(missing_frozen_lock_error())
+            } else {
+                Ok(None)
+            };
+        };
+
+        if lock.is_stale(expected_input_hash) {
+            return if frozen {
+                Err(stale_lock_error())
+            } else {
+                Ok(None)
+            };
+        }
+
+        Ok(Some(lock))
+    }
+
+    pub fn read_frozen_for_install(project_root: impl AsRef<Path>, expected_input_hash: &str) -> Result<Self> {
+        Self::read_for_install(project_root, expected_input_hash, true)?.ok_or_else(missing_frozen_lock_error)
+    }
+
+    pub fn to_resolved_records(
+        &self,
+        project_root: impl AsRef<Path>,
+        cache_dir: impl AsRef<Path>,
+    ) -> Result<Vec<ResolvedRecord>> {
+        let project_root = project_root.as_ref();
+        let cache_dir = cache_dir.as_ref();
+        self.packages
+            .iter()
+            .map(|package| package.to_resolved_record(project_root, cache_dir))
+            .collect()
     }
 
     fn to_document(&self) -> DocumentMut {
@@ -215,6 +301,31 @@ impl LockedPackage {
         package
     }
 
+    pub fn to_resolved_record(&self, project_root: &Path, cache_dir: &Path) -> Result<ResolvedRecord> {
+        if let Some(wheel) = self.wheels.first() {
+            return wheel.to_resolved_record(self, cache_dir);
+        }
+        if let Some(sdist) = &self.sdist {
+            return sdist.to_resolved_record(self, cache_dir);
+        }
+        if let Some(directory) = &self.directory {
+            return Ok(ResolvedRecord::dir(
+                self.name.clone(),
+                self.version.clone(),
+                resolve_project_path(project_root, &directory.path),
+                directory.editable,
+            ));
+        }
+        if let Some(vcs) = &self.vcs {
+            return vcs.to_resolved_record(self, cache_dir);
+        }
+
+        Err(Error::Cli(format!(
+            "pon.lock package `{}` has no installable artifact",
+            self.name
+        )))
+    }
+
     fn to_table(&self) -> Table {
         let mut table = Table::new();
         table.insert("name", value(self.name.as_str()));
@@ -278,6 +389,26 @@ impl LockedWheel {
         }
     }
 
+    pub fn fetch(&self, cache_dir: &Path) -> Result<PathBuf> {
+        fetch_locked_artifact(cache_dir, &self.url, &self.name, &self.hashes)
+    }
+
+    #[must_use]
+    pub fn direct_url(&self) -> DirectUrl {
+        DirectUrl::archive_with_hashes(self.url.clone(), self.hashes.clone())
+    }
+
+    pub fn to_resolved_record(&self, package: &LockedPackage, cache_dir: &Path) -> Result<ResolvedRecord> {
+        Ok(ResolvedRecord {
+            name: package.name.clone(),
+            version: package.version.clone(),
+            artifact: PackageArtifact::Wheel {
+                path: self.fetch(cache_dir)?,
+                direct_url: Some(self.direct_url()),
+            },
+        })
+    }
+
     fn to_table(&self) -> Table {
         file_artifact_table(&self.name, &self.url, &self.hashes)
     }
@@ -306,6 +437,26 @@ impl LockedSdist {
             url: file.url.clone(),
             hashes: file.hashes.clone(),
         }
+    }
+
+    pub fn fetch(&self, cache_dir: &Path) -> Result<PathBuf> {
+        fetch_locked_artifact(cache_dir, &self.url, &self.name, &self.hashes)
+    }
+
+    #[must_use]
+    pub fn direct_url(&self) -> DirectUrl {
+        DirectUrl::archive_with_hashes(self.url.clone(), self.hashes.clone())
+    }
+
+    pub fn to_resolved_record(&self, package: &LockedPackage, cache_dir: &Path) -> Result<ResolvedRecord> {
+        Ok(ResolvedRecord {
+            name: package.name.clone(),
+            version: package.version.clone(),
+            artifact: PackageArtifact::Sdist {
+                path: self.fetch(cache_dir)?,
+                direct_url: Some(self.direct_url()),
+            },
+        })
     }
 
     fn to_table(&self) -> Table {
@@ -352,6 +503,23 @@ pub struct LockedVcs {
 }
 
 impl LockedVcs {
+    pub fn to_resolved_record(&self, package: &LockedPackage, cache_dir: &Path) -> Result<ResolvedRecord> {
+        if !self.vcs_type.eq_ignore_ascii_case("git") {
+            return Err(Error::Cli(format!(
+                "unsupported pon.lock VCS type `{}`; only git is supported",
+                self.vcs_type
+            )));
+        }
+
+        let checkout = vcs::fetch_git(cache_dir, &self.url, Some(self.commit_id.as_str()))?;
+        Ok(ResolvedRecord::dir(
+            package.name.clone(),
+            package.version.clone(),
+            checkout.dir,
+            false,
+        ))
+    }
+
     fn to_table(&self) -> Table {
         let mut table = Table::new();
         table.insert("type", value(self.vcs_type.as_str()));
@@ -402,6 +570,33 @@ impl From<&PackageKind> for LockedPackageKind {
 }
 
 #[must_use]
+pub fn lock_path(project_root: impl AsRef<Path>) -> PathBuf {
+    project_root.as_ref().join(LOCK_FILE_NAME)
+}
+
+#[must_use]
+pub fn compute_project_input_hash(pyproject: &PyProject) -> String {
+    compute_project_input_hash_with_overrides(pyproject, None, None)
+}
+
+#[must_use]
+pub fn compute_project_input_hash_with_overrides(
+    pyproject: &PyProject,
+    index_url: Option<&str>,
+    allow_prerelease: Option<bool>,
+) -> String {
+    let dependencies = pyproject.dependencies();
+    let effective_index_url = index_url.or_else(|| pyproject.tool_pon_index_url());
+    let effective_allow_prerelease = allow_prerelease.unwrap_or_else(|| pyproject.tool_pon_allow_prerelease());
+
+    compute_input_hash(
+        dependencies.iter().map(String::as_str),
+        effective_index_url,
+        effective_allow_prerelease,
+    )
+}
+
+#[must_use]
 pub fn compute_input_hash<I, S>(dependencies: I, index_url: Option<&str>, allow_prerelease: bool) -> String
 where
     I: IntoIterator<Item = S>,
@@ -432,6 +627,40 @@ pub fn stale_lock_error() -> Error {
 #[must_use]
 pub fn missing_frozen_lock_error() -> Error {
     Error::Cli("pon.lock not found; run `pon-pm lock`".to_owned())
+}
+
+fn fetch_locked_artifact(
+    cache_dir: &Path,
+    url: &str,
+    filename: &str,
+    hashes: &BTreeMap<String, String>,
+) -> Result<PathBuf> {
+    let required_hashes = required_hash_entries(hashes);
+    if required_hashes.is_empty() {
+        download_artifact(cache_dir, url, filename, &HashPolicy::Index(hashes))
+    } else {
+        download_artifact(
+            cache_dir,
+            url,
+            filename,
+            &HashPolicy::Required(&required_hashes),
+        )
+    }
+}
+
+fn required_hash_entries(hashes: &BTreeMap<String, String>) -> Vec<String> {
+    hashes
+        .iter()
+        .map(|(algorithm, digest)| format!("{algorithm}:{digest}"))
+        .collect()
+}
+
+fn resolve_project_path(project_root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_root.join(path)
+    }
 }
 
 fn parse_lock(input: &str) -> Result<LockFile> {
@@ -649,6 +878,17 @@ fn sha256_hex(input: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "pon-lock-{label}-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
+
     #[test]
     fn serializes_pep_751_shaped_lock_with_tool_metadata_only_when_needed() {
         let lock = LockFile::with_input_hash(
@@ -768,5 +1008,111 @@ mod tests {
         let _ = fs::remove_file(path);
 
         assert_eq!(read_back, lock);
+    }
+
+    #[test]
+    fn project_input_hash_uses_pyproject_settings_and_overrides() {
+        let pyproject = PyProject::from_str(
+            "pyproject.toml",
+            r#"
+[project]
+dependencies = ["demo>=1", "idna==3.10"]
+
+[tool.pon]
+index-url = "catalog:"
+allow-prerelease = true
+"#,
+        )
+        .expect("parse pyproject");
+
+        assert_eq!(
+            compute_project_input_hash(&pyproject),
+            compute_input_hash(["demo>=1", "idna==3.10"], Some("catalog:"), true)
+        );
+        assert_eq!(
+            compute_project_input_hash_with_overrides(&pyproject, Some("https://example.test/simple/"), Some(false)),
+            compute_input_hash(
+                ["idna==3.10", "demo>=1"],
+                Some("https://example.test/simple/"),
+                false
+            )
+        );
+    }
+
+    #[test]
+    fn project_root_read_helpers_handle_missing_and_stale_frozen_locks() {
+        let root = unique_temp_dir("project-root");
+        let lock = LockFile::with_input_hash(vec![LockedPackage::pure("idna", "3.10")], ">=3.14", "sha256:fresh");
+
+        assert!(LockFile::read_from_project_root(&root).expect("missing optional lock").is_none());
+        assert!(
+            LockFile::read_for_install(&root, "sha256:fresh", false)
+                .expect("missing non-frozen lock")
+                .is_none()
+        );
+        let missing = LockFile::read_for_install(&root, "sha256:fresh", true).expect_err("missing frozen lock");
+        assert!(missing.to_string().contains("pon.lock not found"));
+
+        lock.write_to_project_root(&root).expect("write project lock");
+        assert_eq!(
+            LockFile::read_frozen_for_install(&root, "sha256:fresh").expect("fresh frozen lock"),
+            lock
+        );
+        assert!(
+            LockFile::read_for_install(&root, "sha256:stale", false)
+                .expect("stale non-frozen lock")
+                .is_none()
+        );
+        let stale = LockFile::read_for_install(&root, "sha256:stale", true).expect_err("stale frozen lock");
+        assert!(stale.to_string().contains("input-hash mismatch"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn locked_packages_convert_to_current_install_records() {
+        let root = unique_temp_dir("install-records");
+        let cache_dir = root.join(".pon/cache");
+        fs::create_dir_all(&cache_dir).expect("create cache");
+
+        let mut directory_package = LockedPackage::pure("local-demo", "1.0");
+        directory_package.directory = Some(LockedDirectory {
+            path: PathBuf::from("vendor/local-demo"),
+            editable: true,
+        });
+        let directory_record = directory_package
+            .to_resolved_record(&root, &cache_dir)
+            .expect("directory record");
+        assert_eq!(
+            directory_record.artifact,
+            PackageArtifact::Dir {
+                path: root.join("vendor/local-demo"),
+                editable: true
+            }
+        );
+
+        let wheel_bytes = b"wheel bytes";
+        let wheel_path = root.join("demo-1.0-py3-none-any.whl");
+        fs::write(&wheel_path, wheel_bytes).expect("write wheel bytes");
+        let mut hashes = BTreeMap::new();
+        hashes.insert("sha256".to_owned(), sha256_hex(wheel_bytes));
+        let file_url = format!("file://{}", wheel_path.display());
+        let mut wheel_package = LockedPackage::pure("demo", "1.0");
+        wheel_package.wheels.push(LockedWheel {
+            name: "demo-1.0-py3-none-any.whl".to_owned(),
+            url: file_url.clone(),
+            hashes: hashes.clone(),
+        });
+
+        let wheel_record = wheel_package
+            .to_resolved_record(&root, &cache_dir)
+            .expect("wheel record");
+        let PackageArtifact::Wheel { path, direct_url } = wheel_record.artifact else {
+            panic!("expected wheel artifact");
+        };
+        assert_eq!(path, wheel_path);
+        let direct_url = direct_url.expect("direct URL");
+        assert_eq!(direct_url.url, file_url);
+        assert_eq!(direct_url.archive_info.expect("archive info").hashes, hashes);
+        let _ = fs::remove_dir_all(root);
     }
 }

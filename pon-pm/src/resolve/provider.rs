@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -30,6 +31,9 @@ use crate::resolve::versionset::range_from_specifiers;
 pub struct ResolveProvider<I = CatalogIndex> {
     index: I,
     marker_env: MarkerEnvironment,
+    allow_prerelease: bool,
+    constraints: ConstraintSet,
+    no_deps: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -85,6 +89,143 @@ struct PinnedCandidate {
 enum PinnedArtifact {
     Dir { path: PathBuf, editable: bool },
     Sdist { path: PathBuf },
+    Vcs {
+        url: String,
+        requested_rev: Option<String>,
+        commit: String,
+        dir: PathBuf,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ConstraintSet {
+    constraints: HashMap<String, Vec<VersionSpecifiers>>,
+}
+
+impl ConstraintSet {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_requirements<T, R>(requirements: T) -> Result<Self>
+    where
+        T: IntoIterator<Item = R>,
+        R: AsRef<str>,
+    {
+        let mut constraints = Self::new();
+        let marker_env = pon_marker_env();
+        for requirement in requirements {
+            constraints.insert_requirement_with_env(requirement.as_ref(), &marker_env)?;
+        }
+        Ok(constraints)
+    }
+
+    pub fn from_requirements_with_env<T, R>(requirements: T, marker_env: &MarkerEnvironment) -> Result<Self>
+    where
+        T: IntoIterator<Item = R>,
+        R: AsRef<str>,
+    {
+        let mut constraints = Self::new();
+        for requirement in requirements {
+            constraints.insert_requirement_with_env(requirement.as_ref(), marker_env)?;
+        }
+        Ok(constraints)
+    }
+
+    pub fn insert_requirement(&mut self, raw: impl AsRef<str>) -> Result<()> {
+        let marker_env = pon_marker_env();
+        self.insert_requirement_with_env(raw, &marker_env)
+    }
+
+    pub fn insert_requirement_with_env(&mut self, raw: impl AsRef<str>, marker_env: &MarkerEnvironment) -> Result<()> {
+        let raw = raw.as_ref().trim();
+        let input = parse_requirement_input(raw)?;
+        self.insert_input_with_env(&input, raw, marker_env)
+    }
+
+    pub fn insert_input(&mut self, input: &RequirementInput, line: impl fmt::Display) -> Result<()> {
+        let marker_env = pon_marker_env();
+        self.insert_input_inner(input, line.to_string(), Some(&marker_env))
+    }
+
+    pub fn insert_input_with_env(
+        &mut self,
+        input: &RequirementInput,
+        line: impl fmt::Display,
+        marker_env: &MarkerEnvironment,
+    ) -> Result<()> {
+        self.insert_input_inner(input, line.to_string(), Some(marker_env))
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.constraints.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.constraints.values().map(Vec::len).sum()
+    }
+
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&[VersionSpecifiers]> {
+        self.constraints.get(&names::normalize(name)).map(Vec::as_slice)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &[VersionSpecifiers])> {
+        self.constraints
+            .iter()
+            .map(|(name, specifiers)| (name, specifiers.as_slice()))
+    }
+
+    fn insert_input_inner(
+        &mut self,
+        input: &RequirementInput,
+        line: String,
+        marker_env: Option<&MarkerEnvironment>,
+    ) -> Result<()> {
+        let RequirementInput::Pep508(requirement) = input else {
+            return Err(invalid_constraint_line(&line));
+        };
+
+        if !requirement.extras.is_empty() {
+            return Err(invalid_constraint_line(&line));
+        }
+
+        if let Some(marker_env) = marker_env {
+            if !requirement.evaluate_markers(marker_env, &[]) {
+                return Ok(());
+            }
+        }
+
+        let specifiers = match &requirement.version_or_url {
+            Some(VersionOrUrl::VersionSpecifier(specifiers)) => specifiers.clone(),
+            Some(VersionOrUrl::Url(_)) => return Err(invalid_constraint_line(&line)),
+            None => VersionSpecifiers::default(),
+        };
+
+        self.constraints
+            .entry(names::normalize(requirement.name.as_ref()))
+            .or_default()
+            .push(specifiers);
+        Ok(())
+    }
+}
+
+impl From<HashMap<String, VersionSpecifiers>> for ConstraintSet {
+    fn from(constraints: HashMap<String, VersionSpecifiers>) -> Self {
+        Self {
+            constraints: constraints
+                .into_iter()
+                .map(|(name, specifiers)| (names::normalize(&name), vec![specifiers]))
+                .collect(),
+        }
+    }
+}
+
+fn invalid_constraint_line(line: &str) -> Error {
+    Error::InvalidRequirement(format!("constraints cannot use extras or URLs: {line}"))
 }
 
 pub struct PonProvider<'a, S: CandidateSource> {
@@ -92,7 +233,8 @@ pub struct PonProvider<'a, S: CandidateSource> {
     pub markers: MarkerEnvironment,
     pub allow_prerelease: bool,
     root_reqs: Vec<ResolvedInput>,
-    pub constraints: HashMap<String, VersionSpecifiers>,
+    pinned: std::cell::RefCell<HashMap<String, PinnedCandidate>>,
+    pub constraints: ConstraintSet,
     pub rejects: std::cell::RefCell<BTreeMap<(String, String), Vec<String>>>,
     versions: std::cell::RefCell<HashMap<(String, bool), Vec<Version>>>,
     pub no_deps: bool,
@@ -110,12 +252,67 @@ impl<I> ResolveProvider<I> {
         Self {
             index,
             marker_env: pon_marker_env(),
+            allow_prerelease: false,
+            constraints: ConstraintSet::default(),
+            no_deps: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_allow_prerelease(mut self, allow_prerelease: bool) -> Self {
+        self.allow_prerelease = allow_prerelease;
+        self
+    }
+
+    pub fn set_allow_prerelease(&mut self, allow_prerelease: bool) {
+        self.allow_prerelease = allow_prerelease;
+    }
+
+    #[must_use]
+    pub fn with_no_deps(mut self, no_deps: bool) -> Self {
+        self.no_deps = no_deps;
+        self
+    }
+
+    pub fn set_no_deps(&mut self, no_deps: bool) {
+        self.no_deps = no_deps;
+    }
+
+    #[must_use]
+    pub fn with_constraint_set(mut self, constraints: impl Into<ConstraintSet>) -> Self {
+        self.constraints = constraints.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_constraints(self, constraints: impl Into<ConstraintSet>) -> Self {
+        self.with_constraint_set(constraints)
+    }
+
+    pub fn set_constraint_set(&mut self, constraints: impl Into<ConstraintSet>) {
+        self.constraints = constraints.into();
+    }
+
+    pub fn set_constraints(&mut self, constraints: impl Into<ConstraintSet>) {
+        self.set_constraint_set(constraints);
     }
 
     #[cfg(test)]
     fn with_marker_env(index: I, marker_env: MarkerEnvironment) -> Self {
-        Self { index, marker_env }
+        Self {
+            index,
+            marker_env,
+            allow_prerelease: false,
+            constraints: ConstraintSet::default(),
+            no_deps: false,
+        }
+    }
+
+    fn configure_provider<'a, S: CandidateSource>(&self, provider: PonProvider<'a, S>) -> PonProvider<'a, S> {
+        provider
+            .with_allow_prerelease(self.allow_prerelease)
+            .with_constraints(self.constraints.clone())
+            .with_no_deps(self.no_deps)
     }
 }
 
@@ -128,7 +325,11 @@ impl<I: PackageIndex> ResolveProvider<I> {
 
         let root_names = [resolved.dist_name().to_owned()].into_iter().collect::<BTreeSet<_>>();
         let source = IndexSource::new(&self.index);
-        let provider = PonProvider::from_resolved_inputs(&source, self.marker_env.clone(), vec![resolved]);
+        let provider = self.configure_provider(PonProvider::from_resolved_inputs(
+            &source,
+            self.marker_env.clone(),
+            vec![resolved],
+        ));
         let resolution = match resolve_root(&provider) {
             Ok(resolution) => resolution,
             Err(error) => return Err(cabi_refusal_for_roots(&provider, &root_names).unwrap_or(error)),
@@ -145,9 +346,16 @@ impl<I: PackageIndex> ResolveProvider<I> {
             .ok_or_else(|| Error::InvalidRequirement(format!("no package was resolved for `{raw}`")))
     }
 
-    pub fn resolve_requirements<'a>(&self, requirements: impl IntoIterator<Item = &'a str>) -> Result<Vec<ResolvedPackage>> {
+    pub fn resolve_requirements<'a>(
+        &self,
+        requirements: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<ResolvedPackage>> {
         let source = IndexSource::new(&self.index);
-        let provider = PonProvider::from_requirements_with_env(&source, requirements, self.marker_env.clone())?;
+        let provider = self.configure_provider(PonProvider::from_requirements_with_env(
+            &source,
+            requirements,
+            self.marker_env.clone(),
+        )?);
         let root_names = provider.root_dist_names();
         let resolution = match resolve_root(&provider) {
             Ok(resolution) => resolution,
@@ -197,16 +405,64 @@ impl<'a, S: CandidateSource> PonProvider<'a, S> {
     }
 
     fn from_resolved_inputs(source: &'a S, markers: MarkerEnvironment, root_reqs: Vec<ResolvedInput>) -> Self {
+        let pinned = root_reqs
+            .iter()
+            .filter_map(|input| match input {
+                ResolvedInput::Pinned { candidate, .. } => Some((candidate.name.clone(), candidate.clone())),
+                ResolvedInput::Registry { .. } => None,
+            })
+            .collect::<HashMap<_, _>>();
+
         Self {
             source,
             markers,
             allow_prerelease: false,
             root_reqs,
-            constraints: HashMap::new(),
+            pinned: std::cell::RefCell::new(pinned),
+            constraints: ConstraintSet::default(),
             rejects: std::cell::RefCell::new(BTreeMap::new()),
             versions: std::cell::RefCell::new(HashMap::new()),
             no_deps: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_allow_prerelease(mut self, allow_prerelease: bool) -> Self {
+        self.allow_prerelease = allow_prerelease;
+        self
+    }
+
+    pub fn set_allow_prerelease(&mut self, allow_prerelease: bool) {
+        self.allow_prerelease = allow_prerelease;
+    }
+
+    #[must_use]
+    pub fn with_no_deps(mut self, no_deps: bool) -> Self {
+        self.no_deps = no_deps;
+        self
+    }
+
+    pub fn set_no_deps(&mut self, no_deps: bool) {
+        self.no_deps = no_deps;
+    }
+
+    #[must_use]
+    pub fn with_constraint_set(mut self, constraints: impl Into<ConstraintSet>) -> Self {
+        self.constraints = constraints.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_constraints(self, constraints: impl Into<ConstraintSet>) -> Self {
+        self.with_constraint_set(constraints)
+    }
+
+    pub fn set_constraint_set(&mut self, constraints: impl Into<ConstraintSet>) {
+        self.constraints = constraints.into();
+    }
+
+    pub fn set_constraints(&mut self, constraints: impl Into<ConstraintSet>) {
+        self.set_constraint_set(constraints);
     }
 
     fn dependency_edges(&self, package: &PonPackage, version: &Version) -> Result<DependencyConstraints<PonPackage, Ranges<Version>>> {
@@ -219,10 +475,13 @@ impl<'a, S: CandidateSource> PonProvider<'a, S> {
                             self.add_requirement_edges(&mut edges, requirement, &[])?;
                         }
                         ResolvedInput::Pinned { candidate, .. } => {
-                            edges.push((
-                                PonPackage::Dist(candidate.name.clone()),
+                            let candidates = vec![candidate.version.clone()];
+                            let range = self.apply_constraints(
+                                &candidate.name,
                                 Ranges::singleton(candidate.version.clone()),
-                            ));
+                                &candidates,
+                            );
+                            edges.push((PonPackage::Dist(candidate.name.clone()), range));
                         }
                     }
                 }
@@ -258,16 +517,33 @@ impl<'a, S: CandidateSource> PonProvider<'a, S> {
             return Ok(());
         }
 
+        if let Some(VersionOrUrl::Url(url)) = &requirement.version_or_url {
+            let url = url.to_string();
+            if is_git_direct_url(&url) {
+                let candidate = self.ensure_pinned_git_requirement(requirement, &url)?;
+                let candidates = vec![candidate.version.clone()];
+                let range = self.apply_constraints(
+                    &candidate.name,
+                    Ranges::singleton(candidate.version.clone()),
+                    &candidates,
+                );
+
+                let name = requirement.name.as_ref().to_owned();
+                edges.push((PonPackage::Dist(name.clone()), range.clone()));
+                for extra in &requirement.extras {
+                    edges.push((PonPackage::Extra(name.clone(), extra.to_string()), range.clone()));
+                }
+                return Ok(());
+            }
+        }
+
         let name = requirement.name.as_ref().to_owned();
         let candidates = self.versions_for_name(&name)?;
-        let mut range = self.range_for_requirement(requirement, &candidates)?;
-        if let Some(constraint) = self.constraints.get(&names::normalize(&name)) {
-            range = range.intersection(&range_from_specifiers(
-                constraint,
-                &candidates,
-                self.allow_prerelease,
-            ));
-        }
+        let range = self.apply_constraints(
+            &name,
+            self.range_for_requirement(requirement, &candidates)?,
+            &candidates,
+        );
 
         edges.push((PonPackage::Dist(name.clone()), range.clone()));
         for extra in &requirement.extras {
@@ -280,18 +556,39 @@ impl<'a, S: CandidateSource> PonProvider<'a, S> {
         let specifiers = match &requirement.version_or_url {
             Some(VersionOrUrl::VersionSpecifier(specifiers)) => specifiers.clone(),
             Some(VersionOrUrl::Url(url)) => {
-                return Err(Error::InvalidRequirement(format!(
-                    "direct URL sources are not supported yet: {url}"
-                )));
+                let url = url.to_string();
+                if is_git_direct_url(&url) {
+                    let candidate = self.ensure_pinned_git_requirement(requirement, &url)?;
+                    return Ok(Ranges::singleton(candidate.version));
+                }
+                return Err(unsupported_direct_url(&url));
             }
             None => VersionSpecifiers::default(),
         };
         Ok(range_from_specifiers(&specifiers, candidates, self.allow_prerelease))
     }
 
+    fn apply_constraints(
+        &self,
+        name: &str,
+        mut range: Ranges<Version>,
+        candidates: &[Version],
+    ) -> Ranges<Version> {
+        if let Some(constraints) = self.constraints.get(name) {
+            for constraint in constraints {
+                range = range.intersection(&range_from_specifiers(
+                    constraint,
+                    candidates,
+                    self.allow_prerelease,
+                ));
+            }
+        }
+        range
+    }
+
     fn metadata_for_dist(&self, name: &str, version: &Version) -> Result<CoreMetadata> {
         if let Some(candidate) = self.pinned_candidate(name).filter(|candidate| &candidate.version == version) {
-            return Ok(core_metadata_from_pinned(candidate));
+            return Ok(core_metadata_from_pinned(&candidate));
         }
 
         let metadata = self.source.metadata(name, version)?;
@@ -346,12 +643,21 @@ impl<'a, S: CandidateSource> PonProvider<'a, S> {
         })
     }
 
-    fn pinned_candidate(&self, name: &str) -> Option<&PinnedCandidate> {
+    fn pinned_candidate(&self, name: &str) -> Option<PinnedCandidate> {
         let normalized = names::normalize(name);
-        self.root_reqs.iter().find_map(|input| match input {
-            ResolvedInput::Pinned { candidate, .. } if candidate.name == normalized => Some(candidate),
-            _ => None,
-        })
+        self.pinned.borrow().get(&normalized).cloned()
+    }
+
+    fn ensure_pinned_git_requirement(&self, requirement: &Requirement, url: &str) -> Result<PinnedCandidate> {
+        let requested_name = names::normalize(requirement.name.as_ref());
+        if let Some(candidate) = self.pinned.borrow().get(&requested_name).cloned() {
+            return Ok(candidate);
+        }
+
+        let candidate = pin_git_url(url)?;
+        validate_pinned_requirement_name(&candidate, requirement)?;
+        self.pinned.borrow_mut().insert(candidate.name.clone(), candidate.clone());
+        Ok(candidate)
     }
 
     fn selected_artifact(&self, name: &str, version: &Version) -> Result<(ResolvedArtifact, PackageKind)> {
@@ -642,17 +948,31 @@ fn resolved_input_from_raw(raw: &str, marker_env: &MarkerEnvironment) -> Result<
             raw: raw.to_owned(),
             candidate: pin_local_path(&path, editable)?,
         })),
-        RequirementInput::Url { url } => Err(Error::InvalidRequirement(format!(
-            "direct URL sources are not supported yet: {url}"
-        ))),
+        RequirementInput::Url { url } => {
+            let url = url.to_string();
+            if is_git_direct_url(&url) {
+                return Ok(Some(ResolvedInput::Pinned {
+                    raw: raw.to_owned(),
+                    candidate: pin_git_url(&url)?,
+                }));
+            }
+            Err(unsupported_direct_url(&url))
+        }
         RequirementInput::Pep508(requirement) => {
             if !requirement.evaluate_markers(marker_env, &[]) {
                 return Ok(None);
             }
             if let Some(VersionOrUrl::Url(url)) = &requirement.version_or_url {
-                return Err(Error::InvalidRequirement(format!(
-                    "direct URL sources are not supported yet: {url}"
-                )));
+                let url = url.to_string();
+                if is_git_direct_url(&url) {
+                    let candidate = pin_git_url(&url)?;
+                    validate_pinned_requirement_name(&candidate, &requirement)?;
+                    return Ok(Some(ResolvedInput::Pinned {
+                        raw: raw.to_owned(),
+                        candidate,
+                    }));
+                }
+                return Err(unsupported_direct_url(&url));
             }
             Ok(Some(ResolvedInput::Registry {
                 raw: raw.to_owned(),
@@ -660,6 +980,33 @@ fn resolved_input_from_raw(raw: &str, marker_env: &MarkerEnvironment) -> Result<
             }))
         }
     }
+}
+
+fn is_git_direct_url(url: &str) -> bool {
+    url.trim_start().starts_with("git+")
+}
+
+fn unsupported_direct_url(url: &str) -> Error {
+    Error::InvalidRequirement(format!("direct URL sources are not supported yet: {url}"))
+}
+
+fn validate_pinned_requirement_name(candidate: &PinnedCandidate, requirement: &Requirement) -> Result<()> {
+    let requested_name = names::normalize(requirement.name.as_ref());
+    if candidate.name == requested_name {
+        return Ok(());
+    }
+
+    Err(Error::InvalidRequirement(format!(
+        "direct URL requirement `{requirement}` resolved to package `{}`",
+        candidate.name
+    )))
+}
+
+fn vcs_cache_root() -> PathBuf {
+    std::env::var_os("PON_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".pon"))
+        .join("cache")
 }
 
 fn apply_legacy_version_specifier(input: &mut ResolvedInput, raw: &str, version_specifier: &str) -> Result<()> {
@@ -700,27 +1047,22 @@ impl PinnedArtifact {
                 editable: *editable,
             },
             Self::Sdist { path } => ResolvedArtifact::Sdist(local_project_file(path, version.clone(), kind.clone())),
+            Self::Vcs {
+                url,
+                requested_rev,
+                commit,
+                dir,
+            } => ResolvedArtifact::Vcs {
+                url: url.clone(),
+                requested_rev: requested_rev.clone(),
+                commit: commit.clone(),
+                dir: dir.clone(),
+            },
         }
     }
 }
 
 fn pin_local_path(path: &Path, editable: bool) -> Result<PinnedCandidate> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let manifest_relative = manifest_dir.join(path);
-    let workspace_relative = manifest_dir
-        .parent()
-        .map(|parent| parent.join(path))
-        .unwrap_or_else(|| path.to_path_buf());
-    let path = if path.exists() {
-        path.to_path_buf()
-    } else if manifest_relative.exists() {
-        manifest_relative
-    } else if workspace_relative.exists() {
-        workspace_relative
-    } else {
-        path.to_path_buf()
-    };
-    let path = path.as_path();
     let (pyproject, artifact) = if path.is_dir() {
         let manifest_path = path.join("pyproject.toml");
         if !manifest_path.is_file() {
@@ -767,11 +1109,15 @@ fn pin_local_path(path: &Path, editable: bool) -> Result<PinnedCandidate> {
         .dependencies()
         .into_iter()
         .map(|raw| match parse_requirement_input(&raw)? {
-            RequirementInput::Pep508(requirement) if !matches!(&requirement.version_or_url, Some(VersionOrUrl::Url(_))) => Ok(requirement),
-            RequirementInput::Pep508(requirement) => Err(Error::InvalidRequirement(format!(
-                "direct URL sources are not supported yet: {}",
-                requirement
-            ))),
+            RequirementInput::Pep508(requirement) => match &requirement.version_or_url {
+                Some(VersionOrUrl::Url(url)) if !is_git_direct_url(&url.to_string()) => {
+                    Err(Error::InvalidRequirement(format!(
+                        "direct URL sources are not supported yet: {}",
+                        requirement
+                    )))
+                }
+                _ => Ok(requirement),
+            },
             RequirementInput::Path { .. } | RequirementInput::Url { .. } => Err(Error::InvalidRequirement(format!(
                 "local package dependency `{raw}` is not a PEP 508 registry requirement"
             ))),
@@ -785,6 +1131,19 @@ fn pin_local_path(path: &Path, editable: bool) -> Result<PinnedCandidate> {
         artifact,
         dependencies,
     })
+}
+
+fn pin_git_url(url: &str) -> Result<PinnedCandidate> {
+    let reference = crate::vcs::parse_git_reference(url)?;
+    let checkout = crate::vcs::fetch_git(&vcs_cache_root(), url, None)?;
+    let mut candidate = pin_local_path(&checkout.dir, false)?;
+    candidate.artifact = PinnedArtifact::Vcs {
+        url: url.to_owned(),
+        requested_rev: reference.requested_rev,
+        commit: checkout.commit,
+        dir: checkout.dir,
+    };
+    Ok(candidate)
 }
 
 fn core_metadata_from_pinned(candidate: &PinnedCandidate) -> CoreMetadata {
@@ -915,7 +1274,6 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::index::{DistInfoMetadata, SimpleJsonIndex};
-    use crate::lock::LockFile;
 
     use super::*;
 
@@ -946,7 +1304,12 @@ mod tests {
     #[test]
     fn resolves_fastjson_pon_local_path_as_native() {
         let provider = ResolveProvider::default();
-        let record = provider.resolve_input("fixtures/fastjson-pon", "").expect("record");
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("workspace root")
+            .join("fixtures")
+            .join("fastjson-pon");
+        let record = provider.resolve_input(fixture.to_str().expect("fixture path"), "").expect("record");
 
         assert_eq!(record, PackageRecord {
             name: "fastjson-pon".to_owned(),
@@ -981,11 +1344,6 @@ mod tests {
             resolved.iter().map(|package| package.record.version.as_str()).collect::<Vec<_>>(),
             ["1.0.0", "1.0.0", "1.0.0"]
         );
-        let records = resolved.iter().map(|package| package.record.clone()).collect::<Vec<_>>();
-        let lock = LockFile::from_records(&records).to_string();
-        assert!(lock.contains("name = \"pkg-a\""));
-        assert!(lock.contains("name = \"pkg-b\""));
-        assert!(lock.contains("name = \"pkg-c\""));
     }
 
     #[test]
@@ -1013,9 +1371,15 @@ mod tests {
         let cache = root.join("cache");
         let index = SimpleJsonIndex::with_cache_dir("https://fixtures.example/simple/", &cache);
         for (name, body) in [
-            ("pkg-a", include_str!("../index/fixtures/pkg-a-pep691.json")),
-            ("pkg-b", include_str!("../index/fixtures/pkg-b-pep691.json")),
-            ("pkg-c", include_str!("../index/fixtures/pkg-c-pep691.json")),
+            ("pkg-a", include_str!("../index/fixtures/pkg-a-pep691.json").to_owned()),
+            ("pkg-b", include_str!("../index/fixtures/pkg-b-pep691.json").to_owned()),
+            (
+                "pkg-c",
+                include_str!("../index/fixtures/pkg-c-pep691.json").replace(
+                    "\"requires-python\": \">=3.8\",",
+                    "\"requires-python\": \">=3.8\", \"dist-info-metadata\": { \"sha256\": \"3333333333333333333333333333333333333333333333333333333333333333\" },",
+                ),
+            ),
         ] {
             let url = index.project_url(name);
             let path = index.cache_path_for_url(&url);
