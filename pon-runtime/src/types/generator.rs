@@ -1,7 +1,8 @@
 //! Generator object implementation.
 //!
 //! The runtime object is intentionally stackless: all suspended execution state
-//! lives in the heap `PyFrame`, and resumption is a normal call to `resume`.
+//! lives in the heap [`GenFrame`], and resumption is a normal call to the
+//! compiled body through the shared `pon_gen_resume` driver (pin J0.1).
 
 use core::ffi::c_int;
 use core::mem;
@@ -10,7 +11,6 @@ use std::sync::{LazyLock, Mutex};
 
 use pon_gc::TypeId;
 
-use crate::abi::{PyFrame, r#gen::GenResumeFn};
 use crate::intern;
 use crate::object::{GetAttrFunc, PyAsyncMethods, PyObject, PyObjectHeader, PyType, SendFunc, as_object_ptr};
 use crate::types::{method, type_};
@@ -50,45 +50,37 @@ impl GeneratorKind {
     }
 }
 
-/// Boxed Python generator/coroutine payload.
+/// Boxed Python generator/coroutine payload (pin J0.1).
 #[repr(C)]
 #[derive(Debug)]
 pub struct PyGenerator {
     /// Standard boxed-object header at offset zero.
     pub header: PyObjectHeader,
-    /// Compiled body resume function.
-    pub resume: GenResumeFn,
-    /// Heap frame holding the state index and locals.
-    pub frame: *mut PyFrame,
+    /// Compiled resumable body (single-argument resume ABI, pin J0.1 §2).
+    pub body: GenResumeBodyFn,
+    /// Heap frame holding the resume state and spill slots.
+    pub frame: *mut GenFrame,
+    /// Function object this generator was created from, or NULL.  Pushed as
+    /// the current call while the body runs so closure-cell loads resolve.
+    pub function: *mut PyObject,
     /// `0=generator`, `1=coroutine`, `2=async_generator`.
     pub kind: u8,
-    /// Re-entrancy guard.
-    pub running: bool,
     /// Set after `close` so late resumes raise `StopIteration(None)`.
     pub closed: bool,
-    /// Exception scheduled by `throw` for the next resume-site check.
-    pub pending_throw: *mut PyObject,
 }
 
 impl PyGenerator {
     /// Builds a generator payload around an already-allocated heap frame.
     #[must_use]
-    pub fn new(ty: *const PyType, resume: GenResumeFn, frame: *mut PyFrame, kind: GeneratorKind) -> Self {
+    pub fn new(ty: *const PyType, body: GenResumeBodyFn, frame: *mut GenFrame, function: *mut PyObject, kind: GeneratorKind) -> Self {
         Self {
             header: PyObjectHeader::new(ty),
-            resume,
+            body,
             frame,
+            function,
             kind: kind.as_u8(),
-            running: false,
             closed: false,
-            pending_throw: ptr::null_mut(),
         }
-    }
-
-    /// Returns true when the object has no further resume point.
-    #[must_use]
-    pub unsafe fn is_exhausted(&self) -> bool {
-        self.closed || self.frame.is_null() || unsafe { (*self.frame).state == FRAME_STATE_EXHAUSTED }
     }
 }
 
@@ -187,8 +179,8 @@ pub unsafe extern "C" fn trace_generator(object: *mut u8, visitor: &mut dyn FnMu
     if !generator.frame.is_null() {
         visitor(generator.frame.cast::<u8>());
     }
-    if !generator.pending_throw.is_null() {
-        visitor(generator.pending_throw.cast::<u8>());
+    if !generator.function.is_null() {
+        visitor(generator.function.cast::<u8>());
     }
 }
 
@@ -288,23 +280,19 @@ pub unsafe extern "C" fn generator_getattro(object: *mut PyObject, name: *mut Py
 
 // ---------------------------------------------------------------------------
 // Pin J0.1 — resumable generator frames (frozen contract).
-// Design doc: plans/pon-pin-J01-generator-frames.md. Nothing below is wired
-// into codegen or the HELPERS table yet; Track J1 implements against it and
-// then deletes the eager-yield path above.
+// Design doc: plans/pon-pin-J01-generator-frames.md. The layout below is the
+// live generator representation; the driver and exported helper symbols live
+// in `abi/gen.rs`.
 // ---------------------------------------------------------------------------
 
 /// GC type id reserved for resumable generator frames in the WS-GEN family.
-#[allow(dead_code, reason = "J0 pin: consumed by Track J1 in a later wave")]
 pub const TYPE_ID_GEN_FRAME: TypeId = TypeId(33);
 
 /// Resume state for a frame that has never been resumed (zeroed allocation).
-#[allow(dead_code, reason = "J0 pin: consumed by Track J1 in a later wave")]
 pub const RESUME_START: u32 = 0;
 /// Sentinel resume state stored by the compiled body while it is executing.
-#[allow(dead_code, reason = "J0 pin: consumed by Track J1 in a later wave")]
 pub const RESUME_RUNNING: u32 = u32::MAX - 1;
 /// Sentinel resume state for a finished (returned, unwound, or closed) frame.
-#[allow(dead_code, reason = "J0 pin: consumed by Track J1 in a later wave")]
 pub const RESUME_FINISHED: u32 = u32::MAX;
 
 const _: () = {
@@ -344,7 +332,6 @@ pub struct GenFrame {
 }
 
 /// Byte size of the fixed [`GenFrame`] header preceding the trailing slot array.
-#[allow(dead_code, reason = "J0 pin: consumed by Track J1 in a later wave")]
 pub const GEN_FRAME_HEADER_SIZE: usize = mem::size_of::<GenFrame>();
 
 #[cfg(target_pointer_width = "64")]
@@ -361,7 +348,6 @@ const _: () = {
 ///
 /// Compiled code and the allocator must agree on this formula forever:
 /// slot `k` lives at byte offset `GEN_FRAME_HEADER_SIZE + k * 8` (64-bit).
-#[allow(dead_code, reason = "J0 pin: consumed by Track J1 in a later wave")]
 #[must_use]
 pub const fn gen_frame_alloc_size(slot_count: u32) -> usize {
     GEN_FRAME_HEADER_SIZE + slot_count as usize * mem::size_of::<*mut PyObject>()
@@ -373,8 +359,7 @@ impl GenFrame {
     /// # Safety
     /// `frame` must point at a live `GenFrame` allocation and `index` must be
     /// below its `slot_count`.
-    #[allow(dead_code, reason = "J0 pin: consumed by Track J1 in a later wave")]
-    #[must_use]
+        #[must_use]
     pub unsafe fn slot_ptr(frame: *mut Self, index: u32) -> *mut *mut PyObject {
         // SAFETY: The caller guarantees `frame` is live; `slots` names the
         // trailing array start without materializing a reference to it.
@@ -388,8 +373,7 @@ impl GenFrame {
     ///
     /// # Safety
     /// Same contract as [`GenFrame::slot_ptr`].
-    #[allow(dead_code, reason = "J0 pin: consumed by Track J1 in a later wave")]
-    #[must_use]
+        #[must_use]
     pub unsafe fn slot(frame: *mut Self, index: u32) -> *mut PyObject {
         // SAFETY: `slot_ptr` upholds bounds under the caller's contract.
         unsafe { *Self::slot_ptr(frame, index) }
@@ -400,8 +384,7 @@ impl GenFrame {
     /// # Safety
     /// Same contract as [`GenFrame::slot_ptr`]; `value` must be a boxed object
     /// pointer or NULL.
-    #[allow(dead_code, reason = "J0 pin: consumed by Track J1 in a later wave")]
-    pub unsafe fn set_slot(frame: *mut Self, index: u32, value: *mut PyObject) {
+        pub unsafe fn set_slot(frame: *mut Self, index: u32, value: *mut PyObject) {
         // SAFETY: `slot_ptr` upholds bounds under the caller's contract, and
         // every heap pointer store routes through the write barrier.
         unsafe { crate::sync::store_heap_pointer(Self::slot_ptr(frame, index), value) }
@@ -416,7 +399,6 @@ impl GenFrame {
 /// `sent_value`/`thrown_exc` fields.  A non-NULL return is the yielded value;
 /// NULL means finished (`StopIteration` pending on return, the escaping
 /// exception pending otherwise) with `resume_state == RESUME_FINISHED`.
-#[allow(dead_code, reason = "J0 pin: consumed by Track J1 in a later wave")]
 pub type GenResumeBodyFn = unsafe extern "C" fn(frame: *mut GenFrame) -> *mut PyObject;
 
 /// Traces a [`GenFrame`] allocation for the runtime GC (pin J0.1 §1.2).
@@ -431,7 +413,6 @@ pub type GenResumeBodyFn = unsafe extern "C" fn(frame: *mut GenFrame) -> *mut Py
 /// # Safety
 /// `object` must point at a live `GenFrame` allocation whose trailing array has
 /// `slot_count` entries.
-#[allow(dead_code, reason = "J0 pin: consumed by Track J1 in a later wave")]
 pub unsafe extern "C" fn trace_gen_frame(object: *mut u8, visitor: &mut dyn FnMut(*mut u8)) {
     if object.is_null() {
         return;
@@ -455,50 +436,6 @@ pub unsafe extern "C" fn trace_gen_frame(object: *mut u8, visitor: &mut dyn FnMu
             visitor(value.cast::<u8>());
         }
     }
-}
-
-/// Allocates a zeroed resumable generator frame with `slot_count` spill slots.
-///
-/// Frozen contract (pin J0.1 §1.1): the implementation registers
-/// [`TYPE_ID_GEN_FRAME`] (trace = [`trace_gen_frame`], `finalize: None`) in
-/// `ensure_gen_runtime`, allocates via
-/// `runtime.heap.alloc(gen_frame_alloc_size(slot_count), TYPE_ID_GEN_FRAME)`,
-/// and writes only `header.ob_type` and `slot_count` — zeroed memory already
-/// encodes [`RESUME_START`], NULL payload fields, and NULL slots.  Follows the
-/// runtime NULL-sentinel discipline; the exported `no_mangle` symbol lands with
-/// the J1 implementation in `abi/gen.rs`.
-///
-/// # Safety
-/// The runtime must be initialized before the first call.
-#[allow(dead_code, reason = "J0 pin: consumed by Track J1 in a later wave")]
-pub unsafe extern "C" fn pon_gen_frame_alloc(slot_count: u32) -> *mut GenFrame {
-    let _ = slot_count;
-    crate::abi::return_null_with_error("pon_gen_frame_alloc is a J0.1 pin stub; Track J1 supplies the implementation")
-        .cast::<GenFrame>()
-}
-
-/// Resumes a generator/coroutine body once: the shared driver core behind
-/// `send`, `throw`, and `close`.
-///
-/// Frozen contract (pin J0.1 §4.1): at most one of `sent`/`thrown` is non-NULL
-/// (both NULL means `next(g)`, i.e. send `None`).  The driver only reads
-/// `resume_state`: [`RESUME_RUNNING`] ⇒ ValueError ("generator already
-/// executing"; kind-dispatched wording for coroutines), [`RESUME_FINISHED`] ⇒
-/// `StopIteration(None)` for send / re-raise of `thrown` for throw, non-`None`
-/// send at [`RESUME_START`] ⇒ TypeError.  Otherwise it writes the payload into
-/// `sent_value`/`thrown_exc` (write-barriered, under the generator's critical
-/// section), pushes the frame on the thread-state frame stack, clears the error
-/// state, and calls the compiled [`GenResumeBodyFn`] — the only body call site.
-/// Returns the yielded value, or NULL with the pending exception
-/// (`StopIteration` ⇒ normal exhaustion).
-///
-/// # Safety
-/// `generator` must be a boxed generator/coroutine object; `sent` and `thrown`
-/// must each be a valid boxed object or NULL.
-#[allow(dead_code, reason = "J0 pin: consumed by Track J1 in a later wave")]
-pub unsafe extern "C" fn pon_gen_resume(generator: *mut PyObject, sent: *mut PyObject, thrown: *mut PyObject) -> *mut PyObject {
-    let _ = (generator, sent, thrown);
-    crate::abi::return_null_with_error("pon_gen_resume is a J0.1 pin stub; Track J1 supplies the implementation")
 }
 
 #[cfg(test)]
