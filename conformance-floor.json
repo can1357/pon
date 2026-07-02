@@ -3,6 +3,7 @@
   "passing_modules": [
     "corpus/pkg_driver.py",
     "pon-conformance/corpus/cpython/annotations_function_variable.py",
+    "pon-conformance/corpus/cpython/annotations_lazy_pep649.py",
     "pon-conformance/corpus/cpython/async_manual_send.py",
     "pon-conformance/corpus/cpython/builtins_core.py",
     "pon-conformance/corpus/cpython/class_annotations.py",
@@ -29,6 +30,10 @@
     "pon-conformance/corpus/cpython/lambdas.py",
     "pon-conformance/corpus/cpython/list_methods.py",
     "pon-conformance/corpus/cpython/loop_control.py",
+    "pon-conformance/corpus/cpython/match_class_patterns.py",
+    "pon-conformance/corpus/cpython/match_or_guard.py",
+    "pon-conformance/corpus/cpython/match_patterns.py",
+    "pon-conformance/corpus/cpython/match_sequence_mapping.py",
     "pon-conformance/corpus/cpython/nested_comprehension_scope.py",
     "pon-conformance/corpus/cpython/operators_augmented.py",
     "pon-conformance/corpus/cpython/properties_descriptors.py",
@@ -39,10 +44,11 @@
     "pon-conformance/corpus/cpython/tstrings.py",
     "pon-conformance/corpus/cpython/tuple_methods.py",
     "pon-conformance/corpus/cpython/tuple_unpacking.py",
+    "pon-conformance/corpus/cpython/type_alias_pep695.py",
     "pon-conformance/corpus/cpython/unpack_generalizations.py",
     "pon-conformance/corpus/cpython/walrus.py",
     "pon-conformance/corpus/cpython/yield_from_generator.py",
     "pon-conformance/corpus/cpython/yield_from_list.py"
   ],
-  "min_pass_count": 42
+  "min_pass_count": 48
 }

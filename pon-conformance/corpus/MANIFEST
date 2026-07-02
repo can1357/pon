@@ -41,4 +41,9 @@ pon-conformance/corpus/cpython/keyword_arguments_defaults.py
 pon-conformance/corpus/cpython/unpack_generalizations.py
 pon-conformance/corpus/cpython/class_annotations.py
 pon-conformance/corpus/cpython/properties_descriptors.py
+pon-conformance/corpus/cpython/match_class_patterns.py
+pon-conformance/corpus/cpython/match_sequence_mapping.py
+pon-conformance/corpus/cpython/match_or_guard.py
+pon-conformance/corpus/cpython/annotations_lazy_pep649.py
+pon-conformance/corpus/cpython/type_alias_pep695.py
 corpus/pkg_driver.py

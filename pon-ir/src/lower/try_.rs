@@ -151,8 +151,11 @@ pub(super) fn lower_try(
     stmt: &ruff_python_ast::StmtTry,
 ) -> Result<(), LowerError> {
     if stmt.handlers.is_empty() {
-        let body_term = lower_stmt_list(driver, scope, &stmt.body)?;
-        return lower_finally(driver, scope, &stmt.finalbody, body_term);
+        if stmt.finalbody.is_empty() {
+            let body_term = lower_stmt_list(driver, scope, &stmt.body)?;
+            return restore_term(scope, body_term);
+        }
+        return lower_try_finally_only(driver, scope, stmt);
     }
 
     let handler_block = scope.alloc_block()?;
@@ -183,6 +186,58 @@ pub(super) fn lower_try(
     scope.emit(InstKind::PopExcInfo)?;
     let handler_term = lower_handler_bodies(driver, scope, stmt)?;
     lower_finally(driver, scope, &stmt.finalbody, handler_term)?;
+    scope.jump_if_open(done_block)?;
+    scope.switch_to(done_block)?;
+    Ok(())
+}
+/// Lowers handler-less `try/finally` with a real exception route.
+///
+/// The finally body must run on BOTH exits (pin J0.1 §5.2):
+/// - the static path (fallthrough, `return`, `break`/`continue` jumps, and
+///   lexical `raise`) inlines a finally copy before the pending terminator,
+///   exactly like the old lowering; and
+/// - the dynamic path (a helper call inside the body raising) routes through
+///   a handler record (`PushExcInfo` targeting a finally-exception block)
+///   that runs a second finally copy and re-raises the pending exception.
+///
+/// Generators get finally-across-yield for free: the state-machine transform
+/// pops/re-pushes this record around suspend points like any other handler,
+/// so `throw()`/`close()` payloads delivered at the resume point NULL-route
+/// into the finally-exception block.
+fn lower_try_finally_only(
+    driver: &mut LoweringDriver,
+    scope: &mut BodyScope,
+    stmt: &ruff_python_ast::StmtTry,
+) -> Result<(), LowerError> {
+    let finally_exc_block = scope.alloc_block()?;
+    let done_block = scope.alloc_block()?;
+    scope.emit(InstKind::PushExcInfo {
+        target: finally_exc_block,
+        stack_depth: 0,
+        kind: 0,
+    })?;
+    let protected_start = scope.blocks.len();
+    lower_stmt_list_preserving_term(driver, scope, &stmt.body)?;
+    // A lexical `raise` in the body already NULL-routes to the finally block
+    // through its own Raise instruction; retarget its unreachable static
+    // terminator too so the raise edge is explicit in the CFG.
+    redirect_raise_terms(scope, protected_start, finally_exc_block);
+
+    // Static exits: pop the record, then run the inline finally copy before
+    // the preserved terminator (fallthrough / return / loop jumps).
+    if !matches!(scope.term, Some(Terminator::Jump(target)) if target == finally_exc_block) {
+        let body_term = scope.term.take();
+        scope.emit(InstKind::PopExcInfo)?;
+        lower_finally(driver, scope, &stmt.finalbody, body_term)?;
+    }
+    scope.jump_if_open(done_block)?;
+
+    // Dynamic exit: the pending exception routed here.  Pop the record, run
+    // the exception-path finally copy, and re-deliver the exception (a
+    // finally body that returns/raises replaces it, matching CPython).
+    scope.switch_to(finally_exc_block)?;
+    scope.emit(InstKind::PopExcInfo)?;
+    lower_finally(driver, scope, &stmt.finalbody, Some(Terminator::RaiseTerm))?;
     scope.jump_if_open(done_block)?;
     scope.switch_to(done_block)?;
     Ok(())
