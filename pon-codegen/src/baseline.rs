@@ -225,6 +225,9 @@ pub(crate) struct LowerState {
     pub(crate) local_defined: Vec<bool>,
     pub(crate) cells: HashMap<u32, ir::Value>,
     pub(crate) last_value: Option<ir::Value>,
+    /// Present exactly while lowering a resumable generator body (pin J0.1):
+    /// carries the frame pointer for suspend spills and the gen epilogues.
+    pub(crate) gen_ctx: Option<r#gen::GenBodyCtx>,
 }
 
 impl LowerState {
@@ -235,6 +238,7 @@ impl LowerState {
             local_defined: vec![false; local_count],
             cells: HashMap::new(),
             last_value: None,
+            gen_ctx: None,
         }
     }
 
@@ -327,6 +331,11 @@ pub fn compile_function<M: Module>(
     ctx: &mut Context,
     fctx: &mut FunctionBuilderContext,
 ) -> Result<(), CodegenError> {
+    if ir.is_generator {
+        // Pin J0.1 two-function scheme: allocation stub at the declared
+        // FuncId + anonymous resume body (baseline/gen.rs).
+        return r#gen::compile_generator_function(module, helpers, func_ids, functions, names, ir, entry_arg_count, ctx, fctx);
+    }
     module.clear_context(ctx);
     let ptr_ty = module.target_config().pointer_type();
     let ptr_bytes = ptr_ty.bytes() as usize;
@@ -373,16 +382,66 @@ pub fn compile_function<M: Module>(
             }
         })
         .collect();
+    lower_function_blocks(
+        module,
+        &mut builder,
+        &helper_refs,
+        func_ids,
+        functions,
+        names,
+        &mut state,
+        ptr_ty,
+        ptr_bytes,
+        exception_exit,
+        ir,
+        &block_map,
+        feedback_base_gv,
+        Some(entry),
+    )?;
+
+    builder.switch_to_block(exception_exit);
+    let null = builder.ins().iconst(ptr_ty, 0);
+    builder.ins().return_(&[null]);
+    builder.seal_all_blocks();
+    builder.finalize();
+
+    Ok(())
+}
+
+/// Lower every IR block of `ir` into its mapped CLIF block, tracking the
+/// static exception-handler routing (`PushExcInfo`/`PopExcInfo`) across the
+/// linear block walk.
+///
+/// `prefilled_entry` is the CLIF block that IR block 0 maps to when the
+/// caller already switched to it and emitted a prologue (the non-generator
+/// entry); `None` means every block (including block 0) still needs
+/// `switch_to_block`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lower_function_blocks<M: Module>(
+    module: &mut M,
+    builder: &mut FunctionBuilder<'_>,
+    helper_refs: &HelperFuncRefs,
+    func_ids: &[FuncId],
+    functions: &[Function],
+    names: &NameMap,
+    state: &mut LowerState,
+    ptr_ty: ir::Type,
+    ptr_bytes: usize,
+    exception_exit: ir::Block,
+    ir: &Function,
+    block_map: &[(pon_ir::ir::BlockId, ir::Block)],
+    feedback_base_gv: Option<ir::GlobalValue>,
+    prefilled_entry: Option<ir::Block>,
+) -> Result<(), CodegenError> {
     let mut exception_target_stack = Vec::new();
     let mut current_exception_exit = exception_exit;
-
 
     for block in &ir.blocks {
         let clif_block = block_map
             .iter()
             .find_map(|(id, clif)| (*id == block.id).then_some(*clif))
             .ok_or(CodegenError::Unsupported("missing basic block"))?;
-        if block.id.0 != 0 {
+        if Some(clif_block) != prefilled_entry {
             builder.switch_to_block(clif_block);
         }
         for inst in &block.insts {
@@ -406,7 +465,7 @@ pub fn compile_function<M: Module>(
                     kind,
                 } => {
                     let value = exc::lower_push_exc_info(
-                        &mut builder,
+                        builder,
                         helper_refs.push_exc_info,
                         target.0,
                         *stack_depth,
@@ -425,7 +484,7 @@ pub fn compile_function<M: Module>(
                 InstKind::PopExcInfo => {
                     let previous_exception_exit = exception_target_stack.pop().unwrap_or(exception_exit);
                     let value = exc::lower_pop_exc_info(
-                        &mut builder,
+                        builder,
                         helper_refs.pop_exc_info,
                         ptr_ty,
                         previous_exception_exit,
@@ -435,12 +494,12 @@ pub fn compile_function<M: Module>(
                 }
                 _ => lower_inst(
                     module,
-                    &mut builder,
-                    &helper_refs,
+                    builder,
+                    helper_refs,
                     func_ids,
                     functions,
                     names,
-                    &mut state,
+                    state,
                     ptr_ty,
                     ptr_bytes,
                     current_exception_exit,
@@ -450,28 +509,21 @@ pub fn compile_function<M: Module>(
             };
             state.define_value(inst.result, value);
         }
-        if ir.blocks.len() == 1 {
-            control::lower_terminator(&mut builder, &state, &helper_refs, ptr_ty, current_exception_exit, &block.term)?;
+        if ir.blocks.len() == 1 && prefilled_entry.is_some() {
+            control::lower_terminator(builder, state, helper_refs, ptr_ty, current_exception_exit, &block.term)?;
         } else {
             control::lower_terminator_with_blocks(
-                &mut builder,
-                &state,
-                &helper_refs,
+                builder,
+                state,
+                helper_refs,
                 ptr_ty,
                 current_exception_exit,
-                &block_map,
+                block_map,
                 block.id,
                 &block.term,
             )?;
         }
     }
-
-    builder.switch_to_block(exception_exit);
-    let null = builder.ins().iconst(ptr_ty, 0);
-    builder.ins().return_(&[null]);
-    builder.seal_all_blocks();
-    builder.finalize();
-
     Ok(())
 }
 
@@ -567,6 +619,36 @@ pub(crate) fn declare_helper_refs<M: Module>(module: &mut M, helpers: &HelperRef
     }
 }
 
+/// The argv-slot -> local-slot permutation produced by runtime argument
+/// binding (`(argv_slot, local_slot)` pairs, in argv order).
+///
+/// Shared by [`initialize_parameter_locals`] (normal functions define locals
+/// from argv) and the generator stub (stores bound arguments into frame
+/// parameter slots) so the two can never drift.
+pub(crate) fn parameter_bindings(function: &Function, entry_arg_count: usize) -> Vec<(usize, usize)> {
+    if function.params.total_slot_count() == 0 {
+        return (0..entry_arg_count).map(|slot| (slot, slot)).collect();
+    }
+
+    let positional = function.params.positional_arity();
+    let keyword_only_local = positional + usize::from(function.params.vararg_name.is_some());
+    let mut bindings: Vec<(usize, usize)> = (0..positional).map(|slot| (slot, slot)).collect();
+
+    let mut argv_slot = positional;
+    for index in 0..function.params.keyword_only_count {
+        bindings.push((argv_slot, keyword_only_local + index));
+        argv_slot += 1;
+    }
+    if function.params.vararg_name.is_some() {
+        bindings.push((argv_slot, positional));
+        argv_slot += 1;
+    }
+    if function.params.kwarg_name.is_some() {
+        bindings.push((argv_slot, keyword_only_local + function.params.keyword_only_count));
+    }
+    bindings
+}
+
 pub(crate) fn initialize_parameter_locals(
     builder: &mut FunctionBuilder<'_>,
     state: &mut LowerState,
@@ -582,39 +664,8 @@ pub(crate) fn initialize_parameter_locals(
             n_locals: function.n_locals,
         });
     }
-    if function.params.total_slot_count() == 0 {
-        for slot in 0..entry_arg_count {
-            define_local_from_argv(builder, state, argv, ptr_bytes, ptr_ty, slot, slot)?;
-        }
-        return Ok(());
-    }
-
-    let positional = function.params.positional_arity();
-    for slot in 0..positional {
-        define_local_from_argv(builder, state, argv, ptr_bytes, ptr_ty, slot, slot)?;
-    }
-
-    let mut argv_slot = positional;
-    let keyword_only_local = positional + usize::from(function.params.vararg_name.is_some());
-    for index in 0..function.params.keyword_only_count {
-        define_local_from_argv(builder, state, argv, ptr_bytes, ptr_ty, argv_slot, keyword_only_local + index)?;
-        argv_slot += 1;
-    }
-
-    if function.params.vararg_name.is_some() {
-        define_local_from_argv(builder, state, argv, ptr_bytes, ptr_ty, argv_slot, positional)?;
-        argv_slot += 1;
-    }
-    if function.params.kwarg_name.is_some() {
-        define_local_from_argv(
-            builder,
-            state,
-            argv,
-            ptr_bytes,
-            ptr_ty,
-            argv_slot,
-            keyword_only_local + function.params.keyword_only_count,
-        )?;
+    for (argv_slot, local_slot) in parameter_bindings(function, entry_arg_count) {
+        define_local_from_argv(builder, state, argv, ptr_bytes, ptr_ty, argv_slot, local_slot)?;
     }
     Ok(())
 }
@@ -912,11 +963,9 @@ pub(crate) fn lower_inst<M: Module>(
         InstKind::Await { awaitable } => {
             r#gen::lower_await(builder, helpers.await_value, state, *awaitable, ptr_ty, exception_exit)
         }
-        InstKind::GenResumePayload | InstKind::GenDelegateStep { .. } | InstKind::GenLastStopValue => {
-            Err(CodegenError::Unsupported(
-                "generator body instruction outside a generator body compilation (J1 codegen wave 2 pending)",
-            ))
-        }
+        InstKind::GenResumePayload => r#gen::lower_gen_resume_payload(builder, helpers, state, ptr_ty, exception_exit),
+        InstKind::GenDelegateStep { delegate } => r#gen::lower_gen_delegate_step(builder, helpers, state, *delegate),
+        InstKind::GenLastStopValue => r#gen::lower_gen_last_stop_value(builder, helpers, ptr_ty, exception_exit),
         InstKind::Raise { exc, cause } => {
             exc::lower_raise(builder, helpers.raise, helpers.reraise, state, *exc, *cause, ptr_ty, exception_exit)
         }
