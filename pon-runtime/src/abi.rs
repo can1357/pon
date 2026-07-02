@@ -415,8 +415,10 @@ const PARAMS_MATCH_KEYS: &[AbiTy] = &[AbiTy::PyObjectPtr, AbiTy::PyObjectPtrPtr,
 const PARAMS_MATCH_LEN: &[AbiTy] = &[AbiTy::PyObjectPtr, AbiTy::Usize, AbiTy::U8];
 const PARAMS_EXC_HANDLER: &[AbiTy] = &[AbiTy::U32, AbiTy::U32, AbiTy::U8];
 const PARAMS_GEN_MAKE_FRAME: &[AbiTy] = &[AbiTy::U32];
-const PARAMS_FRAME_LOCAL: &[AbiTy] = &[AbiTy::PyFramePtr, AbiTy::U32];
-const PARAMS_FRAME_SET_LOCAL: &[AbiTy] = &[AbiTy::PyFramePtr, AbiTy::U32, AbiTy::PyObjectPtr];
+const PARAMS_GEN_FRAME: &[AbiTy] = &[AbiTy::PyFramePtr];
+const PARAMS_GEN_FINISH: &[AbiTy] = &[AbiTy::PyFramePtr, AbiTy::PyObjectPtr];
+const PARAMS_GEN_UNWIND: &[AbiTy] = &[AbiTy::PyFramePtr, AbiTy::U8];
+const PARAMS_GEN_DELEGATE_STEP: &[AbiTy] = &[AbiTy::PyFramePtr, AbiTy::PyObjectPtr];
 const PARAMS_MAKE_GENERATOR: &[AbiTy] = &[AbiTy::GenResumePtr, AbiTy::PyFramePtr, AbiTy::U8];
 const PARAMS_FUNCTION_SET_ANNOTATE: &[AbiTy] = &[AbiTy::PyObjectPtr, AbiTy::PyObjectPtr];
 const PARAMS_MAKE_TYPE_ALIAS: &[AbiTy] = &[AbiTy::U32, AbiTy::PyObjectPtr];
@@ -1157,21 +1159,39 @@ pub static HELPERS: &[HelperDecl] = &[
         ret: AbiTy::PyObjectPtr,
     },
     HelperDecl {
-        symbol: "pon_make_frame",
-        address: r#gen::pon_make_frame as *const (),
+        symbol: "pon_gen_frame_alloc",
+        address: r#gen::pon_gen_frame_alloc as *const (),
         params: PARAMS_GEN_MAKE_FRAME,
         ret: AbiTy::PyFramePtr,
     },
     HelperDecl {
-        symbol: "pon_frame_get_local",
-        address: r#gen::pon_frame_get_local as *const (),
-        params: PARAMS_FRAME_LOCAL,
+        symbol: "pon_gen_consume_payload",
+        address: r#gen::pon_gen_consume_payload as *const (),
+        params: PARAMS_GEN_FRAME,
         ret: AbiTy::PyObjectPtr,
     },
     HelperDecl {
-        symbol: "pon_frame_set_local",
-        address: r#gen::pon_frame_set_local as *const (),
-        params: PARAMS_FRAME_SET_LOCAL,
+        symbol: "pon_gen_finish",
+        address: r#gen::pon_gen_finish as *const (),
+        params: PARAMS_GEN_FINISH,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_gen_unwind",
+        address: r#gen::pon_gen_unwind as *const (),
+        params: PARAMS_GEN_UNWIND,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_gen_delegate_step",
+        address: r#gen::pon_gen_delegate_step as *const (),
+        params: PARAMS_GEN_DELEGATE_STEP,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_gen_last_stop_value",
+        address: r#gen::pon_gen_last_stop_value as *const (),
+        params: PARAMS_NONE,
         ret: AbiTy::PyObjectPtr,
     },
     HelperDecl {
@@ -1213,24 +1233,6 @@ pub static HELPERS: &[HelperDecl] = &[
     HelperDecl {
         symbol: "pon_for_next",
         address: r#gen::pon_for_next as *const (),
-        params: PARAMS_OBJ_FEEDBACK,
-        ret: AbiTy::PyObjectPtr,
-    },
-    HelperDecl {
-        symbol: "pon_yield",
-        address: r#gen::pon_yield as *const (),
-        params: PARAMS_OBJ,
-        ret: AbiTy::PyObjectPtr,
-    },
-    HelperDecl {
-        symbol: "pon_eager_yield_generator",
-        address: r#gen::pon_eager_yield_generator as *const (),
-        params: PARAMS_OBJ,
-        ret: AbiTy::PyObjectPtr,
-    },
-    HelperDecl {
-        symbol: "pon_yield_from",
-        address: r#gen::pon_yield_from as *const (),
         params: PARAMS_OBJ_FEEDBACK,
         ret: AbiTy::PyObjectPtr,
     },
@@ -2539,6 +2541,15 @@ pub fn collect() -> Result<(), String> {
             if !value.is_null() {
                 roots.push(value.cast::<u8>());
             }
+        }
+    }
+
+    {
+        // Pin J0.1 §6: the thread's stashed delegation finish value must stay
+        // alive between pon_gen_stop_value and pon_gen_last_stop_value.
+        let stash = r#gen::last_stop_value_root();
+        if !stash.is_null() {
+            roots.push(stash.cast::<u8>());
         }
     }
 
