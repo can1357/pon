@@ -569,3 +569,89 @@ const _: () = {
     assert!(offset_of!(PySet, ob_base) == 0);
     assert!(offset_of!(PySetIter, ob_base) == 0);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::abi::map::pon_build_set;
+    use crate::abi::{pon_const_str, pon_runtime_init};
+    use crate::thread_state::test_state_lock;
+
+    #[track_caller]
+    fn str_object(text: &str) -> *mut PyObject {
+        let object = unsafe { pon_const_str(text.as_ptr(), text.len()) };
+        assert!(!object.is_null(), "failed to allocate test str {text:?}");
+        object
+    }
+
+    #[test]
+    fn set_prehash_collect_dedups_and_keeps_first_occurrence() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+
+            let x_first = str_object("x");
+            let x2 = str_object("x2");
+            let x_dup = str_object("x");
+            assert_ne!(x_first, x_dup, "duplicate element must be a distinct object");
+
+            let mut elements: Vec<(*mut PyObject, isize)> = Vec::new();
+            collect_prehashed_element(&mut elements, x_first).expect("collect first 'x'");
+            collect_prehashed_element(&mut elements, x2).expect("collect 'x2'");
+            collect_prehashed_element(&mut elements, x_dup).expect("collect duplicate 'x'");
+
+            assert_eq!(elements.len(), 2);
+            assert_eq!(elements[0].0, x_first, "duplicate element must keep the FIRST object");
+            assert_eq!(elements[1].0, x2);
+        }
+    }
+
+    #[test]
+    fn set_prehash_fill_round_trips_lookups_from_collected_hashes() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+
+            let mut elements: Vec<(*mut PyObject, isize)> = Vec::new();
+            collect_prehashed_element(&mut elements, str_object("x")).expect("collect 'x'");
+            collect_prehashed_element(&mut elements, str_object("x2")).expect("collect 'x2'");
+            collect_prehashed_element(&mut elements, str_object("x")).expect("collect duplicate 'x'");
+
+            let set = pon_build_set(core::ptr::null_mut(), 0);
+            assert!(!set.is_null());
+            set_fill_prehashed(set, &elements).expect("fill prehashed elements");
+
+            assert_eq!(set_ref(set).expect("set ref").entries.len(), 2);
+            assert!(set_contains(set, str_object("x")).expect("probe fresh 'x'"));
+            assert!(set_contains(set, str_object("x2")).expect("probe fresh 'x2'"));
+            assert!(!set_contains(set, str_object("absent")).expect("probe absent element"));
+        }
+    }
+
+    #[test]
+    fn set_prehash_fill_uses_given_hash_verbatim_and_never_rehashes() {
+        // Deadlock contract: the set layout stores no hashes, so
+        // `set_fill_prehashed` must build buckets from the GIVEN hashes —
+        // rehashing would re-enter user `__hash__` inside `with_runtime`.  A
+        // deliberately skewed hash parks the element in the wrong bucket
+        // chain, so an equal probe (hashed correctly) must MISS; a regression
+        // that rehashes during the fill would find it.
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+
+            let element = str_object("x");
+            let skewed_hash = hash_set_element(element).expect("hash 'x'").wrapping_add(1);
+
+            let set = pon_build_set(core::ptr::null_mut(), 0);
+            assert!(!set.is_null());
+            set_fill_prehashed(set, &[(element, skewed_hash)]).expect("fill with skewed hash");
+
+            assert_eq!(set_ref(set).expect("set ref").entries.len(), 1);
+            assert!(
+                !set_contains(set, str_object("x")).expect("probe fresh 'x'"),
+                "fill must place buckets by the GIVEN hash, not a recomputed one"
+            );
+        }
+    }
+}
