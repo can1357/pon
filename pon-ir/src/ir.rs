@@ -163,6 +163,15 @@ pub type ValueId = Value;
 pub type InstId = Value;
 
 /// A single SSA instruction.
+///
+/// `line` carries the 1-based source line of the enclosing STATEMENT (`0` when
+/// unknown, e.g. lowering without source text or synthesized instructions).
+/// It is a plain field rather than a dedicated line-marker instruction on
+/// purpose: every instruction consumer keeps matching on [`InstKind`]
+/// unchanged (no pseudo-instruction to skip, no dummy SSA result to define),
+/// the value survives block splitting/cloning in the generator transform and
+/// future IR rewrites for free, and codegen recovers statement granularity by
+/// emitting a line record only when consecutive instructions disagree.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Inst {
     /// SSA result produced by this instruction.
@@ -175,6 +184,8 @@ pub struct Inst {
     pub inferred_type: Type,
     /// Sound static upper bound for this instruction's SSA result.
     pub static_type: Type,
+    /// 1-based source line of the enclosing statement; `0` when unknown.
+    pub line: u32,
 }
 
 impl Inst {
@@ -191,6 +202,7 @@ impl Inst {
             feedback_slot: None,
             inferred_type: Type::Bottom,
             static_type: Type::Object,
+            line: 0,
         }
     }
 

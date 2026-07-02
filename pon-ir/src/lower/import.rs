@@ -24,7 +24,19 @@ pub(super) fn lower_import_stmt(
         })?;
 
         let binding = import_binding_name(&alias.name, alias.asname.as_ref());
-        store_import_binding(driver, scope, &binding, module)?;
+        // `import a.b` binds the root module that a fromlist-empty ImportName
+        // returns, but `import a.b as x` binds the LEAF submodule.  Mirror
+        // CPython's compiler_import_as (bpo-30024): walk one ImportFrom per
+        // dotted component after the first, so the runtime's package-child
+        // fallback also serves partially initialized parents.
+        let mut value = module;
+        if alias.asname.is_some() {
+            for attr in module_name.split('.').skip(1) {
+                let attr_id = driver.names.intern(attr)?;
+                value = scope.emit(InstKind::ImportFrom { module: value, name: attr_id })?;
+            }
+        }
+        store_import_binding(driver, scope, &binding, value)?;
     }
 
     Ok(())

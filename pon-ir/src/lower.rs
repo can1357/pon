@@ -1,7 +1,7 @@
 //! Lowering from Ruff's Python AST into pon IR.
 //!
 //! Phase B keeps the public Phase-A entry points (`lower_source` and
-//! `lower_module`) stable while introducing a real driver boundary.  The driver
+//! `lower_module`) in place while introducing a real driver boundary.  The driver
 //! performs scope analysis first, then routes every statement/expression family
 //! through a named module.  Most Phase-B families intentionally return precise
 //! `LowerError::Unsupported` values today; the routing exists so future semantic
@@ -13,6 +13,7 @@ use std::fmt::{self, Display, Formatter};
 
 use ruff_python_ast::{Expr, ExprContext, ModModule, Number, Parameters, Stmt, StmtAssign, StmtFunctionDef};
 use ruff_python_ast::visitor::{self, Visitor};
+use ruff_text_size::Ranged;
 
 use crate::desugar::desugar_module;
 use crate::ir::{
@@ -163,10 +164,18 @@ pub fn lower_source(source: &str) -> Result<Module, LowerError> {
 }
 
 /// Lower a Ruff module AST into IR while preserving the Phase-A executable slice.
-pub fn lower_module(module: &ModModule) -> Result<Module, LowerError> {
-    LoweringDriver::new()
-        .lower_module(module)
-        .map(desugar_module)
+///
+/// `source` must be the text the AST's byte ranges index (annotation-scrubbed
+/// clones keep original ranges, so the pre-scrub text is correct for them).
+/// When present it provides statement-level [`Inst::line`] numbers; with
+/// `None` every lowered instruction carries line `0` and downstream traceback
+/// entries report line 0.
+pub fn lower_module(module: &ModModule, source: Option<&str>) -> Result<Module, LowerError> {
+    let driver = match source {
+        Some(source) => LoweringDriver::with_source(source),
+        None => LoweringDriver::new(),
+    };
+    driver.lower_module(module).map(desugar_module)
 }
 
 /// Parse Python source and report direct `eval`/`exec`/`compile` calls.
@@ -245,6 +254,8 @@ pub(crate) struct LoweringDriver {
     functions: Vec<Function>,
     names: NameTable,
     source: Option<String>,
+    /// Byte offset of each 1-based line start; `None` without source text.
+    line_starts: Option<Vec<u32>>,
 }
 
 impl LoweringDriver {
@@ -253,6 +264,7 @@ impl LoweringDriver {
             functions: Vec::new(),
             names: NameTable::default(),
             source: None,
+            line_starts: None,
         }
     }
 
@@ -261,12 +273,26 @@ impl LoweringDriver {
             functions: Vec::new(),
             names: NameTable::default(),
             source: Some(source.to_owned()),
+            line_starts: Some(compute_line_starts(source)),
         }
     }
 
     pub(crate) fn source_slice(&self, span: SourceSpan) -> Option<&str> {
         let source = self.source.as_deref()?;
         source.get(span.start as usize..span.end as usize)
+    }
+
+    /// 1-based source line containing byte `offset`, or `0` without source.
+    fn line_at_offset(&self, offset: u32) -> u32 {
+        let Some(starts) = &self.line_starts else {
+            return 0;
+        };
+        starts.partition_point(|&start| start <= offset) as u32
+    }
+
+    /// Statement-granularity line stamp for everything `stmt` lowers to.
+    fn statement_line(&self, stmt: &Stmt) -> u32 {
+        self.line_at_offset(stmt.range().start().to_u32())
     }
 
     pub(crate) fn expr_source(&self, expr: &Expr) -> Option<&str> {
@@ -371,6 +397,10 @@ impl LoweringDriver {
         if scope.is_terminated() {
             return Err(LowerError::unsupported("statement after return"));
         }
+
+        // Statement-granularity source line for every instruction this
+        // statement lowers (`0` when the driver has no source text).
+        scope.current_line = self.statement_line(stmt);
 
         match stmt {
             Stmt::FunctionDef(def) => func::lower_function_def_stmt(self, scope, def),
@@ -1015,6 +1045,8 @@ pub(crate) struct BodyScope {
     return_slot: Option<LocalId>,
     /// Next J0.3 inline-cache feedback slot (one per specializable site).
     next_feedback: u32,
+    /// Source line stamped onto every emitted instruction; `0` when unknown.
+    current_line: u32,
 }
 
 impl BodyScope {
@@ -1037,6 +1069,7 @@ impl BodyScope {
             return_route: None,
             return_slot: None,
             next_feedback: 0,
+            current_line: 0,
         };
         scope.emit_cell_prologue();
         scope
@@ -1286,6 +1319,7 @@ impl BodyScope {
         if let Some(slot) = self.reserve_feedback_slot(&inst.kind)? {
             inst = inst.with_feedback_slot(slot);
         }
+        inst.line = self.current_line;
         self.insts.push(inst);
         Ok(result)
     }
@@ -1441,6 +1475,18 @@ fn span_function(def: &StmtFunctionDef) -> SourceSpan {
 
 fn span_bounds(start: u32, end: u32) -> SourceSpan {
     SourceSpan::from_bounds(start, end)
+}
+
+/// Byte offsets of each 1-based line start, for statement line lookups.
+fn compute_line_starts(source: &str) -> Vec<u32> {
+    let mut starts = vec![0u32];
+    for (index, byte) in source.bytes().enumerate() {
+        if byte == b'\n' {
+            // Ruff AST offsets are u32 by construction, so `index` fits.
+            starts.push(index as u32 + 1);
+        }
+    }
+    starts
 }
 
 fn span_expr(expr: &Expr) -> SourceSpan {
@@ -1868,6 +1914,52 @@ compile("1 + 1", "<test>", "eval")
             vec![DynamicCodeKind::Eval, DynamicCodeKind::Exec, DynamicCodeKind::Compile]
         );
         assert!(sinks.iter().all(|sink| sink.span.start < sink.span.end));
+    }
+
+    #[test]
+    fn stamps_statement_lines_on_lowered_instructions() {
+        let source = r#"
+x = 1
+y = x + 1
+
+def f(a):
+    b = a * 2
+    return b
+
+f(y)
+"#;
+        let module = lower_source(source).expect("line-stamp source should lower");
+
+        let dedup_lines = |function: &Function| -> Vec<u32> {
+            let mut lines = Vec::new();
+            for inst in function.blocks.iter().flat_map(|block| &block.insts) {
+                if lines.last() != Some(&inst.line) {
+                    lines.push(inst.line);
+                }
+            }
+            lines
+        };
+
+        // One transition per statement; the implicit module return keeps the
+        // final statement's stamp instead of resetting to 0.
+        let main = &module.functions[module.main.0 as usize];
+        assert_eq!(dedup_lines(main), vec![2, 3, 5, 9]);
+
+        let f = &module.functions[1];
+        assert_eq!(f.name, "f");
+        assert_eq!(dedup_lines(f), vec![6, 7]);
+
+        // Lowering a bare AST without source text stamps no lines at all.
+        let parsed = parse_module_source(source).expect("line-stamp source should parse");
+        let bare = lower_module(&parsed, None).expect("bare AST should lower");
+        assert!(
+            bare.functions
+                .iter()
+                .flat_map(|function| &function.blocks)
+                .flat_map(|block| &block.insts)
+                .all(|inst| inst.line == 0),
+            "sourceless lowering must stamp line 0 everywhere"
+        );
     }
 }
 
