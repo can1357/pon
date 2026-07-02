@@ -173,3 +173,7 @@ pon-conformance/corpus/cpython/super_attr_miss.py
 pon-conformance/corpus/cpython/signal_sys_exception.py
 pon-conformance/corpus/cpython/sys_import_surface.py
 pon-conformance/corpus/cpython/sys_version_info.py
+pon-conformance/corpus/cpython/open_kwargs.py
+pon-conformance/corpus/cpython/exception_ctor_kwargs.py
+pon-conformance/corpus/cpython/sysconfig_build_config.py
+pon-conformance/corpus/cpython/async_comprehensions.py
