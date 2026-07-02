@@ -1,0 +1,6 @@
+# Ignore local CPython checkouts; keep the revision marker tracked.
+*
+!.gitignore
+!cpython-3.14/
+cpython-3.14/*
+!cpython-3.14/REVISION
