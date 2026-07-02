@@ -26,12 +26,13 @@ mod gc;
 mod io;
 mod itertools;
 mod os;
+pub(crate) mod signal;
 mod sre;
 mod sys;
 mod thread;
 mod time;
 mod tokenize;
-mod weakref;
+pub(crate) mod weakref;
 
 /// Sorted, insert-only lookup table of curated native modules: Python module
 /// name -> factory that allocates the module object and installs it into the
@@ -43,6 +44,7 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
     ("_colorize", colorize::make_module),
     ("_contextvars", contextvars::make_module),
     ("_io", io::make_module),
+    ("_signal", signal::make_module),
     ("_sre", sre::make_module),
     ("_thread", thread::make_module),
     ("_tokenize", tokenize::make_module),

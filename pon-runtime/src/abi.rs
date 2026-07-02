@@ -41,7 +41,7 @@ use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::sync::{LazyLock, Mutex, MutexGuard};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use pon_gc::{GcTypeInfo, Heap, RootSource, TypeId};
 
@@ -115,10 +115,47 @@ struct CurrentCall {
     function: *mut PyFunction,
     argv: *mut *mut PyObject,
     argc: usize,
+    /// `pon_current_line` value at push time — the caller's active statement
+    /// line.  Restored on pop so a raise later in the caller's statement (after
+    /// the callee returned) attributes to the caller's line again, and read by
+    /// traceback capture as the caller frame's "last executed" line.
+    caller_line: u32,
 }
 
 thread_local! {
     static CURRENT_FUNCTION_STACK: RefCell<Vec<CurrentCall>> = RefCell::new(Vec::new());
+}
+
+/// Import symbol through which generated code stores the current source line.
+pub const CURRENT_LINE_SYMBOL: &str = "pon_current_line";
+
+/// Current 1-based Python source line; `0` means "no line recorded yet".
+///
+/// Generated code stores to this cell directly (no helper call) at every
+/// statement-line transition; traceback capture reads it as the raise-site
+/// line.  The cell is process-global like the Phase-A thread state: compiled
+/// Python executes single-threaded today, and [`CurrentFunctionGuard`]
+/// save/restore keeps it frame-accurate across compiled calls.  A
+/// free-threading build needs a per-thread cell (TLS data symbol or a helper
+/// call) before generated code may run on multiple threads.
+#[unsafe(export_name = "pon_current_line")]
+static CURRENT_LINE_CELL: AtomicU32 = AtomicU32::new(0);
+
+/// Source line most recently recorded by generated code, `0` when unknown.
+#[must_use]
+pub(crate) fn current_line() -> u32 {
+    CURRENT_LINE_CELL.load(Ordering::Relaxed)
+}
+
+/// Overwrites the recorded source line (guard restore path and tests).
+pub(crate) fn set_current_line(line: u32) {
+    CURRENT_LINE_CELL.store(line, Ordering::Relaxed);
+}
+
+/// Address of the current-line cell for JIT data-symbol registration.
+#[must_use]
+pub fn current_line_cell_address() -> *const u8 {
+    (&raw const CURRENT_LINE_CELL).cast::<u8>()
 }
 // ─── J0.3 GlobalIC guard: process-wide namespace version ────────────────────
 //
@@ -240,6 +277,13 @@ pub struct PyFrame {
     pub parent: *mut PyObject,
     /// Saved exception state across suspension, or NULL.
     pub exc_state: *mut PyObject,
+    /// 1-based source line for traceback-synthesized frames, `0` when unknown.
+    ///
+    /// Only traceback capture writes it.  The runtime `frame` PyType is shared
+    /// by `PyFrame` and resumable `GenFrame` allocations, so type-dispatched
+    /// slots (`frame_getattro`) must NOT read this field — it does not exist
+    /// past the shared header on generator frames.
+    pub line: u32,
 }
 
 /// Active exception-handler record stored in [`PonThreadState`](crate::PonThreadState).
@@ -3108,7 +3152,9 @@ pub(crate) struct CurrentFunctionGuard {
 impl CurrentFunctionGuard {
     pub(crate) fn push(function: *mut PyFunction, argv: *mut *mut PyObject, argc: usize) -> Self {
         if !function.is_null() {
-            CURRENT_FUNCTION_STACK.with(|stack| stack.borrow_mut().push(CurrentCall { function, argv, argc }));
+            let caller_line = current_line();
+            CURRENT_FUNCTION_STACK
+                .with(|stack| stack.borrow_mut().push(CurrentCall { function, argv, argc, caller_line }));
             return Self { pushed: true };
         }
         Self { pushed: false }
@@ -3118,9 +3164,12 @@ impl CurrentFunctionGuard {
 impl Drop for CurrentFunctionGuard {
     fn drop(&mut self) {
         if self.pushed {
-            CURRENT_FUNCTION_STACK.with(|stack| {
-                let _ = stack.borrow_mut().pop();
-            });
+            let caller_line = CURRENT_FUNCTION_STACK.with(|stack| stack.borrow_mut().pop().map(|call| call.caller_line));
+            if let Some(line) = caller_line {
+                // The callee's stores are stale once it returned: restore the
+                // caller's statement line for post-call raises.
+                set_current_line(line);
+            }
         }
     }
 }
@@ -4406,6 +4455,16 @@ pub fn collect() -> Result<(), String> {
     }
     // Entries held by native `_collections` deques, mirroring `_contextvars`.
     for value in crate::native::collections::gc_held_roots() {
+        roots.push(value.cast::<u8>());
+    }
+    // Python handler objects held by the native `_signal` handler table,
+    // mirroring `_contextvars`.
+    for value in crate::native::signal::gc_held_roots() {
+        roots.push(value.cast::<u8>());
+    }
+    // Weakref key objects and values held by native `WeakKeyDictionary`
+    // instances, mirroring `_contextvars`.
+    for value in crate::native::weakref::gc_held_roots() {
         roots.push(value.cast::<u8>());
     }
     extend_tierup_roots(&mut roots);

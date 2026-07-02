@@ -1224,6 +1224,9 @@ pub(crate) fn bind_native_keywords_for_name(
 ) -> Result<Vec<*mut PyObject>, String> {
     match name {
         "sorted" => bind_sorted_keywords(positional, keywords),
+        // `list.sort(key=…, reverse=…)`: the bound receiver is the sole
+        // positional, so the `sorted` shape ([receiver, sort_options]) fits.
+        "sort" => bind_sorted_keywords(positional, keywords),
         "sum" => bind_single_keyword(positional, keywords, "sum", "start", 1, 2),
         "round" => bind_named_positional_keywords(positional, keywords, "round", &["number", "ndigits"], 1, 2),
         "pow" => bind_named_positional_keywords(positional, keywords, "pow", &["base", "exp", "mod"], 2, 3),

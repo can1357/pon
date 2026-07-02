@@ -655,29 +655,77 @@ unsafe extern "C" fn exception_getattro(object: *mut PyObject, name: *mut PyObje
     }
 }
 
-/// Returns true when `sub` is `base` or inherits from it through `tp_base`.
+/// Applies `visit` to `ty` and every ancestor on its raw MRO, returning true
+/// on the first hit.
+///
+/// CPython resolves `except` clauses with `PyType_IsSubtype`: a raw MRO walk
+/// that never consults `__subclasscheck__` hooks.  Heap classes carry their C3
+/// linearization in `tp_mro` (so a second base of a multiple-inheritance class
+/// is visited); bootstrap builtin exception types have no carrier and fall
+/// back to the single-inheritance `tp_base` chain.
+///
+/// # Safety
+///
+/// `ty` must be NULL or point to a live `PyType` object.
+unsafe fn walk_raw_mro(ty: *const PyType, mut visit: impl FnMut(*const PyType) -> bool) -> bool {
+    if ty.is_null() {
+        return false;
+    }
+    // SAFETY: `ty` is a live type object per the caller contract.
+    let carrier = unsafe { (*ty).tp_mro };
+    if !carrier.is_null() {
+        // SAFETY: A non-NULL `tp_mro` is always a live boxed `PyMro` carrier.
+        let mro = unsafe { &*carrier.cast::<crate::mro::PyMro>() };
+        return mro.entries().iter().any(|&entry| !entry.is_null() && visit(entry.cast_const()));
+    }
+    let mut current = ty;
+    while !current.is_null() {
+        if visit(current) {
+            return true;
+        }
+        // SAFETY: `current` walks live type objects; `tp_base` is live or NULL.
+        current = unsafe { (*current).tp_base.cast_const() };
+    }
+    false
+}
+
+/// Returns true when `ty` or any ancestor on its raw MRO is named `name`.
+///
+/// # Safety
+///
+/// `ty` must be NULL or point to a live `PyType` object.
+pub unsafe fn exception_type_named(ty: *const PyType, name: &str) -> bool {
+    // SAFETY: Entries visited by `walk_raw_mro` are live non-NULL type objects.
+    unsafe { walk_raw_mro(ty, |entry| (*entry).name() == name) }
+}
+
+/// Returns true when `sub` is `base` or inherits from it through the raw MRO.
+///
+/// This is the except-clause matching predicate: CPython uses
+/// `PyType_IsSubtype` here, so metaclass `__subclasscheck__` hooks must never
+/// fire on this path.
 ///
 /// # Safety
 ///
 /// Non-NULL pointers must point to live `PyType` objects.
-pub unsafe fn is_exception_subclass(mut sub: *const PyType, base: *const PyType) -> bool {
+pub unsafe fn is_exception_subclass(sub: *const PyType, base: *const PyType) -> bool {
     if sub.is_null() || base.is_null() {
         return false;
     }
-
-    let wants_exception = unsafe { (*base).name() == "Exception" };
-    while !sub.is_null() {
-        if sub == base {
-            return true;
-        }
-        if wants_exception && unsafe { (*sub).name() == "ExceptionGroup" } {
-            return true;
-        }
-        // SAFETY: Caller guarantees that non-NULL `sub` is a live type object.
-        sub = unsafe { (*sub).tp_base.cast_const() };
+    if sub == base {
+        return true;
     }
-
-    false
+    // Builtin `ExceptionGroup` derives from both `BaseExceptionGroup` and
+    // `Exception` in CPython; pon's bootstrap descriptor records only the
+    // group chain, so the `Exception` edge is restored by name.
+    // SAFETY: `base` is live per the caller contract; entries visited by
+    // `walk_raw_mro` are live non-NULL type objects.
+    unsafe {
+        let wants_exception = (*base).name() == "Exception";
+        walk_raw_mro(sub, |entry| {
+            entry == base || (wants_exception && (*entry).name() == "ExceptionGroup")
+        })
+    }
 }
 
 /// Returns true when `object` is a boxed exception instance matching `ty`.
@@ -741,3 +789,150 @@ const _: () = {
     assert!(offset_of!(PyExceptionGroup, base) == 0);
     assert!(size_of::<PyObject>() == size_of::<PyObjectHeader>());
 };
+
+#[cfg(test)]
+mod tests {
+    use core::ptr;
+
+    use super::{exception_type_named, is_exception_subclass};
+    use crate::mro::set_c3_mro;
+    use crate::object::PyType;
+
+    #[test]
+    fn second_base_matches_through_mro_carrier() {
+        let mut type_type = PyType::new(ptr::null(), "type", core::mem::size_of::<PyType>());
+        let type_ptr = &mut type_type as *mut PyType;
+        unsafe { (*type_ptr).ob_base.ob_type = type_ptr };
+
+        let mut first = PyType::new(type_ptr, "FirstBase", 0);
+        let first_ptr = &mut first as *mut PyType;
+        let mut second = PyType::new(type_ptr, "SecondBase", 0);
+        let second_ptr = &mut second as *mut PyType;
+        let mut unrelated = PyType::new(type_ptr, "Unrelated", 0);
+        let unrelated_ptr = &mut unrelated as *mut PyType;
+        let mut sub = PyType::new(type_ptr, "MultiSub", 0);
+        sub.tp_base = first_ptr;
+        let sub_ptr = &mut sub as *mut PyType;
+
+        unsafe {
+            assert_eq!(set_c3_mro(sub_ptr, &[first_ptr, second_ptr]), 0);
+            // The regression: SecondBase is unreachable via tp_base (sub.tp_base
+            // is FirstBase only) and must be found through the C3 carrier.
+            assert!(is_exception_subclass(sub_ptr, second_ptr));
+            assert!(is_exception_subclass(sub_ptr, first_ptr));
+            assert!(!is_exception_subclass(sub_ptr, unrelated_ptr));
+        }
+    }
+
+    #[test]
+    fn tp_base_chain_fallback_without_carrier() {
+        let mut root = PyType::new(ptr::null(), "RootErr", 0);
+        let root_ptr = &mut root as *mut PyType;
+        let mut mid = PyType::new(ptr::null(), "MidErr", 0);
+        mid.tp_base = root_ptr;
+        let mid_ptr = &mut mid as *mut PyType;
+        let mut leaf = PyType::new(ptr::null(), "LeafErr", 0);
+        leaf.tp_base = mid_ptr;
+        let leaf_ptr = &mut leaf as *mut PyType;
+        let mut stranger = PyType::new(ptr::null(), "Stranger", 0);
+        let stranger_ptr = &mut stranger as *mut PyType;
+
+        unsafe {
+            assert!(is_exception_subclass(leaf_ptr, leaf_ptr));
+            assert!(is_exception_subclass(leaf_ptr, mid_ptr));
+            assert!(is_exception_subclass(leaf_ptr, root_ptr));
+            assert!(!is_exception_subclass(leaf_ptr, stranger_ptr));
+            // Direction matters: an ancestor never matches its descendant.
+            assert!(!is_exception_subclass(root_ptr, leaf_ptr));
+            assert!(!is_exception_subclass(ptr::null(), root_ptr));
+            assert!(!is_exception_subclass(leaf_ptr, ptr::null()));
+        }
+    }
+
+    #[test]
+    fn exception_group_matches_exception_by_name() {
+        let mut base_group = PyType::new(ptr::null(), "BaseExceptionGroup", 0);
+        let base_group_ptr = &mut base_group as *mut PyType;
+        let mut group = PyType::new(ptr::null(), "ExceptionGroup", 0);
+        group.tp_base = base_group_ptr;
+        let group_ptr = &mut group as *mut PyType;
+        let mut exception = PyType::new(ptr::null(), "Exception", 0);
+        let exception_ptr = &mut exception as *mut PyType;
+        let mut type_error = PyType::new(ptr::null(), "TypeError", 0);
+        let type_error_ptr = &mut type_error as *mut PyType;
+
+        unsafe {
+            // "Exception" is nowhere on the group's tp_base chain; the edge is
+            // restored by name for the carrier-less builtin descriptor.
+            assert!(is_exception_subclass(group_ptr, exception_ptr));
+            // The name gate is base-side only: the same walk must not match a
+            // base that is not named "Exception".
+            assert!(!is_exception_subclass(group_ptr, type_error_ptr));
+            assert!(!is_exception_subclass(exception_ptr, group_ptr));
+        }
+    }
+
+    #[test]
+    fn carried_exception_group_entry_matches_exception() {
+        let mut type_type = PyType::new(ptr::null(), "type", core::mem::size_of::<PyType>());
+        let type_ptr = &mut type_type as *mut PyType;
+        unsafe { (*type_ptr).ob_base.ob_type = type_ptr };
+
+        let mut group = PyType::new(type_ptr, "ExceptionGroup", 0);
+        let group_ptr = &mut group as *mut PyType;
+        // tp_base deliberately left NULL: the "ExceptionGroup" entry is
+        // reachable ONLY through the carrier, never the tp_base chain.
+        let mut derived = PyType::new(type_ptr, "DerivedGroup", 0);
+        let derived_ptr = &mut derived as *mut PyType;
+        let mut exception = PyType::new(type_ptr, "Exception", 0);
+        let exception_ptr = &mut exception as *mut PyType;
+
+        unsafe {
+            assert_eq!(set_c3_mro(derived_ptr, &[group_ptr]), 0);
+            // "Exception" is absent from the carrier; the entry NAMED
+            // "ExceptionGroup" (not the head type, which is "DerivedGroup")
+            // must restore the edge on the carrier path too.
+            assert!(is_exception_subclass(derived_ptr, exception_ptr));
+        }
+    }
+
+    #[test]
+    fn exception_type_named_walks_carrier() {
+        let mut type_type = PyType::new(ptr::null(), "type", core::mem::size_of::<PyType>());
+        let type_ptr = &mut type_type as *mut PyType;
+        unsafe { (*type_ptr).ob_base.ob_type = type_ptr };
+
+        let mut first = PyType::new(type_ptr, "FirstBase", 0);
+        let first_ptr = &mut first as *mut PyType;
+        let mut second = PyType::new(type_ptr, "SecondBase", 0);
+        let second_ptr = &mut second as *mut PyType;
+        let mut sub = PyType::new(type_ptr, "MultiSub", 0);
+        sub.tp_base = first_ptr;
+        let sub_ptr = &mut sub as *mut PyType;
+
+        unsafe {
+            assert_eq!(set_c3_mro(sub_ptr, &[first_ptr, second_ptr]), 0);
+            // Second-base NAME must be visible through the carrier.
+            assert!(exception_type_named(sub_ptr, "SecondBase"));
+            assert!(exception_type_named(sub_ptr, "FirstBase"));
+            assert!(exception_type_named(sub_ptr, "MultiSub"));
+            assert!(!exception_type_named(sub_ptr, "Absent"));
+        }
+    }
+
+    #[test]
+    fn exception_type_named_walks_tp_base_chain() {
+        let mut root = PyType::new(ptr::null(), "RootErr", 0);
+        let root_ptr = &mut root as *mut PyType;
+        let mut leaf = PyType::new(ptr::null(), "LeafErr", 0);
+        leaf.tp_base = root_ptr;
+        let leaf_ptr = &mut leaf as *mut PyType;
+
+        unsafe {
+            assert!(exception_type_named(leaf_ptr, "RootErr"));
+            assert!(exception_type_named(leaf_ptr, "LeafErr"));
+            assert!(!exception_type_named(leaf_ptr, "Absent"));
+            assert!(!exception_type_named(ptr::null(), "RootErr"));
+        }
+    }
+}

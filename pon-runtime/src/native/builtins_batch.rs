@@ -442,7 +442,9 @@ fn select_min_max(items: Vec<*mut PyObject>, key: *mut PyObject, max_mode: bool)
     Ok(best)
 }
 
-fn stable_sort(items: &mut Vec<*mut PyObject>, key: *mut PyObject, reverse: bool) -> Result<(), ()> {
+/// Insertion-based stable sort shared by `sorted()` and `list.sort()`:
+/// key-mapped once, then rich-compare ordered (`reverse` flips to GT).
+pub(crate) fn stable_sort(items: &mut Vec<*mut PyObject>, key: *mut PyObject, reverse: bool) -> Result<(), ()> {
     let mut keyed = Vec::with_capacity(items.len());
     for item in items.iter().copied() {
         keyed.push((item, key_value(item, key)?));

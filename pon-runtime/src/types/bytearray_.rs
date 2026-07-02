@@ -304,7 +304,8 @@ pub fn pop(array: &mut PyByteArray, index: Option<isize>) -> Result<u8, String> 
     if array.bytes.is_empty() {
         return Err("pop from empty bytearray".to_owned());
     }
-    let index = normalize_existing_index(index.unwrap_or(-1), array.bytes.len())?;
+    let index = normalize_existing_index(index.unwrap_or(-1), array.bytes.len())
+        .map_err(|_| "pop index out of range".to_owned())?;
     Ok(array.bytes.remove(index))
 }
 

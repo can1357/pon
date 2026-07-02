@@ -50,6 +50,21 @@ pub struct PonThreadState {
     pub exception_state_stack: Vec<*mut PyObject>,
     /// Active `except*` dispatcher frames, innermost handler last.
     pub exc_star_stack: Vec<ExcStarFrame>,
+    /// Exception most recently caught by a live handler in the current frame
+    /// context (CPython's `exc_info->exc_value`, the `sys.exception()`
+    /// source).  Parked by the handler-entry helpers (`pon_match_exc`,
+    /// `pon_get_current_exc`, `pon_exc_star_match`) — which run before any
+    /// call can clear `current_exc` — and saved/restored around every
+    /// compiled-code call boundary so it scopes to the catching frame.
+    /// Divergence (documented in `native/sys.rs`): CPython resets this when
+    /// the `except` BLOCK exits; pon resets when the catching FRAME returns,
+    /// so same-frame reads after the block still see the last caught
+    /// exception.
+    pub handled_exc: *mut PyObject,
+    /// Call-boundary save stack for [`Self::handled_exc`] (innermost last).
+    /// Lives here rather than in guard locals so saved exceptions stay
+    /// visible to the precise GC root scan.
+    pub handled_exc_saves: Vec<*mut PyObject>,
     /// Conservative stack-base capture for stop-the-world collection.
     pub stack_base: *mut u8,
     /// Approximate top frame/stack pointer recorded when entering a GC-safe region.
@@ -69,6 +84,8 @@ impl Default for PonThreadState {
             handler_chain: Vec::new(),
             exception_state_stack: Vec::new(),
             exc_star_stack: Vec::new(),
+            handled_exc: ptr::null_mut(),
+            handled_exc_saves: Vec::new(),
             stack_base: ptr::null_mut(),
             stack_top_fp: ptr::null_mut(),
             gc_safe_region_depth: 0,

@@ -26,6 +26,8 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         modules_attr(),
         function_attr("_getframe", sys_getframe),
         function_attr("intern", sys_intern),
+        function_attr("exception", sys_exception),
+        function_attr("exc_info", sys_exc_info),
     ];
     install_module("sys", attrs.into_iter().collect::<Result<Vec<_>, _>>()?)
 }
@@ -164,4 +166,53 @@ unsafe extern "C" fn sys_intern(argv: *mut *mut PyObject, argc: usize) -> *mut P
         return return_null_with_error("intern() argument must be str");
     }
     value
+}
+
+/// `sys.exception()` (CPython 3.12+).
+///
+/// Returns the exception being handled or `None`.  pon keeps the caught
+/// exception installed in `PonThreadState.current_exc` while an `except`
+/// body runs (the same slot `except ... as e` binding and implicit
+/// `__context__` chaining read), so the object-safe pending exception IS the
+/// handled exception whenever compiled Python code can observe it: a call
+/// only happens while no exception is propagating.
+unsafe extern "C" fn sys_exception(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let _ = argv;
+    if argc != 0 {
+        return return_null_with_error(format!("exception() takes no arguments ({argc} given)"));
+    }
+    match crate::abi::exc::pending_exception_object() {
+        Some(exception) => exception,
+        // SAFETY: Singleton accessor.
+        None => unsafe { crate::abi::pon_none() },
+    }
+}
+
+/// `sys.exc_info()`: the `(type, value, traceback)` triple for the handled
+/// exception (same source as [`sys_exception`]), or `(None, None, None)`
+/// outside handlers.  The traceback element is the exception's own
+/// `__traceback__` (None-or-chain contract).
+unsafe extern "C" fn sys_exc_info(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let _ = argv;
+    if argc != 0 {
+        return return_null_with_error(format!("exc_info() takes no arguments ({argc} given)"));
+    }
+    // SAFETY: Singleton accessor.
+    let none = unsafe { crate::abi::pon_none() };
+    let items = match crate::abi::exc::pending_exception_object() {
+        Some(exception) => {
+            let mut slot = exception;
+            // SAFETY: One live argument slot; `builtin_type` reports errors via NULL.
+            let exc_type = unsafe { crate::types::type_::builtin_type(&mut slot, 1) };
+            if exc_type.is_null() {
+                return core::ptr::null_mut();
+            }
+            // SAFETY: Every raise path allocates the `PyBaseException` layout,
+            // so the object-safe pending exception carries the traceback slot.
+            let traceback = unsafe { (*exception.cast::<crate::types::exc::PyBaseException>()).traceback };
+            vec![exc_type, exception, if traceback.is_null() { none } else { traceback }]
+        }
+        None => vec![none, none, none],
+    };
+    super::builtins_mod::alloc_tuple(items)
 }

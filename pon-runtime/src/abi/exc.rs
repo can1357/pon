@@ -73,19 +73,13 @@ pub(crate) fn pending_exception_object() -> Option<*mut PyObject> {
 }
 
 /// Returns true when the pending exception is an instance of the named
-/// builtin exception type (walking `tp_base`).
+/// builtin exception type (raw MRO walk, matching except-clause semantics).
 pub(crate) fn pending_exception_is(name: &str) -> bool {
     let Some(exception) = pending_exception_object() else {
         return false;
     };
-    let mut ty = unsafe { (*exception).ob_type };
-    while !ty.is_null() {
-        if unsafe { (*ty).name() } == name {
-            return true;
-        }
-        ty = unsafe { (*ty).tp_base };
-    }
-    false
+    // SAFETY: `exception` is a live boxed object per `pending_exception_object`.
+    unsafe { crate::types::exc::exception_type_named((*exception).ob_type, name) }
 }
 
 fn active_context() -> *mut PyObject {
@@ -166,11 +160,17 @@ fn alloc_exception_group_from_members(
 /// raise time instead.  A raised-again exception keeps its previous chain as
 /// the deeper suffix, matching CPython's most-recent-call-last ordering.
 ///
-/// Known divergences (best effort until the line-table workstream lands):
-/// frames above the eventual handler are indistinguishable from propagated
-/// frames, native builtin shims count as one call level, generator resume
-/// frames are not counted, and `tb_lineno` stays `0` because pon-ir carries no
-/// source locations.
+/// Line precision: the raise-site entry reads the live `pon_current_line`
+/// cell; every outer frame reports the statement line it was executing when it
+/// made the next-inner compiled call (saved by `CurrentFunctionGuard` at
+/// push).  Lines are statement-granular, `0` when code was lowered without
+/// source text.
+///
+/// Known divergences (best effort): frames above the eventual handler are
+/// indistinguishable from propagated frames, native builtin shims count as one
+/// call level, and generator resume frames are neither counted nor
+/// line-restored (a raise later in the resuming statement reports the
+/// generator body's last stored line).
 fn attach_current_traceback(runtime: &Runtime, exception: *mut PyObject) {
     if exception.is_null() || is_diagnostic_sentinel(exception) {
         return;
@@ -195,17 +195,32 @@ fn attach_current_traceback(runtime: &Runtime, exception: *mut PyObject) {
     );
     let frame_type = ensure_frame_type(runtime._type_type);
     let traceback_type = ensure_traceback_type(runtime._type_type);
-    let python_calls = super::CURRENT_FUNCTION_STACK.with(|stack| stack.borrow().len());
+    let (python_calls, caller_lines) = super::CURRENT_FUNCTION_STACK.with(|stack| {
+        let stack = stack.borrow();
+        let lines: Vec<u32> = stack.iter().map(|call| call.caller_line).collect();
+        (stack.len(), lines)
+    });
 
     // SAFETY: Raise-path callers pass a live boxed exception instance.
     let slot = unsafe { &mut (*exception.cast::<PyBaseException>()).traceback };
     let mut next = *slot;
     // Innermost (raise site) first: its tb_next is the surviving prior chain;
     // the last-built entry is the outermost frame and becomes the new head.
-    for _ in 0..=python_calls {
+    // Entry `depth` sits `depth` call levels above the raise site: depth 0
+    // reads the live line cell, depth k the line saved when the call chain's
+    // k-th-innermost guard was pushed (= that frame's active call statement).
+    for depth in 0..=python_calls {
+        let line = if depth == 0 {
+            super::current_line()
+        } else {
+            caller_lines[python_calls - depth]
+        };
         let frame = runtime.heap.alloc(size_of::<PyFrame>(), TYPE_ID_FRAME).cast::<PyFrame>();
         // SAFETY: `frame` points to a freshly allocated zeroed block of the right size.
-        unsafe { ptr::write(frame, PyFrame::new(frame_type.cast_const(), 0, ptr::null_mut())) };
+        unsafe {
+            ptr::write(frame, PyFrame::new(frame_type.cast_const(), 0, ptr::null_mut()));
+            (*frame).line = line;
+        }
         let entry = runtime
             .heap
             .alloc(size_of::<PyTraceback>(), TYPE_ID_TRACEBACK)
@@ -214,7 +229,7 @@ fn attach_current_traceback(runtime: &Runtime, exception: *mut PyObject) {
         unsafe {
             ptr::write(
                 entry,
-                PyTraceback::new(traceback_type.cast_const(), frame.cast::<PyObject>(), 0, next),
+                PyTraceback::new(traceback_type.cast_const(), frame.cast::<PyObject>(), i64::from(line), next),
             );
         }
         next = entry.cast::<PyObject>();
@@ -340,6 +355,18 @@ pub(crate) fn raise_runtime_error_text(text: &str) -> *mut PyObject {
 pub(crate) fn raise_kind_error_text(kind: ExceptionKind, text: &str) -> *mut PyObject {
     match ensure_runtime_for_exc() {
         Ok(()) => match super::with_runtime(|runtime| raise_builtin_text(runtime, kind, text)) {
+            Some(result) => result,
+            None => super::return_null_with_error("runtime is not initialized"),
+        },
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
+/// Raises a typed builtin exception with NO argument payload (`args == ()`),
+/// e.g. native `_signal.default_int_handler`'s bare `KeyboardInterrupt`.
+pub(crate) fn raise_kind_error_no_args(kind: ExceptionKind) -> *mut PyObject {
+    match ensure_runtime_for_exc() {
+        Ok(()) => match super::with_runtime(|runtime| raise_builtin_value(runtime, kind, ptr::null_mut(), exception_kind_name(kind).to_owned())) {
             Some(result) => result,
             None => super::return_null_with_error("runtime is not initialized"),
         },
@@ -1592,11 +1619,23 @@ mod tests {
         length
     }
 
+    fn traceback_linenos(exception: *mut PyObject) -> Vec<i64> {
+        let mut linenos = Vec::new();
+        let mut entry = unsafe { (*exception.cast::<PyBaseException>()).traceback };
+        while !entry.is_null() {
+            let node = unsafe { &*entry.cast::<crate::traceback::PyTraceback>() };
+            linenos.push(node.lineno);
+            entry = node.tb_next;
+        }
+        linenos
+    }
+
     #[test]
     fn raising_attaches_module_level_traceback_chain() {
         let _guard = test_state_lock();
         unsafe {
             reset_exception_state();
+            super::super::set_current_line(7);
 
             assert!(pon_raise_value_error(b"with frame".as_ptr(), 10).is_null());
 
@@ -1605,8 +1644,10 @@ mod tests {
             assert!(!head.is_null());
             let entry = &*head.cast::<crate::traceback::PyTraceback>();
             assert!(!entry.frame.is_null());
-            assert_eq!(entry.lineno, 0);
+            assert_eq!(entry.lineno, 7, "module-level raise reads the live line cell");
+            assert_eq!((*entry.frame.cast::<PyFrame>()).line, 7, "synthesized frame mirrors the entry line");
             assert!(entry.tb_next.is_null());
+            super::super::set_current_line(0);
             reset_exception_state();
         }
     }
@@ -1617,15 +1658,26 @@ mod tests {
         unsafe {
             reset_exception_state();
             let function = core::ptr::NonNull::<crate::object::PyFunction>::dangling().as_ptr();
+            super::super::set_current_line(2);
             let outer = super::super::push_current_call(function, ptr::null_mut(), 0);
+            super::super::set_current_line(4);
             let inner = super::super::push_current_call(function, ptr::null_mut(), 0);
+            super::super::set_current_line(6);
 
             assert!(pon_raise_value_error(b"deep".as_ptr(), 4).is_null());
-            drop(inner);
-            drop(outer);
 
             let exception = thread_state_lock().current_exc;
             assert_eq!(traceback_chain_len(exception), 3);
+            // Head is the outermost (module) frame at its call statement; the
+            // raise-site entry carries the live cell value.
+            assert_eq!(traceback_linenos(exception), vec![2, 4, 6]);
+
+            drop(inner);
+            assert_eq!(super::super::current_line(), 4, "popping a call restores its caller's line");
+            drop(outer);
+            assert_eq!(super::super::current_line(), 2);
+
+            super::super::set_current_line(0);
             reset_exception_state();
         }
     }
@@ -1635,14 +1687,19 @@ mod tests {
         let _guard = test_state_lock();
         unsafe {
             reset_exception_state();
+            super::super::set_current_line(6);
             assert!(pon_raise_value_error(b"origin".as_ptr(), 6).is_null());
             let exception = thread_state_lock().current_exc;
             assert_eq!(traceback_chain_len(exception), 1);
 
             pon_err_clear();
+            super::super::set_current_line(9);
             assert!(pon_raise(exception, ptr::null_mut()).is_null());
             assert_eq!(thread_state_lock().current_exc, exception);
             assert_eq!(traceback_chain_len(exception), 2);
+            // The re-raise entry is the new head; the original stays deeper.
+            assert_eq!(traceback_linenos(exception), vec![9, 6]);
+            super::super::set_current_line(0);
             reset_exception_state();
         }
     }

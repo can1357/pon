@@ -48,6 +48,7 @@ impl PyFrame {
             locals,
             parent: ptr::null_mut(),
             exc_state: ptr::null_mut(),
+            line: 0,
         }
     }
 

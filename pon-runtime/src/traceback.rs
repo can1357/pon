@@ -3,10 +3,10 @@
 //! Raising helpers in `abi::exc` snapshot the active Python call stack into a
 //! `tb_next`-linked `PyTraceback` chain and store it on the exception instance
 //! (`PyBaseException.traceback`), so `exc.__traceback__` observes CPython's
-//! None-or-chain contract.  Entries stay minimal until the line-table
-//! workstream lands: each carries a synthesized heap frame and `tb_lineno == 0`
-//! (pon-ir instructions carry no source locations yet, so no raise or call site
-//! can know its line at runtime).
+//! None-or-chain contract.  `tb_lineno` is real at statement granularity: the
+//! raise-site entry carries the live `pon_current_line` value and outer
+//! entries the call-site line saved by `CurrentFunctionGuard` (see
+//! `abi::exc::attach_current_traceback` for the precision contract).
 
 use core::{mem, ptr};
 use std::sync::{LazyLock, Mutex};
@@ -31,7 +31,7 @@ pub(crate) struct PyTraceback {
     pub(crate) tb_next: *mut PyObject,
     /// Frame observed for this entry; non-NULL by construction.
     pub(crate) frame: *mut PyObject,
-    /// Source line of this entry; `0` until the line-table workstream lands.
+    /// 1-based statement-level source line of this entry; `0` when unknown.
     pub(crate) lineno: i64,
 }
 
