@@ -2664,16 +2664,15 @@ pub(super) unsafe fn call_type_with_keywords(
     keywords: function::KeywordArgs<'_>,
 ) -> *mut PyObject {
     let cls = callee.cast::<PyType>();
-    // Exception constructors are keyword-free (CPython BaseException.__new__
-    // rejects them); the positional path routes them through the dedicated
-    // exception builder, so refuse here rather than mis-allocating.
+    // Exception classes never take the generic heap-instance path:
+    // `BaseException.__new__` is keyword-blind and construction must end in
+    // the boxed-exception machinery, so they get a dedicated leg.
     let is_exception_type = with_runtime(|runtime| unsafe {
         is_exception_subclass(cls.cast_const(), runtime.exception_types.base_exception.cast_const())
     })
     .unwrap_or(false);
     if is_exception_type {
-        let name = unsafe { (*cls).name() };
-        return return_null_with_error(format!("{name}() takes no keyword arguments"));
+        return unsafe { call_exception_type_with_keywords(callee, args, keywords) };
     }
     let user_new = unsafe { crate::descr::lookup_in_type(cls, crate::intern::intern("__new__")) };
     let object_new = OBJECT_DUNDER_NEW_DESCRIPTOR.load(Ordering::Acquire);
@@ -2764,6 +2763,94 @@ pub(super) unsafe fn call_type_with_keywords(
         }
     }
     instance
+}
+
+/// Exception-class leg of [`call_type_with_keywords`], mirroring CPython's
+/// `type_call` over the builtin exception machinery: `BaseException.__new__`
+/// ignores keywords, so they must reach a user-defined `__init__`/`__new__`
+/// (bound through the function binder) or the builtin init — where the
+/// ImportError family binds `name=`/`path=`/`name_from=` and every other
+/// builtin rejects them with CPython's typed TypeError
+/// (`exc::apply_builtin_exception_keywords`).
+unsafe fn call_exception_type_with_keywords(
+    callee: *mut PyObject,
+    args: &[*mut PyObject],
+    keywords: function::KeywordArgs<'_>,
+) -> *mut PyObject {
+    let cls = callee.cast::<PyType>();
+    let user_new = unsafe { crate::descr::lookup_in_type(cls, crate::intern::intern("__new__")) };
+    let object_new = OBJECT_DUNDER_NEW_DESCRIPTOR.load(Ordering::Acquire);
+    let has_user_new = !user_new.is_null() && user_new != object_new;
+    let init = unsafe { crate::descr::lookup_in_type(cls, crate::intern::intern("__init__")) };
+    let has_user_init = !init.is_null() && init != OBJECT_DUNDER_INIT_CARRIER.load(Ordering::Acquire);
+
+    let instance = if has_user_new {
+        // CPython type_call: a Python-level `__new__` (implicitly static) is
+        // called unbound as `__new__(cls, *args, **kwargs)`.
+        let callable = unsafe { crate::descr::descriptor_get(user_new, ptr::null_mut(), cls) };
+        if callable.is_null() {
+            return ptr::null_mut();
+        }
+        let mut new_argv = Vec::with_capacity(args.len().saturating_add(1));
+        new_argv.push(callee);
+        new_argv.extend_from_slice(args);
+        let instance = if function::function_record(callable).is_some() {
+            unsafe { call_phase_b_function(callable, &new_argv, keywords, None, None) }
+        } else {
+            match unsafe { function::call_bound_function(callable, &new_argv, keywords, None, None) } {
+                Ok(result) => result,
+                Err(message) => return return_null_with_error(message),
+            }
+        };
+        if instance.is_null() {
+            return ptr::null_mut();
+        }
+        // `__init__` only runs when `__new__` produced an instance of `cls`.
+        let instance_type = unsafe { (*instance).ob_type.cast_mut() };
+        if instance_type.is_null() || unsafe { !crate::mro::is_subtype(instance_type, cls) } {
+            return instance;
+        }
+        instance
+    } else {
+        // `BaseException.__new__`: keyword-blind, positional args become the
+        // message/args payload (same builder as the positional call path).
+        let is_group = with_runtime(|runtime| unsafe { runtime.exception_types.is_exception_group_type(cls.cast_const()) })
+            .unwrap_or(false);
+        let instance = if is_group {
+            match with_runtime(|runtime| exc::build_exception_group_checked(runtime, cls, args)) {
+                Some(instance) => instance,
+                None => return return_null_with_error("runtime is not initialized"),
+            }
+        } else {
+            exc::alloc_exception_instance(cls, args)
+        };
+        if instance.is_null() {
+            return ptr::null_mut();
+        }
+        instance
+    };
+
+    if has_user_init {
+        let mut positional = Vec::with_capacity(args.len().saturating_add(1));
+        positional.push(instance);
+        positional.extend_from_slice(args);
+        let result = if function::function_record(init).is_some() {
+            unsafe { call_phase_b_function(init, &positional, keywords, None, None) }
+        } else {
+            match unsafe { function::call_bound_function(init, &positional, keywords, None, None) } {
+                Ok(result) => result,
+                Err(message) => return return_null_with_error(message),
+            }
+        };
+        if result.is_null() {
+            return ptr::null_mut();
+        }
+        return instance;
+    }
+    if keywords.names.is_empty() {
+        return instance;
+    }
+    exc::apply_builtin_exception_keywords(instance, keywords)
 }
 
 /// Materializes binder keywords as a Python dict for CPython-style

@@ -493,10 +493,14 @@ fn open_from_args(args: &[*mut PyObject]) -> Result<*mut PyObject, OpenError> {
         return Err(OpenError::Type(format!("open() expected 1 to 8 arguments, got {}", args.len())));
     }
     let path = expect_str(args[0], "open() file must be str")?.to_owned();
-    let mode_text = if let Some(&mode) = args.get(1) {
-        expect_str(mode, "open() mode must be str")?.to_owned()
-    } else {
-        "r".to_owned()
+    // The keyword binder flattens the full `open(file, mode='r',
+    // buffering=-1, encoding=None, errors=None, newline=None, closefd=True,
+    // opener=None)` signature into eight positional slots with None filling
+    // every absent optional, so a None mode selects the default exactly like
+    // an absent slot does.
+    let mode_text = match args.get(1) {
+        Some(&mode) if !is_none(mode) => expect_str(mode, "open() mode must be str")?.to_owned(),
+        _ => "r".to_owned(),
     };
     let mode = parse_mode(&mode_text)?;
 
@@ -525,8 +529,19 @@ fn open_from_args(args: &[*mut PyObject]) -> Result<*mut PyObject, OpenError> {
         Some("utf-8".to_owned())
     };
 
-    if args.get(4).copied().is_some_and(|errors| !is_none(errors)) {
-        return Err(OpenError::Value("open() errors argument is not implemented".to_owned()));
+    if let Some(&errors) = args.get(4) {
+        if !is_none(errors) {
+            let text = expect_str(errors, "open() errors must be str or None")?;
+            if mode.binary {
+                return Err(OpenError::Value("binary mode doesn't take an errors argument".to_owned()));
+            }
+            // The native text stream decodes strict UTF-8: 'strict' is the
+            // one handler that machinery honors; every other policy is
+            // refused honestly instead of decoding with the wrong behavior.
+            if text != "strict" {
+                return Err(OpenError::Value(format!("open() errors='{text}' is not implemented")));
+            }
+        }
     }
 
     let newline = if mode.binary {

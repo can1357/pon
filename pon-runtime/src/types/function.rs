@@ -19,7 +19,7 @@ use std::sync::{LazyLock, Mutex};
 use crate::abi::{CodeInfo, ParamSpec, return_null_with_error};
 use crate::intern::{self, intern, resolve};
 use crate::object::{PyCodeFn, PyFunction, PyObject, PyObjectHeader, PyType, PyUnicode};
-use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set};
+use crate::thread_state::{pon_err_occurred, pon_err_set};
 use crate::types::{dict, list::PyList, tuple::PyTuple, type_::{self, PyClassDict}};
 
 static FUNCTION_RECORDS: LazyLock<Mutex<HashMap<usize, FunctionRecord>>> =
@@ -1329,9 +1329,8 @@ pub unsafe fn call_bound_function(
     if code.is_null() {
         return Err("function code pointer is null".to_owned());
     }
-    let _guard = crate::abi::push_current_call(function, argv.as_mut_ptr(), argv.len());
-    let _handled_guard = crate::abi::HandledExcGuard::enter();
-    pon_err_clear();
+    let _guard = crate::abi::push_current_call(function.cast::<PyFunction>(), argv.as_mut_ptr(), argv.len());
+    let _handled_guard = crate::abi::HandledExcGuard::enter_clearing_pending();
     // SAFETY: Function entrypoints are emitted with the compiled-code ABI.
     let entry: PyCodeFn = unsafe { mem::transmute(code) };
     // SAFETY: `argv` is contiguous and lives for the duration of the call.
@@ -1564,8 +1563,35 @@ pub(crate) fn bind_native_keywords_for_name(
         "to_bytes" => {
             bind_optional_named_keywords(positional, keywords, "to_bytes", &["self", "length", "byteorder", "signed"], 3)
         }
+        // `open(file, mode='r', buffering=-1, encoding=None, errors=None,
+        // newline=None, closefd=True, opener=None)`: `_osx_support` and the
+        // sysconfig/platform chain pass `encoding=` (and friends) as
+        // keywords; absent optionals arrive as None and the io entry applies
+        // its defaults.  `_io.open` shares this row: both spellings are the
+        // same native entry registered under the function name `open`.
+        // Binder failures are boxed as real TypeErrors so CPython-parity
+        // `except TypeError:` legs match instead of seeing an uncatchable
+        // sentinel diagnostic.
+        "open" => bind_optional_named_keywords(
+            positional,
+            keywords,
+            "open",
+            &["file", "mode", "buffering", "encoding", "errors", "newline", "closefd", "opener"],
+            8,
+        )
+        .map_err(raise_boxed_type_error),
         _ => Err(format!("keyword arguments require Phase-B function metadata ('{name}')")),
     }
+}
+
+/// Boxes a binder failure as a live TypeError object before the message
+/// rides the generic `Err(String)` channel.  `pon_err_set` preserves a
+/// pending boxed exception, so the eventual `return_null_with_error` in the
+/// call plumbing keeps the typed object and `except TypeError:` matches
+/// (CPython raises TypeError for every keyword-binding failure).
+fn raise_boxed_type_error(message: String) -> String {
+    let _ = unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    message
 }
 
 /// Binds a fixed-shape native signature whose optionals default to None:
@@ -1850,6 +1876,7 @@ unsafe fn copy_param_spec(params: *const ParamSpec) -> Result<Option<OwnedParamS
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thread_state::pon_err_clear;
 
     unsafe extern "C" fn dummy_entry(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
         ptr::null_mut()
@@ -2765,6 +2792,119 @@ mod tests {
             )
             .unwrap();
             assert_eq!(bound, vec![arg_pos, override_val]);
+            unregister_function_record(function);
+        }
+    }
+
+    /// Regression pin for the tier-up dispatch contract in
+    /// `call_bound_function` (commit e9da81f routed every `def` through the
+    /// Phase-B record path, which silently pinned dispatch to the record's
+    /// creation-time tier-0 `entry` snapshot and skipped the call-hotness
+    /// probe): the call MUST bump `pon_tierup_bump_call` and dispatch through
+    /// the live `PyFunction::entry` cell, so an installed tier-1 body is
+    /// actually entered.
+    #[test]
+    fn call_bound_function_dispatches_live_entry_and_bumps_hotness() {
+        use std::sync::atomic::AtomicUsize;
+
+        // Per-tier hit counters: dispatch evidence without fabricating
+        // PyObject return values (both stubs return the None singleton, which
+        // is safe to hand back through `call_bound_function`).
+        static TIER0_HITS: AtomicUsize = AtomicUsize::new(0);
+        static TIER1_HITS: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn tier0_stub(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+            TIER0_HITS.fetch_add(1, Ordering::SeqCst);
+            unsafe { crate::abi::pon_none() }
+        }
+
+        unsafe extern "C" fn tier1_stub(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+            TIER1_HITS.fetch_add(1, Ordering::SeqCst);
+            unsafe { crate::abi::pon_none() }
+        }
+
+        let _guard = crate::thread_state::test_state_lock();
+        unsafe {
+            assert_eq!(crate::abi::pon_runtime_init(), 0);
+            pon_err_clear();
+            TIER0_HITS.store(0, Ordering::SeqCst);
+            TIER1_HITS.store(0, Ordering::SeqCst);
+
+            let function = crate::abi::pon_make_function(
+                tier0_stub as *const u8,
+                0,
+                intern("tierup_dispatch_probe"),
+            );
+            assert!(!function.is_null());
+
+            // Phase-B record exactly as `def` registration installs it: the
+            // record's `entry` snapshots the tier-0 body.  Zero parameters,
+            // so the bound argv is empty (`copy_param_spec` accepts a null
+            // names pointer when no named parameter is described).
+            let params = ParamSpec {
+                names: ptr::null(),
+                total_param_count: 0,
+                positional_only_count: 0,
+                positional_count: 0,
+                keyword_only_count: 0,
+                varargs_name: 0,
+                varkw_name: 0,
+            };
+            let code = CodeInfo {
+                entry: tier0_stub as *const u8,
+                params: &params,
+                name_interned: intern("tierup_dispatch_probe"),
+                n_locals: 0,
+                n_feedback: 0,
+                flags: 0,
+            };
+            register_function_record(function, &code, &[], &[], &[], &[]).unwrap();
+
+            let none = crate::abi::pon_none();
+            assert!(!none.is_null());
+
+            // First call: the live `entry` cell still holds the tier-0 body.
+            let result = call_bound_function(
+                function,
+                &[],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(result, none);
+            assert_eq!(TIER0_HITS.load(Ordering::SeqCst), 1);
+            assert_eq!(TIER1_HITS.load(Ordering::SeqCst), 0);
+
+            // Simulate the tier-up install protocol: publish a tier-1 body in
+            // the live dispatch cell.  The record's `entry` and the function's
+            // `code` field still hold the tier-0 stub, so a dispatch that
+            // reverts to either snapshot runs `tier0_stub` again and fails
+            // the counter asserts below.
+            (*function.cast::<PyFunction>())
+                .entry
+                .store(tier1_stub as *mut u8, Ordering::Release);
+
+            let result = call_bound_function(
+                function,
+                &[],
+                KeywordArgs { names: &[], values: &[] },
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(result, none);
+            assert_eq!(TIER0_HITS.load(Ordering::SeqCst), 1);
+            assert_eq!(TIER1_HITS.load(Ordering::SeqCst), 1);
+
+            // Both calls must feed the call-hotness probe
+            // (`pon_tierup_bump_call`), or functions routed through Phase-B
+            // records never get hot and tier-up starves.
+            assert!(
+                (*function.cast::<PyFunction>()).hotness.load(Ordering::Acquire) >= 2,
+                "call_bound_function must bump the tier-up call probe"
+            );
+
             unregister_function_record(function);
         }
     }

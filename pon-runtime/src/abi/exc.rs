@@ -20,6 +20,7 @@ use crate::types::exc::{
     PyExceptionGroup, as_exception_group, is_exception_group_instance, is_exception_instance, is_exception_subclass,
 };
 use crate::types::frame::{TYPE_ID_FRAME, ensure_frame_type, finalize_frame, trace_frame};
+use crate::types::function::KeywordArgs;
 use crate::types::tuple::PyTuple;
 
 use super::{HandlerInfo, PyFrame, Runtime, TYPE_ID_EXCEPTION, TYPE_ID_EXCEPTION_GROUP};
@@ -120,6 +121,48 @@ pub(crate) fn alloc_exception_instance(cls: *mut PyType, args: &[*mut PyObject])
         Some(result) => result,
         None => super::return_null_with_error("runtime is not initialized"),
     }
+}
+
+/// Applies call-site keywords to a freshly built builtin-init exception (no
+/// user `__init__` between the class and `BaseException`), mirroring the
+/// CPython 3.14 `tp_init` surface:
+///
+/// - the `ImportError` family binds `name=`/`path=`/`name_from=`
+///   (`ImportError.__init__`'s clinic keywords) onto the instance, readable
+///   through the fixed attribute surface with a None default;
+/// - every other builtin init rejects keywords with the typed, catchable
+///   TypeError `_PyArg_NoKeywords` raises.
+///
+/// Returns `instance`, or NULL with the TypeError pending.  The family and
+/// the rejection message dispatch on the INSTANCE type, matching CPython's
+/// `type_call`, which re-reads `Py_TYPE(obj)` before running `tp_init`.
+pub(super) fn apply_builtin_exception_keywords(instance: *mut PyObject, keywords: KeywordArgs<'_>) -> *mut PyObject {
+    // SAFETY: `instance` is a live boxed exception from the caller.
+    let ty = unsafe { (*instance).ob_type };
+    let is_import_error_family = super::with_runtime(|runtime| unsafe {
+        is_exception_subclass(ty, runtime.exception_types.import_error.cast_const())
+    })
+    .unwrap_or(false);
+    if !is_import_error_family {
+        // SAFETY: exception instances always carry a live type descriptor.
+        let name = unsafe { (*ty).name() };
+        return raise_type_error_text(&format!("{name}() takes no keyword arguments"));
+    }
+    // Validate every keyword before storing any: CPython's clinic parse
+    // rejects the whole call without observable partial writes.
+    for &name_id in keywords.names {
+        if !matches!(intern::resolve(name_id).as_deref(), Some("name" | "path" | "name_from")) {
+            let spelling = intern::resolve(name_id).unwrap_or_else(|| format!("<interned:{name_id}>"));
+            // CPython 3.14's `ImportError.__init__` reports the clinic name
+            // `ImportError()` for the whole family, ModuleNotFoundError included.
+            return raise_type_error_text(&format!("ImportError() got an unexpected keyword argument '{spelling}'"));
+        }
+    }
+    for (&name_id, &value) in keywords.names.iter().zip(keywords.values.iter()) {
+        // SAFETY: `instance` is a live exception-layout allocation.
+        unsafe { crate::types::exc::set_exception_instance_attr(instance, name_id, value) };
+    }
+    instance
 }
 
 fn active_context() -> *mut PyObject {
@@ -602,6 +645,13 @@ pub unsafe extern "C" fn pon_raise(exc: *mut PyObject, cause: *mut PyObject) -> 
     crate::untag_prelude!(exc, cause);
     super::catch_object_helper(|| {
         if exc.is_null() {
+            // A NULL operand means the raise expression itself failed (e.g.
+            // the exception constructor rejected its keywords): propagate
+            // that pending error instead of masking it with the
+            // derive-from-BaseException morph.
+            if pon_err_occurred() {
+                return ptr::null_mut();
+            }
             return raise_type_error_text("exceptions must derive from BaseException");
         }
         if let Err(message) = ensure_runtime_for_exc() {

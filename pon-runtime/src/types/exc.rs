@@ -672,6 +672,18 @@ unsafe fn exception_fixed_attr(object: *mut PyObject, name: &str) -> Option<*mut
                 exception.message
             })
         }
+        // CPython `ImportError`'s C members (`name`, `path`, `name_from`):
+        // constructor keywords land in the instance dict, and unset reads
+        // default to None instead of AttributeError.  (pon keeps them
+        // dict-backed, so unlike CPython they are `__dict__`-visible.)
+        "name" | "path" | "name_from" if unsafe { exception_type_named((*object).ob_type, "ImportError") } => {
+            let stored = if exception.dict.is_null() {
+                None
+            } else {
+                unsafe { (&*exception.dict).get(crate::intern::intern(name)) }
+            };
+            Some(stored.unwrap_or_else(|| unsafe { crate::abi::pon_none() }))
+        }
         "__cause__" => Some(if exception.cause.is_null() {
             unsafe { crate::abi::pon_none() }
         } else {
@@ -704,6 +716,17 @@ unsafe fn ensure_exception_dict(exception: &mut PyBaseException) -> *mut crate::
         exception.dict = crate::types::type_::new_namespace();
     }
     exception.dict
+}
+
+/// Stores a constructor-bound attribute in the instance dict (the ImportError
+/// family's `name=`/`path=`/`name_from=` keywords).
+///
+/// # Safety
+///
+/// `object` must point to a live `PyBaseException`(-layout) instance.
+pub(crate) unsafe fn set_exception_instance_attr(object: *mut PyObject, name_id: u32, value: *mut PyObject) {
+    let exception = unsafe { &mut *object.cast::<PyBaseException>() };
+    unsafe { (&mut *ensure_exception_dict(exception)).set(name_id, value) };
 }
 
 /// Synthesizes the `BaseException` method surface (`add_note`,

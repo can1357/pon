@@ -1001,7 +1001,16 @@ fn list_resize(list: &mut list::PyListStorage, new_cap: usize) -> Result<(), Str
     Ok(())
 }
 
-fn list_append_raw(list_object: *mut PyObject, item: *mut PyObject) -> Result<(), String> {
+/// Length of a runtime list, or `None` when `object` is not a list.
+/// Untagged native callers only (`crate::import`'s `sys.meta_path` seeding).
+pub(crate) fn list_len(object: *mut PyObject) -> Option<usize> {
+    unsafe { list_cells(object) }.map(|cells| cells.len)
+}
+
+/// Appends one owned heap object to a runtime list.  `pub(crate)` for
+/// `crate::import`'s `sys.meta_path` seeding; tagged Python-level appends go
+/// through `pon_list_append`.
+pub(crate) fn list_append_raw(list_object: *mut PyObject, item: *mut PyObject) -> Result<(), String> {
     let Some(list) = (unsafe { list_cells(list_object) }) else {
         return Err(format!("list append expected list, got {}", object_type_name(list_object)));
     };
