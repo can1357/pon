@@ -616,3 +616,100 @@ const _: () = {
     assert!(offset_of!(PyDictIter, ob_base) == 0);
     assert!(offset_of!(PyDictItem, ob_base) == 0);
 };
+
+#[cfg(test)]
+mod tests {
+    use num_bigint::BigInt;
+    use num_traits::One;
+
+    use super::*;
+    use crate::abi::{map::pon_build_map, pon_const_int, pon_runtime_init};
+    use crate::object::PyObject;
+    use crate::thread_state::test_state_lock;
+    use crate::types::{bool_ as bool_type, complex_ as complex_type, float as float_type, int as int_type};
+
+    #[track_caller]
+    fn assert_same_hash_and_equal(left: *mut PyObject, right: *mut PyObject) {
+        unsafe {
+            assert_eq!(hash_object(left).expect("left hash"), hash_object(right).expect("right hash"));
+            assert!(object_equal(left, right).expect("left equals right"));
+            assert!(object_equal(right, left).expect("right equals left"));
+        }
+    }
+
+    #[test]
+    fn dict_numeric_one_hashes_and_compares_equal_across_bool_int_float_complex() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+
+        let one = int_type::from_i64(1);
+        let true_ = bool_type::from_bool(true);
+        let one_float = float_type::from_f64(1.0);
+        let one_complex = complex_type::from_f64s(1.0, 0.0);
+
+        assert_same_hash_and_equal(one, true_);
+        assert_same_hash_and_equal(one, one_float);
+        assert_same_hash_and_equal(one, one_complex);
+    }
+
+    #[test]
+    fn dict_numeric_equal_one_keys_lookup_and_update_the_same_entry() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+
+            let one = int_type::from_i64(1);
+            let true_ = bool_type::from_bool(true);
+            let one_float = float_type::from_f64(1.0);
+            let one_complex = complex_type::from_f64s(1.0, 0.0);
+            let original_value = pon_const_int(41);
+            let replacement_value = pon_const_int(42);
+            let mut pairs = [one, original_value];
+            let dict = pon_build_map(pairs.as_mut_ptr(), 1);
+
+            assert!(!dict.is_null());
+            assert_eq!(dict_get(dict, true_).expect("lookup by True"), Some(original_value));
+            assert_eq!(dict_get(dict, one_float).expect("lookup by 1.0"), Some(original_value));
+            assert_eq!(dict_get(dict, one_complex).expect("lookup by 1+0j"), Some(original_value));
+
+            dict_insert(dict, true_, replacement_value).expect("update by equal bool key");
+
+            assert_eq!(dict_ref(dict).expect("dict ref").entries.len(), 1);
+            assert_eq!(dict_get(dict, one).expect("lookup by int after update"), Some(replacement_value));
+            assert_eq!(
+                dict_get(dict, one_float).expect("lookup by float after update"),
+                Some(replacement_value)
+            );
+            assert_eq!(
+                dict_get(dict, one_complex).expect("lookup by complex after update"),
+                Some(replacement_value)
+            );
+        }
+    }
+
+    #[test]
+    fn dict_numeric_bigint_spill_key_remains_findable_by_fresh_equal_bigint() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+
+        let value = BigInt::one() << 100_usize;
+        let inserted_key = int_type::from_bigint(value.clone());
+        let lookup_key = int_type::from_bigint(value);
+        assert_ne!(inserted_key, lookup_key);
+        assert_same_hash_and_equal(inserted_key, lookup_key);
+
+        unsafe {
+            let stored_value = pon_const_int(100);
+            let mut pairs = [inserted_key, stored_value];
+            let dict = pon_build_map(pairs.as_mut_ptr(), 1);
+
+            assert!(!dict.is_null());
+            assert_eq!(dict_get(dict, lookup_key).expect("lookup by fresh BigInt"), Some(stored_value));
+            assert_eq!(dict_ref(dict).expect("dict ref").entries.len(), 1);
+        }
+    }
+}

@@ -931,7 +931,7 @@ mod tests {
         let type_ptr = &mut type_type as *mut PyType;
         type_type.ob_base.ob_type = type_ptr;
         let ns = new_namespace();
-        let value = 1usize as *mut PyObject;
+        let value = unsafe { fake_str("callable") };
         unsafe {
             (&mut *ns).set(intern::dunder_call(), value);
             let cls = build_class_from_namespace("C", &[], ns, &[]).cast::<PyType>();

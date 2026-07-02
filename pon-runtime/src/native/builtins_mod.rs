@@ -1236,6 +1236,18 @@ pub fn repr_text(object: *mut PyObject) -> String {
                     return text;
                 }
             }
+            if name == "bytes" {
+                let bytes = &*object.cast::<crate::types::bytes_::PyBytes>();
+                return crate::types::bytes_::repr(bytes.as_slice());
+            }
+            if name == "bytearray" {
+                let bytearray = &*object.cast::<crate::types::bytearray_::PyByteArray>();
+                return crate::types::bytearray_::repr(bytearray.as_slice());
+            }
+            if name == "memoryview" {
+                let view = object.cast::<crate::types::memoryview::PyMemoryView>();
+                return format!("<memory at {}>", crate::types::bytes_::repr(&crate::types::memoryview::tobytes(view)));
+            }
             return format!("<{name} object>");
         }
     }
@@ -1740,4 +1752,73 @@ fn stable_hash(text: &str) -> i64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     if hash == -1 { -2 } else { hash }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ptr;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    use super::*;
+    use crate::object::PyLong;
+    use crate::thread_state::{pon_err_clear, test_state_lock};
+
+    static CALL_COUNTER: AtomicI64 = AtomicI64::new(0);
+
+    unsafe extern "C" fn counter_callable(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+        let value = CALL_COUNTER.fetch_add(1, Ordering::SeqCst);
+        unsafe { abi::pon_const_int(value) }
+    }
+
+    fn init_runtime() {
+        assert_eq!(unsafe { abi::pon_runtime_init() }, 0);
+        pon_err_clear();
+    }
+
+    fn int_value(object: *mut PyObject) -> i64 {
+        assert!(!object.is_null());
+        unsafe { (*object.cast::<PyLong>()).value }
+    }
+
+    #[test]
+    fn next_default_returns_default_after_stop_iteration() {
+        let _guard = test_state_lock();
+        init_runtime();
+        let mut range_args = [unsafe { abi::pon_const_int(0) }];
+        let range = unsafe { builtin_range(range_args.as_mut_ptr(), range_args.len()) };
+        assert!(!range.is_null());
+        let mut iter_args = [range];
+        let iter = unsafe { builtin_iter(iter_args.as_mut_ptr(), iter_args.len()) };
+        assert!(!iter.is_null());
+        let default = unsafe { abi::pon_const_int(42) };
+        let mut next_args = [iter, default];
+        let value = unsafe { builtin_next(next_args.as_mut_ptr(), next_args.len()) };
+        assert_eq!(value, default);
+        assert!(!crate::thread_state::pon_err_occurred());
+    }
+
+    #[test]
+    fn iter_callable_sentinel_stops_on_equal_value() {
+        let _guard = test_state_lock();
+        init_runtime();
+        CALL_COUNTER.store(0, Ordering::SeqCst);
+        let callable = unsafe { abi::pon_make_function(counter_callable as *const u8, 0, intern("counter_callable")) };
+        assert!(!callable.is_null());
+        let sentinel = unsafe { abi::pon_const_int(2) };
+        let mut iter_args = [callable, sentinel];
+        let iter = unsafe { builtin_iter(iter_args.as_mut_ptr(), iter_args.len()) };
+        assert!(!iter.is_null());
+
+        let mut next_args = [iter];
+        let first = unsafe { builtin_next(next_args.as_mut_ptr(), next_args.len()) };
+        assert_eq!(int_value(first), 0);
+        let second = unsafe { builtin_next(next_args.as_mut_ptr(), next_args.len()) };
+        assert_eq!(int_value(second), 1);
+
+        let default = unsafe { abi::pon_const_int(99) };
+        let mut default_args = [iter, default];
+        let stopped = unsafe { builtin_next(default_args.as_mut_ptr(), default_args.len()) };
+        assert_eq!(stopped, default);
+        assert!(!crate::thread_state::pon_err_occurred());
+    }
 }
