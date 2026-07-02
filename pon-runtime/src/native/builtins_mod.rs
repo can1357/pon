@@ -1233,11 +1233,12 @@ unsafe fn builtin_hash_value(object: *mut PyObject) -> Result<i64, String> {
         return Err("unhashable type: 'set'".to_owned());
     } else if matches!(
         unsafe { crate::types::dict::type_name(object) },
-        Some("str" | "bytes" | "dict" | "list" | "bytearray")
+        Some("str" | "bytes" | "dict" | "list" | "bytearray" | "tuple")
     ) || unsafe { crate::types::dict::is_dict_subclass_instance(object) }
     {
         // `hash_object` owns the content-hash (str/bytes CPython seed-0
-        // siphash13 via `crate::pyhash`) and the CPython
+        // siphash13 via `crate::pyhash`, structural tuple hashing shared
+        // with tuple-subclass instances) and the CPython
         // `unhashable type: '...'` rejections (dict/list/bytearray).
         unsafe { crate::types::dict::hash_object(object)? as i64 }
     } else if unsafe { crate::types::weakref::is_weakref(object) } {
@@ -1594,6 +1595,16 @@ pub unsafe extern "C" fn builtin_dict(argv: *mut *mut PyObject, argc: usize) -> 
     let Some(args) = (unsafe { argv_slice(argv, argc) }) else {
         return fail("dict() received a null argv pointer");
     };
+    // `dict(*args, **kwargs)`: keyword entries ride a trailing marker
+    // appended by the keyword binder and merge AFTER the positional source
+    // (later duplicates win, matching CPython's update order).
+    let (args, kw_pairs) = match args.split_last() {
+        Some((&last, rest)) => match unsafe { crate::types::lazy_iter::kw_marker_pairs(last) } {
+            Some(pairs) => (rest, pairs),
+            None => (args, &[][..]),
+        },
+        None => (args, &[][..]),
+    };
     if args.len() > 1 {
         return fail(format!("dict expected at most 1 argument, got {}", args.len()));
     }
@@ -1602,6 +1613,17 @@ pub unsafe extern "C" fn builtin_dict(argv: *mut *mut PyObject, argc: usize) -> 
         if unsafe { collect_dict_update_pairs(source, &mut pairs) }.is_err() {
             return ptr::null_mut();
         }
+    }
+    for &(name, value) in kw_pairs {
+        let Some(text) = crate::intern::resolve(name) else {
+            return fail("dict() keyword name is not interned");
+        };
+        let key = alloc_str(&text);
+        if key.is_null() {
+            return ptr::null_mut();
+        }
+        pairs.push(key);
+        pairs.push(value);
     }
     unsafe { abi::map::pon_build_map(pairs.as_mut_ptr(), pairs.len() / 2) }
 }

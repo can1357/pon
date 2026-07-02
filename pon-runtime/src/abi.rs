@@ -2512,12 +2512,14 @@ unsafe fn install_builtin_type(
 type BuiltinConstructor = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
 
 unsafe fn call_builtin_type_constructor(
+    cls: *mut PyType,
     args: *mut PyObject,
     kwargs: *mut PyObject,
     constructor: BuiltinConstructor,
 ) -> *mut PyObject {
     if !kwargs.is_null() {
-        return return_null_with_error("builtin type keyword arguments are not supported yet");
+        let name = if cls.is_null() { "<unknown>" } else { unsafe { (*cls).name() } };
+        return return_null_with_error(format!("builtin type '{name}' keyword arguments are not supported yet"));
     }
     let mut positional = match unsafe { type_::positional_args_from_object(args) } {
         Ok(positional) => positional,
@@ -2751,91 +2753,113 @@ unsafe fn exact_one_descriptor_arg(
 }
 
 unsafe extern "C" fn builtin_type_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_type) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_type) }
 }
 
 unsafe extern "C" fn builtin_object_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_object) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_object) }
 }
 
 unsafe extern "C" fn builtin_int_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_int) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_int) }
 }
 
 unsafe extern "C" fn builtin_str_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_str) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_str) }
 }
 
 unsafe extern "C" fn builtin_bool_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_bool) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_bool) }
 }
 
 unsafe extern "C" fn builtin_float_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_float) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_float) }
 }
 
 unsafe extern "C" fn builtin_complex_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_complex) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_complex) }
 }
 
 unsafe extern "C" fn builtin_bytes_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_bytes) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_bytes) }
 }
 
 unsafe extern "C" fn builtin_bytearray_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_bytearray) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_bytearray) }
 }
 
 unsafe extern "C" fn builtin_memoryview_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_memoryview) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_memoryview) }
 }
 
 unsafe extern "C" fn builtin_list_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_list) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_list) }
 }
 
 unsafe extern "C" fn builtin_tuple_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_tuple) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_tuple) }
 }
 
 unsafe extern "C" fn builtin_dict_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_dict) }
+    if kwargs.is_null() {
+        return unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_dict) };
+    }
+    // `dict(*args, **kwargs)`: keyword entries (already a str-keyed dict)
+    // merge AFTER the positional mapping/iterable, so duplicate keys keep
+    // CPython's keyword-wins update order.
+    let positional = match unsafe { type_::positional_args_from_object(args) } {
+        Ok(positional) => positional,
+        Err(message) => return return_null_with_error(message),
+    };
+    if positional.len() > 1 {
+        return return_null_with_error(format!("dict expected at most 1 argument, got {}", positional.len()));
+    }
+    let mut pairs = Vec::new();
+    if let Some(&source) = positional.first() {
+        if unsafe { crate::native::builtins_mod::collect_dict_update_pairs(source, &mut pairs) }.is_err() {
+            return ptr::null_mut();
+        }
+    }
+    if unsafe { crate::native::builtins_mod::collect_dict_update_pairs(kwargs, &mut pairs) }.is_err() {
+        return ptr::null_mut();
+    }
+    unsafe { map::pon_build_map(pairs.as_mut_ptr(), pairs.len() / 2) }
 }
 
 unsafe extern "C" fn builtin_set_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_set) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_set) }
 }
 
 unsafe extern "C" fn builtin_frozenset_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_frozenset) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_frozenset) }
 }
 
 unsafe extern "C" fn builtin_range_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_range) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_range) }
 }
 
 unsafe extern "C" fn builtin_enumerate_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_enumerate) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_enumerate) }
 }
 
 unsafe extern "C" fn builtin_zip_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_zip) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_zip) }
 }
 
 unsafe extern "C" fn builtin_map_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_map) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_map) }
 }
 
 unsafe extern "C" fn builtin_filter_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_filter) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_filter) }
 }
 
 unsafe extern "C" fn builtin_property_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_property) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_property) }
 }
 
 unsafe extern "C" fn builtin_super_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
-    unsafe { call_builtin_type_constructor(args, kwargs, crate::native::builtins_mod::builtin_super) }
+    unsafe { call_builtin_type_constructor(_cls, args, kwargs, crate::native::builtins_mod::builtin_super) }
 }
 
 unsafe extern "C" fn builtin_classmethod_new(cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {

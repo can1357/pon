@@ -1516,7 +1516,7 @@ mod tests {
     use num_traits::One;
 
     use super::*;
-    use crate::abi::{map::pon_build_map, pon_const_int, pon_runtime_init};
+    use crate::abi::{map::pon_build_map, pon_const_int, pon_const_str, pon_runtime_init, seq::pon_build_list};
     use crate::object::PyObject;
     use crate::thread_state::test_state_lock;
     use crate::types::{bool_ as bool_type, complex_ as complex_type, float as float_type, int as int_type};
@@ -1528,6 +1528,13 @@ mod tests {
             assert!(object_equal(left, right).expect("left equals right"));
             assert!(object_equal(right, left).expect("right equals left"));
         }
+    }
+
+    #[track_caller]
+    fn str_object(text: &str) -> *mut PyObject {
+        let object = unsafe { pon_const_str(text.as_ptr(), text.len()) };
+        assert!(!object.is_null(), "failed to allocate test str {text:?}");
+        object
     }
 
     #[test]
@@ -1603,6 +1610,62 @@ mod tests {
             assert!(!dict.is_null());
             assert_eq!(dict_get(dict, lookup_key).expect("lookup by fresh BigInt"), Some(stored_value));
             assert_eq!(dict_ref(dict).expect("dict ref").entries.len(), 1);
+        }
+    }
+
+    #[test]
+    fn dict_prehash_collect_dedups_duplicate_keys_and_fill_round_trips() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+
+            let key_a_first = str_object("a");
+            let key_b = str_object("b");
+            let key_a_dup = str_object("a");
+            assert_ne!(key_a_first, key_a_dup, "duplicate key must be a distinct object");
+            let value_1 = pon_const_int(1);
+            let value_2 = pon_const_int(2);
+            let value_3 = pon_const_int(3);
+
+            let mut entries: Vec<DictEntry> = Vec::new();
+            collect_prehashed_entry(&mut entries, key_a_first, value_1).expect("collect (a, 1)");
+            collect_prehashed_entry(&mut entries, key_b, value_2).expect("collect (b, 2)");
+            collect_prehashed_entry(&mut entries, key_a_dup, value_3).expect("collect duplicate (a, 3)");
+
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].key, key_a_first, "duplicate key must keep the FIRST key object");
+            assert_eq!(entries[0].value, value_3, "duplicate key must take the LAST value");
+            assert_eq!(entries[1].key, key_b);
+            assert_eq!(entries[1].value, value_2);
+
+            let dict = pon_build_map(core::ptr::null_mut(), 0);
+            assert!(!dict.is_null());
+            dict_fill_prehashed(dict, &entries).expect("fill prehashed entries");
+
+            assert_eq!(dict_ref(dict).expect("dict ref").entries.len(), 2);
+            assert_eq!(dict_get(dict, str_object("a")).expect("lookup by fresh 'a'"), Some(value_3));
+            assert_eq!(dict_get(dict, str_object("b")).expect("lookup by fresh 'b'"), Some(value_2));
+            assert_eq!(dict_get(dict, str_object("c")).expect("lookup by absent 'c'"), None);
+        }
+    }
+
+    #[test]
+    fn dict_prehash_collect_rejects_unhashable_key_with_wrapped_message() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+
+            let list_key = pon_build_list(core::ptr::null_mut(), 0);
+            assert!(!list_key.is_null());
+            let value = pon_const_int(1);
+
+            let mut entries: Vec<DictEntry> = Vec::new();
+            let message = collect_prehashed_entry(&mut entries, list_key, value).expect_err("list keys are unhashable");
+
+            assert!(message.starts_with("cannot use '"), "got: {message}");
+            assert!(message.contains("unhashable type"), "got: {message}");
+            assert!(message.contains("as a dict key"), "got: {message}");
+            assert!(entries.is_empty(), "failed collect must not leave partial entries");
         }
     }
 }
