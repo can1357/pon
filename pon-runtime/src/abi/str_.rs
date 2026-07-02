@@ -540,7 +540,7 @@ unsafe extern "C" fn memoryview_subscript_slot(object: *mut PyObject, key: *mut 
 unsafe extern "C" fn memoryview_ass_item_slot(object: *mut PyObject, index: isize, value: *mut PyObject) -> c_int {
     match expect_byte(value).and_then(|byte| memoryview_set_index(object, index, byte)) {
         Ok(()) => 0,
-        Err(message) => super::return_minus_one_with_error(message),
+        Err(message) => memoryview_write_error_status(message),
     }
 }
 
@@ -552,10 +552,21 @@ unsafe extern "C" fn memoryview_ass_subscript_slot(object: *mut PyObject, key: *
         };
         match memoryview_assign_slice(object, key, &replacement) {
             Ok(()) => 0,
-            Err(message) => super::return_minus_one_with_error(message),
+            Err(message) => memoryview_write_error_status(message),
         }
     } else {
         unsafe { memoryview_ass_item_slot(object, match str_index_value(key) { Ok(index) => index, Err(message) => return super::return_minus_one_with_error(message) }, value) }
+    }
+}
+
+fn memoryview_write_error_status(message: String) -> c_int {
+    if message == memoryview_type::READONLY_WRITE_ERROR {
+        unsafe {
+            super::exc::pon_raise_type_error(message.as_ptr(), message.len());
+        }
+        -1
+    } else {
+        super::return_minus_one_with_error(message)
     }
 }
 

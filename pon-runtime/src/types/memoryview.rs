@@ -11,6 +11,8 @@ use std::sync::LazyLock;
 use crate::object::{PyObject, PyObjectHeader, PyType};
 use crate::types::{bytearray_, bytes_};
 
+pub const READONLY_WRITE_ERROR: &str = "cannot modify read-only memory";
+
 /// Boxed Python `memoryview` over a contiguous byte window.
 #[repr(C)]
 #[derive(Debug)]
@@ -48,7 +50,7 @@ impl PyMemoryView {
     /// The exporter must be mutable, unique for the duration of the borrow, and cover `len` bytes.
     pub unsafe fn as_mut_slice(&mut self) -> Result<&mut [u8], String> {
         if self.readonly {
-            return Err("cannot modify read-only memory".to_owned());
+            return Err(READONLY_WRITE_ERROR.to_owned());
         }
         if self.data.is_null() && self.len != 0 {
             return Err("memoryview data pointer is null".to_owned());
