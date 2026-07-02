@@ -177,3 +177,4 @@ pon-conformance/corpus/cpython/open_kwargs.py
 pon-conformance/corpus/cpython/exception_ctor_kwargs.py
 pon-conformance/corpus/cpython/sysconfig_build_config.py
 pon-conformance/corpus/cpython/async_comprehensions.py
+pon-conformance/corpus/cpython/float_format_impl.py
