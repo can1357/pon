@@ -82,6 +82,29 @@ pub type TierUpRootHook = unsafe extern "C" fn(TierUpRootVisit, *mut c_void);
 
 static TIERUP_HOOK: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 static TIERUP_ROOT_HOOK: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+/// Identity anchor for the Python-visible `object.__new__` staticmethod
+/// descriptor: `call_type_from_argv` must keep taking the default `tp_new`
+/// slot path when the only `__new__` in a class's MRO is object's generic
+/// allocator (builtin containers rely on their slot allocators).
+static OBJECT_DUNDER_NEW_DESCRIPTOR: AtomicPtr<PyObject> = AtomicPtr::new(ptr::null_mut());
+/// Identity anchor for the permissive `object.__init__` carrier: keyword
+/// call sites treat it as "no `__init__` defined" (CPython raises
+/// `C() takes no arguments`; the no-op would silently swallow keywords).
+static OBJECT_DUNDER_INIT_CARRIER: AtomicPtr<PyObject> = AtomicPtr::new(ptr::null_mut());
+/// Identity anchors for object's default `__repr__`/`__str__` carriers:
+/// Python-level dispatch (`builtins_mod::try_repr_text`/`try_str_text`)
+/// treats a hook that resolves to these as "no user override" and keeps the
+/// native fallback text instead of re-entering the terminus.
+static OBJECT_DUNDER_REPR_CARRIER: AtomicPtr<PyObject> = AtomicPtr::new(ptr::null_mut());
+static OBJECT_DUNDER_STR_CARRIER: AtomicPtr<PyObject> = AtomicPtr::new(ptr::null_mut());
+
+pub(crate) fn object_dunder_repr_carrier() -> *mut PyObject {
+    OBJECT_DUNDER_REPR_CARRIER.load(Ordering::Acquire)
+}
+
+pub(crate) fn object_dunder_str_carrier() -> *mut PyObject {
+    OBJECT_DUNDER_STR_CARRIER.load(Ordering::Acquire)
+}
 
 const DEOPT_THRASH_THRESHOLD: u32 = 64;
 const DEOPT_BACKOFF_MAX_SHIFT: u32 = 6;
@@ -99,9 +122,10 @@ thread_local! {
 }
 // ─── J0.3 GlobalIC guard: process-wide namespace version ────────────────────
 //
-// `pon_load_global` resolves through TWO layered stores (the executing
-// module's `PyModuleObject.attrs`, then the flat `Runtime.globals` map that
-// also holds builtins), neither of which is a versioned dict object yet.
+// `pon_load_global` resolves through layered stores (the defining module's
+// `PyModuleObject.attrs`, then the active module's, then the flat
+// `Runtime.globals` map holding ONLY builtins — module-scope stores never
+// write it), none of which is a versioned dict object yet.
 // Until N4 lands the real module-dict representation (J0.3 §5), GlobalIC
 // guards on ONE process-wide counter that is bumped by
 //   1. every mutation of either store (insert/replace/delete), and
@@ -917,13 +941,13 @@ pub static HELPERS: &[HelperDecl] = &[
         symbol: "pon_unpack_seq",
         address: seq::pon_unpack_seq as *const (),
         params: PARAMS_UNPACK_SEQ,
-        ret: AbiTy::PyObjectPtrPtr,
+        ret: AbiTy::PyObjectPtr,
     },
     HelperDecl {
         symbol: "pon_unpack_ex",
         address: seq::pon_unpack_ex as *const (),
         params: PARAMS_UNPACK_EX,
-        ret: AbiTy::PyObjectPtrPtr,
+        ret: AbiTy::PyObjectPtr,
     },
     HelperDecl {
         symbol: "pon_build_map",
@@ -1487,7 +1511,16 @@ pub(crate) struct Runtime {
     not_implemented: *mut PyNone,
     globals: HashMap<u32, *mut PyObject>,
     ellipsis: *mut PyNone,
-    class_namespace_stack: Vec<*mut type_::PyClassDict>,
+    class_namespace_stack: Vec<ClassBodyFrame>,
+}
+
+/// One active class-body scope.  `mapping` is the `__prepare__`-provided
+/// namespace whose `__setitem__`/`__getitem__` the body's name operations
+/// route through; NULL selects the plain `PyClassDict` fast path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ClassBodyFrame {
+    namespace: *mut type_::PyClassDict,
+    mapping: *mut PyObject,
 }
 
 unsafe impl Send for Runtime {}
@@ -1566,6 +1599,7 @@ fn init_runtime() -> Result<(), String> {
             let mut function_type = Box::new(PyType::new(type_type, "function", mem::size_of::<PyFunction>()));
             function_type.tp_descr_get = Some(function::function_descr_get);
             function_type.tp_getattro = Some(function::function_getattro);
+            function_type.tp_setattro = Some(function::function_setattro);
             unsafe { function::install_function_type_attrs(function_type.as_mut(), type_type) };
             let function_type = Box::into_raw(function_type);
             let none_type = Box::into_raw(Box::new(PyType::new(type_type, "NoneType", mem::size_of::<PyNone>())));
@@ -1673,7 +1707,7 @@ fn register_gc_types(heap: &Heap) {
         TYPE_ID_FUNCTION,
         GcTypeInfo {
             size: mem::size_of::<PyFunction>(),
-            trace: trace_no_refs,
+            trace: trace_function,
             finalize: Some(finalize_function),
         },
     );
@@ -1726,6 +1760,14 @@ fn register_gc_types(heap: &Heap) {
         },
     );
     heap.register_type(
+        type_::TYPE_ID_PAYLOAD_SUBCLASS_INSTANCE,
+        GcTypeInfo {
+            size: mem::size_of::<type_::PyPayloadSubclassInstance>(),
+            trace: type_::trace_payload_subclass_instance,
+            finalize: Some(type_::finalize_payload_subclass_instance),
+        },
+    );
+    heap.register_type(
         crate::types::weakref::TYPE_ID_WEAKREF,
         GcTypeInfo {
             size: mem::size_of::<crate::types::weakref::PyWeakRef>(),
@@ -1758,6 +1800,21 @@ unsafe extern "C" fn finalize_unicode(object: *mut u8) {
     }
 }
 
+unsafe extern "C" fn trace_function(object: *mut u8, visitor: &mut dyn FnMut(*mut u8)) {
+    if object.is_null() {
+        return;
+    }
+    // SAFETY: The GC calls this only for live allocations registered as PyFunction.
+    let function = unsafe { &*object.cast::<PyFunction>() };
+    if !function.attr_dict.is_null() {
+        visitor(function.attr_dict.cast::<u8>());
+    }
+    if !function.annotations.is_null() {
+        visitor(function.annotations.cast::<u8>());
+    }
+    crate::types::function::visit_function_gc_refs(object.cast::<PyObject>(), visitor);
+}
+
 unsafe extern "C" fn finalize_function(object: *mut u8) {
     if object.is_null() {
         return;
@@ -1766,6 +1823,7 @@ unsafe extern "C" fn finalize_function(object: *mut u8) {
     crate::types::weakref::clear_weakrefs(object.cast::<PyObject>());
     let function = object.cast::<PyFunction>();
     function::unregister_function_record(function.cast::<PyObject>());
+    function::clear_function_module(function.cast::<PyObject>());
     // SAFETY: The GC calls this only for unreachable PyFunction allocations, so
     // no compiled code can concurrently read these interior-mutable owners.
     unsafe {
@@ -1824,7 +1882,24 @@ fn register_builtin_type_globals(runtime: &mut Runtime) {
             (*union_type).tp_base = object_type;
         }
         install_builtin_type(runtime, "object", object_type, Some(builtin_object_new), object_type);
+        // PEP 3119 default: `object.__subclasshook__` returns NotImplemented
+        // so ABC `__subclasscheck__` falls through to MRO/registry checks.
+        install_object_subclasshook(runtime, object_type);
+        // Default `__repr__`/`__str__`/`__format__`/`__reduce_ex__` surface
+        // (MRO terminus identity anchors for class machinery like enum).
+        install_object_dunders(runtime, object_type);
         install_builtin_type(runtime, "type", runtime._type_type, Some(builtin_type_new), object_type);
+        // Python-visible `type.__new__` staticmethod: metaclass `__new__`
+        // overrides terminate here via `super().__new__(mcls, ...)`.
+        install_type_dunder_new(runtime);
+        install_type_dunder_prepare(runtime);
+        // Default `__instancecheck__`/`__subclasscheck__` terminus for
+        // metaclass overrides that delegate via `super()`.
+        install_type_check_dunders(runtime);
+        // `None.__new__` and friends: NoneType gets real attribute lookup
+        // over `object`, with `__new__` aliased to object's carrier so the
+        // identity checks in enum's `_find_new_` hold.
+        install_none_attribute_support(runtime, object_type);
         install_builtin_type(runtime, "int", runtime.long_type, Some(builtin_int_new), object_type);
         install_builtin_type(runtime, "str", runtime.unicode_type, Some(builtin_str_new), object_type);
 
@@ -1894,7 +1969,416 @@ fn register_builtin_type_globals(runtime: &mut Runtime) {
             Some(builtin_frozenset_new),
             object_type,
         );
+        // Real `__new__`/`__repr__` (+`__str__`) entries for the data types
+        // enum mixes with; must run after the int/str globals exist.
+        install_data_type_dunders(runtime);
     }
+}
+
+fn install_type_dunder_new(runtime: &mut Runtime) {
+    let name = crate::intern::intern("__new__");
+    let Ok(function) = alloc_function(
+        runtime,
+        type_::type_dunder_new as *const u8,
+        crate::builtins::variadic_arity(),
+        name,
+    ) else {
+        return;
+    };
+    // A staticmethod carrier keeps `super().__new__` and `cls.__new__`
+    // lookups from binding the receiver (CPython: `__new__` is implicitly
+    // static).
+    let descriptor = unsafe { classmethod::new_staticmethod(staticmethod_builtin_type(), function) };
+    if descriptor.is_null() {
+        return;
+    }
+    unsafe {
+        let type_type = runtime._type_type;
+        let mut dict = (*type_type).tp_dict.cast::<type_::PyClassDict>();
+        if dict.is_null() {
+            dict = type_::new_namespace();
+            (*type_type).tp_dict = dict.cast::<PyObject>();
+        }
+        (&mut *dict).set(name, descriptor.cast::<PyObject>());
+        crate::sync::register_namespaced_type(type_type);
+    }
+}
+
+/// `type.__prepare__(name, bases, **kwds)` — ignores its arguments and
+/// returns a fresh empty dict (CPython parity; installed as a classmethod).
+unsafe extern "C" fn type_dunder_prepare_native(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+    unsafe { map::pon_build_map(ptr::null_mut(), 0) }
+}
+
+fn install_type_dunder_prepare(runtime: &mut Runtime) {
+    let name = crate::intern::intern("__prepare__");
+    let Ok(function) = alloc_function(
+        runtime,
+        type_dunder_prepare_native as *const u8,
+        crate::builtins::variadic_arity(),
+        name,
+    ) else {
+        return;
+    };
+    let descriptor = unsafe { classmethod::new_classmethod(classmethod_builtin_type(), function) };
+    if descriptor.is_null() {
+        return;
+    }
+    unsafe {
+        let type_type = runtime._type_type;
+        let mut dict = (*type_type).tp_dict.cast::<type_::PyClassDict>();
+        if dict.is_null() {
+            dict = type_::new_namespace();
+            (*type_type).tp_dict = dict.cast::<PyObject>();
+        }
+        (&mut *dict).set(name, descriptor.cast::<PyObject>());
+        crate::sync::register_namespaced_type(type_type);
+    }
+}
+
+/// `tp_getattro` for `None`: MRO-only lookup with descriptor binding.  No
+/// instance dict — `PyNone` is header-only, so the generic heap-instance
+/// resolver must not be installed here (its `PyHeapInstance` dict cast would
+/// read past the allocation).
+unsafe extern "C" fn none_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name_text) = (unsafe { type_::unicode_text(name) }) else {
+        return return_null_with_error("attribute name must be str");
+    };
+    let name_id = crate::intern::intern(name_text);
+    let ty = unsafe { (*object).ob_type.cast_mut() };
+    let descr = unsafe { crate::descr::lookup_in_type(ty, name_id) };
+    if descr.is_null() {
+        return unsafe { pon_raise_attribute_error(object, name_id) };
+    }
+    unsafe { crate::descr::descriptor_get(descr, object, ty) }
+}
+
+/// NoneType attribute support: MRO lookups over an `object` base, with
+/// `__new__` aliased to the same staticmethod carrier `object.__new__`
+/// resolves to (CPython: `None.__new__ is object.__new__`; enum's
+/// `_find_new_` compares the two by identity).
+fn install_none_attribute_support(runtime: &mut Runtime, object_type: *mut PyType) {
+    let none_type = runtime.none_type;
+    if none_type.is_null() {
+        return;
+    }
+    unsafe {
+        (*none_type).tp_base = object_type;
+        (*none_type).tp_getattro = Some(none_getattro);
+        let object_dict = (*object_type).tp_dict.cast::<type_::PyClassDict>();
+        if !object_dict.is_null() {
+            if let Some(new_carrier) = (&*object_dict).get(crate::intern::intern("__new__")) {
+                let dict = type_::new_namespace();
+                (&mut *dict).set(crate::intern::intern("__new__"), new_carrier);
+                (*none_type).tp_dict = dict.cast::<PyObject>();
+            }
+        }
+        crate::sync::register_namespaced_type(none_type);
+    }
+}
+
+/// `type.__instancecheck__(cls, instance)` — default isinstance semantics
+/// (`type(instance)` MRO walk), the terminus for metaclass hooks that
+/// delegate via `super().__instancecheck__(instance)`.  Deliberately does
+/// NOT re-enter the metaclass hook dispatch (CPython: `type_call` slot
+/// wrapper calls `recursive_isinstance`).
+unsafe extern "C" fn type_dunder_instancecheck_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 2 {
+        const MESSAGE: &str = "__instancecheck__() takes exactly one argument";
+        return unsafe { exc::pon_raise_type_error(MESSAGE.as_ptr(), MESSAGE.len()) };
+    }
+    let cls = unsafe { *argv };
+    let instance = unsafe { *argv.add(1) };
+    if !unsafe { crate::types::type_::is_type_object(cls) } {
+        const MESSAGE: &str = "isinstance() arg 2 must be a class";
+        return unsafe { exc::pon_raise_type_error(MESSAGE.as_ptr(), MESSAGE.len()) };
+    }
+    let ty = if instance.is_null() { ptr::null_mut() } else { unsafe { (*instance).ob_type }.cast_mut() };
+    let ok = !ty.is_null() && unsafe { crate::mro::is_subtype(ty, cls.cast::<PyType>()) };
+    unsafe { number::pon_const_bool(i32::from(ok)) }
+}
+
+/// `type.__subclasscheck__(cls, subclass)` — default issubclass semantics
+/// (MRO walk), the terminus for `super().__subclasscheck__(subclass)`.
+unsafe extern "C" fn type_dunder_subclasscheck_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 2 {
+        const MESSAGE: &str = "__subclasscheck__() takes exactly one argument";
+        return unsafe { exc::pon_raise_type_error(MESSAGE.as_ptr(), MESSAGE.len()) };
+    }
+    let cls = unsafe { *argv };
+    let subclass = unsafe { *argv.add(1) };
+    if unsafe { !crate::types::type_::is_type_object(cls) || !crate::types::type_::is_type_object(subclass) } {
+        const MESSAGE: &str = "issubclass() arguments must be classes";
+        return unsafe { exc::pon_raise_type_error(MESSAGE.as_ptr(), MESSAGE.len()) };
+    }
+    let ok = unsafe { crate::mro::is_subtype(subclass.cast::<PyType>(), cls.cast::<PyType>()) };
+    unsafe { number::pon_const_bool(i32::from(ok)) }
+}
+
+/// Installs `type.__instancecheck__` / `type.__subclasscheck__` as plain
+/// methods in the builtin `type`'s dict so metaclass overrides can delegate
+/// through `super()` (CPython exposes them as slot wrappers on `type`).
+/// Hook dispatch is unaffected: `metaclass_check_hook` stops strictly below
+/// the builtin `type`, so these natives never detour plain isinstance().
+fn install_type_check_dunders(runtime: &mut Runtime) {
+    for (name, entry) in [
+        ("__instancecheck__", type_dunder_instancecheck_native as unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject),
+        ("__subclasscheck__", type_dunder_subclasscheck_native as unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject),
+    ] {
+        let name = crate::intern::intern(name);
+        let Ok(function) = alloc_function(runtime, entry as *const u8, 2, name) else {
+            continue;
+        };
+        unsafe {
+            let type_type = runtime._type_type;
+            let mut dict = (*type_type).tp_dict.cast::<type_::PyClassDict>();
+            if dict.is_null() {
+                dict = type_::new_namespace();
+                (*type_type).tp_dict = dict.cast::<PyObject>();
+            }
+            (&mut *dict).set(name, function);
+            crate::sync::register_namespaced_type(type_type);
+        }
+    }
+}
+
+unsafe extern "C" fn object_subclasshook_native(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+    with_runtime(|runtime| as_object_ptr(runtime.not_implemented)).unwrap_or(ptr::null_mut())
+}
+
+fn install_object_subclasshook(runtime: &mut Runtime, object_type: *mut PyType) {
+    let name = crate::intern::intern("__subclasshook__");
+    let Ok(function) = alloc_function(
+        runtime,
+        object_subclasshook_native as *const u8,
+        crate::builtins::variadic_arity(),
+        name,
+    ) else {
+        return;
+    };
+    let descriptor = unsafe { classmethod::new_classmethod(classmethod_builtin_type(), function) };
+    if descriptor.is_null() {
+        return;
+    }
+    unsafe {
+        let mut dict = (*object_type).tp_dict.cast::<type_::PyClassDict>();
+        if dict.is_null() {
+            dict = type_::new_namespace();
+            (*object_type).tp_dict = dict.cast::<PyObject>();
+        }
+        (&mut *dict).set(name, descriptor.cast::<PyObject>());
+        crate::sync::register_namespaced_type(object_type);
+    }
+}
+
+unsafe fn native_receiver_arg(argv: *mut *mut PyObject, argc: usize, name: &str) -> Result<*mut PyObject, *mut PyObject> {
+    if argc == 0 || argv.is_null() {
+        return Err(return_null_with_error(format!("object.{name}() requires a receiver")));
+    }
+    Ok(unsafe { *argv })
+}
+
+/// `object.__repr__(self)` — the native default repr (MRO terminus).
+unsafe extern "C" fn object_dunder_repr_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let receiver = match unsafe { native_receiver_arg(argv, argc, "__repr__") } {
+        Ok(receiver) => receiver,
+        Err(error) => return error,
+    };
+    // The MRO terminus stays dispatch-free: `try_repr_text` resolves user
+    // hooks before ever landing here.
+    let text = match crate::native::builtins_mod::repr_text_no_dispatch(receiver) {
+        Ok(text) => text,
+        Err(()) => return ptr::null_mut(),
+    };
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+/// `object.__str__(self)` — defaults to repr, matching CPython.
+unsafe extern "C" fn object_dunder_str_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let receiver = match unsafe { native_receiver_arg(argv, argc, "__str__") } {
+        Ok(receiver) => receiver,
+        Err(error) => return error,
+    };
+    // CPython `object.__str__` delegates to `repr(self)` — WITH `__repr__`
+    // dispatch (a class overriding only `__repr__` strs through it).
+    let text = match crate::native::builtins_mod::try_repr_text(receiver) {
+        Ok(text) => text,
+        Err(()) => return ptr::null_mut(),
+    };
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+/// `object.__format__(self, spec)` — empty spec means `str(self)`, anything
+/// else is a TypeError (CPython parity).  Deliberately does NOT delegate to
+/// the spec formatter, which dispatches back through `__format__`.
+unsafe extern "C" fn object_dunder_format_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let receiver = match unsafe { native_receiver_arg(argv, argc, "__format__") } {
+        Ok(receiver) => receiver,
+        Err(error) => return error,
+    };
+    let spec = if argc >= 2 {
+        let spec_object = unsafe { *argv.add(1) };
+        match unsafe { type_::unicode_text(spec_object) } {
+            Some(text) => text.to_owned(),
+            None => return return_null_with_error("__format__() argument must be str"),
+        }
+    } else {
+        String::new()
+    };
+    if !spec.is_empty() {
+        let message = format!(
+            "unsupported format string passed to {}.__format__",
+            unsafe { object_type_name_for_error(receiver) },
+        );
+        return unsafe { exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    let text = match crate::native::builtins_mod::try_str_text(receiver) {
+        Ok(text) => text,
+        Err(()) => return ptr::null_mut(),
+    };
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+/// `object.__reduce_ex__(self, protocol)` — placeholder terminus so class
+/// machinery (enum) can identity-compare and reassign it; pickling itself is
+/// not implemented.
+unsafe extern "C" fn object_dunder_reduce_ex_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let receiver = match unsafe { native_receiver_arg(argv, argc, "__reduce_ex__") } {
+        Ok(receiver) => receiver,
+        Err(error) => return error,
+    };
+    let message = format!("cannot pickle '{}' object", unsafe { object_type_name_for_error(receiver) });
+    unsafe { exc::pon_raise_type_error(message.as_ptr(), message.len()) }
+}
+
+unsafe fn object_type_name_for_error(object: *mut PyObject) -> &'static str {
+    if object.is_null() {
+        return "object";
+    }
+    let ty = unsafe { (*object).ob_type };
+    if ty.is_null() { "object" } else { unsafe { (*ty).name() } }
+}
+
+/// Default dunder surface on `object`'s dict: `__repr__`/`__str__`/
+/// `__format__`/`__reduce_ex__`/`__init__` as plain functions (unbound on
+/// class access, bound on instance access), plus a staticmethod-wrapped
+/// `__new__` allocator, the MRO terminus class machinery like enum's
+/// `EnumType.__new__`/`_find_new_` identity-compares against.
+fn install_object_dunders(runtime: &mut Runtime, object_type: *mut PyType) {
+    let entries: [(&str, *const u8); 5] = [
+        ("__repr__", object_dunder_repr_native as *const u8),
+        ("__str__", object_dunder_str_native as *const u8),
+        ("__format__", object_dunder_format_native as *const u8),
+        ("__reduce_ex__", object_dunder_reduce_ex_native as *const u8),
+        ("__init__", object_dunder_init_native as *const u8),
+    ];
+    for (spelling, entry) in entries {
+        let name = crate::intern::intern(spelling);
+        let Ok(function) = alloc_function(runtime, entry, crate::builtins::variadic_arity(), name) else {
+            continue;
+        };
+        unsafe {
+            let mut dict = (*object_type).tp_dict.cast::<type_::PyClassDict>();
+            if dict.is_null() {
+                dict = type_::new_namespace();
+                (*object_type).tp_dict = dict.cast::<PyObject>();
+            }
+            (&mut *dict).set(name, function.cast::<PyObject>());
+        }
+        match spelling {
+            "__init__" => OBJECT_DUNDER_INIT_CARRIER.store(function.cast::<PyObject>(), Ordering::Release),
+            "__repr__" => OBJECT_DUNDER_REPR_CARRIER.store(function.cast::<PyObject>(), Ordering::Release),
+            "__str__" => OBJECT_DUNDER_STR_CARRIER.store(function.cast::<PyObject>(), Ordering::Release),
+            _ => {}
+        }
+    }
+    // `object.__new__` is a staticmethod carrier like `type.__new__`/
+    // `int.__new__` (CPython: `__new__` is implicitly static), so class and
+    // instance lookups return the identical unbound carrier.
+    let new_name = crate::intern::intern("__new__");
+    if let Ok(function) =
+        alloc_function(runtime, object_dunder_new_native as *const u8, crate::builtins::variadic_arity(), new_name)
+    {
+        let descriptor = unsafe { classmethod::new_staticmethod(staticmethod_builtin_type(), function) };
+        if !descriptor.is_null() {
+            unsafe {
+                let mut dict = (*object_type).tp_dict.cast::<type_::PyClassDict>();
+                if dict.is_null() {
+                    dict = type_::new_namespace();
+                    (*object_type).tp_dict = dict.cast::<PyObject>();
+                }
+                (&mut *dict).set(new_name, descriptor.cast::<PyObject>());
+            }
+            OBJECT_DUNDER_NEW_DESCRIPTOR.store(descriptor.cast::<PyObject>(), Ordering::Release);
+        }
+    }
+    crate::sync::register_namespaced_type(object_type);
+}
+
+/// `object.__init__(self, *args)` — the MRO terminus.  Excess arguments are
+/// tolerated exactly when the receiver's class overrides `__new__` (CPython
+/// `object_init`; enum's member `__init__(*args)` path).  A receiver whose
+/// class leaves `__new__` at object's generic allocator raises the CPython
+/// TypeError instead of silently swallowing the arguments.
+unsafe extern "C" fn object_dunder_init_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc == 0 || argv.is_null() {
+        return return_null_with_error("object.__init__() requires a receiver");
+    }
+    if argc > 1 {
+        let receiver = unsafe { *argv };
+        // Tagged immediates carry no dereferenceable type; their classes
+        // (int, bool, float) all override `__new__`, so tolerate.
+        if !receiver.is_null() && crate::tag::is_heap(receiver) {
+            let ty = unsafe { (*receiver).ob_type.cast_mut() };
+            // Only heap-instance classes are probed: builtin-layout receivers
+            // (list/tuple/dict instances) reach here through native
+            // constructors whose INSTANCE type object is distinct from the
+            // global constructor type (no tp_new/tp_base on it), and their
+            // builtin classes always override `__new__` in CPython terms.
+            if !ty.is_null()
+                && unsafe { (*ty).gc_type_id } == crate::types::type_::TYPE_ID_HEAP_INSTANCE.0 as usize
+                && !unsafe { type_new_is_overridden(ty) }
+            {
+                const MESSAGE: &str =
+                    "object.__init__() takes exactly one argument (the instance to initialize)";
+                return unsafe { exc::pon_raise_type_error(MESSAGE.as_ptr(), MESSAGE.len()) };
+            }
+        }
+    }
+    unsafe { pon_none() }
+}
+
+/// Whether `ty` overrides `__new__` past object's generic allocator: either a
+/// Python-level/`install_*` dict entry other than object's carrier, or a
+/// builtin constructor in the `tp_new` slot (property, list, ... override via
+/// slot only).
+unsafe fn type_new_is_overridden(ty: *mut PyType) -> bool {
+    if let Some(slot) = unsafe { (*ty).tp_new } {
+        if slot as usize != type_::type_new as *const () as usize {
+            return true;
+        }
+    }
+    let ty_new = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern("__new__")) };
+    let object_new = OBJECT_DUNDER_NEW_DESCRIPTOR.load(Ordering::Acquire);
+    !ty_new.is_null() && ty_new != object_new
+}
+
+/// `object.__new__(cls, *args)` — the generic instance allocator, exposed as
+/// a Python-visible staticmethod carrier.  Excess arguments are tolerated
+/// (CPython tolerates them whenever `__init__` is overridden — mirroring the
+/// permissive `object.__init__` above); allocation defers to the layout-aware
+/// generic `type_new` (heap, dict-subclass, and payload-subclass instances).
+unsafe extern "C" fn object_dunder_new_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc == 0 {
+        const MESSAGE: &str = "object.__new__(): not enough arguments";
+        return unsafe { exc::pon_raise_type_error(MESSAGE.as_ptr(), MESSAGE.len()) };
+    }
+    let cls = unsafe { *argv };
+    if unsafe { !type_::is_type_object(cls) } {
+        const MESSAGE: &str = "object.__new__(X): X is not a type object";
+        return unsafe { exc::pon_raise_type_error(MESSAGE.as_ptr(), MESSAGE.len()) };
+    }
+    unsafe { type_::type_new(cls.cast::<PyType>(), ptr::null_mut(), ptr::null_mut()) }
 }
 
 unsafe fn install_builtin_type(
@@ -1975,8 +2459,153 @@ fn builtin_constructor_for_name(name: &str) -> Option<BuiltinConstructor> {
     match name {
         "enumerate" => Some(crate::native::builtins_mod::builtin_enumerate),
         "zip" => Some(crate::native::builtins_batch::builtin_zip),
+        "complex" => Some(crate::native::builtins_mod::builtin_complex),
+        // `type(name, bases, ns, **kwds)`: class keywords ride to the
+        // metaclass constructor through the phase-A binder's trailing marker.
+        "type" => Some(crate::native::builtins_mod::builtin_type),
+        // `property(fget=None, fset=None, fdel=None, doc=None)`: the binder
+        // flattens keywords into the four positional slots (None = absent).
+        "property" => Some(crate::native::builtins_mod::builtin_property),
         _ => None,
     }
+}
+
+/// Instantiates a class callee whose call site carries keyword arguments:
+/// the keyword-aware sibling of `call_type_from_argv`.  A Python-level
+/// `__new__` receives the keywords through the function binder; the
+/// `__init__` leg binds them the same way.  Keywords reaching a slot-only
+/// constructor are an error (CPython: `list(x=1)` raises TypeError).
+pub(super) unsafe fn call_type_with_keywords(
+    callee: *mut PyObject,
+    args: &[*mut PyObject],
+    keywords: function::KeywordArgs<'_>,
+) -> *mut PyObject {
+    let cls = callee.cast::<PyType>();
+    // Exception constructors are keyword-free (CPython BaseException.__new__
+    // rejects them); the positional path routes them through the dedicated
+    // exception builder, so refuse here rather than mis-allocating.
+    let is_exception_type = with_runtime(|runtime| unsafe {
+        is_exception_subclass(cls.cast_const(), runtime.exception_types.base_exception.cast_const())
+    })
+    .unwrap_or(false);
+    if is_exception_type {
+        let name = unsafe { (*cls).name() };
+        return return_null_with_error(format!("{name}() takes no keyword arguments"));
+    }
+    let user_new = unsafe { crate::descr::lookup_in_type(cls, crate::intern::intern("__new__")) };
+    let object_new = OBJECT_DUNDER_NEW_DESCRIPTOR.load(Ordering::Acquire);
+    let instance = if user_new.is_null() || user_new == object_new {
+        let new = unsafe { (*cls).tp_new.unwrap_or(type_::type_new) };
+        let args_object = if args.is_empty() {
+            ptr::null_mut()
+        } else {
+            match with_runtime(|runtime| seq::alloc_tuple_from_slice(runtime, args)) {
+                Some(Ok(tuple)) => tuple,
+                Some(Err(message)) => return return_null_with_error(message),
+                None => return return_null_with_error("runtime is not initialized"),
+            }
+        };
+        // Slot constructors receive the keywords as a real dict (CPython
+        // `tp_new(cls, args, kwds)`); most reject non-NULL kwargs with their
+        // own TypeError, which is the honest failure.
+        let kwargs_object = match unsafe { keywords_as_dict(keywords) } {
+            Ok(kwargs) => kwargs,
+            Err(message) => return return_null_with_error(message),
+        };
+        let instance = unsafe { new(cls, args_object, kwargs_object) };
+        if instance.is_null() {
+            return ptr::null_mut();
+        }
+        instance
+    } else {
+        let callable = unsafe { crate::descr::descriptor_get(user_new, ptr::null_mut(), cls) };
+        if callable.is_null() {
+            return ptr::null_mut();
+        }
+        let mut new_argv = Vec::with_capacity(args.len().saturating_add(1));
+        new_argv.push(callee);
+        new_argv.extend_from_slice(args);
+        let instance = if function::function_record(callable).is_some() {
+            unsafe { call_phase_b_function(callable, &new_argv, keywords, None, None) }
+        } else {
+            match unsafe { function::call_bound_function(callable, &new_argv, keywords, None, None) } {
+                Ok(result) => result,
+                Err(message) => return return_null_with_error(message),
+            }
+        };
+        if instance.is_null() {
+            return ptr::null_mut();
+        }
+        // `__init__` only runs when `__new__` produced an instance of `cls`.
+        let instance_type = unsafe { (*instance).ob_type.cast_mut() };
+        if instance_type.is_null() || unsafe { !crate::mro::is_subtype(instance_type, cls) } {
+            return instance;
+        }
+        instance
+    };
+
+    let new_overridden =
+        !(user_new.is_null() || user_new == object_new) || unsafe { type_new_is_overridden(cls) };
+    let init = unsafe { crate::descr::lookup_in_type(cls, crate::intern::intern("__init__")) };
+    if init == OBJECT_DUNDER_INIT_CARRIER.load(Ordering::Acquire) {
+        // The permissive terminus is not a user override.  With `__new__`
+        // overridden CPython's `object.__init__` ignores the arguments — the
+        // instance is complete; without it the keywords have nowhere to go.
+        if !new_overridden {
+            let name = unsafe { (*cls).name() };
+            return return_null_with_error(format!("{name}() takes no keyword arguments"));
+        }
+        return instance;
+    }
+    if !init.is_null() {
+        let mut positional = Vec::with_capacity(args.len().saturating_add(1));
+        positional.push(instance);
+        positional.extend_from_slice(args);
+        let result = if function::function_record(init).is_some() {
+            unsafe { call_phase_b_function(init, &positional, keywords, None, None) }
+        } else {
+            match unsafe { function::call_bound_function(init, &positional, keywords, None, None) } {
+                Ok(result) => result,
+                Err(message) => return return_null_with_error(message),
+            }
+        };
+        if result.is_null() {
+            return ptr::null_mut();
+        }
+    } else if !keywords.names.is_empty() {
+        let name = unsafe { (*cls).name() };
+        return return_null_with_error(format!("{name}() takes no keyword arguments"));
+    } else if let Some(init_slot) = unsafe { (*cls).tp_init } {
+        if unsafe { init_slot(instance, ptr::null_mut(), ptr::null_mut()) } < 0 {
+            return ptr::null_mut();
+        }
+    }
+    instance
+}
+
+/// Materializes binder keywords as a Python dict for CPython-style
+/// `tp_new(cls, args, kwds)` slots.  Empty keywords stay NULL.
+unsafe fn keywords_as_dict(keywords: function::KeywordArgs<'_>) -> Result<*mut PyObject, String> {
+    if keywords.names.is_empty() {
+        return Ok(ptr::null_mut());
+    }
+    let mut pairs = Vec::with_capacity(keywords.names.len() * 2);
+    for (&name, &value) in keywords.names.iter().zip(keywords.values.iter()) {
+        let Some(spelling) = crate::intern::resolve(name) else {
+            return Err(format!("keyword name id {name} is not interned"));
+        };
+        let key = unsafe { pon_const_str(spelling.as_ptr(), spelling.len()) };
+        if key.is_null() {
+            return Err("failed to allocate keyword name".to_owned());
+        }
+        pairs.push(key);
+        pairs.push(value);
+    }
+    let dict = unsafe { map::pon_build_map(pairs.as_mut_ptr(), pairs.len() / 2) };
+    if dict.is_null() {
+        return Err("failed to allocate keyword dict".to_owned());
+    }
+    Ok(dict)
 }
 
 fn classmethod_builtin_type() -> *mut PyType {
@@ -2325,6 +2954,9 @@ enum CallTarget {
     Type,
     Method,
     Slot(crate::object::CallFunc),
+    /// Instance of a class with no `tp_call`: dispatch through the type's
+    /// `__call__` descriptor (CPython `slot_tp_call`).
+    DunderCall,
 }
 
 /// Calls a boxed callable, including native builtins, heap types, and bound methods.
@@ -2354,6 +2986,8 @@ pub unsafe extern "C" fn pon_call(callee: *mut PyObject, argv: *mut *mut PyObjec
                 Ok(CallTarget::Method)
             } else if !callee.is_null() && !(*callee).ob_type.is_null() && (*(*callee).ob_type).tp_call.is_some() {
                 Ok(CallTarget::Slot((*(*callee).ob_type).tp_call.expect("checked Some")))
+            } else if !callee.is_null() && !(*callee).ob_type.is_null() {
+                Ok(CallTarget::DunderCall)
             } else {
                 Err("callee is not callable".to_owned())
             }
@@ -2382,6 +3016,20 @@ pub unsafe extern "C" fn pon_call(callee: *mut PyObject, argv: *mut *mut PyObjec
             CallTarget::Type => unsafe { call_type_from_argv(callee, argv, argc) },
             CallTarget::Method => unsafe { call_method_from_argv(callee, argv, argc) },
             CallTarget::Slot(call) => unsafe { call_slot_from_argv(callee, call, argv, argc) },
+            CallTarget::DunderCall => {
+                // SAFETY: The target selection proved `callee` and its type
+                // are non-NULL live objects.
+                let ty = unsafe { (*callee).ob_type.cast_mut() };
+                let dunder = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern(crate::intern::DUNDER_CALL)) };
+                if dunder.is_null() {
+                    return return_null_with_error("callee is not callable");
+                }
+                let bound = unsafe { crate::descr::descriptor_get(dunder, callee, ty) };
+                if bound.is_null() {
+                    return ptr::null_mut();
+                }
+                unsafe { pon_call(bound, argv, argc) }
+            }
         }
     })
 }
@@ -2751,20 +3399,48 @@ unsafe fn call_type_from_argv(callee: *mut PyObject, argv: *mut *mut PyObject, a
         };
     }
 
-    let new = unsafe { (*cls).tp_new.unwrap_or(type_::type_new) };
-    let args_object = if args.is_empty() {
-        ptr::null_mut()
-    } else {
-        match with_runtime(|runtime| seq::alloc_tuple_from_slice(runtime, args)) {
-            Some(Ok(tuple)) => tuple,
-            Some(Err(message)) => return return_null_with_error(message),
-            None => return return_null_with_error("runtime is not initialized"),
+    let user_new = unsafe { crate::descr::lookup_in_type(cls, crate::intern::intern("__new__")) };
+    // Object's generic `__new__` carrier is not a user override: keep the
+    // default `tp_new` slot path (builtin containers and exception layouts
+    // depend on their slot allocators, not the heap-instance fallback).
+    let object_new = OBJECT_DUNDER_NEW_DESCRIPTOR.load(Ordering::Acquire);
+    let instance = if user_new.is_null() || user_new == object_new {
+        let new = unsafe { (*cls).tp_new.unwrap_or(type_::type_new) };
+        let args_object = if args.is_empty() {
+            ptr::null_mut()
+        } else {
+            match with_runtime(|runtime| seq::alloc_tuple_from_slice(runtime, args)) {
+                Some(Ok(tuple)) => tuple,
+                Some(Err(message)) => return return_null_with_error(message),
+                None => return return_null_with_error("runtime is not initialized"),
+            }
+        };
+        let instance = unsafe { new(cls, args_object, ptr::null_mut()) };
+        if instance.is_null() {
+            return ptr::null_mut();
         }
+        instance
+    } else {
+        // CPython type_call: a Python-level `__new__` (implicitly static) is
+        // called unbound as `__new__(cls, *args)`.
+        let callable = unsafe { crate::descr::descriptor_get(user_new, ptr::null_mut(), cls) };
+        if callable.is_null() {
+            return ptr::null_mut();
+        }
+        let mut new_argv = Vec::with_capacity(args.len().saturating_add(1));
+        new_argv.push(callee);
+        new_argv.extend_from_slice(args);
+        let instance = unsafe { pon_call(callable, new_argv.as_mut_ptr(), new_argv.len()) };
+        if instance.is_null() {
+            return ptr::null_mut();
+        }
+        // `__init__` only runs when `__new__` produced an instance of `cls`.
+        let instance_type = unsafe { (*instance).ob_type.cast_mut() };
+        if instance_type.is_null() || unsafe { !crate::mro::is_subtype(instance_type, cls) } {
+            return instance;
+        }
+        instance
     };
-    let instance = unsafe { new(cls, args_object, ptr::null_mut()) };
-    if instance.is_null() {
-        return ptr::null_mut();
-    }
 
     let init = unsafe { crate::descr::lookup_in_type(cls, crate::intern::intern("__init__")) };
     if !init.is_null() {
@@ -2851,40 +3527,12 @@ pub unsafe extern "C" fn pon_build_class(
         let Some(name) = crate::intern::resolve(name_interned) else {
             return return_null_with_error(format!("class name id {name_interned} is not interned"));
         };
-        let namespace = type_::new_namespace();
-        if with_runtime(|runtime| runtime.class_namespace_stack.push(namespace)).is_none() {
-            return return_null_with_error("runtime is not initialized");
-        }
-        if !body.is_null() {
-            let result = unsafe { pon_call(body, ptr::null_mut(), 0) };
-            let popped = with_runtime(|runtime| runtime.class_namespace_stack.pop()).flatten();
-            if popped != Some(namespace) {
-                return return_null_with_error("class namespace stack is corrupted");
-            }
-            if result.is_null() {
-                return ptr::null_mut();
-            }
-        } else {
-            let popped = with_runtime(|runtime| runtime.class_namespace_stack.pop()).flatten();
-            if popped != Some(namespace) {
-                return return_null_with_error("class namespace stack is corrupted");
-            }
-        }
         let base_slice = if base_count == 0 {
             &[]
         } else {
             unsafe { core::slice::from_raw_parts(bases, base_count) }
         };
-        let class = unsafe { type_::build_class_from_namespace(&name, base_slice, namespace, &[]) };
-        if class.is_null() {
-            return ptr::null_mut();
-        }
-        let _ = with_runtime(|runtime| unsafe {
-            if (*class).ob_type.is_null() {
-                (*class).ob_type = runtime._type_type.cast_const();
-            }
-        });
-        class
+        unsafe { build_class_with_body(body, &name, base_slice, &[]) }
     })
 }
 
@@ -2916,25 +3564,6 @@ pub unsafe extern "C" fn pon_build_class_ex(
         let Some(name) = crate::intern::resolve(name_interned) else {
             return return_null_with_error(format!("class name id {name_interned} is not interned"));
         };
-        let namespace = type_::new_namespace();
-        if with_runtime(|runtime| runtime.class_namespace_stack.push(namespace)).is_none() {
-            return return_null_with_error("runtime is not initialized");
-        }
-        if !body.is_null() {
-            let result = unsafe { pon_call(body, ptr::null_mut(), 0) };
-            let popped = with_runtime(|runtime| runtime.class_namespace_stack.pop()).flatten();
-            if popped != Some(namespace) {
-                return return_null_with_error("class namespace stack is corrupted");
-            }
-            if result.is_null() {
-                return ptr::null_mut();
-            }
-        } else {
-            let popped = with_runtime(|runtime| runtime.class_namespace_stack.pop()).flatten();
-            if popped != Some(namespace) {
-                return return_null_with_error("class namespace stack is corrupted");
-            }
-        }
         let mut base_vec = if base_count == 0 {
             Vec::new()
         } else {
@@ -2972,17 +3601,80 @@ pub unsafe extern "C" fn pon_build_class_ex(
             .zip(values.iter().copied())
             .map(|(name, value)| type_::ClassKeyword { name, value })
             .collect::<Vec<_>>();
-        let class = unsafe { type_::build_class_from_namespace(&name, &base_vec, namespace, &keywords) };
-        if class.is_null() {
-            return ptr::null_mut();
-        }
-        let _ = with_runtime(|runtime| unsafe {
-            if (*class).ob_type.is_null() {
-                (*class).ob_type = runtime._type_type.cast_const();
-            }
-        });
-        class
+        unsafe { build_class_with_body(body, &name, &base_vec, &keywords) }
     })
+}
+
+/// Shared `__build_class__` core: runs the `__prepare__` protocol, executes
+/// the body into the prepared scope, and dispatches class construction.
+unsafe fn build_class_with_body(
+    body: *mut PyObject,
+    name: &str,
+    bases: &[*mut PyObject],
+    keywords: &[type_::ClassKeyword],
+) -> *mut PyObject {
+    let scope = match unsafe { type_::prepare_class_scope(name, bases, keywords) } {
+        Ok(scope) => scope,
+        Err(()) => return ptr::null_mut(),
+    };
+    let frame = if scope.mapping.is_null() {
+        ClassBodyFrame {
+            namespace: type_::new_namespace(),
+            mapping: ptr::null_mut(),
+        }
+    } else {
+        ClassBodyFrame {
+            namespace: ptr::null_mut(),
+            mapping: scope.mapping,
+        }
+    };
+    if with_runtime(|runtime| runtime.class_namespace_stack.push(frame)).is_none() {
+        return return_null_with_error("runtime is not initialized");
+    }
+    let body_result = if body.is_null() {
+        ptr::null_mut()
+    } else {
+        unsafe { pon_call(body, ptr::null_mut(), 0) }
+    };
+    let popped = with_runtime(|runtime| runtime.class_namespace_stack.pop()).flatten();
+    if popped != Some(frame) {
+        return return_null_with_error("class namespace stack is corrupted");
+    }
+    if !body.is_null() && body_result.is_null() {
+        return ptr::null_mut();
+    }
+    let class = if scope.mapping.is_null() {
+        unsafe { type_::build_class_from_namespace(name, &scope.bases, frame.namespace, keywords) }
+    } else {
+        unsafe { type_::build_class_from_prepared_mapping(name, &scope.bases, scope.mapping, keywords) }
+    };
+    if class.is_null() {
+        return ptr::null_mut();
+    }
+    let _ = with_runtime(|runtime| unsafe {
+        if (*class).ob_type.is_null() {
+            (*class).ob_type = runtime._type_type.cast_const();
+        }
+    });
+    class
+}
+
+/// Interned name → runtime string key for `__prepare__` mapping operations.
+unsafe fn class_mapping_key(name_interned: u32) -> *mut PyObject {
+    let Some(spelling) = resolve(name_interned) else {
+        return return_null_with_error(format!("name id {name_interned} is not interned"));
+    };
+    unsafe { pon_const_str(spelling.as_ptr(), spelling.len()) }
+}
+
+/// True when the pending exception state allows a name-lookup fallthrough:
+/// nothing pending, or a KeyError from the mapping probe (cleared).
+fn clear_mapping_miss() -> bool {
+    if exc::pending_exception_object().is_none() || exc::pending_exception_is("KeyError") {
+        pon_err_clear();
+        return true;
+    }
+    false
 }
 
 #[unsafe(no_mangle)]
@@ -2992,52 +3684,101 @@ pub unsafe extern "C" fn pon_setup_annotations() -> *mut PyObject {
             return return_null_with_error(message);
         }
         let name = crate::intern::intern("__annotations__");
-        if let Some(existing) = with_runtime(|runtime| {
-            if let Some(namespace) = runtime.class_namespace_stack.last() {
-                unsafe { (&**namespace).get(name) }
-            } else {
-                runtime.globals.get(&name).copied()
+        let Some(frame) = with_runtime(|runtime| runtime.class_namespace_stack.last().copied()) else {
+            return return_null_with_error("runtime is not initialized");
+        };
+        if let Some(frame) = frame {
+            if !frame.mapping.is_null() {
+                // `__prepare__` mapping scope: read/write through the mapping
+                // protocol so user mappings observe the annotations dict.
+                let key = unsafe { class_mapping_key(name) };
+                if key.is_null() {
+                    return ptr::null_mut();
+                }
+                let existing = unsafe { crate::abstract_op::subscript_get(frame.mapping, key) };
+                if !existing.is_null() {
+                    return existing;
+                }
+                if !clear_mapping_miss() {
+                    return ptr::null_mut();
+                }
+                let annotations = unsafe { map::pon_build_map(ptr::null_mut(), 0) };
+                if annotations.is_null() {
+                    return annotations;
+                }
+                return unsafe { map::pon_subscript_set(frame.mapping, key, annotations) };
             }
-        })
-        .flatten()
-        {
+            if let Some(existing) = unsafe { (&*frame.namespace).get(name) } {
+                return existing;
+            }
+            let annotations = unsafe { map::pon_build_map(ptr::null_mut(), 0) };
+            if annotations.is_null() {
+                return annotations;
+            }
+            unsafe {
+                (&mut *frame.namespace).set(name, annotations);
+            }
+            return annotations;
+        }
+        // Module scope: `__annotations__` is a per-module global (CPython
+        // semantics), never a flat-pool binding — the flat map is the
+        // builtins table, and a shared entry would merge every module's
+        // annotations into the first binder's dict.
+        let target_module = current_defining_module().or_else(crate::import::active_module_name_id);
+        if let Some(existing) = match target_module {
+            Some(module) => crate::import::module_attr(module, name),
+            // No module context (embedding/unit tests): flat-pool last resort.
+            None => with_runtime(|runtime| runtime.globals.get(&name).copied()).flatten(),
+        } {
             return existing;
         }
         let annotations = unsafe { map::pon_build_map(ptr::null_mut(), 0) };
         if annotations.is_null() {
             return annotations;
         }
-        match with_runtime(|runtime| {
-            if let Some(namespace) = runtime.class_namespace_stack.last().copied() {
-                unsafe {
-                    (&mut *namespace).set(name, annotations);
-                }
-                Ok(annotations)
-            } else {
-                runtime.globals.insert(name, annotations);
-                crate::import::store_active_module_attr(name, annotations);
-                // J0.3 GlobalIC site: module-level __annotations__ insert.
-                bump_namespace_version();
-                ensure_module_annotate_function(runtime).map(|()| annotations)
+        match target_module {
+            Some(module) => {
+                // Bumps the namespace version (J0.3 GlobalIC site).
+                crate::import::store_module_attr(module, name, annotations);
+                crate::dynexec::sync_global_store_for_module(module, name, annotations);
             }
-        }) {
-            Some(Ok(value)) => value,
+            None => {
+                let _ = with_runtime(|runtime| {
+                    runtime.globals.insert(name, annotations);
+                    // J0.3 GlobalIC site: context-less __annotations__ insert.
+                    bump_namespace_version();
+                });
+            }
+        }
+        match with_runtime(|runtime| ensure_module_annotate_function(runtime, target_module)) {
+            Some(Ok(())) => annotations,
             Some(Err(message)) => return_null_with_error(message),
             None => return_null_with_error("runtime is not initialized"),
         }
     })
 }
 
-fn ensure_module_annotate_function(runtime: &mut Runtime) -> Result<(), String> {
+fn ensure_module_annotate_function(runtime: &mut Runtime, target_module: Option<u32>) -> Result<(), String> {
     let name = crate::intern::intern("__annotate__");
-    if runtime.globals.contains_key(&name) {
+    let already_bound = match target_module {
+        Some(module) => crate::import::module_attr(module, name).is_some(),
+        None => runtime.globals.contains_key(&name),
+    };
+    if already_bound {
         return Ok(());
     }
     let function = alloc_function(runtime, module_annotations_annotate as *const u8, 1, name)?;
-    runtime.globals.insert(name, function);
-    crate::import::store_active_module_attr(name, function);
-    // J0.3 GlobalIC site: module __annotate__ registration.
-    bump_namespace_version();
+    match target_module {
+        Some(module) => {
+            // Bumps the namespace version (J0.3 GlobalIC site).
+            crate::import::store_module_attr(module, name, function);
+        }
+        None => {
+            runtime.globals.insert(name, function);
+            // J0.3 GlobalIC site: context-less __annotate__ registration.
+            bump_namespace_version();
+        }
+    }
     Ok(())
 }
 
@@ -3111,18 +3852,34 @@ pub unsafe extern "C" fn pon_delete_global(name_interned: u32) -> *mut PyObject 
         if let Err(message) = ensure_runtime_initialized() {
             return return_null_with_error(message);
         }
-        let removed_module_attr = crate::import::delete_active_module_attr(name_interned);
-        let removed_global = with_runtime(|runtime| {
-            let removed = runtime.globals.remove(&name_interned).is_some();
-            if removed {
-                // J0.3 GlobalIC site: flat-map delete.
-                bump_namespace_version();
+        // Defining-module scoping, mirrored from `pon_store_global`.
+        let target_module = current_defining_module().or_else(crate::import::active_module_name_id);
+        let removed = match target_module {
+            // CPython rule: `del name` unbinds the module global only.  The
+            // flat pool is the builtins table and is never touched — deleting
+            // an unbound global raises NameError even when a builtin of the
+            // same name exists, and deleting a module-local shadow re-exposes
+            // the builtin instead of evicting it process-wide.
+            // `delete_module_attr` bumps the namespace version (J0.3).
+            Some(module) => {
+                let removed = crate::import::delete_module_attr(module, name_interned);
+                if removed {
+                    crate::dynexec::sync_global_delete_for_module(module, name_interned);
+                }
+                removed
             }
-            removed
-        })
-        .unwrap_or(false);
-        if removed_module_attr || removed_global {
-            crate::dynexec::sync_global_delete_for_active_module(name_interned);
+            // No module context (embedding/unit tests): flat-pool last resort.
+            None => with_runtime(|runtime| {
+                let removed = runtime.globals.remove(&name_interned).is_some();
+                if removed {
+                    // J0.3 GlobalIC site: context-less flat-map delete.
+                    bump_namespace_version();
+                }
+                removed
+            })
+            .unwrap_or(false),
+        };
+        if removed {
             unsafe { pon_none() }
         } else {
             let name = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
@@ -3138,19 +3895,34 @@ pub unsafe extern "C" fn pon_delete_name(name_interned: u32) -> *mut PyObject {
         if let Err(message) = ensure_runtime_initialized() {
             return return_null_with_error(message);
         }
-        let class_delete = with_runtime(|runtime| {
-            runtime.class_namespace_stack.last().copied().map(|namespace| unsafe {
-                (&mut *namespace).del(name_interned)
-            })
-        });
-        match class_delete {
-            Some(Some(true)) => unsafe { pon_none() },
-            Some(Some(false)) => {
+        let Some(frame) = with_runtime(|runtime| runtime.class_namespace_stack.last().copied()) else {
+            return return_null_with_error("runtime is not initialized");
+        };
+        match frame {
+            Some(frame) if !frame.mapping.is_null() => {
+                let key = unsafe { class_mapping_key(name_interned) };
+                if key.is_null() {
+                    return ptr::null_mut();
+                }
+                let result = unsafe { crate::abstract_op::subscript_del(frame.mapping, key) };
+                if !result.is_null() {
+                    return unsafe { pon_none() };
+                }
+                if !clear_mapping_miss() {
+                    return ptr::null_mut();
+                }
                 let name = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
                 exc::raise_name_error_text(&format!("name '{name}' is not defined"))
             }
-            Some(None) => unsafe { pon_delete_global(name_interned) },
-            None => return_null_with_error("runtime is not initialized"),
+            Some(frame) => {
+                if unsafe { (&mut *frame.namespace).del(name_interned) } {
+                    unsafe { pon_none() }
+                } else {
+                    let name = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
+                    exc::raise_name_error_text(&format!("name '{name}' is not defined"))
+                }
+            }
+            None => unsafe { pon_delete_global(name_interned) },
         }
     })
 }
@@ -3181,7 +3953,11 @@ pub unsafe extern "C" fn pon_load_global(name_interned: u32, feedback: *mut Feed
         }
         // J0.3 capture discipline: version BEFORE the lookup.
         let version = namespace_version();
-        let resolved = crate::import::active_module_attr(name_interned)
+        // CPython `__globals__` scoping: the executing function's defining
+        // module wins over the caller's active module, which wins over the
+        // flat pool (builtins + cross-module last-writer fallback).
+        let resolved = defining_module_attr(name_interned)
+            .or_else(|| crate::import::active_module_attr(name_interned))
             .or_else(|| with_runtime(|runtime| runtime.globals.get(&name_interned).copied()).flatten());
         match resolved {
             Some(value) => {
@@ -3211,19 +3987,31 @@ pub unsafe extern "C" fn pon_load_name(name_interned: u32) -> *mut PyObject {
         if let Err(message) = ensure_runtime_initialized() {
             return return_null_with_error(message);
         }
-        with_runtime(|runtime| {
-            runtime
-                .class_namespace_stack
-                .last()
-                .and_then(|namespace| unsafe { (&**namespace).get(name_interned) })
-        })
-        .flatten()
-        .or_else(|| crate::import::active_module_attr(name_interned))
-        .or_else(|| with_runtime(|runtime| runtime.globals.get(&name_interned).copied()).flatten())
-        .unwrap_or_else(|| {
-            let name = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
-            exc::raise_name_error_text(&format!("name '{name}' is not defined"))
-        })
+        let frame = with_runtime(|runtime| runtime.class_namespace_stack.last().copied()).flatten();
+        if let Some(frame) = frame {
+            if !frame.mapping.is_null() {
+                let key = unsafe { class_mapping_key(name_interned) };
+                if key.is_null() {
+                    return ptr::null_mut();
+                }
+                let value = unsafe { crate::abstract_op::subscript_get(frame.mapping, key) };
+                if !value.is_null() {
+                    return value;
+                }
+                if !clear_mapping_miss() {
+                    return ptr::null_mut();
+                }
+            } else if let Some(value) = unsafe { (&*frame.namespace).get(name_interned) } {
+                return value;
+            }
+        }
+        defining_module_attr(name_interned)
+            .or_else(|| crate::import::active_module_attr(name_interned))
+            .or_else(|| with_runtime(|runtime| runtime.globals.get(&name_interned).copied()).flatten())
+            .unwrap_or_else(|| {
+                let name = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
+                exc::raise_name_error_text(&format!("name '{name}' is not defined"))
+            })
     })
 }
 
@@ -3238,6 +4026,7 @@ pub unsafe extern "C" fn pon_print(value: *mut PyObject) -> *mut PyObject {
         }
         let text = match format_object_for_print(value) {
             Ok(text) => text,
+            Err(_) if crate::thread_state::pon_err_occurred() => return ptr::null_mut(),
             Err(_) => crate::native::builtins_mod::str_text(value),
         };
         let mut stdout = io::stdout().lock();
@@ -3257,7 +4046,10 @@ pub unsafe extern "C" fn pon_make_function(code: *const u8, arity: usize, name_i
             return return_null_with_error(message);
         }
         match with_runtime(|runtime| alloc_function(runtime, code, arity, name_interned)) {
-            Some(Ok(object)) => object,
+            Some(Ok(object)) => {
+                record_new_function_module(object);
+                object
+            }
             Some(Err(message)) => return_null_with_error(message),
             None => return_null_with_error("runtime is not initialized"),
         }
@@ -3265,29 +4057,6 @@ pub unsafe extern "C" fn pon_make_function(code: *const u8, arity: usize, name_i
 }
 
 /// Stores a module-global value by interned name.
-pub(crate) fn store_flat_global_for_dynexec(name_interned: u32, value: *mut PyObject) {
-    if value.is_null() {
-        return;
-    }
-    let _ = with_runtime(|runtime| {
-        runtime.globals.insert(name_interned, value);
-        // J0.3 GlobalIC site: flat-map insert/replace through globals().
-        bump_namespace_version();
-    });
-}
-
-pub(crate) fn delete_flat_global_for_dynexec(name_interned: u32) -> bool {
-    with_runtime(|runtime| {
-        let removed = runtime.globals.remove(&name_interned).is_some();
-        if removed {
-            // J0.3 GlobalIC site: flat-map removal through globals().
-            bump_namespace_version();
-        }
-        removed
-    })
-    .unwrap_or(false)
-}
-
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_store_global(name_interned: u32, value: *mut PyObject) -> *mut PyObject {
     crate::untag_prelude!(value);
@@ -3298,18 +4067,37 @@ pub unsafe extern "C" fn pon_store_global(name_interned: u32, value: *mut PyObje
         if let Err(message) = ensure_runtime_initialized() {
             return return_null_with_error(message);
         }
-        crate::import::store_active_module_attr(name_interned, value);
-        let stored = match with_runtime(|runtime| {
-            runtime.globals.insert(name_interned, value);
-            // J0.3 GlobalIC site: flat-map insert/replace.
-            bump_namespace_version();
-            value
-        }) {
-            Some(stored) => stored,
-            None => return_null_with_error("runtime is not initialized"),
+        // CPython `__globals__` scoping, mirrored from `pon_load_global`: a
+        // `global` store made by a function body lands in its defining
+        // module's namespace, not the caller's active module.  The flat pool
+        // is NEVER written here — it is the builtins table, and a module-
+        // scope write would leak the binding process-wide (reprlib's
+        // module-level `repr = aRepr.repr` must not clobber builtin `repr`).
+        // `store_module_attr` bumps the namespace version (J0.3 GlobalIC
+        // site), so recorded ICs re-resolve after the visibility change.
+        let target_module = current_defining_module().or_else(crate::import::active_module_name_id);
+        let stored_in_module = match target_module {
+            Some(module) => crate::import::store_module_attr(module, name_interned, value),
+            None => false,
         };
-        crate::dynexec::sync_global_store_for_active_module(name_interned, value);
-        stored
+        if let Some(module) = target_module {
+            crate::dynexec::sync_global_store_for_module(module, name_interned, value);
+        }
+        if !stored_in_module {
+            // No module context (embedding/unit tests) or the defining module
+            // was dropped from the cache: the flat pool is the only remaining
+            // store that keeps the binding loadable.
+            if with_runtime(|runtime| {
+                runtime.globals.insert(name_interned, value);
+                // J0.3 GlobalIC site: context-less flat-map insert/replace.
+                bump_namespace_version();
+            })
+            .is_none()
+            {
+                return return_null_with_error("runtime is not initialized");
+            }
+        }
+        value
     })
 }
 
@@ -3324,25 +4112,27 @@ pub unsafe extern "C" fn pon_store_name(name_interned: u32, value: *mut PyObject
         if let Err(message) = ensure_runtime_initialized() {
             return return_null_with_error(message);
         }
-        let Some((stored, module_scope)) = with_runtime(|runtime| {
-            if let Some(namespace) = runtime.class_namespace_stack.last().copied() {
-                unsafe {
-                    (&mut *namespace).set(name_interned, value);
-                }
-                (value, false)
-            } else {
-                runtime.globals.insert(name_interned, value);
-                // J0.3 GlobalIC site: module-scope StoreName lands in the flat map.
-                bump_namespace_version();
-                (value, true)
-            }
-        }) else {
+        let Some(frame) = with_runtime(|runtime| runtime.class_namespace_stack.last().copied()) else {
             return return_null_with_error("runtime is not initialized");
         };
-        if module_scope {
-            crate::dynexec::sync_global_store_for_active_module(name_interned, value);
+        match frame {
+            Some(frame) if !frame.mapping.is_null() => {
+                let key = unsafe { class_mapping_key(name_interned) };
+                if key.is_null() {
+                    return ptr::null_mut();
+                }
+                // MRO-aware `__setitem__` dispatch: user mappings from
+                // `__prepare__` observe every class-body store, in order.
+                unsafe { map::pon_subscript_set(frame.mapping, key, value) }
+            }
+            Some(frame) => {
+                unsafe {
+                    (&mut *frame.namespace).set(name_interned, value);
+                }
+                value
+            }
+            None => unsafe { pon_store_global(name_interned, value) },
         }
-        stored
     })
 }
 
@@ -3389,39 +4179,47 @@ pub fn format_object_for_print(value: *mut PyObject) -> Result<String, String> {
         return Err("cannot print NULL object".to_owned());
     }
 
-    with_runtime(|runtime| {
+    let fast = with_runtime(|runtime| {
         // SAFETY: The type checks ensure exact concrete casts.
         unsafe {
             if let Some(value) = bool_::to_bool(value) {
-                return Ok(if value { "True".to_owned() } else { "False".to_owned() });
+                return Some(Ok(if value { "True".to_owned() } else { "False".to_owned() }));
             }
             if is_exact_type(value, runtime.long_type) {
-                return Ok((*value.cast::<PyLong>()).value.to_string());
+                return Some(Ok((*value.cast::<PyLong>()).value.to_string()));
             }
             if is_exact_type(value, runtime.unicode_type) {
                 let unicode = &*value.cast::<PyUnicode>();
-                return unicode
-                    .as_str()
-                    .map(ToOwned::to_owned)
-                    .ok_or_else(|| "unicode object contains invalid UTF-8".to_owned());
+                return Some(
+                    unicode
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                        .ok_or_else(|| "unicode object contains invalid UTF-8".to_owned()),
+                );
             }
             if crate::types::float::is_exact_float(value) {
                 let float = &*value.cast::<crate::types::float::PyFloat>();
-                return Ok(crate::types::float::repr_f64(float.value));
+                return Some(Ok(crate::types::float::repr_f64(float.value)));
             }
             if is_exact_type(value, runtime.none_type) {
-                return Ok("None".to_owned());
+                return Some(Ok("None".to_owned()));
             }
             if is_exact_type(value, runtime.not_implemented_type) {
-                return Ok("NotImplemented".to_owned());
+                return Some(Ok("NotImplemented".to_owned()));
             }
             if is_exact_type(value, runtime.ellipsis_type) {
-                return Ok("Ellipsis".to_owned());
+                return Some(Ok("Ellipsis".to_owned()));
             }
-            Ok(crate::native::builtins_mod::str_text(value))
+            None
         }
-    })
-    .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
+    });
+    match fast {
+        None => Err("runtime is not initialized".to_owned()),
+        Some(Some(result)) => result,
+        // `__str__` dispatch runs OUTSIDE the `with_runtime` closure: the
+        // hook is arbitrary Python and must not re-enter a held runtime.
+        Some(None) => crate::native::builtins_mod::try_str_text(value).map_err(|()| "str() raised".to_owned()),
+    }
 }
 
 struct LocalRoots {
@@ -3456,6 +4254,47 @@ fn extend_tierup_roots(roots: &mut Vec<*mut u8>) {
     unsafe { hook(push_tierup_root, (roots as *mut Vec<*mut u8>).cast::<c_void>()) };
 }
 
+/// Pushes one class-namespace value onto the root list, piercing the known
+/// malloc'd descriptor carriers (classmethod / staticmethod / property /
+/// bound method) whose wrapped GC callables marking cannot otherwise reach.
+///
+/// Tagged immediates and NULL are skipped up front; other non-GC pointers
+/// pushed here are filtered by the collector's pointer classification.
+fn push_namespace_value_roots(value: *mut PyObject, roots: &mut Vec<*mut u8>) {
+    let mut worklist = vec![value];
+    // Carrier fields are program-controlled; a pathological carrier cycle
+    // must not wedge the collector.
+    let mut budget = 64usize;
+    while let Some(object) = worklist.pop() {
+        if object.is_null() || !crate::tag::is_heap(object) {
+            continue;
+        }
+        roots.push(object.cast::<u8>());
+        budget = match budget.checked_sub(1) {
+            Some(rest) => rest,
+            None => break,
+        };
+        let ty = unsafe { (*object).ob_type.cast_mut() };
+        if ty.is_null() {
+            continue;
+        }
+        if ty == classmethod_builtin_type() {
+            worklist.push(unsafe { (*object.cast::<classmethod::PyClassMethod>()).callable });
+        } else if ty == staticmethod_builtin_type() {
+            worklist.push(unsafe { (*object.cast::<classmethod::PyStaticMethod>()).callable });
+        } else if ty == crate::native::builtins_mod::property_type() {
+            let property = unsafe { &*object.cast::<crate::types::property::PyProperty>() };
+            worklist.push(property.fget);
+            worklist.push(property.fset);
+            worklist.push(property.fdel);
+            worklist.push(property.doc);
+        } else if let Some((function, receiver)) = crate::types::method::bound_method_parts(object) {
+            worklist.push(function);
+            worklist.push(receiver);
+        }
+    }
+}
+
 /// Runs a stop-the-world collection using the runtime's current root set.
 pub fn collect() -> Result<(), String> {
     let mut slot = runtime_lock();
@@ -3471,14 +4310,33 @@ pub fn collect() -> Result<(), String> {
     for value in runtime.globals.values().copied() {
         roots.push(value.cast::<u8>());
     }
-    for namespace in runtime.class_namespace_stack.iter().copied() {
-        if namespace.is_null() {
+    for frame in runtime.class_namespace_stack.iter() {
+        // A `__prepare__` mapping is held only by this frame during body
+        // execution; root it so its storage (and transitively the body's
+        // stores) survives a mid-body collection.
+        if !frame.mapping.is_null() {
+            roots.push(frame.mapping.cast::<u8>());
+        }
+        if frame.namespace.is_null() {
             continue;
         }
-        for (_, value) in unsafe { (&*namespace).iter() } {
+        for (_, value) in unsafe { (&*frame.namespace).iter() } {
             if !value.is_null() {
                 roots.push(value.cast::<u8>());
             }
+        }
+    }
+    // Namespaced-type dict values: type objects are malloc'd boxes, so marking
+    // cannot reach the GC-managed values stored in their `PyClassDict`
+    // namespaces.  Types are immortal (leaked boxes), so rooting every
+    // registered type's dict values is exact, not conservative.
+    for ty in crate::sync::namespaced_types() {
+        let dict = unsafe { (*ty).tp_dict.cast::<type_::PyClassDict>() };
+        if dict.is_null() {
+            continue;
+        }
+        for (_, value) in unsafe { (&*dict).iter() } {
+            push_namespace_value_roots(value, &mut roots);
         }
     }
 
@@ -3535,6 +4393,21 @@ pub fn collect() -> Result<(), String> {
             roots.push(self_arg.cast::<u8>());
         }
     }
+    // Values held by native `_contextvars` state (context entries, token
+    // snapshots, constructor defaults): the holder objects are immortal
+    // leaked boxes marking cannot reach, mirroring `rooted_globals_dicts`.
+    for value in crate::native::contextvars::gc_held_roots() {
+        roots.push(value.cast::<u8>());
+    }
+    // Values held by native `_codecs` registry state (search functions,
+    // error handlers, cached CodecInfo objects), mirroring `_contextvars`.
+    for value in crate::native::codecs::gc_held_roots() {
+        roots.push(value.cast::<u8>());
+    }
+    // Entries held by native `_collections` deques, mirroring `_contextvars`.
+    for value in crate::native::collections::gc_held_roots() {
+        roots.push(value.cast::<u8>());
+    }
     extend_tierup_roots(&mut roots);
 
     let mut roots = LocalRoots { roots };
@@ -3561,6 +4434,63 @@ pub(crate) fn alloc_gc_object(type_id: TypeId, info: GcTypeInfo) -> Result<*mut 
         runtime.heap.alloc(size, type_id)
     })
     .ok_or_else(|| "runtime is not initialized".to_owned())
+}
+// ─── Defining-module scoping for function-body global loads/stores ──────────
+//
+// CPython gives every function a `__globals__` namespace: the dict of the
+// module that DEFINED it, not the module that happens to be executing when
+// it is called.  The runtime's layered global stores (active-module attrs,
+// then the flat name-keyed pool) lose that scoping, so two modules defining
+// the same top-level name (`re/__init__._compile` vs `re._compiler._compile`)
+// collide: last writer wins in the flat pool and cross-module calls bind the
+// wrong object.  These helpers recover the CPython rule: functions record
+// their defining module at creation (`types::function::FUNCTION_MODULES`),
+// and loads/stores made while a compiled function body executes scope to
+// that module first.  Every layer below stays as a fallback, so contexts
+// without a record (native wrappers, pre-init builtins, bare tests) keep the
+// pre-existing active→flat behavior.
+
+/// Depth of this thread's compiled-call stack (`CurrentFunctionGuard` pushes).
+#[must_use]
+pub(crate) fn current_function_stack_depth() -> usize {
+    CURRENT_FUNCTION_STACK.with(|stack| stack.borrow().len())
+}
+
+/// Defining module of the innermost compiled function that (a) was pushed
+/// while the innermost active module body ran — entries below that floor
+/// belong to frames suspended behind the module import and must not leak
+/// their namespace into it — and (b) carries a defining-module record.
+fn current_defining_module() -> Option<u32> {
+    let floor = crate::import::active_module_call_floor();
+    CURRENT_FUNCTION_STACK.with(|stack| {
+        let stack = stack.borrow();
+        let floor = floor.min(stack.len());
+        stack[floor..]
+            .iter()
+            .rev()
+            .find_map(|call| crate::types::function::function_module(call.function.cast::<PyObject>()))
+    })
+}
+
+/// Resolve `name` in the executing function's defining-module namespace.
+/// `None` when no scoped function is executing, when the module is gone, or
+/// when the module does not bind the name — callers then fall back to the
+/// active-module / flat-pool layers.
+fn defining_module_attr(name: u32) -> Option<*mut PyObject> {
+    let module = current_defining_module()?;
+    crate::import::module_attr(module, name)
+}
+
+/// Record the defining module for a freshly created function object: the
+/// enclosing function's module when compiled code is executing (nested defs,
+/// decorator-built wrappers), else the actively executing module body.
+pub(super) fn record_new_function_module(function: *mut PyObject) {
+    if function.is_null() {
+        return;
+    }
+    if let Some(module) = current_defining_module().or_else(crate::import::active_module_name_id) {
+        crate::types::function::set_function_module(function, module);
+    }
 }
 
 #[cfg(test)]
@@ -3700,6 +4630,50 @@ mod tests {
     }
 
     #[test]
+    fn load_global_scopes_to_defining_module_over_flat_pool() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+            let name = intern("collide_probe");
+            crate::import::install_module("scope_mod_a", []).unwrap();
+            crate::import::install_module("scope_mod_b", []).unwrap();
+
+            // Module a's body defines the probe function AND binds the name.
+            crate::import::begin_module_execution("scope_mod_a").unwrap();
+            let fa = pon_make_function(return_none as *const u8, 0, intern("collide_probe_fn"));
+            assert!(!fa.is_null());
+            let value_a = pon_const_int(11);
+            assert_eq!(pon_store_global(name, value_a), value_a);
+            crate::import::end_module_execution("scope_mod_a");
+            assert_eq!(crate::types::function::function_module(fa), Some(intern("scope_mod_a")));
+
+            // Module b's body is the flat pool's last writer for the SAME name.
+            crate::import::begin_module_execution("scope_mod_b").unwrap();
+            let value_b = pon_const_int(22);
+            assert_eq!(pon_store_global(name, value_b), value_b);
+            crate::import::end_module_execution("scope_mod_b");
+
+            // While a scope_mod_a function executes (no module body active),
+            // the load must resolve through its DEFINING module's namespace,
+            // not the flat pool where module b clobbered the binding.
+            {
+                let _call = push_current_call(fa.cast::<PyFunction>(), ptr::null_mut(), 0);
+                assert_eq!(pon_load_global(name, ptr::null_mut()), value_a);
+            }
+
+            // Empty call stack and no active module: module-scope stores no
+            // longer write the flat pool, so the name resolves to NOTHING —
+            // module b's binding stays private to module b instead of
+            // clobbering the process-wide namespace.
+            assert!(pon_load_global(name, ptr::null_mut()).is_null());
+            assert!(pon_err_occurred());
+            pon_err_clear();
+            // Builtins keep resolving through the flat pool.
+            assert!(!pon_load_global(intern("print"), ptr::null_mut()).is_null());
+        }
+    }
+
+    #[test]
     fn print_conversion_formats_unicode_and_int() {
         let _guard = test_state_lock();
         unsafe {
@@ -3708,6 +4682,173 @@ mod tests {
             let integer = pon_const_int(-7);
             assert_eq!(format_object_for_print(string).as_deref(), Ok("hello"));
             assert_eq!(format_object_for_print(integer).as_deref(), Ok("-7"));
+        }
+    }
+}
+
+/// Allocates a payload-subclass heap instance (`str`/`int`-derived class)
+/// with the extended layout: heap-instance prefix plus the canonical
+/// builtin payload slot.
+pub(crate) unsafe fn alloc_payload_subclass_instance(
+    cls: *mut PyType,
+    dict: *mut type_::PyClassDict,
+    slots: Vec<type_::PySlotValue>,
+    value: *mut PyObject,
+) -> Result<*mut PyObject, String> {
+    with_runtime(|runtime| {
+        let object = runtime
+            .heap
+            .alloc(
+                mem::size_of::<type_::PyPayloadSubclassInstance>(),
+                type_::TYPE_ID_PAYLOAD_SUBCLASS_INSTANCE,
+            )
+            .cast::<type_::PyPayloadSubclassInstance>();
+        unsafe {
+            ptr::write(
+                object,
+                type_::PyPayloadSubclassInstance {
+                    base: type_::PyHeapInstance {
+                        ob_base: PyObjectHeader::new(cls),
+                        dict,
+                        slots,
+                        weakrefs: ptr::null_mut(),
+                        finalized: false,
+                    },
+                    value,
+                },
+            );
+        }
+        Ok(as_object_ptr(object))
+    })
+    .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
+}
+
+/// Core of the Python-visible `int.__new__`/`str.__new__` staticmethod
+/// carriers: validate the class argument, build the canonical value with the
+/// builtin constructor, and wrap it in the payload-subclass layout when the
+/// class is a Python subclass of the owner.
+unsafe fn data_type_dunder_new_common(
+    owner: &'static str,
+    constructor: BuiltinConstructor,
+    argv: *mut *mut PyObject,
+    argc: usize,
+) -> *mut PyObject {
+    if argv.is_null() || argc == 0 {
+        let message = format!("{owner}.__new__(): not enough arguments");
+        return unsafe { exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    let cls = unsafe { *argv };
+    if unsafe { !type_::is_type_object(cls) } {
+        let message = format!("{owner}.__new__(X): X is not a type object");
+        return unsafe { exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    let cls_ty = cls.cast::<PyType>();
+    let is_owner_subtype = unsafe { crate::mro::mro_entries(cls_ty) }.iter().any(|entry| {
+        !entry.is_null()
+            && unsafe {
+                (**entry).gc_type_id != type_::TYPE_ID_HEAP_INSTANCE.0 as usize && (**entry).name() == owner
+            }
+    });
+    if !is_owner_subtype {
+        let cls_name = unsafe { (*cls_ty).name() };
+        let message = format!("{owner}.__new__({cls_name}): {cls_name} is not a subtype of {owner}");
+        return unsafe { exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    let value = unsafe { constructor(if argc > 1 { argv.add(1) } else { ptr::null_mut() }, argc - 1) };
+    if value.is_null() {
+        return ptr::null_mut();
+    }
+    if unsafe { (*cls_ty).gc_type_id != type_::TYPE_ID_HEAP_INSTANCE.0 as usize } {
+        // `cls` is the builtin itself: the canonical value IS the instance.
+        return value;
+    }
+    if unsafe { !type_::type_is_payload_subclass(cls_ty) } {
+        let cls_name = unsafe { (*cls_ty).name() };
+        let message = format!("{owner}.__new__({cls_name}): {cls_name} does not embed a {owner} payload");
+        return unsafe { exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    match unsafe { type_::alloc_payload_instance_for_class(cls_ty, value) } {
+        Ok(object) => object,
+        Err(message) => return_null_with_error(message),
+    }
+}
+
+unsafe extern "C" fn int_dunder_new_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { data_type_dunder_new_common("int", crate::native::builtins_mod::builtin_int, argv, argc) }
+}
+
+unsafe extern "C" fn str_dunder_new_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { data_type_dunder_new_common("str", crate::native::builtins_mod::builtin_str, argv, argc) }
+}
+
+/// `<data type>.__repr__(self)` — repr of the receiver's canonical value
+/// (payload-subclass receivers read through their payload).
+unsafe extern "C" fn data_type_dunder_repr_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let receiver = match unsafe { native_receiver_arg(argv, argc, "__repr__") } {
+        Ok(receiver) => receiver,
+        Err(error) => return error,
+    };
+    let receiver = unsafe { type_::payload_subclass_value(receiver) }.unwrap_or(receiver);
+    let text = crate::native::builtins_mod::repr_text(receiver);
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+/// `str.__str__(self)` — text of the receiver's canonical value.
+unsafe extern "C" fn data_type_dunder_str_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let receiver = match unsafe { native_receiver_arg(argv, argc, "__str__") } {
+        Ok(receiver) => receiver,
+        Err(error) => return error,
+    };
+    let receiver = unsafe { type_::payload_subclass_value(receiver) }.unwrap_or(receiver);
+    let text = crate::native::builtins_mod::str_text(receiver);
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+/// Data-type dunder surface for `int` and `str`: a real `__new__`
+/// (staticmethod carrier, payload-subclass aware) plus `__repr__` (and
+/// `__str__` on `str` only — CPython dict containment), so enum's
+/// `_find_data_type_`/`_find_data_repr_`/`_find_new_` probes hold.
+fn install_data_type_dunders(runtime: &mut Runtime) {
+    let long_type = runtime.long_type;
+    let unicode_type = runtime.unicode_type;
+    let entries: [(*mut PyType, *const u8, bool); 2] = [
+        (long_type, int_dunder_new_native as *const u8, false),
+        (unicode_type, str_dunder_new_native as *const u8, true),
+    ];
+    for (ty, new_entry, with_str) in entries {
+        if ty.is_null() {
+            continue;
+        }
+        let new_name = crate::intern::intern("__new__");
+        let Ok(function) = alloc_function(runtime, new_entry, crate::builtins::variadic_arity(), new_name) else {
+            continue;
+        };
+        let descriptor = unsafe { classmethod::new_staticmethod(staticmethod_builtin_type(), function) };
+        if descriptor.is_null() {
+            continue;
+        }
+        unsafe {
+            let mut dict = (*ty).tp_dict.cast::<type_::PyClassDict>();
+            if dict.is_null() {
+                dict = type_::new_namespace();
+                (*ty).tp_dict = dict.cast::<PyObject>();
+            }
+            (&mut *dict).set(new_name, descriptor.cast::<PyObject>());
+            let repr_name = crate::intern::intern("__repr__");
+            if let Ok(function) =
+                alloc_function(runtime, data_type_dunder_repr_native as *const u8, crate::builtins::variadic_arity(), repr_name)
+            {
+                (&mut *dict).set(repr_name, function.cast::<PyObject>());
+            }
+            if with_str {
+                let str_name = crate::intern::intern("__str__");
+                if let Ok(function) =
+                    alloc_function(runtime, data_type_dunder_str_native as *const u8, crate::builtins::variadic_arity(), str_name)
+                {
+                    (&mut *dict).set(str_name, function.cast::<PyObject>());
+                }
+            }
+            crate::sync::register_namespaced_type(ty);
         }
     }
 }

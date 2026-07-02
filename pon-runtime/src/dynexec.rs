@@ -219,7 +219,13 @@ fn sync_module_attrs_into_dict(module_name: u32, dict_object: *mut PyObject) -> 
 }
 
 fn module_globals_dict() -> Result<*mut PyObject, String> {
-    let module_name = module_name_for_globals();
+    module_namespace_dict(module_name_for_globals())
+}
+
+/// Live namespace dict for one module, registered so mutations through it
+/// sync back into the module's attrs (`globals()` for the active module,
+/// `some_module.__dict__` for any module).
+pub(crate) fn module_namespace_dict(module_name: u32) -> Result<*mut PyObject, String> {
     if let Some(dict_addr) = GLOBALS_REGISTRY
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
@@ -256,14 +262,13 @@ fn key_name_id(key: *mut PyObject) -> Option<u32> {
     Some(intern(&text))
 }
 
-/// Mirror a normal compiled global store into a previously-returned globals dict.
-pub(crate) fn sync_global_store_for_active_module(name: u32, value: *mut PyObject) {
+/// Mirror a compiled global store into `module_name`'s previously-returned
+/// globals dict (defining-module scoping: the store may target a module other
+/// than the active one when a cross-module function body rebinds a global).
+pub(crate) fn sync_global_store_for_module(module_name: u32, name: u32, value: *mut PyObject) {
     if value.is_null() {
         return;
     }
-    let Some(module_name) = crate::import::active_module_name_id() else {
-        return;
-    };
     let dict_addr = {
         let registry = GLOBALS_REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
         registry.by_module.get(&module_name).copied()
@@ -279,11 +284,9 @@ pub(crate) fn sync_global_store_for_active_module(name: u32, value: *mut PyObjec
     }
 }
 
-/// Mirror a normal compiled global deletion into a previously-returned globals dict.
-pub(crate) fn sync_global_delete_for_active_module(name: u32) {
-    let Some(module_name) = crate::import::active_module_name_id() else {
-        return;
-    };
+/// Mirror a compiled global deletion into `module_name`'s previously-returned
+/// globals dict (defining-module scoping, matching `sync_global_store_for_module`).
+pub(crate) fn sync_global_delete_for_module(module_name: u32, name: u32) {
     let dict_addr = {
         let registry = GLOBALS_REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
         registry.by_module.get(&module_name).copied()
@@ -314,7 +317,6 @@ pub(crate) fn sync_globals_dict_set(dict_object: *mut PyObject, key: *mut PyObje
         return;
     };
     crate::import::store_active_module_attr(name, value);
-    abi::store_flat_global_for_dynexec(name, value);
 }
 
 /// Called by dict item-deletion helpers after a successful delete.
@@ -332,7 +334,25 @@ pub(crate) fn sync_globals_dict_delete(dict_object: *mut PyObject, key: *mut PyO
         return;
     };
     crate::import::delete_active_module_attr(name);
-    abi::delete_flat_global_for_dynexec(name);
+}
+
+/// Called by `dict.update` after a successful bulk write.
+///
+/// `globals().update({...})` mutates the registered globals dict without
+/// going through the item-assignment helpers, so the new bindings must be
+/// copied back into the active module's attrs for compiled name lookups to
+/// see them (re._constants injects its opcode constants this way).
+pub(crate) fn sync_globals_dict_bulk(dict_object: *mut PyObject) {
+    if dict_object.is_null() {
+        return;
+    }
+    let Some(binding) = binding_for_dict(dict_object) else {
+        return;
+    };
+    if crate::import::active_module_name_id() != Some(binding.module_name) {
+        return;
+    }
+    let _ = copy_dict_to_active_module(dict_object);
 }
 
 fn compile_source(source: String, filename: String, mode: DynCodeMode) -> Result<*mut PyObject, String> {
@@ -366,13 +386,24 @@ fn execute_code(code: &PyCodeObject, globals: *mut PyObject, locals: *mut PyObje
     if locals != globals && unsafe { dict::is_dict(locals) } {
         copy_dict_to_active_module(locals)?;
     }
+    // The dynamic body executes as module-toplevel code of the module whose
+    // namespace backs `globals` (its stores/loads must land in that module's
+    // attrs, and the result probe reads them back from there).  Re-enter that
+    // module's execution context so the defining-module call floor masks the
+    // suspended caller frames, exactly as a real module import would.
+    let context_module = resolve(module_name_for_globals())
+        .filter(|name| crate::import::begin_module_execution(name).is_ok());
     let result = hook(DynExecuteRequest {
         source: &code.source,
         filename: &code.filename,
         mode: code.mode,
         globals,
         locals,
-    })?;
+    });
+    if let Some(name) = context_module {
+        crate::import::end_module_execution(&name);
+    }
+    let result = result?;
     let module_name = module_name_for_globals();
     if unsafe { dict::is_dict(globals) } {
         sync_module_attrs_into_dict(module_name, globals)?;
@@ -394,7 +425,6 @@ fn copy_dict_to_active_module(dict_object: *mut PyObject) -> Result<(), String> 
             continue;
         };
         crate::import::store_active_module_attr(name, entry.value);
-        abi::store_flat_global_for_dynexec(name, entry.value);
     }
     Ok(())
 }
@@ -558,13 +588,15 @@ pub unsafe extern "C" fn builtin_dunder_import(argv: *mut *mut PyObject, argc: u
     let Some(name) = (unsafe { str_text(args[0]) }) else {
         return return_null_with_error("__import__() name must be str");
     };
-    let level = if let Some(&level_object) = args.get(4) {
-        match unsafe { int::to_bigint(level_object) }.and_then(|value| value.to_u32()) {
-            Some(level) => level,
-            None => return return_null_with_error("__import__() level must be int"),
+    let level = match args.get(4) {
+        // Keyword binding fills absent optionals with None (CPython default 0).
+        Some(&level_object) if unsafe { !is_none(level_object) } => {
+            match unsafe { int::to_bigint(level_object) }.and_then(|value| value.to_u32()) {
+                Some(level) => level,
+                None => return return_null_with_error("__import__() level must be int"),
+            }
         }
-    } else {
-        0
+        _ => 0,
     };
     let mut fromlist_names = Vec::new();
     if let Some(&fromlist) = args.get(3) {

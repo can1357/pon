@@ -14,7 +14,10 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::{LazyLock, Mutex};
 
-use crate::abi::{pon_const_int, pon_const_str, pon_none, pon_store_global, raise_import_error_text, return_minus_one_with_error, return_null_with_error};
+use crate::abi::{
+    pon_const_int, pon_const_str, pon_none, pon_store_global, raise_import_error_text, return_minus_one_with_error, return_null_with_error,
+};
+use crate::abi::exc::raise_attribute_error_text;
 use crate::intern::{intern, resolve};
 use crate::object::{PyObject, PyObjectHeader, PyType, PyUnicode, as_object_ptr};
 use crate::thread_state::pon_err_occurred;
@@ -50,6 +53,14 @@ struct ImportState {
     source_loader: Option<SourceModuleLoader>,
     module_type: *mut PyType,
     current_modules: Vec<u32>,
+    /// Per-`current_modules` entry: the compiled-call stack depth captured at
+    /// `begin_module_execution`.  Call-stack entries at or above this floor
+    /// were pushed while the module body ran, so global loads/stores made by
+    /// them scope to their own defining module, while a bare depth==floor
+    /// context means the module toplevel itself is executing.
+    current_module_floors: Vec<usize>,
+    /// Live `sys.modules` dict mirroring `modules`; NULL until first use.
+    modules_dict: *mut PyObject,
 }
 
 unsafe impl Send for ImportState {}
@@ -60,11 +71,14 @@ impl ImportState {
     fn new() -> Self {
         let mut ty = Box::new(PyType::new(ptr::null(), "module", mem::size_of::<PyModuleObject>()));
         ty.tp_getattro = Some(module_getattro);
+        ty.tp_setattro = Some(module_setattro);
         Self {
             modules: HashMap::new(),
             source_loader: None,
             module_type: Box::into_raw(ty),
             current_modules: Vec::new(),
+            current_module_floors: Vec::new(),
+            modules_dict: ptr::null_mut(),
         }
     }
 }
@@ -90,6 +104,8 @@ pub fn reset_import_state_for_tests() {
         state.modules.clear();
         state.source_loader = None;
         state.current_modules.clear();
+        state.current_module_floors.clear();
+        state.modules_dict = ptr::null_mut();
     }
     if crate::abi::runtime_is_initialized() {
         register_native_modules().expect("re-registering native modules after import-state reset");
@@ -233,8 +249,17 @@ pub unsafe extern "C" fn pon_import_from(module: *mut PyObject, name_interned: u
     let attr = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
     if module_is_package(module_ref) {
         let child_name = format!("{module_name}.{attr}");
-        if let Ok(child) = import_module_by_name(&child_name) {
-            return child;
+        match import_module_by_name(&child_name) {
+            Ok(child) => return child,
+            // A missing submodule falls through to the historical
+            // cannot-import-name diagnostic; every other failure propagates
+            // (CPython `_handle_fromlist` swallows only a ModuleNotFoundError
+            // naming the child itself, so a deeper missing module raised
+            // while executing the child's body must surface verbatim).
+            Err(message) if message != format!("no module named '{child_name}'") => {
+                return raise_import_error_text(&message);
+            }
+            Err(_) => {}
         }
     }
     raise_import_error_text(&format!("cannot import name '{attr}' from '{module_name}'"))
@@ -271,6 +296,60 @@ pub fn cached_module(name: u32) -> Option<*mut PyObject> {
     state.modules.get(&name).copied()
 }
 
+/// Returns the live `sys.modules` dict, allocating it on first use.
+///
+/// The dict mirrors the interned-name import cache: the runtime publishes
+/// every module it registers, and `import` consults the dict as the
+/// user-visible authority so `sys.modules[name] = module` (e.g. `collections`
+/// publishing `collections.abc`) and `del sys.modules[name]` behave like
+/// CPython.
+pub fn sys_modules_dict() -> Result<*mut PyObject, String> {
+    {
+        let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        if !state.modules_dict.is_null() {
+            return Ok(state.modules_dict);
+        }
+    }
+    // Allocate outside the state lock: dict construction takes its own locks.
+    // SAFETY: A NULL item array with a zero pair count builds an empty dict.
+    let dict = unsafe { crate::abi::map::pon_build_map(ptr::null_mut(), 0) };
+    if dict.is_null() {
+        return Err("failed to allocate the sys.modules dict".to_owned());
+    }
+    let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    if state.modules_dict.is_null() {
+        state.modules_dict = dict;
+    }
+    Ok(state.modules_dict)
+}
+
+/// Publishes a registered module into the live `sys.modules` dict.
+///
+/// Called with the import-state lock released: dict insertion takes the
+/// dict's own critical section and must never nest inside `IMPORT_STATE`.
+fn mirror_module_registration(name: &str, module: *mut PyObject) -> Result<(), String> {
+    let dict = sys_modules_dict()?;
+    let key = runtime_string(name)?;
+    let _guard = crate::sync::begin_critical_section(dict);
+    // SAFETY: `dict` is an exact runtime dict; `key` and `module` are valid.
+    unsafe { crate::types::dict::dict_insert(dict, key, module) }
+}
+
+/// Reads the `sys.modules` binding for `name`, when the dict already exists.
+fn sys_modules_entry(name: &str) -> Result<Option<*mut PyObject>, String> {
+    let dict = {
+        let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        state.modules_dict
+    };
+    if dict.is_null() {
+        return Ok(None);
+    }
+    let key = runtime_string(name)?;
+    let _guard = crate::sync::begin_critical_section(dict);
+    // SAFETY: `dict` is an exact runtime dict and `key` is a valid string.
+    unsafe { crate::types::dict::dict_get(dict, key) }
+}
+
 /// Creates or replaces a module object in `sys.modules` with the supplied attrs.
 pub fn install_module(name: &str, attrs: impl IntoIterator<Item = (u32, *mut PyObject)>) -> Result<*mut PyObject, String> {
     create_module(name, false, attrs)
@@ -282,21 +361,55 @@ fn import_module_by_name(name: &str) -> Result<*mut PyObject, String> {
     }
 
     let name_id = intern(name);
-    {
+    let cached = {
         let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
-        if let Some(module) = state.modules.get(&name_id).copied() {
-            return Ok(module);
+        state.modules.get(&name_id).copied()
+    };
+    match (cached, sys_modules_entry(name)?) {
+        // Steady state: the cache and `sys.modules` agree.
+        (Some(module), Some(entry)) if module == entry => return Ok(module),
+        // A binding the user inserted or replaced through `sys.modules` wins.
+        (_, Some(entry)) => {
+            let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+            state.modules.insert(name_id, entry);
+            drop(state);
+            // J0.3 GlobalIC site: the module behind this name changed.
+            crate::abi::bump_namespace_version();
+            return Ok(entry);
         }
+        // The user deleted the binding: forget the cache entry and re-import.
+        (Some(_), None) => {
+            let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+            state.modules.remove(&name_id);
+            drop(state);
+            // J0.3 GlobalIC site: the module behind this name was dropped.
+            crate::abi::bump_namespace_version();
+        }
+        (None, None) => {}
     }
 
     if let Some(parent) = parent_module_name(name) {
         import_module_by_name(parent)?;
+        // CPython bootstrap's "crazy side-effects" re-check: executing the
+        // parent may have published this very name into `sys.modules`
+        // (e.g. `collections/__init__.py` registers `collections.abc` as an
+        // alias of `_collections_abc`). Adopt that binding instead of
+        // resolving the child from disk.
+        if let Some(entry) = sys_modules_entry(name)? {
+            let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+            state.modules.insert(name_id, entry);
+            drop(state);
+            // J0.3 GlobalIC site: a new name -> module binding appeared.
+            crate::abi::bump_namespace_version();
+            return Ok(entry);
+        }
     }
 
     if let Some(module) = native_module(name)? {
         let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
         state.modules.insert(name_id, module);
         drop(state);
+        mirror_module_registration(name, module)?;
         bind_child_to_parent(name, module);
         return Ok(module);
     }
@@ -472,6 +585,29 @@ fn vendored_stdlib_root() -> Option<PathBuf> {
     candidates.into_iter().find(|root| root.is_dir())
 }
 
+/// Ordered source-import roots the runtime consults for pure-Python modules:
+/// current directory, installed packages, the conformance corpus,
+/// `PONPATH`/`PON_IMPORT_PATH` entries, then the vendored stdlib last.
+/// Exposed so AoT reachability resolves static imports with exactly the
+/// runtime's search order and embeds what the runtime would otherwise have to
+/// source-load.
+#[must_use]
+pub fn source_search_roots() -> Vec<PathBuf> {
+    search_roots()
+}
+
+/// True when `import name` never reaches source-root resolution at runtime
+/// because the curated native registry or the C-accelerated refusal list
+/// serves it first. AoT reachability consults this so a same-named `.py` on a
+/// source root is never embedded: the runtime would never execute it.
+/// Installed-package fixtures also shadow source files but depend on process
+/// environment, so they are deliberately not reflected here; a unit they
+/// shadow is dead weight in the binary, not a behavior change.
+#[must_use]
+pub fn import_shadowed_from_source(name: &str) -> bool {
+    crate::native::is_native_module(name) || is_unsupported_c_accelerated(name)
+}
+
 fn load_curated_assignment_module(name: &str, source: &str, is_package: bool) -> Result<*mut PyObject, String> {
     let mut attrs = Vec::new();
     for line in source.lines() {
@@ -521,6 +657,8 @@ fn create_module(
     });
     let object = as_object_ptr(Box::into_raw(object));
     state.modules.insert(name_id, object);
+    drop(state);
+    mirror_module_registration(name, object)?;
     // J0.3 GlobalIC site: a (re)installed module can replace the module whose
     // attrs overlay `pon_load_global` currently consults.
     crate::abi::bump_namespace_version();
@@ -579,11 +717,15 @@ fn bind_child_to_parent(name: &str, module: *mut PyObject) {
 
 pub fn begin_module_execution(name: &str) -> Result<(), String> {
     let name_id = intern(name);
+    // Captured before taking the import lock: the depth belongs to the
+    // executing thread's compiled-call stack.
+    let floor = crate::abi::current_function_stack_depth();
     let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
     if !state.modules.contains_key(&name_id) {
         return Err(format!("cannot execute uncached module '{name}'"));
     }
     state.current_modules.push(name_id);
+    state.current_module_floors.push(floor);
     // J0.3 GlobalIC site: context switch changes which attr overlay
     // `pon_load_global` consults.
     crate::abi::bump_namespace_version();
@@ -595,9 +737,20 @@ pub fn end_module_execution(name: &str) {
     let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
     if state.current_modules.last().copied() == Some(name_id) {
         state.current_modules.pop();
+        state.current_module_floors.pop();
         // J0.3 GlobalIC site: context switch (see begin_module_execution).
         crate::abi::bump_namespace_version();
     }
+}
+
+/// Compiled-call stack depth captured when the innermost active module body
+/// began executing; `0` when no module body is active.  Call-stack entries at
+/// or above this floor were pushed by calls made during the module body, so
+/// only they may scope a global load/store to their defining module.
+#[must_use]
+pub fn active_module_call_floor() -> usize {
+    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    state.current_module_floors.last().copied().unwrap_or(0)
 }
 
 fn current_importer_package() -> Option<String> {
@@ -630,20 +783,37 @@ pub fn active_module_attrs_snapshot() -> Option<Vec<(u32, *mut PyObject)>> {
 }
 
 pub fn active_module_attr(name: u32) -> Option<*mut PyObject> {
+    let current = {
+        let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        state.current_modules.last().copied()?
+    };
+    module_attr(current, name)
+}
+
+/// Live attribute binding of one cached module, by interned module name.
+pub fn module_attr(module_name: u32, name: u32) -> Option<*mut PyObject> {
     let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
-    let current = state.current_modules.last().copied()?;
-    let module = state.modules.get(&current).copied()?;
+    let module = state.modules.get(&module_name).copied()?;
     let module = module_from_object_locked(&state, module)?;
     // SAFETY: The import state proved the object uses `PyModuleObject` layout.
     unsafe { (&*module).attrs.get(&name).copied() }
 }
 
 pub fn store_active_module_attr(name: u32, value: *mut PyObject) -> bool {
-    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
-    let Some(current) = state.current_modules.last().copied() else {
-        return false;
+    let current = {
+        let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Some(current) = state.current_modules.last().copied() else {
+            return false;
+        };
+        current
     };
-    let Some(module) = state.modules.get(&current).copied() else {
+    store_module_attr(current, name, value)
+}
+
+/// Store one attribute binding into a cached module, by interned module name.
+pub fn store_module_attr(module_name: u32, name: u32, value: *mut PyObject) -> bool {
+    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    let Some(module) = state.modules.get(&module_name).copied() else {
         return false;
     };
     let Some(module) = module_from_object_locked(&state, module) else {
@@ -653,17 +823,26 @@ pub fn store_active_module_attr(name: u32, value: *mut PyObject) -> bool {
     unsafe {
         (&mut *module).attrs.insert(name, value);
     }
-    // J0.3 GlobalIC site: active-module attr overlay insert/replace.
+    // J0.3 GlobalIC site: module attr overlay insert/replace.
     crate::abi::bump_namespace_version();
     true
 }
 
 pub fn delete_active_module_attr(name: u32) -> bool {
-    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
-    let Some(current) = state.current_modules.last().copied() else {
-        return false;
+    let current = {
+        let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Some(current) = state.current_modules.last().copied() else {
+            return false;
+        };
+        current
     };
-    let Some(module) = state.modules.get(&current).copied() else {
+    delete_module_attr(current, name)
+}
+
+/// Delete one attribute binding from a cached module, by interned module name.
+pub fn delete_module_attr(module_name: u32, name: u32) -> bool {
+    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    let Some(module) = state.modules.get(&module_name).copied() else {
         return false;
     };
     let Some(module) = module_from_object_locked(&state, module) else {
@@ -672,7 +851,7 @@ pub fn delete_active_module_attr(name: u32) -> bool {
     // SAFETY: The import state proved the object uses `PyModuleObject` layout.
     let removed = unsafe { (&mut *module).attrs.remove(&name).is_some() };
     if removed {
-        // J0.3 GlobalIC site: active-module attr removal.
+        // J0.3 GlobalIC site: module attr overlay removal.
         crate::abi::bump_namespace_version();
     }
     removed
@@ -983,13 +1162,63 @@ unsafe extern "C" fn module_getattro(module: *mut PyObject, name: *mut PyObject)
     let Some(name_text) = name_text else {
         return return_null_with_error("module attribute name is not valid UTF-8");
     };
+    if name_text == "__dict__" {
+        // The live namespace view: mutations through it sync back into the
+        // module attrs via the dynexec globals-registry hooks (CPython's
+        // module `__dict__` IS the module namespace).
+        return match crate::dynexec::module_namespace_dict(unsafe { (*module).name }) {
+            Ok(dict) => dict,
+            Err(message) => return_null_with_error(message),
+        };
+    }
     let name_id = intern(name_text);
     // SAFETY: `as_module` proved the layout.
     let module_ref = unsafe { &*module };
     module_ref.attrs.get(&name_id).copied().unwrap_or_else(|| {
         let module_name = resolve(module_ref.name).unwrap_or_else(|| format!("<module:{}>", module_ref.name));
-        return_null_with_error(format!("module '{module_name}' has no attribute '{name_text}'"))
+        raise_attribute_error_text(&format!("module '{module_name}' has no attribute '{name_text}'"))
     })
+}
+
+/// `module.attr = value` / `del module.attr` (CPython module objects are
+/// plain namespaces; `_py_warnings` bumps `_filters_version` on its module
+/// object).  Mirrors [`store_module_attr`]/[`delete_module_attr`], including
+/// the J0.3 GlobalIC bump: module attrs overlay `pon_load_global`.
+unsafe extern "C" fn module_setattro(module: *mut PyObject, name: *mut PyObject, value: *mut PyObject) -> c_int {
+    if module.is_null() || name.is_null() {
+        return_null_with_error("module attribute assignment received NULL");
+        return -1;
+    }
+    let Some(module) = as_module(module) else {
+        return_null_with_error("attribute receiver is not a module");
+        return -1;
+    };
+    // SAFETY: Attribute names are allocated by `abstract_op` as `PyUnicode`.
+    let name_text = unsafe { (&*name.cast::<PyUnicode>()).as_str() };
+    let Some(name_text) = name_text else {
+        return_null_with_error("module attribute name is not valid UTF-8");
+        return -1;
+    };
+    let name_id = intern(name_text);
+    if value.is_null() {
+        // SAFETY: `as_module` proved the layout.
+        let removed = unsafe { (&mut *module).attrs.remove(&name_id).is_some() };
+        if !removed {
+            // SAFETY: `as_module` proved the layout.
+            let module_ref = unsafe { &*module };
+            let module_name = resolve(module_ref.name).unwrap_or_else(|| format!("<module:{}>", module_ref.name));
+            raise_attribute_error_text(&format!("module '{module_name}' has no attribute '{name_text}'"));
+            return -1;
+        }
+    } else {
+        // SAFETY: `as_module` proved the layout.
+        unsafe {
+            (&mut *module).attrs.insert(name_id, value);
+        }
+    }
+    // J0.3 GlobalIC site: module attr overlay insert/replace/removal.
+    crate::abi::bump_namespace_version();
+    0
 }
 
 /// Status helper for hub integration that reports whether a module object owns an attribute.
