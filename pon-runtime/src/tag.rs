@@ -228,6 +228,12 @@ mod macro_tests {
     }
 
     #[test]
+    fn gc_tag_constants_match_runtime_tag_constants() {
+        assert_eq!(pon_gc::IMMEDIATE_TAG_MASK, super::TAG_MASK);
+        assert_eq!(pon_gc::IMMEDIATE_TAG_HEAP, super::TAG_HEAP);
+    }
+
+    #[test]
     fn prelude_passes_heap_and_null_through() {
         // SAFETY: NULL is the documented pass-through sentinel; no deref occurs.
         unsafe {

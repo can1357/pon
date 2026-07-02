@@ -1,7 +1,7 @@
 //! Descriptor protocol and generic attribute access.
 
 use core::ffi::c_int;
-use core::ptr;
+use core::{mem, ptr};
 
 use crate::abi;
 use crate::feedback::{ATTR_DESCR_BLIND, ATTR_DESCR_PROBE_DICT, AttrCacheKind, AttrIC, FeedbackCell};
@@ -10,7 +10,7 @@ use crate::mro;
 use crate::object::{PyObject, PyType, update_slot_from_dunder};
 use crate::sync;
 use crate::thread_state::pon_err_set;
-use crate::types::type_::{self, PyClassDict, PyHeapInstance};
+use crate::types::{dict, type_::{self, PyClassDict, PyHeapInstance}};
 
 fn raise_attr_error(message: impl Into<String>) -> *mut PyObject {
     pon_err_set(message);
@@ -43,6 +43,114 @@ unsafe fn dict_from_ptr(dict: *mut PyObject) -> Option<&'static mut PyClassDict>
     }
 }
 
+fn raise_type_status(message: impl AsRef<str>) -> c_int {
+    let message = message.as_ref();
+    unsafe {
+        abi::exc::pon_raise_type_error(message.as_ptr(), message.len());
+    }
+    -1
+}
+
+fn raise_missing_attr_status(object: *mut PyObject, name_id: u32) -> c_int {
+    let _ = unsafe { abi::pon_raise_attribute_error(object, name_id) };
+    -1
+}
+
+unsafe fn object_type_display(object: *mut PyObject) -> String {
+    if object.is_null() {
+        return "NULL".to_owned();
+    }
+    let ty = unsafe { object_type(object) };
+    if ty.is_null() {
+        "object".to_owned()
+    } else {
+        unsafe { (*ty).name() }.to_owned()
+    }
+}
+
+unsafe fn class_dict_to_dict(class_dict: *mut PyClassDict) -> *mut PyObject {
+    if class_dict.is_null() {
+        return ptr::null_mut();
+    }
+    let out = unsafe { abi::map::pon_build_map(ptr::null_mut(), 0) };
+    if out.is_null() {
+        return ptr::null_mut();
+    }
+    for (name, value) in unsafe { (&*class_dict).iter() } {
+        let Some(spelling) = intern::resolve(name) else {
+            continue;
+        };
+        let key = unsafe { abi::pon_const_str(spelling.as_ptr(), spelling.len()) };
+        if key.is_null() {
+            return ptr::null_mut();
+        }
+        if unsafe { abi::map::pon_dict_set_item_status(out, key, value) } < 0 {
+            return ptr::null_mut();
+        }
+    }
+    out
+}
+
+unsafe fn set_instance_dict(object: *mut PyObject, value: *mut PyObject) -> c_int {
+    let instance = object.cast::<PyHeapInstance>();
+    if unsafe { (*instance).dict.is_null() } {
+        return raise_missing_attr_status(object, intern::intern("__dict__"));
+    }
+    let replacement = type_::new_namespace();
+    if !value.is_null() {
+        if unsafe { !dict::is_dict(value) } {
+            let got = unsafe { object_type_display(value) };
+            return raise_type_status(format!("__dict__ must be set to a dictionary, not a '{got}'"));
+        }
+        let entries = match unsafe { dict::dict_entries_snapshot(value) } {
+            Ok(entries) => entries,
+            Err(message) => return raise_type_status(message),
+        };
+        for entry in entries {
+            if let Some(text) = unsafe { type_::unicode_text(entry.key) } {
+                unsafe {
+                    (&mut *replacement).set(intern::intern(text), entry.value);
+                }
+            }
+        }
+    }
+    unsafe {
+        (*instance).dict = replacement;
+    }
+    0
+}
+
+unsafe fn heap_type_layout_compatible(current: *mut PyType, replacement: *mut PyType) -> bool {
+    if current.is_null() || replacement.is_null() {
+        return false;
+    }
+    let current = unsafe { &*current };
+    let replacement = unsafe { &*replacement };
+    let heap_basicsize = mem::size_of::<PyHeapInstance>();
+    current.tp_basicsize == heap_basicsize
+        && replacement.tp_basicsize == heap_basicsize
+        && current.tp_itemsize == replacement.tp_itemsize
+        && current.tp_dictoffset == replacement.tp_dictoffset
+}
+
+unsafe fn set_instance_class(object: *mut PyObject, current_ty: *mut PyType, value: *mut PyObject) -> c_int {
+    if value.is_null() {
+        return raise_type_status("can't delete __class__ attribute");
+    }
+    if unsafe { !is_type_object(value) } {
+        let got = unsafe { object_type_display(value) };
+        return raise_type_status(format!("__class__ must be set to a class, not '{got}' object"));
+    }
+    let replacement = value.cast::<PyType>();
+    if unsafe { !heap_type_layout_compatible(current_ty, replacement) } {
+        return raise_type_status("__class__ assignment only supported for mutable types or ModuleType subclasses");
+    }
+    unsafe {
+        (*object).ob_type = replacement;
+    }
+    0
+}
+
 /// Look up `name` in `ty` and its MRO without invoking descriptor binding.
 #[must_use]
 pub unsafe fn lookup_in_type(ty: *mut PyType, name: u32) -> *mut PyObject {
@@ -63,7 +171,7 @@ pub unsafe fn lookup_in_type(ty: *mut PyType, name: u32) -> *mut PyObject {
     ptr::null_mut()
 }
 
-/// Invoke `descr.__get__(obj, owner)` when a descriptor slot exists.
+/// Invoke `descr.__get__(obj, owner)` when a descriptor slot or Python dunder exists.
 #[must_use]
 pub unsafe fn descriptor_get(descr: *mut PyObject, obj: *mut PyObject, owner: *mut PyType) -> *mut PyObject {
     if descr.is_null() {
@@ -76,10 +184,31 @@ pub unsafe fn descriptor_get(descr: *mut PyObject, obj: *mut PyObject, owner: *m
     if let Some(get) = unsafe { (*ty).tp_descr_get } {
         return unsafe { get(descr, obj, owner.cast::<PyObject>()) };
     }
-    descr
+    let get = unsafe { lookup_in_type(ty, intern::intern("__get__")) };
+    if get.is_null() {
+        return descr;
+    }
+    let obj_arg = if obj.is_null() {
+        unsafe { abi::pon_none() }
+    } else {
+        obj
+    };
+    if obj_arg.is_null() {
+        return ptr::null_mut();
+    }
+    let owner_arg = if owner.is_null() {
+        unsafe { abi::pon_none() }
+    } else {
+        owner.cast::<PyObject>()
+    };
+    if owner_arg.is_null() {
+        return ptr::null_mut();
+    }
+    let mut argv = [descr, obj_arg, owner_arg];
+    unsafe { abi::pon_call(get, argv.as_mut_ptr(), argv.len()) }
 }
 
-/// Invoke `descr.__set__`/`__delete__` when a descriptor setter slot exists.
+/// Invoke `descr.__set__`/`__delete__` when a descriptor setter slot or Python dunder exists.
 pub unsafe fn descriptor_set(descr: *mut PyObject, obj: *mut PyObject, value: *mut PyObject) -> c_int {
     if descr.is_null() {
         return raise_attr_status("descriptor is NULL");
@@ -88,10 +217,26 @@ pub unsafe fn descriptor_set(descr: *mut PyObject, obj: *mut PyObject, value: *m
     if ty.is_null() {
         return raise_attr_status("descriptor has no type");
     }
-    let Some(set) = (unsafe { (*ty).tp_descr_set }) else {
-        return raise_attr_status("attribute is read-only");
+    if let Some(set) = unsafe { (*ty).tp_descr_set } {
+        return unsafe { set(descr, obj, value) };
+    }
+    let dunder = if value.is_null() { "__delete__" } else { "__set__" };
+    let method = unsafe { lookup_in_type(ty, intern::intern(dunder)) };
+    if method.is_null() {
+        return raise_attr_status(if value.is_null() {
+            "can't delete attribute"
+        } else {
+            "attribute is read-only"
+        });
+    }
+    let result = if value.is_null() {
+        let mut argv = [descr, obj];
+        unsafe { abi::pon_call(method, argv.as_mut_ptr(), argv.len()) }
+    } else {
+        let mut argv = [descr, obj, value];
+        unsafe { abi::pon_call(method, argv.as_mut_ptr(), argv.len()) }
     };
-    unsafe { set(descr, obj, value) }
+    if result.is_null() { -1 } else { 0 }
 }
 
 #[must_use]
@@ -100,7 +245,14 @@ unsafe fn is_data_descriptor(descr: *mut PyObject) -> bool {
         return false;
     }
     let ty = unsafe { object_type(descr) };
-    !ty.is_null() && unsafe { (*ty).tp_descr_set.is_some() }
+    if ty.is_null() {
+        return false;
+    }
+    unsafe {
+        (*ty).tp_descr_set.is_some()
+            || !lookup_in_type(ty, intern::intern("__set__")).is_null()
+            || !lookup_in_type(ty, intern::intern("__delete__")).is_null()
+    }
 }
 
 unsafe fn is_type_object(object: *mut PyObject) -> bool {
@@ -285,6 +437,17 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
         return unsafe { descriptor_get(class_descr, object, obj_ty) };
     }
 
+    if !is_type && name_id == intern::intern("__class__") {
+        return obj_ty.cast::<PyObject>();
+    }
+    if !is_type && name_id == intern::intern("__dict__") {
+        let dict = unsafe { instance_dict(object) };
+        if dict.is_null() {
+            return unsafe { abi::pon_raise_attribute_error(object, name_id) };
+        }
+        return unsafe { class_dict_to_dict(dict) };
+    }
+
     let dict = unsafe { instance_dict(object) };
     if !dict.is_null() {
         if let Some(value) = unsafe { (&*dict).get(name_id) } {
@@ -305,8 +468,7 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
         return unsafe { descriptor_get(meta_descr, object, obj_ty) };
     }
 
-    let spelling = intern::resolve(name_id).unwrap_or_else(|| format!("<interned:{name_id}>"));
-    raise_attr_error(format!("attribute '{spelling}' was not found"))
+    unsafe { abi::pon_raise_attribute_error(object, name_id) }
 }
 
 /// Publishes a descriptor-shaped [`AttrIC`] record (`mode` selects blind vs
@@ -358,6 +520,13 @@ pub unsafe extern "C" fn generic_set_attr(object: *mut PyObject, name: *mut PyOb
         return raise_attr_status("attribute receiver has no type");
     }
     let is_type = unsafe { is_type_object(object) };
+    if !is_type && name_id == intern::intern("__dict__") {
+        return unsafe { set_instance_dict(object, value) };
+    }
+    if !is_type && name_id == intern::intern("__class__") {
+        return unsafe { set_instance_class(object, obj_ty, value) };
+    }
+
 
     let descr = unsafe { lookup_in_type(obj_ty, name_id) };
     if unsafe { is_data_descriptor(descr) } {
@@ -377,8 +546,7 @@ pub unsafe extern "C" fn generic_set_attr(object: *mut PyObject, name: *mut PyOb
 
     let dict = unsafe { instance_dict(object) };
     if dict.is_null() {
-        let spelling = intern::resolve(name_id).unwrap_or_else(|| format!("<interned:{name_id}>"));
-        return raise_attr_status(format!("attribute '{spelling}' cannot be assigned"));
+        return raise_missing_attr_status(object, name_id);
     }
 
     if value.is_null() {
@@ -391,7 +559,7 @@ pub unsafe extern "C" fn generic_set_attr(object: *mut PyObject, name: *mut PyOb
             }
             0
         } else {
-            raise_attr_status("attribute does not exist")
+            raise_missing_attr_status(object, name_id)
         }
     } else {
         unsafe { (&mut *dict).set(name_id, value) };

@@ -14,6 +14,7 @@ pub type UnpackStatus = i32;
 /// seam.  The feedback pointer is accepted for ABI stability and ignored.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_get_iter(object: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
+    crate::untag_prelude!(object);
     unsafe { super::record_feedback_unary(feedback, object) };
     super::catch_object_helper(|| {
         // SAFETY: Delegates to the generic iterator protocol.
@@ -25,6 +26,7 @@ pub unsafe extern "C" fn pon_get_iter(object: *mut PyObject, feedback: *mut Feed
 /// feedback pointer is accepted for ABI stability and ignored.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_iter_next(iterator: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
+    crate::untag_prelude!(iterator);
     unsafe { super::record_feedback_unary(feedback, iterator) };
     super::catch_object_helper(|| unsafe { abstract_op::iter_next(iterator) })
 }

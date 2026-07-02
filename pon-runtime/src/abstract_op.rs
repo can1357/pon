@@ -146,9 +146,12 @@ pub unsafe fn unary_op(op: u8, operand: *mut PyObject) -> *mut PyObject {
 /// as binary operations, swapping the comparison op for the right-hand call.
 pub unsafe fn rich_compare(op: u8, a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
     if unsafe { is_exact_pylong(a) && is_exact_pylong(b) } {
-        // SAFETY: The exact-type checks above prove both operands use PyLong's layout.
-        let left = unsafe { (*a.cast::<PyLong>()).value };
-        let right = unsafe { (*b.cast::<PyLong>()).value };
+        let Some(left) = (unsafe { crate::types::int::to_bigint(a) }) else {
+            return raise_type_error("left int operand is invalid");
+        };
+        let Some(right) = (unsafe { crate::types::int::to_bigint(b) }) else {
+            return raise_type_error("right int operand is invalid");
+        };
         let result = match op {
             RICH_LT => left < right,
             RICH_LE => left <= right,
@@ -216,10 +219,43 @@ pub unsafe fn rich_compare(op: u8, a: *mut PyObject, b: *mut PyObject) -> *mut P
         }
     }
 
+    let left_dunder = unsafe { rich_dunder(left_type, op) };
+    let right_dunder = if same_type {
+        ptr::null_mut()
+    } else {
+        unsafe { rich_dunder(right_type, swapped_rich_op(op)) }
+    };
+    let distinct_right_dunder = !right_dunder.is_null() && left_dunder != right_dunder;
+
+    if right_subtype && distinct_right_dunder {
+        match unsafe { call_rich_dunder(right_dunder, b, a, right_type) } {
+            SlotOutcome::Value(value) => return value,
+            SlotOutcome::Error => return ptr::null_mut(),
+            SlotOutcome::Missing | SlotOutcome::NotImplemented => {}
+        }
+    }
+
+    match unsafe { call_rich_dunder(left_dunder, a, b, left_type) } {
+        SlotOutcome::Value(value) => return value,
+        SlotOutcome::Error => return ptr::null_mut(),
+        SlotOutcome::Missing | SlotOutcome::NotImplemented => {}
+    }
+
+    if !right_subtype && distinct_right_dunder {
+        match unsafe { call_rich_dunder(right_dunder, b, a, right_type) } {
+            SlotOutcome::Value(value) => return value,
+            SlotOutcome::Error => return ptr::null_mut(),
+            SlotOutcome::Missing | SlotOutcome::NotImplemented => {}
+        }
+    }
+
     match op {
         RICH_EQ => unsafe { abi::pon_const_int(i64::from(a == b)) },
         RICH_NE => unsafe { abi::pon_const_int(i64::from(a != b)) },
-        _ => raise_type_error(rich_unsupported_message(op)),
+        _ => {
+            let message = unsafe { rich_unsupported_message(op, a, b) };
+            raise_type_error(&message)
+        }
     }
 }
 
@@ -362,6 +398,54 @@ pub unsafe fn subscript_get(object: *mut PyObject, key: *mut PyObject) -> *mut P
     raise_type_error("object is not subscriptable")
 }
 
+/// Deletes a subscription through mapping/sequence assignment slots or `__delitem__`.
+pub unsafe fn subscript_del(object: *mut PyObject, key: *mut PyObject) -> *mut PyObject {
+    let Some(ty) = (unsafe { object_type(object) }) else {
+        return raise_type_error("subscription receiver is NULL or has no type");
+    };
+
+    if let Some(slot) = unsafe { (*ty).tp_as_mapping.as_ref().and_then(|methods| methods.mp_ass_subscript) } {
+        let status = unsafe { slot(object, key, ptr::null_mut()) };
+        if status < 0 {
+            ensure_exception("mapping delete slot returned an error without setting an exception");
+            return ptr::null_mut();
+        }
+        return unsafe { abi::pon_none() };
+    }
+
+    if let Some(slot) = unsafe { (*ty).tp_as_sequence.as_ref().and_then(|methods| methods.sq_ass_item) } {
+        if !unsafe { is_exact_pylong(key) } {
+            return raise_type_error("sequence index must be an int");
+        }
+        let value = unsafe { (*key.cast::<PyLong>()).value };
+        let Ok(index) = isize::try_from(value) else {
+            return raise_type_error("sequence index is out of range for this platform");
+        };
+        let status = unsafe { slot(object, index, ptr::null_mut()) };
+        if status < 0 {
+            ensure_exception("sequence delete slot returned an error without setting an exception");
+            return ptr::null_mut();
+        }
+        return unsafe { abi::pon_none() };
+    }
+
+    let delitem = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern("__delitem__")) };
+    if !delitem.is_null() {
+        let callable = unsafe { crate::descr::descriptor_get(delitem, object, ty) };
+        if callable.is_null() {
+            return ptr::null_mut();
+        }
+        let mut argv = [key];
+        let result = unsafe { abi::pon_call(callable, argv.as_mut_ptr(), argv.len()) };
+        if result.is_null() {
+            return ptr::null_mut();
+        }
+        return unsafe { abi::pon_none() };
+    }
+
+    raise_type_error("object does not support item deletion")
+}
+
 /// Builds `types.GenericAlias` for `builtin[key]` subscripts on constructor
 /// functions (`list[int]`, `dict[str, int]`).  Tuple keys flatten into the
 /// alias argument list; non-constructor receivers return `None` so the caller
@@ -446,6 +530,33 @@ unsafe fn reflected_binary_slot(ty: *mut PyType, op: u8) -> Option<BinaryFunc> {
         })
     }
 }
+
+unsafe fn rich_dunder(ty: *mut PyType, op: u8) -> *mut PyObject {
+    let name = match op {
+        RICH_LT => "__lt__",
+        RICH_LE => "__le__",
+        RICH_EQ => "__eq__",
+        RICH_NE => "__ne__",
+        RICH_GT => "__gt__",
+        RICH_GE => "__ge__",
+        _ => return ptr::null_mut(),
+    };
+    unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern(name)) }
+}
+
+unsafe fn call_rich_dunder(method: *mut PyObject, obj: *mut PyObject, other: *mut PyObject, owner: *mut PyType) -> SlotOutcome {
+    if method.is_null() {
+        return SlotOutcome::Missing;
+    }
+    let callable = unsafe { crate::descr::descriptor_get(method, obj, owner) };
+    if callable.is_null() {
+        return SlotOutcome::Error;
+    }
+    let mut argv = [other];
+    let result = unsafe { abi::pon_call(callable, argv.as_mut_ptr(), argv.len()) };
+    slot_result(result, "rich comparison method returned NULL without setting an exception")
+}
+
 
 fn same_binary_slot(left: Option<BinaryFunc>, right: Option<BinaryFunc>) -> bool {
     match (left, right) {
@@ -663,14 +774,25 @@ fn unary_unsupported_message(op: u8) -> &'static str {
     }
 }
 
-fn rich_unsupported_message(op: u8) -> &'static str {
+fn rich_op_symbol(op: u8) -> Option<&'static str> {
     match op {
-        RICH_LT => "unsupported operands for <",
-        RICH_LE => "unsupported operands for <=",
-        RICH_EQ => "unsupported operands for ==",
-        RICH_NE => "unsupported operands for !=",
-        RICH_GT => "unsupported operands for >",
-        RICH_GE => "unsupported operands for >=",
-        _ => "unknown rich comparison operation",
+        RICH_LT => Some("<"),
+        RICH_LE => Some("<="),
+        RICH_GT => Some(">"),
+        RICH_GE => Some(">="),
+        _ => None,
     }
+}
+
+unsafe fn rich_unsupported_message(op: u8, a: *mut PyObject, b: *mut PyObject) -> String {
+    let Some(symbol) = rich_op_symbol(op) else {
+        return "unknown rich comparison operation".to_owned();
+    };
+    let left = unsafe { object_type(a) }
+        .map(|ty| unsafe { (*ty).name() }.to_owned())
+        .unwrap_or_else(|| "object".to_owned());
+    let right = unsafe { object_type(b) }
+        .map(|ty| unsafe { (*ty).name() }.to_owned())
+        .unwrap_or_else(|| "object".to_owned());
+    format!("'{symbol}' not supported between instances of '{left}' and '{right}'")
 }

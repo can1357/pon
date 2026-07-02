@@ -33,6 +33,7 @@ pub unsafe extern "C" fn pon_call_ex(
     dstar: *mut PyObject,
     feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
+    crate::untag_prelude!(callee, star, dstar);
     // J0.3 CallIC: record the observed callee identity (first target wins;
     // a second distinct target latches the cell megamorphic).  Tier-0 never
     // consults this — it exists to feed O3's tier-1 call specialization.
@@ -85,6 +86,7 @@ pub unsafe extern "C" fn pon_call_method(
     argc: usize,
     feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
+    crate::untag_prelude!(recv_pair);
     catch_object_helper(|| {
         if let Err(message) = ensure_runtime_initialized() {
             return return_null_with_error(message);
@@ -202,6 +204,7 @@ pub unsafe extern "C" fn pon_function_set_closure(
     closure: *mut *mut PyObject,
     closure_count: usize,
 ) -> *mut PyObject {
+    crate::untag_prelude!(function);
     catch_object_helper(|| {
         let cells = match unsafe { object_slice(closure, closure_count) } {
             Ok(values) => values,
@@ -216,6 +219,7 @@ pub unsafe extern "C" fn pon_function_set_closure(
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_make_cell(value: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(value);
     catch_object_helper(|| {
         if value.is_null() {
             return return_null_with_error("cannot create closure cell from NULL");
@@ -226,6 +230,7 @@ pub unsafe extern "C" fn pon_make_cell(value: *mut PyObject) -> *mut PyObject {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_cell_get(cell_object: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(cell_object);
     catch_object_helper(|| match unsafe { cell::cell_get(cell_object.cast::<cell::PyCell>()) } {
         Ok(value) => value,
         Err(message) => return_null_with_error(message),
@@ -234,6 +239,7 @@ pub unsafe extern "C" fn pon_cell_get(cell_object: *mut PyObject) -> *mut PyObje
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_cell_set(cell_object: *mut PyObject, value: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(cell_object, value);
     catch_object_helper(|| match unsafe { cell::cell_set(cell_object.cast::<cell::PyCell>(), value) } {
         Ok(()) => value,
         Err(message) => return_null_with_error(message),
@@ -242,6 +248,7 @@ pub unsafe extern "C" fn pon_cell_set(cell_object: *mut PyObject, value: *mut Py
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_cell_delete(cell_object: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(cell_object);
     catch_object_helper(|| match unsafe { cell::cell_delete(cell_object.cast::<cell::PyCell>()) } {
         Ok(()) => unsafe { super::pon_none() },
         Err(message) => return_null_with_error(message),
@@ -270,6 +277,7 @@ pub unsafe extern "C" fn pon_current_closure_cell(index: usize) -> *mut PyObject
 /// wiring pass.  Descriptor lookup is intentionally not performed here.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_load_method_pair(function: *mut PyObject, receiver: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(function, receiver);
     catch_object_helper(|| match method::new_bound_method(function, receiver) {
         Ok(method) => method.cast::<PyObject>(),
         Err(message) => return_null_with_error(message),

@@ -375,12 +375,14 @@ unsafe fn pon_gen_resume(generator: *mut PyObject, sent: *mut PyObject, thrown: 
 /// Sends a value into a generator/coroutine and returns the next yielded value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_gen_send(generator: *mut PyObject, value: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(generator, value);
     super::catch_object_helper(|| unsafe { pon_gen_resume(generator, value, ptr::null_mut()) })
 }
 
 /// Throws an exception into a generator/coroutine at its suspend point.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_gen_throw(generator: *mut PyObject, exc: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(generator, exc);
     super::catch_object_helper(|| {
         if exc.is_null() {
             return raise_type_error("generator throw exception is null");
@@ -393,6 +395,7 @@ pub unsafe extern "C" fn pon_gen_throw(generator: *mut PyObject, exc: *mut PyObj
 /// `StopIteration`/`GeneratorExit` back (pin J0.1 §4.5).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_gen_close(generator: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(generator);
     super::catch_object_helper(|| {
         let (generator, _types) = match unsafe { expect_generator(generator) } {
             Ok(pair) => pair,
@@ -500,6 +503,7 @@ pub unsafe extern "C" fn pon_gen_consume_payload(frame: *mut GenFrame) -> *mut P
 /// the frame and leave `StopIteration(v)` pending.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_gen_finish(frame: *mut GenFrame, retval: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(retval);
     if frame.is_null() {
         return super::return_null_with_error("generator frame pointer is null");
     }
@@ -611,6 +615,7 @@ pub unsafe extern "C" fn pon_gen_last_stop_value() -> *mut PyObject {
 /// via [`pon_gen_stop_value`]); other exceptions propagate as plain NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_gen_delegate_step(frame: *mut GenFrame, delegate: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(delegate);
     super::catch_object_helper(|| {
         if frame.is_null() {
             return super::return_null_with_error("generator frame pointer is null");
@@ -698,6 +703,7 @@ pub unsafe extern "C" fn pon_gen_delegate_step(frame: *mut GenFrame, delegate: *
 /// Returns an asynchronous iterator via `am_aiter`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_get_aiter(object: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
+    crate::untag_prelude!(object);
     unsafe { super::record_feedback_unary(feedback, object) };
     super::catch_object_helper(|| {
         if object.is_null() {
@@ -725,6 +731,7 @@ pub unsafe extern "C" fn pon_get_aiter(object: *mut PyObject, feedback: *mut Fee
 /// Advances a synchronous iterator for `for` lowering.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_for_next(iterator: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
+    crate::untag_prelude!(iterator);
     // SAFETY: Delegates to the sync iterator helper, preserving NULL+StopIteration.
     unsafe { super::iter::pon_iter_next(iterator, feedback) }
 }
@@ -732,6 +739,7 @@ pub unsafe extern "C" fn pon_for_next(iterator: *mut PyObject, feedback: *mut Fe
 /// Converts an awaitable to its await iterator.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_await(awaitable: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
+    crate::untag_prelude!(awaitable);
     unsafe { super::record_feedback_unary(feedback, awaitable) };
     super::catch_object_helper(|| {
         if awaitable.is_null() {

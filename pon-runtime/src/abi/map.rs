@@ -9,7 +9,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use pon_gc::{GcTypeInfo, TypeId};
 
-use crate::object::{as_object_ptr, PyObject, PyType, PyUnicode};
+use crate::object::{as_object_ptr, PyLong, PyObject, PyType, PyUnicode};
 use crate::thread_state::pon_err_set;
 use crate::types::{dict, frozenset, method, set_};
 
@@ -265,6 +265,7 @@ pub unsafe extern "C" fn pon_build_frozenset(items: *mut *mut PyObject, count: u
 /// Inserts a key/value pair into a dict and returns the dict.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_map_insert(map: *mut PyObject, key: *mut PyObject, value: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(map, key, value);
     super::catch_object_helper(|| {
         let _guard = crate::sync::begin_critical_section(map);
         match unsafe { dict::dict_insert(map, key, value) } {
@@ -277,10 +278,14 @@ pub unsafe extern "C" fn pon_map_insert(map: *mut PyObject, key: *mut PyObject, 
 /// Status form used by mapping slots.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_set_item_status(map: *mut PyObject, key: *mut PyObject, value: *mut PyObject) -> c_int {
+    crate::untag_prelude!(err = -1; map, key, value);
     super::catch_status_helper(|| {
         let _guard = crate::sync::begin_critical_section(map);
         match unsafe { dict::dict_insert(map, key, value) } {
-            Ok(()) => 0,
+            Ok(()) => {
+                crate::dynexec::sync_globals_dict_set(map, key, value);
+                0
+            }
             Err(message) => status_error(message),
         }
     })
@@ -289,6 +294,7 @@ pub unsafe extern "C" fn pon_dict_set_item_status(map: *mut PyObject, key: *mut 
 /// Fetches `map[key]`, raising KeyError on a miss.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_get_item(map: *mut PyObject, key: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(map, key);
     super::catch_object_helper(|| {
         let _guard = crate::sync::begin_critical_section(map);
         match unsafe { dict::dict_get(map, key) } {
@@ -302,41 +308,78 @@ pub unsafe extern "C" fn pon_dict_get_item(map: *mut PyObject, key: *mut PyObjec
 /// Deletes `map[key]` and returns None.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_subscript_del(object: *mut PyObject, key: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(object, key);
     super::catch_object_helper(|| {
         if unsafe { dict::is_dict(object) } {
             let _guard = crate::sync::begin_critical_section(object);
             match unsafe { dict::dict_remove(object, key) } {
-                Ok(Some(_)) => unsafe { super::pon_none() },
+                Ok(Some(_)) => {
+                    crate::dynexec::sync_globals_dict_delete(object, key);
+                    unsafe { super::pon_none() }
+                }
                 Ok(None) => raise_key_error(key),
                 Err(message) => null_error(message),
             }
         } else {
-            null_error("object does not support item deletion")
+            unsafe { crate::abstract_op::subscript_del(object, key) }
         }
     })
 }
 /// Stores `object[key] = value` and returns `value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_subscript_set(object: *mut PyObject, key: *mut PyObject, value: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(object, key, value);
     super::catch_object_helper(|| {
         if unsafe { dict::is_dict(object) } {
             let _guard = crate::sync::begin_critical_section(object);
             match unsafe { dict::dict_insert(object, key, value) } {
-                Ok(()) => value,
+                Ok(()) => {
+                    crate::dynexec::sync_globals_dict_set(object, key, value);
+                    value
+                }
                 Err(message) => null_error(message),
             }
         } else {
-            null_error("object does not support item assignment")
+            if object.is_null() {
+                return null_error("subscription receiver is NULL or has no type");
+            }
+            let ty = unsafe { (*object).ob_type.cast_mut() };
+            if let Some(slot) = unsafe { (*ty).tp_as_mapping.as_ref().and_then(|methods| methods.mp_ass_subscript) } {
+                if unsafe { slot(object, key, value) } < 0 {
+                    ptr::null_mut()
+                } else {
+                    value
+                }
+            } else if let Some(slot) = unsafe { (*ty).tp_as_sequence.as_ref().and_then(|methods| methods.sq_ass_item) } {
+                if unsafe { dict::type_name(key) } != Some("int") {
+                    return null_error("sequence index must be an int");
+                }
+                let index = unsafe { (*key.cast::<PyLong>()).value };
+                let Ok(index) = isize::try_from(index) else {
+                    return null_error("sequence index is out of range for this platform");
+                };
+                if unsafe { slot(object, index, value) } < 0 {
+                    ptr::null_mut()
+                } else {
+                    value
+                }
+            } else {
+                null_error("object does not support item assignment")
+            }
         }
     })
 }
 /// Status form used by mapping slots.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_del_item_status(map: *mut PyObject, key: *mut PyObject) -> c_int {
+    crate::untag_prelude!(err = -1; map, key);
     super::catch_status_helper(|| {
         let _guard = crate::sync::begin_critical_section(map);
         match unsafe { dict::dict_remove(map, key) } {
-            Ok(Some(_)) => 0,
+            Ok(Some(_)) => {
+                crate::dynexec::sync_globals_dict_delete(map, key);
+                0
+            }
             Ok(None) => {
                 let _ = raise_key_error(key);
                 -1
@@ -349,6 +392,7 @@ pub unsafe extern "C" fn pon_dict_del_item_status(map: *mut PyObject, key: *mut 
 /// Merges another exact dict into `map` and returns `map`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_merge(map: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(map, other);
     super::catch_object_helper(|| {
         let _guard = crate::sync::begin_critical_section2(map, other);
         match unsafe { dict::dict_merge_exact(map, other) } {
@@ -361,6 +405,7 @@ pub unsafe extern "C" fn pon_dict_merge(map: *mut PyObject, other: *mut PyObject
 /// Merges exact-dict entries from `other` into `map`, rejecting duplicates for call kwargs.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_merge_unique(map: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(map, other);
     super::catch_object_helper(|| {
         let _guard = crate::sync::begin_critical_section2(map, other);
         let entries = match unsafe { dict::dict_entries_snapshot(other) } {
@@ -384,12 +429,14 @@ pub unsafe extern "C" fn pon_dict_merge_unique(map: *mut PyObject, other: *mut P
 /// `dict.update` exact-dict helper. Returns the receiver.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_update(map: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(map, other);
     unsafe { pon_dict_merge(map, other) }
 }
 
 /// `dict.get(key, default=None)` helper.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_get_method(map: *mut PyObject, key: *mut PyObject, default: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(map, key, default);
     super::catch_object_helper(|| {
         let fallback = match super::with_runtime(|runtime| if default.is_null() { none_object(runtime) } else { default }) {
             Some(value) => value,
@@ -553,6 +600,7 @@ pub unsafe extern "C" fn pon_dict_get_bound_method(map: *mut PyObject) -> *mut P
 /// `dict.setdefault(key, default=None)` helper.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_setdefault(map: *mut PyObject, key: *mut PyObject, default: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(map, key, default);
     super::catch_object_helper(|| {
         let value = match super::with_runtime(|runtime| if default.is_null() { none_object(runtime) } else { default }) {
             Some(value) => value,
@@ -573,6 +621,7 @@ pub unsafe extern "C" fn pon_dict_setdefault(map: *mut PyObject, key: *mut PyObj
 /// `dict.pop(key[, default])` helper. A NULL `default` means no default was supplied.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_pop(map: *mut PyObject, key: *mut PyObject, default: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(map, key, default);
     super::catch_object_helper(|| {
         let _guard = crate::sync::begin_critical_section(map);
         match unsafe { dict::dict_remove(map, key) } {
@@ -586,12 +635,14 @@ pub unsafe extern "C" fn pon_dict_pop(map: *mut PyObject, key: *mut PyObject, de
 /// Returns an insertion-order key iterator for a dict.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_keys(map: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(map);
     unsafe { pon_dict_iter_keys(map) }
 }
 
 /// Returns an insertion-order value iterator for a dict.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_values(map: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(map);
     super::catch_object_helper(|| match super::with_runtime(|runtime| {
         register_map_types(runtime);
         alloc_dict_iter(runtime, map, dict::DictIterKind::Values)
@@ -604,6 +655,7 @@ pub unsafe extern "C" fn pon_dict_values(map: *mut PyObject) -> *mut PyObject {
 /// Returns an insertion-order item iterator for a dict.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_items(map: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(map);
     super::catch_object_helper(|| match super::with_runtime(|runtime| {
         register_map_types(runtime);
         alloc_dict_iter(runtime, map, dict::DictIterKind::Items)
@@ -616,6 +668,7 @@ pub unsafe extern "C" fn pon_dict_items(map: *mut PyObject) -> *mut PyObject {
 /// Returns an insertion-order key iterator for a dict.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_iter_keys(map: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(map);
     super::catch_object_helper(|| {
         if unsafe { !dict::is_dict(map) } {
             return null_error("expected dict object");
@@ -633,6 +686,7 @@ pub unsafe extern "C" fn pon_dict_iter_keys(map: *mut PyObject) -> *mut PyObject
 /// Advances a dictionary iterator.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_iter_next(iterator: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(iterator);
     super::catch_object_helper(|| {
         if unsafe { !dict::is_dict_iter(iterator) } {
             return null_error("expected dict iterator object");
@@ -659,6 +713,7 @@ pub unsafe extern "C" fn pon_dict_iter_next(iterator: *mut PyObject) -> *mut PyO
 /// Adds an element to a set and returns the receiver.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_set_add(set: *mut PyObject, item: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(set, item);
     super::catch_object_helper(|| {
         let _guard = crate::sync::begin_critical_section(set);
         match unsafe { set_::set_add(set, item) } {
@@ -683,6 +738,7 @@ pub unsafe extern "C" fn pon_set_discard(set: *mut PyObject, item: *mut PyObject
 /// Contains predicate for sequence/dict/set/frozenset. Returns `1`, `0`, or `-1` on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_contains(container: *mut PyObject, item: *mut PyObject) -> c_int {
+    crate::untag_prelude!(err = -1; container, item);
     super::catch_status_helper(|| {
         let _guard = crate::sync::begin_critical_section(container);
         if unsafe { dict::is_dict(container) } {
@@ -729,6 +785,7 @@ unsafe fn sequence_contains_slot(
 /// Returns an iterator over a set/frozenset.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_set_iter(set: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(set);
     super::catch_object_helper(|| {
         if unsafe { !set_::is_any_set(set) } {
             return null_error("expected set or frozenset object");
@@ -743,6 +800,7 @@ pub unsafe extern "C" fn pon_set_iter(set: *mut PyObject) -> *mut PyObject {
 /// Advances a set/frozenset iterator.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_set_iter_next(iterator: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(iterator);
     super::catch_object_helper(|| {
         if !matches!(unsafe { dict::type_name(iterator) }, Some("set_iterator")) {
             return null_error("expected set iterator object");
@@ -765,6 +823,7 @@ pub unsafe extern "C" fn pon_set_iter_next(iterator: *mut PyObject) -> *mut PyOb
 /// Returns `left | right` for set/frozenset operands.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_set_union(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(left, right);
     super::catch_object_helper(|| {
         let _guard = crate::sync::begin_critical_section2(left, right);
         let left_entries = match unsafe { set_::entries_snapshot(left) } {
@@ -789,6 +848,7 @@ pub unsafe extern "C" fn pon_set_union(left: *mut PyObject, right: *mut PyObject
 /// Returns `left & right` for set/frozenset operands.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_set_intersection(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(left, right);
     super::catch_object_helper(|| {
         let _guard = crate::sync::begin_critical_section2(left, right);
         let left_entries = match unsafe { set_::entries_snapshot(left) } {
@@ -817,6 +877,7 @@ pub unsafe extern "C" fn pon_set_intersection(left: *mut PyObject, right: *mut P
 /// Returns `left - right` for set/frozenset operands.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_set_difference(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(left, right);
     super::catch_object_helper(|| {
         let _guard = crate::sync::begin_critical_section2(left, right);
         let left_entries = match unsafe { set_::entries_snapshot(left) } {
@@ -944,6 +1005,7 @@ pub unsafe fn pon_set_bound_method(set: *mut PyObject, name: &str) -> *mut PyObj
 /// Hashes a frozenset. Returns `-1` on error with a thread-state error set.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_frozenset_hash(object: *mut PyObject) -> isize {
+    crate::untag_prelude!(err = -1; object);
     match catch_unwind(AssertUnwindSafe(|| unsafe { frozenset::frozenset_hash_value(object) })) {
         Ok(Ok(hash)) => hash,
         Ok(Err(message)) => {

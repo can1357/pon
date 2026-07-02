@@ -20,6 +20,10 @@ use std::sync::{Mutex, MutexGuard};
 /// Phase A does not carry per-type alignment metadata, so the heap uses a
 /// conservative C-compatible alignment for every object.
 pub const DEFAULT_HEAP_ALIGNMENT: usize = 16;
+/// Low bits used by runtime immediate values; non-heap candidates are skipped.
+pub const IMMEDIATE_TAG_MASK: usize = 0b11;
+/// Low-two-bits pattern of every real GC heap pointer candidate.
+pub const IMMEDIATE_TAG_HEAP: usize = 0b00;
 
 static EXTERNAL_STACK_BASE: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
 
@@ -162,6 +166,10 @@ pub struct WriteBarrier;
 impl WriteBarrier {
     /// Records that `slot` now contains `new`.
     pub fn record(slot: *mut *mut u8, new: *mut u8) {
+        if new.addr() & IMMEDIATE_TAG_MASK != IMMEDIATE_TAG_HEAP {
+            return;
+        }
+
         #[cfg(feature = "free-threading")]
         {
             write_barrier_state().record(slot, new);
@@ -991,6 +999,10 @@ fn size_class_for(size: usize) -> usize {
 }
 
 fn mark_pointer(state: &mut HeapState, mark_queue: &mut MarkQueue, pointer: *mut u8) -> bool {
+    if pointer.addr() & IMMEDIATE_TAG_MASK != IMMEDIATE_TAG_HEAP {
+        return false;
+    }
+
     let Some(classification) = state.classify_pointer(pointer) else {
         return false;
     };
@@ -1031,6 +1043,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const TYPE_ID: TypeId = TypeId(1);
+    static PRECISE_ROOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static PRECISE_ROOT_A: AtomicUsize = AtomicUsize::new(0);
+    static PRECISE_ROOT_B: AtomicUsize = AtomicUsize::new(0);
+
 
     #[cfg(feature = "free-threading")]
     static BARRIER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1064,6 +1080,26 @@ mod tests {
             trace: no_trace,
             finalize,
         }
+    }
+
+    fn tagged_small_int(value: i64) -> *mut u8 {
+        (((value as usize) << 1) | 1) as *mut u8
+    }
+
+    fn reserved_immediate(address: usize) -> *mut u8 {
+        ((address & !IMMEDIATE_TAG_MASK) | 0b10) as *mut u8
+    }
+
+    unsafe extern "C" fn precise_roots_hook(visitor: &mut dyn FnMut(*mut u8)) -> bool {
+        let first = PRECISE_ROOT_A.load(Ordering::SeqCst) as *mut u8;
+        let second = PRECISE_ROOT_B.load(Ordering::SeqCst) as *mut u8;
+        if !first.is_null() {
+            visitor(first);
+        }
+        if !second.is_null() {
+            visitor(second);
+        }
+        true
     }
 
     #[test]
@@ -1279,6 +1315,56 @@ mod tests {
         assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn tagged_root_patterns_do_not_retain_or_crash() {
+        static FINALIZED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn finalize(_object: *mut u8) {
+            FINALIZED.fetch_add(1, Ordering::SeqCst);
+        }
+
+        FINALIZED.store(0, Ordering::SeqCst);
+        let heap = Heap::new();
+        heap.register_type(TYPE_ID, type_info(32, Some(finalize)));
+        let object = heap.alloc(32, TYPE_ID);
+
+        heap.collect(&mut Roots(vec![tagged_small_int(0), tagged_small_int(-1), 0x2 as *mut u8]));
+
+        assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
+
+        let heap = Heap::new();
+        heap.register_type(TYPE_ID, type_info(32, None));
+        heap.collect(&mut Roots(vec![
+            tagged_small_int(0),
+            tagged_small_int(-1),
+            0x2 as *mut u8,
+            (usize::MAX | 1) as *mut u8,
+        ]));
+
+        let _ = object;
+    }
+
+    #[test]
+    fn tagged_root_aliasing_allocation_address_is_filtered_before_classification() {
+        static FINALIZED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn finalize(_object: *mut u8) {
+            FINALIZED.fetch_add(1, Ordering::SeqCst);
+        }
+
+        FINALIZED.store(0, Ordering::SeqCst);
+        let heap = Heap::new();
+        heap.register_type(TYPE_ID, type_info(32, Some(finalize)));
+        let object = heap.alloc(32, TYPE_ID);
+        let odd_alias = (object.addr() | 1) as *mut u8;
+        let reserved_alias = reserved_immediate(object.addr());
+
+        heap.collect(&mut Roots(vec![odd_alias, reserved_alias]));
+
+        assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
+        assert!(heap.lock_state().allocations.is_empty());
+    }
+
     #[repr(C)]
     struct Node {
         next: *mut u8,
@@ -1292,6 +1378,86 @@ mod tests {
         }
     }
 
+
+    #[repr(C)]
+    struct Pair {
+        first: *mut u8,
+        second: *mut u8,
+    }
+
+    unsafe extern "C" fn trace_pair(object: *mut u8, visitor: &mut dyn FnMut(*mut u8)) {
+        // SAFETY: Test allocations for this type are initialized as `Pair`.
+        let pair = unsafe { &*object.cast::<Pair>() };
+        if !pair.first.is_null() {
+            visitor(pair.first);
+        }
+        if !pair.second.is_null() {
+            visitor(pair.second);
+        }
+    }
+
+    #[test]
+    fn tagged_child_field_is_skipped_while_aligned_sibling_survives() {
+        let heap = Heap::new();
+        heap.register_type(
+            TYPE_ID,
+            GcTypeInfo {
+                size: std::mem::size_of::<Pair>(),
+                trace: trace_pair,
+                finalize: None,
+            },
+        );
+        let holder = heap.alloc(std::mem::size_of::<Pair>(), TYPE_ID);
+        let sibling = heap.alloc(std::mem::size_of::<Pair>(), TYPE_ID);
+
+        // SAFETY: `holder` is a live `Pair` allocation owned by this heap.
+        unsafe {
+            ptr::write(
+                holder.cast::<Pair>(),
+                Pair {
+                    first: tagged_small_int(42),
+                    second: sibling,
+                },
+            );
+        }
+
+        heap.collect(&mut Roots(vec![holder]));
+
+        let state = heap.lock_state();
+        assert!(state.classify_pointer(holder).is_some());
+        assert!(state.classify_pointer(sibling).is_some());
+    }
+
+    #[test]
+    fn precise_roots_accept_aligned_values_and_skip_tagged_values() {
+        static FINALIZED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn finalize(_object: *mut u8) {
+            FINALIZED.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let _guard = PRECISE_ROOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        set_precise_stack_roots(None);
+        PRECISE_ROOT_A.store(0, Ordering::SeqCst);
+        PRECISE_ROOT_B.store(0, Ordering::SeqCst);
+
+        FINALIZED.store(0, Ordering::SeqCst);
+        let heap = Heap::new();
+        heap.register_type(TYPE_ID, type_info(16, Some(finalize)));
+        let object = heap.alloc(16, TYPE_ID);
+        PRECISE_ROOT_A.store(tagged_small_int(5).addr(), Ordering::SeqCst);
+        PRECISE_ROOT_B.store(object.addr(), Ordering::SeqCst);
+        set_precise_stack_roots(Some(precise_roots_hook));
+
+        heap.collect(&mut Roots(Vec::new()));
+        set_precise_stack_roots(None);
+
+        assert_eq!(FINALIZED.load(Ordering::SeqCst), 0);
+        heap.collect(&mut Roots(Vec::new()));
+        assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
+    }
     #[test]
     fn traced_cycle_is_preserved_while_rooted_then_reclaimed() {
         static FINALIZED: AtomicUsize = AtomicUsize::new(0);
@@ -1377,7 +1543,7 @@ mod tests {
     fn write_barrier_records_and_shades_during_concurrent_marking() {
         let _guard = reset_write_barrier_for_test();
         let mut slot = ptr::null_mut();
-        let new = NonNull::<u8>::dangling().as_ptr();
+        let new = 0x1000 as *mut u8;
 
         WriteBarrier::begin_concurrent_marking();
         WriteBarrier::record(&mut slot, new);
@@ -1390,6 +1556,22 @@ mod tests {
             vec![WriteBarrierRecord::new(&mut slot, new)],
         );
         assert_eq!(WriteBarrier::drain_shaded(), vec![new]);
+        assert!(WriteBarrier::drain_records().is_empty());
+        assert!(WriteBarrier::drain_shaded().is_empty());
+    }
+
+    #[cfg(feature = "free-threading")]
+    #[test]
+    fn write_barrier_skips_tagged_new_values_during_concurrent_marking() {
+        let _guard = reset_write_barrier_for_test();
+        let mut slot = ptr::null_mut();
+
+        WriteBarrier::begin_concurrent_marking();
+        WriteBarrier::record(&mut slot, tagged_small_int(7));
+        WriteBarrier::record(&mut slot, reserved_immediate(0x1000));
+        pon_gc_write_barrier(&mut slot, tagged_small_int(-1));
+        WriteBarrier::end_concurrent_marking();
+
         assert!(WriteBarrier::drain_records().is_empty());
         assert!(WriteBarrier::drain_shaded().is_empty());
     }

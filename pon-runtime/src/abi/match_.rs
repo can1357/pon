@@ -275,6 +275,7 @@ fn raise_assertion_error(message: *mut PyObject) -> *mut PyObject {
 /// containers degrade to a non-match instead of failing during extraction.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_match_sequence(subject: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
+    crate::untag_prelude!(subject);
     unsafe { super::record_feedback_unary(feedback, subject) };
     catch_match_object(|| {
         if !unsafe { type_name_in(subject, SEQUENCE_PATTERN_NAMES) } {
@@ -300,6 +301,7 @@ pub unsafe extern "C" fn pon_match_sequence(subject: *mut PyObject, feedback: *m
 /// required so partially-wired native dicts degrade to a non-match.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_match_mapping(subject: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
+    crate::untag_prelude!(subject);
     unsafe { super::record_feedback_unary(feedback, subject) };
     catch_match_object(|| truth_object(unsafe { is_mapping_pattern_candidate(subject) }))
 }
@@ -330,6 +332,7 @@ pub unsafe extern "C" fn pon_match_get_len(subject: *mut PyObject, feedback: *mu
 /// Returns boxed true when the subject length satisfies the pattern threshold.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_match_len_ge(subject: *mut PyObject, n: usize, exact: u8) -> *mut PyObject {
+    crate::untag_prelude!(subject);
     catch_match_object(|| match unsafe { match_len(subject) } {
         Ok(len) => {
             let Ok(len) = usize::try_from(len) else {
@@ -352,6 +355,7 @@ pub unsafe extern "C" fn pon_match_keys(
     keys: *mut *mut PyObject,
     nkeys: usize,
 ) -> *mut PyObject {
+    crate::untag_prelude!(subject);
     catch_match_object(|| {
         if nkeys != 0 && keys.is_null() {
             return raise_type_error("MATCH_KEYS received a NULL key array");
@@ -468,6 +472,7 @@ pub unsafe extern "C" fn pon_match_class(
     kw: *const u32,
     nkw: usize,
 ) -> *mut PyObject {
+    crate::untag_prelude!(subject, cls);
     catch_match_object(|| {
         if nkw != 0 && kw.is_null() {
             return raise_type_error("MATCH_CLASS received a NULL keyword array");
@@ -569,6 +574,7 @@ pub unsafe extern "C" fn pon_match_class(
 /// Implements `assert test, msg` once lowering has evaluated both operands.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_assert(test: *mut PyObject, message: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(test, message);
     catch_match_object(|| match unsafe { abstract_op::is_true(test) } {
         1 => unsafe { super::pon_none() },
         0 => raise_assertion_error(message),

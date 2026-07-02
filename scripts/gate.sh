@@ -30,6 +30,7 @@ if [ "$MODE" = "full" ]; then
   run ft       cargo test --workspace --features free-threading -q
   run ftstress cargo run -q -p pon-conformance --features free-threading -- --suite ft-stress
   run bench    cargo run -q -p pon-conformance -- --bench
+  run tier0diff env PON_TIER0_ONLY=1 cargo run -q -p pon-conformance -- --suite cpython --check-floor
 fi
 
 echo "GATE-SUMMARY: $([ $FAIL -eq 0 ] && echo ALL-GREEN || echo RED)"

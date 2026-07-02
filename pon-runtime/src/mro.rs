@@ -173,4 +173,32 @@ mod tests {
             assert_eq!(names, ["D", "B", "C", "A", "object"]);
         }
     }
+
+    #[test]
+    fn c3_rejects_inconsistent_base_order() {
+        let mut type_type = PyType::new(ptr::null(), "type", core::mem::size_of::<PyType>());
+        let type_ptr = &mut type_type as *mut PyType;
+        type_type.ob_base.ob_type = type_ptr;
+
+        let mut object = PyType::new(type_ptr, "object", 0);
+        let object_ptr = &mut object as *mut PyType;
+        let mut x = PyType::new(type_ptr, "X", 0);
+        let x_ptr = &mut x as *mut PyType;
+        let mut y = PyType::new(type_ptr, "Y", 0);
+        let y_ptr = &mut y as *mut PyType;
+        let mut a = PyType::new(type_ptr, "A", 0);
+        let a_ptr = &mut a as *mut PyType;
+        let mut b = PyType::new(type_ptr, "B", 0);
+        let b_ptr = &mut b as *mut PyType;
+        let mut c = PyType::new(type_ptr, "C", 0);
+        let c_ptr = &mut c as *mut PyType;
+
+        unsafe {
+            assert_eq!(set_c3_mro(x_ptr, &[object_ptr]), 0);
+            assert_eq!(set_c3_mro(y_ptr, &[object_ptr]), 0);
+            assert_eq!(set_c3_mro(a_ptr, &[x_ptr, y_ptr]), 0);
+            assert_eq!(set_c3_mro(b_ptr, &[y_ptr, x_ptr]), 0);
+            assert_eq!(set_c3_mro(c_ptr, &[a_ptr, b_ptr]), -1);
+        }
+    }
 }

@@ -243,6 +243,7 @@ pub unsafe extern "C" fn pon_thread_detach() -> i32 {
 /// callback returns or panics.  A NULL entry returns `-1` and records a diagnostic.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_thread_start_new(entry: *const u8, arg: *mut PyObject) -> i32 {
+    crate::untag_prelude!(err = -1; arg);
     match catch_unwind(AssertUnwindSafe(|| {
         if entry.is_null() {
             pon_err_set("thread entry pointer is null");

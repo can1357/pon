@@ -130,6 +130,7 @@ fn range_type() -> *mut PyType {
 fn slice_type() -> *mut PyType {
     SLICE_TYPE.get_or_init(|| {
         let mut ty = PyType::new(ptr::null(), "slice", mem::size_of::<PySlice>());
+        slice_::install_slice_slots(&mut ty);
         ty.gc_type_id = TYPE_ID_SLICE.0 as usize;
         Box::into_raw(Box::new(ty)) as usize
     });
@@ -249,7 +250,7 @@ fn alloc_list_from_slice(runtime: &Runtime, values: &[*mut PyObject]) -> Result<
     Ok(as_object_ptr(object))
 }
 
-fn alloc_tuple_from_slice(runtime: &Runtime, values: &[*mut PyObject]) -> Result<*mut PyObject, String> {
+pub(crate) fn alloc_tuple_from_slice(runtime: &Runtime, values: &[*mut PyObject]) -> Result<*mut PyObject, String> {
     register_seq_gc_types(runtime);
     let items = leak_slots(values.len())?;
     if !items.is_null() {
@@ -1492,6 +1493,7 @@ pub unsafe extern "C" fn pon_build_tuple(argv: *mut *mut PyObject, n: usize) -> 
 /// Builds a Python `range(start, stop, step)` object.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_build_range(start: *mut PyObject, stop: *mut PyObject, step: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(start, stop, step);
     catch_object_helper(|| {
         let start_value = if is_none(start) { 0 } else { match long_value(start) { Ok(value) => value, Err(message) => return return_null_with_error(message) } };
         let stop_value = match long_value(stop) {
@@ -1510,6 +1512,7 @@ pub unsafe extern "C" fn pon_build_range(start: *mut PyObject, stop: *mut PyObje
 /// Builds a Python slice object.  NULL bounds are canonicalized to `None`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_build_slice(start: *mut PyObject, stop: *mut PyObject, step: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(start, stop, step);
     catch_object_helper(|| {
         let none = match none_object() {
             Ok(value) => value,
@@ -1528,6 +1531,7 @@ pub unsafe extern "C" fn pon_build_slice(start: *mut PyObject, stop: *mut PyObje
 /// Appends `value` to `list` and returns the list on success.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_list_append(list: *mut PyObject, value: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(list, value);
     catch_object_helper(|| match list_append_raw(list, value) {
         Ok(()) => list,
         Err(message) => return_null_with_error(message),
@@ -1537,6 +1541,7 @@ pub unsafe extern "C" fn pon_list_append(list: *mut PyObject, value: *mut PyObje
 /// Extends `list` with every item in `iterable` and returns the list on success.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_list_extend(list: *mut PyObject, iterable: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(list, iterable);
     catch_object_helper(|| {
         let values = match sequence_to_vec(iterable) {
             Ok(values) => values,
@@ -1554,6 +1559,7 @@ pub unsafe extern "C" fn pon_list_extend(list: *mut PyObject, iterable: *mut PyO
 /// Stable-sort a list containing simple comparable tier-0 values.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_list_sort(list: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(list);
     catch_object_helper(|| {
         if !is_list(list) {
             return return_null_with_error(format!("list.sort expected list, got {}", object_type_name(list)));
@@ -1575,6 +1581,7 @@ pub unsafe extern "C" fn pon_list_sort(list: *mut PyObject) -> *mut PyObject {
 /// Returns the length of a sequence as a C `isize` status value.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_seq_len(object: *mut PyObject) -> isize {
+    crate::untag_prelude!(err = -1; object);
     match catch_unwind(AssertUnwindSafe(|| sequence_len_raw(object))) {
         Ok(Ok(len)) => isize::try_from(len).unwrap_or_else(|_| return_minus_one_with_error("sequence length exceeds isize") as isize),
         Ok(Err(message)) => return_minus_one_with_error(message) as isize,
@@ -1585,6 +1592,7 @@ pub unsafe extern "C" fn pon_seq_len(object: *mut PyObject) -> isize {
 /// Returns `len(object)` as a boxed integer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_get_len(object: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
+    crate::untag_prelude!(object);
     unsafe { super::record_feedback_unary(feedback, object) };
     catch_object_helper(|| {
         let len = match object_len_raw(object, true) {
@@ -1605,6 +1613,7 @@ pub unsafe extern "C" fn pon_get_len(object: *mut PyObject, feedback: *mut Feedb
 /// Returns `object[index_or_slice]` through sequence semantics.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_seq_get_item(object: *mut PyObject, index_or_slice: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(object, index_or_slice);
     catch_object_helper(|| {
         if is_slice(index_or_slice) {
             match sequence_slice_raw(object, index_or_slice) {
@@ -1623,6 +1632,7 @@ pub unsafe extern "C" fn pon_seq_get_item(object: *mut PyObject, index_or_slice:
 /// Stores `value` into `object[index_or_slice]`; NULL value means deletion.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_seq_set_item(object: *mut PyObject, index_or_slice: *mut PyObject, value: *mut PyObject) -> i32 {
+    crate::untag_prelude!(err = -1; object, index_or_slice, value);
     catch_status_helper(|| match list_ass_subscript_raw(object, index_or_slice, value) {
         Ok(()) => 0,
         Err(message) => return_minus_one_with_error(message),
@@ -1632,12 +1642,14 @@ pub unsafe extern "C" fn pon_seq_set_item(object: *mut PyObject, index_or_slice:
 /// Deletes `object[index_or_slice]`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_seq_del_item(object: *mut PyObject, index_or_slice: *mut PyObject) -> i32 {
+    crate::untag_prelude!(err = -1; object, index_or_slice);
     unsafe { pon_seq_set_item(object, index_or_slice, ptr::null_mut()) }
 }
 
 /// Returns a newly allocated C array containing exactly `n` unpacked elements.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_unpack_seq(value: *mut PyObject, n: usize, feedback: *mut FeedbackCell) -> *mut *mut PyObject {
+    crate::untag_prelude!(value);
     unsafe { super::record_feedback_unary(feedback, value) };
     catch_object_helper(|| {
         let values = match sequence_to_vec(value) {
@@ -1654,6 +1666,7 @@ pub unsafe extern "C" fn pon_unpack_seq(value: *mut PyObject, n: usize, feedback
 /// Returns unpack-ex results: leading items, a middle list, then trailing items.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_unpack_ex(value: *mut PyObject, before: usize, after: usize) -> *mut *mut PyObject {
+    crate::untag_prelude!(value);
     catch_object_helper(|| {
         let values = match sequence_to_vec(value) {
             Ok(values) => values,

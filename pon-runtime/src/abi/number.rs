@@ -55,6 +55,7 @@ pub unsafe extern "C" fn pon_binary_op(
     b: *mut PyObject,
     feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
+    crate::untag_prelude!(a, b);
     unsafe { super::record_feedback_binary(feedback, a, b) };
     super::catch_object_helper(|| {
         unsafe {
@@ -87,6 +88,7 @@ pub unsafe extern "C" fn pon_number_binary(
     b: *mut PyObject,
     feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
+    crate::untag_prelude!(a, b);
     unsafe { pon_binary_op(op, a, b, feedback) }
 }
 
@@ -94,6 +96,7 @@ pub unsafe extern "C" fn pon_number_binary(
 /// exception set on error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_unary_op(op: NumberOp, a: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
+    crate::untag_prelude!(a);
     unsafe { super::record_feedback_unary(feedback, a) };
     super::catch_object_helper(|| {
         unsafe {
@@ -109,6 +112,7 @@ pub unsafe extern "C" fn pon_unary_op(op: NumberOp, a: *mut PyObject, feedback: 
 /// Phase-B helper-table alias for unary numeric dispatch.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_number_unary(op: NumberOp, a: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
+    crate::untag_prelude!(a);
     unsafe { pon_unary_op(op, a, feedback) }
 }
 
@@ -120,6 +124,7 @@ pub unsafe extern "C" fn pon_number_inplace(
     b: *mut PyObject,
     feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
+    crate::untag_prelude!(a, b);
     unsafe { pon_binary_op(op, a, b, feedback) }
 }
 
@@ -127,6 +132,7 @@ pub unsafe extern "C" fn pon_number_inplace(
 /// or `1`, and non-indexable values raise `TypeError`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_index(object: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(object);
     super::catch_object_helper(|| {
         unsafe {
             install_runtime_int_slots(object);
@@ -139,6 +145,63 @@ pub unsafe extern "C" fn pon_index(object: *mut PyObject) -> *mut PyObject {
         }
         raise_type_error("object cannot be interpreted as an integer")
     })
+}
+
+/// Implements `abs()` for built-in numeric objects.
+#[must_use]
+pub fn abs_object(object: *mut PyObject) -> *mut PyObject {
+    super::catch_object_helper(|| {
+        unsafe {
+            install_runtime_int_slots(object);
+        }
+        match unsafe { numeric_value(object) } {
+            Some(NumericValue::Int(value)) => int::from_bigint(value.abs()),
+            Some(NumericValue::Float(value)) => float::from_f64(value.abs()),
+            Some(NumericValue::Complex(real, imag)) => float::from_f64(real.hypot(imag)),
+            None => raise_type_error("bad operand type for abs()"),
+        }
+    })
+}
+
+/// Implements `divmod()` for built-in int and float operands.
+#[must_use]
+pub fn divmod_objects(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    super::catch_object_helper(|| {
+        unsafe {
+            install_runtime_int_slots(left);
+            install_runtime_int_slots(right);
+        }
+        match unsafe { (numeric_value(left), numeric_value(right)) } {
+            (Some(NumericValue::Int(left)), Some(NumericValue::Int(right))) => divmod_ints(&left, &right),
+            (Some(left), Some(right)) => divmod_reals(left, right),
+            _ => raise_type_error("unsupported operands for divmod()"),
+        }
+    })
+}
+
+fn divmod_ints(left: &BigInt, right: &BigInt) -> *mut PyObject {
+    if right.is_zero() {
+        return raise_value_error("integer division or modulo by zero");
+    }
+    let (quotient, remainder) = left.div_mod_floor(right);
+    let mut values = [int::from_bigint(quotient), int::from_bigint(remainder)];
+    unsafe { crate::abi::seq::pon_build_tuple(values.as_mut_ptr(), values.len()) }
+}
+
+fn divmod_reals(left: NumericValue, right: NumericValue) -> *mut PyObject {
+    let Some(left) = real_as_f64(left) else {
+        return raise_type_error("int too large to convert to float");
+    };
+    let Some(right) = real_as_f64(right) else {
+        return raise_type_error("int too large to convert to float");
+    };
+    if right == 0.0 {
+        return raise_value_error("float divmod()");
+    }
+    let quotient = (left / right).floor();
+    let remainder = left - quotient * right;
+    let mut values = [float::from_f64(quotient), float::from_f64(remainder)];
+    unsafe { crate::abi::seq::pon_build_tuple(values.as_mut_ptr(), values.len()) }
 }
 
 /// Converts a Python numeric object to `f64`.
@@ -418,22 +481,187 @@ fn unary_unsupported_message(op: NumberOp) -> &'static str {
 #[cfg(test)]
 mod tests {
     use core::ptr;
+    use std::sync::MutexGuard;
 
     use num_bigint::BigInt;
     use num_traits::One;
 
     use super::*;
-    use crate::thread_state::pon_err_clear;
+    use crate::object::PyObject;
+    use crate::thread_state::{pon_err_clear, test_state_lock};
 
-    unsafe fn init() {
-        assert_eq!(unsafe { crate::abi::pon_runtime_init() }, 0);
+    fn init() -> MutexGuard<'static, ()> {
+        let guard = test_state_lock();
+        unsafe {
+            assert_eq!(crate::abi::pon_runtime_init(), 0);
+        }
         pon_err_clear();
+        guard
+    }
+
+    fn str_object(text: &str) -> *mut PyObject {
+        let object = unsafe { crate::abi::pon_const_str(text.as_ptr(), text.len()) };
+        assert!(!object.is_null(), "failed to allocate test str {text:?}");
+        object
+    }
+
+    fn parse_bigint(text: &str) -> BigInt {
+        BigInt::parse_bytes(text.as_bytes(), 10).expect("valid decimal BigInt literal")
+    }
+
+    #[track_caller]
+    fn assert_bigint_object(object: *mut PyObject, expected: BigInt) {
+        assert!(!object.is_null());
+        assert_eq!(unsafe { int::to_bigint(object) }, Some(expected));
+    }
+
+    #[track_caller]
+    fn assert_binary_bigint(op: NumberOp, left: &BigInt, right: &BigInt, expected: BigInt) {
+        let result = unsafe {
+            pon_binary_op(
+                op,
+                int::from_bigint(left.clone()),
+                int::from_bigint(right.clone()),
+                ptr::null_mut(),
+            )
+        };
+        assert_bigint_object(result, expected);
+    }
+
+    #[track_caller]
+    fn assert_unary_bigint(op: NumberOp, value: &BigInt, expected: BigInt) {
+        let result = unsafe { pon_unary_op(op, int::from_bigint(value.clone()), ptr::null_mut()) };
+        assert_bigint_object(result, expected);
+    }
+
+    #[test]
+    fn k3_numeric_bigint_spill_binary_and_unary_ops_keep_arbitrary_precision() {
+        let _guard = init();
+        let left = (BigInt::one() << 80_usize) + BigInt::from(123);
+        let right = (BigInt::one() << 75_usize) - BigInt::from(77);
+        assert_binary_bigint(BINARY_ADD, &left, &right, left.clone() + right.clone());
+        assert_binary_bigint(BINARY_MUL, &left, &right, left.clone() * right.clone());
+        assert_binary_bigint(BINARY_LSHIFT, &left, &BigInt::from(17), left.clone() << 17_usize);
+        assert_binary_bigint(BINARY_RSHIFT, &left, &BigInt::from(9), left.clone() >> 9_usize);
+
+        let negative = -((BigInt::one() << 84_usize) + BigInt::from(0x5a5a_u32));
+        let mask = (BigInt::one() << 82_usize) - BigInt::from(0x1234_u32);
+        assert_binary_bigint(BINARY_AND, &negative, &mask, negative.clone() & mask.clone());
+        assert_binary_bigint(BINARY_OR, &negative, &mask, negative.clone() | mask.clone());
+        assert_binary_bigint(BINARY_XOR, &negative, &mask, negative.clone() ^ mask.clone());
+        assert_unary_bigint(UNARY_NEG, &negative, -negative.clone());
+        assert_unary_bigint(UNARY_INVERT, &negative, !negative.clone());
+    }
+
+    #[test]
+    fn k3_numeric_int_hash_matches_cpython_width_boundary_canaries() {
+        let cases = [
+            ((BigInt::one() << 61_usize) - BigInt::from(1), 0_isize),
+            (BigInt::one() << 61_usize, 1_isize),
+            (BigInt::from(-1), -2_isize),
+            (BigInt::one() << 64_usize, 8_isize),
+        ];
+
+        for (value, expected) in cases {
+            assert_eq!(int::hash_bigint(&value), expected, "hash({value})");
+        }
+    }
+
+    #[test]
+    fn k3_numeric_float_repr_matches_shortest_roundtrip_canaries() {
+        let cases = [
+            (0.1, "0.1"),
+            (1.0, "1.0"),
+            (-0.0, "-0.0"),
+            (1e16, "1e+16"),
+            (1e-5, "1e-05"),
+        ];
+
+        for (value, expected) in cases {
+            assert_eq!(float::repr_f64(value), expected, "repr({value:?})");
+        }
+        let rounded = "9007199254740993.0".parse::<f64>().expect("valid f64 literal");
+        assert_eq!(float::repr_f64(rounded), "9007199254740992.0");
+    }
+
+    #[test]
+    fn k3_numeric_int_construct_base_zero_accepts_prefix_underscores_and_rejects_legacy_octal() {
+        let _guard = init();
+        let cases = [
+            ("  +0b_1010", BigInt::from(10)),
+            ("0o7_5", BigInt::from(61)),
+            ("0x_Ff", BigInt::from(255)),
+            ("1_234_567", BigInt::from(1_234_567)),
+        ];
+
+        for (text, expected) in cases {
+            let args = [str_object(text), unsafe { crate::abi::pon_const_int(0) }];
+            let result = int::construct_from_args(&args);
+            assert_bigint_object(result, expected);
+        }
+
+        let invalid_args = [str_object("010"), unsafe { crate::abi::pon_const_int(0) }];
+        assert!(int::construct_from_args(&invalid_args).is_null());
+        pon_err_clear();
+    }
+
+    #[test]
+    fn k3_numeric_int_construct_from_float_truncates_toward_zero_without_i64_limit() {
+        let _guard = init();
+        let cases = [
+            (3.9, BigInt::from(3)),
+            (-3.9, BigInt::from(-3)),
+            (2.0_f64.powi(63), BigInt::one() << 63_usize),
+        ];
+
+        for (value, expected) in cases {
+            let args = [float::from_f64(value)];
+            let result = int::construct_from_args(&args);
+            assert_bigint_object(result, expected);
+        }
+    }
+
+    #[test]
+    fn k3_numeric_complex_constructor_and_repr_preserve_nan_inf_and_negative_zero_canaries() {
+        let _guard = init();
+
+        let parsed = complex_::construct_from_args(&[str_object("nan+infj")]);
+        assert!(!parsed.is_null());
+        let (real, imag) = unsafe { complex_::to_f64s(parsed) }.expect("complex object");
+        assert!(real.is_nan());
+        assert_eq!(imag, f64::INFINITY);
+        assert_eq!(complex_::repr_complex(real, imag), "(nan+infj)");
+
+        let negative_zero = complex_::construct_from_args(&[str_object("-0-0j")]);
+        let (real, imag) = unsafe { complex_::to_f64s(negative_zero) }.expect("complex object");
+        assert!(real.is_sign_negative());
+        assert!(imag.is_sign_negative());
+        assert_eq!(complex_::repr_complex(real, imag), "(-0-0j)");
+
+        assert_eq!(complex_::repr_complex(-0.0, 0.0), "(-0+0j)");
+        assert_eq!(complex_::repr_complex(0.0, -0.0), "-0j");
+    }
+
+    #[test]
+    fn k3_numeric_divmod_objects_returns_exact_quotient_and_remainder_for_huge_ints() {
+        let _guard = init();
+        let left = (BigInt::one() << 130_usize) + BigInt::from(123);
+        let right = (BigInt::one() << 65_usize) - BigInt::from(1);
+        let result = divmod_objects(int::from_bigint(left), int::from_bigint(right));
+
+        assert!(!result.is_null());
+        assert!(unsafe { int::type_name_is(result, "tuple") });
+        let tuple = unsafe { &*result.cast::<crate::types::tuple::PyTuple>() };
+        let items = unsafe { tuple.as_slice() };
+        assert_eq!(items.len(), 2);
+        assert_eq!(unsafe { int::to_bigint(items[0]) }, Some(parse_bigint("36893488147419103233")));
+        assert_eq!(unsafe { int::to_bigint(items[1]) }, Some(BigInt::from(124)));
     }
 
     #[test]
     fn pow_keeps_large_ints_exact() {
         unsafe {
-            init();
+            let _guard = init();
             let result = pon_binary_op(
                 BINARY_POW,
                 crate::abi::pon_const_int(2),
@@ -449,7 +677,7 @@ mod tests {
     #[test]
     fn floor_division_and_modulo_follow_python_sign_rules() {
         unsafe {
-            init();
+            let _guard = init();
             let left = crate::abi::pon_const_int(-7);
             let right = crate::abi::pon_const_int(2);
 
@@ -464,7 +692,7 @@ mod tests {
     #[test]
     fn bool_is_distinct_but_numeric() {
         unsafe {
-            init();
+            let _guard = init();
             let truth = pon_const_bool(1);
             assert!(bool_::is_exact_bool(truth));
             assert!(!int::is_exact_int(truth));
@@ -477,7 +705,7 @@ mod tests {
     #[test]
     fn unsupported_numeric_operation_raises_type_error() {
         unsafe {
-            init();
+            let _guard = init();
             let result = pon_binary_op(
                 BINARY_MATMUL,
                 crate::abi::pon_const_int(1),

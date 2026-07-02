@@ -24,6 +24,7 @@ pub unsafe extern "C" fn pon_load_attr(
     name: AttrName,
     feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
+    crate::untag_prelude!(object);
     super::catch_object_helper(|| unsafe { get_attr_dispatch(object, name, feedback) })
 }
 
@@ -51,6 +52,7 @@ pub(super) unsafe fn get_attr_dispatch(object: *mut PyObject, name: AttrName, fe
 /// Stores an attribute by interned name and returns the stored value on success.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_store_attr(object: *mut PyObject, name: AttrName, value: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(object, value);
     super::catch_object_helper(|| {
         if value.is_null() {
             return super::return_null_with_error("cannot store NULL attribute value");
@@ -66,6 +68,7 @@ pub unsafe extern "C" fn pon_store_attr(object: *mut PyObject, name: AttrName, v
 /// Deletes an attribute by interned name and returns `None` on success.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_delete_attr(object: *mut PyObject, name: AttrName) -> *mut PyObject {
+    crate::untag_prelude!(object);
     super::catch_object_helper(|| {
         if unsafe { abstract_op::del_attr(object, name) } < 0 {
             ptr::null_mut()
@@ -84,17 +87,20 @@ pub unsafe extern "C" fn pon_load_method(
     name: AttrName,
     feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
+    crate::untag_prelude!(object);
     unsafe { pon_load_attr(object, name, feedback) }
 }
 
 /// Core `isinstance` hook for builtin wiring.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_isinstance(object: *mut PyObject, cls: *mut PyObject) -> i32 {
+    crate::untag_prelude!(err = -1; object, cls);
     super::catch_status_helper(|| unsafe { descr::isinstance(object, cls) })
 }
 
 /// Core `issubclass` hook for builtin wiring.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_issubclass(cls: *mut PyObject, base: *mut PyObject) -> i32 {
+    crate::untag_prelude!(err = -1; cls, base);
     super::catch_status_helper(|| unsafe { descr::issubclass(cls, base) })
 }

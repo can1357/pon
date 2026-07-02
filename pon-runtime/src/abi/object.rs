@@ -21,6 +21,7 @@ pub unsafe extern "C" fn pon_rich_compare(
     b: *mut PyObject,
     feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
+    crate::untag_prelude!(a, b);
     unsafe { super::record_feedback_binary(feedback, a, b) };
     super::catch_object_helper(|| unsafe { abstract_op::rich_compare(op, a, b) })
 }
@@ -28,6 +29,7 @@ pub unsafe extern "C" fn pon_rich_compare(
 /// Computes Python truth.  Returns `1`, `0`, or `-1` with the current exception.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_is_true(object: *mut PyObject) -> i32 {
+    crate::untag_prelude!(err = -1; object);
     super::catch_status_helper(|| unsafe { abstract_op::is_true(object) })
 }
 
@@ -41,18 +43,21 @@ pub unsafe extern "C" fn pon_get_attr(
     name: u32,
     feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
+    crate::untag_prelude!(object);
     super::catch_object_helper(|| unsafe { super::attr::get_attr_dispatch(object, name, feedback) })
 }
 
 /// Stores an interned-name attribute through the object's attribute slot.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_set_attr(object: *mut PyObject, name: u32, value: *mut PyObject) -> i32 {
+    crate::untag_prelude!(err = -1; object, value);
     super::catch_status_helper(|| unsafe { abstract_op::set_attr(object, name, value) })
 }
 
 /// Deletes an interned-name attribute through the object's attribute slot.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_del_attr(object: *mut PyObject, name: u32) -> i32 {
+    crate::untag_prelude!(err = -1; object);
     super::catch_status_helper(|| unsafe { abstract_op::del_attr(object, name) })
 }
 
@@ -63,6 +68,7 @@ pub unsafe extern "C" fn pon_subscript_get(
     key: *mut PyObject,
     feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
+    crate::untag_prelude!(object, key);
     unsafe { super::record_feedback_binary(feedback, object, key) };
     super::catch_object_helper(|| unsafe { abstract_op::subscript_get(object, key) })
 }
