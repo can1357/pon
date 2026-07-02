@@ -36,6 +36,11 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         string_attr("executable", "pon"),
         string_attr("prefix", ""),
         string_attr("base_prefix", ""),
+        string_attr("exec_prefix", ""),
+        string_attr("base_exec_prefix", ""),
+        // POSIX default-build ABI flags ('' since 3.8's pymalloc-flag drop);
+        // `test.support` reads it at import.
+        string_attr("abiflags", ""),
         flags_attr(),
         hash_info_attr(),
         warnoptions_attr(),
@@ -288,20 +293,33 @@ unsafe extern "C" fn sys_intern(argv: *mut *mut PyObject, argc: usize) -> *mut P
     value
 }
 
-/// `sys.exception()` (CPython 3.12+).
+/// Source of `sys.exception()` / `sys.exc_info()`: the object-safe pending
+/// exception when one is installed (a handler-entry helper running before
+/// any call), else the thread's parked handled exception
+/// (`PonThreadState.handled_exc`) — parked by `pon_match_exc` /
+/// `pon_get_current_exc` / `pon_exc_star_match` at handler entry and
+/// saved/restored around every call boundary by `abi::HandledExcGuard`.
 ///
-/// Returns the exception being handled or `None`.  pon keeps the caught
-/// exception installed in `PonThreadState.current_exc` while an `except`
-/// body runs (the same slot `except ... as e` binding and implicit
-/// `__context__` chaining read), so the object-safe pending exception IS the
-/// handled exception whenever compiled Python code can observe it: a call
-/// only happens while no exception is propagating.
+/// Documented divergence: CPython resets the handled exception when the
+/// `except` BLOCK exits; pon resets when the catching FRAME returns, so a
+/// read later in the SAME frame (e.g. module level after a module-level
+/// `try`) still reports the last caught exception.  Function-scoped
+/// handlers — the shape `unittest`/`contextlib` use — observe CPython
+/// behavior exactly.
+fn handled_exception() -> Option<*mut PyObject> {
+    crate::abi::exc::pending_exception_object().or_else(|| {
+        let handled = crate::thread_state::thread_state_lock().handled_exc;
+        (!handled.is_null()).then_some(handled)
+    })
+}
+
+/// `sys.exception()` (CPython 3.12+): the exception being handled, or `None`.
 unsafe extern "C" fn sys_exception(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let _ = argv;
     if argc != 0 {
         return return_null_with_error(format!("exception() takes no arguments ({argc} given)"));
     }
-    match crate::abi::exc::pending_exception_object() {
+    match handled_exception() {
         Some(exception) => exception,
         // SAFETY: Singleton accessor.
         None => unsafe { crate::abi::pon_none() },
@@ -319,7 +337,7 @@ unsafe extern "C" fn sys_exc_info(argv: *mut *mut PyObject, argc: usize) -> *mut
     }
     // SAFETY: Singleton accessor.
     let none = unsafe { crate::abi::pon_none() };
-    let items = match crate::abi::exc::pending_exception_object() {
+    let items = match handled_exception() {
         Some(exception) => {
             let mut slot = exception;
             // SAFETY: One live argument slot; `builtin_type` reports errors via NULL.

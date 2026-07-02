@@ -1,3 +1,4 @@
+use super::try_::redirect_raise_terms;
 use super::*;
 
 fn lower_enter_call(
@@ -77,20 +78,27 @@ fn referenced(scope: &BodyScope, scan_start: usize, tramp: BlockId) -> bool {
 
 /// Lowers representative `with`/`async with` ordering into the family-owned IR
 /// skeleton: evaluate managers left-to-right, call enter left-to-right, lower the
-/// body, then call exits in reverse order.  The exception/finally integration pass
-/// wraps this skeleton with handler edges so `__exit__` sees real exception info.
+/// body inside a `PushExcInfo` protected region, then call exits in reverse order.
+///
+/// Exception path (`try_`'s handler discipline): every failing call and
+/// syntactic `raise` in the body routes to a handler block that pops the
+/// record and calls `__exit__(type(exc), exc, None)` innermost-first.  A
+/// truthy `__exit__` result suppresses the exception — the remaining
+/// managers see the normal `(None, None, None)` exits — while an all-falsy
+/// chain re-raises the original exception object (PEP 343).
 ///
 /// Departing edges follow `try_`'s `PhaseExits` discipline: `break`/`continue`
 /// (under `loop_targets`) and `return` inside the body jump to per-statement
-/// trampolines that run the normal-path `__exit__` calls before resuming the
-/// outer edge.  Nested statements chain trampolines, so every `with` runs
-/// exactly its own exits, innermost first.
+/// trampolines that pop the handler record and run the normal-path `__exit__`
+/// calls before resuming the outer edge.  Nested statements chain
+/// trampolines, so every `with` runs exactly its own exits, innermost first.
 pub(super) fn lower_with_stmt(
     driver: &mut LoweringDriver,
     scope: &mut BodyScope,
     stmt: &ruff_python_ast::StmtWith,
     loop_targets: Option<control::LoopTargets>,
 ) -> Result<(), LowerError> {
+    let exit_name = if stmt.is_async { "__aexit__" } else { "__exit__" };
     let mut managers = Vec::with_capacity(stmt.items.len());
     for item in &stmt.items {
         let manager = driver.lower_expr(scope, &item.context_expr)?;
@@ -106,6 +114,9 @@ pub(super) fn lower_with_stmt(
         }
         managers.push(manager);
     }
+
+    let handler_block = scope.alloc_block()?;
+    let done_block = scope.alloc_block()?;
 
     // Trampoline ids are allocated eagerly: blocks only materialize when
     // switched to, so an unreferenced trampoline costs an id, not a block.
@@ -135,6 +146,13 @@ pub(super) fn lower_with_stmt(
     }
     let scan_start = scope.blocks.len();
 
+    scope.emit(InstKind::PushExcInfo {
+        target: handler_block,
+        stack_depth: 0,
+        kind: 0,
+    })?;
+    let protected_start = scope.blocks.len();
+
     for body_stmt in &stmt.body {
         if scope.is_terminated() {
             break;
@@ -143,62 +161,67 @@ pub(super) fn lower_with_stmt(
     }
     scope.return_route = outer_route;
 
+    // Syntactic raises inside the protected region route to the handler like
+    // failing calls (which codegen already routes via the pushed record).
+    redirect_raise_terms(scope, protected_start, handler_block);
+
     let tramps = [break_tramp, continue_tramp, return_tramp];
     let is_tramp = |target: BlockId| tramps.into_iter().flatten().any(|tramp| tramp == target);
 
     let pending = scope.term.take();
     match pending {
         // The body departs through one of this statement's trampolines; the
-        // trampoline owns the `__exit__` duties for that edge.
+        // trampoline owns the pop + `__exit__` duties for that edge.
         Some(Terminator::Jump(target)) if is_tramp(target) => {
             scope.set_term(Terminator::Jump(target))?;
         }
-        Some(Terminator::RaiseTerm) => {
-            for manager in managers.iter().rev().copied() {
-                let exc = scope.emit(InstKind::GetCurrentExc)?;
-                let type_name = driver.names.intern("type")?;
-                let type_fn = scope.emit(InstKind::LoadBuiltin(type_name))?;
-                let exc_type = scope.emit(InstKind::Call {
-                    callee: type_fn,
-                    args: vec![exc],
-                })?;
-                let tb = scope.emit(InstKind::Const(PyConst::None))?;
-                lower_exit_call(
-                    driver,
-                    scope,
-                    manager,
-                    if stmt.is_async { "__aexit__" } else { "__exit__" },
-                    stmt.is_async,
-                    [exc_type, exc, tb],
-                )?;
-            }
-        }
         term => {
+            scope.emit(InstKind::PopExcInfo)?;
             lower_normal_exits(driver, scope, &managers, stmt.is_async)?;
             if let Some(term) = term {
                 scope.set_term(term)?;
             }
         }
     }
+    scope.jump_if_open(done_block)?;
 
-    if !tramps
-        .into_iter()
-        .flatten()
-        .any(|tramp| referenced(scope, scan_start, tramp))
-    {
-        return Ok(());
+    // Exception path: pop the record, then walk the managers innermost-first
+    // with the caught exception until one suppresses it.
+    scope.switch_to(handler_block)?;
+    scope.emit(InstKind::PopExcInfo)?;
+    let exc = scope.emit(InstKind::GetCurrentExc)?;
+    let type_name = driver.names.intern("type")?;
+    let type_fn = scope.emit(InstKind::LoadBuiltin(type_name))?;
+    let exc_type = scope.emit(InstKind::Call {
+        callee: type_fn,
+        args: vec![exc],
+    })?;
+    let tb = scope.emit(InstKind::Const(PyConst::None))?;
+    for (index, manager) in managers.iter().rev().copied().enumerate() {
+        let result = lower_exit_call(driver, scope, manager, exit_name, stmt.is_async, [exc_type, exc, tb])?;
+        let cond = scope.emit(InstKind::BoolTest { val: result })?;
+        let suppress_block = scope.alloc_block()?;
+        let next_block = scope.alloc_block()?;
+        scope.set_term(Terminator::CondBranch {
+            cond,
+            then_: suppress_block,
+            else_: next_block,
+        })?;
+        // Suppressed: the managers acquired before this one still see the
+        // normal-path exits, then control resumes after the statement.
+        scope.switch_to(suppress_block)?;
+        lower_normal_exits(driver, scope, &managers[..managers.len() - 1 - index], stmt.is_async)?;
+        scope.set_term(Terminator::Jump(done_block))?;
+        scope.switch_to(next_block)?;
     }
+    // No manager suppressed: re-raise the original exception object.
+    scope.emit(InstKind::Raise {
+        exc: Some(exc),
+        cause: None,
+    })?;
+    scope.set_term(Terminator::RaiseTerm)?;
 
-    // Park the fall-through edge (if any) while the trampolines are filled.
-    let done_block = if scope.term.is_none() {
-        let done = scope.alloc_block()?;
-        scope.set_term(Terminator::Jump(done))?;
-        Some(done)
-    } else {
-        None
-    };
-
-    // break / continue: run the exits, then resume the outer loop edge.
+    // break / continue: pop the record, run the exits, resume the outer edge.
     for (tramp, outer) in [
         (break_tramp, loop_targets.map(|targets| targets.break_block)),
         (
@@ -213,15 +236,18 @@ pub(super) fn lower_with_stmt(
             continue;
         }
         scope.switch_to(tramp)?;
+        scope.emit(InstKind::PopExcInfo)?;
         lower_normal_exits(driver, scope, &managers, stmt.is_async)?;
         scope.set_term(Terminator::Jump(outer))?;
     }
 
-    // return: run the exits, then forward to the next route outward (value
-    // stays parked in the shared return slot) or actually return.
+    // return: pop the record, run the exits, then forward to the next route
+    // outward (value stays parked in the shared return slot) or actually
+    // return.
     if let Some(tramp) = return_tramp {
         if referenced(scope, scan_start, tramp) {
             scope.switch_to(tramp)?;
+            scope.emit(InstKind::PopExcInfo)?;
             lower_normal_exits(driver, scope, &managers, stmt.is_async)?;
             match outer_route {
                 Some(route) => scope.set_term(Terminator::Jump(route))?,
@@ -236,9 +262,7 @@ pub(super) fn lower_with_stmt(
         }
     }
 
-    if let Some(done) = done_block {
-        scope.switch_to(done)?;
-    }
+    scope.switch_to(done_block)?;
     Ok(())
 }
 

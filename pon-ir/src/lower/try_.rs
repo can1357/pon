@@ -30,7 +30,7 @@ fn lower_stmt_list_preserving_term(
     Ok(())
 }
 
-fn redirect_raise_terms(scope: &mut BodyScope, start_block: usize, handler_block: BlockId) -> bool {
+pub(super) fn redirect_raise_terms(scope: &mut BodyScope, start_block: usize, handler_block: BlockId) -> bool {
     let mut redirected = false;
     for block in &mut scope.blocks[start_block..] {
         if matches!(block.term, Terminator::RaiseTerm) {
