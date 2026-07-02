@@ -96,3 +96,8 @@ pon-conformance/corpus/cpython/init_subclass.py
 pon-conformance/corpus/cpython/seq_repeat.py
 pon-conformance/corpus/cpython/lang_except_break.py
 pon-conformance/corpus/cpython/lang_assert_stmt.py
+pon-conformance/corpus/cpython/weakref_basic.py
+pon-conformance/corpus/cpython/delfin.py
+pon-conformance/corpus/cpython/except_star.py
+pon-conformance/corpus/cpython/object_generator_throw_close.py
+pon-conformance/corpus/cpython/union_types.py
