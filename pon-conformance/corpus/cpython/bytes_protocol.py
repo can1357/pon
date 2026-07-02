@@ -102,3 +102,30 @@ for byte in grow:
     if len(grown) == 1:
         grow.append(99)
 print(grown, grow)
+
+table = bytes(range(255, -1, -1))
+print(b'\x00\x01\xff'.translate(table), bytearray(b'\x00\xff').translate(table))
+print(b'0000'.translate(b'0' + b'1' * 255), b'abcabc'.translate(None, b'b'))
+print(b'abc'.translate(None), b'spam and eggs'.translate(bytes(range(256)), b'aeiou'))
+bits = bytearray(8)
+bits[1] = 1
+bits[6] = 1
+s = bits.translate(b'0' + b'1' * 255)[::-1]
+print(s, int(s, 2), int(b'0101', 2), int(b'ff', 16), int(bytearray(b'42')), int(b' 7 '))
+print(b'abcb'.find(98), b'abcb'.rfind(98), b'abcb'.index(99), b'abcb'.count(98), b'abcb'.find(120), bytearray(b'abcb').find(98, 2))
+print(b'abcd'[::-1], bytearray(b'abcd')[::-1], b'abcdef'[4:1:-2])
+try:
+    b'ab'[9]
+except IndexError as exc:
+    print("IndexError", exc)
+try:
+    bytearray(b'ab')[9] = 1
+except IndexError as exc:
+    print("IndexError", exc)
+charmap = bytearray(4)
+try:
+    charmap[300] = 1
+except IndexError:
+    charmap += b'\x00' * 297
+    charmap[300] = 1
+print(len(charmap), charmap[300], charmap.find(1), charmap.find(1, 301), charmap.count(0))
