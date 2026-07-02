@@ -34,6 +34,45 @@ fn run_executes_hello_fixture() {
     assert_eq!(output.stderr.as_slice(), b"");
 }
 
+/// pon's build-time config module (`_sysconfigdata__<platform>_`, the
+/// generated-at-build-time module CPython's `sysconfig._init_posix` imports)
+/// is served by the curated native registry.  This pins the CT test.support
+/// ladder step: `sysconfig.get_config_var('CFLAGS')` must return a str
+/// instead of raising ModuleNotFoundError out of `get_config_vars()`.
+#[test]
+fn run_serves_sysconfig_build_time_config() {
+    let fixture_dir = TempDir::new("pon-cli-run-sysconfig");
+    let fixture_path = fixture_dir.path().join("sysconfig_probe.py");
+    fs::write(
+        &fixture_path,
+        "import sysconfig\n\
+         cflags = sysconfig.get_config_var('CFLAGS')\n\
+         print(type(cflags).__name__)\n\
+         print(repr(cflags))\n\
+         print(repr(sysconfig.get_config_var('Py_GIL_DISABLED')))\n\
+         print(repr(sysconfig.get_config_var('no_such_var_probe')))\n",
+    )
+    .expect("write sysconfig_probe.py fixture");
+
+    let stdlib = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../pon-conformance/vendor/cpython-3.14/Lib");
+    let output = Command::new(env!("CARGO_BIN_EXE_pon-cli"))
+        .arg("run")
+        .arg(&fixture_path)
+        .env("PON_STDLIB_PATH", &stdlib)
+        .env("PONPATH", &stdlib)
+        .output()
+        .expect("run pon-cli binary");
+
+    assert!(
+        output.status.success(),
+        "sysconfig probe should exit successfully; status={:?}, stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout.as_slice(), b"str\n''\n0\nNone\n");
+}
+
 struct TempDir {
     path: PathBuf,
 }
