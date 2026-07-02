@@ -6,6 +6,7 @@
 
 use core::mem::{offset_of, size_of};
 use core::ptr;
+use std::sync::LazyLock;
 
 use crate::object::{PyObject, PyObjectHeader, PyType, as_object_ptr};
 
@@ -46,17 +47,41 @@ impl PyBaseException {
     }
 }
 
+/// Boxed exception-group payload: a BaseException plus its immutable member tuple.
+#[repr(C)]
+#[derive(Debug)]
+pub struct PyExceptionGroup {
+    /// Common exception payload; must remain first.
+    pub base: PyBaseException,
+    /// Boxed tuple of member exceptions. Non-NULL for valid groups.
+    pub exceptions: *mut PyObject,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct PyExceptionGroupMethod {
+    pub ob_base: PyObjectHeader,
+    pub receiver: *mut PyObject,
+    pub kind: u8,
+}
+
+pub const EXC_GROUP_METHOD_SPLIT: u8 = 0;
+pub const EXC_GROUP_METHOD_SUBGROUP: u8 = 1;
+pub const EXC_GROUP_METHOD_DERIVE: u8 = 2;
+
 /// Builtin exception class selector used by raising helpers and tests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExceptionKind {
     BaseException,
     Exception,
     ImportError,
+    EOFError,
     TypeError,
     ValueError,
     KeyError,
     IndexError,
     NameError,
+    UnboundLocalError,
     NotImplementedError,
     AttributeError,
     StopIteration,
@@ -74,12 +99,14 @@ pub struct ExceptionTypeSet {
     pub base_exception: *mut PyType,
     pub exception: *mut PyType,
     pub import_error: *mut PyType,
+    pub eof_error: *mut PyType,
     pub type_error: *mut PyType,
     pub value_error: *mut PyType,
     pub key_error: *mut PyType,
     pub index_error: *mut PyType,
     pub attribute_error: *mut PyType,
     pub name_error: *mut PyType,
+    pub unbound_local_error: *mut PyType,
     pub not_implemented_error: *mut PyType,
     pub stop_iteration: *mut PyType,
     pub generator_exit: *mut PyType,
@@ -97,31 +124,35 @@ impl ExceptionTypeSet {
         let base_exception = new_exception_type(type_type, "BaseException", ptr::null_mut());
         let exception = new_exception_type(type_type, "Exception", base_exception);
         let import_error = new_exception_type(type_type, "ImportError", exception);
+        let eof_error = new_exception_type(type_type, "EOFError", exception);
         let type_error = new_exception_type(type_type, "TypeError", exception);
         let value_error = new_exception_type(type_type, "ValueError", exception);
         let key_error = new_exception_type(type_type, "KeyError", exception);
         let index_error = new_exception_type(type_type, "IndexError", exception);
         let attribute_error = new_exception_type(type_type, "AttributeError", exception);
         let name_error = new_exception_type(type_type, "NameError", exception);
+        let unbound_local_error = new_exception_type(type_type, "UnboundLocalError", name_error);
         let runtime_error = new_exception_type(type_type, "RuntimeError", exception);
         let not_implemented_error = new_exception_type(type_type, "NotImplementedError", runtime_error);
         let stop_iteration = new_exception_type(type_type, "StopIteration", exception);
         let generator_exit = new_exception_type(type_type, "GeneratorExit", base_exception);
         let os_error = new_exception_type(type_type, "OSError", exception);
         let assertion_error = new_exception_type(type_type, "AssertionError", exception);
-        let base_exception_group = new_exception_type(type_type, "BaseExceptionGroup", base_exception);
-        let exception_group = new_exception_type(type_type, "ExceptionGroup", base_exception_group);
+        let base_exception_group = new_exception_group_type(type_type, "BaseExceptionGroup", base_exception);
+        let exception_group = new_exception_group_type(type_type, "ExceptionGroup", base_exception_group);
 
         Self {
             base_exception,
             exception,
             import_error,
+            eof_error,
             type_error,
             value_error,
             key_error,
             index_error,
             attribute_error,
             name_error,
+            unbound_local_error,
             not_implemented_error,
             stop_iteration,
             generator_exit,
@@ -140,12 +171,14 @@ impl ExceptionTypeSet {
             ExceptionKind::BaseException => self.base_exception,
             ExceptionKind::Exception => self.exception,
             ExceptionKind::ImportError => self.import_error,
+            ExceptionKind::EOFError => self.eof_error,
             ExceptionKind::TypeError => self.type_error,
             ExceptionKind::ValueError => self.value_error,
             ExceptionKind::KeyError => self.key_error,
             ExceptionKind::IndexError => self.index_error,
             ExceptionKind::AttributeError => self.attribute_error,
             ExceptionKind::NameError => self.name_error,
+            ExceptionKind::UnboundLocalError => self.unbound_local_error,
             ExceptionKind::NotImplementedError => self.not_implemented_error,
             ExceptionKind::StopIteration => self.stop_iteration,
             ExceptionKind::GeneratorExit => self.generator_exit,
@@ -157,19 +190,21 @@ impl ExceptionTypeSet {
         }
     }
 
-    /// Returns every core builtin exception type required by B05-EXC-CORE.
+    /// Returns every core builtin exception type required by B05-EXC-CORE and wave-2 compat.
     #[must_use]
-    pub fn core_types(self) -> [(ExceptionKind, *mut PyType); 17] {
+    pub fn core_types(self) -> [(ExceptionKind, *mut PyType); 19] {
         [
             (ExceptionKind::BaseException, self.base_exception),
             (ExceptionKind::Exception, self.exception),
             (ExceptionKind::ImportError, self.import_error),
+            (ExceptionKind::EOFError, self.eof_error),
             (ExceptionKind::TypeError, self.type_error),
             (ExceptionKind::ValueError, self.value_error),
             (ExceptionKind::KeyError, self.key_error),
             (ExceptionKind::IndexError, self.index_error),
             (ExceptionKind::AttributeError, self.attribute_error),
             (ExceptionKind::NameError, self.name_error),
+            (ExceptionKind::UnboundLocalError, self.unbound_local_error),
             (ExceptionKind::NotImplementedError, self.not_implemented_error),
             (ExceptionKind::StopIteration, self.stop_iteration),
             (ExceptionKind::GeneratorExit, self.generator_exit),
@@ -196,20 +231,96 @@ fn new_exception_type(type_type: *mut PyType, name: &'static str, base: *mut PyT
     Box::into_raw(Box::new(ty))
 }
 
+fn new_exception_group_type(type_type: *mut PyType, name: &'static str, base: *mut PyType) -> *mut PyType {
+    let mut ty = PyType::new(type_type.cast_const(), name, size_of::<PyExceptionGroup>());
+    ty.tp_base = base;
+    ty.tp_getattro = Some(exception_getattro);
+    Box::into_raw(Box::new(ty))
+}
+
+fn exception_group_method_type() -> *mut PyType {
+    static TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut ty = PyType::new(ptr::null(), "exception_group_method", size_of::<PyExceptionGroupMethod>());
+        ty.tp_call = Some(exception_group_method_call);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *TYPE as *mut PyType
+}
+
+#[must_use]
+pub fn new_exception_group_method(receiver: *mut PyObject, kind: u8) -> *mut PyObject {
+    Box::into_raw(Box::new(PyExceptionGroupMethod {
+        ob_base: PyObjectHeader::new(exception_group_method_type()),
+        receiver,
+        kind,
+    }))
+    .cast::<PyObject>()
+}
+
+unsafe extern "C" fn exception_group_method_call(callee: *mut PyObject, args: *mut PyObject, _kwargs: *mut PyObject) -> *mut PyObject {
+    if callee.is_null() {
+        crate::thread_state::pon_err_set("exception group method receiver is NULL");
+        return ptr::null_mut();
+    }
+    let method = unsafe { &*callee.cast::<PyExceptionGroupMethod>() };
+    unsafe { crate::abi::exc::call_exception_group_method(method.receiver, method.kind, args) }
+}
+
+#[must_use]
+pub unsafe fn is_exception_group_type_ptr(mut ty: *const PyType) -> bool {
+    while !ty.is_null() {
+        let name = unsafe { (*ty).name() };
+        if name == "BaseExceptionGroup" || name == "ExceptionGroup" {
+            return true;
+        }
+        ty = unsafe { (*ty).tp_base.cast_const() };
+    }
+    false
+}
+
+#[must_use]
+pub unsafe fn is_exception_group_instance(object: *mut PyObject) -> bool {
+    !object.is_null() && unsafe { is_exception_group_type_ptr((*object).ob_type) }
+}
+
+#[must_use]
+pub unsafe fn as_exception_group<'a>(object: *mut PyObject) -> Option<&'a PyExceptionGroup> {
+    if unsafe { is_exception_group_instance(object) } {
+        Some(unsafe { &*object.cast::<PyExceptionGroup>() })
+    } else {
+        None
+    }
+}
+
 unsafe extern "C" fn exception_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
     let Some(name) = (unsafe { crate::types::type_::unicode_text(name) }) else {
         crate::thread_state::pon_err_set("exception attribute name must be str");
         return ptr::null_mut();
     };
     let exception = unsafe { &*object.cast::<PyBaseException>() };
+    let is_group = unsafe { is_exception_group_instance(object) };
     match name {
         "args" => {
-            if exception.message.is_null() {
+            if is_group {
+                let group = unsafe { &*object.cast::<PyExceptionGroup>() };
+                crate::native::builtins_mod::alloc_tuple(vec![exception.message, group.exceptions])
+            } else if exception.message.is_null() {
                 crate::native::builtins_mod::alloc_tuple(Vec::new())
             } else {
                 crate::native::builtins_mod::alloc_tuple(vec![exception.message])
             }
         }
+        "message" => {
+            if exception.message.is_null() {
+                unsafe { crate::abi::pon_none() }
+            } else {
+                exception.message
+            }
+        }
+        "exceptions" if is_group => unsafe { (&*object.cast::<PyExceptionGroup>()).exceptions },
+        "split" if is_group => new_exception_group_method(object, EXC_GROUP_METHOD_SPLIT),
+        "subgroup" if is_group => new_exception_group_method(object, EXC_GROUP_METHOD_SUBGROUP),
+        "derive" if is_group => new_exception_group_method(object, EXC_GROUP_METHOD_DERIVE),
         "value" => {
             let is_stop_iteration = unsafe {
                 !exception.ob_base.ob_type.is_null()
@@ -260,8 +371,12 @@ pub unsafe fn is_exception_subclass(mut sub: *const PyType, base: *const PyType)
         return false;
     }
 
+    let wants_exception = unsafe { (*base).name() == "Exception" };
     while !sub.is_null() {
         if sub == base {
+            return true;
+        }
+        if wants_exception && unsafe { (*sub).name() == "ExceptionGroup" } {
             return true;
         }
         // SAFETY: Caller guarantees that non-NULL `sub` is a live type object.
@@ -311,7 +426,24 @@ pub unsafe extern "C" fn trace_base_exception(object: *mut u8, visitor: &mut dyn
     }
 }
 
+/// Traces the boxed pointers stored in a `PyExceptionGroup`.
+///
+/// # Safety
+///
+/// `object` must be NULL or point to a live `PyExceptionGroup` allocation.
+pub unsafe extern "C" fn trace_exception_group(object: *mut u8, visitor: &mut dyn FnMut(*mut u8)) {
+    if object.is_null() {
+        return;
+    }
+    unsafe { trace_base_exception(object, visitor) };
+    let group = unsafe { &*object.cast::<PyExceptionGroup>() };
+    if !group.exceptions.is_null() {
+        visitor(group.exceptions.cast::<u8>());
+    }
+}
+
 const _: () = {
     assert!(offset_of!(PyBaseException, ob_base) == 0);
+    assert!(offset_of!(PyExceptionGroup, base) == 0);
     assert!(size_of::<PyObject>() == size_of::<PyObjectHeader>());
 };

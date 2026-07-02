@@ -180,6 +180,7 @@ pub fn new_generic_alias(origin: *mut PyObject, args: Vec<*mut PyObject>) -> *mu
 /// C ABI constructor for `InstKind::MakeTypeAlias` (`type X = expr`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_make_type_alias(name_interned: u32, thunk: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(thunk);
     if thunk.is_null() {
         pon_err_set("type alias thunk is NULL");
         return ptr::null_mut();

@@ -14,6 +14,7 @@ pub mod slots {
 
 /// Exception hierarchy and boxed exception payloads.
 pub mod exc;
+pub mod weakref;
 
 /// Numeric type modules.
 pub mod int;
@@ -25,12 +26,14 @@ pub mod complex_;
 pub mod str_;
 pub mod bytes_;
 pub mod bytearray_;
+pub mod memoryview;
 
 /// Sequence type modules.
 pub mod list;
 pub mod tuple;
 pub mod range_;
 pub mod slice_;
+pub mod lazy_iter;
 
 /// Mapping and set type modules.
 pub mod dict;

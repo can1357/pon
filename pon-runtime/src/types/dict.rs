@@ -5,7 +5,9 @@ use core::mem::{offset_of, size_of};
 use core::ptr;
 use std::sync::LazyLock;
 
-use crate::object::{PyLong, PyMappingMethods, PyObject, PyObjectHeader, PyType, PyUnicode};
+use num_bigint::BigInt;
+
+use crate::object::{PyMappingMethods, PyObject, PyObjectHeader, PyType, PyUnicode};
 use crate::thread_state::pon_err_set;
 
 /// Boxed insertion-ordered Python `dict`.
@@ -325,8 +327,11 @@ pub unsafe fn object_equal(left: *mut PyObject, right: *mut PyObject) -> Result<
         return Ok(false);
     }
 
+    if let Some(equal) = unsafe { numeric_object_equal(left, right) } {
+        return Ok(equal);
+    }
+
     match (unsafe { type_name(left) }, unsafe { type_name(right) }) {
-        (Some("int"), Some("int")) => Ok(unsafe { (*left.cast::<PyLong>()).value == (*right.cast::<PyLong>()).value }),
         (Some("str"), Some("str")) => {
             let l = unsafe { &*left.cast::<PyUnicode>() };
             let r = unsafe { &*right.cast::<PyUnicode>() };
@@ -342,13 +347,78 @@ pub unsafe fn object_equal(left: *mut PyObject, right: *mut PyObject) -> Result<
     }
 }
 
+unsafe fn numeric_object_equal(left: *mut PyObject, right: *mut PyObject) -> Option<bool> {
+    if let Some(left_int) = unsafe { crate::types::int::to_bigint_including_bool(left) } {
+        return Some(numeric_int_equal(&left_int, right));
+    }
+    if let Some(right_int) = unsafe { crate::types::int::to_bigint_including_bool(right) } {
+        return Some(numeric_int_equal(&right_int, left));
+    }
+    if let Some(left_float) = unsafe { crate::types::float::to_f64(left) } {
+        return Some(numeric_float_equal(left_float, right));
+    }
+    if let Some(right_float) = unsafe { crate::types::float::to_f64(right) } {
+        return Some(numeric_float_equal(right_float, left));
+    }
+    let left_complex = unsafe { crate::types::complex_::to_f64s(left)? };
+    let right_complex = unsafe { crate::types::complex_::to_f64s(right)? };
+    Some(left_complex.0 == right_complex.0 && left_complex.1 == right_complex.1)
+}
+
+fn numeric_int_equal(integer: &BigInt, other: *mut PyObject) -> bool {
+    if let Some(other) = unsafe { crate::types::int::to_bigint_including_bool(other) } {
+        return *integer == other;
+    }
+    if let Some(other) = unsafe { crate::types::float::to_f64(other) } {
+        return float_equals_int(other, integer);
+    }
+    if let Some((real, imag)) = unsafe { crate::types::complex_::to_f64s(other) } {
+        return imag == 0.0 && float_equals_int(real, integer);
+    }
+    false
+}
+
+fn numeric_float_equal(float: f64, other: *mut PyObject) -> bool {
+    if let Some(other) = unsafe { crate::types::float::to_f64(other) } {
+        return float == other;
+    }
+    if let Some((real, imag)) = unsafe { crate::types::complex_::to_f64s(other) } {
+        return imag == 0.0 && float == real;
+    }
+    false
+}
+
+fn float_equals_int(float: f64, integer: &BigInt) -> bool {
+    if !float.is_finite() || float.fract() != 0.0 {
+        return false;
+    }
+    crate::types::int::bigint_from_f64_trunc(float).as_ref() == Some(integer)
+}
+
 /// Computes a mapping-compatible hash for hashable Phase-B objects.
 pub unsafe fn hash_object(object: *mut PyObject) -> Result<isize, String> {
     if object.is_null() {
         return Err("cannot hash NULL object".to_owned());
     }
+    let hash = match unsafe { numeric_hash_object(object) } {
+        Some(hash) => hash,
+        None => hash_object_non_numeric(object)?,
+    };
+    Ok(normalize_hash(hash))
+}
+
+unsafe fn numeric_hash_object(object: *mut PyObject) -> Option<isize> {
+    if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(object) } {
+        return Some(crate::types::int::hash_bigint(&value));
+    }
+    if let Some(value) = unsafe { crate::types::float::to_f64(object) } {
+        return Some(crate::types::float::hash_f64(value));
+    }
+    unsafe { crate::types::complex_::to_f64s(object).map(|(real, imag)| crate::types::complex_::hash_complex(real, imag)) }
+}
+
+fn hash_object_non_numeric(object: *mut PyObject) -> Result<isize, String> {
     let hash = match unsafe { type_name(object) } {
-        Some("int") => unsafe { (*object.cast::<PyLong>()).value as isize },
         Some("str") => {
             let unicode = unsafe { &*object.cast::<PyUnicode>() };
             hash_bytes(unsafe { unicode_bytes(unicode) }) as isize
@@ -366,9 +436,8 @@ pub unsafe fn hash_object(object: *mut PyObject) -> Result<isize, String> {
         Some(_) => object as usize as isize,
         None => return Err("object has null type".to_owned()),
     };
-    Ok(normalize_hash(hash))
+    Ok(hash)
 }
-
 /// Returns a boxed object's type name.
 #[must_use]
 pub unsafe fn type_name(object: *mut PyObject) -> Option<&'static str> {

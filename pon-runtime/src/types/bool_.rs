@@ -114,6 +114,10 @@ unsafe extern "C" fn nb_positive(object: *mut PyObject) -> *mut PyObject {
     unsafe { nb_index(object) }
 }
 
+unsafe extern "C" fn nb_absolute(object: *mut PyObject) -> *mut PyObject {
+    unsafe { nb_index(object) }
+}
+
 unsafe extern "C" fn nb_invert(object: *mut PyObject) -> *mut PyObject {
     match unsafe { to_bool(object) } {
         Some(false) => crate::types::int::from_i64(-1),
@@ -131,6 +135,7 @@ fn make_number_methods() -> PyNumberMethods {
         nb_power: Some(crate::types::int::nb_power),
         nb_negative: Some(nb_negative),
         nb_positive: Some(nb_positive),
+        nb_absolute: Some(nb_absolute),
         nb_bool: Some(bool_slot),
         nb_invert: Some(nb_invert),
         nb_lshift: Some(crate::types::int::nb_lshift),

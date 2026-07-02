@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
 use num_bigint::{BigInt, Sign};
-use num_traits::{One, Signed, ToPrimitive};
+use num_traits::{One, Signed, ToPrimitive, Zero};
 
 use crate::abi;
 use crate::object::{PyLong, PyNumberMethods, PyObject, PyObjectHeader};
@@ -83,6 +83,214 @@ pub fn from_bigint(value: BigInt) -> *mut PyObject {
 #[must_use]
 pub fn from_i64(value: i64) -> *mut PyObject {
     unsafe { abi::pon_const_int(value) }
+}
+
+/// Extracts an integer payload from exact `int` and `bool` objects.
+#[must_use]
+pub unsafe fn to_bigint_including_bool(object: *mut PyObject) -> Option<BigInt> {
+    if let Some(value) = unsafe { crate::types::bool_::to_bool(object) } {
+        return Some(BigInt::from(i32::from(value)));
+    }
+    unsafe { to_bigint(object) }
+}
+
+/// Implements the built-in `int()` constructor once the builtin shim has sliced argv.
+#[must_use]
+pub fn construct_from_args(args: &[*mut PyObject]) -> *mut PyObject {
+    match args.len() {
+        0 => from_i64(0),
+        1 => unsafe { construct_one(args[0]) },
+        2 => unsafe { construct_with_base(args[0], args[1]) },
+        len => raise_type_error(&format!("int() expected at most 2 arguments, got {len}")),
+    }
+}
+
+/// Converts a finite `f64` to the exact integer obtained by truncating toward zero.
+#[must_use]
+pub fn bigint_from_f64_trunc(value: f64) -> Option<BigInt> {
+    if !value.is_finite() {
+        return None;
+    }
+    if value == 0.0 {
+        return Some(BigInt::zero());
+    }
+
+    let bits = value.to_bits();
+    let negative = bits >> 63 != 0;
+    let exp_bits = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1_u64 << 52) - 1);
+    let (mantissa, exponent) = if exp_bits == 0 {
+        (frac, 1 - 1023 - 52)
+    } else {
+        ((1_u64 << 52) | frac, exp_bits - 1023 - 52)
+    };
+    let mut value = BigInt::from(mantissa);
+    if exponent >= 0 {
+        value <<= exponent as usize;
+    } else {
+        value >>= (-exponent) as usize;
+    }
+    if negative {
+        value = -value;
+    }
+    Some(value)
+}
+
+unsafe fn construct_one(object: *mut PyObject) -> *mut PyObject {
+    if let Some(value) = unsafe { to_bigint_including_bool(object) } {
+        return from_bigint(value);
+    }
+    if let Some(value) = unsafe { crate::types::float::to_f64(object) } {
+        if value.is_nan() {
+            return raise_value_error("cannot convert float NaN to integer");
+        }
+        if value.is_infinite() {
+            return raise_value_error("cannot convert float infinity to integer");
+        }
+        return match bigint_from_f64_trunc(value) {
+            Some(value) => from_bigint(value),
+            None => raise_value_error("cannot convert float infinity to integer"),
+        };
+    }
+    if let Some(text) = unsafe { crate::types::type_::unicode_text(object) } {
+        return match parse_int_text(text, 10) {
+            Ok(value) => from_bigint(value),
+            Err(message) => raise_value_error(&message),
+        };
+    }
+    raise_type_error("int() argument must be a string, a bytes-like object or a real number, not object")
+}
+
+unsafe fn construct_with_base(object: *mut PyObject, base_object: *mut PyObject) -> *mut PyObject {
+    let Some(text) = (unsafe { crate::types::type_::unicode_text(object) }) else {
+        return raise_type_error("int() can't convert non-string with explicit base");
+    };
+    let Some(base) = (unsafe { to_bigint_including_bool(base_object).and_then(|value| value.to_i32()) }) else {
+        return raise_value_error("int() base must be >= 2 and <= 36, or 0");
+    };
+    if base != 0 && !(2..=36).contains(&base) {
+        return raise_value_error("int() base must be >= 2 and <= 36, or 0");
+    }
+    match parse_int_text(text, base) {
+        Ok(value) => from_bigint(value),
+        Err(message) => raise_value_error(&message),
+    }
+}
+
+fn parse_int_text(text: &str, requested_base: i32) -> Result<BigInt, String> {
+    let trimmed = text.trim();
+    let invalid = || invalid_int_literal(text, requested_base);
+    if trimmed.is_empty() {
+        return Err(invalid());
+    }
+
+    let mut rest = trimmed;
+    let mut negative = false;
+    if let Some(after) = rest.strip_prefix('+') {
+        rest = after;
+    } else if let Some(after) = rest.strip_prefix('-') {
+        negative = true;
+        rest = after;
+    }
+    if rest.is_empty() {
+        return Err(invalid());
+    }
+
+    let (base, digits, prefixed) = detect_base(rest, requested_base)?;
+    let value = parse_digits(digits, base, prefixed).ok_or_else(invalid)?;
+    if requested_base == 0 && !prefixed && decimal_base_zero_is_invalid(digits, &value) {
+        return Err(invalid());
+    }
+    Ok(if negative { -value } else { value })
+}
+
+fn detect_base(rest: &str, requested_base: i32) -> Result<(u32, &str, bool), String> {
+    if requested_base != 0 && !(2..=36).contains(&requested_base) {
+        return Err("int() base must be >= 2 and <= 36, or 0".to_owned());
+    }
+
+    let lower = rest.as_bytes();
+    let prefix_base = if lower.len() >= 2 && lower[0] == b'0' {
+        match lower[1].to_ascii_lowercase() {
+            b'b' => Some(2),
+            b'o' => Some(8),
+            b'x' => Some(16),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    match (requested_base, prefix_base) {
+        (0, Some(base)) => Ok((base, &rest[2..], true)),
+        (0, None) => Ok((10, rest, false)),
+        (base, Some(prefix)) if base as u32 == prefix => Ok((prefix, &rest[2..], true)),
+        (base, _) => Ok((base as u32, rest, false)),
+    }
+}
+
+fn parse_digits(digits: &str, base: u32, prefixed: bool) -> Option<BigInt> {
+    let mut value = BigInt::zero();
+    let mut saw_digit = false;
+    let mut previous_digit = false;
+    let mut after_prefix = prefixed;
+    for ch in digits.chars() {
+        if ch == '_' {
+            if !previous_digit && !after_prefix {
+                return None;
+            }
+            previous_digit = false;
+            after_prefix = false;
+            continue;
+        }
+        let digit = digit_value(ch)?;
+        if digit >= base {
+            return None;
+        }
+        value = value * base + digit;
+        saw_digit = true;
+        previous_digit = true;
+        after_prefix = false;
+    }
+    if !saw_digit || !previous_digit {
+        return None;
+    }
+    Some(value)
+}
+
+fn digit_value(ch: char) -> Option<u32> {
+    match ch {
+        '0'..='9' => Some(u32::from(ch as u8 - b'0')),
+        'a'..='z' => Some(u32::from(ch as u8 - b'a') + 10),
+        'A'..='Z' => Some(u32::from(ch as u8 - b'A') + 10),
+        _ => None,
+    }
+}
+
+fn decimal_base_zero_is_invalid(digits: &str, value: &BigInt) -> bool {
+    digits.starts_with('0') && !value.is_zero()
+}
+
+fn invalid_int_literal(text: &str, base: i32) -> String {
+    format!("invalid literal for int() with base {base}: {}", python_string_repr(text))
+}
+
+fn python_string_repr(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('\'');
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\x{:02x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Installs integer slots on the runtime `int` type reached from an object.
@@ -172,6 +380,13 @@ pub unsafe extern "C" fn nb_negative(object: *mut PyObject) -> *mut PyObject {
     unsafe { crate::abi::number::pon_unary_op(crate::abstract_op::UNARY_NEG, object, ptr::null_mut()) }
 }
 
+pub unsafe extern "C" fn nb_absolute(object: *mut PyObject) -> *mut PyObject {
+    match unsafe { to_bigint(object) } {
+        Some(value) => from_bigint(value.abs()),
+        None => raise_type_error("bad operand type for abs()"),
+    }
+}
+
 pub unsafe extern "C" fn nb_positive(object: *mut PyObject) -> *mut PyObject {
     unsafe { crate::abi::number::pon_unary_op(crate::abstract_op::UNARY_POS, object, ptr::null_mut()) }
 }
@@ -221,6 +436,7 @@ fn make_number_methods() -> PyNumberMethods {
         nb_power: Some(nb_power),
         nb_negative: Some(nb_negative),
         nb_positive: Some(nb_positive),
+        nb_absolute: Some(nb_absolute),
         nb_bool: Some(bool_slot),
         nb_invert: Some(nb_invert),
         nb_lshift: Some(nb_lshift),
@@ -251,4 +467,8 @@ fn make_number_methods() -> PyNumberMethods {
 
 fn raise_type_error(message: &str) -> *mut PyObject {
     unsafe { abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) }
+}
+
+fn raise_value_error(message: &str) -> *mut PyObject {
+    unsafe { abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) }
 }

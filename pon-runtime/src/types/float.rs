@@ -103,6 +103,59 @@ fn place_decimal(digits: &str, decpt: i32) -> String {
     }
 }
 
+/// CPython-compatible numeric hash for finite floats and infinities.
+#[must_use]
+pub fn hash_f64(value: f64) -> isize {
+    const HASH_BITS: i32 = 61;
+    const HASH_MODULUS: u128 = (1_u128 << HASH_BITS) - 1;
+    const HASH_INF: isize = 314_159;
+
+    if value == 0.0 {
+        return 0;
+    }
+    if value.is_nan() {
+        let hash = value.to_bits() as isize;
+        return if hash == -1 { -2 } else { hash };
+    }
+    if value.is_infinite() {
+        return if value.is_sign_negative() { -HASH_INF } else { HASH_INF };
+    }
+
+    let bits = value.to_bits();
+    let negative = bits >> 63 != 0;
+    let exp_bits = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1_u64 << 52) - 1);
+    let (mut mantissa, mut exponent) = if exp_bits == 0 {
+        (frac, 1 - 1023 - 52)
+    } else {
+        ((1_u64 << 52) | frac, exp_bits - 1023 - 52)
+    };
+    while exponent < 0 && mantissa & 1 == 0 {
+        mantissa >>= 1;
+        exponent += 1;
+    }
+
+    let mut hash = (u128::from(mantissa) % HASH_MODULUS) as i128;
+    if exponent >= 0 {
+        hash = (hash * pow2_mod(exponent as u32) as i128) % HASH_MODULUS as i128;
+    } else {
+        let denom_power = (-exponent) % HASH_BITS;
+        let inverse_power = if denom_power == 0 { 0 } else { HASH_BITS - denom_power };
+        hash = (hash * pow2_mod(inverse_power as u32) as i128) % HASH_MODULUS as i128;
+    }
+    if negative {
+        hash = -hash;
+    }
+    if hash == -1 { -2 } else { hash as isize }
+}
+
+fn pow2_mod(exponent: u32) -> u128 {
+    const HASH_BITS: u32 = 61;
+    const HASH_MODULUS: u128 = (1_u128 << HASH_BITS) - 1;
+    let shift = exponent % HASH_BITS;
+    if shift == 0 { 1 } else { (1_u128 << shift) % HASH_MODULUS }
+}
+
 /// Returns the float protocol slot table.
 #[must_use]
 pub fn number_methods_ptr() -> *mut PyNumberMethods {
@@ -111,17 +164,7 @@ pub fn number_methods_ptr() -> *mut PyNumberMethods {
 
 unsafe extern "C" fn hash_slot(object: *mut PyObject) -> isize {
     match unsafe { to_f64(object) } {
-        Some(value) => {
-            if value == 0.0 {
-                0
-            } else if value.is_finite() {
-                let hash = value.to_bits() as isize;
-                if hash == -1 { -2 } else { hash }
-            } else {
-                let hash = value.to_bits() as isize;
-                if hash == -1 { -2 } else { hash }
-            }
-        }
+        Some(value) => hash_f64(value),
         None => -1,
     }
 }
@@ -148,6 +191,13 @@ unsafe extern "C" fn nb_negative(object: *mut PyObject) -> *mut PyObject {
     }
 }
 
+unsafe extern "C" fn nb_absolute(object: *mut PyObject) -> *mut PyObject {
+    match unsafe { to_f64(object) } {
+        Some(value) => from_f64(value.abs()),
+        None => raise_type_error("bad operand type for abs()"),
+    }
+}
+
 unsafe extern "C" fn nb_positive(object: *mut PyObject) -> *mut PyObject {
     unsafe { nb_float(object) }
 }
@@ -161,6 +211,7 @@ fn make_number_methods() -> PyNumberMethods {
         nb_power: Some(crate::types::int::nb_power),
         nb_negative: Some(nb_negative),
         nb_positive: Some(nb_positive),
+        nb_absolute: Some(nb_absolute),
         nb_bool: Some(bool_slot),
         nb_float: Some(nb_float),
         nb_floor_divide: Some(crate::types::int::nb_floor_divide),

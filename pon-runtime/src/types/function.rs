@@ -264,6 +264,7 @@ pub unsafe extern "C" fn pon_function_set_annotate(
     function: *mut PyObject,
     annotate: *mut PyObject,
 ) -> *mut PyObject {
+    crate::untag_prelude!(function, annotate);
     match set_function_annotate(function, annotate) {
         Ok(()) => function,
         Err(message) => return_null_with_error(message),
@@ -646,50 +647,132 @@ fn bind_native_keywords(
     };
     match name.as_str() {
         "sorted" => bind_sorted_keywords(positional, keywords),
+        "sum" => bind_single_keyword(positional, keywords, "sum", "start", 1, 2),
+        "round" => bind_named_positional_keywords(positional, keywords, "round", &["number", "ndigits"], 1, 2),
+        "pow" => bind_named_positional_keywords(positional, keywords, "pow", &["base", "exp", "mod"], 2, 3),
+        "min" => bind_minmax_keywords(positional, keywords, "min"),
+        "max" => bind_minmax_keywords(positional, keywords, "max"),
+        "zip" => bind_zip_keywords(positional, keywords),
         "enumerate" => bind_single_keyword(positional, keywords, "enumerate", "start", 1, 2),
         _ => Err("keyword arguments require Phase-B function metadata".to_owned()),
     }
 }
 
 fn bind_sorted_keywords(positional: &[*mut PyObject], keywords: KeywordArgs<'_>) -> Result<Vec<*mut PyObject>, String> {
-    if positional.is_empty() || positional.len() > 2 {
-        return Err(format!("sorted() expected 1 or 2 positional arguments, got {}", positional.len()));
+    if positional.len() != 1 {
+        return Err(format!("sorted expected 1 argument, got {}", positional.len()));
     }
-    let mut key = positional.get(1).copied();
-    let mut reverse = None;
+    let mut key = unsafe { crate::abi::pon_none() };
+    if key.is_null() {
+        return Err("failed to allocate None for sorted key default".to_owned());
+    }
+    let mut reverse = false;
     for (name, value) in keywords.names.iter().copied().zip(keywords.values.iter().copied()) {
         if value.is_null() {
             return Err(format!("keyword argument {} is NULL", keyword_name(name)));
         }
         match keyword_name(name).as_str() {
-            "key" => {
-                if key.is_some() {
-                    return Err("sorted() got multiple values for keyword argument 'key'".to_owned());
-                }
-                key = Some(value);
-            }
+            "key" => key = value,
             "reverse" => {
-                if reverse.is_some() {
-                    return Err("sorted() got multiple values for keyword argument 'reverse'".to_owned());
-                }
-                reverse = Some(value);
+                reverse = match unsafe { crate::abi::pon_is_true(value) } {
+                    0 => false,
+                    1 => true,
+                    _ => return Err("reverse truth-value testing failed".to_owned()),
+                };
             }
-            other => return Err(format!("sorted() got an unexpected keyword argument '{other}'")),
+            other => return Err(format!("sort() got an unexpected keyword argument '{other}'")),
         }
     }
-    let mut argv = Vec::with_capacity(1 + usize::from(key.is_some() || reverse.is_some()) + usize::from(reverse.is_some()));
-    argv.push(positional[0]);
-    if let Some(key) = key {
-        argv.push(key);
-    } else if reverse.is_some() {
-        let none = unsafe { crate::abi::pon_none() };
-        if none.is_null() {
-            return Err("failed to allocate None for sorted key placeholder".to_owned());
-        }
-        argv.push(none);
+    Ok(vec![positional[0], crate::types::lazy_iter::new_sort_options(key, reverse)])
+}
+
+fn bind_minmax_keywords(positional: &[*mut PyObject], keywords: KeywordArgs<'_>, function_name: &str) -> Result<Vec<*mut PyObject>, String> {
+    if positional.is_empty() {
+        return Err(format!("{function_name} expected at least 1 argument, got 0"));
     }
-    if let Some(reverse) = reverse {
-        argv.push(reverse);
+    let mut key = unsafe { crate::abi::pon_none() };
+    if key.is_null() {
+        return Err(format!("failed to allocate None for {function_name} key default"));
+    }
+    let mut default = unsafe { crate::abi::pon_none() };
+    if default.is_null() {
+        return Err(format!("failed to allocate None for {function_name} default"));
+    }
+    let mut has_default = false;
+    for (name, value) in keywords.names.iter().copied().zip(keywords.values.iter().copied()) {
+        if value.is_null() {
+            return Err(format!("keyword argument {} is NULL", keyword_name(name)));
+        }
+        match keyword_name(name).as_str() {
+            "key" => key = value,
+            "default" => {
+                default = value;
+                has_default = true;
+            }
+            other => return Err(format!("{function_name}() got an unexpected keyword argument '{other}'")),
+        }
+    }
+    let mut argv = positional.to_vec();
+    argv.push(crate::types::lazy_iter::new_minmax_options(key, default, has_default));
+    Ok(argv)
+}
+
+fn bind_zip_keywords(positional: &[*mut PyObject], keywords: KeywordArgs<'_>) -> Result<Vec<*mut PyObject>, String> {
+    let mut strict = false;
+    for (name, value) in keywords.names.iter().copied().zip(keywords.values.iter().copied()) {
+        if value.is_null() {
+            return Err(format!("keyword argument {} is NULL", keyword_name(name)));
+        }
+        match keyword_name(name).as_str() {
+            "strict" => {
+                strict = match unsafe { crate::abi::pon_is_true(value) } {
+                    0 => false,
+                    1 => true,
+                    _ => return Err("strict truth-value testing failed".to_owned()),
+                };
+            }
+            other => return Err(format!("zip() got an unexpected keyword argument '{other}'")),
+        }
+    }
+    let mut argv = positional.to_vec();
+    argv.push(crate::types::lazy_iter::new_zip_strict_marker(strict));
+    Ok(argv)
+}
+
+fn bind_named_positional_keywords(
+    positional: &[*mut PyObject],
+    keywords: KeywordArgs<'_>,
+    function_name: &str,
+    names: &[&str],
+    min_positional: usize,
+    max_positional: usize,
+) -> Result<Vec<*mut PyObject>, String> {
+    if positional.len() > max_positional {
+        return Err(format!("{function_name}() expected at most {max_positional} positional arguments, got {}", positional.len()));
+    }
+    let mut argv = positional.to_vec();
+    argv.resize(max_positional, ptr::null_mut());
+    for (name, value) in keywords.names.iter().copied().zip(keywords.values.iter().copied()) {
+        if value.is_null() {
+            return Err(format!("keyword argument {} is NULL", keyword_name(name)));
+        }
+        let actual = keyword_name(name);
+        let Some(index) = names.iter().position(|expected| *expected == actual) else {
+            return Err(format!("{function_name}() got an unexpected keyword argument '{actual}'"));
+        };
+        if index < positional.len() || !argv[index].is_null() {
+            return Err(format!("{function_name}() got multiple values for argument '{actual}'"));
+        }
+        argv[index] = value;
+    }
+    while argv.last().is_some_and(|value| value.is_null()) {
+        argv.pop();
+    }
+    if argv.iter().any(|value| value.is_null()) {
+        return Err(format!("{function_name}() missing required argument"));
+    }
+    if argv.len() < min_positional {
+        return Err(format!("{function_name}() expected at least {min_positional} arguments, got {}", argv.len()));
     }
     Ok(argv)
 }
