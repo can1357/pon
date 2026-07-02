@@ -800,7 +800,7 @@ unsafe fn call_pow_dunder(base: *mut PyObject, exp: *mut PyObject, modulo: *mut 
     (!result.is_null()).then_some(result)
 }
 
-unsafe fn try_get_attr(object: *mut PyObject, name: &str) -> Option<*mut PyObject> {
+pub(super) unsafe fn try_get_attr(object: *mut PyObject, name: &str) -> Option<*mut PyObject> {
     let result = unsafe { abi::pon_get_attr(object, intern(name), ptr::null_mut()) };
     if result.is_null() {
         if pon_err_occurred() {
@@ -812,7 +812,7 @@ unsafe fn try_get_attr(object: *mut PyObject, name: &str) -> Option<*mut PyObjec
     }
 }
 
-fn collect_iterable(object: *mut PyObject) -> Result<Vec<*mut PyObject>, String> {
+pub(super) fn collect_iterable(object: *mut PyObject) -> Result<Vec<*mut PyObject>, String> {
     let iter = unsafe { abi::pon_get_iter(object, ptr::null_mut()) };
     if iter.is_null() {
         return Err(format!("'{}' object is not iterable", type_name(object)));
@@ -885,7 +885,7 @@ fn class_dict_to_dict(class_dict: *mut PyClassDict) -> Result<*mut PyObject, Str
     Ok(unsafe { abi::map::pon_build_map(flat.as_mut_ptr(), flat.len() / 2) })
 }
 
-fn names_for_object(object: *mut PyObject) -> Vec<String> {
+pub(super) fn names_for_object(object: *mut PyObject) -> Vec<String> {
     let mut names = Vec::new();
     if let Some(class_dict) = unsafe { class_namespace(object) } {
         names.extend(class_dict_names(class_dict));
@@ -912,7 +912,7 @@ fn class_dict_names(class_dict: *mut PyClassDict) -> Vec<String> {
         .collect()
 }
 
-unsafe fn names_from_mapping(mapping: *mut PyObject) -> Result<Vec<String>, String> {
+pub(super) unsafe fn names_from_mapping(mapping: *mut PyObject) -> Result<Vec<String>, String> {
     if mapping.is_null() {
         return Ok(Vec::new());
     }
@@ -929,7 +929,7 @@ fn name_text(object: *mut PyObject) -> String {
     unsafe { object_to_string(object) }.unwrap_or_else(|| crate::native::builtins_mod::str_text(object))
 }
 
-fn build_str_list(names: Vec<String>) -> *mut PyObject {
+pub(super) fn build_str_list(names: Vec<String>) -> *mut PyObject {
     let values = names.into_iter().map(|name| alloc_str(&name)).collect::<Vec<_>>();
     build_list(values)
 }
