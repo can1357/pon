@@ -235,6 +235,7 @@ fn compile_generator_body<M: Module>(
     let helper_refs = declare_helper_refs(module, helpers, &mut ctx.func);
     let feedback_base = declare_feedback_cells(module, ir_function)?;
     let feedback_base_gv = feedback_base.map(|data_id| module.declare_data_in_func(data_id, &mut ctx.func));
+    let line_cell_gv = super::declare_line_cell_gv(module, ir_function, &mut ctx.func)?;
 
     let mut builder = FunctionBuilder::new(&mut ctx.func, fctx);
     let dispatch = builder.create_block();
@@ -335,6 +336,7 @@ fn compile_generator_body<M: Module>(
         ir_function,
         &block_map,
         feedback_base_gv,
+        line_cell_gv,
         None,
     )?;
 

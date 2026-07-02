@@ -517,6 +517,10 @@ fn make_tier1_module() -> JITModule {
     for helper in HELPERS {
         builder.symbol(helper.symbol, helper.address.cast::<u8>());
     }
+    builder.symbol(
+        pon_runtime::abi::CURRENT_LINE_SYMBOL,
+        pon_runtime::abi::current_line_cell_address(),
+    );
     crate::register_free_threading_symbols(&mut builder);
     JITModule::new(builder)
 }
@@ -951,7 +955,7 @@ mod tests {
             lowering_steps: Vec::new(),
             feedback: Vec::new(),
         };
-        let mut function = PyFunction::new(std::ptr::null(), tier0_entry, 0, 0);
+        let function = PyFunction::new(std::ptr::null(), tier0_entry, 0, 0);
         function.tier_state.store(TIER_STATE_QUEUED, Ordering::Release);
 
         assert!(install_compilation(&driver.shared, &function, compilation));

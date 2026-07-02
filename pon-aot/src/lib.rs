@@ -208,7 +208,7 @@ fn typed_ir_module(entry_path: &Path, allow_dynamic: bool) -> anyhow::Result<pon
     let mut lowerable = parsed.clone();
     pon_codegen::strip_annotations_for_lowering(&mut lowerable);
 
-    let mut module = pon_ir::lower_module(&lowerable)
+    let mut module = pon_ir::lower_module(&lowerable, Some(&source))
         .with_context(|| format!("failed to lower `{}` for typed AoT", entry_path.display()))?;
     pon_codegen::infer_module_types(&mut module, &annotations);
     Ok(module)

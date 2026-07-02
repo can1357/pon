@@ -21,7 +21,7 @@ use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{self, AbiParam, FuncRef, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-use cranelift_module::{DataDescription, DataId, FuncId, Module, ModuleError};
+use cranelift_module::{DataDescription, DataId, FuncId, Linkage, Module, ModuleError};
 use pon_ir::ir::{Block as IrBlock, BlockId, Function, InstKind, Module as IrModule, PyConst, Terminator, Value as IrValue};
 
 use crate::helpers::HelperRefs;
@@ -378,6 +378,7 @@ pub fn compile_function<M: Module>(
     // function has no specializable sites.
     let feedback_base = declare_feedback_cells(module, ir)?;
     let feedback_base_gv = feedback_base.map(|data_id| module.declare_data_in_func(data_id, &mut ctx.func));
+    let line_cell_gv = declare_line_cell_gv(module, ir, &mut ctx.func)?;
 
     let mut builder = FunctionBuilder::new(&mut ctx.func, fctx);
     let entry = builder.create_block();
@@ -427,6 +428,7 @@ pub fn compile_function<M: Module>(
         ir,
         &block_map,
         feedback_base_gv,
+        line_cell_gv,
         Some(entry),
     )?;
 
@@ -468,6 +470,7 @@ pub fn compile_osr_function<M: Module>(
     let helper_refs = declare_helper_refs(module, helpers, &mut ctx.func);
     let feedback_base = declare_feedback_cells(module, ir)?;
     let feedback_base_gv = feedback_base.map(|data_id| module.declare_data_in_func(data_id, &mut ctx.func));
+    let line_cell_gv = declare_line_cell_gv(module, ir, &mut ctx.func)?;
     let reachable = reachable_from(ir, header);
 
     let mut builder = FunctionBuilder::new(&mut ctx.func, fctx);
@@ -520,6 +523,7 @@ pub fn compile_osr_function<M: Module>(
         ir,
         &block_map,
         feedback_base_gv,
+        line_cell_gv,
         &reachable,
     )?;
 
@@ -639,6 +643,7 @@ pub(crate) fn lower_function_blocks<M: Module>(
     ir: &Function,
     block_map: &[(pon_ir::ir::BlockId, ir::Block)],
     feedback_base_gv: Option<ir::GlobalValue>,
+    line_cell_gv: Option<ir::GlobalValue>,
     prefilled_entry: Option<ir::Block>,
 ) -> Result<(), CodegenError> {
     let exception_entry_stacks = block_exception_entry_stacks(ir)?;
@@ -658,7 +663,16 @@ pub(crate) fn lower_function_blocks<M: Module>(
             exception_exit,
             "exception handler target block",
         )?;
+        let mut last_line = 0u32;
         for inst in &block.insts {
+            // Statement-line transition: record the new line into the runtime
+            // cell before the statement's first effect can raise or call.
+            if let Some(line_cell_gv) = line_cell_gv {
+                if inst.line != 0 && inst.line != last_line {
+                    emit_line_store(builder, line_cell_gv, ptr_ty, inst.line);
+                    last_line = inst.line;
+                }
+            }
             // J0.3: materialize this site's static feedback-cell address
             // (base + slot * FEEDBACK_CELL_SIZE) for specializable ops.
             let feedback_cell = match (inst.feedback_slot, feedback_base_gv) {
@@ -765,6 +779,7 @@ fn lower_function_blocks_subset<M: Module>(
     ir: &Function,
     block_map: &[(BlockId, ir::Block)],
     feedback_base_gv: Option<ir::GlobalValue>,
+    line_cell_gv: Option<ir::GlobalValue>,
     reachable: &HashSet<BlockId>,
 ) -> Result<(), CodegenError> {
     let exception_entry_stacks = block_exception_entry_stacks(ir)?;
@@ -785,7 +800,14 @@ fn lower_function_blocks_subset<M: Module>(
             exception_exit,
             "OSR exception handler target block",
         )?;
+        let mut last_line = 0u32;
         for inst in &block.insts {
+            if let Some(line_cell_gv) = line_cell_gv {
+                if inst.line != 0 && inst.line != last_line {
+                    emit_line_store(builder, line_cell_gv, ptr_ty, inst.line);
+                    last_line = inst.line;
+                }
+            }
             let feedback_cell = match (inst.feedback_slot, feedback_base_gv) {
                 (Some(slot), Some(gv)) => {
                     let base = builder.ins().global_value(ptr_ty, gv);
@@ -1635,6 +1657,34 @@ pub(crate) fn declare_feedback_cells<M: Module>(
     Ok(Some(data_id))
 }
 
+/// Declares the imported `pon_current_line` runtime cell and returns its
+/// per-function [`ir::GlobalValue`] when `ir` stamps any statement line.
+/// Line-free IR (hand-built or lowered without source text) gets `None`, which
+/// keeps its emitted code byte-identical to pre-line-plumbing output.
+pub(crate) fn declare_line_cell_gv<M: Module>(
+    module: &mut M,
+    ir: &Function,
+    func: &mut ir::Function,
+) -> Result<Option<ir::GlobalValue>, CodegenError> {
+    let has_lines = ir.blocks.iter().any(|block| block.insts.iter().any(|inst| inst.line != 0));
+    if !has_lines {
+        return Ok(None);
+    }
+    let data_id = module.declare_data(pon_runtime::abi::CURRENT_LINE_SYMBOL, Linkage::Import, true, false)?;
+    Ok(Some(module.declare_data_in_func(data_id, func)))
+}
+
+/// Records a statement-line transition: one direct `i32` store of `line` into
+/// the imported `pon_current_line` cell (see `pon_runtime::abi`).  A direct
+/// store beats a `pon_set_line` helper call here: no caller-saved register
+/// clobbers around it and three machine instructions per transition, emitted
+/// only when consecutive instructions disagree on their statement line.
+pub(crate) fn emit_line_store(builder: &mut FunctionBuilder<'_>, line_cell_gv: ir::GlobalValue, ptr_ty: ir::Type, line: u32) {
+    let address = builder.ins().global_value(ptr_ty, line_cell_gv);
+    let value = builder.ins().iconst(ir::types::I32, i64::from(line));
+    builder.ins().store(MemFlagsData::new(), value, address, 0);
+}
+
 /// A pointer-carrying `ExplicitSlot` array built for one consuming helper call.
 ///
 /// `addr` is the array base passed to the helper.  `scrub` names the backing
@@ -1908,6 +1958,10 @@ mod tests {
         for helper in HELPERS {
             builder.symbol(helper.symbol, helper.address.cast::<u8>());
         }
+        builder.symbol(
+            pon_runtime::abi::CURRENT_LINE_SYMBOL,
+            pon_runtime::abi::current_line_cell_address(),
+        );
         register_free_threading_symbols(&mut builder);
         cranelift_jit::JITModule::new(builder)
     }

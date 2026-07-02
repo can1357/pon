@@ -188,6 +188,10 @@ mod tests {
         for helper in HELPERS {
             builder.symbol(helper.symbol, helper.address.cast::<u8>());
         }
+        builder.symbol(
+            pon_runtime::abi::CURRENT_LINE_SYMBOL,
+            pon_runtime::abi::current_line_cell_address(),
+        );
         register_free_threading_symbols(&mut builder);
         cranelift_jit::JITModule::new(builder)
     }

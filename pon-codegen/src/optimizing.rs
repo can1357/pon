@@ -1802,6 +1802,10 @@ mod tests {
         for helper in HELPERS {
             builder.symbol(helper.symbol, helper.address.cast::<u8>());
         }
+        builder.symbol(
+            pon_runtime::abi::CURRENT_LINE_SYMBOL,
+            pon_runtime::abi::current_line_cell_address(),
+        );
         cranelift_jit::JITModule::new(builder)
     }
 
