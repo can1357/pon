@@ -401,6 +401,7 @@ fn codec_result(payload: *mut PyObject, consumed: usize) -> *mut PyObject {
 // Builtin codec cores
 
 /// A failed builtin codec call, mapped onto the matching typed exception.
+#[derive(Debug)]
 pub(crate) enum CoreError {
     /// -> `UnicodeDecodeError` with a CPython-shaped message.
     Decode(String),
