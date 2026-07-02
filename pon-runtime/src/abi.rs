@@ -1967,6 +1967,11 @@ fn register_builtin_type_globals(runtime: &mut Runtime) {
         // Default `__instancecheck__`/`__subclasscheck__` terminus for
         // metaclass overrides that delegate via `super()`.
         install_type_check_dunders(runtime);
+        // `type.__dict__` getset descriptors: `__annotations__` (PEP 649;
+        // annotationlib captures its unbound `__get__` at module scope),
+        // `__mro__` and `__dict__` (inspect.py:1667/1668 capture theirs; the
+        // whole `test.support` import chain runs those lines).
+        install_type_getset_descriptors(runtime);
         // `None.__new__` and friends: NoneType gets real attribute lookup
         // over `object`, with `__new__` aliased to object's carrier so the
         // identity checks in enum's `_find_new_` hold.
@@ -2208,6 +2213,36 @@ fn install_type_check_dunders(runtime: &mut Runtime) {
                 (*type_type).tp_dict = dict.cast::<PyObject>();
             }
             (&mut *dict).set(name, function);
+            crate::sync::register_namespaced_type(type_type);
+        }
+    }
+}
+
+/// Installs the `type.__dict__` getset descriptors — `__annotations__`
+/// (PEP 649 class-annotations surface), `__mro__`, and `__dict__` (inspect's
+/// static-introspection captures) — see the descriptor section in `descr.rs`.
+/// Attribute reads on class receivers keep resolving through the fast paths
+/// in `generic_get_attr_cached`; the dict entries exist for direct
+/// `type.__dict__[...]` consumers (annotationlib, inspect) and give
+/// class-level writes data-descriptor routing (`__annotations__` writable,
+/// the other two read-only).
+fn install_type_getset_descriptors(runtime: &mut Runtime) {
+    // Stamp the shared descriptor type's metatype and the descriptors'
+    // `__objclass__` (the builtin `type`); idempotent with the function-type
+    // install path.
+    unsafe { crate::descr::finalize_getset_descriptors(runtime._type_type) };
+    for (name, descriptor) in crate::descr::type_getset_entries() {
+        if descriptor.is_null() {
+            continue;
+        }
+        unsafe {
+            let type_type = runtime._type_type;
+            let mut dict = (*type_type).tp_dict.cast::<type_::PyClassDict>();
+            if dict.is_null() {
+                dict = type_::new_namespace();
+                (*type_type).tp_dict = dict.cast::<PyObject>();
+            }
+            (&mut *dict).set(crate::intern::intern(name), descriptor);
             crate::sync::register_namespaced_type(type_type);
         }
     }
@@ -4630,6 +4665,11 @@ pub fn collect() -> Result<(), String> {
     for value in crate::native::contextvars::gc_held_roots() {
         roots.push(value.cast::<u8>());
     }
+    // Values held by native `_thread._local` per-thread namespaces,
+    // mirroring `_contextvars`.
+    for value in crate::native::thread::gc_held_roots() {
+        roots.push(value.cast::<u8>());
+    }
     // Values held by native `_codecs` registry state (search functions,
     // error handlers, cached CodecInfo objects), mirroring `_contextvars`.
     for value in crate::native::codecs::gc_held_roots() {
@@ -4647,6 +4687,17 @@ pub fn collect() -> Result<(), String> {
     // Weakref key objects and values held by native `WeakKeyDictionary`
     // instances, mirroring `_contextvars`.
     for value in crate::native::weakref::gc_held_roots() {
+        roots.push(value.cast::<u8>());
+    }
+    // Registered exit callbacks held by native `atexit`, mirroring
+    // `_contextvars`.
+    for value in crate::native::atexit::gc_held_roots() {
+        roots.push(value.cast::<u8>());
+    }
+    // Module attribute values held by the import registry (module objects are
+    // immortal leaked boxes marking cannot traverse) plus the `sys.modules`
+    // dict: every module-scope binding in every module.
+    for value in crate::import::gc_held_roots() {
         roots.push(value.cast::<u8>());
     }
     extend_tierup_roots(&mut roots);

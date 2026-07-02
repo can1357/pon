@@ -198,12 +198,6 @@ struct PyFunctionCodeObject {
     metadata: FunctionCodeMetadata,
 }
 
-#[repr(C)]
-struct PyFunctionGetSetDescriptor {
-    ob_base: PyObjectHeader,
-    name: u32,
-}
-
 fn function_code_type() -> *mut PyType {
     static CODE_TYPE: LazyLock<usize> = LazyLock::new(|| {
         let mut ty = PyType::new(ptr::null(), "code", mem::size_of::<PyFunctionCodeObject>());
@@ -211,15 +205,6 @@ fn function_code_type() -> *mut PyType {
         Box::into_raw(Box::new(ty)) as usize
     });
     *CODE_TYPE as *mut PyType
-}
-
-fn function_getset_descriptor_type() -> *mut PyType {
-    static DESCRIPTOR_TYPE: LazyLock<usize> = LazyLock::new(|| {
-        let mut ty = PyType::new(ptr::null(), "getset_descriptor", mem::size_of::<PyFunctionGetSetDescriptor>());
-        ty.tp_descr_get = Some(function_getset_descr_get);
-        Box::into_raw(Box::new(ty)) as usize
-    });
-    *DESCRIPTOR_TYPE as *mut PyType
 }
 
 /// Install Python-visible function/code descriptor metadata on the runtime's
@@ -234,10 +219,14 @@ pub unsafe fn install_function_type_attrs(function_type: *mut PyType, type_type:
         return;
     }
     let code_type = function_code_type();
-    let descriptor_type = function_getset_descriptor_type();
     unsafe {
         (*code_type).ob_base.ob_type = type_type;
-        (*descriptor_type).ob_base.ob_type = type_type;
+        // The slot descriptors below are instances of the SHARED
+        // `getset_descriptor` type (descr.rs) — `types.GetSetDescriptorType`
+        // is derived from `type(FunctionType.__code__)` and must be identical
+        // to the `type.__dict__` getsets' type.  Stamp its metatype here too
+        // (idempotent with the abi.rs install path, so ordering is free).
+        crate::descr::finalize_getset_descriptors(type_type);
     }
 
     let dict = unsafe {
@@ -260,32 +249,41 @@ pub unsafe fn install_function_type_attrs(function_type: *mut PyType, type_type:
         "__annotate__",
     ] {
         let name = intern(attr);
-        let descriptor = Box::into_raw(Box::new(PyFunctionGetSetDescriptor {
-            ob_base: PyObjectHeader::new(descriptor_type),
-            name,
-        }))
-        .cast::<PyObject>();
+        let descriptor = crate::descr::new_function_getset_descriptor(name, function_type);
         unsafe { (&mut *dict).set(name, descriptor) };
     }
 }
 
-unsafe extern "C" fn function_getset_descr_get(
-    descr: *mut PyObject,
-    obj: *mut PyObject,
-    _owner: *mut PyObject,
-) -> *mut PyObject {
-    if descr.is_null() {
-        return return_null_with_error("function descriptor is NULL");
+/// True when `object` is a function object (the shared `getset_descriptor`
+/// in descr.rs validates receivers before delegating slot traffic here).
+pub(crate) fn is_function_object(object: *mut PyObject) -> bool {
+    if object.is_null() || !crate::tag::is_heap(object) {
+        return false;
     }
-    if obj.is_null() {
-        return descr;
+    let ty = unsafe { (*object).ob_type };
+    !ty.is_null() && unsafe { (*ty).name() } == "function"
+}
+
+/// Descriptor-protocol read of a function slot (`descr.__get__(f)`); the
+/// receiver was validated by the caller.
+pub(crate) unsafe fn getset_slot_get(function: *mut PyObject, name_id: u32) -> *mut PyObject {
+    function_attr_by_id(function, name_id).unwrap_or_else(|| return_null_with_error("unknown function descriptor"))
+}
+
+/// Descriptor-protocol write/delete of a function slot (`descr.__set__(f, v)`
+/// / `descr.__delete__(f)`): identical semantics to a plain attribute write,
+/// so delegate to `function_setattro`.
+pub(crate) unsafe fn getset_slot_set(function: *mut PyObject, name_id: u32, value: *mut PyObject) -> c_int {
+    let Some(name_text) = crate::intern::resolve(name_id) else {
+        pon_err_set("function attribute name is not interned");
+        return -1;
+    };
+    let name = const_str(&name_text);
+    if name.is_null() {
+        pon_err_set("failed to allocate function attribute key");
+        return -1;
     }
-    let obj_ty = unsafe { (*obj).ob_type };
-    if !obj_ty.is_null() && unsafe { (*obj_ty).name() == "type" } {
-        return descr;
-    }
-    let name = unsafe { (*descr.cast::<PyFunctionGetSetDescriptor>()).name };
-    function_attr_by_id(obj, name).unwrap_or_else(|| return_null_with_error("unknown function descriptor"))
+    unsafe { function_setattro(function, name, value) }
 }
 
 fn const_str(text: &str) -> *mut PyObject {
@@ -1424,7 +1422,17 @@ pub(crate) fn bind_native_keywords_for_name(
         // `type(name, bases, ns, **kwds)`: arbitrary class keywords ride to
         // the metaclass constructor in a trailing marker (`metaclass`, PEP
         // 487 `__init_subclass__` keywords, enum's `boundary`/`_simple`).
-        "type" => bind_class_keywords(positional, keywords),
+        "type" => bind_any_keywords(positional, keywords, "type"),
+        // `str.format(*args, **kwargs)`: arbitrary keyword names are template
+        // fields, riding in a trailing marker that `str_format_method` peels
+        // into the named-field mapping (base64.py renders its `__doc__`
+        // templates with keyword fields at import time).
+        "format" => bind_any_keywords(positional, keywords, "format"),
+        // `bytes.translate(table, /, delete=b'')`: `delete` rides in a
+        // trailing marker that `bytes_translate_method` peels, preserving the
+        // absent-vs-explicit-None distinction (base64.b16decode passes
+        // `delete=` with a None table).
+        "translate" => bind_trailing_marker_keywords(positional, keywords, "translate", &["delete"]),
         // `__import__(name, globals=None, locals=None, fromlist=(), level=0)`:
         // the vendored `encodings` package search function calls it with
         // `fromlist=`/`level=` keywords; absent optionals arrive as None and
@@ -1466,8 +1474,84 @@ pub(crate) fn bind_native_keywords_for_name(
         "zip_longest" => bind_trailing_marker_keywords(positional, keywords, "zip_longest", &["fillvalue"]),
         "product" => bind_trailing_marker_keywords(positional, keywords, "product", &["repeat"]),
         "complex" => bind_named_positional_keywords(positional, keywords, "complex", &["real", "imag"], 0, 2),
+        // Native `_struct.unpack_from(format, buffer, offset=0)`; the bound
+        // `Struct.unpack_from(buffer, offset=0)` shape fits because the
+        // receiver occupies the first slot. Absent optionals arrive as None.
+        "unpack_from" => {
+            bind_optional_named_keywords(positional, keywords, "unpack_from", &["format", "buffer", "offset"], 3)
+        }
+        // `compile(source, filename, mode, flags=0, dont_inherit=False,
+        // optimize=-1, *, _feature_version=-1)`: `ast.parse` passes
+        // `optimize`/`_feature_version` as keywords; absent slots arrive as
+        // NULL and the dynexec entry defaults them.
+        "compile" => bind_optional_named_keywords(
+            positional,
+            keywords,
+            "compile",
+            &["source", "filename", "mode", "flags", "dont_inherit", "optimize", "_feature_version"],
+            6,
+        ),
         "property" => {
             bind_optional_named_keywords(positional, keywords, "property", &["fget", "fset", "fdel", "doc"], 4)
+        }
+        // Native `binascii` keyword signatures (email/base64/quopri chain).
+        // Fixed shapes flatten keywords into positional slots; absent
+        // optionals arrive as None and the entries apply their defaults.
+        "a2b_base64" => {
+            bind_optional_named_keywords(positional, keywords, "a2b_base64", &["data", "strict_mode"], 1)
+        }
+        "b2a_base64" => {
+            bind_optional_named_keywords(positional, keywords, "b2a_base64", &["data", "newline"], 1)
+        }
+        "a2b_qp" => bind_optional_named_keywords(positional, keywords, "a2b_qp", &["data", "header"], 2),
+        "b2a_qp" => bind_optional_named_keywords(
+            positional,
+            keywords,
+            "b2a_qp",
+            &["data", "quotetabs", "istext", "header"],
+            4,
+        ),
+        "b2a_uu" => bind_optional_named_keywords(positional, keywords, "b2a_uu", &["data", "backtick"], 1),
+        "b2a_hex" => {
+            bind_optional_named_keywords(positional, keywords, "b2a_hex", &["data", "sep", "bytes_per_sep"], 3)
+        }
+        "hexlify" => {
+            bind_optional_named_keywords(positional, keywords, "hexlify", &["data", "sep", "bytes_per_sep"], 3)
+        }
+        // Native `math` keyword-only parameters (statistics/random chain).
+        // Fixed shapes flatten keywords into positional slots; absent
+        // optionals arrive as None and the entries apply their defaults.
+        "isclose" => {
+            bind_optional_named_keywords(positional, keywords, "isclose", &["a", "b", "rel_tol", "abs_tol"], 2)
+        }
+        "nextafter" => bind_optional_named_keywords(positional, keywords, "nextafter", &["x", "y", "steps"], 2),
+        "prod" => bind_optional_named_keywords(positional, keywords, "prod", &["iterable", "start"], 1),
+        // Native `os.lstat(path, *, dir_fd=None)`: `glob._lexists` always
+        // forwards `dir_fd=` as a keyword; None (the flattened absent slot)
+        // selects the plain non-fd syscall and non-None values raise the
+        // honest NotImplementedError in the entry.
+        "lstat" => bind_optional_named_keywords(positional, keywords, "lstat", &["path", "dir_fd"], 1),
+        // Native `_thread.start_joinable_thread(function, handle=None,
+        // daemon=True)`: `threading.Thread.start` passes `handle`/`daemon`
+        // as keywords; absent optionals arrive as None and the entry
+        // defaults them.
+        "start_joinable_thread" => bind_optional_named_keywords(
+            positional,
+            keywords,
+            "start_joinable_thread",
+            &["function", "handle", "daemon"],
+            3,
+        ),
+        // `int.from_bytes(bytes, byteorder='big', *, signed=False)` served by
+        // the synthetic type attribute (`descr::synthetic_type_attr`).
+        "from_bytes" => {
+            bind_optional_named_keywords(positional, keywords, "from_bytes", &["bytes", "byteorder", "signed"], 2)
+        }
+        // `int.to_bytes(length=1, byteorder='big', *, signed=False)`: the
+        // bound receiver occupies the first slot (`unpack_from` precedent);
+        // absent optionals arrive as None and the entry applies the defaults.
+        "to_bytes" => {
+            bind_optional_named_keywords(positional, keywords, "to_bytes", &["self", "length", "byteorder", "signed"], 3)
         }
         _ => Err("keyword arguments require Phase-B function metadata".to_owned()),
     }
@@ -1543,17 +1627,22 @@ fn bind_trailing_marker_keywords(
     Ok(argv)
 }
 
-/// Binds `type(name, bases, ns, **kwds)`: positionals pass through untouched
-/// and every keyword (any name — class keywords are user-defined) rides in a
-/// trailing `lazy_iter::PyKwMarker` that `builtin_type` unpacks.
-fn bind_class_keywords(positional: &[*mut PyObject], keywords: KeywordArgs<'_>) -> Result<Vec<*mut PyObject>, String> {
+/// Binds a variadic native signature accepting arbitrary keyword names:
+/// positionals pass through untouched and every keyword rides in a trailing
+/// `lazy_iter::PyKwMarker` (`type(**kwds)` unpacked by `builtin_type`,
+/// `str.format(**kwargs)` peeled by `str_format_method`).
+fn bind_any_keywords(
+    positional: &[*mut PyObject],
+    keywords: KeywordArgs<'_>,
+    function_name: &str,
+) -> Result<Vec<*mut PyObject>, String> {
     let mut pairs = Vec::with_capacity(keywords.names.len());
     for (name, value) in keywords.names.iter().copied().zip(keywords.values.iter().copied()) {
         if value.is_null() {
             return Err(format!("keyword argument {} is NULL", keyword_name(name)));
         }
         if pairs.iter().any(|&(existing, _)| existing == name) {
-            return Err(format!("type() got multiple values for argument '{}'", keyword_name(name)));
+            return Err(format!("{function_name}() got multiple values for argument '{}'", keyword_name(name)));
         }
         pairs.push((name, value));
     }

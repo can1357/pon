@@ -841,8 +841,10 @@ unsafe fn mapping_get(mapping: *mut PyObject, key: &str) -> Result<*mut PyObject
     let key = boxed_str(key)?;
     let value = unsafe { super::object::pon_subscript_get(mapping, key, ptr::null_mut()) };
     if value.is_null() {
+        // Keep the boxed exception pending: `pon_err_set` preserves it, so a
+        // mapping miss stays a catchable `KeyError` (`'{x}'.format()` named
+        // fields, `format_map`) instead of degrading to a generic diagnostic.
         let message = pon_err_message().unwrap_or_else(|| "format mapping lookup failed".to_owned());
-        pon_err_clear();
         Err(message)
     } else {
         Ok(value)
@@ -852,8 +854,9 @@ unsafe fn mapping_get(mapping: *mut PyObject, key: &str) -> Result<*mut PyObject
 unsafe fn attr_get(value: *mut PyObject, attr: &str) -> Result<*mut PyObject, String> {
     let object = unsafe { super::object::pon_get_attr(value, intern(attr), ptr::null_mut()) };
     if object.is_null() {
+        // Same convention as `mapping_get`: the boxed AttributeError stays
+        // pending and catchable.
         let message = pon_err_message().unwrap_or_else(|| format!("attribute '{attr}' was not found"));
-        pon_err_clear();
         Err(message)
     } else {
         Ok(object)
@@ -869,8 +872,9 @@ unsafe fn item_get(value: *mut PyObject, key: &str) -> Result<*mut PyObject, Str
     };
     let object = unsafe { super::object::pon_subscript_get(value, key_object, ptr::null_mut()) };
     if object.is_null() {
+        // Same convention as `mapping_get`: the boxed IndexError/KeyError
+        // stays pending and catchable.
         let message = pon_err_message().unwrap_or_else(|| "format item lookup failed".to_owned());
-        pon_err_clear();
         Err(message)
     } else {
         Ok(object)

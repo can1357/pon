@@ -65,6 +65,7 @@ pub fn set_iter_type(type_type: *const PyType) -> *mut PyType {
         let mut ty = PyType::new(ptr::null(), "set_iterator", size_of::<PySetIter>());
         ty.tp_iternext = Some(set_iter_next_slot);
         ty.tp_iter = Some(set_iter_identity_slot);
+        ty.tp_getattro = Some(crate::abstract_op::iterator_dunder_getattro);
         Box::into_raw(Box::new(ty)) as usize
     });
     let ty = *TYPE as *mut PyType;

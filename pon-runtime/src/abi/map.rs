@@ -651,6 +651,31 @@ if args.len() != 1 {
 }
 unsafe { pon_dict_items(receiver) } }
 
+pub(crate) unsafe extern "C" fn dict_copy_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match map_method_args(argv, argc, "dict.copy") {
+        Ok(args) => args,
+        Err(message) => return null_error(message),
+    };
+    let receiver = match ensure_dict_method_receiver(args, "copy") {
+        Ok(receiver) => receiver,
+        Err(raised) => return raised,
+    };
+    if args.len() != 1 {
+        return raise_map_type_error(format!("dict.copy() expected 0 arguments, got {}", args.len().saturating_sub(1)));
+    }
+    // CPython `dict.copy`: a shallow EXACT dict, also for subclass receivers.
+    let entries = match unsafe { dict::dict_entries_snapshot(receiver) } {
+        Ok(entries) => entries,
+        Err(message) => return null_error(message),
+    };
+    let mut pairs = Vec::with_capacity(entries.len() * 2);
+    for entry in entries {
+        pairs.push(entry.key);
+        pairs.push(entry.value);
+    }
+    unsafe { pon_build_map(pairs.as_mut_ptr(), pairs.len() / 2) }
+}
+
 pub(crate) unsafe extern "C" fn dict_setdefault_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject { let args = match map_method_args(argv, argc, "dict.setdefault") {
     Ok(args) => args,
     Err(message) => return null_error(message),
@@ -708,6 +733,7 @@ pub unsafe fn pon_dict_bound_method(map: *mut PyObject, name: &str) -> *mut PyOb
         "setdefault" => alloc_bound_native_method(map, name, dict_setdefault_method_trampoline),
         "pop" => alloc_bound_native_method(map, name, dict_pop_method_trampoline),
         "update" => alloc_bound_native_method(map, name, dict_update_method_trampoline),
+        "copy" => alloc_bound_native_method(map, name, dict_copy_method_trampoline),
         _ => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
     }
 }

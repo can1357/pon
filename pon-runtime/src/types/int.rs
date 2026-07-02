@@ -370,13 +370,19 @@ pub unsafe fn install_slots_for_object(object: *mut PyObject) {
 
 /// Instance attribute surface for exact `int`/`bool` receivers (slotless
 /// native types reach here from `abstract_op::get_attr`): `bit_length`/
-/// `bit_count` bound methods plus the numeric-tower value attributes.
+/// `bit_count`/`__index__`/`__trunc__` bound methods plus the numeric-tower
+/// value attributes (`operator.index` calls `a.__index__()` in the vendored
+/// stdlib, so the dunder must resolve as an instance attribute).
 pub unsafe fn int_instance_attr(object: *mut PyObject, name: u32) -> Option<*mut PyObject> {
     let value = unsafe { to_bigint_including_bool(crate::tag::untag_arg(object)) }?;
     let name_text = crate::intern::resolve(name)?;
     match name_text.as_str() {
         "bit_length" => bound_int_method(object, name, int_bit_length_method),
         "bit_count" => bound_int_method(object, name, int_bit_count_method),
+        "to_bytes" => bound_int_method(object, name, int_to_bytes_method),
+        "__index__" | "__int__" | "__trunc__" | "__floor__" | "__ceil__" => {
+            bound_int_method(object, name, int_identity_method)
+        }
         "numerator" | "real" => Some(from_bigint(value)),
         "denominator" => Some(from_bigint(BigInt::from(1))),
         "imag" => Some(from_bigint(BigInt::from(0))),
@@ -396,6 +402,15 @@ fn bound_int_method(
     match crate::types::method::new_bound_method(function, receiver) {
         Ok(method) => Some(method.cast::<PyObject>()),
         Err(message) => Some(raise_type_error(&message)),
+    }
+}
+/// `int.__index__`/`__int__`/`__trunc__`/`__floor__`/`__ceil__`: identity on
+/// exact ints (CPython returns self; the runtime's canonical boxing keeps
+/// value identity).
+unsafe extern "C" fn int_identity_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    match unsafe { int_method_receiver(argv, argc, "__index__") } {
+        Ok(value) => from_bigint(value),
+        Err(error) => error,
     }
 }
 
@@ -422,6 +437,157 @@ unsafe extern "C" fn int_bit_count_method(argv: *mut *mut PyObject, argc: usize)
         Ok(value) => from_bigint(BigInt::from(value.magnitude().count_ones())),
         Err(error) => error,
     }
+}
+
+/// `int.to_bytes(length=1, byteorder='big', *, signed=False)` — bound
+/// instance method: `argv[0]` is the receiver; keyword slots arrive
+/// positionally with None filling absent values (`types::function` binder
+/// arm).  `importlib._bootstrap_external` calls it at module scope
+/// (`MAGIC_NUMBER = (3610).to_bytes(2, 'little')`, pyc header tokens).
+unsafe extern "C" fn int_to_bytes_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc == 0 || argc > 4 {
+        return raise_type_error(&format!("to_bytes() takes 0 to 3 arguments ({} given)", argc.saturating_sub(1)));
+    }
+    // SAFETY: The caller passes a live argv window of length argc.
+    let args: Vec<*mut PyObject> =
+        unsafe { core::slice::from_raw_parts(argv, argc) }.iter().map(|&arg| crate::tag::untag_arg(arg)).collect();
+    let Some(value) = (unsafe { to_bigint_including_bool(args[0]) }) else {
+        return raise_type_error("to_bytes() receiver must be an integer");
+    };
+    let is_none = |object: *mut PyObject| {
+        // SAFETY: Type probe tolerates any live object.
+        let name = unsafe { crate::types::dict::type_name(object) };
+        name == Some("NoneType")
+    };
+    let length = match args.get(1).copied().filter(|&len| !is_none(len)) {
+        None => 1usize, // length defaults to 1
+        Some(len) => {
+            let Some(len) = (unsafe { to_bigint_including_bool(len) }) else {
+                return raise_type_error("to_bytes() length argument must be an integer");
+            };
+            match len.to_isize() {
+                Some(len) if len >= 0 => len as usize,
+                Some(_) => return raise_value_error("length argument must be non-negative"),
+                None => return raise_overflow_error("Python int too large to convert to C ssize_t"),
+            }
+        }
+    };
+    let little = match args.get(2).copied().filter(|&order| !is_none(order)) {
+        None => false, // byteorder defaults to 'big'
+        Some(order) => {
+            // SAFETY: `unicode_text` type-checks its argument.
+            match unsafe { crate::types::type_::unicode_text(order) } {
+                Some("big") => false,
+                Some("little") => true,
+                _ => return raise_value_error("byteorder must be either 'little' or 'big'"),
+            }
+        }
+    };
+    let signed = match args.get(3).copied().filter(|&flag| !is_none(flag)) {
+        None => false,
+        // SAFETY: Truth helper follows the NULL-sentinel error contract.
+        Some(flag) => match unsafe { crate::abstract_op::is_true(flag) } {
+            negative if negative < 0 => return ptr::null_mut(),
+            truth => truth != 0,
+        },
+    };
+    let mut bytes = if value.sign() == Sign::NoSign {
+        // Zero fits any width, including `(0).to_bytes(0, ...)` -> b''.
+        vec![0u8; length]
+    } else if value.sign() == Sign::Minus && !signed {
+        return raise_overflow_error("can't convert negative int to unsigned");
+    } else if signed {
+        let mut le = value.to_signed_bytes_le();
+        if le.len() > length {
+            return raise_overflow_error("int too big to convert");
+        }
+        let fill = if value.sign() == Sign::Minus { 0xFF } else { 0x00 };
+        le.resize(length, fill);
+        le
+    } else {
+        let (_, mut le) = value.to_bytes_le();
+        if le.len() > length {
+            return raise_overflow_error("int too big to convert");
+        }
+        le.resize(length, 0x00);
+        le
+    };
+    if !little {
+        bytes.reverse();
+    }
+    // SAFETY: Runtime allocation helper; NULL on failure with the error set.
+    unsafe { abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) }
+}
+/// Cached `int.from_bytes` function object served by type-level attribute
+/// lookup (`descr::synthetic_type_attr`); classmethod semantics degenerate to
+/// a plain function because the type receiver is not passed through.
+#[must_use]
+pub fn from_bytes_function() -> *mut PyObject {
+    static FUNCTION: LazyLock<usize> = LazyLock::new(|| {
+        let name = crate::intern::intern("from_bytes");
+        // SAFETY: Live builtin entry point with the runtime calling convention.
+        let function =
+            unsafe { abi::pon_make_function(int_from_bytes_entry as *const u8, crate::builtins::variadic_arity(), name) };
+        function as usize
+    });
+    *FUNCTION as *mut PyObject
+}
+
+/// `int.from_bytes(bytes, byteorder='big', *, signed=False)`; keyword slots
+/// arrive positionally with None filling absent values (`types::function`
+/// binder arm), and the `random.py` str-seed path calls it one-argument.
+unsafe extern "C" fn int_from_bytes_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc == 0 || argc > 3 {
+        return raise_type_error(&format!("from_bytes() takes 1 to 3 arguments ({argc} given)"));
+    }
+    // SAFETY: The caller passes a live argv window of length argc.
+    let args: Vec<*mut PyObject> =
+        unsafe { core::slice::from_raw_parts(argv, argc) }.iter().map(|&arg| crate::tag::untag_arg(arg)).collect();
+    let payload: Vec<u8> = {
+        let data = args[0];
+        // SAFETY: A non-NULL heap object carries a live header.
+        let ty = unsafe { data.as_ref().map_or(ptr::null(), |object| object.ob_type) };
+        if crate::types::bytes_::is_bytes_type(ty) {
+            // SAFETY: Type check above proved the layout.
+            unsafe { (*data.cast::<crate::types::bytes_::PyBytes>()).as_slice().to_vec() }
+        } else if crate::types::bytearray_::is_bytearray_type(ty) {
+            // SAFETY: Type check above proved the layout.
+            unsafe { (*data.cast::<crate::types::bytearray_::PyByteArray>()).as_slice().to_vec() }
+        } else {
+            return raise_type_error("cannot convert non-bytes object to int");
+        }
+    };
+    let is_none = |object: *mut PyObject| {
+        // SAFETY: Type probe tolerates any live object.
+        let name = unsafe { crate::types::dict::type_name(object) };
+        name == Some("NoneType")
+    };
+    let little = match args.get(1).copied().filter(|&order| !is_none(order)) {
+        None => false, // byteorder defaults to 'big'
+        Some(order) => {
+            // SAFETY: `unicode_text` type-checks its argument.
+            match unsafe { crate::types::type_::unicode_text(order) } {
+                Some("big") => false,
+                Some("little") => true,
+                _ => return raise_value_error("byteorder must be either 'little' or 'big'"),
+            }
+        }
+    };
+    let signed = match args.get(2).copied().filter(|&flag| !is_none(flag)) {
+        None => false,
+        // SAFETY: Truth helper follows the NULL-sentinel error contract.
+        Some(flag) => match unsafe { crate::abstract_op::is_true(flag) } {
+            negative if negative < 0 => return ptr::null_mut(),
+            truth => truth != 0,
+        },
+    };
+    let value = match (little, signed) {
+        (false, false) => BigInt::from_bytes_be(Sign::Plus, &payload),
+        (true, false) => BigInt::from_bytes_le(Sign::Plus, &payload),
+        (false, true) => BigInt::from_signed_bytes_be(&payload),
+        (true, true) => BigInt::from_signed_bytes_le(&payload),
+    };
+    from_bigint(value)
 }
 
 /// Returns the integer protocol slot table.
@@ -586,4 +752,8 @@ fn raise_type_error(message: &str) -> *mut PyObject {
 
 fn raise_value_error(message: &str) -> *mut PyObject {
     unsafe { abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) }
+}
+
+fn raise_overflow_error(message: &str) -> *mut PyObject {
+    crate::abi::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::OverflowError, message)
 }

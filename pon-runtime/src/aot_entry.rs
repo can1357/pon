@@ -104,7 +104,6 @@ unsafe fn pon_aot_entry_impl(argc: i32, argv: *const *const u8) -> i32 {
     }
 
     let module_result = unsafe { pon_module_main() };
-    crate::import::end_module_execution("__main__");
     let mut exit_code = if module_result.is_null() {
         if !pon_err_occurred() {
             pon_err_set("module main returned NULL without setting an exception");
@@ -114,6 +113,11 @@ unsafe fn pon_aot_entry_impl(argc: i32, argv: *const *const u8) -> i32 {
     } else {
         0
     };
+    // CPython finalization order: the uncaught report (if any) precedes the
+    // atexit callbacks, which run before `__main__` teardown so hooks still
+    // see live module state.
+    crate::native::atexit::run_exit_callbacks();
+    crate::import::end_module_execution("__main__");
 
     if unsafe { crate::sys::pon_io_flush_std() } != 0 && exit_code == 0 {
         exit_code = 1;

@@ -1006,6 +1006,39 @@ pub unsafe fn build_class_from_prepared_mapping(
     unsafe { construct_class(metaclass, name, &base_types, namespace, keywords) }
 }
 
+/// CPython `type_new_staticmethod` parity: a plain function `__new__` in the
+/// class namespace is implicitly wrapped in a `staticmethod` carrier before
+/// the namespace becomes `tp_dict`, so `cls.__dict__['__new__']` exposes
+/// `__func__`/`__wrapped__` (enum's `_simple_enum` and `_find_new_` read it)
+/// and `cls.__new__` lookups never bind a receiver.  Instantiation is
+/// unaffected: `call_type_from_argv` resolves the entry through
+/// `descr::descriptor_get`, which pierces the carrier.  Anything that is not
+/// exactly a plain function (already-wrapped carriers, arbitrary callables)
+/// is left as written, matching CPython's `PyFunction_Check` gate.
+unsafe fn wrap_dunder_new_as_staticmethod(namespace: *mut PyClassDict) {
+    let new_id = intern::intern("__new__");
+    let Some(value) = (unsafe { (&*namespace).get(new_id) }) else {
+        return;
+    };
+    if unsafe { object_type_display(value) } != "function" {
+        return;
+    }
+    let Some(carrier_type) = abi::runtime_global(intern::intern("staticmethod")) else {
+        return;
+    };
+    if unsafe { !is_type_object(carrier_type) } {
+        return;
+    }
+    // SAFETY: `carrier_type` is the builtin staticmethod type object and
+    // `value` is a live function object owned by the namespace.  The carrier
+    // box is kept alive by the namespace entry; the collector pierces it
+    // (`push_namespace_value_roots`) to keep the wrapped function alive.
+    let carrier = unsafe { crate::types::classmethod::new_staticmethod(carrier_type.cast::<PyType>(), value) };
+    if !carrier.is_null() {
+        unsafe { (&mut *namespace).set(new_id, carrier) };
+    }
+}
+
 /// `type.__new__` core: allocate and publish the heap type object.
 #[must_use]
 unsafe fn construct_class(
@@ -1018,6 +1051,7 @@ unsafe fn construct_class(
     if namespace.is_null() {
         return raise_object("class namespace is NULL");
     }
+    unsafe { wrap_dunder_new_as_staticmethod(namespace) };
     // CPython: `class C:` means `class C(object):` — the implicit terminus
     // applies to the CONSTRUCTED type (tp_base, MRO, registries) while the
     // Python-visible `bases` tuple handed to metaclasses stays as written.

@@ -70,10 +70,22 @@ pub unsafe fn binary_op(op: u8, a: *mut PyObject, b: *mut PyObject) -> *mut PyOb
         // SAFETY: The exact-type checks above prove both operands use PyLong's layout.
         let left = unsafe { (*a.cast::<PyLong>()).value };
         let right = unsafe { (*b.cast::<PyLong>()).value };
-        return match left.checked_add(right) {
-            Some(sum) => unsafe { abi::pon_const_int(sum) },
-            None => raise_type_error("integer addition overflow"),
-        };
+        // Wide ints are PyLong shells whose inline payload is 0 with the real
+        // value out of line (`types::int::from_bigint`), so the allocation-free
+        // fast path is only sound when both inline payloads are nonzero.
+        // Zeros and shells take the exact BigInt route below; i64 overflow
+        // promotes instead of raising (CPython ints never overflow).
+        if left != 0 && right != 0 {
+            if let Some(sum) = left.checked_add(right) {
+                return unsafe { abi::pon_const_int(sum) };
+            }
+        }
+        // SAFETY: Exact ints always carry an extractable payload.
+        if let (Some(left), Some(right)) =
+            unsafe { (crate::types::int::to_bigint(a), crate::types::int::to_bigint(b)) }
+        {
+            return crate::types::int::from_bigint(left + right);
+        }
     }
 
     let Some(left_type) = (unsafe { object_type(a) }) else {
@@ -656,6 +668,54 @@ pub unsafe fn iter_next(iterator: *mut PyObject) -> *mut PyObject {
         SlotOutcome::Error => ptr::null_mut(),
         SlotOutcome::Missing | SlotOutcome::NotImplemented => raise_type_error("object is not an iterator"),
     }
+}
+
+/// Shared `tp_getattro` for built-in iterator types: serves `__next__` and
+/// `__iter__` as bound methods forwarding through the runtime iterator
+/// protocol, and raises `AttributeError` for every other name.  CPython
+/// exposes these as type-dict slot wrappers; pon's native iterator types have
+/// no type dicts, so stdlib idioms like `iter(x).__next__` bind here instead.
+pub(crate) unsafe extern "C" fn iterator_dunder_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let name = crate::tag::untag_arg(name);
+    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        return raise_type_error("attribute name must be str");
+    };
+    let entry: unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject = match name_text {
+        "__next__" => iterator_dunder_next_method,
+        "__iter__" => iterator_dunder_iter_method,
+        _ => return unsafe { abi::exc::pon_raise_attribute_error(object, crate::intern::intern(name_text)) },
+    };
+    // SAFETY: `entry` is a live builtin entry point with the runtime calling convention.
+    let function = unsafe { abi::pon_make_function(entry as *const u8, crate::builtins::variadic_arity(), crate::intern::intern(name_text)) };
+    if function.is_null() {
+        return ptr::null_mut();
+    }
+    match crate::types::method::new_bound_method(function, object) {
+        Ok(method) => method.cast::<PyObject>(),
+        Err(message) => {
+            crate::thread_state::pon_err_set(message);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Bound `iterator.__next__()`: forwards to [`iter_next`]; iterator slots
+/// raise their own typed `StopIteration`.
+unsafe extern "C" fn iterator_dunder_next_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 1 || argv.is_null() {
+        return raise_type_error(&format!("__next__() takes no arguments ({} given)", argc.saturating_sub(1)));
+    }
+    // SAFETY: The call helper supplies `argv` with at least one live entry.
+    unsafe { iter_next(crate::tag::untag_arg(*argv)) }
+}
+
+/// Bound `iterator.__iter__()`: identity, mirroring the `tp_iter` slot.
+unsafe extern "C" fn iterator_dunder_iter_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 1 || argv.is_null() {
+        return raise_type_error(&format!("__iter__() takes no arguments ({} given)", argc.saturating_sub(1)));
+    }
+    // SAFETY: The call helper supplies `argv` with at least one live entry.
+    unsafe { crate::tag::untag_arg(*argv) }
 }
 
 /// Dispatches subscription through mapping `mp_subscript`, then through the

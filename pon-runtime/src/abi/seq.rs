@@ -170,6 +170,7 @@ fn seq_iter_type() -> *mut PyType {
     SEQ_ITER_TYPE.get_or_init(|| {
         let mut ty = PyType::new(ptr::null(), "sequence_iterator", mem::size_of::<PySeqIter>());
         ty.tp_iter = Some(seq_iter_identity_slot);
+        ty.tp_getattro = Some(crate::abstract_op::iterator_dunder_getattro);
         ty.tp_iternext = Some(seq_iter_next_slot);
         ty.gc_type_id = TYPE_ID_SEQ_ITER.0 as usize;
         Box::into_raw(Box::new(ty)) as usize

@@ -151,6 +151,7 @@ static BYTES_ITER_TYPE: LazyLock<usize> = LazyLock::new(|| {
     let mut ty = PyType::new(runtime_type_type(), "bytes_iterator", mem::size_of::<PyBytesIter>());
     ty.tp_iter = Some(bytes_iter_identity_slot);
     ty.tp_iternext = Some(bytes_iter_next_slot);
+    ty.tp_getattro = Some(crate::abstract_op::iterator_dunder_getattro);
     Box::into_raw(Box::new(ty)) as usize
 });
 
@@ -202,6 +203,7 @@ static BYTEARRAY_ITER_TYPE: LazyLock<usize> = LazyLock::new(|| {
     let mut ty = PyType::new(runtime_type_type(), "bytearray_iterator", mem::size_of::<PyByteArrayIter>());
     ty.tp_iter = Some(bytes_iter_identity_slot);
     ty.tp_iternext = Some(bytearray_iter_next_slot);
+    ty.tp_getattro = Some(crate::abstract_op::iterator_dunder_getattro);
     Box::into_raw(Box::new(ty)) as usize
 });
 
@@ -326,6 +328,7 @@ static STR_ITER_TYPE: LazyLock<usize> = LazyLock::new(|| {
     let mut ty = PyType::new(runtime_type_type(), "str_iterator", mem::size_of::<PyStrIter>());
     ty.tp_iter = Some(str_iter_identity_slot);
     ty.tp_iternext = Some(str_iter_next_slot);
+    ty.tp_getattro = Some(crate::abstract_op::iterator_dunder_getattro);
     Box::into_raw(Box::new(ty)) as usize
 });
 
@@ -1180,6 +1183,166 @@ pub(crate) fn ensure_str_type_methods_installed(ty: *mut PyType) {
     crate::sync::type_modified(ty);
 }
 
+/// `bytes.maketrans(frm, to)` / `bytearray.maketrans` reached off the type:
+/// a STATIC method building the 256-byte translation table, with CPython's
+/// exact error text (`base64.py` builds its url-safe tables at module scope).
+unsafe extern "C" fn bytes_maketrans_static_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    super::catch_object_helper(|| {
+        let Some(args) = raw_args(argv, argc) else {
+            return super::return_null_with_error("bytes method argv pointer is null");
+        };
+        bytes_maketrans_method(args)
+    })
+}
+
+fn bytes_maketrans_method(args: &[*mut PyObject]) -> *mut PyObject {
+    if args.len() != 2 {
+        return raise_type_error(format!("maketrans expected 2 arguments, got {}", args.len()));
+    }
+    let bytes_arg = |value: *mut PyObject| -> Result<Vec<u8>, String> {
+        expect_bytes_like(value).map_err(|_| {
+            let name = if crate::tag::is_small_int(value) {
+                "int"
+            } else if value.is_null() {
+                "NULL"
+            } else {
+                unsafe { crate::types::dict::type_name(value) }.unwrap_or("object")
+            };
+            format!("a bytes-like object is required, not '{name}'")
+        })
+    };
+    let from = match bytes_arg(args[0]) {
+        Ok(from) => from,
+        Err(message) => return raise_type_error(message),
+    };
+    let to = match bytes_arg(args[1]) {
+        Ok(to) => to,
+        Err(message) => return raise_type_error(message),
+    };
+    if from.len() != to.len() {
+        return raise_value_error("maketrans arguments must have same length".to_owned());
+    }
+    let mut table: [u8; 256] = core::array::from_fn(|index| index as u8);
+    for (&from_byte, &to_byte) in from.iter().zip(to.iter()) {
+        table[usize::from(from_byte)] = to_byte;
+    }
+    as_object_ptr(bytes_type::boxed_bytes(&table))
+}
+
+/// `bytes.fromhex` / `bytearray.fromhex` reached off the type (a classmethod
+/// in CPython; static-style here — all argv are arguments, no receiver).
+unsafe extern "C" fn bytes_fromhex_static_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    super::catch_object_helper(|| {
+        let Some(args) = raw_args(argv, argc) else {
+            return super::return_null_with_error("bytes method argv pointer is null");
+        };
+        bytes_fromhex_method(args, false)
+    })
+}
+
+unsafe extern "C" fn bytearray_fromhex_static_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    super::catch_object_helper(|| {
+        let Some(args) = raw_args(argv, argc) else {
+            return super::return_null_with_error("bytearray method argv pointer is null");
+        };
+        bytes_fromhex_method(args, true)
+    })
+}
+
+/// Shared body for the bytes/bytearray one-shot type-namespace installers:
+/// the instance-method surface as plain functions (the trampolines peel
+/// `argv[0]`, so unbound `bytes.upper(b)` patterns work) plus `maketrans` and
+/// `fromhex` as staticmethod carriers around receiverless entries.
+fn install_binary_type_methods(
+    ty: *mut PyType,
+    names: &[&str],
+    entry_for_name: fn(&str) -> Option<unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject>,
+    fromhex_entry: unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject,
+) {
+    let namespace = unsafe { (*ty).tp_dict.cast::<type_::PyClassDict>() };
+    let namespace = if namespace.is_null() { type_::new_namespace() } else { namespace };
+    for name in names {
+        let interned = crate::intern::intern(name);
+        if unsafe { (&*namespace).get(interned) }.is_some() {
+            continue;
+        }
+        let Some(entry) = entry_for_name(name) else { continue };
+        if let Ok(function) = alloc_native_str_function(name, entry) {
+            unsafe { (&mut *namespace).set(interned, function) };
+        }
+    }
+    for (name, entry) in [
+        ("maketrans", bytes_maketrans_static_entry as unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject),
+        ("fromhex", fromhex_entry),
+    ] {
+        let interned = crate::intern::intern(name);
+        if unsafe { (&*namespace).get(interned) }.is_some() {
+            continue;
+        }
+        if let Ok(function) = alloc_native_str_function(name, entry) {
+            let descriptor =
+                unsafe { crate::types::classmethod::new_staticmethod(super::staticmethod_builtin_type(), function) };
+            if !descriptor.is_null() {
+                unsafe { (&mut *namespace).set(interned, descriptor) };
+            }
+        }
+    }
+    unsafe {
+        (*ty).tp_dict = namespace.cast::<PyObject>();
+    }
+    // GC rooting for the namespace values plus IC invalidation for any
+    // AttrIC guarding the type object.
+    crate::sync::register_namespaced_type(ty);
+    crate::sync::type_modified(ty);
+}
+
+/// The instance-method names served type-level for `bytes`; every name must
+/// resolve through [`bytes_method_entry_for_name`].
+const BYTES_TYPE_METHOD_NAMES: &[&str] = &[
+    "split", "rsplit", "splitlines", "join", "replace", "find", "rfind", "index", "rindex", "count",
+    "startswith", "endswith", "decode", "strip", "lstrip", "rstrip", "upper", "lower", "title",
+    "capitalize", "swapcase", "center", "ljust", "rjust", "zfill", "expandtabs", "partition",
+    "rpartition", "removeprefix", "removesuffix", "isalpha", "isalnum", "isdigit", "isspace",
+    "isupper", "islower", "istitle", "isascii", "hex", "translate",
+];
+
+/// One-shot installer for the builtin `bytes` type object's `tp_dict` surface
+/// (the str installer's shape; `descr::synthetic_type_attr` triggers it on
+/// first type-level attribute access).
+pub(crate) fn ensure_bytes_type_methods_installed(ty: *mut PyType) {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if ty.is_null() || INSTALLED.load(AtomicOrdering::SeqCst) {
+        return;
+    }
+    if crate::abi::runtime_type_type().is_null() {
+        return;
+    }
+    if INSTALLED.swap(true, AtomicOrdering::SeqCst) {
+        return;
+    }
+    install_binary_type_methods(ty, BYTES_TYPE_METHOD_NAMES, bytes_method_entry_for_name, bytes_fromhex_static_entry);
+}
+
+/// One-shot installer for the builtin `bytearray` type object's `tp_dict`
+/// surface: the bytes names plus the mutation methods.
+pub(crate) fn ensure_bytearray_type_methods_installed(ty: *mut PyType) {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if ty.is_null() || INSTALLED.load(AtomicOrdering::SeqCst) {
+        return;
+    }
+    if crate::abi::runtime_type_type().is_null() {
+        return;
+    }
+    if INSTALLED.swap(true, AtomicOrdering::SeqCst) {
+        return;
+    }
+    const BYTEARRAY_EXTRA: &[&str] = &["append", "extend", "insert", "pop", "remove", "clear"];
+    let names: Vec<&str> = BYTES_TYPE_METHOD_NAMES.iter().chain(BYTEARRAY_EXTRA).copied().collect();
+    install_binary_type_methods(ty, &names, bytearray_method_entry_for_name, bytearray_fromhex_static_entry);
+}
+
 macro_rules! str_entry {
     ($func:ident, $id:ident) => {
         unsafe extern "C" fn $func(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -2022,7 +2185,34 @@ fn str_maketrans_method(args: &[*mut PyObject]) -> *mut PyObject {
 }
 
 fn str_format_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
-    match unsafe { super::format::format_template(receiver, args, None) } {
+    // Keyword calls arrive with a trailing marker from the name-keyed native
+    // binder (`"{name}".format(name=...)`, `**kwargs` included); the pairs
+    // become the named-field mapping and the remaining args stay positional.
+    let (args, mapping) = match args.split_last() {
+        Some((&last, head)) if unsafe { crate::types::lazy_iter::kw_marker_pairs(last) }.is_some() => {
+            let pairs = unsafe { crate::types::lazy_iter::kw_marker_pairs(last) }.unwrap_or(&[]);
+            let mut flat: Vec<*mut PyObject> = Vec::with_capacity(pairs.len() * 2);
+            for &(name_id, value) in pairs {
+                let Some(name) = crate::intern::resolve(name_id) else {
+                    return raise_type_error("str.format keyword name is not interned");
+                };
+                let key = match boxed_str(&name) {
+                    Ok(key) => key,
+                    Err(message) => return super::return_null_with_error(message),
+                };
+                flat.push(key);
+                flat.push(value);
+            }
+            // SAFETY: `flat` holds `pairs.len()` live key/value pairs.
+            let mapping = unsafe { super::map::pon_build_map(flat.as_mut_ptr(), pairs.len()) };
+            if mapping.is_null() {
+                return ptr::null_mut();
+            }
+            (head, Some(mapping))
+        }
+        _ => (args, None),
+    };
+    match unsafe { super::format::format_template(receiver, args, mapping) } {
         Ok(text) => alloc_str_object(&text),
         Err(message) => super::return_null_with_error(message),
     }
@@ -2369,11 +2559,24 @@ fn bytes_needle_arg(value: *mut PyObject) -> Result<Vec<u8>, String> {
 }
 
 fn bytes_translate_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool) -> *mut PyObject {
+    // `delete=` arrives in a trailing marker from the name-keyed native
+    // binder (`bytes.translate(None, delete=...)` in `base64.b16decode`);
+    // the binder already rejects other names and duplicates.
+    let (args, kw_delete) = match args.split_last() {
+        Some((&last, head)) => match unsafe { crate::types::lazy_iter::kw_marker_pairs(last) } {
+            Some(pairs) => (head, pairs.first().map(|&(_, value)| value)),
+            None => (args, None),
+        },
+        None => (args, None),
+    };
     if !(1..=2).contains(&args.len()) { return raise_type_error("bytes.translate expected one or two arguments"); }
+    if kw_delete.is_some() && args.len() == 2 {
+        return raise_type_error("translate() got multiple values for argument 'delete'");
+    }
     let table = if is_none(args[0]) { None } else {
         match expect_bytes_like(args[0]) { Ok(table) => Some(table), Err(message) => return raise_type_error(message) }
     };
-    let delete = match args.get(1).copied() {
+    let delete = match kw_delete.or(args.get(1).copied()) {
         Some(value) => match expect_bytes_like(value) { Ok(delete) => delete, Err(message) => return raise_type_error(message) },
         None => Vec::new(),
     };

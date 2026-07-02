@@ -118,6 +118,7 @@ pub fn dict_iter_type(type_type: *const PyType) -> *mut PyType {
         let mut ty = PyType::new(ptr::null(), "dict_keyiterator", size_of::<PyDictIter>());
         ty.tp_iternext = Some(dict_iter_next_slot);
         ty.tp_iter = Some(dict_iter_identity_slot);
+        ty.tp_getattro = Some(crate::abstract_op::iterator_dunder_getattro);
         Box::into_raw(Box::new(ty)) as usize
     });
     let ty = *TYPE as *mut PyType;
@@ -794,7 +795,7 @@ unsafe extern "C" fn dict_getattro_slot(object: *mut PyObject, name: *mut PyObje
         return ptr::null_mut();
     };
     match attr.as_str() {
-        "get" | "keys" | "values" | "items" | "setdefault" | "pop" | "update" => unsafe {
+        "get" | "keys" | "values" | "items" | "setdefault" | "pop" | "update" | "copy" => unsafe {
             crate::abi::map::pon_dict_bound_method(object, &attr)
         },
         // `fromkeys` is a classmethod in CPython: the receiver only supplies the
@@ -1121,6 +1122,7 @@ pub fn ensure_dict_subclass_methods_installed() {
         ("setdefault", crate::abi::map::dict_setdefault_method_trampoline as *const u8),
         ("pop", crate::abi::map::dict_pop_method_trampoline as *const u8),
         ("update", crate::abi::map::dict_update_method_trampoline as *const u8),
+        ("copy", crate::abi::map::dict_copy_method_trampoline as *const u8),
     ];
     for (name, code) in natives {
         let interned = crate::intern::intern(name);

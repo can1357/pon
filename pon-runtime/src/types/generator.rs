@@ -244,6 +244,24 @@ unsafe extern "C" fn generator_close_method(argv: *mut *mut PyObject, argc: usiz
     unsafe { crate::abi::r#gen::pon_gen_close(args[0]) }
 }
 
+unsafe extern "C" fn generator_dunder_next_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { exact_args(argv, argc, 1, "__next__") } {
+        Ok(args) => args,
+        Err(message) => return crate::abi::return_null_with_error(message),
+    };
+    // SAFETY: The bound method receiver is the only exact slot; the generator's
+    // own `tp_iternext` raises typed `StopIteration` on exhaustion.
+    unsafe { crate::abstract_op::iter_next(args[0]) }
+}
+
+unsafe extern "C" fn generator_dunder_iter_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { exact_args(argv, argc, 1, "__iter__") } {
+        Ok(args) => args,
+        Err(message) => return crate::abi::return_null_with_error(message),
+    };
+    args[0]
+}
+
 unsafe fn bound_generator_method(
     object: *mut PyObject,
     name: &'static str,
@@ -274,6 +292,8 @@ pub unsafe extern "C" fn generator_getattro(object: *mut PyObject, name: *mut Py
         "send" => unsafe { bound_generator_method(object, "send", 2, generator_send_method as *const u8) },
         "throw" => unsafe { bound_generator_method(object, "throw", 2, generator_throw_method as *const u8) },
         "close" => unsafe { bound_generator_method(object, "close", 1, generator_close_method as *const u8) },
+        "__next__" => unsafe { bound_generator_method(object, "__next__", 1, generator_dunder_next_method as *const u8) },
+        "__iter__" => unsafe { bound_generator_method(object, "__iter__", 1, generator_dunder_iter_method as *const u8) },
         _ => crate::abi::return_null_with_error(format!("attribute '{name}' was not found")),
     }
 }

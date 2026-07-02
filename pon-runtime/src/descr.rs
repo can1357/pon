@@ -2,6 +2,7 @@
 
 use core::ffi::c_int;
 use core::{mem, ptr};
+use std::sync::LazyLock;
 
 use crate::abi;
 use crate::feedback::{ATTR_DESCR_BLIND, ATTR_DESCR_PROBE_DICT, AttrCacheKind, AttrIC, FeedbackCell};
@@ -242,9 +243,16 @@ unsafe fn synthetic_type_attr(ty: *mut PyType, name_id: u32) -> *mut PyObject {
         crate::abi::seq::ensure_list_type_methods_installed(ty);
     } else if type_name == "str" {
         crate::abi::str_::ensure_str_type_methods_installed(ty);
+    } else if type_name == "bytes" {
+        crate::abi::str_::ensure_bytes_type_methods_installed(ty);
+    } else if type_name == "bytearray" {
+        crate::abi::str_::ensure_bytearray_type_methods_installed(ty);
     }
     if (type_name == "dict" || unsafe { dict::type_is_dict_subclass(ty) }) && name_id == intern::intern("fromkeys") {
         return crate::native::builtins_mod::dict_fromkeys_function();
+    }
+    if type_name == "int" && name_id == intern::intern("from_bytes") {
+        return crate::types::int::from_bytes_function();
     }
     let is_known_descriptor = type_name == "object" && name_id == intern::intern("__init__");
     if is_known_descriptor {
@@ -585,47 +593,9 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
         return unsafe { abi::pon_none() };
     }
     if is_type && name_id == intern::intern("__annotations__") {
-        // PEP 649 lazy class annotations: own-dict cache hit, else materialize
-        // by calling the class's own `__annotate__(1)` (VALUE format) and
-        // cache into tp_dict.  Never MRO-inherited: each class materializes
-        // its own dict (empty when the class body had no annotations).
-        let ty = object.cast::<PyType>();
-        let dict = unsafe { (*ty).tp_dict.cast::<PyClassDict>() };
-        if !dict.is_null() {
-            if let Some(value) = unsafe { (&*dict).get(name_id) } {
-                return value;
-            }
-        }
-        let annotate = if dict.is_null() {
-            None
-        } else {
-            unsafe { (&*dict).get(intern::intern("__annotate__")) }
-        };
-        let annotations = match annotate {
-            Some(annotate) => {
-                let format = unsafe { abi::pon_const_int(1) };
-                if format.is_null() {
-                    return ptr::null_mut();
-                }
-                let mut argv = [format];
-                let result = unsafe { abi::pon_call(annotate, argv.as_mut_ptr(), 1) };
-                if result.is_null() {
-                    // Propagate NameError/NotImplementedError from the
-                    // annotate body without caching a partial dict.
-                    return ptr::null_mut();
-                }
-                result
-            }
-            None => unsafe { abi::map::pon_build_map(ptr::null_mut(), 0) },
-        };
-        if annotations.is_null() || dict.is_null() {
-            return annotations;
-        }
-        unsafe { (&mut *dict).set(name_id, annotations) };
-        // J0.3 §6 site #1 (type-dict set): the cache insert mutates the class
-        // namespace, so stale replays must re-resolve.
-        sync::type_modified(ty);
-        return annotations;
+        // PEP 649 lazy class annotations, shared with the
+        // `type.__dict__['__annotations__']` getset descriptor below.
+        return unsafe { type_annotations_get(object.cast::<PyType>()) };
     }
 
     // J0.3 capture discipline: the guard version is loaded BEFORE the slow
@@ -995,6 +965,470 @@ pub unsafe fn isinstance(obj: *mut PyObject, cls: *mut PyObject) -> c_int {
 pub unsafe fn call_with_one(callable: *mut PyObject, arg: *mut PyObject) -> *mut PyObject {
     let mut argv = [arg];
     unsafe { abi::pon_call(callable, argv.as_mut_ptr(), 1) }
+}
+
+// ---------------------------------------------------------------------------
+// `getset_descriptor`: the shared native descriptor type (CPython
+// `PyGetSetDescr`)
+// ---------------------------------------------------------------------------
+//
+// One instance family fronts the builtin `type`'s dict entries
+// (`__annotations__` / `__mro__` / `__dict__`), the other the `function`
+// type's slot descriptors (`__code__`, `__globals__`, ...).  They share ONE
+// Python-visible type because the stdlib checks identity against
+// `types.GetSetDescriptorType = type(FunctionType.__code__)`: inspect's
+// `getattr_static` recognizes the legitimate `type.__dict__['__dict__']`
+// getset that way (`_shadowed_dict` also verifies `__objclass__`), and
+// annotationlib captures `type.__dict__['__annotations__'].__get__` at module
+// scope.  Function-instance attribute traffic keeps flowing through
+// `function_getattro`/`function_setattro`; the function payload here only
+// serves class-level reads and direct descriptor-protocol calls.
+
+/// Which `type` getset a descriptor instance fronts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TypeGetSetKind {
+    /// `type.__dict__['__annotations__']` — writable PEP 649 storage
+    /// (annotationlib captures `.__get__` at module scope).
+    Annotations,
+    /// `type.__dict__['__mro__']` — read-only MRO tuple
+    /// (inspect: `_static_getmro = type.__dict__['__mro__'].__get__`).
+    Mro,
+    /// `type.__dict__['__dict__']` — read-only namespace snapshot
+    /// (inspect: `_get_dunder_dict_of_class = type.__dict__["__dict__"].__get__`).
+    DunderDict,
+}
+
+impl TypeGetSetKind {
+    const fn attr_name(self) -> &'static str {
+        match self {
+            Self::Annotations => "__annotations__",
+            Self::Mro => "__mro__",
+            Self::DunderDict => "__dict__",
+        }
+    }
+}
+
+/// Which surface a `getset_descriptor` instance fronts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GetSetPayload {
+    /// Builtin `type` dict getsets (per-kind get/set semantics below).
+    Type(TypeGetSetKind),
+    /// `function` slot descriptors keyed by interned attribute name; get/set
+    /// delegate to `types::function` so the semantics stay in that module.
+    FunctionAttr(u32),
+}
+
+/// A `getset_descriptor` instance (CPython `PyGetSetDescr`: the applicable
+/// class and attribute name ride per instance; behavior is payload dispatch).
+#[repr(C)]
+struct PyGetSetDescr {
+    ob_base: crate::object::PyObjectHeader,
+    /// CPython `d_type`: the class the descriptor applies to (`type` or
+    /// `function`); stamped by the runtime installers via
+    /// [`finalize_getset_descriptors`] / the function factory, read back
+    /// through `__objclass__` (inspect's `_shadowed_dict` verifies it).
+    objclass: *mut PyType,
+    payload: GetSetPayload,
+}
+
+impl PyGetSetDescr {
+    /// Attribute name the descriptor serves (`__mro__`, `__code__`, ...).
+    fn name(&self) -> String {
+        match self.payload {
+            GetSetPayload::Type(kind) => kind.attr_name().to_owned(),
+            GetSetPayload::FunctionAttr(name_id) => {
+                intern::resolve(name_id).unwrap_or_else(|| format!("<interned:{name_id}>"))
+            }
+        }
+    }
+
+    /// `d_type` display name for error messages and `__qualname__`.
+    fn objclass_display(&self) -> &str {
+        if self.objclass.is_null() {
+            "?"
+        } else {
+            // SAFETY: `objclass` is a leaked builtin type stamped at install.
+            unsafe { (*self.objclass).name() }
+        }
+    }
+}
+
+fn getset_descriptor_type() -> *mut PyType {
+    static TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut ty = PyType::new(ptr::null(), "getset_descriptor", mem::size_of::<PyGetSetDescr>());
+        ty.tp_descr_get = Some(getset_descr_get);
+        ty.tp_descr_set = Some(getset_descr_set);
+        ty.tp_getattro = Some(getset_descr_getattro);
+        ty.tp_repr = Some(getset_descr_repr);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *TYPE as *mut PyType
+}
+
+fn new_getset_descriptor(objclass: *mut PyType, payload: GetSetPayload) -> *mut PyObject {
+    Box::into_raw(Box::new(PyGetSetDescr {
+        ob_base: crate::object::PyObjectHeader::new(getset_descriptor_type()),
+        objclass,
+        payload,
+    }))
+    .cast::<PyObject>()
+}
+
+/// Per-kind singletons for the `type` dict (leaked; they live in the builtin
+/// `type`'s tp_dict for the whole process, outside the GC heap).  `objclass`
+/// starts NULL and is stamped by [`finalize_getset_descriptors`].
+fn type_getset_descriptor(kind: TypeGetSetKind) -> *mut PyObject {
+    static ANNOTATIONS: LazyLock<usize> =
+        LazyLock::new(|| new_getset_descriptor(ptr::null_mut(), GetSetPayload::Type(TypeGetSetKind::Annotations)) as usize);
+    static MRO: LazyLock<usize> =
+        LazyLock::new(|| new_getset_descriptor(ptr::null_mut(), GetSetPayload::Type(TypeGetSetKind::Mro)) as usize);
+    static DUNDER_DICT: LazyLock<usize> =
+        LazyLock::new(|| new_getset_descriptor(ptr::null_mut(), GetSetPayload::Type(TypeGetSetKind::DunderDict)) as usize);
+    (match kind {
+        TypeGetSetKind::Annotations => *ANNOTATIONS,
+        TypeGetSetKind::Mro => *MRO,
+        TypeGetSetKind::DunderDict => *DUNDER_DICT,
+    }) as *mut PyObject
+}
+
+/// The `type.__dict__['__annotations__']` singleton (identity guard for the
+/// builtin `type` in [`type_annotations_get`]; also the abi.rs install hook).
+#[must_use]
+pub fn annotations_descriptor() -> *mut PyObject {
+    type_getset_descriptor(TypeGetSetKind::Annotations)
+}
+
+/// Every `(name, descriptor)` pair belonging in the builtin `type`'s dict.
+#[must_use]
+pub fn type_getset_entries() -> [(&'static str, *mut PyObject); 3] {
+    [TypeGetSetKind::Annotations, TypeGetSetKind::Mro, TypeGetSetKind::DunderDict]
+        .map(|kind| (kind.attr_name(), type_getset_descriptor(kind)))
+}
+
+/// `function` slot descriptor factory (`types::function` install path); the
+/// `function` type rides in as `objclass` for `__objclass__` and messages.
+#[must_use]
+pub(crate) fn new_function_getset_descriptor(name_id: u32, objclass: *mut PyType) -> *mut PyObject {
+    new_getset_descriptor(objclass, GetSetPayload::FunctionAttr(name_id))
+}
+
+/// Stamps the runtime-init identities descriptors can't reach at
+/// construction: the shared descriptor type's metatype and the builtin
+/// `type` as the type-getsets' `__objclass__`.  Idempotent; both installers
+/// (abi.rs type setup, `install_function_type_attrs`) call it so the result
+/// is order-independent.
+pub(crate) unsafe fn finalize_getset_descriptors(type_type: *mut PyType) {
+    unsafe { (*getset_descriptor_type()).ob_base.ob_type = type_type };
+    for kind in [TypeGetSetKind::Annotations, TypeGetSetKind::Mro, TypeGetSetKind::DunderDict] {
+        let descr = type_getset_descriptor(kind).cast::<PyGetSetDescr>();
+        unsafe { (*descr).objclass = type_type };
+    }
+}
+
+/// PEP 649 lazy class annotations for `ty`: own-dict cache hit, else
+/// materialize by calling the class's own `__annotate__(1)` (VALUE format)
+/// and cache into tp_dict.  Never MRO-inherited: each class materializes its
+/// own dict (empty when the class body had no annotations).
+///
+/// The builtin `type` itself is the one class whose own dict holds the
+/// descriptor singleton rather than an annotations dict; CPython's getset
+/// raises AttributeError for static types there, and so do we (annotationlib
+/// relies on that branch to classify static types).
+pub(crate) unsafe fn type_annotations_get(ty: *mut PyType) -> *mut PyObject {
+    let name_id = intern::intern("__annotations__");
+    let dict = unsafe { (*ty).tp_dict.cast::<PyClassDict>() };
+    if !dict.is_null() {
+        if let Some(value) = unsafe { (&*dict).get(name_id) } {
+            if value == annotations_descriptor() {
+                const MESSAGE: &str = "type object 'type' has no attribute '__annotations__'";
+                return crate::abi::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::AttributeError, MESSAGE);
+            }
+            return value;
+        }
+    }
+    let annotate = if dict.is_null() {
+        None
+    } else {
+        unsafe { (&*dict).get(intern::intern("__annotate__")) }
+    };
+    let annotations = match annotate {
+        Some(annotate) => {
+            let format = unsafe { abi::pon_const_int(1) };
+            if format.is_null() {
+                return ptr::null_mut();
+            }
+            let mut argv = [format];
+            let result = unsafe { abi::pon_call(annotate, argv.as_mut_ptr(), 1) };
+            if result.is_null() {
+                // Propagate NameError/NotImplementedError from the
+                // annotate body without caching a partial dict.
+                return ptr::null_mut();
+            }
+            result
+        }
+        None => unsafe { abi::map::pon_build_map(ptr::null_mut(), 0) },
+    };
+    if annotations.is_null() || dict.is_null() {
+        return annotations;
+    }
+    unsafe { (&mut *dict).set(name_id, annotations) };
+    // J0.3 §6 site #1 (type-dict set): the cache insert mutates the class
+    // namespace, so stale replays must re-resolve.
+    sync::type_modified(ty);
+    annotations
+}
+
+/// Class-level `__annotations__` write/delete (the writable getset arm):
+/// stores into the class's own tp_dict entry — the same storage the getter
+/// consults.  Receiver guards live in [`getset_descr_set`].
+unsafe fn type_annotations_set(ty: *mut PyType, value: *mut PyObject) -> c_int {
+    let name_id = intern::intern("__annotations__");
+    let dict = unsafe { (*ty).tp_dict.cast::<PyClassDict>() };
+    let own_entry = if dict.is_null() {
+        None
+    } else {
+        unsafe { (&*dict).get(name_id) }
+    };
+    if own_entry == Some(annotations_descriptor()) {
+        // The builtin `type` — the descriptor's home, recognizable by the
+        // singleton in its own dict — is immutable, as in CPython.
+        return raise_type_status("cannot set '__annotations__' attribute of immutable type 'type'");
+    }
+    if value.is_null() {
+        // Delete: CPython raises a bare AttributeError('__annotations__')
+        // when nothing was cached or assigned.
+        if dict.is_null() || unsafe { !(&mut *dict).del(name_id) } {
+            let _ = crate::abi::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::AttributeError, "__annotations__");
+            return -1;
+        }
+    } else {
+        let dict = if dict.is_null() {
+            let fresh = type_::new_namespace();
+            unsafe { (*ty).tp_dict = fresh.cast::<PyObject>() };
+            fresh
+        } else {
+            dict
+        };
+        unsafe { (&mut *dict).set(name_id, value) };
+    }
+    // J0.3 §6 sites #1/#2: type-dict mutation through the descriptor must
+    // invalidate stale attr replays (direct `descr.__set__(cls, v)` calls
+    // bypass `generic_set_attr`'s bump).
+    sync::type_modified(ty);
+    0
+}
+
+/// CPython receiver-mismatch text: `descriptor 'X' for 'T' objects doesn't
+/// apply to a 'Y' object`.
+unsafe fn getset_receiver_mismatch(descr: *mut PyGetSetDescr, obj: *mut PyObject) -> String {
+    let got = unsafe { object_type_display(obj) };
+    let (name, objclass) = unsafe { ((*descr).name(), (*descr).objclass_display()) };
+    format!("descriptor '{name}' for '{objclass}' objects doesn't apply to a '{got}' object")
+}
+
+/// `descriptor.__get__(obj, owner=None)` slot: a NULL/absent instance returns
+/// the descriptor itself (CPython getset class-access semantics); receivers
+/// are validated per payload.
+unsafe extern "C" fn getset_descr_get(descr: *mut PyObject, obj: *mut PyObject, _owner: *mut PyObject) -> *mut PyObject {
+    if obj.is_null() {
+        return descr;
+    }
+    let d = descr.cast::<PyGetSetDescr>();
+    match unsafe { (*d).payload } {
+        GetSetPayload::Type(kind) => {
+            if unsafe { !is_type_object(obj) } {
+                let message = unsafe { getset_receiver_mismatch(d, obj) };
+                return unsafe { abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+            }
+            let ty = obj.cast::<PyType>();
+            match kind {
+                TypeGetSetKind::Annotations => unsafe { type_annotations_get(ty) },
+                TypeGetSetKind::Mro => {
+                    // Same tuple the `__mro__` fast path in
+                    // `generic_get_attr_cached` builds (inspect's
+                    // `_static_getmro` must agree with `C.__mro__`).
+                    let mut entries = unsafe { mro::mro_entries(ty) }
+                        .into_iter()
+                        .map(|entry| entry.cast::<PyObject>())
+                        .collect::<Vec<_>>();
+                    unsafe {
+                        abi::seq::pon_build_tuple(
+                            if entries.is_empty() { ptr::null_mut() } else { entries.as_mut_ptr() },
+                            entries.len(),
+                        )
+                    }
+                }
+                TypeGetSetKind::DunderDict => unsafe { type_dict_object(ty) },
+            }
+        }
+        GetSetPayload::FunctionAttr(name_id) => {
+            if unsafe { is_type_object(obj) } {
+                // Class-level read (`FunctionType.__code__`): the descriptor
+                // itself, exactly as before unification.
+                return descr;
+            }
+            if !crate::types::function::is_function_object(obj) {
+                let message = unsafe { getset_receiver_mismatch(d, obj) };
+                return unsafe { abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+            }
+            unsafe { crate::types::function::getset_slot_get(obj, name_id) }
+        }
+    }
+}
+
+/// `descriptor.__set__(obj, value)` / `__delete__(obj)` slot.  Of the `type`
+/// getsets only `__annotations__` is writable; `__mro__`/`__dict__` raise the
+/// CPython read-only AttributeError.  Function slots delegate to
+/// `function_setattro` — the same semantics as a plain attribute write.
+unsafe extern "C" fn getset_descr_set(descr: *mut PyObject, obj: *mut PyObject, value: *mut PyObject) -> c_int {
+    let d = descr.cast::<PyGetSetDescr>();
+    match unsafe { (*d).payload } {
+        GetSetPayload::Type(kind) => {
+            if obj.is_null() || unsafe { !is_type_object(obj) } {
+                return raise_type_status(unsafe { getset_receiver_mismatch(d, obj) });
+            }
+            if kind != TypeGetSetKind::Annotations {
+                let message = format!("attribute '{}' of 'type' objects is not writable", kind.attr_name());
+                let _ = crate::abi::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::AttributeError, &message);
+                return -1;
+            }
+            unsafe { type_annotations_set(obj.cast::<PyType>(), value) }
+        }
+        GetSetPayload::FunctionAttr(name_id) => {
+            if !crate::types::function::is_function_object(obj) {
+                return raise_type_status(unsafe { getset_receiver_mismatch(d, obj) });
+            }
+            unsafe { crate::types::function::getset_slot_set(obj, name_id, value) }
+        }
+    }
+}
+
+/// repr parity: `<attribute '<name>' of '<objclass>' objects>`.
+unsafe extern "C" fn getset_descr_repr(descr: *mut PyObject) -> *mut PyObject {
+    let d = descr.cast::<PyGetSetDescr>();
+    let text = unsafe { format!("<attribute '{}' of '{}' objects>", (*d).name(), (*d).objclass_display()) };
+    unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }
+}
+
+/// `tp_getattro` for the descriptor: the protocol dunders are served as
+/// callable bound methods (annotationlib and inspect store `descr.__get__`
+/// and call it later), plus the introspective name fields.  Unknown names
+/// raise AttributeError DIRECTLY — getset descriptors carry no instance
+/// dict, and the generic path's instance-dict probe assumes a
+/// `PyHeapInstance` layout these header-only payloads don't have (falling
+/// through used to read a garbage `dict` pointer and abort).
+unsafe extern "C" fn getset_descr_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(text) = (unsafe { type_::unicode_text(crate::tag::untag_arg(name)) }) else {
+        const MESSAGE: &str = "attribute name must be str";
+        return unsafe { abi::exc::pon_raise_type_error(MESSAGE.as_ptr(), MESSAGE.len()) };
+    };
+    let d = object.cast::<PyGetSetDescr>();
+    match text {
+        "__get__" => getset_descr_bound_entry(object, text, getset_descr_dunder_get_entry),
+        "__set__" => getset_descr_bound_entry(object, text, getset_descr_dunder_set_entry),
+        "__delete__" => getset_descr_bound_entry(object, text, getset_descr_dunder_delete_entry),
+        "__name__" => {
+            let name = unsafe { (*d).name() };
+            unsafe { abi::pon_const_str(name.as_ptr(), name.len()) }
+        }
+        "__qualname__" => {
+            let qualname = unsafe { format!("{}.{}", (*d).objclass_display(), (*d).name()) };
+            unsafe { abi::pon_const_str(qualname.as_ptr(), qualname.len()) }
+        }
+        "__objclass__" => {
+            let objclass = unsafe { (*d).objclass };
+            if objclass.is_null() {
+                return unsafe { abi::pon_raise_attribute_error(object, intern::intern(text)) };
+            }
+            objclass.cast::<PyObject>()
+        }
+        "__class__" => unsafe { (*object).ob_type }.cast_mut().cast::<PyObject>(),
+        "__doc__" => unsafe { abi::pon_none() },
+        _ => unsafe { abi::pon_raise_attribute_error(object, intern::intern(text)) },
+    }
+}
+
+/// Binds `entry` to `receiver` as a method pair (receiver rides in `argv[0]`).
+fn getset_descr_bound_entry(
+    receiver: *mut PyObject,
+    name: &str,
+    entry: unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject,
+) -> *mut PyObject {
+    // SAFETY: `entry` is a live builtin entry point with the runtime calling
+    // convention.
+    let function =
+        unsafe { abi::pon_make_function(entry as *const u8, crate::builtins::variadic_arity(), intern::intern(name)) };
+    if function.is_null() {
+        return ptr::null_mut();
+    }
+    match crate::types::method::new_bound_method(function, receiver) {
+        Ok(method) => method.cast::<PyObject>(),
+        Err(message) => raise_attr_error(message),
+    }
+}
+
+unsafe fn getset_descr_entry_args<'a>(argv: *mut *mut PyObject, argc: usize) -> Option<&'a [*mut PyObject]> {
+    if argv.is_null() {
+        return (argc == 0).then_some(&[]);
+    }
+    Some(unsafe { core::slice::from_raw_parts(argv.cast_const(), argc) })
+}
+
+/// True when `object` is the `None` singleton (tag-tolerant).
+fn getset_descr_none_arg(object: *mut PyObject) -> bool {
+    // SAFETY: Singleton accessor.
+    crate::tag::untag_arg(object) == unsafe { abi::pon_none() }
+}
+
+/// `descr.__get__(obj, owner=None)` — annotationlib's and inspect's captured
+/// getters call this with one argument.
+unsafe extern "C" fn getset_descr_dunder_get_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { getset_descr_entry_args(argv, argc) }) else {
+        return raise_attr_error("__get__ received a NULL argv pointer");
+    };
+    let (&receiver, rest) = args.split_first().unwrap_or((&ptr::null_mut(), &[]));
+    if rest.is_empty() || rest.len() > 2 {
+        const MESSAGE: &str = "__get__(instance, owner=None) takes 1 or 2 arguments";
+        return unsafe { abi::exc::pon_raise_type_error(MESSAGE.as_ptr(), MESSAGE.len()) };
+    }
+    let obj = if getset_descr_none_arg(rest[0]) { ptr::null_mut() } else { rest[0] };
+    let owner = rest.get(1).copied().unwrap_or(ptr::null_mut());
+    // SAFETY: Slot implementation follows the NULL-sentinel error contract.
+    unsafe { getset_descr_get(receiver, obj, owner) }
+}
+
+/// `descr.__set__(obj, value)`.
+unsafe extern "C" fn getset_descr_dunder_set_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { getset_descr_entry_args(argv, argc) }) else {
+        return raise_attr_error("__set__ received a NULL argv pointer");
+    };
+    let &[receiver, obj, value] = args else {
+        const MESSAGE: &str = "__set__(instance, value) takes exactly 2 arguments";
+        return unsafe { abi::exc::pon_raise_type_error(MESSAGE.as_ptr(), MESSAGE.len()) };
+    };
+    // SAFETY: Slot implementation follows the negative-status error contract.
+    if unsafe { getset_descr_set(receiver, obj, value) } < 0 {
+        return ptr::null_mut();
+    }
+    // SAFETY: Singleton accessor.
+    unsafe { abi::pon_none() }
+}
+
+/// `descr.__delete__(obj)`.
+unsafe extern "C" fn getset_descr_dunder_delete_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { getset_descr_entry_args(argv, argc) }) else {
+        return raise_attr_error("__delete__ received a NULL argv pointer");
+    };
+    let &[receiver, obj] = args else {
+        const MESSAGE: &str = "__delete__(instance) takes exactly 1 argument";
+        return unsafe { abi::exc::pon_raise_type_error(MESSAGE.as_ptr(), MESSAGE.len()) };
+    };
+    // SAFETY: Slot implementation follows the negative-status error contract.
+    if unsafe { getset_descr_set(receiver, obj, ptr::null_mut()) } < 0 {
+        return ptr::null_mut();
+    }
+    // SAFETY: Singleton accessor.
+    unsafe { abi::pon_none() }
 }
 #[cfg(test)]
 mod tests {

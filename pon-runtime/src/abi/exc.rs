@@ -320,9 +320,19 @@ fn raise_type_error_text(text: &str) -> *mut PyObject {
     }
 }
 
+/// Raises the typed import failure for `text`: a missing-module diagnostic
+/// (`No module named '...'`, the exact text `resolve_module_by_name` emits)
+/// raises `ModuleNotFoundError` like CPython — `subprocess` gates its whole
+/// Windows surface on `except ModuleNotFoundError: import msvcrt` — and
+/// every other import failure stays a plain `ImportError`.
 pub fn raise_import_error_text(text: &str) -> *mut PyObject {
+    let kind = if text.starts_with("No module named ") {
+        ExceptionKind::ModuleNotFoundError
+    } else {
+        ExceptionKind::ImportError
+    };
     match ensure_runtime_for_exc() {
-        Ok(()) => match super::with_runtime(|runtime| raise_builtin_text(runtime, ExceptionKind::ImportError, text)) {
+        Ok(()) => match super::with_runtime(|runtime| raise_builtin_text(runtime, kind, text)) {
             Some(result) => result,
             None => super::return_null_with_error("runtime is not initialized"),
         },

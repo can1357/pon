@@ -20,7 +20,7 @@ use crate::abi::{
 use crate::abi::exc::raise_attribute_error_text;
 use crate::intern::{intern, resolve};
 use crate::object::{PyObject, PyObjectHeader, PyType, PyUnicode, as_object_ptr};
-use crate::thread_state::pon_err_occurred;
+use crate::thread_state::{pon_err_clear, pon_err_occurred};
 
 /// Host callback used by the CLI/JIT integration pass to execute a source module
 /// through the normal ruff -> IR -> JIT pipeline and return its module object.
@@ -256,7 +256,7 @@ pub unsafe extern "C" fn pon_import_from(module: *mut PyObject, name_interned: u
             // (CPython `_handle_fromlist` swallows only a ModuleNotFoundError
             // naming the child itself, so a deeper missing module raised
             // while executing the child's body must surface verbatim).
-            Err(message) if message != format!("no module named '{child_name}'") => {
+            Err(message) if message != format!("No module named '{child_name}'") => {
                 return raise_import_error_text(&message);
             }
             Err(_) => {}
@@ -356,8 +356,53 @@ pub fn install_module(name: &str, attrs: impl IntoIterator<Item = (u32, *mut PyO
 }
 
 fn import_module_by_name(name: &str) -> Result<*mut PyObject, String> {
+    let module = resolve_module_by_name(name)?;
+    if name == "os" {
+        ensure_os_path_alias();
+    }
+    Ok(module)
+}
+
+/// CPython's `os.py` executes `import posixpath as path` and publishes
+/// `sys.modules['os.path']`, so a plain `import os` already makes `os.path`
+/// usable (`glob` reads `os.path.lexists` in a class body).  pon's `os` is a
+/// native seed registered during runtime init, when the source importer that
+/// serves `posixpath` cannot run yet — and resolving it inside the factory
+/// would recurse, because `posixpath`'s own body does `import os`.
+///
+/// The alias is therefore installed right after any successful `os`
+/// resolution: at that point `os` is cached, so posixpath's `import os` is a
+/// cache hit and cannot recurse.  The in-progress flag breaks the remaining
+/// cycle (`os.path` -> parent `os` -> this hook -> `os.path`), and the
+/// native `os.path` row registers the module under both names and binds the
+/// parent's `path` attribute (`bind_child_to_parent`).
+///
+/// Failure policy: embeddings without the vendored stdlib (runtime unit
+/// tests) cannot resolve `posixpath`; the hook clears the pending diagnostic
+/// and leaves `os.path` unbound — exactly the pre-alias behavior — instead
+/// of failing `import os`.  A direct `import os.path` still surfaces the
+/// real error loudly.
+fn ensure_os_path_alias() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+    let alias_id = intern("os.path");
+    let alias_cached = {
+        let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        state.modules.contains_key(&alias_id)
+    };
+    if alias_cached || IN_PROGRESS.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let result = import_module_by_name("os.path");
+    IN_PROGRESS.store(false, Ordering::Release);
+    if result.is_err() && pon_err_occurred() {
+        pon_err_clear();
+    }
+}
+
+fn resolve_module_by_name(name: &str) -> Result<*mut PyObject, String> {
     if name.is_empty() {
-        return Err("no module named ''".to_owned());
+        return Err("No module named ''".to_owned());
     }
 
     let name_id = intern(name);
@@ -443,7 +488,13 @@ fn import_module_by_name(name: &str) -> Result<*mut PyObject, String> {
             state.source_loader
         };
         if let Some(loader) = loader {
-            let module = create_module(name, spec.is_package, [])?;
+            // CPython sets `__file__` on source-imported modules, as an
+            // absolute path (sys.path[0] is absolutized since 3.11; abspath,
+            // not realpath). The JIT-loader path is the only importer that
+            // knows a source path (AoT-embedded bodies have none).
+            let file_path = std::path::absolute(&spec.path).unwrap_or_else(|_| spec.path.clone());
+            let file_object = runtime_string(&file_path.to_string_lossy())?;
+            let module = create_module(name, spec.is_package, [(intern("__file__"), file_object)])?;
             bind_child_to_parent(name, module);
             begin_module_execution(name)?;
             let loaded = loader(SourceModuleRequest {
@@ -468,7 +519,7 @@ fn import_module_by_name(name: &str) -> Result<*mut PyObject, String> {
         return Ok(module);
     }
 
-    Err(format!("no module named '{name}'"))
+    Err(format!("No module named '{name}'"))
 }
 
 fn native_module(name: &str) -> Result<Option<*mut PyObject>, String> {
@@ -491,7 +542,6 @@ fn is_unsupported_c_accelerated(name: &str) -> bool {
             | "_bz2"
             | "_lzma"
             | "_ctypes"
-            | "math"
     )
 }
 
@@ -775,6 +825,46 @@ pub fn module_attrs_snapshot(module_name: u32) -> Option<Vec<(u32, *mut PyObject
     // SAFETY: The import state proved the object uses `PyModuleObject` layout.
     let module = unsafe { &*module };
     Some(module.attrs.iter().map(|(name, value)| (*name, *value)).collect())
+}
+
+/// GC roots held by the import registry: every registered module's attribute
+/// values plus the live `sys.modules` dict.  Module objects are immortal
+/// leaked boxes ([`create_module`] never frees them), so marking cannot reach
+/// the GC-heap values their attrs hold; without these roots an explicit
+/// `gc.collect()` frees live module globals (any module-scope binding, every
+/// module).  Non-module `sys.modules` entries (arbitrary objects installed
+/// via `sys.modules[name] = obj`) are rooted directly, like CPython's dict
+/// reference keeps them alive.
+///
+/// Consumed by `crate::abi::collect` while the runtime lock is held: takes
+/// only the import-state mutex and never re-enters the runtime.  `collect`
+/// runs solely from explicit `gc.collect()` calls, and Python code never
+/// executes while `IMPORT_STATE` is locked, so the mutex is always free here.
+pub fn gc_held_roots() -> Vec<*mut PyObject> {
+    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    let mut roots = Vec::new();
+    if !state.modules_dict.is_null() {
+        roots.push(state.modules_dict);
+    }
+    for &object in state.modules.values() {
+        match module_from_object_locked(&state, object) {
+            Some(module) => {
+                // SAFETY: The layout check proved `PyModuleObject`; attrs are
+                // enumerated under the import-state lock.
+                for (_, &value) in unsafe { (*module).attrs.iter() } {
+                    if !value.is_null() && crate::tag::is_heap(value) {
+                        roots.push(value);
+                    }
+                }
+            }
+            None => {
+                if !object.is_null() && crate::tag::is_heap(object) {
+                    roots.push(object);
+                }
+            }
+        }
+    }
+    roots
 }
 
 pub fn active_module_attrs_snapshot() -> Option<Vec<(u32, *mut PyObject)>> {
@@ -1150,6 +1240,16 @@ fn as_module(object: *mut PyObject) -> Option<*mut PyModuleObject> {
     is_module.then_some(object.cast::<PyModuleObject>())
 }
 
+/// Live namespace dict for a module OBJECT, or `None` when `object` is not a
+/// module. This is the same dict `module.__dict__` serves (mutations through
+/// it sync back into module attrs); `dir(module)` enumerates it exactly like
+/// CPython's `module.__dir__`, which returns `list(module.__dict__)`.
+pub(crate) fn module_namespace_for_object(object: *mut PyObject) -> Option<Result<*mut PyObject, String>> {
+    let module = as_module(object)?;
+    // SAFETY: `as_module` proved the `PyModuleObject` layout.
+    Some(crate::dynexec::module_namespace_dict(unsafe { (*module).name }))
+}
+
 unsafe extern "C" fn module_getattro(module: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
     if module.is_null() || name.is_null() {
         return return_null_with_error("module attribute lookup received NULL");
@@ -1174,10 +1274,17 @@ unsafe extern "C" fn module_getattro(module: *mut PyObject, name: *mut PyObject)
     let name_id = intern(name_text);
     // SAFETY: `as_module` proved the layout.
     let module_ref = unsafe { &*module };
-    module_ref.attrs.get(&name_id).copied().unwrap_or_else(|| {
-        let module_name = resolve(module_ref.name).unwrap_or_else(|| format!("<module:{}>", module_ref.name));
-        raise_attribute_error_text(&format!("module '{module_name}' has no attribute '{name_text}'"))
-    })
+    if let Some(value) = module_ref.attrs.get(&name_id).copied() {
+        return value;
+    }
+    // Attrs miss: consult the registered namespace dict. CPython module
+    // attribute lookup IS a `__dict__` lookup, so bindings created only
+    // through the dict view (`vars(mod)["k"] = v`) must resolve here too.
+    if let Some(value) = crate::dynexec::peek_module_namespace_value(module_ref.name, name_text) {
+        return value;
+    }
+    let module_name = resolve(module_ref.name).unwrap_or_else(|| format!("<module:{}>", module_ref.name));
+    raise_attribute_error_text(&format!("module '{module_name}' has no attribute '{name_text}'"))
 }
 
 /// `module.attr = value` / `del module.attr` (CPython module objects are
@@ -1200,21 +1307,25 @@ unsafe extern "C" fn module_setattro(module: *mut PyObject, name: *mut PyObject,
         return -1;
     };
     let name_id = intern(name_text);
+    // SAFETY: `as_module` proved the layout.
+    let module_name_id = unsafe { (&*module).name };
     if value.is_null() {
         // SAFETY: `as_module` proved the layout.
         let removed = unsafe { (&mut *module).attrs.remove(&name_id).is_some() };
         if !removed {
-            // SAFETY: `as_module` proved the layout.
-            let module_ref = unsafe { &*module };
-            let module_name = resolve(module_ref.name).unwrap_or_else(|| format!("<module:{}>", module_ref.name));
+            let module_name = resolve(module_name_id).unwrap_or_else(|| format!("<module:{module_name_id}>"));
             raise_attribute_error_text(&format!("module '{module_name}' has no attribute '{name_text}'"));
             return -1;
         }
+        // Keep the registered namespace dict (`module.__dict__`) coherent:
+        // `dir(module)` and the getattro fallback read it.
+        crate::dynexec::sync_global_delete_for_module(module_name_id, name_id);
     } else {
         // SAFETY: `as_module` proved the layout.
         unsafe {
             (&mut *module).attrs.insert(name_id, value);
         }
+        crate::dynexec::sync_global_store_for_module(module_name_id, name_id, value);
     }
     // J0.3 GlobalIC site: module attr overlay insert/replace/removal.
     crate::abi::bump_namespace_version();

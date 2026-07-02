@@ -122,6 +122,7 @@ fn iterator_type(name: &'static str, size: usize) -> *mut PyType {
     let mut ty = PyType::new(ptr::null(), name, size);
     ty.tp_iter = Some(identity_iter);
     ty.tp_iternext = Some(iterator_next);
+    ty.tp_getattro = Some(crate::abstract_op::iterator_dunder_getattro);
     Box::into_raw(Box::new(ty))
 }
 

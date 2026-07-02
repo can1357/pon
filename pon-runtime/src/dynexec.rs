@@ -248,6 +248,22 @@ pub(crate) fn module_namespace_dict(module_name: u32) -> Result<*mut PyObject, S
     Ok(dict_object)
 }
 
+/// Value bound in `module_name`'s registered namespace dict, or `None` when
+/// no dict was ever materialized or it lacks `name`. Read-only peek that
+/// never creates the dict: module attr lookups fall back here so dict-only
+/// bindings (e.g. `vars(mod)["k"] = v`) resolve like CPython, where the
+/// module `__dict__` IS the attribute namespace.
+pub(crate) fn peek_module_namespace_value(module_name: u32, name: &str) -> Option<*mut PyObject> {
+    let dict_addr = GLOBALS_REGISTRY
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .by_module
+        .get(&module_name)
+        .copied()?;
+    let key = const_str_object(name).ok()?;
+    unsafe { dict::dict_get(dict_addr as *mut PyObject, key) }.ok().flatten()
+}
+
 fn binding_for_dict(dict_object: *mut PyObject) -> Option<GlobalsBinding> {
     GLOBALS_REGISTRY
         .lock()
@@ -454,14 +470,25 @@ fn namespace_args(args: &[*mut PyObject], name: &str) -> Result<(*mut PyObject, 
     Ok((globals, locals))
 }
 
+/// CPython `PyCF_ONLY_AST` (`ast.PyCF_ONLY_AST` / `_ast` re-export): compile
+/// to an AST object instead of a code object.  pon's `compile` builds code
+/// objects only; `ast.parse` routes here and gets the typed refusal below.
+const PYCF_ONLY_AST: i64 = 0x400;
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn builtin_compile(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let args = match argv_slice(argv, argc, "compile") {
         Ok(args) => args,
         Err(message) => return return_null_with_error(message),
     };
-    if args.len() != 3 {
-        return return_null_with_error(format!("compile() expected 3 arguments, got {}", args.len()));
+    // `compile(source, filename, mode, flags=0, dont_inherit=False,
+    // optimize=-1, *, _feature_version=-1)`: the keyword binder flattens the
+    // full signature to seven slots (absent = NULL); positional callers pass
+    // three to six.  `dont_inherit`/`optimize`/`_feature_version` select
+    // CPython pipeline variants pon does not model and are accepted unread
+    // (`ast.parse` passes their defaults).
+    if args.len() < 3 || args.len() > 7 {
+        return return_null_with_error(format!("compile() expected 3 to 6 arguments, got {}", args.len()));
     }
     let Some(source) = (unsafe { str_text(args[0]) }) else {
         return return_null_with_error("compile() arg 1 must be a string");
@@ -472,6 +499,15 @@ pub unsafe extern "C" fn builtin_compile(argv: *mut *mut PyObject, argc: usize) 
     let Some(mode_text) = (unsafe { str_text(args[2]) }) else {
         return return_null_with_error("compile() arg 3 must be a string");
     };
+    let flags = match optional_int_arg(args, 3, "flags") {
+        Ok(flags) => flags,
+        Err(message) => return return_null_with_error(message),
+    };
+    if flags & PYCF_ONLY_AST != 0 {
+        const MESSAGE: &str =
+            "pon does not support compile() with ast.PyCF_ONLY_AST (ast.parse); only code-object compilation is available";
+        return abi::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::NotImplementedError, MESSAGE);
+    }
     let Some(mode) = DynCodeMode::from_str(&mode_text) else {
         return return_null_with_error("compile() mode must be 'exec', 'eval', or 'single'");
     };
@@ -479,6 +515,37 @@ pub unsafe extern "C" fn builtin_compile(argv: *mut *mut PyObject, argc: usize) 
         Ok(code) => code,
         Err(message) => return_null_with_error(message),
     }
+}
+
+/// Reads an optional int slot from a flattened native argv: absent (short
+/// argv), NULL (keyword-binder fill), and None all mean "default 0".
+fn optional_int_arg(args: &[*mut PyObject], index: usize, name: &str) -> Result<i64, String> {
+    let Some(&object) = args.get(index) else {
+        return Ok(0);
+    };
+    if object.is_null() {
+        return Ok(0);
+    }
+    if let Some(value) = int_of(object) {
+        return Ok(value);
+    }
+    if unsafe { is_none(object) } {
+        return Ok(0);
+    }
+    Err(format!("compile() {name} must be an int"))
+}
+
+/// Tagged-immediate-aware i64 extraction (the `_collections` idiom).
+fn int_of(object: *mut PyObject) -> Option<i64> {
+    if crate::tag::is_small_int(object) {
+        return Some(crate::tag::untag_small_int(object));
+    }
+    if object.is_null() {
+        return None;
+    }
+    // SAFETY: Heap pointer with a live header; layout proved by the name check.
+    (unsafe { crate::types::dict::type_name(object) } == Some("int"))
+        .then(|| unsafe { (*object.cast::<crate::object::PyLong>()).value })
 }
 
 #[unsafe(no_mangle)]
