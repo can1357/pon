@@ -91,6 +91,7 @@ pub(crate) fn lower_call_ex(
     ptr_ty: ir::Type,
     ptr_bytes: usize,
     exception_exit: ir::Block,
+    feedback_cell: Option<ir::Value>,
 ) -> Result<ir::Value, CodegenError> {
     let callee = state.value(call.callee)?;
     let argv = build_call_argv(builder, helpers, state, call.args, ptr_ty, ptr_bytes)?;
@@ -100,7 +101,7 @@ pub(crate) fn lower_call_ex(
     let kw_values = build_kw_value_array(builder, state, call.kwargs, ptr_ty, ptr_bytes)?;
     let kw_count = builder.ins().iconst(ptr_ty, call.kwargs.len() as i64);
     let dstar = optional_value(builder, state, call.dstar, ptr_ty)?;
-    let feedback = builder.ins().iconst(ptr_ty, 0);
+    let feedback = feedback_cell.unwrap_or_else(|| builder.ins().iconst(ptr_ty, 0));
     Ok(call_pyobject_helper(
         builder,
         helpers.call_ex,
@@ -117,6 +118,7 @@ pub(crate) struct CallMethodArgs<'a> {
 }
 
 /// Lower method calls through `pon_call_method`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_call_method(
     builder: &mut FunctionBuilder<'_>,
     helpers: &HelperFuncRefs,
@@ -125,11 +127,12 @@ pub(crate) fn lower_call_method(
     ptr_ty: ir::Type,
     ptr_bytes: usize,
     exception_exit: ir::Block,
+    feedback_cell: Option<ir::Value>,
 ) -> Result<ir::Value, CodegenError> {
     let recv_pair = state.value(call.recv_pair)?;
     let argv = build_call_argv(builder, helpers, state, call.args, ptr_ty, ptr_bytes)?;
     let argc = builder.ins().iconst(ptr_ty, call.args.len() as i64);
-    let feedback = builder.ins().iconst(ptr_ty, 0);
+    let feedback = feedback_cell.unwrap_or_else(|| builder.ins().iconst(ptr_ty, 0));
     Ok(call_pyobject_helper(
         builder,
         helpers.call_method,

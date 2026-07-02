@@ -664,6 +664,7 @@ fn lower_cold_copy<M: Module>(
                 ptr_bytes,
                 exception_exit,
                 &inst.kind,
+                None,
             )?;
             cold_state.define_value(inst.result, value);
         }
@@ -943,6 +944,7 @@ fn lower_baseline_inst<M: Module>(
         ptr_bytes,
         exception_exit,
         &inst.kind,
+        None,
     )?;
     if let InstKind::StoreLocal(slot, _) = &inst.kind {
         let index = slot.0 as usize;
@@ -1843,7 +1845,7 @@ def mix(seed):
             functions: vec![Function {
                 name: "reload_arg".to_owned(),
                 arity: 1,
-                is_coroutine: false,
+                is_coroutine: false, is_generator: false,
                 params: Default::default(),
                 n_locals: 1,
                 blocks: vec![Block {

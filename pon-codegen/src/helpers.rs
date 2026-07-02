@@ -316,7 +316,6 @@ pub enum HelperId {
     Yield,
     YieldFrom,
     Await,
-    EagerGeneratorReturn,
     ImportName,
     ImportFrom,
     ImportStar,
@@ -371,6 +370,7 @@ const P_OBJ_OBJ_OBJ: &[AbiShape] = &[AbiShape::PyObjectPtr, AbiShape::PyObjectPt
 const P_OP_OBJ: &[AbiShape] = &[AbiShape::U8, AbiShape::PyObjectPtr, AbiShape::FeedbackCellPtr];
 const P_OP_OBJ_OBJ: &[AbiShape] = &[AbiShape::U8, AbiShape::PyObjectPtr, AbiShape::PyObjectPtr, AbiShape::FeedbackCellPtr];
 const P_NAME: &[AbiShape] = &[AbiShape::U32];
+const P_NAME_FEEDBACK: &[AbiShape] = &[AbiShape::U32, AbiShape::FeedbackCellPtr];
 const P_NAME_OBJ: &[AbiShape] = &[AbiShape::U32, AbiShape::PyObjectPtr];
 const P_OBJ_NAME: &[AbiShape] = &[AbiShape::PyObjectPtr, AbiShape::U32];
 const P_OBJ_NAME_FEEDBACK: &[AbiShape] = &[AbiShape::PyObjectPtr, AbiShape::U32, AbiShape::FeedbackCellPtr];
@@ -445,7 +445,7 @@ pub static PHASE_B_HELPERS: &[HelperSig] = &[
     HelperSig { id: HelperId::SubscriptGet, family: HelperFamily::Map, symbol: "pon_subscript_get", params: P_OBJ_OBJ_FEEDBACK, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
     HelperSig { id: HelperId::SubscriptSet, family: HelperFamily::Map, symbol: "pon_subscript_set", params: P_OBJ_OBJ_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::SubscriptDel, family: HelperFamily::Map, symbol: "pon_subscript_del", params: P_OBJ_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
-    HelperSig { id: HelperId::LoadGlobal, family: HelperFamily::ImportBuiltins, symbol: "pon_load_global", params: P_NAME, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
+    HelperSig { id: HelperId::LoadGlobal, family: HelperFamily::ImportBuiltins, symbol: "pon_load_global", params: P_NAME_FEEDBACK, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
     HelperSig { id: HelperId::StoreGlobal, family: HelperFamily::ImportBuiltins, symbol: "pon_store_global", params: P_NAME_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::LoadName, family: HelperFamily::ImportBuiltins, symbol: "pon_load_name", params: P_NAME, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::StoreName, family: HelperFamily::ImportBuiltins, symbol: "pon_store_name", params: P_NAME_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
@@ -482,7 +482,6 @@ pub static PHASE_B_HELPERS: &[HelperSig] = &[
     HelperSig { id: HelperId::CurrentClosureCell, family: HelperFamily::Call, symbol: "pon_current_closure_cell", params: P_INDEX, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::YieldFrom, family: HelperFamily::IterGen, symbol: "pon_yield_from", params: P_OBJ_FEEDBACK, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
     HelperSig { id: HelperId::Await, family: HelperFamily::IterGen, symbol: "pon_await", params: P_OBJ_FEEDBACK, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
-    HelperSig { id: HelperId::EagerGeneratorReturn, family: HelperFamily::IterGen, symbol: "pon_eager_yield_generator", params: P_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::ImportName, family: HelperFamily::ImportBuiltins, symbol: "pon_import_name", params: P_IMPORT_NAME, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::ImportFrom, family: HelperFamily::ImportBuiltins, symbol: "pon_import_from", params: P_OBJ_NAME, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::ImportStar, family: HelperFamily::ImportBuiltins, symbol: "pon_import_star", params: P_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },

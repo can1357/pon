@@ -21,7 +21,7 @@ use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{self, AbiParam, FuncRef, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-use cranelift_module::{DataDescription, FuncId, Module, ModuleError};
+use cranelift_module::{DataDescription, DataId, FuncId, Module, ModuleError};
 use pon_ir::ir::{Block as IrBlock, Function, InstKind, Module as IrModule, PyConst, Value as IrValue};
 
 use crate::helpers::HelperRefs;
@@ -289,6 +289,7 @@ pub(crate) fn lower_boxed_subregion<M: Module>(
                 ptr_bytes,
                 exception_exit,
                 &inst.kind,
+                None,
             )?;
             state.define_value(inst.result, value);
         }
@@ -328,6 +329,13 @@ pub fn compile_function<M: Module>(
     ctx.func.signature.returns.push(AbiParam::new(ptr_ty));
 
     let helper_refs = declare_helper_refs(module, helpers, &mut ctx.func);
+    // J0.3: one static, writable, zero-initialized FeedbackCell array per
+    // compiled code object.  Every closure produced from one `def` shares
+    // these cells (CPython-style per-code caches); IC guards validate
+    // identity+version, so sharing is semantically inert.  NULL when the
+    // function has no specializable sites.
+    let feedback_base = declare_feedback_cells(module, ir)?;
+    let feedback_base_gv = feedback_base.map(|data_id| module.declare_data_in_func(data_id, &mut ctx.func));
 
     let mut builder = FunctionBuilder::new(&mut ctx.func, fctx);
     let entry = builder.create_block();
@@ -371,6 +379,19 @@ pub fn compile_function<M: Module>(
             builder.switch_to_block(clif_block);
         }
         for inst in &block.insts {
+            // J0.3: materialize this site's static feedback-cell address
+            // (base + slot * FEEDBACK_CELL_SIZE) for specializable ops.
+            let feedback_cell = match (inst.feedback_slot, feedback_base_gv) {
+                (Some(slot), Some(gv)) => {
+                    let base = builder.ins().global_value(ptr_ty, gv);
+                    Some(
+                        builder
+                            .ins()
+                            .iadd_imm(base, i64::from(slot.0) * pon_runtime::feedback::FEEDBACK_CELL_SIZE as i64),
+                    )
+                }
+                _ => None,
+            };
             let value = match &inst.kind {
                 InstKind::PushExcInfo {
                     target,
@@ -417,6 +438,7 @@ pub fn compile_function<M: Module>(
                     ptr_bytes,
                     current_exception_exit,
                     &inst.kind,
+                    feedback_cell,
                 )?,
             };
             state.define_value(inst.result, value);
@@ -612,6 +634,7 @@ pub(crate) fn lower_inst<M: Module>(
     ptr_bytes: usize,
     exception_exit: ir::Block,
     kind: &InstKind,
+    feedback_cell: Option<ir::Value>,
 ) -> Result<ir::Value, CodegenError> {
     match kind {
         InstKind::Const(PyConst::Int(value)) => number::lower_const_int(builder, helpers, *value, ptr_ty, exception_exit),
@@ -710,7 +733,7 @@ pub(crate) fn lower_inst<M: Module>(
         InstKind::LoadLocal(slot) => name::lower_load_local(builder, state, slot.0),
         InstKind::StoreLocal(slot, value) => name::lower_store_local(builder, state, slot.0, *value),
         InstKind::DeleteLocal(_) => name::lower_delete_local(),
-        InstKind::LoadGlobal(name) => name::lower_load_global(builder, helpers, names, name.0, ptr_ty, exception_exit),
+        InstKind::LoadGlobal(name) => name::lower_load_global(builder, helpers, names, name.0, ptr_ty, exception_exit, feedback_cell),
         InstKind::StoreGlobal(name, value) => name::lower_store_global(
             builder,
             helpers,
@@ -797,10 +820,10 @@ pub(crate) fn lower_inst<M: Module>(
         InstKind::Not { val } => {
             compare::lower_not_op(builder, helpers.is_true, helpers.const_bool, state, *val, ptr_ty, exception_exit)
         }
-        InstKind::LoadAttr { obj, name } => attr::lower_load_attr(builder, helpers, names, state, *obj, name.0, ptr_ty, exception_exit),
+        InstKind::LoadAttr { obj, name } => attr::lower_load_attr(builder, helpers, names, state, *obj, name.0, ptr_ty, exception_exit, feedback_cell),
         InstKind::StoreAttr { obj, name, val } => attr::lower_store_attr(builder, helpers, names, state, *obj, name.0, *val, ptr_ty, exception_exit),
         InstKind::DeleteAttr { obj, name } => attr::lower_delete_attr(builder, helpers, names, state, *obj, name.0, ptr_ty, exception_exit),
-        InstKind::LoadMethod { obj, name } => attr::lower_load_method(builder, helpers, names, state, *obj, name.0, ptr_ty, exception_exit),
+        InstKind::LoadMethod { obj, name } => attr::lower_load_method(builder, helpers, names, state, *obj, name.0, ptr_ty, exception_exit, feedback_cell),
         InstKind::SubscriptGet { obj, index } => {
             mapping::lower_subscript_get_with_helper(builder, helpers.subscript_get, state, *obj, *index, ptr_ty, exception_exit)
         }
@@ -841,6 +864,7 @@ pub(crate) fn lower_inst<M: Module>(
             ptr_ty,
             ptr_bytes,
             exception_exit,
+            feedback_cell,
         ),
         InstKind::CallMethod { recv_pair, args } => call::lower_call_method(
             builder,
@@ -853,6 +877,7 @@ pub(crate) fn lower_inst<M: Module>(
             ptr_ty,
             ptr_bytes,
             exception_exit,
+            feedback_cell,
         ),
         InstKind::GetIter { iterable } => {
             r#gen::lower_get_iter(builder, helpers.get_iter, state, *iterable, ptr_ty, exception_exit)
@@ -867,21 +892,17 @@ pub(crate) fn lower_inst<M: Module>(
         InstKind::UnpackEx { val, before, after } => {
             container::lower_unpack_ex(builder, helpers.unpack_ex, state, *val, *before, *after, ptr_ty, exception_exit)
         }
-        InstKind::Yield { val } => r#gen::lower_yield(builder, helpers.yield_value, state, *val, ptr_ty, exception_exit),
-        InstKind::YieldFrom { iter } => {
-            r#gen::lower_yield_from(builder, helpers.yield_from, state, *iter, ptr_ty, exception_exit)
-        }
+        InstKind::Yield { .. } | InstKind::YieldFrom { .. } => Err(CodegenError::Unsupported(
+            "raw yield marker reached codegen; generator state-machine transform must run first",
+        )),
         InstKind::Await { awaitable } => {
             r#gen::lower_await(builder, helpers.await_value, state, *awaitable, ptr_ty, exception_exit)
         }
-        InstKind::EagerGeneratorReturn { value } => r#gen::lower_eager_generator_return(
-            builder,
-            helpers.eager_yield_generator,
-            state,
-            *value,
-            ptr_ty,
-            exception_exit,
-        ),
+        InstKind::GenResumePayload | InstKind::GenDelegateStep { .. } | InstKind::GenLastStopValue => {
+            Err(CodegenError::Unsupported(
+                "generator body instruction outside a generator body compilation (J1 codegen wave 2 pending)",
+            ))
+        }
         InstKind::Raise { exc, cause } => {
             exc::lower_raise(builder, helpers.raise, helpers.reraise, state, *exc, *cause, ptr_ty, exception_exit)
         }
@@ -1092,6 +1113,33 @@ pub(crate) fn declare_string_data<M: Module>(
     module.define_data(data_id, &data)?;
     let global = module.declare_data_in_func(data_id, builder.func);
     Ok(builder.ins().global_value(ptr_ty, global))
+}
+/// J0.3: declare one writable, zero-initialized static `FeedbackCell` array
+/// covering a function's lowering-assigned feedback slots (`None` when the
+/// function has no specializable sites).  Tier-0 helper calls pass
+/// `base + slot * FEEDBACK_CELL_SIZE`; the cells live exactly as long as the
+/// emitted code that references them (same JIT/AoT module).
+pub(crate) fn declare_feedback_cells<M: Module>(
+    module: &mut M,
+    ir: &Function,
+) -> Result<Option<DataId>, CodegenError> {
+    let slots = ir
+        .blocks
+        .iter()
+        .flat_map(|block| block.insts.iter())
+        .filter_map(|inst| inst.feedback_slot)
+        .map(|slot| slot.0 as usize + 1)
+        .max()
+        .unwrap_or(0);
+    if slots == 0 {
+        return Ok(None);
+    }
+    let data_id = module.declare_anonymous_data(true, false)?;
+    let mut data = DataDescription::new();
+    data.set_align(align_of::<pon_runtime::feedback::FeedbackCell>() as u64);
+    data.define_zeroinit(slots * pon_runtime::feedback::FEEDBACK_CELL_SIZE);
+    module.define_data(data_id, &data)?;
+    Ok(Some(data_id))
 }
 
 pub(crate) fn build_call_argv(
@@ -1322,7 +1370,7 @@ mod tests {
             functions: vec![Function {
                 name: "binary".to_owned(),
                 arity: 2,
-                is_coroutine: false,
+                is_coroutine: false, is_generator: false,
                 params: Default::default(),
                 n_locals: 2,
                 blocks: vec![Block {
@@ -1410,7 +1458,7 @@ mod tests {
             functions: vec![Function {
                 name: "unary".to_owned(),
                 arity: 1,
-                is_coroutine: false,
+                is_coroutine: false, is_generator: false,
                 params: Default::default(),
                 n_locals: 1,
                 blocks: vec![Block {
@@ -1472,7 +1520,7 @@ mod tests {
             functions: vec![Function {
                 name: "next_item".to_owned(),
                 arity: 1,
-                is_coroutine: false,
+                is_coroutine: false, is_generator: false,
                 params: Default::default(),
                 n_locals: 1,
                 blocks: vec![Block {
@@ -1505,7 +1553,7 @@ mod tests {
             functions: vec![Function {
                 name: "loop_poll".to_owned(),
                 arity: 1,
-                is_coroutine: false,
+                is_coroutine: false, is_generator: false,
                 params: Default::default(),
                 n_locals: 2,
                 blocks: vec![
@@ -1575,7 +1623,7 @@ mod tests {
             functions: vec![Function {
                 name: "no_poll".to_owned(),
                 arity: 0,
-                is_coroutine: false,
+                is_coroutine: false, is_generator: false,
                 params: Default::default(),
                 n_locals: 0,
                 blocks: vec![Block {
@@ -1603,7 +1651,7 @@ mod tests {
                 Function {
                     name: "__main__".to_owned(),
                     arity: 0,
-                is_coroutine: false,
+                is_coroutine: false, is_generator: false,
                     params: Default::default(),
                     n_locals: 0,
                     blocks: vec![Block {
@@ -1626,7 +1674,7 @@ mod tests {
                 Function {
                     name: "add".to_owned(),
                     arity: 2,
-                is_coroutine: false,
+                is_coroutine: false, is_generator: false,
                     params: Default::default(),
                     n_locals: 2,
                     blocks: vec![Block {
@@ -1665,7 +1713,7 @@ mod tests {
                 Function {
                     name: "__main__".to_owned(),
                     arity: 0,
-                is_coroutine: false,
+                is_coroutine: false, is_generator: false,
                     params: Default::default(),
                     n_locals: 0,
                     blocks: vec![Block {
@@ -1690,7 +1738,7 @@ mod tests {
                 Function {
                     name: "with_defaults".to_owned(),
                     arity: 1,
-                is_coroutine: false,
+                is_coroutine: false, is_generator: false,
                     params: Default::default(),
                     n_locals: 2,
                     blocks: vec![Block {
@@ -1735,7 +1783,7 @@ mod tests {
                 Function {
                     name: "__main__".to_owned(),
                     arity: 1,
-                is_coroutine: false,
+                is_coroutine: false, is_generator: false,
                     params: Default::default(),
                     n_locals: 1,
                     blocks: vec![Block {
@@ -1759,7 +1807,7 @@ mod tests {
                 Function {
                     name: "inner".to_owned(),
                     arity: 0,
-                is_coroutine: false,
+                is_coroutine: false, is_generator: false,
                     params: Default::default(),
                     n_locals: 0,
                     blocks: vec![Block {
@@ -1807,7 +1855,7 @@ mod tests {
             functions: vec![Function {
                 name: "future".to_owned(),
                 arity: 0,
-                is_coroutine: false,
+                is_coroutine: false, is_generator: false,
                 params: Default::default(),
                 n_locals: 0,
                 blocks: vec![Block {
@@ -1829,7 +1877,7 @@ mod tests {
             functions: vec![Function {
                 name: "future_term".to_owned(),
                 arity: 0,
-                is_coroutine: false,
+                is_coroutine: false, is_generator: false,
                 params: Default::default(),
                 n_locals: 0,
                 blocks: vec![Block {

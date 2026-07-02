@@ -32,7 +32,11 @@ pub(crate) fn lower_store_local(
     Ok(value)
 }
 
-/// Lower a Phase-A global load through `pon_load_global`.
+/// Lower a global load through `pon_load_global(name, feedback)`.
+///
+/// `feedback_cell` is the site's static J0.3 GlobalIC cell address, or `None`
+/// for a NULL cell (helper skips IC consultation).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_load_global(
     builder: &mut FunctionBuilder<'_>,
     helpers: &HelperFuncRefs,
@@ -40,12 +44,14 @@ pub(crate) fn lower_load_global(
     name: u32,
     ptr_ty: ir::Type,
     exception_exit: ir::Block,
+    feedback_cell: Option<ir::Value>,
 ) -> Result<ir::Value, CodegenError> {
     let runtime_name = builder.ins().iconst(ir::types::I32, i64::from(names.runtime_id(name)?));
+    let feedback = feedback_cell.unwrap_or_else(|| builder.ins().iconst(ptr_ty, 0));
     Ok(call_pyobject_helper(
         builder,
         helpers.load_global,
-        &[runtime_name],
+        &[runtime_name, feedback],
         ptr_ty,
         exception_exit,
     ))

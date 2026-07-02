@@ -16,8 +16,8 @@ use ruff_python_ast::visitor::{self, Visitor};
 
 use crate::desugar::desugar_module;
 use crate::ir::{
-    Block, BlockId, CellId, Function, FunctionId, Inst, InstKind, LocalId, Module, NameId,
-    ParamLayout, PyConst, Terminator, Value,
+    Block, BlockId, CellId, FeedbackSlot, Function, FunctionId, Inst, InstKind, LocalId, Module,
+    NameId, ParamLayout, PyConst, Terminator, Value,
 };
 use crate::parse::parse_module_source;
 
@@ -257,6 +257,12 @@ impl LoweringDriver {
         let main = self.reserve_function("__main__")?;
         let mut body = BodyScope::new(&analysis.root);
 
+        // PEP 649 NOTE (J3, in progress): scope analysis now discovers an
+        // `__annotate__` child at index 0 when the module has variable
+        // annotations; the synthesis/claim of that child lands with the
+        // synth::synthesize_namespace_annotate seam. Until then the child is
+        // simply left unclaimed and the legacy eager path below remains live.
+
         for stmt in &module.body {
             self.lower_stmt(&mut body, stmt)?;
         }
@@ -278,6 +284,7 @@ impl LoweringDriver {
             name: name.to_owned(),
             arity: 0,
             is_coroutine: false,
+            is_generator: false,
             params: ParamLayout::default(),
             blocks: vec![Block {
                 id: BlockId(0),
@@ -864,31 +871,7 @@ impl LoweringDriver {
     ) -> Result<(), LowerError> {
         match target {
             Expr::Name(name) if matches!(name.ctx, ExprContext::Store) => {
-                let raw_name = name.id.as_str();
-                if scope.is_global_name(raw_name) {
-                    let name_id = self.names.intern(raw_name)?;
-                    scope.emit(InstKind::StoreGlobal(name_id, value))?;
-                } else if scope.is_class() {
-                    let name_id = self.names.intern(raw_name)?;
-                    scope.emit(InstKind::StoreName(name_id, value))?;
-                } else {
-                    match scope.name_class(raw_name) {
-                        Some(NameClass::Cell { cell_slot, .. }) => {
-                            scope.emit(InstKind::StoreCell(CellId(*cell_slot), value))?;
-                        }
-                        Some(NameClass::Free { slot }) => {
-                            scope.emit(InstKind::StoreCell(CellId(*slot), value))?;
-                        }
-                        Some(NameClass::Local { slot }) => {
-                            scope.emit(InstKind::StoreLocal(LocalId(*slot), value))?;
-                        }
-                        Some(NameClass::Builtin) | Some(NameClass::Global { .. }) | None => {
-                            let name_id = self.names.intern(raw_name)?;
-                            scope.emit(InstKind::StoreName(name_id, value))?;
-                        }
-                    }
-                }
-                Ok(())
+                self.store_name_value(scope, name.id.as_str(), value)
             }
             Expr::Attribute(attr) if matches!(attr.ctx, ExprContext::Store) => {
                 let obj = self.lower_expr(scope, &attr.value)?;
@@ -907,6 +890,42 @@ impl LoweringDriver {
             _ => unsupported_expr("assignment target", target),
         }
     }
+
+    /// Stores `value` under a plain name using the scope's binding class.
+    ///
+    /// Shared by assignment targets and match-pattern captures, which bind
+    /// names without an `Expr::Name` node.
+    fn store_name_value(
+        &mut self,
+        scope: &mut BodyScope,
+        raw_name: &str,
+        value: Value,
+    ) -> Result<(), LowerError> {
+        if scope.is_global_name(raw_name) {
+            let name_id = self.names.intern(raw_name)?;
+            scope.emit(InstKind::StoreGlobal(name_id, value))?;
+        } else if scope.is_class() {
+            let name_id = self.names.intern(raw_name)?;
+            scope.emit(InstKind::StoreName(name_id, value))?;
+        } else {
+            match scope.name_class(raw_name) {
+                Some(NameClass::Cell { cell_slot, .. }) => {
+                    scope.emit(InstKind::StoreCell(CellId(*cell_slot), value))?;
+                }
+                Some(NameClass::Free { slot }) => {
+                    scope.emit(InstKind::StoreCell(CellId(*slot), value))?;
+                }
+                Some(NameClass::Local { slot }) => {
+                    scope.emit(InstKind::StoreLocal(LocalId(*slot), value))?;
+                }
+                Some(NameClass::Builtin) | Some(NameClass::Global { .. }) | None => {
+                    let name_id = self.names.intern(raw_name)?;
+                    scope.emit(InstKind::StoreName(name_id, value))?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct BodyScope {
@@ -920,6 +939,8 @@ pub(crate) struct BodyScope {
     next_block: u32,
     temp_locals: usize,
     reraise_exc: Option<LocalId>,
+    /// Next J0.3 inline-cache feedback slot (one per specializable site).
+    next_feedback: u32,
 }
 
 impl BodyScope {
@@ -937,6 +958,7 @@ impl BodyScope {
             next_block: 1,
             temp_locals: 0,
             reraise_exc: None,
+            next_feedback: 0,
         };
         scope.emit_cell_prologue();
         scope
@@ -1121,8 +1143,37 @@ impl BodyScope {
             .next_value
             .checked_add(1)
             .ok_or_else(|| LowerError::internal("too many SSA values for u32 ids"))?;
-        self.insts.push(Inst::new(result, kind));
+        let mut inst = Inst::new(result, kind);
+        if let Some(slot) = self.reserve_feedback_slot(&inst.kind)? {
+            inst = inst.with_feedback_slot(slot);
+        }
+        self.insts.push(inst);
         Ok(result)
+    }
+
+    /// J0.3: reserve one feedback slot per specializable operation.  The IR
+    /// op kind statically fixes the cell interpretation (`FeedbackKind`
+    /// contract): attribute/method loads get Attr cells, global loads get
+    /// Global cells, method/extended calls get Call cells.  Plain `Call`
+    /// stays slot-free this wave (its helper has no feedback parameter).
+    fn reserve_feedback_slot(&mut self, kind: &InstKind) -> Result<Option<FeedbackSlot>, LowerError> {
+        let wants_slot = matches!(
+            kind,
+            InstKind::LoadAttr { .. }
+                | InstKind::LoadMethod { .. }
+                | InstKind::LoadGlobal(_)
+                | InstKind::CallMethod { .. }
+                | InstKind::CallEx { .. }
+        );
+        if !wants_slot {
+            return Ok(None);
+        }
+        let slot = FeedbackSlot(self.next_feedback);
+        self.next_feedback = self
+            .next_feedback
+            .checked_add(1)
+            .ok_or_else(|| LowerError::internal("too many feedback slots for u32 ids"))?;
+        Ok(Some(slot))
     }
 
     fn set_term(&mut self, term: Terminator) -> Result<(), LowerError> {
@@ -1136,14 +1187,7 @@ impl BodyScope {
     fn finish(mut self) -> Result<Function, LowerError> {
         if self.term.is_none() {
             let none = self.emit(InstKind::Const(PyConst::None))?;
-            let result = if self.info.is_async {
-                self.emit(InstKind::EagerGeneratorReturn { value: none })?
-            } else if self.info.is_generator {
-                self.emit(InstKind::GetIter { iterable: none })?
-            } else {
-                none
-            };
-            self.term = Some(Terminator::Return(result));
+            self.term = Some(Terminator::Return(none));
         }
 
         let term = self
@@ -1156,14 +1200,20 @@ impl BodyScope {
             term,
         });
         let params = param_layout(&self.info);
-        Ok(Function {
+        let is_generator_body = self.info.is_generator || self.info.is_async;
+        let mut function = Function {
             name: self.info.name,
             arity: self.info.parameters.arity(),
             is_coroutine: self.info.is_async,
+            is_generator: is_generator_body,
             params,
             blocks: self.blocks,
             n_locals: self.info.locals.len() + self.temp_locals,
-        })
+        };
+        if is_generator_body {
+            generator::transform_generator_function(&mut function)?;
+        }
+        Ok(function)
     }
 }
 
@@ -1551,11 +1601,11 @@ g = (i for i in range(3))
             .find(|function| function.name == "<genexpr>")
             .expect("generator expression should synthesize a child function");
         assert_eq!(genexpr.arity, 1);
+        assert!(genexpr.is_generator, "genexpr body must be a generator state machine");
         assert!(genexpr
             .blocks
             .iter()
-            .flat_map(|block| &block.insts)
-            .any(|inst| matches!(inst.kind, InstKind::Yield { .. })));
+            .any(|block| matches!(block.term, Terminator::Suspend { state: 1, .. })));
     }
 
     #[test]
@@ -1612,11 +1662,21 @@ async def f():
             .find(|function| function.name == "f")
             .expect("async function body should be present");
         assert!(function.is_coroutine);
+        assert!(
+            function.is_generator,
+            "async bodies must be resumable state machines"
+        );
+        assert!(
+            function
+                .blocks
+                .first()
+                .is_some_and(|block| matches!(block.insts.first().map(|inst| &inst.kind), Some(InstKind::GenResumePayload))),
+            "generator-family entry must consume the resume payload before user code"
+        );
         assert!(function
             .blocks
             .iter()
-            .flat_map(|block| &block.insts)
-            .any(|inst| matches!(inst.kind, InstKind::EagerGeneratorReturn { .. })));
+            .any(|block| matches!(block.term, Terminator::Return(_))));
     }
 
     #[test]

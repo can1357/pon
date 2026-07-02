@@ -7,6 +7,9 @@ use pon_ir::ir::Value as IrValue;
 use super::{CodegenError, HelperFuncRefs, LowerState, NameMap, call_pyobject_helper};
 
 /// Lower `LoadAttr` through the runtime descriptor-aware attribute helper.
+///
+/// `feedback_cell` is the site's static J0.3 feedback-cell address (attr
+/// kind), or `None` for a NULL cell (helper skips IC consultation).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_load_attr(
     builder: &mut FunctionBuilder<'_>,
@@ -17,10 +20,11 @@ pub(crate) fn lower_load_attr(
     name: u32,
     ptr_ty: ir::Type,
     exception_exit: ir::Block,
+    feedback_cell: Option<ir::Value>,
 ) -> Result<ir::Value, CodegenError> {
     let obj = state.value(obj)?;
     let runtime_name = builder.ins().iconst(ir::types::I32, i64::from(names.runtime_id(name)?));
-    let feedback = builder.ins().iconst(ptr_ty, 0);
+    let feedback = feedback_cell.unwrap_or_else(|| builder.ins().iconst(ptr_ty, 0));
     Ok(call_pyobject_helper(
         builder,
         helpers.get_attr,
@@ -84,8 +88,9 @@ pub(crate) fn lower_load_method(
     name: u32,
     ptr_ty: ir::Type,
     exception_exit: ir::Block,
+    feedback_cell: Option<ir::Value>,
 ) -> Result<ir::Value, CodegenError> {
-    lower_load_attr(builder, helpers, names, state, obj, name, ptr_ty, exception_exit)
+    lower_load_attr(builder, helpers, names, state, obj, name, ptr_ty, exception_exit, feedback_cell)
 }
 
 fn emit_status_check(builder: &mut FunctionBuilder<'_>, status: ir::Value, exception_exit: ir::Block) {
