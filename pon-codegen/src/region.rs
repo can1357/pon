@@ -472,6 +472,7 @@ fn push_inst_operands(kind: &InstKind, operands: &mut Vec<IrValue>) {
         | InstKind::GenDelegateStep { delegate: value }
         | InstKind::MatchExc { exc_type: value }
         | InstKind::CheckExcStar { exc_types: value }
+        | InstKind::ExcStarMatch { exc_types: value }
         | InstKind::MatchSequence { subj: value }
         | InstKind::MatchMapping { subj: value }
         | InstKind::GetLen { subj: value }
@@ -521,6 +522,7 @@ fn push_inst_operands(kind: &InstKind, operands: &mut Vec<IrValue>) {
             push_optional_operand(operands, *cause);
         }
         InstKind::Reraise | InstKind::PushExcInfo { .. } | InstKind::PopExcInfo | InstKind::GetCurrentExc => {}
+        InstKind::ExcStarEnter | InstKind::ExcStarBodyOk | InstKind::ExcStarBodyRaised | InstKind::ExcStarFinish => {}
         InstKind::BuildExcGroup { excs } | InstKind::MatchKeys { keys: excs, .. } => {
             if let InstKind::MatchKeys { subj, .. } = kind {
                 operands.push(*subj);

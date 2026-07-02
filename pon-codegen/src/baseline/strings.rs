@@ -55,7 +55,7 @@ pub(crate) fn lower_build_string<M: Module>(
 
 /// Lower template-string interpolation parts through `pon_build_template`.
 pub(crate) fn lower_build_template<M: Module>(
-    _module: &mut M,
+    module: &mut M,
     builder: &mut FunctionBuilder<'_>,
     helper: ir::FuncRef,
     state: &LowerState,
@@ -63,7 +63,7 @@ pub(crate) fn lower_build_template<M: Module>(
     ptr_ty: ir::Type,
     exception_exit: ir::Block,
 ) -> Result<ir::Value, CodegenError> {
-    let parts_ptr = build_template_parts(builder, state, parts, ptr_ty)?;
+    let parts_ptr = build_template_parts(module, builder, state, parts, ptr_ty)?;
     let count = builder.ins().iconst(ptr_ty, parts.len() as i64);
     Ok(call_pyobject_helper(builder, helper, &[parts_ptr, count], ptr_ty, exception_exit))
 }
@@ -104,7 +104,8 @@ fn build_fstring_parts(
     Ok(builder.ins().stack_addr(ptr_ty, slot, 0))
 }
 
-fn build_template_parts(
+fn build_template_parts<M: Module>(
+    module: &mut M,
     builder: &mut FunctionBuilder<'_>,
     state: &LowerState,
     parts: &[TStrPart],
@@ -120,6 +121,7 @@ fn build_template_parts(
             TStrPart::Literal(_) => return Err(CodegenError::Unsupported("BuildTemplate literal ConstId data")),
             TStrPart::Interp {
                 value,
+                expression,
                 conversion,
                 format_spec,
             } => {
@@ -128,9 +130,15 @@ fn build_template_parts(
                     Some(format_spec) => state.value(*format_spec)?,
                     None => null,
                 };
+                let expression_ptr = if expression.is_empty() {
+                    null
+                } else {
+                    declare_string_data(module, builder, expression, ptr_ty)?
+                };
+                let expression_len = builder.ins().iconst(ptr_ty, expression.len() as i64);
                 stack_store(builder, value, slot, base)?;
-                stack_store(builder, null, slot, base + 8)?;
-                stack_store(builder, null, slot, base + 16)?;
+                stack_store(builder, expression_ptr, slot, base + 8)?;
+                stack_store(builder, expression_len, slot, base + 16)?;
                 let header = builder.ins().iconst(ir::types::I64, i64::from(*conversion) << 32);
                 stack_store(builder, header, slot, base + 24)?;
                 stack_store(builder, format_spec, slot, base + 32)?;

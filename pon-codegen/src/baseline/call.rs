@@ -179,12 +179,6 @@ pub(crate) fn lower_build_class<M: Module>(
     ptr_bytes: usize,
     exception_exit: ir::Block,
 ) -> Result<ir::Value, CodegenError> {
-    if !keywords.is_empty() {
-        return Err(CodegenError::Unsupported("BuildClass keyword arguments"));
-    }
-    if !decorators.is_empty() {
-        return Err(CodegenError::Unsupported("BuildClass decorators"));
-    }
     let body = lower_make_function(
         module,
         builder,
@@ -199,14 +193,31 @@ pub(crate) fn lower_build_class<M: Module>(
     )?;
     let bases_ptr = build_call_argv(builder, helpers, state, bases, ptr_ty, ptr_bytes)?;
     let base_count = builder.ins().iconst(ptr_ty, bases.len() as i64);
+    let kw_names = build_kw_name_array(builder, names, keywords, ptr_ty)?;
+    let kw_values = build_kw_value_array(builder, state, keywords, ptr_ty, ptr_bytes)?;
+    let kw_count = builder.ins().iconst(ptr_ty, keywords.len() as i64);
     let runtime_name = builder.ins().iconst(ir::types::I32, i64::from(names.runtime_id(name.0)?));
-    Ok(call_pyobject_helper(
+    let mut class_value = call_pyobject_helper(
         builder,
         helpers.build_class,
-        &[body, runtime_name, bases_ptr, base_count],
+        &[body, runtime_name, bases_ptr, base_count, kw_names, kw_values, kw_count],
         ptr_ty,
         exception_exit,
-    ))
+    );
+    for decorator in decorators.iter().rev().copied() {
+        let decorator = state.value(decorator)?;
+        let slot = builder.create_sized_stack_slot(StackSlotData {
+            kind: StackSlotKind::ExplicitSlot,
+            size: ptr_bytes.try_into().map_err(|_| CodegenError::OffsetTooLarge { offset: ptr_bytes })?,
+            align_shift: ptr_bytes.trailing_zeros() as u8,
+            key: None,
+        });
+        builder.ins().stack_store(class_value, slot, 0);
+        let argv = builder.ins().stack_addr(ptr_ty, slot, 0);
+        let argc = builder.ins().iconst(ptr_ty, 1);
+        class_value = call_pyobject_helper(builder, helpers.call, &[decorator, argv, argc], ptr_ty, exception_exit);
+    }
+    Ok(class_value)
 }
 
 #[allow(clippy::too_many_arguments)]

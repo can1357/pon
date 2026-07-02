@@ -13,7 +13,7 @@ pub(crate) mod name;
 pub(crate) mod number;
 pub(crate) mod strings;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 
@@ -22,7 +22,7 @@ use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{self, AbiParam, FuncRef, InstBuilder, MemFlagsData, StackSlotData, StackSlotKind};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_module::{DataDescription, DataId, FuncId, Module, ModuleError};
-use pon_ir::ir::{Block as IrBlock, Function, InstKind, Module as IrModule, PyConst, Value as IrValue};
+use pon_ir::ir::{Block as IrBlock, BlockId, Function, InstKind, Module as IrModule, PyConst, Terminator, Value as IrValue};
 
 use crate::helpers::HelperRefs;
 
@@ -144,6 +144,10 @@ pub(crate) struct HelperFuncRefs {
     pub(crate) call_method: FuncRef,
     pub(crate) load_global: FuncRef,
     pub(crate) load_name: FuncRef,
+    pub(crate) load_local: FuncRef,
+    pub(crate) delete_local: FuncRef,
+    pub(crate) delete_global: FuncRef,
+    pub(crate) delete_name: FuncRef,
     pub(crate) get_attr: FuncRef,
     pub(crate) set_attr: FuncRef,
     pub(crate) del_attr: FuncRef,
@@ -177,6 +181,11 @@ pub(crate) struct HelperFuncRefs {
     pub(crate) pop_exc_info: FuncRef,
     pub(crate) match_exc: FuncRef,
     pub(crate) check_exc_star: FuncRef,
+    pub(crate) exc_star_enter: FuncRef,
+    pub(crate) exc_star_match: FuncRef,
+    pub(crate) exc_star_body_ok: FuncRef,
+    pub(crate) exc_star_body_raised: FuncRef,
+    pub(crate) exc_star_finish: FuncRef,
     pub(crate) get_current_exc: FuncRef,
     pub(crate) build_exc_group: FuncRef,
     pub(crate) get_iter: FuncRef,
@@ -213,6 +222,8 @@ pub(crate) struct HelperFuncRefs {
     pub(crate) load_build_class: FuncRef,
     pub(crate) store_global: FuncRef,
     pub(crate) none: FuncRef,
+    pub(crate) osr_poll: FuncRef,
+    pub(crate) deopt_note: FuncRef,
     #[cfg(feature = "free-threading")]
     pub(crate) safepoint_poll: FuncRef,
     #[cfg(feature = "free-threading")]
@@ -368,6 +379,11 @@ pub fn compile_function<M: Module>(
     for _ in 0..ir.n_locals {
         state.locals.push(builder.declare_var(ptr_ty));
     }
+    let unbound = builder.ins().iconst(ptr_ty, 0);
+    for slot in 0..ir.n_locals {
+        builder.def_var(state.locals[slot], unbound);
+        state.local_defined[slot] = true;
+    }
     initialize_parameter_locals(&mut builder, &mut state, argv, ptr_bytes, entry_arg_count, ir, ptr_ty)?;
     emit_safepoint_poll(&mut builder, &helper_refs);
 
@@ -405,6 +421,98 @@ pub fn compile_function<M: Module>(
     builder.seal_all_blocks();
     builder.finalize();
 
+    Ok(())
+}
+
+/// Lower a baseline OSR entry that resumes `ir` at `header` from an
+/// `OsrTransferBuffer`.
+#[allow(clippy::too_many_arguments)]
+pub fn compile_osr_function<M: Module>(
+    module: &mut M,
+    helpers: &HelperRefs,
+    func_ids: &[FuncId],
+    functions: &[Function],
+    names: &NameMap,
+    ir: &Function,
+    header: BlockId,
+    live_values: &[IrValue],
+    ctx: &mut Context,
+    fctx: &mut FunctionBuilderContext,
+) -> Result<(), CodegenError> {
+    module.clear_context(ctx);
+    let ptr_ty = module.target_config().pointer_type();
+    let ptr_bytes = ptr_ty.bytes() as usize;
+    let live_count = ir.n_locals.saturating_add(live_values.len());
+    if live_count > 16 {
+        return Err(CodegenError::Unsupported("OSR live set exceeds transfer buffer"));
+    }
+
+    ctx.func.signature.params.push(AbiParam::new(ptr_ty));
+    ctx.func.signature.returns.push(AbiParam::new(ptr_ty));
+
+    let helper_refs = declare_helper_refs(module, helpers, &mut ctx.func);
+    let feedback_base = declare_feedback_cells(module, ir)?;
+    let feedback_base_gv = feedback_base.map(|data_id| module.declare_data_in_func(data_id, &mut ctx.func));
+    let reachable = reachable_from(ir, header);
+
+    let mut builder = FunctionBuilder::new(&mut ctx.func, fctx);
+    let entry = builder.create_block();
+    let exception_exit = builder.create_block();
+    builder.set_cold_block(exception_exit);
+    builder.append_block_params_for_function_params(entry);
+    builder.switch_to_block(entry);
+    builder.seal_block(entry);
+    let buffer = builder.func.dfg.block_params(entry)[0];
+
+    let mut state = LowerState::new(ir.n_locals);
+    for _ in 0..ir.n_locals {
+        state.locals.push(builder.declare_var(ptr_ty));
+    }
+    for slot in 0..ir.n_locals {
+        let value = builder.ins().load(ptr_ty, MemFlagsData::new(), buffer, offset_i32(8 + slot * ptr_bytes)?);
+        builder.def_var(state.locals[slot], value);
+        state.local_defined[slot] = true;
+    }
+    for (index, value) in live_values.iter().enumerate() {
+        let offset = 8 + (ir.n_locals + index) * ptr_bytes;
+        let boxed = builder.ins().load(ptr_ty, MemFlagsData::new(), buffer, offset_i32(offset)?);
+        state.define_value(*value, boxed);
+    }
+
+    let block_map: Vec<(BlockId, ir::Block)> = ir
+        .blocks
+        .iter()
+        .filter(|block| reachable.contains(&block.id))
+        .map(|block| (block.id, builder.create_block()))
+        .collect();
+    let header_block = block_map
+        .iter()
+        .find_map(|(id, block)| (*id == header).then_some(*block))
+        .ok_or(CodegenError::Unsupported("OSR header block"))?;
+    builder.ins().jump(header_block, &[]);
+
+    lower_function_blocks_subset(
+        module,
+        &mut builder,
+        &helper_refs,
+        func_ids,
+        functions,
+        names,
+        &mut state,
+        ptr_ty,
+        ptr_bytes,
+        exception_exit,
+        ir,
+        &block_map,
+        feedback_base_gv,
+        &reachable,
+    )?;
+
+    builder.switch_to_block(exception_exit);
+    let null = builder.ins().iconst(ptr_ty, 0);
+    builder.ins().return_(&[null]);
+    builder.seal_all_blocks();
+    builder.finalize();
     Ok(())
 }
 
@@ -519,10 +627,118 @@ pub(crate) fn lower_function_blocks<M: Module>(
                 ptr_ty,
                 current_exception_exit,
                 block_map,
+                ir,
                 block.id,
                 &block.term,
             )?;
         }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_function_blocks_subset<M: Module>(
+    module: &mut M,
+    builder: &mut FunctionBuilder<'_>,
+    helper_refs: &HelperFuncRefs,
+    func_ids: &[FuncId],
+    functions: &[Function],
+    names: &NameMap,
+    state: &mut LowerState,
+    ptr_ty: ir::Type,
+    ptr_bytes: usize,
+    exception_exit: ir::Block,
+    ir: &Function,
+    block_map: &[(BlockId, ir::Block)],
+    feedback_base_gv: Option<ir::GlobalValue>,
+    reachable: &HashSet<BlockId>,
+) -> Result<(), CodegenError> {
+    let mut exception_target_stack = Vec::new();
+    let mut current_exception_exit = exception_exit;
+
+    for block in &ir.blocks {
+        if !reachable.contains(&block.id) {
+            continue;
+        }
+        let clif_block = block_map
+            .iter()
+            .find_map(|(id, clif)| (*id == block.id).then_some(*clif))
+            .ok_or(CodegenError::Unsupported("missing OSR basic block"))?;
+        builder.switch_to_block(clif_block);
+        for inst in &block.insts {
+            let feedback_cell = match (inst.feedback_slot, feedback_base_gv) {
+                (Some(slot), Some(gv)) => {
+                    let base = builder.ins().global_value(ptr_ty, gv);
+                    Some(
+                        builder
+                            .ins()
+                            .iadd_imm(base, i64::from(slot.0) * pon_runtime::feedback::FEEDBACK_CELL_SIZE as i64),
+                    )
+                }
+                _ => None,
+            };
+            let value = match &inst.kind {
+                InstKind::PushExcInfo {
+                    target,
+                    stack_depth,
+                    kind,
+                } => {
+                    let value = exc::lower_push_exc_info(
+                        builder,
+                        helper_refs.push_exc_info,
+                        target.0,
+                        *stack_depth,
+                        *kind,
+                        ptr_ty,
+                        current_exception_exit,
+                    )?;
+                    let handler = block_map
+                        .iter()
+                        .find_map(|(id, clif)| (*id == *target).then_some(*clif))
+                        .ok_or(CodegenError::Unsupported("OSR exception handler target block"))?;
+                    exception_target_stack.push(current_exception_exit);
+                    current_exception_exit = handler;
+                    value
+                }
+                InstKind::PopExcInfo => {
+                    let previous_exception_exit = exception_target_stack.pop().unwrap_or(exception_exit);
+                    let value = exc::lower_pop_exc_info(
+                        builder,
+                        helper_refs.pop_exc_info,
+                        ptr_ty,
+                        previous_exception_exit,
+                    )?;
+                    current_exception_exit = previous_exception_exit;
+                    value
+                }
+                _ => lower_inst(
+                    module,
+                    builder,
+                    helper_refs,
+                    func_ids,
+                    functions,
+                    names,
+                    state,
+                    ptr_ty,
+                    ptr_bytes,
+                    current_exception_exit,
+                    &inst.kind,
+                    feedback_cell,
+                )?,
+            };
+            state.define_value(inst.result, value);
+        }
+        control::lower_terminator_with_blocks(
+            builder,
+            state,
+            helper_refs,
+            ptr_ty,
+            current_exception_exit,
+            block_map,
+            ir,
+            block.id,
+            &block.term,
+        )?;
     }
     Ok(())
 }
@@ -544,6 +760,10 @@ pub(crate) fn declare_helper_refs<M: Module>(module: &mut M, helpers: &HelperRef
         call_method: module.declare_func_in_func(helpers.call_method, func),
         load_global: module.declare_func_in_func(helpers.load_global, func),
         load_name: module.declare_func_in_func(helpers.load_name, func),
+        load_local: module.declare_func_in_func(helpers.load_local, func),
+        delete_local: module.declare_func_in_func(helpers.delete_local, func),
+        delete_global: module.declare_func_in_func(helpers.delete_global, func),
+        delete_name: module.declare_func_in_func(helpers.delete_name, func),
         get_attr: module.declare_func_in_func(helpers.get_attr, func),
         set_attr: module.declare_func_in_func(helpers.set_attr, func),
         del_attr: module.declare_func_in_func(helpers.del_attr, func),
@@ -577,6 +797,11 @@ pub(crate) fn declare_helper_refs<M: Module>(module: &mut M, helpers: &HelperRef
         pop_exc_info: module.declare_func_in_func(helpers.pop_exc_info, func),
         match_exc: module.declare_func_in_func(helpers.match_exc, func),
         check_exc_star: module.declare_func_in_func(helpers.check_exc_star, func),
+        exc_star_enter: module.declare_func_in_func(helpers.exc_star_enter, func),
+        exc_star_match: module.declare_func_in_func(helpers.exc_star_match, func),
+        exc_star_body_ok: module.declare_func_in_func(helpers.exc_star_body_ok, func),
+        exc_star_body_raised: module.declare_func_in_func(helpers.exc_star_body_raised, func),
+        exc_star_finish: module.declare_func_in_func(helpers.exc_star_finish, func),
         get_current_exc: module.declare_func_in_func(helpers.get_current_exc, func),
         build_exc_group: module.declare_func_in_func(helpers.build_exc_group, func),
         get_iter: module.declare_func_in_func(helpers.get_iter, func),
@@ -612,6 +837,8 @@ pub(crate) fn declare_helper_refs<M: Module>(module: &mut M, helpers: &HelperRef
         load_build_class: module.declare_func_in_func(helpers.load_build_class, func),
         store_global: module.declare_func_in_func(helpers.store_global, func),
         none: module.declare_func_in_func(helpers.none, func),
+        osr_poll: module.declare_func_in_func(helpers.osr_poll, func),
+        deopt_note: module.declare_func_in_func(helpers.deopt_note, func),
         #[cfg(feature = "free-threading")]
         safepoint_poll: module.declare_func_in_func(helpers.safepoint_poll, func),
         #[cfg(feature = "free-threading")]
@@ -795,9 +1022,13 @@ pub(crate) fn lower_inst<M: Module>(
         InstKind::DictMergeUnique { map, other } => {
             mapping::lower_dict_merge_with_helper(builder, helpers.dict_merge_unique, state, *map, *other, ptr_ty, exception_exit)
         }
-        InstKind::LoadLocal(slot) => name::lower_load_local(builder, state, slot.0),
+        InstKind::LoadLocal(slot) => {
+            name::lower_load_local(builder, helpers, state, slot.0, ptr_ty, exception_exit)
+        }
         InstKind::StoreLocal(slot, value) => name::lower_store_local(builder, state, slot.0, *value),
-        InstKind::DeleteLocal(_) => name::lower_delete_local(),
+        InstKind::DeleteLocal(slot) => {
+            name::lower_delete_local(builder, helpers, state, slot.0, ptr_ty, exception_exit)
+        }
         InstKind::LoadGlobal(name) => name::lower_load_global(builder, helpers, names, name.0, ptr_ty, exception_exit, feedback_cell),
         InstKind::StoreGlobal(name, value) => name::lower_store_global(
             builder,
@@ -809,7 +1040,9 @@ pub(crate) fn lower_inst<M: Module>(
             ptr_ty,
             exception_exit,
         ),
-        InstKind::DeleteGlobal(_) => name::lower_delete_global(),
+        InstKind::DeleteGlobal(name) => {
+            name::lower_delete_global(builder, helpers, names, name.0, ptr_ty, exception_exit)
+        }
         InstKind::LoadName(name) => name::lower_load_name(builder, helpers, names, name.0, ptr_ty, exception_exit),
         InstKind::StoreName(name, value) => name::lower_store_name(
             builder,
@@ -821,7 +1054,9 @@ pub(crate) fn lower_inst<M: Module>(
             ptr_ty,
             exception_exit,
         ),
-        InstKind::DeleteName(_) => name::lower_delete_name(),
+        InstKind::DeleteName(name) => {
+            name::lower_delete_name(builder, helpers, names, name.0, ptr_ty, exception_exit)
+        }
         InstKind::LoadCell(cell) => {
             name::lower_load_cell(builder, helpers, state, cell.0, ptr_ty, exception_exit)
         }
@@ -990,6 +1225,17 @@ pub(crate) fn lower_inst<M: Module>(
         InstKind::CheckExcStar { exc_types } => {
             exc::lower_check_exc_star(builder, helpers.check_exc_star, state, *exc_types, ptr_ty, exception_exit)
         }
+        InstKind::ExcStarEnter => exc::lower_exc_star_enter(builder, helpers.exc_star_enter, ptr_ty, exception_exit),
+        InstKind::ExcStarMatch { exc_types } => {
+            exc::lower_exc_star_match(builder, helpers.exc_star_match, state, *exc_types, ptr_ty, exception_exit)
+        }
+        InstKind::ExcStarBodyOk => {
+            exc::lower_exc_star_body_ok(builder, helpers.exc_star_body_ok, ptr_ty, exception_exit)
+        }
+        InstKind::ExcStarBodyRaised => {
+            exc::lower_exc_star_body_raised(builder, helpers.exc_star_body_raised, ptr_ty, exception_exit)
+        }
+        InstKind::ExcStarFinish => exc::lower_exc_star_finish(builder, helpers.exc_star_finish, ptr_ty, exception_exit),
         InstKind::GetCurrentExc => exc::lower_get_current_exc(builder, helpers.get_current_exc, ptr_ty, exception_exit),
         InstKind::BuildExcGroup { excs } => exc::lower_build_exc_group(
             builder,
@@ -1326,6 +1572,98 @@ fn emit_null_check(
 
 pub(crate) fn offset_i32(offset: usize) -> Result<i32, CodegenError> {
     i32::try_from(offset).map_err(|_| CodegenError::OffsetTooLarge { offset })
+}
+
+/// Canonical SSA suffix for a loop-header OSR transfer.
+///
+/// Locals are carried separately by slot number; this returns only SSA values
+/// live-in at `header`, sorted by `Value` index.
+#[must_use]
+pub fn osr_live_values(function: &Function, header: BlockId) -> Vec<IrValue> {
+    let mut gens = HashMap::<BlockId, HashSet<IrValue>>::new();
+    let mut kill = HashMap::<BlockId, HashSet<IrValue>>::new();
+    for block in &function.blocks {
+        let mut block_gen = HashSet::new();
+        let mut block_kill = HashSet::new();
+        for inst in &block.insts {
+            for operand in crate::region::inst_operands(&inst.kind) {
+                if !block_kill.contains(&operand) {
+                    block_gen.insert(operand);
+                }
+            }
+            block_kill.insert(inst.result);
+        }
+        for operand in crate::region::terminator_operands(&block.term) {
+            if !block_kill.contains(&operand) {
+                block_gen.insert(operand);
+            }
+        }
+        gens.insert(block.id, block_gen);
+        kill.insert(block.id, block_kill);
+    }
+
+    let mut live_in = function
+        .blocks
+        .iter()
+        .map(|block| (block.id, HashSet::<IrValue>::new()))
+        .collect::<HashMap<_, _>>();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in function.blocks.iter().rev() {
+            let mut out = HashSet::new();
+            for successor in successors(&block.term) {
+                if let Some(input) = live_in.get(&successor) {
+                    out.extend(input.iter().copied());
+                }
+            }
+            let mut next = gens.get(&block.id).cloned().unwrap_or_default();
+            for value in out {
+                if !kill.get(&block.id).is_some_and(|set| set.contains(&value)) {
+                    next.insert(value);
+                }
+            }
+            let entry = live_in.entry(block.id).or_default();
+            if *entry != next {
+                *entry = next;
+                changed = true;
+            }
+        }
+    }
+
+    let mut values = live_in.remove(&header).unwrap_or_default().into_iter().collect::<Vec<_>>();
+    values.sort_by_key(|value| value.0);
+    values
+}
+
+fn reachable_from(function: &Function, entry: BlockId) -> HashSet<BlockId> {
+    let mut reachable = HashSet::new();
+    let mut queue = VecDeque::new();
+    reachable.insert(entry);
+    queue.push_back(entry);
+    while let Some(block_id) = queue.pop_front() {
+        let Some(block) = function.blocks.iter().find(|block| block.id == block_id) else {
+            continue;
+        };
+        for successor in successors(&block.term) {
+            if reachable.insert(successor) {
+                queue.push_back(successor);
+            }
+        }
+    }
+    reachable
+}
+
+fn successors(term: &Terminator) -> Vec<BlockId> {
+    match term {
+        Terminator::Jump(target) => vec![*target],
+        Terminator::Branch { then_blk, else_blk, .. } => vec![*then_blk, *else_blk],
+        Terminator::CondBranch { then_, else_, .. } => vec![*then_, *else_],
+        Terminator::ForLoop { body, done, .. } => vec![*body, *done],
+        Terminator::Suspend { resume, .. } => vec![*resume],
+        Terminator::Return(_) | Terminator::RaiseTerm | Terminator::Unreachable => Vec::new(),
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]

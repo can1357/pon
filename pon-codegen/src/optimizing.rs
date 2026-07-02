@@ -681,6 +681,7 @@ fn lower_cold_copy<M: Module>(
             ptr_ty,
             exception_exit,
             cold_blocks,
+            function,
             region,
             block.id,
             &block.term,
@@ -710,6 +711,7 @@ fn lower_cold_terminator_with_region_args(
     ptr_ty: ir::Type,
     exception_exit: ir::Block,
     cold_blocks: &[(BlockId, ir::Block)],
+    function: &Function,
     region: &TypedRegion,
     current_block: BlockId,
     term: &Terminator,
@@ -745,6 +747,7 @@ fn lower_cold_terminator_with_region_args(
             ptr_ty,
             exception_exit,
             cold_blocks,
+            function,
             current_block,
             term,
         ),
@@ -1006,6 +1009,7 @@ fn lower_primary_terminator(
                 ptr_ty,
                 exception_exit,
                 block_map,
+                function,
                 current_block,
                 term,
             )
@@ -1038,6 +1042,7 @@ fn lower_primary_terminator(
                 ptr_ty,
                 exception_exit,
                 block_map,
+                function,
                 current_block,
                 term,
             )
@@ -1082,6 +1087,7 @@ fn lower_primary_terminator(
                     ptr_ty,
                     exception_exit,
                     block_map,
+                    function,
                     current_block,
                     term,
                 )
@@ -1127,6 +1133,7 @@ fn lower_primary_terminator(
                     ptr_ty,
                     exception_exit,
                     block_map,
+                    function,
                     current_block,
                     term,
                 )
@@ -1143,6 +1150,7 @@ fn lower_primary_terminator(
                 ptr_ty,
                 exception_exit,
                 block_map,
+                function,
                 current_block,
                 term,
             )
@@ -1438,6 +1446,8 @@ fn side_exit_unless(
 
     builder.switch_to_block(fail);
     sync_all_dirty_locals(builder, helpers, state, ptr_ty, exception_exit)?;
+    let null_function = builder.ins().iconst(ptr_ty, 0);
+    builder.ins().call(helpers.deopt_note, &[null_function]);
     let target_args = if builder.func.dfg.block_params(cold_target).is_empty() {
         Vec::new()
     } else {

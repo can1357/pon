@@ -117,6 +117,54 @@ pub(crate) fn lower_check_exc_star(
     Ok(call_pyobject_helper(builder, check_exc_star, &[exc_types], ptr_ty, exception_exit))
 }
 
+pub(crate) fn lower_exc_star_enter(
+    builder: &mut FunctionBuilder<'_>,
+    exc_star_enter: ir::FuncRef,
+    ptr_ty: ir::Type,
+    exception_exit: ir::Block,
+) -> Result<ir::Value, CodegenError> {
+    Ok(call_pyobject_helper(builder, exc_star_enter, &[], ptr_ty, exception_exit))
+}
+
+pub(crate) fn lower_exc_star_match(
+    builder: &mut FunctionBuilder<'_>,
+    exc_star_match: ir::FuncRef,
+    state: &LowerState,
+    exc_types: ValueId,
+    ptr_ty: ir::Type,
+    exception_exit: ir::Block,
+) -> Result<ir::Value, CodegenError> {
+    let exc_types = state.value(exc_types)?;
+    Ok(call_pyobject_helper(builder, exc_star_match, &[exc_types], ptr_ty, exception_exit))
+}
+
+pub(crate) fn lower_exc_star_body_ok(
+    builder: &mut FunctionBuilder<'_>,
+    exc_star_body_ok: ir::FuncRef,
+    ptr_ty: ir::Type,
+    exception_exit: ir::Block,
+) -> Result<ir::Value, CodegenError> {
+    Ok(call_pyobject_helper(builder, exc_star_body_ok, &[], ptr_ty, exception_exit))
+}
+
+pub(crate) fn lower_exc_star_body_raised(
+    builder: &mut FunctionBuilder<'_>,
+    exc_star_body_raised: ir::FuncRef,
+    ptr_ty: ir::Type,
+    exception_exit: ir::Block,
+) -> Result<ir::Value, CodegenError> {
+    Ok(call_pyobject_helper(builder, exc_star_body_raised, &[], ptr_ty, exception_exit))
+}
+
+pub(crate) fn lower_exc_star_finish(
+    builder: &mut FunctionBuilder<'_>,
+    exc_star_finish: ir::FuncRef,
+    ptr_ty: ir::Type,
+    exception_exit: ir::Block,
+) -> Result<ir::Value, CodegenError> {
+    Ok(call_pyobject_helper(builder, exc_star_finish, &[], ptr_ty, exception_exit))
+}
+
 /// Lower active-exception object load.  The runtime returns `None` when there is
 /// no object-safe current exception.
 pub(crate) fn lower_get_current_exc(

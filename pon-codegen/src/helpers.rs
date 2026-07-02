@@ -52,6 +52,14 @@ pub struct HelperRefs {
     pub load_global: FuncId,
     /// `pon_load_name(name_id) -> *mut PyObject`.
     pub load_name: FuncId,
+    /// `pon_load_local(value) -> *mut PyObject`.
+    pub load_local: FuncId,
+    /// `pon_delete_local(value) -> *mut PyObject`.
+    pub delete_local: FuncId,
+    /// `pon_delete_global(name_id) -> *mut PyObject`.
+    pub delete_global: FuncId,
+    /// `pon_delete_name(name_id) -> *mut PyObject`.
+    pub delete_name: FuncId,
     /// `pon_load_builtin(name_id) -> *mut PyObject`.
     pub load_builtin: FuncId,
     /// `pon_store_name(name_id, value) -> *mut PyObject`.
@@ -118,6 +126,16 @@ pub struct HelperRefs {
     pub match_exc: FuncId,
     /// `pon_check_exc_star(exc_types) -> *mut PyObject`.
     pub check_exc_star: FuncId,
+    /// `pon_exc_star_enter() -> *mut PyObject`.
+    pub exc_star_enter: FuncId,
+    /// `pon_exc_star_match(exc_types) -> *mut PyObject`.
+    pub exc_star_match: FuncId,
+    /// `pon_exc_star_body_ok() -> *mut PyObject`.
+    pub exc_star_body_ok: FuncId,
+    /// `pon_exc_star_body_raised() -> *mut PyObject`.
+    pub exc_star_body_raised: FuncId,
+    /// `pon_exc_star_finish() -> *mut PyObject`.
+    pub exc_star_finish: FuncId,
     /// `pon_get_current_exc() -> *mut PyObject`.
     pub get_current_exc: FuncId,
     /// `pon_build_exc_group(argv, argc) -> *mut PyObject`.
@@ -182,7 +200,7 @@ pub struct HelperRefs {
     pub make_typevar: FuncId,
     /// `pon_setup_annotations() -> *mut PyObject`.
     pub setup_annotations: FuncId,
-    /// `pon_build_class(body, name_id, bases, base_count) -> *mut PyObject`.
+    /// `pon_build_class_ex(body, name_id, bases, base_count, kw_names, kw_values, kw_count) -> *mut PyObject`.
     pub build_class: FuncId,
     /// `pon_load_build_class() -> *mut PyObject`.
     pub load_build_class: FuncId,
@@ -192,6 +210,10 @@ pub struct HelperRefs {
     pub none: FuncId,
     /// `pon_runtime_init() -> i32`.
     pub runtime_init: FuncId,
+    /// `pon_osr_poll(loop_header) -> code pointer or NULL`.
+    pub osr_poll: FuncId,
+    /// `pon_deopt_note(function_or_null) -> i32`.
+    pub deopt_note: FuncId,
     /// `pon_safepoint_poll()`.
     #[cfg(feature = "free-threading")]
     pub safepoint_poll: FuncId,
@@ -322,6 +344,11 @@ pub enum HelperId {
     PopExcInfo,
     MatchExc,
     CheckExcStar,
+    ExcStarEnter,
+    ExcStarMatch,
+    ExcStarBodyOk,
+    ExcStarBodyRaised,
+    ExcStarFinish,
     GetCurrentExc,
     BuildExcGroup,
     GetIter,
@@ -423,7 +450,15 @@ const P_MAKE_FUNCTION_FULL: &[AbiShape] = &[
 const P_FUNCTION_SET_CLOSURE: &[AbiShape] = &[AbiShape::PyObjectPtr, AbiShape::PyObjectPtrPtr, AbiShape::Usize];
 const P_CELL_SET: &[AbiShape] = &[AbiShape::PyObjectPtr, AbiShape::PyObjectPtr];
 const P_INDEX: &[AbiShape] = &[AbiShape::Usize];
-const P_BUILD_CLASS: &[AbiShape] = &[AbiShape::PyObjectPtr, AbiShape::U32, AbiShape::PyObjectPtrPtr, AbiShape::Usize];
+const P_BUILD_CLASS: &[AbiShape] = &[
+    AbiShape::PyObjectPtr,
+    AbiShape::U32,
+    AbiShape::PyObjectPtrPtr,
+    AbiShape::Usize,
+    AbiShape::ConstNamePtr,
+    AbiShape::PyObjectPtrPtr,
+    AbiShape::Usize,
+];
 const P_RAISE: &[AbiShape] = &[AbiShape::PyObjectPtr, AbiShape::PyObjectPtr];
 const P_HANDLER: &[AbiShape] = &[AbiShape::U32, AbiShape::U32, AbiShape::U8];
 const P_IMPORT_NAME: &[AbiShape] = &[AbiShape::U32, AbiShape::ConstNamePtr, AbiShape::Usize, AbiShape::U32];
@@ -476,13 +511,18 @@ pub static PHASE_B_HELPERS: &[HelperSig] = &[
     HelperSig { id: HelperId::CallMethod, family: HelperFamily::Call, symbol: "pon_call_method", params: P_CALL_FEEDBACK, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
     HelperSig { id: HelperId::MakeFunction, family: HelperFamily::Call, symbol: "pon_make_function", params: P_MAKE_FUNCTION, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::MakeFunctionFull, family: HelperFamily::Call, symbol: "pon_make_function_full", params: P_MAKE_FUNCTION_FULL, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
-    HelperSig { id: HelperId::BuildClass, family: HelperFamily::Call, symbol: "pon_build_class", params: P_BUILD_CLASS, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
+    HelperSig { id: HelperId::BuildClass, family: HelperFamily::Call, symbol: "pon_build_class_ex", params: P_BUILD_CLASS, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::Raise, family: HelperFamily::Exc, symbol: "pon_raise", params: P_RAISE, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::Reraise, family: HelperFamily::Exc, symbol: "pon_reraise", params: P_NONE, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::PushExcInfo, family: HelperFamily::Exc, symbol: "pon_push_exc_info", params: P_HANDLER, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::PopExcInfo, family: HelperFamily::Exc, symbol: "pon_pop_exc_info", params: P_NONE, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::MatchExc, family: HelperFamily::Exc, symbol: "pon_match_exc", params: P_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::CheckExcStar, family: HelperFamily::Exc, symbol: "pon_check_exc_star", params: P_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
+    HelperSig { id: HelperId::ExcStarEnter, family: HelperFamily::Exc, symbol: "pon_exc_star_enter", params: P_NONE, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
+    HelperSig { id: HelperId::ExcStarMatch, family: HelperFamily::Exc, symbol: "pon_exc_star_match", params: P_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
+    HelperSig { id: HelperId::ExcStarBodyOk, family: HelperFamily::Exc, symbol: "pon_exc_star_body_ok", params: P_NONE, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
+    HelperSig { id: HelperId::ExcStarBodyRaised, family: HelperFamily::Exc, symbol: "pon_exc_star_body_raised", params: P_NONE, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
+    HelperSig { id: HelperId::ExcStarFinish, family: HelperFamily::Exc, symbol: "pon_exc_star_finish", params: P_NONE, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::GetCurrentExc, family: HelperFamily::Exc, symbol: "pon_get_current_exc", params: P_NONE, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::BuildExcGroup, family: HelperFamily::Exc, symbol: "pon_build_exc_group", params: P_OBJ_ARR, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::GetIter, family: HelperFamily::IterGen, symbol: "pon_get_iter", params: P_OBJ_FEEDBACK, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
@@ -542,6 +582,10 @@ pub fn declare_helpers<M: Module>(module: &mut M) -> ModuleResult<HelperRefs> {
         call_method: declare_one(module, "pon_call_method")?,
         load_global: declare_one(module, "pon_load_global")?,
         load_name: declare_one(module, "pon_load_name")?,
+        load_local: declare_one(module, "pon_load_local")?,
+        delete_local: declare_one(module, "pon_delete_local")?,
+        delete_global: declare_one(module, "pon_delete_global")?,
+        delete_name: declare_one(module, "pon_delete_name")?,
         load_builtin: declare_one(module, "pon_load_builtin")?,
         store_name: declare_one(module, "pon_store_name")?,
         get_attr: declare_one(module, "pon_get_attr")?,
@@ -575,6 +619,11 @@ pub fn declare_helpers<M: Module>(module: &mut M) -> ModuleResult<HelperRefs> {
         pop_exc_info: declare_one(module, "pon_pop_exc_info")?,
         match_exc: declare_one(module, "pon_match_exc")?,
         check_exc_star: declare_one(module, "pon_check_exc_star")?,
+        exc_star_enter: declare_one(module, "pon_exc_star_enter")?,
+        exc_star_match: declare_one(module, "pon_exc_star_match")?,
+        exc_star_body_ok: declare_one(module, "pon_exc_star_body_ok")?,
+        exc_star_body_raised: declare_one(module, "pon_exc_star_body_raised")?,
+        exc_star_finish: declare_one(module, "pon_exc_star_finish")?,
         get_current_exc: declare_one(module, "pon_get_current_exc")?,
         build_exc_group: declare_one(module, "pon_build_exc_group")?,
         get_iter: declare_one(module, "pon_get_iter")?,
@@ -607,11 +656,13 @@ pub fn declare_helpers<M: Module>(module: &mut M) -> ModuleResult<HelperRefs> {
         make_type_alias: declare_one(module, "pon_make_type_alias")?,
         make_typevar: declare_one(module, "pon_make_typevar")?,
         setup_annotations: declare_one(module, "pon_setup_annotations")?,
-        build_class: declare_one(module, "pon_build_class")?,
+        build_class: declare_one(module, "pon_build_class_ex")?,
         load_build_class: declare_one(module, "pon_load_build_class")?,
         store_global: declare_one(module, "pon_store_global")?,
         none: declare_one(module, "pon_none")?,
         runtime_init: declare_one(module, "pon_runtime_init")?,
+        osr_poll: declare_one(module, "pon_osr_poll")?,
+        deopt_note: declare_one(module, "pon_deopt_note")?,
         #[cfg(feature = "free-threading")]
         safepoint_poll: declare_free_threading_helper(module, crate::FT_SAFEPOINT_POLL, &[], None)?,
         #[cfg(feature = "free-threading")]

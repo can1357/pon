@@ -14,10 +14,14 @@ use super::{
 /// Lower a Phase-A local load.
 pub(crate) fn lower_load_local(
     builder: &mut FunctionBuilder<'_>,
-    state: &mut LowerState,
+    helpers: &HelperFuncRefs,
+    state: &LowerState,
     slot: u32,
+    ptr_ty: ir::Type,
+    exception_exit: ir::Block,
 ) -> Result<ir::Value, CodegenError> {
-    load_local(builder, state, slot)
+    let value = load_local(builder, state, slot)?;
+    Ok(call_pyobject_helper(builder, helpers.load_local, &[value], ptr_ty, exception_exit))
 }
 
 /// Lower a Phase-A local store and return the stored boxed value.
@@ -197,14 +201,33 @@ fn build_name_array(
     Ok(builder.ins().stack_addr(ptr_ty, slot, 0))
 }
 
-/// Reserve local delete lowering.
-pub(crate) fn lower_delete_local() -> Result<ir::Value, CodegenError> {
-    Err(CodegenError::Unsupported("DeleteLocal"))
+/// Lower local deletion to a checked unbind.
+pub(crate) fn lower_delete_local(
+    builder: &mut FunctionBuilder<'_>,
+    helpers: &HelperFuncRefs,
+    state: &mut LowerState,
+    slot: u32,
+    ptr_ty: ir::Type,
+    exception_exit: ir::Block,
+) -> Result<ir::Value, CodegenError> {
+    let value = load_local(builder, state, slot)?;
+    let result = call_pyobject_helper(builder, helpers.delete_local, &[value], ptr_ty, exception_exit);
+    let unbound = builder.ins().iconst(ptr_ty, 0);
+    store_local(builder, state, slot, unbound)?;
+    Ok(result)
 }
 
-/// Reserve global delete lowering.
-pub(crate) fn lower_delete_global() -> Result<ir::Value, CodegenError> {
-    Err(CodegenError::Unsupported("DeleteGlobal"))
+/// Lower global deletion through `pon_delete_global`.
+pub(crate) fn lower_delete_global(
+    builder: &mut FunctionBuilder<'_>,
+    helpers: &HelperFuncRefs,
+    names: &NameMap,
+    name: u32,
+    ptr_ty: ir::Type,
+    exception_exit: ir::Block,
+) -> Result<ir::Value, CodegenError> {
+    let runtime_name = builder.ins().iconst(ir::types::I32, i64::from(names.runtime_id(name)?));
+    Ok(call_pyobject_helper(builder, helpers.delete_global, &[runtime_name], ptr_ty, exception_exit))
 }
 
 /// Lower a class/module namespace store through `pon_store_name`.
@@ -230,9 +253,17 @@ pub(crate) fn lower_store_name(
     ))
 }
 
-/// Reserve namespace delete lowering.
-pub(crate) fn lower_delete_name() -> Result<ir::Value, CodegenError> {
-    Err(CodegenError::Unsupported("DeleteName"))
+/// Lower class/module namespace deletion through `pon_delete_name`.
+pub(crate) fn lower_delete_name(
+    builder: &mut FunctionBuilder<'_>,
+    helpers: &HelperFuncRefs,
+    names: &NameMap,
+    name: u32,
+    ptr_ty: ir::Type,
+    exception_exit: ir::Block,
+) -> Result<ir::Value, CodegenError> {
+    let runtime_name = builder.ins().iconst(ir::types::I32, i64::from(names.runtime_id(name)?));
+    Ok(call_pyobject_helper(builder, helpers.delete_name, &[runtime_name], ptr_ty, exception_exit))
 }
 
 pub(crate) fn cell_object(
