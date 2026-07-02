@@ -2,13 +2,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::str::FromStr;
 
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::names;
 use crate::resolve::source::PackageKind;
-use crate::resolve::versionset::Version;
+use pep440_rs::{Version, VersionSpecifiers};
 use crate::wheel::compat::{any_supported, default_supported_tags};
 use crate::wheel::filename::WheelFilename;
 
@@ -240,8 +241,8 @@ pub fn parse_project_json(body: &str) -> Result<Option<ProjectPage>> {
     let files = response
         .files
         .into_iter()
-        .map(project_file_from_response)
-        .collect::<Result<Vec<_>>>()?;
+        .filter_map(project_file_from_response)
+        .collect::<Vec<_>>();
     Ok(Some(ProjectPage {
         meta_api_version: response.meta.api_version,
         name,
@@ -249,16 +250,24 @@ pub fn parse_project_json(body: &str) -> Result<Option<ProjectPage>> {
     }))
 }
 
-fn project_file_from_response(file: SimpleFileResponse) -> Result<ProjectFile> {
+fn project_file_from_response(file: SimpleFileResponse) -> Option<ProjectFile> {
     let version = version_from_filename(&file.filename)?;
     let kind = classify_package_file(&file.filename);
-    Ok(ProjectFile {
+    let (requires_python, requires_python_invalid) = match file.requires_python {
+        Some(raw) => match VersionSpecifiers::from_str(raw.trim()) {
+            Ok(specifiers) => (Some(specifiers), false),
+            Err(_) => (None, true),
+        },
+        None => (None, false),
+    };
+    Some(ProjectFile {
         filename: file.filename,
         url: file.url,
         version,
         kind,
         hashes: file.hashes,
-        requires_python: file.requires_python,
+        requires_python,
+        requires_python_invalid,
         yanked: file.yanked.and_then(YankedValue::into_reason),
         dist_info_metadata: file
             .core_metadata
@@ -290,19 +299,16 @@ fn is_refcount_cpython_abi(tag: &str) -> bool {
     tag.starts_with("cp") && tag != "abi3" && tag != "none"
 }
 
-fn version_from_filename(filename: &str) -> Result<Version> {
+fn version_from_filename(filename: &str) -> Option<Version> {
     if let Ok(wheel) = WheelFilename::parse(filename) {
-        return Version::parse(&wheel.version).map_err(|_| Error::InvalidRequirement(filename.to_owned()));
+        return Version::from_str(&wheel.version).ok();
     }
 
     let stem = filename
         .strip_suffix(".tar.gz")
-        .or_else(|| filename.strip_suffix(".zip"))
-        .ok_or_else(|| Error::UnsupportedArtifact(format!("simple index file `{filename}` is not a wheel or sdist")))?;
-    let (_, version) = stem
-        .rsplit_once('-')
-        .ok_or_else(|| Error::InvalidRequirement(filename.to_owned()))?;
-    Version::parse(version).map_err(|_| Error::InvalidRequirement(filename.to_owned()))
+        .or_else(|| filename.strip_suffix(".zip"))?;
+    let (_, version) = stem.rsplit_once('-')?;
+    Version::from_str(version).ok()
 }
 
 fn validate_normalized_name(name: &str) -> Result<String> {
@@ -403,10 +409,14 @@ mod tests {
         assert_eq!(project.name, "demo-pkg");
         assert_eq!(project.files.len(), 4);
         assert_eq!(project.files[0].filename, "demo_pkg-1.0.0-py3-none-any.whl");
-        assert_eq!(project.files[0].version.raw(), "1.0.0");
+        assert_eq!(project.files[0].version.to_string(), "1.0.0");
         assert_eq!(project.files[0].kind, PackageKind::Pure);
         assert_eq!(project.files[0].hashes["sha256"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        assert_eq!(project.files[0].requires_python.as_deref(), Some(">=3.8"));
+        assert_eq!(
+            project.files[0].requires_python.as_ref().map(ToString::to_string),
+            Some(">=3.8".to_owned())
+        );
+        assert!(!project.files[0].requires_python_invalid);
         assert_eq!(project.files[1].yanked.as_deref(), Some("bad metadata"));
         assert_eq!(project.files[2].kind, PackageKind::CAbiRefused {
             reason: NO_OB_REFCNT_C_ABI_REFUSAL.to_owned(),
@@ -437,7 +447,10 @@ mod tests {
         let project = index.lookup("Demo_Pkg").expect("lookup").expect("project");
 
         assert_eq!(project.name, "demo-pkg");
-        assert_eq!(project.files[0].requires_python.as_deref(), Some(">=3.8"));
+        assert_eq!(
+            project.files[0].requires_python.as_ref().map(ToString::to_string),
+            Some(">=3.8".to_owned())
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::env::EnvLayout;
 use crate::error::{Error, Result};
 use crate::install::{InstallReport, InstalledPackageRecord, ResolvedRecord, upsert_installed_package};
+use crate::manifest::PyProject;
 use crate::names;
 
 struct LocalPythonManifest {
@@ -76,12 +77,19 @@ pub fn install_local_python_package(env: &EnvLayout, resolved_record: &ResolvedR
 }
 
 fn read_manifest(path: &Path) -> Result<LocalPythonManifest> {
-    let content = fs::read_to_string(path)?;
-    let package_name = toml_string(&content, "project", "name")
-        .ok_or_else(|| Error::UnsupportedArtifact(format!("{} is missing [project].name", path.display())))?;
-    let version = toml_string(&content, "project", "version")
-        .ok_or_else(|| Error::UnsupportedArtifact(format!("{} is missing [project].version", path.display())))?;
-    let import_name = toml_string(&content, "tool.pon", "import-name").unwrap_or_else(|| names::normalize(&package_name).replace('-', "_"));
+    let pyproject = PyProject::read(path)?;
+    let package_name = pyproject
+        .project_name()
+        .ok_or_else(|| Error::UnsupportedArtifact(format!("{} is missing [project].name", path.display())))?
+        .to_owned();
+    let version = pyproject
+        .project_version()
+        .ok_or_else(|| Error::UnsupportedArtifact(format!("{} is missing [project].version", path.display())))?
+        .to_owned();
+    let import_name = pyproject
+        .tool_pon_import_name()
+        .map(str::to_owned)
+        .unwrap_or_else(|| names::normalize(&package_name).replace('-', "_"));
     if !is_import_path(&import_name) {
         return Err(Error::UnsupportedArtifact(format!(
             "local import name `{import_name}` must be a dotted Python import path"
@@ -141,38 +149,6 @@ fn copy_file(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-fn toml_string(content: &str, section: &str, key: &str) -> Option<String> {
-    let mut active_section = "";
-    for raw_line in content.lines() {
-        let line = raw_line.split('#').next().unwrap_or_default().trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            active_section = line.trim_start_matches('[').trim_end_matches(']').trim();
-            continue;
-        }
-        if active_section != section {
-            continue;
-        }
-        let Some((candidate_key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if candidate_key.trim() == key {
-            return parse_quoted(value.trim()).map(str::to_owned);
-        }
-    }
-    None
-}
-
-fn parse_quoted(value: &str) -> Option<&str> {
-    let quote = value.as_bytes().first().copied()?;
-    if quote != b'\'' && quote != b'\"' {
-        return None;
-    }
-    let end = value[1..].find(char::from(quote))? + 1;
-    Some(&value[1..end])
-}
 
 fn is_import_path(value: &str) -> bool {
     !value.is_empty() && value.split('.').all(is_identifier)

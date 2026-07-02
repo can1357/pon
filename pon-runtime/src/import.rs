@@ -153,6 +153,7 @@ pub unsafe extern "C" fn pon_import_name(
 /// Loads one named attribute from an imported module.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_import_from(module: *mut PyObject, name_interned: u32) -> *mut PyObject {
+    crate::untag_prelude!(module);
     if module.is_null() {
         return return_null_with_error("cannot import from NULL module");
     }
@@ -179,6 +180,7 @@ pub unsafe extern "C" fn pon_import_from(module: *mut PyObject, name_interned: u
 /// Imports all public module attributes into the active globals dictionary.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_import_star(module: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(module);
     if module.is_null() {
         return return_null_with_error("cannot import * from NULL module");
     }
@@ -528,6 +530,25 @@ fn current_importer_package() -> Option<String> {
     unicode_text(package).map(str::to_owned)
 }
 
+pub fn active_module_name_id() -> Option<u32> {
+    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    state.current_modules.last().copied()
+}
+
+pub fn module_attrs_snapshot(module_name: u32) -> Option<Vec<(u32, *mut PyObject)>> {
+    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    let module = state.modules.get(&module_name).copied()?;
+    let module = module_from_object_locked(&state, module)?;
+    // SAFETY: The import state proved the object uses `PyModuleObject` layout.
+    let module = unsafe { &*module };
+    Some(module.attrs.iter().map(|(name, value)| (*name, *value)).collect())
+}
+
+pub fn active_module_attrs_snapshot() -> Option<Vec<(u32, *mut PyObject)>> {
+    let module_name = active_module_name_id()?;
+    module_attrs_snapshot(module_name)
+}
+
 pub fn active_module_attr(name: u32) -> Option<*mut PyObject> {
     let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
     let current = state.current_modules.last().copied()?;
@@ -555,6 +576,26 @@ pub fn store_active_module_attr(name: u32, value: *mut PyObject) -> bool {
     // J0.3 GlobalIC site: active-module attr overlay insert/replace.
     crate::abi::bump_namespace_version();
     true
+}
+
+pub fn delete_active_module_attr(name: u32) -> bool {
+    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    let Some(current) = state.current_modules.last().copied() else {
+        return false;
+    };
+    let Some(module) = state.modules.get(&current).copied() else {
+        return false;
+    };
+    let Some(module) = module_from_object_locked(&state, module) else {
+        return false;
+    };
+    // SAFETY: The import state proved the object uses `PyModuleObject` layout.
+    let removed = unsafe { (&mut *module).attrs.remove(&name).is_some() };
+    if removed {
+        // J0.3 GlobalIC site: active-module attr removal.
+        crate::abi::bump_namespace_version();
+    }
+    removed
 }
 
 fn unicode_text(object: *mut PyObject) -> Option<&'static str> {
@@ -874,6 +915,7 @@ unsafe extern "C" fn module_getattro(module: *mut PyObject, name: *mut PyObject)
 /// Status helper for hub integration that reports whether a module object owns an attribute.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_module_has_attr(module: *mut PyObject, name: u32) -> c_int {
+    crate::untag_prelude!(err = -1; module);
     if module.is_null() {
         return return_minus_one_with_error("cannot query NULL module");
     }

@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
 use crate::error::{Error, Result};
 use crate::names;
 use crate::resolve::source::PackageKind;
-use crate::resolve::versionset::{Version, VersionSet};
+use pep440_rs::{Version, VersionSpecifiers};
 
 mod simple_json;
 
@@ -30,10 +31,11 @@ impl ProjectPage {
     }
 
     #[must_use]
-    pub fn best_match(&self, version_set: &VersionSet) -> Option<ProjectFile> {
+    pub fn best_match(&self, specifiers: &VersionSpecifiers) -> Option<ProjectFile> {
         self.files
             .iter()
-            .filter(|file| version_set.contains(&file.version))
+            .filter(|file| !file.requires_python_invalid)
+            .filter(|file| specifiers.contains(&file.version))
             .max_by(|left, right| {
                 left.version
                     .cmp(&right.version)
@@ -64,7 +66,8 @@ pub struct ProjectFile {
     pub version: Version,
     pub kind: PackageKind,
     pub hashes: BTreeMap<String, String>,
-    pub requires_python: Option<String>,
+    pub requires_python: Option<VersionSpecifiers>,
+    pub requires_python_invalid: bool,
     pub yanked: Option<String>,
     pub dist_info_metadata: Option<DistInfoMetadata>,
 }
@@ -190,10 +193,11 @@ fn file(filename: &str, version: &str, kind: PackageKind) -> Result<ProjectFile>
     Ok(ProjectFile {
         filename: filename.to_owned(),
         url: format!("{DEFAULT_INDEX_URL}{filename}"),
-        version: Version::parse(version).map_err(|_| Error::InvalidRequirement(filename.to_owned()))?,
+        version: Version::from_str(version).map_err(|_| Error::InvalidRequirement(filename.to_owned()))?,
         kind,
         hashes: BTreeMap::new(),
         requires_python: None,
+        requires_python_invalid: false,
         yanked: None,
         dist_info_metadata: None,
     })
@@ -212,7 +216,8 @@ mod tests {
         assert_eq!(project.name, "flit-core");
         assert_eq!(project.files[0].filename, "flit_core-3.12.0-py3-none-any.whl");
         assert!(project.files[0].hashes.is_empty());
-        assert_eq!(project.files[0].requires_python, None);
+        assert!(project.files[0].requires_python.is_none());
+        assert!(!project.files[0].requires_python_invalid);
         assert_eq!(project.files[0].yanked, None);
     }
 
@@ -220,11 +225,11 @@ mod tests {
     fn version_set_selects_highest_matching_catalog_file() {
         let index = CatalogIndex::new();
         let project = index.lookup("idna").expect("lookup").expect("project");
-        let version_set = VersionSet::parse("<3.10").expect("version set");
+        let version_set = VersionSpecifiers::from_str("<3.10").expect("version set");
         let best = project.best_match(&version_set).expect("best match");
 
-        assert_eq!(project.versions().iter().map(Version::raw).collect::<Vec<_>>(), ["3.9", "3.10"]);
-        assert_eq!(best.version.raw(), "3.9");
+        assert_eq!(project.versions().iter().map(ToString::to_string).collect::<Vec<_>>(), ["3.9", "3.10"]);
+        assert_eq!(best.version.to_string(), "3.9");
     }
 
     #[test]
@@ -240,7 +245,7 @@ mod tests {
             files: vec![native, yanked, pure.clone()],
         };
 
-        let best = project.best_match(&VersionSet::default()).expect("best");
+        let best = project.best_match(&VersionSpecifiers::default()).expect("best");
 
         assert_eq!(best, pure);
     }

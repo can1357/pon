@@ -14,6 +14,7 @@ use zip::write::SimpleFileOptions;
 use crate::env::EnvLayout;
 use crate::error::{Error, Result};
 use crate::index::{CatalogIndex, PackageIndex};
+use crate::manifest::PyProject;
 use crate::install::{ResolvedRecord, install_package};
 use crate::resolve::provider::ResolveProvider;
 use crate::resolve::source::PackageKind;
@@ -48,23 +49,31 @@ impl SdistBuilder for CatalogSdistBuilder {
         unpack_tar_gz(&archive_path, &unpack_root)?;
         let source_root = locate_project_root(&unpack_root)?;
         let pyproject_path = source_root.join("pyproject.toml");
-        let pyproject = fs::read_to_string(&pyproject_path).map_err(|error| {
+        let pyproject = PyProject::read(&pyproject_path)?;
+        let build_system = pyproject.build_system().ok_or_else(|| {
+            Error::UnsupportedArtifact(format!("{} is missing [build-system].requires", pyproject_path.display()))
+        })?;
+        if !pyproject.build_system_has_key("requires") {
+            return Err(Error::UnsupportedArtifact(format!(
+                "{} is missing [build-system].requires",
+                pyproject_path.display()
+            )));
+        }
+        let build_backend = build_system.build_backend.as_deref().ok_or_else(|| {
             Error::UnsupportedArtifact(format!(
-                "sdist `{}` is missing readable pyproject.toml at {}: {error}",
-                request.filename,
+                "{} is missing [build-system].build-backend",
                 pyproject_path.display()
             ))
         })?;
-        let build_system = BuildSystem::parse(&pyproject, &pyproject_path)?;
-        if build_system.build_backend != "flit_core.buildapi" {
+        if build_backend != "flit_core.buildapi" {
             return Err(Error::UnsupportedArtifact(format!(
                 "unsupported PEP 517 build backend `{}`: backend `{}` is not available in the isolated Pon build environment",
-                build_system.build_backend, build_system.build_backend
+                build_backend, build_backend
             )));
         }
         let build_env = EnvLayout::new(temp_root.join("build-env"));
         install_build_requirements(&build_env, &build_system.requires)?;
-        run_build_wheel_hook(&build_env, &source_root, &wheel_dir, &build_system.build_backend)?;
+        run_build_wheel_hook(&build_env, &source_root, &wheel_dir, build_backend)?;
 
         let wheel_path = match find_single_wheel(&wheel_dir)? {
             Some(wheel) => wheel,
@@ -76,29 +85,6 @@ impl SdistBuilder for CatalogSdistBuilder {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct BuildSystem {
-    requires: Vec<String>,
-    build_backend: String,
-}
-
-impl BuildSystem {
-    fn parse(content: &str, path: &Path) -> Result<Self> {
-        let requires = toml_string_array(content, "build-system", "requires").ok_or_else(|| {
-            Error::UnsupportedArtifact(format!("{} is missing [build-system].requires", path.display()))
-        })?;
-        let build_backend = toml_string(content, "build-system", "build-backend").ok_or_else(|| {
-            Error::UnsupportedArtifact(format!(
-                "{} is missing [build-system].build-backend",
-                path.display()
-            ))
-        })?;
-        Ok(Self {
-            requires,
-            build_backend,
-        })
-    }
-}
 
 fn sdist_source_path(filename: &str) -> Result<PathBuf> {
     let path = Path::new(filename);
@@ -363,107 +349,6 @@ fn write_wheel_archive(wheel_path: &Path, dist_info: &str, members: Vec<(String,
     Ok(())
 }
 
-fn toml_string(content: &str, section: &str, key: &str) -> Option<String> {
-    section_body(content, section).and_then(|body| {
-        body.lines().find_map(|raw_line| {
-            let line = raw_line.split('#').next().unwrap_or_default().trim();
-            let (candidate, value) = line.split_once('=')?;
-            (candidate.trim() == key).then(|| parse_quoted(value.trim())).flatten()
-        })
-    })
-}
-
-fn toml_string_array(content: &str, section: &str, key: &str) -> Option<Vec<String>> {
-    let body = section_body(content, section)?;
-    let lines = body.lines().collect::<Vec<_>>();
-    let start = lines.iter().position(|line| {
-        let line = line.split('#').next().unwrap_or_default().trim();
-        line.split_once('=').is_some_and(|(candidate, _)| candidate.trim() == key)
-    })?;
-    let mut array = String::new();
-    for line in &lines[start..] {
-        array.push_str(line);
-        array.push('\n');
-        if line.contains(']') {
-            break;
-        }
-    }
-    extract_string_literals(&array).ok()
-}
-
-fn section_body<'a>(content: &'a str, section: &str) -> Option<String> {
-    let header = format!("[{section}]");
-    let mut active = false;
-    let mut body = String::new();
-    for raw_line in content.lines() {
-        let trimmed = raw_line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if active {
-                break;
-            }
-            active = trimmed == header;
-            continue;
-        }
-        if active {
-            body.push_str(raw_line);
-            body.push('\n');
-        }
-    }
-    active.then_some(body)
-}
-
-fn parse_quoted(value: &str) -> Option<String> {
-    let quote = value.chars().next()?;
-    if quote != '\'' && quote != '"' {
-        return None;
-    }
-    let mut escaped = false;
-    let mut output = String::new();
-    for ch in value[quote.len_utf8()..].chars() {
-        if escaped {
-            output.push(ch);
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == quote {
-            return Some(output);
-        } else {
-            output.push(ch);
-        }
-    }
-    None
-}
-
-fn extract_string_literals(input: &str) -> std::result::Result<Vec<String>, String> {
-    let mut values = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    let mut escaped = false;
-
-    for ch in input.chars() {
-        match quote {
-            Some(_) if escaped => {
-                current.push(ch);
-                escaped = false;
-            }
-            Some(_) if ch == '\\' => escaped = true,
-            Some(active) if ch == active => {
-                values.push(current.clone());
-                current.clear();
-                quote = None;
-            }
-            Some(_) => current.push(ch),
-            None if ch == '\'' || ch == '"' => quote = Some(ch),
-            None => {}
-        }
-    }
-
-    if quote.is_some() {
-        Err("unterminated string array".to_owned())
-    } else {
-        Ok(values)
-    }
-}
 
 fn unique_temp_dir(prefix: &str, label: &str) -> Result<PathBuf> {
     let unique = SystemTime::now()

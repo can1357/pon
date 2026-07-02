@@ -7,6 +7,7 @@ pub mod abstract_op;
 pub mod abi;
 pub mod builtins;
 pub mod descr;
+pub mod dynexec;
 pub mod feedback;
 pub mod import;
 pub mod intern;

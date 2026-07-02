@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use flate2::read::GzDecoder;
 use zip::ZipArchive;
@@ -9,9 +10,10 @@ use zip::result::ZipError;
 
 use crate::error::{Error, Result};
 use crate::index::{CatalogIndex, PackageIndex, ProjectFile, ProjectPage};
-use crate::marker::{MarkerEnvironment, MarkerExpression};
+use crate::marker::pon_marker_env;
 use crate::resolve::source::{PackageKind, PackageRecord, PackageSource};
-use crate::resolve::versionset::{Version, VersionSet};
+use pep440_rs::{Version, VersionSpecifiers};
+use pep508_rs::{MarkerEnvironment, Requirement, VerbatimUrl, VersionOrUrl};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolveProvider<I = CatalogIndex> {
@@ -36,7 +38,7 @@ struct ResolvedNode {
 struct RequirementSpec {
     raw: String,
     source: PackageSource,
-    version_set: VersionSet,
+    version_set: VersionSpecifiers,
 }
 
 impl Default for ResolveProvider<CatalogIndex> {
@@ -50,7 +52,7 @@ impl<I> ResolveProvider<I> {
     pub fn new(index: I) -> Self {
         Self {
             index,
-            marker_env: MarkerEnvironment::current(),
+            marker_env: pon_marker_env(),
         }
     }
 
@@ -61,7 +63,7 @@ impl<I> ResolveProvider<I> {
 }
 
 impl<I: PackageIndex> ResolveProvider<I> {
-    pub fn resolve(&self, source: &PackageSource, version_set: &VersionSet) -> Result<PackageRecord> {
+    pub fn resolve(&self, source: &PackageSource, version_set: &VersionSpecifiers) -> Result<PackageRecord> {
         match source {
             PackageSource::Registry { name, index_url } => {
                 let (record, _) = self.resolve_registry(name, index_url.as_deref(), version_set)?;
@@ -76,7 +78,7 @@ impl<I: PackageIndex> ResolveProvider<I> {
 
     pub fn resolve_input(&self, input: impl AsRef<str>, version_specifier: impl AsRef<str>) -> Result<PackageRecord> {
         let source = PackageSource::parse(input)?;
-        let version_set = VersionSet::parse(version_specifier)?;
+        let version_set = parse_version_specifiers(version_specifier.as_ref())?;
         self.resolve(&source, &version_set)
     }
 
@@ -144,7 +146,7 @@ impl<I: PackageIndex> ResolveProvider<I> {
         &self,
         name: &str,
         _index_url: Option<&str>,
-        version_set: &VersionSet,
+        version_set: &VersionSpecifiers,
     ) -> Result<(PackageRecord, ProjectFile)> {
         let project = self
             .index
@@ -155,7 +157,7 @@ impl<I: PackageIndex> ResolveProvider<I> {
         })?;
         let record = PackageRecord {
             name: project.name,
-            version: file.version.raw().to_owned(),
+            version: file.version.to_string(),
             kind: file.kind.clone(),
         };
         Ok((record, file))
@@ -190,46 +192,44 @@ impl RequirementSpec {
         if raw.is_empty() {
             return Err(Error::InvalidRequirement(raw.to_owned()));
         }
-        if PackageSource::parse(raw).is_ok_and(|source| matches!(source, PackageSource::Path(_))) {
-            return Ok(Some(Self {
-                raw: raw.to_owned(),
-                source: PackageSource::parse(raw)?,
-                version_set: VersionSet::default(),
-            }));
+        let bare_source = raw.starts_with("http://")
+            || raw.starts_with("https://")
+            || raw.starts_with("file://")
+            || raw.starts_with('.')
+            || raw.starts_with('/')
+            || (raw.contains(std::path::MAIN_SEPARATOR) && !raw.chars().any(char::is_whitespace));
+        if bare_source {
+            let source = PackageSource::parse(raw)?;
+            if matches!(source, PackageSource::Path(_) | PackageSource::Url(_)) {
+                return Ok(Some(Self {
+                    raw: raw.to_owned(),
+                    source,
+                    version_set: VersionSpecifiers::default(),
+                }));
+            }
         }
 
-        let (requirement, marker) = raw.split_once(';').map_or((raw, ""), |(requirement, marker)| {
-            (requirement.trim(), marker.trim())
-        });
-        if !MarkerExpression::parse(marker)?.evaluate(marker_env)? {
+        let requirement = Requirement::<VerbatimUrl>::from_str(raw).map_err(|_| Error::InvalidRequirement(raw.to_owned()))?;
+        if !requirement.evaluate_markers(marker_env, &[]) {
             return Ok(None);
         }
 
-        let name_end = requirement
-            .char_indices()
-            .find_map(|(index, ch)| {
-                if matches!(ch, '[' | '(' | '<' | '>' | '=' | '!' | '~') || ch.is_whitespace() {
-                    Some(index)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(requirement.len());
-        let name = requirement[..name_end].trim();
-        let source = PackageSource::parse(name)?;
-        let mut rest = requirement[name_end..].trim();
-        if let Some(after_extra) = rest.strip_prefix('[').and_then(|value| value.split_once(']').map(|(_, tail)| tail)) {
-            rest = after_extra.trim();
-        }
-        let specifier = if let Some(inner) = rest.strip_prefix('(').and_then(|value| value.split_once(')').map(|(inner, _)| inner)) {
-            inner.trim()
-        } else {
-            rest
+        let source = match &requirement.version_or_url {
+            Some(VersionOrUrl::Url(url)) => PackageSource::Url(url.to_string()),
+            Some(VersionOrUrl::VersionSpecifier(_)) | None => PackageSource::Registry {
+                name: requirement.name.to_string(),
+                index_url: None,
+            },
         };
+        let version_set = match requirement.version_or_url {
+            Some(VersionOrUrl::VersionSpecifier(specifiers)) => specifiers,
+            Some(VersionOrUrl::Url(_)) | None => VersionSpecifiers::default(),
+        };
+
         Ok(Some(Self {
             raw: raw.to_owned(),
             source,
-            version_set: VersionSet::parse(specifier)?,
+            version_set,
         }))
     }
 
@@ -241,12 +241,17 @@ impl RequirementSpec {
     }
 }
 
-fn best_compatible_file(project: &ProjectPage, version_set: &VersionSet, marker_env: &MarkerEnvironment) -> Option<ProjectFile> {
+fn best_compatible_file(
+    project: &ProjectPage,
+    version_set: &VersionSpecifiers,
+    marker_env: &MarkerEnvironment,
+) -> Option<ProjectFile> {
     project
         .files
         .iter()
+        .filter(|file| !file.requires_python_invalid)
         .filter(|file| version_set.contains(&file.version))
-        .filter(|file| requires_python_matches(file.requires_python.as_deref(), marker_env))
+        .filter(|file| requires_python_matches(file.requires_python.as_ref(), marker_env))
         .max_by(|left, right| {
             left.version
                 .cmp(&right.version)
@@ -257,14 +262,19 @@ fn best_compatible_file(project: &ProjectPage, version_set: &VersionSet, marker_
         .cloned()
 }
 
-fn requires_python_matches(requires_python: Option<&str>, marker_env: &MarkerEnvironment) -> bool {
-    let Some(requires_python) = requires_python else {
-        return true;
-    };
-    let Ok(specifier) = VersionSet::parse(requires_python) else {
-        return false;
-    };
-    Version::parse(&marker_env.python_version).is_ok_and(|version| specifier.contains(&version))
+fn requires_python_matches(requires_python: Option<&VersionSpecifiers>, marker_env: &MarkerEnvironment) -> bool {
+    match requires_python {
+        Some(specifier) => specifier.contains(&marker_env.python_version().version),
+        None => true,
+    }
+}
+
+fn parse_version_specifiers(raw: &str) -> Result<VersionSpecifiers> {
+    let trimmed = raw.trim();
+    if trimmed == "*" {
+        return Ok(VersionSpecifiers::default());
+    }
+    VersionSpecifiers::from_str(trimmed).map_err(|_| Error::InvalidSpecifier(raw.to_owned()))
 }
 
 fn yanked_rank(file: &ProjectFile) -> u8 {
@@ -280,7 +290,8 @@ fn package_kind_rank(file: &ProjectFile) -> u8 {
 }
 
 fn ensure_existing_satisfies(existing: &ResolvedNode, spec: &RequirementSpec) -> Result<()> {
-    let version = Version::parse(&existing.record.version)?;
+    let version = Version::from_str(&existing.record.version)
+        .map_err(|_| Error::InvalidRequirement(existing.record.version.clone()))?;
     if spec.version_set.contains(&version) {
         Ok(())
     } else {
@@ -537,7 +548,7 @@ mod tests {
     fn resolves_fastjson_pon_local_path_as_native() {
         let provider = ResolveProvider::default();
         let source = PackageSource::parse("fixtures/fastjson-pon").expect("source");
-        let record = provider.resolve(&source, &VersionSet::default()).expect("record");
+        let record = provider.resolve(&source, &VersionSpecifiers::default()).expect("record");
 
         assert_eq!(record, PackageRecord {
             name: "fastjson-pon".to_owned(),
@@ -588,9 +599,9 @@ mod tests {
             ],
         };
 
-        let file = best_compatible_file(&project, &VersionSet::default(), &marker_env()).expect("file");
+        let file = best_compatible_file(&project, &VersionSpecifiers::default(), &marker_env()).expect("file");
 
-        assert_eq!(file.version.raw(), "1.0.0");
+        assert_eq!(file.version.to_string(), "1.0.0");
     }
 
     fn cached_chain_index() -> SimpleJsonIndex {
@@ -628,10 +639,11 @@ mod tests {
         ProjectFile {
             filename: filename.to_owned(),
             url: format!("https://files.example/{filename}"),
-            version: Version::parse(version).expect("version"),
+            version: Version::from_str(version).expect("version"),
             kind: PackageKind::Pure,
             hashes: BTreeMap::new(),
-            requires_python: requires_python.map(str::to_owned),
+            requires_python: requires_python.map(|specifier| VersionSpecifiers::from_str(specifier).expect("requires-python")),
+            requires_python_invalid: false,
             yanked: None,
             dist_info_metadata: sidecar.then(|| crate::index::DistInfoMetadata {
                 hashes: BTreeMap::new(),
@@ -640,18 +652,20 @@ mod tests {
     }
 
     fn marker_env() -> MarkerEnvironment {
-        MarkerEnvironment {
-            python_version: "3.13".to_owned(),
-            python_full_version: "3.13.0".to_owned(),
-            os_name: "posix".to_owned(),
-            sys_platform: "darwin".to_owned(),
-            platform_machine: "arm64".to_owned(),
-            platform_system: "Darwin".to_owned(),
-            implementation_name: "pon".to_owned(),
-            implementation_version: "0.1.0".to_owned(),
-            python_implementation: "Pon".to_owned(),
-            extra: None,
-        }
+        MarkerEnvironment::try_from(pep508_rs::MarkerEnvironmentBuilder {
+            implementation_name: "pon",
+            implementation_version: "3.13.0",
+            os_name: "posix",
+            platform_machine: "arm64",
+            platform_python_implementation: "Pon",
+            platform_release: "",
+            platform_system: "Darwin",
+            platform_version: "",
+            python_full_version: "3.13.0",
+            python_version: "3.13",
+            sys_platform: "darwin",
+        })
+        .expect("marker env")
     }
 
     fn temp_project(label: &str) -> PathBuf {

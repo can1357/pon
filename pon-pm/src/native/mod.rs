@@ -6,6 +6,7 @@ use crate::error::{Error, Result};
 use crate::install::{
     InstallReport, InstalledPackageRecord, ResolvedRecord, upsert_installed_package, validate_registry_field,
 };
+use crate::manifest::PyProject;
 use crate::names;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -142,17 +143,22 @@ impl NativeRegistry {
 }
 
 fn read_native_manifest(path: &Path) -> Result<NativeManifest> {
-    let content = fs::read_to_string(path)?;
-    let package_name = toml_string(&content, "project", "name")
-        .ok_or_else(|| Error::UnsupportedArtifact(format!("{} is missing [project].name", path.display())))?;
-    let version = toml_string(&content, "project", "version")
-        .ok_or_else(|| Error::UnsupportedArtifact(format!("{} is missing [project].version", path.display())))?;
-    let import_name = toml_string(&content, "tool.pon.native", "import-name").ok_or_else(|| {
+    let pyproject = PyProject::read(path)?;
+    let package_name = pyproject
+        .project_name()
+        .ok_or_else(|| Error::UnsupportedArtifact(format!("{} is missing [project].name", path.display())))?
+        .to_owned();
+    let version = pyproject
+        .project_version()
+        .ok_or_else(|| Error::UnsupportedArtifact(format!("{} is missing [project].version", path.display())))?
+        .to_owned();
+    let import_name = pyproject.tool_pon_native_import_name().ok_or_else(|| {
         Error::UnsupportedArtifact(format!(
             "{} is missing [tool.pon.native].import-name",
             path.display()
         ))
     })?;
+    let import_name = import_name.to_owned();
     if !is_import_name(&import_name) {
         return Err(Error::UnsupportedArtifact(format!(
             "native import name `{import_name}` must be a Python identifier"
@@ -174,38 +180,6 @@ fn materialize_native_marker(env: &EnvLayout, manifest: &NativeManifest) -> Resu
     Ok(())
 }
 
-fn toml_string(content: &str, section: &str, key: &str) -> Option<String> {
-    let mut active_section = "";
-    for raw_line in content.lines() {
-        let line = raw_line.split('#').next().unwrap_or_default().trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            active_section = line.trim_start_matches('[').trim_end_matches(']').trim();
-            continue;
-        }
-        if active_section != section {
-            continue;
-        }
-        let Some((candidate_key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if candidate_key.trim() != key {
-            continue;
-        }
-        return parse_basic_toml_string(value.trim());
-    }
-    None
-}
-
-fn parse_basic_toml_string(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    if bytes.len() < 2 || bytes.first().copied() != Some(b'"') || bytes.last().copied() != Some(b'"') {
-        return None;
-    }
-    Some(value[1..value.len() - 1].to_owned())
-}
 
 fn is_import_name(value: &str) -> bool {
     let mut chars = value.chars();

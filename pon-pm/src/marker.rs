@@ -1,169 +1,72 @@
-use crate::error::{Error, Result};
+use pep508_rs::{MarkerEnvironment, MarkerEnvironmentBuilder};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MarkerEnvironment {
-    pub python_version: String,
-    pub python_full_version: String,
-    pub os_name: String,
-    pub sys_platform: String,
-    pub platform_machine: String,
-    pub platform_system: String,
-    pub implementation_name: String,
-    pub implementation_version: String,
-    pub python_implementation: String,
-    pub extra: Option<String>,
+/// pon's PEP 508 marker environment (F-U9): implementation_name="pon",
+/// platform_python_implementation="Pon", Python 3.14, and host platform fields.
+#[must_use]
+pub fn pon_marker_env() -> MarkerEnvironment {
+    MarkerEnvironment::try_from(MarkerEnvironmentBuilder {
+        implementation_name: "pon",
+        implementation_version: "3.14.0",
+        os_name: os_name(),
+        platform_machine: platform_machine(),
+        platform_python_implementation: "Pon",
+        platform_release: "",
+        platform_system: platform_system(),
+        platform_version: "",
+        python_full_version: "3.14.0",
+        python_version: "3.14",
+        sys_platform: sys_platform(),
+    })
+    .expect("pon marker environment literals are valid PEP 440 versions")
 }
 
-impl MarkerEnvironment {
-    #[must_use]
-    pub fn current() -> Self {
-        Self {
-            python_version: "3.13".to_owned(),
-            python_full_version: "3.13.0".to_owned(),
-            os_name: std::env::consts::OS.to_owned(),
-            sys_platform: std::env::consts::OS.to_owned(),
-            platform_machine: std::env::consts::ARCH.to_owned(),
-            platform_system: std::env::consts::OS.to_owned(),
-            implementation_name: "pon".to_owned(),
-            implementation_version: env!("CARGO_PKG_VERSION").to_owned(),
-            python_implementation: "Pon".to_owned(),
-            extra: None,
-        }
-    }
-
-    fn value(&self, key: &str) -> Option<&str> {
-        match key {
-            "python_version" => Some(&self.python_version),
-            "python_full_version" => Some(&self.python_full_version),
-            "os_name" => Some(&self.os_name),
-            "sys_platform" => Some(&self.sys_platform),
-            "platform_machine" => Some(&self.platform_machine),
-            "platform_system" => Some(&self.platform_system),
-            "implementation_name" => Some(&self.implementation_name),
-            "implementation_version" => Some(&self.implementation_version),
-            "python_implementation" | "platform_python_implementation" => Some(&self.python_implementation),
-            "extra" => self.extra.as_deref(),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MarkerExpression {
-    raw: String,
-}
-
-impl MarkerExpression {
-    pub fn parse(raw: impl AsRef<str>) -> Result<Self> {
-        let raw = raw.as_ref().trim();
-        if raw.is_empty() {
-            return Ok(Self { raw: String::new() });
-        }
-        if !raw.contains('"') && !raw.contains('\'') {
-            return Err(Error::InvalidMarker(raw.to_owned()));
-        }
-        Ok(Self { raw: raw.to_owned() })
-    }
-
-    #[must_use]
-    pub fn raw(&self) -> &str {
-        &self.raw
-    }
-
-    pub fn evaluate(&self, env: &MarkerEnvironment) -> Result<bool> {
-        if self.raw.is_empty() {
-            return Ok(true);
-        }
-
-        self.raw
-            .split(" or ")
-            .map(|term| {
-                term.split(" and ")
-                    .map(|factor| evaluate_factor(factor.trim(), env))
-                    .try_fold(true, |acc, value| value.map(|value| acc && value))
-            })
-            .try_fold(false, |acc, value| value.map(|value| acc || value))
-    }
-}
-
-fn evaluate_factor(factor: &str, env: &MarkerEnvironment) -> Result<bool> {
-    for op in ["==", "!=", ">=", "<=", ">", "<"] {
-        if let Some((left, right)) = factor.split_once(op) {
-            let left = left.trim();
-            let right = unquote(right.trim()).ok_or_else(|| Error::InvalidMarker(factor.to_owned()))?;
-            let value = env.value(left).ok_or_else(|| Error::InvalidMarker(factor.to_owned()))?;
-            return Ok(compare_values(value, op, &right));
-        }
-    }
-    Err(Error::InvalidMarker(factor.to_owned()))
-}
-
-fn unquote(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    if bytes.len() >= 2
-        && ((bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
-            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\''))
-    {
-        Some(value[1..value.len() - 1].to_owned())
+fn os_name() -> &'static str {
+    if cfg!(windows) {
+        "nt"
     } else {
-        None
+        "posix"
     }
 }
 
-fn compare_values(left: &str, op: &str, right: &str) -> bool {
-    let ordering = version_key(left).cmp(&version_key(right));
-    match op {
-        "==" => left == right,
-        "!=" => left != right,
-        ">=" => ordering.is_ge(),
-        "<=" => ordering.is_le(),
-        ">" => ordering.is_gt(),
-        "<" => ordering.is_lt(),
-        _ => false,
+fn sys_platform() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        "linux" => "linux",
+        "windows" => "win32",
+        other => other,
     }
 }
 
-fn version_key(value: &str) -> Vec<u32> {
-    value
-        .split('.')
-        .map(|part| part.parse::<u32>().unwrap_or(0))
-        .collect()
+fn platform_machine() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "arm64",
+        (_, arch) => arch,
+    }
+}
+
+fn platform_system() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "Darwin",
+        "linux" => "Linux",
+        "windows" => "Windows",
+        other => other,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn env() -> MarkerEnvironment {
-        MarkerEnvironment {
-            python_version: "3.13".to_owned(),
-            python_full_version: "3.13.1".to_owned(),
-            os_name: "posix".to_owned(),
-            sys_platform: "darwin".to_owned(),
-            platform_machine: "arm64".to_owned(),
-            platform_system: "Darwin".to_owned(),
-            implementation_name: "pon".to_owned(),
-            implementation_version: "0.1.0".to_owned(),
-            python_implementation: "Pon".to_owned(),
-            extra: Some("test".to_owned()),
-        }
-    }
-
     #[test]
-    fn evaluates_supported_marker_boolean_forms() {
-        let marker = MarkerExpression::parse(
-            "python_version >= '3.12' and sys_platform == 'darwin' or extra == 'docs'",
-        )
-        .expect("marker");
-        assert!(marker.evaluate(&env()).expect("eval"));
-    }
+    fn marker_environment_reports_pon_python_314() {
+        let env = pon_marker_env();
 
-    #[test]
-    fn evaluates_implementation_markers() {
-        let positive = MarkerExpression::parse("implementation_name == 'pon'").expect("parse");
-        let negative = MarkerExpression::parse("implementation_name == 'cpython'").expect("parse");
-
-        assert!(positive.evaluate(&env()).expect("positive"));
-        assert!(!negative.evaluate(&env()).expect("negative"));
+        assert_eq!(env.implementation_name(), "pon");
+        assert_eq!(env.implementation_version().to_string(), "3.14.0");
+        assert_eq!(env.python_full_version().to_string(), "3.14.0");
+        assert_eq!(env.python_version().to_string(), "3.14");
+        assert_eq!(env.platform_python_implementation(), "Pon");
+        assert_eq!(env.platform_release(), "");
+        assert_eq!(env.platform_version(), "");
     }
 }

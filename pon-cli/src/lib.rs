@@ -9,8 +9,9 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use pon_ir::lower_source;
 use pon_jit::JitEngine;
-use pon_runtime::import::{SourceModuleRequest, begin_module_execution, cached_module, end_module_execution, install_module, set_source_module_loader};
-use pon_runtime::{intern, pon_runtime_init};
+use pon_runtime::dynexec::{DynCodeMode, DynCompileRequest, DynExecuteRequest, set_dynamic_code_hooks};
+use pon_runtime::import::{SourceModuleRequest, active_module_attr, begin_module_execution, cached_module, end_module_execution, install_module, set_source_module_loader};
+use pon_runtime::{PyObject, intern, pon_none, pon_runtime_init};
 
 pub mod build;
 
@@ -57,6 +58,7 @@ pub fn run_file(path: impl AsRef<Path>) -> Result<()> {
     }
     let module = lower_source(&source).context("failed to parse/lower source")?;
     set_source_module_loader(load_source_module);
+    set_dynamic_code_hooks(validate_dynamic_source, execute_dynamic_source);
     let init_status = unsafe { pon_runtime_init() };
     if init_status != 0 {
         bail!("runtime initialization failed");
@@ -78,6 +80,45 @@ fn load_source_module(request: SourceModuleRequest<'_>) -> std::result::Result<*
         .map_err(|error| format!("failed to execute source module '{}': {error}", request.name))?;
     std::mem::forget(engine);
     cached_module(intern(request.name)).ok_or_else(|| format!("source module '{}' was not cached", request.name))
+}
+
+fn dynexec_source(source: &str, mode: DynCodeMode) -> String {
+    match mode {
+        DynCodeMode::Eval => format!("__pon_dyn_eval_result = ({source})\n"),
+        DynCodeMode::Exec | DynCodeMode::Single => source.to_owned(),
+    }
+}
+
+fn validate_dynamic_source(request: DynCompileRequest<'_>) -> std::result::Result<(), String> {
+    let source = dynexec_source(request.source, request.mode);
+    lower_source(&source)
+        .map(|_| ())
+        .map_err(|error| format!("failed to parse/lower dynamic source '{}': {error}", request.filename))
+}
+
+fn execute_dynamic_source(request: DynExecuteRequest<'_>) -> std::result::Result<*mut PyObject, String> {
+    let source = dynexec_source(request.source, request.mode);
+    let module = lower_source(&source)
+        .map_err(|error| format!("failed to parse/lower dynamic source '{}': {error}", request.filename))?;
+    let mut engine = JitEngine::new();
+    engine
+        .run(&module)
+        .map_err(|error| format!("failed to execute dynamic source '{}': {error}", request.filename))?;
+    std::mem::forget(engine);
+    match request.mode {
+        DynCodeMode::Eval => {
+            let name = intern("__pon_dyn_eval_result");
+            active_module_attr(name).ok_or_else(|| "dynamic eval did not produce a result".to_owned())
+        }
+        DynCodeMode::Exec | DynCodeMode::Single => {
+            let none = unsafe { pon_none() };
+            if none.is_null() {
+                Err("failed to allocate None for dynamic exec result".to_owned())
+            } else {
+                Ok(none)
+            }
+        }
+    }
 }
 
 /// Runs one Pon/Python source file with additional environment visible to the runtime.
