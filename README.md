@@ -122,7 +122,7 @@ These pins are settled workspace-wide and enforced by `Cargo.lock` / `rust-toolc
 | Backend | all `cranelift-*` crates `=0.133.1`, lockstep |
 | Bignum | `num-bigint 0.4.6` behind `PyLong` |
 | CLIF flags | `preserve_frame_pointers=true`; `is_pic=false` JIT / `is_pic=true` AoT |
-| Reference | CPython v3.14.0 (vendored `Lib/` under `pon-conformance/vendor/`) |
+| Reference | CPython v3.14.0, pinned in `pon-conformance/vendor/cpython-3.14/REVISION` |
 
 ## Status
 
@@ -140,10 +140,4 @@ What is explicitly **not** done yet — this is the active roadmap, in order:
 4. **AoT parity growth** toward the full corpus, plus single-binary product polish.
 5. **Free-threading** is feature-gated (`--features free-threading`) and experimental.
 
-Known gaps at the language level are tracked in `plans/pon-subplan-G-compat.md` — that document, not this README, is the authoritative compatibility baseline.
-
-## Documents
-
-- [`PLAN.md`](PLAN.md) — the execution playbook: phase graph, gates, orchestration rules.
-- [`HANDOFF.md`](HANDOFF.md) — the current working plan and operating rules.
-- `plans/` — the master plan, per-phase sub-plans, and frozen design pins (`pon-pin-J01…J07`).
+Known gaps at the language level are burned down through the ratcheted floors above — the committed floor files, not this README, are the authoritative compatibility baseline.
