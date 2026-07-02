@@ -401,21 +401,24 @@ fn is_sequence_index_error(message: &str) -> bool {
     message == "sequence index out of range"
 }
 
+/// Sequence subscript/store funnels: out-of-range sentinels become typed
+/// IndexError, zero-step slices ValueError, non-int keys TypeError;
+/// receiver invariants keep the bare diagnostic.
 fn return_null_with_sequence_error(message: String) -> *mut PyObject {
-    if is_sequence_index_error(&message) {
+    if is_sequence_index_error(&message) || message == "sequence index is out of range for this platform" {
         super::exc::raise_index_error_text(&message)
+    } else if message == "slice step cannot be zero" {
+        raise_typed(ExceptionKind::ValueError, &message)
+    } else if message.starts_with("expected int, got ") {
+        raise_typed(ExceptionKind::TypeError, &message)
     } else {
         return_null_with_error(message)
     }
 }
 
 fn return_minus_one_with_sequence_error(message: String) -> c_int {
-    if is_sequence_index_error(&message) {
-        super::exc::raise_index_error_text(&message);
-        -1
-    } else {
-        return_minus_one_with_error(message)
-    }
+    let _ = return_null_with_sequence_error(message);
+    -1
 }
 
 /// Raises a typed builtin exception carrying the diagnostic text — unless a
@@ -1521,7 +1524,7 @@ unsafe extern "C" fn range_item_slot(object: *mut PyObject, index: isize) -> *mu
 
 unsafe extern "C" fn tuple_concat_slot(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
     if !is_tuple(left) || !is_tuple(right) {
-        return return_null_with_error("can only concatenate tuple to tuple");
+        return raise_seq_type_error("can only concatenate tuple to tuple");
     }
     let left_items = unsafe { (&*left.cast::<PyTuple>()).as_slice() };
     let right_items = unsafe { (&*right.cast::<PyTuple>()).as_slice() };
@@ -1533,7 +1536,7 @@ unsafe extern "C" fn tuple_concat_slot(left: *mut PyObject, right: *mut PyObject
 
 unsafe extern "C" fn list_concat_slot(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
     if !is_list(left) || !is_list(right) {
-        return return_null_with_error("can only concatenate list to list");
+        return raise_seq_type_error("can only concatenate list to list");
     }
     let left_items = unsafe { (&*left.cast::<PyList>()).as_slice() };
     let right_items = unsafe { (&*right.cast::<PyList>()).as_slice() };
@@ -1549,11 +1552,11 @@ unsafe extern "C" fn list_concat_slot(left: *mut PyObject, right: *mut PyObject)
 
 unsafe extern "C" fn list_repeat_slot(object: *mut PyObject, count: *mut PyObject) -> *mut PyObject {
     if !is_list(object) {
-        return return_null_with_error("can only repeat list");
+        return raise_seq_type_error("can only repeat list");
     }
     let count = match repeat_count_value(count) {
         Ok(count) => count,
-        Err(message) => return return_null_with_error(message),
+        Err(message) => return raise_seq_repeat_error(message),
     };
     let items = unsafe { (&*object.cast::<PyList>()).as_slice() };
     let values = match repeated_values(items, count) {
@@ -1569,11 +1572,11 @@ unsafe extern "C" fn list_repeat_slot(object: *mut PyObject, count: *mut PyObjec
 
 unsafe extern "C" fn tuple_repeat_slot(object: *mut PyObject, count: *mut PyObject) -> *mut PyObject {
     if !is_tuple(object) {
-        return return_null_with_error("can only repeat tuple");
+        return raise_seq_type_error("can only repeat tuple");
     }
     let count = match repeat_count_value(count) {
         Ok(count) => count,
-        Err(message) => return return_null_with_error(message),
+        Err(message) => return raise_seq_repeat_error(message),
     };
     let items = unsafe { (&*object.cast::<PyTuple>()).as_slice() };
     let values = match repeated_values(items, count) {
@@ -1593,6 +1596,16 @@ fn repeat_count_value(count: *mut PyObject) -> Result<usize, String> {
         Ok(0)
     } else {
         usize::try_from(count).map_err(|_| "repeat count is out of range".to_owned())
+    }
+}
+
+/// Sequence-repeat count failures: non-int counts are CPython TypeError;
+/// counts beyond the index range are OverflowError.
+fn raise_seq_repeat_error(message: String) -> *mut PyObject {
+    if message == "repeat count is out of range" {
+        raise_typed(ExceptionKind::OverflowError, &message)
+    } else {
+        raise_typed(ExceptionKind::TypeError, &message)
     }
 }
 
@@ -1620,7 +1633,7 @@ unsafe extern "C" fn list_getattro_slot(object: *mut PyObject, name: *mut PyObje
         "count" => bound_seq_method(object, &name, list_count_method),
         "insert" => bound_seq_method(object, &name, list_insert_method),
         "remove" => bound_seq_method(object, &name, list_remove_method),
-        _ => return_null_with_error(format!("attribute '{name}' was not found")),
+        _ => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
     }
 }
 
@@ -1707,7 +1720,7 @@ unsafe extern "C" fn tuple_getattro_slot(object: *mut PyObject, name: *mut PyObj
     match name.as_str() {
         "count" => bound_seq_method(object, &name, tuple_count_method),
         "index" => bound_seq_method(object, &name, tuple_index_method),
-        _ => return_null_with_error(format!("attribute '{name}' was not found")),
+        _ => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
     }
 }
 
@@ -1831,12 +1844,12 @@ pub unsafe extern "C" fn pon_build_tuple(argv: *mut *mut PyObject, n: usize) -> 
 pub unsafe extern "C" fn pon_build_range(start: *mut PyObject, stop: *mut PyObject, step: *mut PyObject) -> *mut PyObject {
     crate::untag_prelude!(start, stop, step);
     catch_object_helper(|| {
-        let start_value = if is_none(start) { 0 } else { match long_value(start) { Ok(value) => value, Err(message) => return return_null_with_error(message) } };
+        let start_value = if is_none(start) { 0 } else { match long_value(start) { Ok(value) => value, Err(message) => return raise_seq_type_error(message) } };
         let stop_value = match long_value(stop) {
             Ok(value) => value,
-            Err(message) => return return_null_with_error(message),
+            Err(message) => return raise_seq_type_error(message),
         };
-        let step_value = if is_none(step) { 1 } else { match long_value(step) { Ok(value) => value, Err(message) => return return_null_with_error(message) } };
+        let step_value = if is_none(step) { 1 } else { match long_value(step) { Ok(value) => value, Err(message) => return raise_seq_type_error(message) } };
         match with_runtime(|runtime| alloc_range(runtime, start_value, stop_value, step_value)) {
             Some(Ok(object)) => object,
             Some(Err(message)) => return_null_with_error(message),
@@ -1881,11 +1894,11 @@ pub unsafe extern "C" fn pon_list_extend(list: *mut PyObject, iterable: *mut PyO
     catch_object_helper(|| {
         let values = match sequence_to_vec(iterable) {
             Ok(values) => values,
-            Err(message) => return return_null_with_error(message),
+            Err(message) => return raise_seq_type_error(message),
         };
         for value in values {
             if let Err(message) = list_append_raw(list, value) {
-                return return_null_with_error(message);
+                return raise_seq_stream_error(message);
             }
         }
         list
@@ -1932,7 +1945,7 @@ pub unsafe extern "C" fn pon_list_sort(list: *mut PyObject) -> *mut PyObject {
         let pylist = unsafe { &mut *list.cast::<PyList>() };
         let values = unsafe { pylist.as_mut_slice() };
         if let Err(message) = validate_sortable(values) {
-            return return_null_with_error(message);
+            return raise_seq_type_error(message);
         }
         values.sort_by(|left, right| compare_simple(*left, *right).unwrap_or(Ordering::Equal));
         match none_object() {

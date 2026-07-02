@@ -1076,6 +1076,7 @@ pub unsafe extern "C" fn pon_match_exc(exc_type: *mut PyObject) -> *mut PyObject
         if current.is_null() || is_diagnostic_sentinel(current) {
             unsafe { super::pon_none() }
         } else {
+            park_handled_exception(current);
             current
         }
     })
@@ -1175,7 +1176,10 @@ pub unsafe extern "C" fn pon_exc_star_match(exc_types: *mut PyObject) -> *mut Py
             frame.rest = split.rest;
         }
         match super::with_runtime(|runtime| set_current_exception(runtime, split.matched)) {
-            Some(()) => split.matched,
+            Some(()) => {
+                park_handled_exception(split.matched);
+                split.matched
+            }
             None => super::return_null_with_error("runtime is not initialized"),
         }
     })
@@ -1278,9 +1282,23 @@ pub unsafe extern "C" fn pon_get_current_exc() -> *mut PyObject {
         if current.is_null() || is_diagnostic_sentinel(current) {
             unsafe { super::pon_none() }
         } else {
+            park_handled_exception(current);
             current
         }
     })
+}
+
+/// Parks `exception` as the thread's handled exception — the
+/// `sys.exception()` / `sys.exc_info()` source (CPython
+/// `exc_info->exc_value`).
+///
+/// Handler-entry helpers ([`pon_match_exc`], [`pon_get_current_exc`],
+/// [`pon_exc_star_match`]) call this BEFORE the handler body's first call
+/// boundary clears the pending slot; `crate::abi::HandledExcGuard` then
+/// saves/restores the parked value around every compiled-code call so it
+/// scopes to the catching frame.
+fn park_handled_exception(exception: *mut PyObject) {
+    thread_state_lock().handled_exc = exception;
 }
 
 pub(super) fn build_exception_group_checked(runtime: &Runtime, cls: *mut PyType, args: &[*mut PyObject]) -> *mut PyObject {

@@ -130,3 +130,7 @@ pon-conformance/corpus/cpython/builtin_shadow_isolation.py
 pon-conformance/corpus/cpython/contextvars_basic.py
 pon-conformance/corpus/cpython/try_stack_joins.py
 pon-conformance/corpus/cpython/collections_native.py
+pon-conformance/corpus/cpython/set_element_errors.py
+corpus/import_as_submodule.py
+pon-conformance/corpus/cpython/container_identity.py
+pon-conformance/corpus/cpython/except_multibase.py
