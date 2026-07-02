@@ -62,6 +62,7 @@ pub const STR_METHOD_ISASCII: StrMethodId = 43;
 pub const STR_METHOD_TRANSLATE: StrMethodId = 44;
 pub const STR_METHOD_MAKETRANS: StrMethodId = 45;
 pub const STR_METHOD_FORMAT_MAP: StrMethodId = 46;
+pub const STR_METHOD_FORMAT: StrMethodId = 47;
 
 /// Bytes/bytearray method selector passed through the helper ABI.
 pub type BytesMethodId = u16;
@@ -660,6 +661,7 @@ unsafe extern "C" fn str_getattro(object: *mut PyObject, name: *mut PyObject) ->
         "isascii" => bound_str_method(object, name, str_isascii_entry),
         "translate" => bound_str_method(object, name, str_translate_entry),
         "maketrans" => bound_str_method(object, name, str_maketrans_entry),
+        "format" => bound_str_method(object, name, str_format_entry),
         "format_map" => bound_str_method(object, name, str_format_map_entry),
         _ => super::return_null_with_error(format!("attribute '{name}' was not found")),
     }
@@ -754,6 +756,7 @@ str_entry!(str_isascii_entry, STR_METHOD_ISASCII);
 str_entry!(str_translate_entry, STR_METHOD_TRANSLATE);
 str_entry!(str_maketrans_entry, STR_METHOD_MAKETRANS);
 str_entry!(str_format_map_entry, STR_METHOD_FORMAT_MAP);
+str_entry!(str_format_entry, STR_METHOD_FORMAT);
 
 macro_rules! bytes_entry {
     ($func:ident, $id:ident) => {
@@ -956,7 +959,7 @@ pub unsafe extern "C" fn pon_format_value(
     format_spec: *mut PyObject,
 ) -> *mut PyObject {
     crate::untag_prelude!(value, format_spec);
-    super::catch_object_helper(|| match format_value_to_text(value, conversion, format_spec) {
+    super::catch_object_helper(|| match super::format::format_value_to_text(value, conversion, format_spec) {
         Ok(text) => alloc_str_object(&text),
         Err(message) => super::return_null_with_error(message),
     })
@@ -980,7 +983,7 @@ pub unsafe extern "C" fn pon_build_string(parts: *const super::FStrPartRaw, len:
 /// Builds a representative template-string object from raw parts.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_build_template(parts: *const super::TStrPartRaw, len: usize) -> *mut PyObject {
-    super::catch_object_helper(|| match build_template(parts, len) {
+    super::catch_object_helper(|| match unsafe { super::format::build_template_from_raw(parts, len) } {
         Ok(template) => template,
         Err(message) => super::return_null_with_error(message),
     })
@@ -1048,6 +1051,7 @@ pub unsafe extern "C" fn pon_str_method(
             STR_METHOD_ISASCII => str_predicate_method(args, str_type::is_ascii_str(&receiver)),
             STR_METHOD_TRANSLATE => str_translate_method(&receiver, args),
             STR_METHOD_MAKETRANS => str_maketrans_method(args),
+            STR_METHOD_FORMAT => str_format_method(&receiver, args),
             STR_METHOD_FORMAT_MAP => str_format_map_method(&receiver, args),
             _ => super::return_null_with_error("unknown str method selector"),
         }
@@ -1130,7 +1134,7 @@ fn render_fstring(parts: *const super::FStrPartRaw, len: usize) -> Result<String
         if part.value.is_null() {
             out.push_str(raw_utf8(part.literal, part.literal_len)?);
         } else {
-            out.push_str(&format_value_to_text(part.value, part.conversion, part.format_spec)?);
+            out.push_str(&super::format::format_value_to_text(part.value, part.conversion, part.format_spec)?);
         }
     }
     Ok(out)
@@ -1241,37 +1245,7 @@ fn format_value_to_text(value: *mut PyObject, conversion: u8, format_spec: *mut 
 }
 
 pub(crate) fn format_object_with_spec(value: *mut PyObject, spec: &str) -> Result<String, String> {
-    let parsed = ParsedFormatSpec::parse(spec)?;
-    let (body, kind) = match parsed.ty {
-        Some('d') => {
-            let value = object_to_i64(value).ok_or_else(|| "format code 'd' requires int".to_owned())?;
-            (value.to_string(), FormatValueKind::Number)
-        }
-        Some('f') => {
-            let value = object_to_f64(value).ok_or_else(|| "format code 'f' requires int or float".to_owned())?;
-            let precision = parsed.precision.unwrap_or(6);
-            (format!("{value:.precision$}"), FormatValueKind::Number)
-        }
-        Some('s') => {
-            let text = if let Some(precision) = parsed.precision {
-                truncate_to_precision(&object_to_str(value)?, precision)
-            } else {
-                object_to_str(value)?
-            };
-            (text, FormatValueKind::Text)
-        }
-        None => {
-            let text = object_to_str(value)?;
-            let text = if let Some(precision) = parsed.precision {
-                truncate_to_precision(&text, precision)
-            } else {
-                text
-            };
-            (text, FormatValueKind::Text)
-        }
-        Some(_) => return Err("unsupported format specification".to_owned()),
-    };
-    apply_parsed_format(&body, parsed, kind)
+    super::format::format_object_with_spec(value, spec)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1777,8 +1751,21 @@ fn str_maketrans_method(args: &[*mut PyObject]) -> *mut PyObject {
     as_object_ptr(Box::into_raw(Box::new(PyStrTranslateTable { ob_base: PyObjectHeader::new(str_translate_table_type()), table })))
 }
 
-fn str_format_map_method(_receiver: &str, _args: &[*mut PyObject]) -> *mut PyObject {
-    super::return_null_with_error("str.format_map is deferred to the shared format-spec engine")
+fn str_format_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
+    match unsafe { super::format::format_template(receiver, args, None) } {
+        Ok(text) => alloc_str_object(&text),
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
+fn str_format_map_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
+    if args.len() != 1 {
+        return super::return_null_with_error("str.format_map expected exactly one argument");
+    }
+    match unsafe { super::format::format_template(receiver, &[], Some(args[0])) } {
+        Ok(text) => alloc_str_object(&text),
+        Err(message) => super::return_null_with_error(message),
+    }
 }
 
 fn str_encode_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {

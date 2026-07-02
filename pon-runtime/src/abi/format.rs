@@ -221,7 +221,7 @@ fn format_str(value: &str, spec: &str) -> Result<String, String> {
     } else {
         value.to_owned()
     };
-    apply_width(&text, &parsed, FormatValueKind::Text)
+    apply_text_width(&text, &parsed)
 }
 
 fn format_int(value: &BigInt, spec: &str) -> Result<String, String> {
@@ -277,7 +277,7 @@ fn format_char(value: &BigInt, spec: &ParsedFormatSpec) -> Result<String, String
     let Some(ch) = char::from_u32(codepoint) else {
         return Err("%c arg not in range(0x110000)".to_owned());
     };
-    apply_width(&ch.to_string(), spec, FormatValueKind::Text)
+    apply_text_width(&ch.to_string(), spec)
 }
 
 fn format_float(value: f64, spec: &str) -> Result<String, String> {
@@ -388,11 +388,6 @@ fn float_body_is_zero(body: &str) -> bool {
     mantissa.chars().all(|ch| matches!(ch, '0' | '.' | ',' | '_'))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FormatValueKind {
-    Text,
-    Number,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FormatAlign {
@@ -566,7 +561,7 @@ fn apply_number_width(sign: &str, prefix: &str, body: &str, suffix: &str, spec: 
     apply_width_with_align(&raw, spec.fill, align, pad)
 }
 
-fn apply_width(value: &str, spec: &ParsedFormatSpec, kind: FormatValueKind) -> Result<String, String> {
+fn apply_text_width(value: &str, spec: &ParsedFormatSpec) -> Result<String, String> {
     let Some(width) = spec.width else {
         return Ok(value.to_owned());
     };
@@ -575,10 +570,7 @@ fn apply_width(value: &str, spec: &ParsedFormatSpec, kind: FormatValueKind) -> R
     if pad == 0 {
         return Ok(value.to_owned());
     }
-    let align = spec.align.unwrap_or(match kind {
-        FormatValueKind::Text => FormatAlign::Left,
-        FormatValueKind::Number => FormatAlign::Right,
-    });
+    let align = spec.align.unwrap_or(FormatAlign::Left);
     if align == FormatAlign::SignAware {
         return Err("'=' alignment not allowed in this format specifier".to_owned());
     }
@@ -1116,7 +1108,7 @@ mod tests {
             let first = boxed_str("alpha").unwrap();
             let second = super::super::pon_const_int(42);
             let args = [first, second];
-            assert_eq!(format_template("{} {1:#x} {{ok}}", &args, None).unwrap(), "alpha 0x2a {ok}");
+            assert_eq!(format_template("{0} {1:#x} {{ok}}", &args, None).unwrap(), "alpha 0x2a {ok}");
         }
     }
 }
