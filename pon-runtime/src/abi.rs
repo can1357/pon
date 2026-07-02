@@ -418,6 +418,9 @@ const PARAMS_GEN_MAKE_FRAME: &[AbiTy] = &[AbiTy::U32];
 const PARAMS_FRAME_LOCAL: &[AbiTy] = &[AbiTy::PyFramePtr, AbiTy::U32];
 const PARAMS_FRAME_SET_LOCAL: &[AbiTy] = &[AbiTy::PyFramePtr, AbiTy::U32, AbiTy::PyObjectPtr];
 const PARAMS_MAKE_GENERATOR: &[AbiTy] = &[AbiTy::GenResumePtr, AbiTy::PyFramePtr, AbiTy::U8];
+const PARAMS_FUNCTION_SET_ANNOTATE: &[AbiTy] = &[AbiTy::PyObjectPtr, AbiTy::PyObjectPtr];
+const PARAMS_MAKE_TYPE_ALIAS: &[AbiTy] = &[AbiTy::U32, AbiTy::PyObjectPtr];
+const PARAMS_MAKE_TYPEVAR: &[AbiTy] = &[AbiTy::U32];
 
 /// Exported helper table consumed by later codegen/JIT stages.
 pub static HELPERS: &[HelperDecl] = &[
@@ -1332,6 +1335,24 @@ pub static HELPERS: &[HelperDecl] = &[
         address: pon_gc_safe_region_leave as *const (),
         params: PARAMS_NONE,
         ret: AbiTy::I32,
+    },
+    HelperDecl {
+        symbol: "pon_function_set_annotate",
+        address: crate::types::function::pon_function_set_annotate as *const (),
+        params: PARAMS_FUNCTION_SET_ANNOTATE,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_make_type_alias",
+        address: crate::types::typealias::pon_make_type_alias as *const (),
+        params: PARAMS_MAKE_TYPE_ALIAS,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_make_typevar",
+        address: crate::types::typealias::pon_make_typevar as *const (),
+        params: PARAMS_MAKE_TYPEVAR,
+        ret: AbiTy::PyObjectPtr,
     },
 ];
 
@@ -2296,7 +2317,7 @@ pub unsafe extern "C" fn pon_load_global(name_interned: u32, feedback: *mut Feed
             }
             None => {
                 let name = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
-                return_null_with_error(format!("name '{name}' is not defined"))
+                exc::raise_name_error_text(&format!("name '{name}' is not defined"))
             }
         }
     })
@@ -2319,7 +2340,7 @@ pub unsafe extern "C" fn pon_load_name(name_interned: u32) -> *mut PyObject {
         .or_else(|| with_runtime(|runtime| runtime.globals.get(&name_interned).copied()).flatten())
         .unwrap_or_else(|| {
             let name = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
-            return_null_with_error(format!("name '{name}' is not defined"))
+            exc::raise_name_error_text(&format!("name '{name}' is not defined"))
         })
     })
 }

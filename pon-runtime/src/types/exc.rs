@@ -56,8 +56,11 @@ pub enum ExceptionKind {
     ValueError,
     KeyError,
     IndexError,
+    NameError,
+    NotImplementedError,
     AttributeError,
     StopIteration,
+    GeneratorExit,
     RuntimeError,
     OSError,
     AssertionError,
@@ -76,7 +79,10 @@ pub struct ExceptionTypeSet {
     pub key_error: *mut PyType,
     pub index_error: *mut PyType,
     pub attribute_error: *mut PyType,
+    pub name_error: *mut PyType,
+    pub not_implemented_error: *mut PyType,
     pub stop_iteration: *mut PyType,
+    pub generator_exit: *mut PyType,
     pub runtime_error: *mut PyType,
     pub os_error: *mut PyType,
     pub assertion_error: *mut PyType,
@@ -96,8 +102,11 @@ impl ExceptionTypeSet {
         let key_error = new_exception_type(type_type, "KeyError", exception);
         let index_error = new_exception_type(type_type, "IndexError", exception);
         let attribute_error = new_exception_type(type_type, "AttributeError", exception);
-        let stop_iteration = new_exception_type(type_type, "StopIteration", exception);
+        let name_error = new_exception_type(type_type, "NameError", exception);
         let runtime_error = new_exception_type(type_type, "RuntimeError", exception);
+        let not_implemented_error = new_exception_type(type_type, "NotImplementedError", runtime_error);
+        let stop_iteration = new_exception_type(type_type, "StopIteration", exception);
+        let generator_exit = new_exception_type(type_type, "GeneratorExit", base_exception);
         let os_error = new_exception_type(type_type, "OSError", exception);
         let assertion_error = new_exception_type(type_type, "AssertionError", exception);
         let base_exception_group = new_exception_type(type_type, "BaseExceptionGroup", base_exception);
@@ -112,7 +121,10 @@ impl ExceptionTypeSet {
             key_error,
             index_error,
             attribute_error,
+            name_error,
+            not_implemented_error,
             stop_iteration,
+            generator_exit,
             runtime_error,
             os_error,
             assertion_error,
@@ -133,7 +145,10 @@ impl ExceptionTypeSet {
             ExceptionKind::KeyError => self.key_error,
             ExceptionKind::IndexError => self.index_error,
             ExceptionKind::AttributeError => self.attribute_error,
+            ExceptionKind::NameError => self.name_error,
+            ExceptionKind::NotImplementedError => self.not_implemented_error,
             ExceptionKind::StopIteration => self.stop_iteration,
+            ExceptionKind::GeneratorExit => self.generator_exit,
             ExceptionKind::RuntimeError => self.runtime_error,
             ExceptionKind::OSError => self.os_error,
             ExceptionKind::AssertionError => self.assertion_error,
@@ -144,7 +159,7 @@ impl ExceptionTypeSet {
 
     /// Returns every core builtin exception type required by B05-EXC-CORE.
     #[must_use]
-    pub fn core_types(self) -> [(ExceptionKind, *mut PyType); 14] {
+    pub fn core_types(self) -> [(ExceptionKind, *mut PyType); 17] {
         [
             (ExceptionKind::BaseException, self.base_exception),
             (ExceptionKind::Exception, self.exception),
@@ -154,7 +169,10 @@ impl ExceptionTypeSet {
             (ExceptionKind::KeyError, self.key_error),
             (ExceptionKind::IndexError, self.index_error),
             (ExceptionKind::AttributeError, self.attribute_error),
+            (ExceptionKind::NameError, self.name_error),
+            (ExceptionKind::NotImplementedError, self.not_implemented_error),
             (ExceptionKind::StopIteration, self.stop_iteration),
+            (ExceptionKind::GeneratorExit, self.generator_exit),
             (ExceptionKind::RuntimeError, self.runtime_error),
             (ExceptionKind::OSError, self.os_error),
             (ExceptionKind::AssertionError, self.assertion_error),

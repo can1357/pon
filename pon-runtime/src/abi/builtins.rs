@@ -17,7 +17,7 @@ pub unsafe extern "C" fn pon_load_builtin(name_interned: u32) -> *mut PyObject {
             .flatten()
             .unwrap_or_else(|| {
                 let name = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
-                super::return_null_with_error(format!("builtin name '{name}' is not defined"))
+                super::exc::raise_name_error_text(&format!("name '{name}' is not defined"))
             })
     })
 }

@@ -131,6 +131,17 @@ pub fn raise_import_error_text(text: &str) -> *mut PyObject {
     }
 }
 
+/// Raises a typed `NameError(text)` for failed name/global/builtin lookups.
+pub(super) fn raise_name_error_text(text: &str) -> *mut PyObject {
+    match ensure_runtime_for_exc() {
+        Ok(()) => match super::with_runtime(|runtime| raise_builtin_text(runtime, ExceptionKind::NameError, text)) {
+            Some(result) => result,
+            None => super::return_null_with_error("runtime is not initialized"),
+        },
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
 fn raise_message_exception(kind: ExceptionKind, ptr: *const u8, len: usize) -> *mut PyObject {
     let bytes = match bytes_from_raw(ptr, len) {
         Ok(bytes) => bytes,
@@ -177,7 +188,10 @@ fn exception_kind_name(kind: ExceptionKind) -> &'static str {
         ExceptionKind::KeyError => "KeyError",
         ExceptionKind::IndexError => "IndexError",
         ExceptionKind::AttributeError => "AttributeError",
+        ExceptionKind::NameError => "NameError",
+        ExceptionKind::NotImplementedError => "NotImplementedError",
         ExceptionKind::StopIteration => "StopIteration",
+        ExceptionKind::GeneratorExit => "GeneratorExit",
         ExceptionKind::RuntimeError => "RuntimeError",
         ExceptionKind::OSError => "OSError",
         ExceptionKind::AssertionError => "AssertionError",
