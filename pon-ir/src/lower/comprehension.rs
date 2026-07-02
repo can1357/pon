@@ -94,6 +94,7 @@ pub(super) fn lower_generator_expr(
         "<genexpr>",
         &expr.generators,
         span_bounds(expr.range.start().to_u32(), expr.range.end().to_u32()),
+        true,
         |driver, body| {
             lower_comprehension_loops(driver, body, &expr.generators, 0, &mut |driver, body| {
                 let item = driver.lower_expr(body, &expr.elt)?;
@@ -113,7 +114,7 @@ fn lower_collecting_comprehension(
     collect_kind: CollectKind,
     mut emit_item: impl FnMut(&mut LoweringDriver, &mut BodyScope, Value) -> Result<(), LowerError>,
 ) -> Result<Value, LowerError> {
-    lower_comprehension_call(driver, scope, child_name, generators, span, |driver, body| {
+    lower_comprehension_call(driver, scope, child_name, generators, span, false, |driver, body| {
         let accumulator = match collect_kind {
             CollectKind::List => body.emit(InstKind::BuildList { elts: Vec::new() })?,
             CollectKind::Set => body.emit(InstKind::BuildSet { elts: Vec::new() })?,
@@ -126,30 +127,71 @@ fn lower_collecting_comprehension(
     })
 }
 
+/// Materializes one comprehension as a call of its synthesized child-scope
+/// function over the outer iterable's (async) iterator.
+///
+/// PEP 530 async comprehensions: when scope analysis marked the child scope
+/// async (an `async for` clause or an `await` anywhere in the clauses/element),
+/// the child is synthesized as a coroutine — `is_async` flows through
+/// `ScopeInfo` into `Function::is_coroutine` — and the call site awaits it,
+/// mirroring CPython's `GET_AWAITABLE`/`SEND` sequence after the comprehension
+/// call.  The outer iterator handed over as `.0` is acquired with `GetAIter`
+/// exactly when the FIRST clause is async; a sync first clause with `await`
+/// deeper in still iterates synchronously.
+///
+/// Async generator expressions stay rejected: their child would be an async
+/// generator object, which the runtime cannot represent yet (`GeneratorKind::
+/// AsyncGenerator` maps to the plain generator type without an `__anext__`
+/// surface).
 fn lower_comprehension_call(
     driver: &mut LoweringDriver,
     enclosing: &mut BodyScope,
     child_name: &str,
     generators: &[Comprehension],
     span: SourceSpan,
+    is_genexpr: bool,
     lower_body: impl FnOnce(&mut LoweringDriver, &mut BodyScope) -> Result<(), LowerError>,
 ) -> Result<Value, LowerError> {
     let first_generator = generators
         .first()
         .ok_or_else(|| LowerError::internal("comprehension without generator clause"))?;
-    reject_async_comprehension(generators, span)?;
 
     let outer_iterable = driver.lower_expr(enclosing, &first_generator.iter)?;
-    let outer_iter = enclosing.emit(InstKind::GetIter {
-        iterable: outer_iterable,
-    })?;
-    let parameters = comprehension_parameters(first_generator);
     let child_info = enclosing.next_child_scope(ScopeKind::Comprehension, child_name)?;
+    let is_async_comp = child_info.is_async;
+    if is_async_comp {
+        if is_genexpr {
+            return unsupported_at("async generator expressions", span);
+        }
+        if !enclosing.info.is_async {
+            // CPython rejects this shape at compile time with the same words.
+            return unsupported_at(
+                "asynchronous comprehension outside of an asynchronous function",
+                span,
+            );
+        }
+    }
+    let outer_iter = if first_generator.is_async {
+        enclosing.emit(InstKind::GetAIter {
+            iterable: outer_iterable,
+        })?
+    } else {
+        enclosing.emit(InstKind::GetIter {
+            iterable: outer_iterable,
+        })?
+    };
+    let parameters = comprehension_parameters(first_generator);
     let function = synth::synthesize_scope_function(driver, enclosing, child_info, &parameters, lower_body)?;
-    enclosing.emit(InstKind::Call {
+    let call = enclosing.emit(InstKind::Call {
         callee: function,
         args: vec![outer_iter],
-    })
+    })?;
+    if is_async_comp {
+        let iter = enclosing.emit(InstKind::Await { awaitable: call })?;
+        enclosing.emit(InstKind::YieldFrom { iter })
+    } else {
+        Ok(call)
+    }
 }
 
 fn lower_comprehension_loops(
@@ -164,7 +206,6 @@ fn lower_comprehension_loops(
     };
 
     let header_block = body.alloc_block()?;
-    let body_block = body.alloc_block()?;
     let done_block = body.alloc_block()?;
     let iter = if index == 0 {
         let slot = body.local_slot(COMP_ITER_PARAM).ok_or_else(|| {
@@ -173,19 +214,28 @@ fn lower_comprehension_loops(
         body.emit(InstKind::LoadLocal(slot))?
     } else {
         let iterable = driver.lower_expr(body, &generator.iter)?;
-        body.emit(InstKind::GetIter { iterable })?
+        if generator.is_async {
+            body.emit(InstKind::GetAIter { iterable })?
+        } else {
+            body.emit(InstKind::GetIter { iterable })?
+        }
     };
     body.set_term(Terminator::Jump(header_block))?;
 
     body.switch_to(header_block)?;
-    let item = body.emit(InstKind::ForNext { iter })?;
-    body.set_term(Terminator::ForLoop {
-        iter,
-        body: body_block,
-        done: done_block,
-    })?;
-
-    body.switch_to(body_block)?;
+    let item = if generator.is_async {
+        generator::emit_async_for_step(driver, body, iter, done_block)?
+    } else {
+        let body_block = body.alloc_block()?;
+        let item = body.emit(InstKind::ForNext { iter })?;
+        body.set_term(Terminator::ForLoop {
+            iter,
+            body: body_block,
+            done: done_block,
+        })?;
+        body.switch_to(body_block)?;
+        item
+    };
     driver.lower_store_target(body, &generator.target, item)?;
     for if_expr in &generator.ifs {
         let pass_block = body.alloc_block()?;
@@ -204,12 +254,6 @@ fn lower_comprehension_loops(
     body.switch_to(done_block)
 }
 
-fn reject_async_comprehension(generators: &[Comprehension], span: SourceSpan) -> Result<(), LowerError> {
-    if generators.iter().any(|generator| generator.is_async) {
-        return unsupported_at("async comprehensions", span);
-    }
-    Ok(())
-}
 
 fn comprehension_parameters(generator: &Comprehension) -> Parameters {
     let range = generator.range;

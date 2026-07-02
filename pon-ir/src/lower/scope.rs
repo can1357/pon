@@ -661,6 +661,7 @@ fn scan_expr(expr: &Expr, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
             scan_comprehension_generators(&expr.generators, scope, &mut child)?;
             scan_expr(&expr.key, &mut child)?;
             scan_expr(&expr.value, &mut child)?;
+            propagate_comprehension_asyncness(&child, scope);
             scope.children.push(child);
         }
         Expr::Generator(expr) => {
@@ -668,6 +669,7 @@ fn scan_expr(expr: &Expr, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
             child.is_generator = true;
             scan_comprehension_generators(&expr.generators, scope, &mut child)?;
             scan_expr(&expr.elt, &mut child)?;
+            propagate_comprehension_asyncness(&child, scope);
             scope.children.push(child);
         }
         Expr::Await(expr) => {
@@ -754,6 +756,20 @@ fn scan_interpolated_elements<'a>(
     Ok(())
 }
 
+/// PEP 530 implicit-async propagation: a nested async list/set/dict
+/// comprehension is awaited where its call materializes, so an enclosing
+/// COMPREHENSION scope containing one becomes async itself (CPython permits
+/// the chain only inside async functions; lowering rejects it when it
+/// bottoms out in a non-async scope).  Generator-expression children
+/// insulate — constructing an async generator object awaits nothing — and
+/// enclosing `def`/module scopes never inherit asyncness from a nested
+/// comprehension.
+fn propagate_comprehension_asyncness(child: &ScopeBuilder, enclosing: &mut ScopeBuilder) {
+    if child.is_async && !child.is_generator && matches!(enclosing.kind, ScopeKind::Comprehension) {
+        enclosing.is_async = true;
+    }
+}
+
 fn scan_comprehension(
     name: &str,
     elt: &Expr,
@@ -763,6 +779,7 @@ fn scan_comprehension(
     let mut child = ScopeBuilder::new(ScopeKind::Comprehension, name, false);
     scan_comprehension_generators(generators, scope, &mut child)?;
     scan_expr(elt, &mut child)?;
+    propagate_comprehension_asyncness(&child, scope);
     scope.children.push(child);
     Ok(())
 }

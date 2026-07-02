@@ -507,6 +507,9 @@ impl LoweringDriver {
         stmt: &ruff_python_ast::StmtFor,
         _loop_targets: Option<control::LoopTargets>,
     ) -> Result<(), LowerError> {
+        if stmt.is_async {
+            return self.lower_async_for_stmt(scope, stmt, _loop_targets);
+        }
         let header_block = scope.alloc_block()?;
         let body_block = scope.alloc_block()?;
         let else_block = if stmt.orelse.is_empty() {
@@ -528,6 +531,58 @@ impl LoweringDriver {
         })?;
 
         scope.switch_to(body_block)?;
+        control::lower_for_item_store_with_driver(self, scope, stmt, item)?;
+        let nested_targets = control::LoopTargets {
+            break_block: done_block,
+            continue_block: header_block,
+        };
+        self.lower_stmt_list(scope, &stmt.body, Some(nested_targets))?;
+        scope.jump_if_open(header_block)?;
+
+        if let Some(else_block) = else_block {
+            scope.switch_to(else_block)?;
+            self.lower_stmt_list(scope, &stmt.orelse, _loop_targets)?;
+            scope.jump_if_open(done_block)?;
+        }
+
+        scope.switch_to(done_block)?;
+        Ok(())
+    }
+
+    /// Lowers `async for` under CPython's `END_ASYNC_FOR` discipline: acquire
+    /// the async iterator once, then each iteration awaits
+    /// `aiter.__anext__()` inside a protected region whose handler routes
+    /// `StopAsyncIteration` to the `else`/done edge and re-raises everything
+    /// else ([`generator::emit_async_for_step`]).  The loop body runs OUTSIDE
+    /// the protected region, so a `StopAsyncIteration` raised there
+    /// propagates instead of terminating the loop.
+    fn lower_async_for_stmt(
+        &mut self,
+        scope: &mut BodyScope,
+        stmt: &ruff_python_ast::StmtFor,
+        _loop_targets: Option<control::LoopTargets>,
+    ) -> Result<(), LowerError> {
+        if !scope.info.is_async {
+            // CPython rejects this shape at compile time with the same words.
+            return unsupported_at(
+                "'async for' outside async function",
+                span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()),
+            );
+        }
+        let header_block = scope.alloc_block()?;
+        let else_block = if stmt.orelse.is_empty() {
+            None
+        } else {
+            Some(scope.alloc_block()?)
+        };
+        let done_block = scope.alloc_block()?;
+        let iterable = self.lower_expr(scope, &stmt.iter)?;
+        let iter = scope.emit(InstKind::GetAIter { iterable })?;
+        scope.set_term(Terminator::Jump(header_block))?;
+
+        scope.switch_to(header_block)?;
+        let item =
+            generator::emit_async_for_step(self, scope, iter, else_block.unwrap_or(done_block))?;
         control::lower_for_item_store_with_driver(self, scope, stmt, item)?;
         let nested_targets = control::LoopTargets {
             break_block: done_block,

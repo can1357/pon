@@ -41,6 +41,65 @@ pub(super) fn lower_await_expr(
     scope.emit(InstKind::YieldFrom { iter })
 }
 
+/// Emits one `async for` advance under CPython's `END_ASYNC_FOR` discipline:
+/// `item = await aiter.__anext__()` inside a `PushExcInfo`-protected region
+/// whose handler routes `StopAsyncIteration` to `exhausted` and re-raises
+/// everything else.  The protected region covers ONLY the advance — a
+/// `StopAsyncIteration` raised by the loop body must propagate, so callers
+/// lower the body after this returns (record already popped).  On success the
+/// scope is positioned in a fresh open block with the item value returned.
+///
+/// Callers re-enter the block that invokes this helper once per iteration, so
+/// the push/pop pairing stays balanced on the backedge, and the generator
+/// transform re-pushes the record at the await's suspend point like any other
+/// handler around a `yield`.
+pub(super) fn emit_async_for_step(
+    driver: &mut LoweringDriver,
+    scope: &mut BodyScope,
+    aiter: Value,
+    exhausted: BlockId,
+) -> Result<Value, LowerError> {
+    let handler_block = scope.alloc_block()?;
+    let continue_block = scope.alloc_block()?;
+    scope.emit(InstKind::PushExcInfo {
+        target: handler_block,
+        stack_depth: 0,
+        kind: 0,
+    })?;
+    let anext = driver.names.intern("__anext__")?;
+    let method = scope.emit(InstKind::LoadAttr {
+        obj: aiter,
+        name: anext,
+    })?;
+    let awaitable = scope.emit(InstKind::Call {
+        callee: method,
+        args: Vec::new(),
+    })?;
+    let iter = scope.emit(InstKind::Await { awaitable })?;
+    let item = scope.emit(InstKind::YieldFrom { iter })?;
+    scope.emit(InstKind::PopExcInfo)?;
+    scope.set_term(Terminator::Jump(continue_block))?;
+
+    scope.switch_to(handler_block)?;
+    scope.emit(InstKind::PopExcInfo)?;
+    let stop_name = driver.names.intern("StopAsyncIteration")?;
+    let stop = scope.emit(InstKind::LoadBuiltin(stop_name))?;
+    let matched = scope.emit(InstKind::MatchExc { exc_type: stop })?;
+    let cond = scope.emit(InstKind::BoolTest { val: matched })?;
+    let miss_block = scope.alloc_block()?;
+    scope.set_term(Terminator::CondBranch {
+        cond,
+        then_: exhausted,
+        else_: miss_block,
+    })?;
+    scope.switch_to(miss_block)?;
+    scope.emit(InstKind::Reraise)?;
+    scope.set_term(Terminator::RaiseTerm)?;
+
+    scope.switch_to(continue_block)?;
+    Ok(item)
+}
+
 /// One enclosing static handler record active at a suspend point.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct HandlerSpec {
