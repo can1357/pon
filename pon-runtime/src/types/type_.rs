@@ -24,6 +24,9 @@ pub struct PyClassDict {
     /// Common object header.  The carrier is internal and may have a NULL type.
     pub ob_base: PyObjectHeader,
     entries: HashMap<u32, *mut PyObject>,
+    /// Insertion order of live keys (Python 3.7+ dict ordering guarantee;
+    /// class namespaces drive `__set_name__`/enum member order).
+    order: Vec<u32>,
 }
 
 impl PyClassDict {
@@ -33,6 +36,7 @@ impl PyClassDict {
         Self {
             ob_base: PyObjectHeader::new(ptr::null()),
             entries: HashMap::new(),
+            order: Vec::new(),
         }
     }
 
@@ -42,19 +46,29 @@ impl PyClassDict {
         self.entries.get(&name).copied()
     }
 
-    /// Store or replace one interned-name value.
+    /// Store or replace one interned-name value.  Overwrites keep the
+    /// original insertion position (CPython dict semantics).
     pub fn set(&mut self, name: u32, value: *mut PyObject) {
-        self.entries.insert(name, value);
+        if self.entries.insert(name, value).is_none() {
+            self.order.push(name);
+        }
     }
 
     /// Delete one interned-name value.
     pub fn del(&mut self, name: u32) -> bool {
-        self.entries.remove(&name).is_some()
+        if self.entries.remove(&name).is_some() {
+            self.order.retain(|&existing| existing != name);
+            true
+        } else {
+            false
+        }
     }
 
-    /// Iterate over namespace entries.
+    /// Iterate over namespace entries in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (u32, *mut PyObject)> + '_ {
-        self.entries.iter().map(|(name, value)| (*name, *value))
+        self.order
+            .iter()
+            .filter_map(|name| self.entries.get(name).map(|value| (*name, *value)))
     }
 }
 
@@ -136,21 +150,133 @@ pub fn new_namespace() -> *mut PyClassDict {
     Box::into_raw(Box::new(PyClassDict::new()))
 }
 
+/// GC type id for heap instances embedding a builtin data-type payload
+/// (`str`/`int` subclasses); class-instance family next to
+/// [`TYPE_ID_HEAP_INSTANCE`].
+pub const TYPE_ID_PAYLOAD_SUBCLASS_INSTANCE: TypeId = TypeId(108);
+
+/// Heap-class instance carrying a canonical builtin payload (`str`/`int`
+/// subclasses). Mirrors `PyDictSubclassInstance`: the generic heap-instance
+/// prefix keeps every instance-attribute, slot, and weakref path working
+/// unchanged, while `value` holds the canonical builtin object the native
+/// protocol reads through.
+#[repr(C)]
+#[derive(Debug)]
+pub struct PyPayloadSubclassInstance {
+    /// Generic heap-instance prefix; must remain first.
+    pub base: PyHeapInstance,
+    /// Canonical builtin payload: a heap `str`, or a tagged/heap `int`.
+    pub value: *mut PyObject,
+}
+
+/// Names of builtin data types whose Python subclasses embed a canonical
+/// payload ([`PyPayloadSubclassInstance`] layout).  Deliberately narrow:
+/// widening to float/bytes/tuple must first audit their subclass users.
+const PAYLOAD_BASE_NAMES: [&str; 2] = ["str", "int"];
+
+/// Returns whether `ty` is a heap class using the payload-subclass layout.
+#[must_use]
+pub unsafe fn type_is_payload_subclass(ty: *mut PyType) -> bool {
+    if ty.is_null() {
+        return false;
+    }
+    unsafe {
+        (*ty).gc_type_id == TYPE_ID_HEAP_INSTANCE.0 as usize
+            && (*ty).tp_basicsize == mem::size_of::<PyPayloadSubclassInstance>()
+    }
+}
+
+/// Returns whether `object` is a payload-subclass heap instance.
+#[must_use]
+pub unsafe fn is_payload_subclass_instance(object: *mut PyObject) -> bool {
+    !object.is_null()
+        && crate::tag::is_heap(object)
+        && unsafe { type_is_payload_subclass((*object).ob_type.cast_mut()) }
+}
+
+/// Embedded canonical payload of a `str`/`int`-subclass instance, when set.
+#[must_use]
+pub unsafe fn payload_subclass_value(object: *mut PyObject) -> Option<*mut PyObject> {
+    if unsafe { !is_payload_subclass_instance(object) } {
+        return None;
+    }
+    let value = unsafe { (*object.cast::<PyPayloadSubclassInstance>()).value };
+    if value.is_null() { None } else { Some(value) }
+}
+
+/// Returns whether a class built over `bases` embeds a builtin data-type
+/// payload: some base linearizes over `str` or `int`.  Mirrors
+/// `dict::class_bases_embed_dict` (non-heap name match).
+#[must_use]
+pub unsafe fn class_bases_embed_payload(bases: &[*mut PyType]) -> bool {
+    bases.iter().copied().any(|base| {
+        unsafe { crate::mro::mro_entries(base) }.iter().any(|entry| {
+            !entry.is_null()
+                && unsafe {
+                    (**entry).gc_type_id != TYPE_ID_HEAP_INSTANCE.0 as usize
+                        && PAYLOAD_BASE_NAMES.contains(&(**entry).name())
+                }
+        })
+    })
+}
+
+/// Traces GC references of a payload-subclass instance: the heap-instance
+/// prefix plus the embedded payload (heap payloads only; tagged ints carry
+/// no allocation).
+pub unsafe extern "C" fn trace_payload_subclass_instance(object: *mut u8, visitor: &mut dyn FnMut(*mut u8)) {
+    if object.is_null() {
+        return;
+    }
+    unsafe { crate::types::weakref::trace_heap_instance(object, visitor) };
+    let value = unsafe { (*object.cast::<PyPayloadSubclassInstance>()).value };
+    if !value.is_null() && crate::tag::is_heap(value) {
+        visitor(value.cast::<u8>());
+    }
+}
+
+/// Finalizes a payload-subclass instance: heap-instance semantics only (the
+/// payload is an independently managed object).
+pub unsafe extern "C" fn finalize_payload_subclass_instance(object: *mut u8) {
+    if object.is_null() {
+        return;
+    }
+    unsafe { crate::types::weakref::finalize_heap_instance(object) };
+}
+
+/// Allocate a payload-subclass instance of `cls` carrying `value`, with the
+/// instance dict/slot storage `cls` prescribes.
+pub(crate) unsafe fn alloc_payload_instance_for_class(cls: *mut PyType, value: *mut PyObject) -> Result<*mut PyObject, String> {
+    let dict = if unsafe { (*cls).tp_dictoffset != 0 } {
+        new_namespace()
+    } else {
+        ptr::null_mut()
+    };
+    unsafe { abi::alloc_payload_subclass_instance(cls, dict, slot_storage(cls), value) }
+}
+
 /// Best-effort extraction of UTF-8 text from a runtime string object.
+/// Str-subclass instances read through their canonical payload.
 #[must_use]
 pub unsafe fn unicode_text<'a>(object: *mut PyObject) -> Option<&'a str> {
-    if object.is_null() {
+    if object.is_null() || !crate::tag::is_heap(object) {
         return None;
     }
     let ty = unsafe { (*object).ob_type };
-    if ty.is_null() || unsafe { (*ty).name() != "str" } {
+    if ty.is_null() {
         return None;
     }
-    unsafe { (*object.cast::<PyUnicode>()).as_str() }
+    if unsafe { (*ty).name() } == "str" {
+        return unsafe { (*object.cast::<PyUnicode>()).as_str() };
+    }
+    let value = unsafe { payload_subclass_value(object) }?;
+    unsafe { unicode_text(value) }
 }
 
+/// Type of `object`, or NULL when `object` is NULL or a tagged immediate
+/// (immediates carry no dereferenceable type; callers route NULL through
+/// their existing error/fallthrough paths).
 unsafe fn object_type(object: *mut PyObject) -> *mut PyType {
-    if object.is_null() {
+    if object.is_null() || !crate::tag::is_heap(object) {
         ptr::null_mut()
     } else {
         unsafe { (*object).ob_type.cast_mut() }
@@ -178,7 +304,7 @@ fn leak_type_name(name: &str) -> &'static str {
     Box::leak(name.to_owned().into_boxed_str())
 }
 
-unsafe fn is_type_object(object: *mut PyObject) -> bool {
+pub(crate) unsafe fn is_type_object(object: *mut PyObject) -> bool {
     if object.is_null() {
         return false;
     }
@@ -394,6 +520,242 @@ fn namespace_allows_dict(bases: &[*mut PyType], spec: &SlotSpec) -> bool {
     !spec.declared || spec.wants_dict || bases.iter().any(|base| unsafe { !base.is_null() && (**base).tp_dictoffset != 0 })
 }
 
+/// Python-level construction hooks (`__new__`/`__init__`) found on a
+/// metaclass strictly below the builtin `type` in MRO order.
+struct MetaclassHooks {
+    new_hook: *mut PyObject,
+    init_hook: *mut PyObject,
+}
+
+impl MetaclassHooks {
+    fn any(&self) -> bool {
+        !self.new_hook.is_null() || !self.init_hook.is_null()
+    }
+}
+
+/// Scan `meta`'s MRO for Python construction hooks, stopping at the builtin
+/// `type` whose entries only describe default construction.
+unsafe fn metaclass_construction_hooks(meta: *mut PyType) -> MetaclassHooks {
+    let mut hooks = MetaclassHooks {
+        new_hook: ptr::null_mut(),
+        init_hook: ptr::null_mut(),
+    };
+    let type_type = abi::runtime_type_type();
+    if meta.is_null() || meta == type_type {
+        return hooks;
+    }
+    let new_id = intern::intern("__new__");
+    let init_id = intern::intern("__init__");
+    for cls in unsafe { mro::mro_entries(meta) } {
+        if cls == type_type {
+            break;
+        }
+        if cls.is_null() {
+            continue;
+        }
+        let dict = unsafe { (*cls).tp_dict.cast::<PyClassDict>() };
+        if dict.is_null() {
+            continue;
+        }
+        if hooks.new_hook.is_null() {
+            if let Some(value) = unsafe { (&*dict).get(new_id) } {
+                hooks.new_hook = value;
+            }
+        }
+        if hooks.init_hook.is_null() {
+            if let Some(value) = unsafe { (&*dict).get(init_id) } {
+                hooks.init_hook = value;
+            }
+        }
+    }
+    hooks
+}
+
+/// Materialize an internal class namespace as a Python dict object.
+unsafe fn namespace_to_dict_object(namespace: *mut PyClassDict) -> *mut PyObject {
+    let out = unsafe { abi::map::pon_build_map(ptr::null_mut(), 0) };
+    if out.is_null() || namespace.is_null() {
+        return out;
+    }
+    for (name, value) in unsafe { (&*namespace).iter() } {
+        let Some(spelling) = intern::resolve(name) else {
+            continue;
+        };
+        let key = unsafe { abi::pon_const_str(spelling.as_ptr(), spelling.len()) };
+        if key.is_null() {
+            return ptr::null_mut();
+        }
+        if unsafe { abi::map::pon_dict_set_item_status(out, key, value) } < 0 {
+            return ptr::null_mut();
+        }
+    }
+    out
+}
+
+/// Call one metaclass constructor hook with `(head, name, bases, ns)` plus
+/// class keywords.  Python functions receive keywords through the binder;
+/// other callables only support keyword-free class statements.
+unsafe fn call_constructor_hook(
+    hook: *mut PyObject,
+    owner: *mut PyType,
+    argv: &[*mut PyObject],
+    keywords: &[ClassKeyword],
+) -> *mut PyObject {
+    let callable = unsafe { descr::descriptor_get(hook, ptr::null_mut(), owner) };
+    if callable.is_null() {
+        return ptr::null_mut();
+    }
+    // Classmethod hooks (`__prepare__`) bind into a method pair; pierce it so
+    // class keywords still reach the underlying Python function's binder.
+    let (hook_function, receiver) = match crate::types::method::bound_method_parts(callable) {
+        Some((im_func, im_self)) if unsafe { object_type_display(im_func) == "function" } => {
+            (im_func, Some(im_self))
+        }
+        _ => (callable, None),
+    };
+    if unsafe { object_type_display(hook_function) == "function" } {
+        let argv_with_receiver = receiver.map(|receiver| {
+            let mut out = Vec::with_capacity(argv.len() + 1);
+            out.push(receiver);
+            out.extend_from_slice(argv);
+            out
+        });
+        let full_argv = argv_with_receiver.as_deref().unwrap_or(argv);
+        let kw_names = keywords.iter().map(|keyword| keyword.name).collect::<Vec<_>>();
+        let kw_values = keywords.iter().map(|keyword| keyword.value).collect::<Vec<_>>();
+        let bound_keywords = function::KeywordArgs {
+            names: kw_names.as_slice(),
+            values: kw_values.as_slice(),
+        };
+        return unsafe {
+            function::call_bound_function(hook_function, full_argv, bound_keywords, None, None)
+                .unwrap_or_else(|message| raise_object(message))
+        };
+    }
+    if !keywords.is_empty() {
+        return raise_object("class keywords require a Python-level metaclass constructor");
+    }
+    let mut call_argv = argv.to_vec();
+    unsafe { abi::pon_call(callable, call_argv.as_mut_ptr(), call_argv.len()) }
+}
+
+/// CPython `__build_class__` parity: invoke `meta(name, bases, ns, **kwds)`
+/// through the metaclass's Python `__new__`/`__init__` hooks.
+unsafe fn call_metaclass_constructor(
+    metaclass: *mut PyType,
+    name: &str,
+    base_types: &[*mut PyType],
+    namespace: *mut PyClassDict,
+    ns_override: *mut PyObject,
+    keywords: &[ClassKeyword],
+    hooks: &MetaclassHooks,
+) -> *mut PyObject {
+    let name_object = unsafe { abi::pon_const_str(name.as_ptr(), name.len()) };
+    if name_object.is_null() {
+        return ptr::null_mut();
+    }
+    let mut base_objects = base_types.iter().map(|base| base.cast::<PyObject>()).collect::<Vec<_>>();
+    let bases_tuple = unsafe {
+        abi::seq::pon_build_tuple(
+            if base_objects.is_empty() {
+                ptr::null_mut()
+            } else {
+                base_objects.as_mut_ptr()
+            },
+            base_objects.len(),
+        )
+    };
+    if bases_tuple.is_null() {
+        return ptr::null_mut();
+    }
+    // A `__prepare__`-provided mapping passes through to the hooks intact
+    // (CPython hands the metaclass the very namespace the body executed in);
+    // the plain fast path materializes the internal namespace as a dict.
+    let ns_object = if ns_override.is_null() {
+        unsafe { namespace_to_dict_object(namespace) }
+    } else {
+        ns_override
+    };
+    if ns_object.is_null() {
+        return ptr::null_mut();
+    }
+    let class_keywords = keywords
+        .iter()
+        .copied()
+        .filter(|keyword| intern::resolve(keyword.name).as_deref() != Some("metaclass"))
+        .collect::<Vec<_>>();
+
+    let cls = if hooks.new_hook.is_null() {
+        unsafe { construct_class(metaclass, name, base_types, namespace, keywords) }
+    } else {
+        let argv = [metaclass.cast::<PyObject>(), name_object, bases_tuple, ns_object];
+        unsafe { call_constructor_hook(hooks.new_hook, metaclass, &argv, &class_keywords) }
+    };
+    if cls.is_null() {
+        return ptr::null_mut();
+    }
+
+    if !hooks.init_hook.is_null() {
+        let cls_type = unsafe { object_type(cls) };
+        if !cls_type.is_null() && unsafe { mro::is_subtype(cls_type, metaclass) } {
+            let argv = [cls, name_object, bases_tuple, ns_object];
+            let result = unsafe { call_constructor_hook(hooks.init_hook, metaclass, &argv, &class_keywords) };
+            if result.is_null() {
+                return ptr::null_mut();
+            }
+        }
+    }
+    cls
+}
+
+/// Python-visible `type.__new__`, installed on the builtin `type` object as a
+/// staticmethod: `type.__new__(type, x)` queries a type; the 4-argument form
+/// constructs a class with the requested metaclass (no hook re-dispatch, so
+/// `super().__new__(mcls, ...)` inside a metaclass `__new__` terminates here).
+pub unsafe extern "C" fn type_dunder_new(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { raw_arg_slice(argv, argc) } {
+        Ok(args) => args,
+        Err(message) => return raise_object(message),
+    };
+    if args.is_empty() {
+        return raise_object("type.__new__(): not enough arguments");
+    }
+    let mcls = args[0];
+    if mcls.is_null() || unsafe { !is_type_object(mcls) } {
+        return raise_object("type.__new__(X): X is not a type object");
+    }
+    match args.len() {
+        2 => {
+            let ty = unsafe { object_type(args[1]) };
+            if ty.is_null() {
+                return raise_object("type() argument has no type");
+            }
+            unsafe { canonical_type_object(ty) }.cast::<PyObject>()
+        }
+        4 => {
+            let Some(name) = (unsafe { unicode_text(args[1]) }) else {
+                return raise_object("type.__new__() argument 1 must be str");
+            };
+            let bases = match unsafe { positional_args_from_object(args[2]) } {
+                Ok(bases) => bases,
+                Err(_) => return raise_object("type.__new__() argument 2 must be tuple"),
+            };
+            let namespace = match unsafe { namespace_from_mapping(args[3]) } {
+                Ok(namespace) => namespace,
+                Err(message) => return raise_object(message),
+            };
+            let Some(base_types) = (unsafe { normalize_bases(&bases) }) else {
+                return ptr::null_mut();
+            };
+            let Some(winner) = (unsafe { select_metaclass(&base_types, mcls) }) else {
+                return ptr::null_mut();
+            };
+            unsafe { construct_class(winner, name, &base_types, namespace, &[]) }
+        }
+        n => raise_object(format!("type.__new__() takes exactly 3 arguments ({} given)", n - 1)),
+    }
+}
+
 /// Allocate a heap type with a pre-populated namespace and C3 MRO.
 #[must_use]
 pub unsafe fn build_class_from_namespace(
@@ -405,6 +767,7 @@ pub unsafe fn build_class_from_namespace(
     if namespace.is_null() {
         return raise_object("class namespace is NULL");
     }
+    unsafe { seed_namespace_module(namespace) };
     let Some(base_types) = (unsafe { normalize_bases(bases) }) else {
         return ptr::null_mut();
     };
@@ -416,20 +779,260 @@ pub unsafe fn build_class_from_namespace(
     let Some(metaclass) = (unsafe { select_metaclass(&base_types, explicit_meta) }) else {
         return ptr::null_mut();
     };
+    let hooks = unsafe { metaclass_construction_hooks(metaclass) };
+    if hooks.any() {
+        return unsafe { call_metaclass_constructor(metaclass, name, &base_types, namespace, ptr::null_mut(), keywords, &hooks) };
+    }
+    unsafe { construct_class(metaclass, name, &base_types, namespace, keywords) }
+}
+
+/// CPython class bodies always see `__module__`: the compiler seeds
+/// `__module__ = __name__` before the body runs, and `type.__new__` falls
+/// back to the caller's globals when the namespace lacks it.  pon's lowering
+/// emits neither, so class construction seeds the active module's name
+/// (`__main__` outside module execution) into any namespace missing it —
+/// stdlib machinery (`enum._simple_enum`, pickling) reads `cls.__module__`.
+unsafe fn seed_namespace_module(namespace: *mut PyClassDict) {
+    if namespace.is_null() {
+        return;
+    }
+    let module_id = intern::intern("__module__");
+    if unsafe { (&*namespace).get(module_id) }.is_some() {
+        return;
+    }
+    let name = crate::import::active_module_name_id()
+        .and_then(intern::resolve)
+        .unwrap_or_else(|| "__main__".to_owned());
+    let value = unsafe { abi::pon_const_str(name.as_ptr(), name.len()) };
+    if value.is_null() {
+        // Allocation failure is already recorded; construction surfaces it.
+        return;
+    }
+    unsafe { (&mut *namespace).set(module_id, value) };
+}
+
+/// MRO scan for a Python-level `__prepare__` strictly below the builtin
+/// `type`: the builtin default (a fresh empty dict) is exactly what the
+/// plain fast path provides, so only user hooks select the mapping protocol.
+unsafe fn find_prepare_hook(meta: *mut PyType) -> *mut PyObject {
+    let type_type = abi::runtime_type_type();
+    if meta.is_null() || meta == type_type {
+        return ptr::null_mut();
+    }
+    let prepare_id = intern::intern("__prepare__");
+    for cls in unsafe { mro::mro_entries(meta) } {
+        if cls == type_type {
+            break;
+        }
+        if cls.is_null() {
+            continue;
+        }
+        let dict = unsafe { (*cls).tp_dict.cast::<PyClassDict>() };
+        if dict.is_null() {
+            continue;
+        }
+        if let Some(value) = unsafe { (&*dict).get(prepare_id) } {
+            return value;
+        }
+    }
+    ptr::null_mut()
+}
+
+/// Pre-body scope for one class statement, from [`prepare_class_scope`].
+pub struct PreparedClassScope {
+    /// `__prepare__`-provided namespace mapping; NULL selects the internal
+    /// `PyClassDict` fast path.
+    pub mapping: *mut PyObject,
+    /// Bases with `__mro_entries__` already resolved (CPython `update_bases`
+    /// runs once, before `__prepare__` and the body).
+    pub bases: Vec<*mut PyObject>,
+}
+
+/// CPython `__build_class__` prepare step: resolve the winning metaclass and
+/// call its Python-level `__prepare__(name, bases, **kwds)` when one exists
+/// below the builtin `type`.  Ordinary classes skip the call entirely — the
+/// internal class namespace IS `type.__prepare__`'s empty dict.  Returns
+/// `Err(())` with the exception set when resolution or the hook fails.
+pub unsafe fn prepare_class_scope(
+    name: &str,
+    bases: &[*mut PyObject],
+    keywords: &[ClassKeyword],
+) -> Result<PreparedClassScope, ()> {
+    let Some(base_types) = (unsafe { normalize_bases(bases) }) else {
+        return Err(());
+    };
+    let resolved_bases = base_types.iter().map(|base| base.cast::<PyObject>()).collect::<Vec<_>>();
+    let explicit_meta = keywords
+        .iter()
+        .find(|keyword| intern::resolve(keyword.name).as_deref() == Some("metaclass"))
+        .map(|keyword| keyword.value)
+        .unwrap_or(ptr::null_mut());
+    let Some(metaclass) = (unsafe { select_metaclass(&base_types, explicit_meta) }) else {
+        return Err(());
+    };
+    let hook = unsafe { find_prepare_hook(metaclass) };
+    if hook.is_null() {
+        return Ok(PreparedClassScope {
+            mapping: ptr::null_mut(),
+            bases: resolved_bases,
+        });
+    }
+    let name_object = unsafe { abi::pon_const_str(name.as_ptr(), name.len()) };
+    if name_object.is_null() {
+        return Err(());
+    }
+    let mut base_objects = resolved_bases.clone();
+    let bases_tuple = unsafe {
+        abi::seq::pon_build_tuple(
+            if base_objects.is_empty() {
+                ptr::null_mut()
+            } else {
+                base_objects.as_mut_ptr()
+            },
+            base_objects.len(),
+        )
+    };
+    if bases_tuple.is_null() {
+        return Err(());
+    }
+    let class_keywords = keywords
+        .iter()
+        .copied()
+        .filter(|keyword| intern::resolve(keyword.name).as_deref() != Some("metaclass"))
+        .collect::<Vec<_>>();
+    let argv = [name_object, bases_tuple];
+    let mapping = unsafe { call_constructor_hook(hook, metaclass, &argv, &class_keywords) };
+    if mapping.is_null() {
+        return Err(());
+    }
+    // CPython validates before running the body: the namespace must be a
+    // mapping (concrete dict storage, or `__getitem__` reachable through the
+    // MRO — the dict method natives install lazily, so storage is checked
+    // first).
+    let mapping_type = unsafe { object_type(mapping) };
+    let supports_items = unsafe { dict::has_dict_storage(mapping) }
+        || (!mapping_type.is_null()
+            && unsafe { !descr::lookup_in_type(mapping_type, intern::intern("__getitem__")).is_null() });
+    if !supports_items {
+        let message = format!(
+            "{}.__prepare__() must return a mapping, not {}",
+            unsafe { (*metaclass).name() },
+            unsafe { object_type_display(mapping) },
+        );
+        unsafe { abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+        return Err(());
+    }
+    Ok(PreparedClassScope {
+        mapping,
+        bases: resolved_bases,
+    })
+}
+
+/// Build a class whose body executed into a `__prepare__`-provided mapping.
+/// Metaclass constructor hooks receive the mapping object itself (CPython
+/// passes the prepared namespace through); default construction snapshots it
+/// into the internal class namespace, exactly like `type.__new__` does.
+#[must_use]
+pub unsafe fn build_class_from_prepared_mapping(
+    name: &str,
+    bases: &[*mut PyObject],
+    mapping: *mut PyObject,
+    keywords: &[ClassKeyword],
+) -> *mut PyObject {
+    let Some(base_types) = (unsafe { normalize_bases(bases) }) else {
+        return ptr::null_mut();
+    };
+    let explicit_meta = keywords
+        .iter()
+        .find(|keyword| intern::resolve(keyword.name).as_deref() == Some("metaclass"))
+        .map(|keyword| keyword.value)
+        .unwrap_or(ptr::null_mut());
+    let Some(metaclass) = (unsafe { select_metaclass(&base_types, explicit_meta) }) else {
+        return ptr::null_mut();
+    };
+    let hooks = unsafe { metaclass_construction_hooks(metaclass) };
+    // The internal snapshot is consumed only by default construction; a
+    // Python `__new__` hook receives the mapping itself and any conversion
+    // happens inside the `super().__new__` chain (CPython `type.__new__`
+    // copies the mapping at that point, after hook-side mutation).
+    let namespace = if hooks.new_hook.is_null() {
+        match unsafe { namespace_from_mapping(mapping) } {
+            Ok(namespace) => namespace,
+            Err(_) => {
+                return raise_object(format!(
+                    "__prepare__ namespace of type '{}' does not convert to a class namespace",
+                    unsafe { object_type_display(mapping) },
+                ));
+            }
+        }
+    } else {
+        ptr::null_mut()
+    };
+    if hooks.any() {
+        return unsafe {
+            call_metaclass_constructor(metaclass, name, &base_types, namespace, mapping, keywords, &hooks)
+        };
+    }
+    unsafe { construct_class(metaclass, name, &base_types, namespace, keywords) }
+}
+
+/// `type.__new__` core: allocate and publish the heap type object.
+#[must_use]
+unsafe fn construct_class(
+    metaclass: *mut PyType,
+    name: &str,
+    base_types: &[*mut PyType],
+    namespace: *mut PyClassDict,
+    keywords: &[ClassKeyword],
+) -> *mut PyObject {
+    if namespace.is_null() {
+        return raise_object("class namespace is NULL");
+    }
+    // CPython: `class C:` means `class C(object):` — the implicit terminus
+    // applies to the CONSTRUCTED type (tp_base, MRO, registries) while the
+    // Python-visible `bases` tuple handed to metaclasses stays as written.
+    let object_default: [*mut PyType; 1];
+    let base_types: &[*mut PyType] = if base_types.is_empty() {
+        match abi::runtime_global(intern::intern("object")) {
+            Some(object_type) if unsafe { is_type_object(object_type) } && object_type.cast::<PyType>() != metaclass => {
+                object_default = [object_type.cast::<PyType>()];
+                &object_default
+            }
+            _ => base_types,
+        }
+    } else {
+        base_types
+    };
     let slot_spec = match slot_spec_from_namespace(unsafe { &*namespace }) {
         Ok(spec) => spec,
         Err(message) => return raise_object(message),
     };
-    if unsafe { !validate_slot_layout(&*namespace, &base_types, &slot_spec) } {
+    if unsafe { !validate_slot_layout(&*namespace, base_types, &slot_spec) } {
         return ptr::null_mut();
     }
 
     let static_name = leak_type_name(name);
-    let mut ty = PyType::new(metaclass, static_name, mem::size_of::<PyHeapInstance>());
+    // Classes linearizing over the builtin `dict` embed native dict storage in
+    // their instances; the distinct basicsize doubles as the layout marker
+    // (`dict::type_is_dict_subclass`), and the dict type's method surface must
+    // exist before MRO lookups on the new class can resolve through it.
+    let embeds_dict = unsafe { crate::types::dict::class_bases_embed_dict(base_types) };
+    let instance_size = if embeds_dict {
+        crate::types::dict::ensure_dict_subclass_methods_installed();
+        mem::size_of::<crate::types::dict::PyDictSubclassInstance>()
+    } else if unsafe { class_bases_embed_payload(base_types) } {
+        // Classes linearizing over `str`/`int` embed a canonical payload
+        // slot; the distinct basicsize is the layout marker
+        // (`type_is_payload_subclass`).
+        mem::size_of::<PyPayloadSubclassInstance>()
+    } else {
+        mem::size_of::<PyHeapInstance>()
+    };
+    let mut ty = PyType::new(metaclass, static_name, instance_size);
     ty.tp_base = base_types.first().copied().unwrap_or(ptr::null_mut());
     ty.tp_bases = ptr::null_mut();
     ty.tp_dict = namespace.cast::<PyObject>();
-    ty.tp_dictoffset = if namespace_allows_dict(&base_types, &slot_spec) { 1 } else { 0 };
+    ty.tp_dictoffset = if namespace_allows_dict(base_types, &slot_spec) { 1 } else { 0 };
     ty.tp_getattro = Some(descr::generic_get_attr);
     ty.tp_setattro = Some(descr::generic_set_attr);
     ty.tp_new = Some(type_new);
@@ -437,7 +1040,10 @@ pub unsafe fn build_class_from_namespace(
     ty.gc_type_id = TYPE_ID_HEAP_INSTANCE.0 as usize;
 
     let ty = Box::into_raw(Box::new(ty));
-    if unsafe { mro::set_c3_mro(ty, &base_types) } < 0 {
+    // GC visibility: the type box is malloc'd, so the collector can only keep
+    // the namespace's GC values alive through the namespaced-type root set.
+    crate::sync::register_namespaced_type(ty);
+    if unsafe { mro::set_c3_mro(ty, base_types) } < 0 {
         return ptr::null_mut();
     }
     // J0.3 §6 note A: register the new type with every MRO ancestor so a
@@ -448,6 +1054,12 @@ pub unsafe fn build_class_from_namespace(
             crate::sync::register_subclass(ancestor, ty);
         }
     }
+    // Declared-base registry backing `cls.__subclasses__()`.
+    for base in base_types.iter().copied() {
+        if !base.is_null() && base != ty {
+            crate::sync::register_direct_subclass(base, ty);
+        }
+    }
 
     install_slot_descriptors(ty, namespace, &slot_spec);
     for (name, value) in unsafe { (&*namespace).iter().collect::<Vec<_>>() } {
@@ -456,7 +1068,7 @@ pub unsafe fn build_class_from_namespace(
     if unsafe { !call_set_names(ty, namespace) } {
         return ptr::null_mut();
     }
-    if unsafe { !call_init_subclass(ty, &base_types, keywords) } {
+    if unsafe { !call_init_subclass(ty, base_types, keywords) } {
         return ptr::null_mut();
     }
     ty.cast::<PyObject>()
@@ -502,7 +1114,9 @@ fn install_slot_descriptors(ty: *mut PyType, namespace: *mut PyClassDict, spec: 
 }
 
 unsafe fn is_member_descriptor(value: *mut PyObject) -> bool {
-    !value.is_null() && unsafe { (*value).ob_type == member_descriptor_type().cast_const() }
+    !value.is_null()
+        && crate::tag::is_heap(value)
+        && unsafe { (*value).ob_type == member_descriptor_type().cast_const() }
 }
 
 unsafe fn own_slot_count(ty: *mut PyType) -> usize {
@@ -589,12 +1203,43 @@ pub unsafe extern "C" fn type_new(cls: *mut PyType, _args: *mut PyObject, _kwarg
     if cls.is_null() {
         return raise_object("cannot instantiate NULL type");
     }
+    // PEP 3119: ABCMeta stores a non-empty `__abstractmethods__` frozenset in
+    // the class's own dict; instantiating such a class is a TypeError.
+    let type_dict = unsafe { (*cls).tp_dict.cast::<PyClassDict>() };
+    if !type_dict.is_null() {
+        if let Some(abstracts) = unsafe { (&*type_dict).get(intern::intern("__abstractmethods__")) } {
+            if unsafe { abi::pon_is_true(abstracts) } == 1 {
+                let message = format!(
+                    "Can't instantiate abstract class {} without an implementation for its abstract methods",
+                    unsafe { (*cls).name() }
+                );
+                unsafe { abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+                return ptr::null_mut();
+            }
+        }
+    }
     let dict = if unsafe { (*cls).tp_dictoffset != 0 } {
         new_namespace()
     } else {
         ptr::null_mut()
     };
     let slots = slot_storage(cls);
+    if unsafe { crate::types::dict::type_is_dict_subclass(cls) } {
+        // Dict-derived classes allocate the extended layout: heap-instance
+        // prefix plus embedded dict storage.
+        return match crate::abi::map::alloc_dict_subclass_instance(cls, dict, slots) {
+            Ok(object) => object,
+            Err(message) => raise_object(message),
+        };
+    }
+    if unsafe { type_is_payload_subclass(cls) } {
+        // Payload-derived classes allocate the extended layout; the payload
+        // slot starts empty and is filled by `str.__new__`/`int.__new__`.
+        return match unsafe { abi::alloc_payload_subclass_instance(cls, dict, slots, ptr::null_mut()) } {
+            Ok(object) => object,
+            Err(message) => raise_object(message),
+        };
+    }
     match abi::alloc_heap_instance(cls, dict, slots) {
         Ok(object) => object,
         Err(_message) if !abi::runtime_is_initialized() => {
@@ -690,12 +1335,17 @@ unsafe fn call_set_names(ty: *mut PyType, namespace: *mut PyClassDict) -> bool {
             }
         };
         if result.is_null() {
-            pon_err_set(format!(
-                "Error calling __set_name__ on '{}' instance '{}' in '{}'",
-                unsafe { (*value_ty).name() },
-                spelling,
-                unsafe { (*ty).name() }
-            ));
+            // CPython 3.12+: the original exception propagates (with a note
+            // attached); never replace it.  Only synthesize the context
+            // message when the callee failed without raising.
+            if !crate::thread_state::pon_err_occurred() {
+                pon_err_set(format!(
+                    "Error calling __set_name__ on '{}' instance '{}' in '{}'",
+                    unsafe { (*value_ty).name() },
+                    spelling,
+                    unsafe { (*ty).name() }
+                ));
+            }
             return false;
         }
     }
@@ -808,8 +1458,18 @@ pub unsafe fn builtin_type(argv: *mut *mut PyObject, argc: usize) -> *mut PyObje
         Ok(args) => args,
         Err(message) => return raise_object(message),
     };
+    // A trailing keyword marker carries `type(name, bases, ns, **kwds)` class
+    // keywords from the phase-A binder (`metaclass`, PEP 487 keywords, enum's
+    // `boundary`/`_simple`, ...); they ride to the metaclass constructor.
+    let (args, keywords) = match args.split_last() {
+        Some((&last, rest)) => match unsafe { crate::types::lazy_iter::kw_marker_pairs(last) } {
+            Some(pairs) => (rest, pairs),
+            None => (args, &[][..]),
+        },
+        None => (args, &[][..]),
+    };
     match args.len() {
-        1 => {
+        1 if keywords.is_empty() => {
             let object = args[0];
             if object.is_null() {
                 return raise_object("type() argument is NULL");
@@ -820,7 +1480,7 @@ pub unsafe fn builtin_type(argv: *mut *mut PyObject, argc: usize) -> *mut PyObje
             }
             unsafe { canonical_type_object(ty) }.cast::<PyObject>()
         }
-        3 => unsafe { build_class_from_type_args(args[0], args[1], args[2]) },
+        3 => unsafe { build_class_from_type_args(args[0], args[1], args[2], keywords) },
         n => raise_object(format!("type() takes 1 or 3 arguments, got {n}")),
     }
 }
@@ -836,7 +1496,12 @@ unsafe fn raw_arg_slice<'a>(argv: *mut *mut PyObject, argc: usize) -> Result<&'a
     })
 }
 
-unsafe fn build_class_from_type_args(name: *mut PyObject, bases: *mut PyObject, namespace: *mut PyObject) -> *mut PyObject {
+unsafe fn build_class_from_type_args(
+    name: *mut PyObject,
+    bases: *mut PyObject,
+    namespace: *mut PyObject,
+    keywords: &[(u32, *mut PyObject)],
+) -> *mut PyObject {
     let Some(name) = (unsafe { unicode_text(name) }) else {
         return raise_object("type.__new__() argument 1 must be str");
     };
@@ -848,7 +1513,11 @@ unsafe fn build_class_from_type_args(name: *mut PyObject, bases: *mut PyObject, 
         Ok(namespace) => namespace,
         Err(message) => return raise_object(message),
     };
-    unsafe { build_class_from_namespace(name, &bases, namespace, &[]) }
+    let keywords = keywords
+        .iter()
+        .map(|&(name, value)| ClassKeyword { name, value })
+        .collect::<Vec<_>>();
+    unsafe { build_class_from_namespace(name, &bases, namespace, &keywords) }
 }
 
 unsafe fn namespace_from_mapping(namespace: *mut PyObject) -> Result<*mut PyClassDict, String> {
@@ -856,7 +1525,7 @@ unsafe fn namespace_from_mapping(namespace: *mut PyObject) -> Result<*mut PyClas
         return Err("type.__new__() argument 3 must be dict".to_owned());
     }
     let ty = unsafe { object_type(namespace) };
-    if ty.is_null() || unsafe { (*ty).name() } != "dict" {
+    if ty.is_null() || unsafe { !dict::has_dict_storage(namespace) } {
         return Err("type.__new__() argument 3 must be dict".to_owned());
     }
     let entries = unsafe { dict::dict_entries_snapshot(namespace) }.map_err(|_| "type.__new__() argument 3 must be dict".to_owned())?;
@@ -865,6 +1534,11 @@ unsafe fn namespace_from_mapping(namespace: *mut PyObject) -> Result<*mut PyClas
         let Some(name) = (unsafe { unicode_text(entry.key) }) else {
             return Err("type.__new__() argument 3 keys must be str".to_owned());
         };
+        // Values are copied raw: they may be tagged immediates, which class
+        // dicts tolerate (descriptor probes, slot installers, and GC rooting
+        // all guard with `tag::is_heap` before dereferencing).  Boxing here is
+        // NOT an option — this runs inside the type-call path where the
+        // runtime lock may be held, and boxing allocates through it.
         unsafe { (&mut *out).set(intern::intern(name), entry.value) };
     }
     Ok(out)

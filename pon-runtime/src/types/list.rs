@@ -69,7 +69,10 @@ pub unsafe fn list_repr(object: *mut PyObject) -> Result<String, String> {
         if index != 0 {
             out.push_str(", ");
         }
-        out.push_str(&crate::native::builtins_mod::repr_text(item));
+        match crate::native::builtins_mod::try_repr_text(item) {
+            Ok(text) => out.push_str(&text),
+            Err(()) => return Err("list element repr raised".to_owned()),
+        }
     }
     out.push(']');
     Ok(out)

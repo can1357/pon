@@ -46,6 +46,18 @@ pub struct PyReversed {
     index: isize,
 }
 
+/// Legacy sequence iterator (CPython `PySeqIter`): wraps an object exposing
+/// `__getitem__` but no `__iter__` and steps indexes 0, 1, 2, ... until
+/// IndexError.  `seq` is nulled once exhausted so further `next()` calls stop
+/// cleanly without re-entering `__getitem__`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct PySeqIter {
+    pub ob_base: PyObjectHeader,
+    seq: *mut PyObject,
+    index: i64,
+}
+
 #[repr(C)]
 #[derive(Debug)]
 pub struct PyZipStrictMarker {
@@ -69,6 +81,17 @@ pub struct PySortOptions {
     reverse: bool,
 }
 
+/// Keyword-carrier appended by the native binder for variadic builtins whose
+/// keyword surface cannot be flattened into fixed positional slots
+/// (`itertools.zip_longest(fillvalue=...)`, `itertools.product(repeat=...)`).
+/// Pairs are `(interned name, value)` in call order.
+#[repr(C)]
+#[derive(Debug)]
+pub struct PyKwMarker {
+    pub ob_base: PyObjectHeader,
+    pairs: Vec<(u32, *mut PyObject)>,
+}
+
 
 #[derive(Clone, Copy, Debug)]
 pub struct MinMaxOptions {
@@ -88,9 +111,12 @@ static FILTER_TYPE: LazyLock<usize> = LazyLock::new(|| iterator_type("filter", m
 static ZIP_TYPE: LazyLock<usize> = LazyLock::new(|| iterator_type("zip", mem::size_of::<PyZip>()) as usize);
 static REVERSED_TYPE: LazyLock<usize> =
     LazyLock::new(|| iterator_type("list_reverseiterator", mem::size_of::<PyReversed>()) as usize);
+// CPython spells this type `iterator` (`type(iter(HasGetitemOnly()))`).
+static SEQ_ITER_TYPE: LazyLock<usize> = LazyLock::new(|| iterator_type("iterator", mem::size_of::<PySeqIter>()) as usize);
 static ZIP_STRICT_MARKER_TYPE: LazyLock<usize> = LazyLock::new(|| plain_type("zip_strict_marker", mem::size_of::<PyZipStrictMarker>()) as usize);
 static MINMAX_OPTIONS_TYPE: LazyLock<usize> = LazyLock::new(|| plain_type("minmax_options", mem::size_of::<PyMinMaxOptions>()) as usize);
 static SORT_OPTIONS_TYPE: LazyLock<usize> = LazyLock::new(|| plain_type("sort_options", mem::size_of::<PySortOptions>()) as usize);
+static KW_MARKER_TYPE: LazyLock<usize> = LazyLock::new(|| plain_type("kwargs_marker", mem::size_of::<PyKwMarker>()) as usize);
 
 fn iterator_type(name: &'static str, size: usize) -> *mut PyType {
     let mut ty = PyType::new(ptr::null(), name, size);
@@ -139,6 +165,15 @@ pub fn new_reversed(seq: *mut PyObject, len: isize) -> *mut PyObject {
     .cast::<PyObject>()
 }
 
+pub fn new_seq_iter(seq: *mut PyObject) -> *mut PyObject {
+    Box::into_raw(Box::new(PySeqIter {
+        ob_base: PyObjectHeader::new(*SEQ_ITER_TYPE as *const PyType),
+        seq,
+        index: 0,
+    }))
+    .cast::<PyObject>()
+}
+
 pub fn new_zip_strict_marker(strict: bool) -> *mut PyObject {
     Box::into_raw(Box::new(PyZipStrictMarker {
         ob_base: PyObjectHeader::new(*ZIP_STRICT_MARKER_TYPE as *const PyType),
@@ -162,6 +197,14 @@ pub fn new_sort_options(key: *mut PyObject, reverse: bool) -> *mut PyObject {
         ob_base: PyObjectHeader::new(*SORT_OPTIONS_TYPE as *const PyType),
         key,
         reverse,
+    }))
+    .cast::<PyObject>()
+}
+
+pub fn new_kw_marker(pairs: Vec<(u32, *mut PyObject)>) -> *mut PyObject {
+    Box::into_raw(Box::new(PyKwMarker {
+        ob_base: PyObjectHeader::new(*KW_MARKER_TYPE as *const PyType),
+        pairs,
     }))
     .cast::<PyObject>()
 }
@@ -198,6 +241,14 @@ pub unsafe fn sort_options_value(object: *mut PyObject) -> Option<SortOptions> {
     }
 }
 
+pub unsafe fn kw_marker_pairs<'a>(object: *mut PyObject) -> Option<&'a [(u32, *mut PyObject)]> {
+    if unsafe { is_exact_type(object, *KW_MARKER_TYPE as *const PyType) } {
+        Some(unsafe { (*object.cast::<PyKwMarker>()).pairs.as_slice() })
+    } else {
+        None
+    }
+}
+
 
 unsafe extern "C" fn identity_iter(object: *mut PyObject) -> *mut PyObject {
     object
@@ -216,6 +267,8 @@ unsafe extern "C" fn iterator_next(object: *mut PyObject) -> *mut PyObject {
         unsafe { zip_next(object.cast::<PyZip>()) }
     } else if ty == *REVERSED_TYPE as *const PyType {
         unsafe { reversed_next(object.cast::<PyReversed>()) }
+    } else if ty == *SEQ_ITER_TYPE as *const PyType {
+        unsafe { seq_iter_next(object.cast::<PySeqIter>()) }
     } else {
         raise_type_error("object is not an iterator")
     }
@@ -310,6 +363,33 @@ unsafe fn reversed_next(iter: *mut PyReversed) -> *mut PyObject {
     iter.index -= 1;
     result
 }
+
+unsafe fn seq_iter_next(iter: *mut PySeqIter) -> *mut PyObject {
+    let iter = unsafe { &mut *iter };
+    if iter.seq.is_null() {
+        return raise_stop_iteration();
+    }
+    let index = crate::types::int::from_i64(iter.index);
+    if index.is_null() {
+        return ptr::null_mut();
+    }
+    // Full subscript path so user-defined `__getitem__` overrides fire.
+    let result = unsafe { abi::object::pon_subscript_get(iter.seq, index, ptr::null_mut()) };
+    if result.is_null() {
+        // CPython `iterobject.c:seqiter_next`: IndexError or StopIteration
+        // raised by `__getitem__` is clean exhaustion; anything else (including
+        // message-only diagnostics) propagates to the caller.
+        if crate::abi::exc::pending_exception_is("IndexError") || crate::abi::exc::pending_exception_is("StopIteration") {
+            pon_err_clear();
+            iter.seq = ptr::null_mut();
+            return raise_stop_iteration();
+        }
+        return ptr::null_mut();
+    }
+    iter.index += 1;
+    result
+}
+
 
 #[derive(Clone, Copy, Debug)]
 enum NextItem {

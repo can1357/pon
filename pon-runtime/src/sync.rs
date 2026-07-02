@@ -189,6 +189,71 @@ pub fn register_subclass(base: *const PyType, derived: *const PyType) {
     }
 }
 
+/// Direct (declared-base) subclass registry backing `cls.__subclasses__()`.
+/// Distinct from [`TYPE_SUBCLASSES`], which records every MRO ancestor for
+/// transitive IC invalidation.
+static TYPE_DIRECT_SUBCLASSES: LazyLock<Mutex<HashMap<usize, Vec<usize>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Records `derived` as a declared direct subclass of `base`.
+pub fn register_direct_subclass(base: *const PyType, derived: *const PyType) {
+    if base.is_null() || derived.is_null() || core::ptr::eq(base, derived) {
+        return;
+    }
+    let mut table = TYPE_DIRECT_SUBCLASSES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let children = table.entry(base as usize).or_default();
+    if !children.contains(&(derived as usize)) {
+        children.push(derived as usize);
+    }
+}
+
+/// Declared direct subclasses of `base` in registration order.
+#[must_use]
+pub fn direct_subclasses(base: *const PyType) -> Vec<*mut PyType> {
+    let table = TYPE_DIRECT_SUBCLASSES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    table
+        .get(&(base as usize))
+        .map(|children| children.iter().map(|&address| address as *mut PyType).collect())
+        .unwrap_or_default()
+}
+
+// ─── GC rooting registry for types that own a namespace dictionary ──────────
+//
+// Type objects are malloc'd (`Box::into_raw`) rather than GC-heap allocations,
+// so the collector cannot trace through a type to the GC-managed values stored
+// in its `tp_dict` (`PyClassDict`).  Every type that acquires a namespace
+// registers here, and `abi::collect` roots each registered type's dict values
+// on every collection.  Like the subclass tables above, entries rely on the
+// current immortal-types contract (leaked boxes/statics); if type reclamation
+// ever lands, the collector must clear dead entries.
+static TYPES_WITH_NAMESPACE: LazyLock<Mutex<Vec<usize>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Records `ty` as owning a `PyClassDict` namespace whose values must be
+/// treated as GC roots.  Idempotent; NULL is ignored.
+pub fn register_namespaced_type(ty: *const PyType) {
+    if ty.is_null() {
+        return;
+    }
+    let mut table = TYPES_WITH_NAMESPACE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if !table.contains(&(ty as usize)) {
+        table.push(ty as usize);
+    }
+}
+
+/// Snapshot of every namespace-owning type in registration order.
+#[must_use]
+pub fn namespaced_types() -> Vec<*mut PyType> {
+    let table = TYPES_WITH_NAMESPACE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    table.iter().map(|&address| address as *mut PyType).collect()
+}
+
 /// Post-publication type mutation hook (J0.3 §6): bumps the in-object
 /// `version_tag` of `ty` and every transitive subclass, plus each type's
 /// side-table `version_epoch` (the ordered FT counter, step 4 of the §7

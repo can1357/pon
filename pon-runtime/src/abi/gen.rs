@@ -11,6 +11,7 @@ use core::{cell::Cell, ptr};
 
 use pon_gc::GcTypeInfo;
 
+use super::exc::pending_exception_object;
 use crate::abstract_op;
 use crate::feedback::FeedbackCell;
 use crate::object::{PyObject, PyType, is_exact_type};
@@ -135,10 +136,7 @@ fn raise_value_error(message: &str) -> *mut PyObject {
 }
 
 fn current_stop_iteration_value() -> Option<*mut PyObject> {
-    let current = thread_state_lock().current_exc;
-    if current.is_null() {
-        return None;
-    }
+    let current = pending_exception_object()?;
 
     let is_stop = super::with_runtime(|runtime| {
         // SAFETY: `current` is the thread state's active exception pointer.
@@ -161,11 +159,13 @@ fn stop_iteration_value_and_clear() -> Option<*mut PyObject> {
 }
 
 /// True when the pending exception matches builtin `kind`.
+///
+/// Message-only diagnostics (dangling `current_exc` sentinel) never match:
+/// they carry no exception object to test.
 fn pending_exception_matches(kind: ExceptionKind) -> bool {
-    let current = thread_state_lock().current_exc;
-    if current.is_null() {
+    let Some(current) = pending_exception_object() else {
         return false;
-    }
+    };
     super::with_runtime(|runtime| {
         // SAFETY: `current` is the thread state's active exception pointer.
         unsafe { is_exception_instance(current, runtime.exception_types.get(kind).cast_const()) }
@@ -782,7 +782,7 @@ mod tests {
     use super::*;
     use crate::abi::{format_object_for_print, pon_const_int, pon_get_iter, pon_none, pon_runtime_init};
     use crate::abi::seq::pon_build_range;
-    use crate::thread_state::{pon_err_clear, pon_err_message, pon_err_occurred, test_state_lock};
+    use crate::thread_state::{pon_err_clear, pon_err_message, pon_err_occurred, pon_err_set, test_state_lock};
 
     /// Hand-written body mirroring pin J0.1 §4.6: two yields, `a` spilled in
     /// slot 0 across suspend point 2, `StopIteration(a + b)` on finish.
@@ -1116,6 +1116,49 @@ mod tests {
             assert!(result.is_null());
             assert!(pending_exception_matches(ExceptionKind::GeneratorExit), "GeneratorExit must re-raise after closing the delegate");
             assert_eq!((*inner_frame).resume_state, RESUME_FINISHED, "delegate must be closed");
+            pon_err_clear();
+        }
+    }
+
+    #[test]
+    fn stop_iteration_queries_ignore_message_only_diagnostic_sentinel() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+            pon_err_clear();
+            pon_err_set("message-only diagnostic");
+            assert!(pon_err_occurred());
+
+            // Regression: pre-fix these dereferenced the dangling `current_exc`
+            // sentinel installed by `pon_err_set` and crashed (EXC_BAD_ACCESS).
+            assert!(
+                !pending_exception_matches(ExceptionKind::StopIteration),
+                "a message-only diagnostic carries no exception object to match",
+            );
+            assert_eq!(current_stop_iteration_value(), None);
+
+            assert!(pon_err_occurred(), "queries must not consume the pending diagnostic");
+            assert_eq!(pon_err_message().as_deref(), Some("message-only diagnostic"));
+            pon_err_clear();
+        }
+    }
+
+    #[test]
+    fn stop_iteration_queries_observe_real_raised_stop_iteration() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+            pon_err_clear();
+            let value = pon_const_int(7);
+            assert!(crate::abi::exc::pon_raise_stop_iteration(value).is_null());
+
+            assert!(pending_exception_matches(ExceptionKind::StopIteration));
+            assert_eq!(
+                current_stop_iteration_value(),
+                Some(value),
+                "StopIteration.value must be readable without clearing",
+            );
+            assert!(pon_err_occurred(), "the current-value query must leave StopIteration pending");
             pon_err_clear();
         }
     }

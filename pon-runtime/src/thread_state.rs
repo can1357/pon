@@ -211,9 +211,19 @@ pub fn test_state_lock() -> MutexGuard<'static, ()> {
 /// Until exception classes are introduced, the diagnostic string is the stable
 /// payload and `current_exc` is a non-null sentinel.  Runtime helpers that have a
 /// concrete boxed exception may use [`pon_err_set_object`] instead.
+///
+/// A live BOXED exception already pending is authoritative and is preserved:
+/// replacing it with a message-only sentinel would strip its type and make it
+/// uncatchable by `except` clauses (`pon_exc_matches` never matches the
+/// sentinel).  Helpers that intend to substitute a new error must
+/// [`pon_err_clear`] first or raise a boxed exception via `pon_raise_*`.
 pub fn pon_err_set(message: impl Into<String>) {
     let mut state = thread_state_lock();
-    state.current_exc = core::ptr::NonNull::<PyObject>::dangling().as_ptr();
+    let sentinel = core::ptr::NonNull::<PyObject>::dangling().as_ptr();
+    if !state.current_exc.is_null() && state.current_exc != sentinel {
+        return;
+    }
+    state.current_exc = sentinel;
     state.diagnostic_message = Some(message.into());
 }
 

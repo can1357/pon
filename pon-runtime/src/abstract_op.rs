@@ -83,6 +83,12 @@ pub unsafe fn binary_op(op: u8, a: *mut PyObject, b: *mut PyObject) -> *mut PyOb
         return raise_type_error("right operand is NULL or has no type");
     };
 
+    // `str % args` — CPython unicode `nb_remainder` (%-formatting).  Keyed by
+    // the exact type name, matching the str rich-compare fast path below.
+    if op == BINARY_MOD && unsafe { (*left_type).name() == "str" } {
+        return unsafe { abi::format::percent_format(a, b) };
+    }
+
     if op == BINARY_MUL {
         match unsafe { try_sequence_repeat(left_type, a, b) } {
             SlotOutcome::Value(value) => return value,
@@ -129,6 +135,44 @@ pub unsafe fn binary_op(op: u8, a: *mut PyObject, b: *mut PyObject) -> *mut PyOb
         }
     }
 
+    // Python-level binary dunders (heap classes: `IntFlag.__or__`, user
+    // `__add__`, ...) — native types express theirs through the slots above.
+    if let Some((forward, reflected)) = binary_dunder_names(op) {
+        if right_subtype && !same_type {
+            match unsafe { call_binary_dunder(right_type, reflected, b, a) } {
+                SlotOutcome::Value(value) => return value,
+                SlotOutcome::Error => return ptr::null_mut(),
+                SlotOutcome::Missing | SlotOutcome::NotImplemented => {}
+            }
+        }
+        match unsafe { call_binary_dunder(left_type, forward, a, b) } {
+            SlotOutcome::Value(value) => return value,
+            SlotOutcome::Error => return ptr::null_mut(),
+            SlotOutcome::Missing | SlotOutcome::NotImplemented => {}
+        }
+        if !right_subtype && !same_type {
+            match unsafe { call_binary_dunder(right_type, reflected, b, a) } {
+                SlotOutcome::Value(value) => return value,
+                SlotOutcome::Error => return ptr::null_mut(),
+                SlotOutcome::Missing | SlotOutcome::NotImplemented => {}
+            }
+        }
+    }
+
+    // Payload-subclass terminus: `int`/`str`-subclass instances without a
+    // Python-level override compute through their canonical payload (CPython
+    // inherits the base's number/sequence slots; results are the plain base
+    // type, `int`-subclass `+` returning exact `int`).
+    let left_payload = unsafe { crate::types::type_::payload_subclass_value(a) };
+    let right_payload = unsafe { crate::types::type_::payload_subclass_value(b) };
+    if left_payload.is_some() || right_payload.is_some() {
+        // Full numeric entry, not a bare `binary_op` recursion: the slot
+        // tables have no forward `**` wiring (`nb_power` is ternary), while
+        // `pon_binary_op` computes every numeric op directly and falls back
+        // here for non-numeric payloads (str concat, `%`-format).
+        return unsafe { abi::number::pon_binary_op(op, left_payload.unwrap_or(a), right_payload.unwrap_or(b), ptr::null_mut()) };
+    }
+
     raise_type_error(binary_unsupported_message(op))
 }
 
@@ -148,10 +192,30 @@ pub unsafe fn unary_op(op: u8, operand: *mut PyObject) -> *mut PyObject {
     };
 
     match unsafe { call_unary_slot(slot, operand) } {
-        SlotOutcome::Value(value) => value,
-        SlotOutcome::Error => ptr::null_mut(),
-        SlotOutcome::Missing | SlotOutcome::NotImplemented => raise_type_error(unary_unsupported_message(op)),
+        SlotOutcome::Value(value) => return value,
+        SlotOutcome::Error => return ptr::null_mut(),
+        SlotOutcome::Missing | SlotOutcome::NotImplemented => {}
     }
+
+    // Python-level unary dunders (heap classes: `Flag.__invert__`, ...).
+    let name = match op {
+        UNARY_NEG => "__neg__",
+        UNARY_POS => "__pos__",
+        UNARY_INVERT => "__invert__",
+        _ => return raise_type_error(unary_unsupported_message(op)),
+    };
+    match unsafe { call_unary_dunder(ty, name, operand) } {
+        SlotOutcome::Value(value) => return value,
+        SlotOutcome::Error => return ptr::null_mut(),
+        SlotOutcome::Missing | SlotOutcome::NotImplemented => {}
+    }
+
+    // Payload-subclass terminus (see `binary_op`).
+    if let Some(payload) = unsafe { crate::types::type_::payload_subclass_value(operand) } {
+        return unsafe { unary_op(op, payload) };
+    }
+
+    raise_type_error(unary_unsupported_message(op))
 }
 
 /// Dispatches a rich comparison.  Exact PyLong comparisons are handled directly;
@@ -245,6 +309,15 @@ pub unsafe fn rich_compare(op: u8, a: *mut PyObject, b: *mut PyObject) -> *mut P
             SlotOutcome::Error => return ptr::null_mut(),
             SlotOutcome::Missing | SlotOutcome::NotImplemented => {}
         }
+    }
+
+    // Payload-subclass terminus: an `int`/`str`-subclass operand without a
+    // Python-level override compares through its canonical payload (CPython
+    // inherits the base's `tp_richcompare`: `IntEnum.B == 2`).
+    let left_payload = unsafe { crate::types::type_::payload_subclass_value(a) };
+    let right_payload = unsafe { crate::types::type_::payload_subclass_value(b) };
+    if left_payload.is_some() || right_payload.is_some() {
+        return unsafe { rich_compare(op, left_payload.unwrap_or(a), right_payload.unwrap_or(b)) };
     }
 
     match op {
@@ -420,7 +493,62 @@ pub unsafe fn is_true(object: *mut PyObject) -> i32 {
         return unsafe { len_to_truth(slot(object), "mapping __len__ returned a negative value without setting an exception") };
     }
 
+    // Python-level `__bool__`/`__len__` on heap instances (slotless types;
+    // e.g. dict subclasses reaching dict's tp_dict `__len__` native).  Order
+    // matches CPython: `__bool__` wins over `__len__`, and `__bool__` must
+    // return a strict bool — anything else is a TypeError, never recursed.
+    let bool_hook = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern("__bool__")) };
+    if !bool_hook.is_null() {
+        let result = unsafe { call_truth_hook(bool_hook, object, ty) };
+        if result.is_null() {
+            return -1;
+        }
+        let Some(value) = (unsafe { crate::types::bool_::to_bool(crate::tag::untag_arg(result)) }) else {
+            let returned = unsafe { crate::types::dict::type_name(crate::tag::untag_arg(result)) }.unwrap_or("object");
+            return raise_type_error_status(&format!("__bool__ should return bool, returned {returned}"));
+        };
+        return i32::from(value);
+    }
+    let len_hook = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern("__len__")) };
+    if !len_hook.is_null() {
+        let result = unsafe { call_truth_hook(len_hook, object, ty) };
+        if result.is_null() {
+            return -1;
+        }
+        let len = unsafe { is_true_len_value(result) };
+        if len < 0 {
+            return -1;
+        }
+        return i32::from(len > 0);
+    }
+
     1
+}
+
+/// Binds and invokes a zero-argument truth hook (`__bool__`/`__len__`).
+unsafe fn call_truth_hook(hook: *mut PyObject, object: *mut PyObject, ty: *mut PyType) -> *mut PyObject {
+    let bound = unsafe { crate::descr::descriptor_get(hook, object, ty) };
+    if bound.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { abi::pon_call(bound, ptr::null_mut(), 0) }
+}
+
+/// Extracts a non-negative length from a `__len__` result for truth testing.
+unsafe fn is_true_len_value(result: *mut PyObject) -> i64 {
+    let Some(value) = (unsafe { crate::types::int::to_bigint_including_bool(crate::tag::untag_arg(result)) }) else {
+        return raise_type_error_status("'object' object cannot be interpreted as an integer").into();
+    };
+    use num_traits::ToPrimitive;
+    match value.to_i64() {
+        Some(len) if len >= 0 => len,
+        Some(_) => {
+            let message = "__len__() should return >= 0";
+            let _ = unsafe { abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) };
+            -1
+        }
+        None => raise_type_error_status("cannot fit '__len__' result into an index-sized integer").into(),
+    }
 }
 
 /// Dispatches attribute lookup through `tp_getattro`.
@@ -429,7 +557,21 @@ pub unsafe fn get_attr(object: *mut PyObject, name: u32) -> *mut PyObject {
         return raise_type_error("attribute receiver is NULL or has no type");
     };
     let Some(slot) = (unsafe { (*ty).tp_getattro }) else {
-        return raise_type_error("object does not support attribute lookup");
+        // Slotless native receivers (e.g. int) still expose the universal
+        // `__class__` (CPython: `object.__class__` getset).
+        if name == crate::intern::intern("__class__") {
+            return ty.cast::<PyObject>();
+        }
+        // Exact `int`/`bool` receivers: the narrow instance-method surface
+        // (`bit_length`, `bit_count`, `numerator`/`denominator`/...).
+        if let Some(result) = unsafe { crate::types::int::int_instance_attr(object, name) } {
+            return result;
+        }
+        let attr = crate::intern::resolve(name).unwrap_or_else(|| format!("<interned:{name}>"));
+        return raise_type_error(&format!(
+            "'{}' object does not support attribute lookup (attribute '{attr}')",
+            unsafe { (*ty).name() },
+        ));
     };
     let Some(name_object) = interned_name_object(name) else {
         return raise_type_error("attribute name is not interned");
@@ -437,6 +579,16 @@ pub unsafe fn get_attr(object: *mut PyObject, name: u32) -> *mut PyObject {
 
     let result = unsafe { slot(object, name_object) };
     if result.is_null() {
+        // Native resolvers answer only their method tables; `__class__` is
+        // universal, so recover it here.  Heap types go through
+        // `generic_get_attr`, which serves `__class__` itself (and lets a
+        // data-descriptor override win), so it is excluded from the rescue.
+        if name == crate::intern::intern("__class__")
+            && !core::ptr::fn_addr_eq(slot, crate::descr::generic_get_attr as unsafe extern "C" fn(_, _) -> _)
+        {
+            crate::thread_state::pon_err_clear();
+            return ty.cast::<PyObject>();
+        }
         ensure_exception("attribute lookup returned NULL without setting an exception");
     }
     result
@@ -463,7 +615,30 @@ pub unsafe fn get_iter(object: *mut PyObject) -> *mut PyObject {
     match unsafe { call_unary_slot(slot, object) } {
         SlotOutcome::Value(value) => value,
         SlotOutcome::Error => ptr::null_mut(),
-        SlotOutcome::Missing | SlotOutcome::NotImplemented => raise_type_error("object is not iterable"),
+        SlotOutcome::Missing | SlotOutcome::NotImplemented => {
+            // Python-level `__iter__` (heap instances, e.g. WeakSet).
+            let hook = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern("__iter__")) };
+            if hook.is_null() {
+                // Legacy sequence-iteration protocol (CPython
+                // `PyObject_GetIter` -> `PySeqIter_New`): a type providing
+                // `__getitem__` — native `sq_item` or a Python-level dunder
+                // resolved on the class MRO, never the instance — iterates by
+                // calling `__getitem__(0)`, `__getitem__(1)`, ... until
+                // IndexError (vendored `re._parser.SubPattern`).
+                let sq_item = unsafe { (*ty).tp_as_sequence.as_ref().and_then(|methods| methods.sq_item) };
+                if sq_item.is_some()
+                    || !unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern("__getitem__")) }.is_null()
+                {
+                    return crate::types::lazy_iter::new_seq_iter(object);
+                }
+                return raise_type_error(&format!("'{}' object is not iterable", unsafe { (*ty).name() }));
+            }
+            let bound = unsafe { crate::descr::descriptor_get(hook, object, ty) };
+            if bound.is_null() {
+                return ptr::null_mut();
+            }
+            unsafe { abi::pon_call(bound, ptr::null_mut(), 0) }
+        }
     }
 }
 
@@ -525,7 +700,20 @@ pub unsafe fn subscript_get(object: *mut PyObject, key: *mut PyObject) -> *mut P
         return alias;
     }
 
-    raise_type_error("object is not subscriptable")
+    // Python-level `__getitem__` (heap instances, incl. dict subclasses
+    // reaching the natives installed in dict's tp_dict; user overrides win
+    // by MRO order).  Mirrors the `__delitem__` fallback in `subscript_del`.
+    let getitem = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern("__getitem__")) };
+    if !getitem.is_null() {
+        let callable = unsafe { crate::descr::descriptor_get(getitem, object, ty) };
+        if callable.is_null() {
+            return ptr::null_mut();
+        }
+        let mut argv = [key];
+        return unsafe { abi::pon_call(callable, argv.as_mut_ptr(), argv.len()) };
+    }
+
+    raise_type_error(&format!("'{}' object is not subscriptable", unsafe { (*ty).name() }))
 }
 
 /// Deletes a subscription through mapping/sequence assignment slots or `__delitem__`.
@@ -573,7 +761,11 @@ pub unsafe fn subscript_del(object: *mut PyObject, key: *mut PyObject) -> *mut P
         return unsafe { abi::pon_none() };
     }
 
-    raise_type_error("object does not support item deletion")
+    // CPython wording differs by key kind: integer keys reach the
+    // `PySequence_DelItem` error ("doesn't"), everything else the
+    // `PyObject_DelItem` error ("does not").
+    let verb = if unsafe { is_exact_pylong(key) } { "doesn't" } else { "does not" };
+    raise_type_error(&format!("'{}' object {verb} support item deletion", unsafe { (*ty).name() }))
 }
 
 /// Builds `types.GenericAlias` for `builtin[key]` subscripts on constructor
@@ -703,6 +895,62 @@ unsafe fn call_rich_dunder(method: *mut PyObject, obj: *mut PyObject, other: *mu
     let mut argv = [other];
     let result = unsafe { abi::pon_call(callable, argv.as_mut_ptr(), argv.len()) };
     slot_result(result, "rich comparison method returned NULL without setting an exception")
+}
+
+/// Forward/reflected Python dunder spellings for a binary numeric op.
+fn binary_dunder_names(op: u8) -> Option<(&'static str, &'static str)> {
+    Some(match op {
+        BINARY_ADD => ("__add__", "__radd__"),
+        BINARY_SUB => ("__sub__", "__rsub__"),
+        BINARY_MUL => ("__mul__", "__rmul__"),
+        BINARY_DIV => ("__truediv__", "__rtruediv__"),
+        BINARY_FLOORDIV => ("__floordiv__", "__rfloordiv__"),
+        BINARY_MOD => ("__mod__", "__rmod__"),
+        BINARY_POW => ("__pow__", "__rpow__"),
+        BINARY_LSHIFT => ("__lshift__", "__rlshift__"),
+        BINARY_RSHIFT => ("__rshift__", "__rrshift__"),
+        BINARY_AND => ("__and__", "__rand__"),
+        BINARY_OR => ("__or__", "__ror__"),
+        BINARY_XOR => ("__xor__", "__rxor__"),
+        BINARY_MATMUL => ("__matmul__", "__rmatmul__"),
+        _ => return None,
+    })
+}
+
+/// Calls a Python-level binary dunder resolved from a HEAP class's MRO.
+/// Native receivers report `Missing` (their behavior lives in slots).
+unsafe fn call_binary_dunder(ty: *mut PyType, name: &str, receiver: *mut PyObject, other: *mut PyObject) -> SlotOutcome {
+    if unsafe { (*ty).gc_type_id } != crate::types::type_::TYPE_ID_HEAP_INSTANCE.0 as usize {
+        return SlotOutcome::Missing;
+    }
+    let hook = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern(name)) };
+    if hook.is_null() {
+        return SlotOutcome::Missing;
+    }
+    let callable = unsafe { crate::descr::descriptor_get(hook, receiver, ty) };
+    if callable.is_null() {
+        return SlotOutcome::Error;
+    }
+    let mut argv = [other];
+    let result = unsafe { abi::pon_call(callable, argv.as_mut_ptr(), argv.len()) };
+    slot_result(result, "binary dunder returned NULL without setting an exception")
+}
+
+/// Calls a Python-level unary dunder resolved from a HEAP class's MRO.
+unsafe fn call_unary_dunder(ty: *mut PyType, name: &str, receiver: *mut PyObject) -> SlotOutcome {
+    if unsafe { (*ty).gc_type_id } != crate::types::type_::TYPE_ID_HEAP_INSTANCE.0 as usize {
+        return SlotOutcome::Missing;
+    }
+    let hook = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern(name)) };
+    if hook.is_null() {
+        return SlotOutcome::Missing;
+    }
+    let callable = unsafe { crate::descr::descriptor_get(hook, receiver, ty) };
+    if callable.is_null() {
+        return SlotOutcome::Error;
+    }
+    let result = unsafe { abi::pon_call(callable, ptr::null_mut(), 0) };
+    slot_result(result, "unary dunder returned NULL without setting an exception")
 }
 
 

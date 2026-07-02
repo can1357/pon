@@ -65,7 +65,13 @@ pub unsafe extern "C" fn pon_binary_op(
 
         match unsafe { (numeric_value(a), numeric_value(b)) } {
             (Some(left), Some(right)) => binary_numeric(op, left, right),
-            (Some(_), None) | (None, Some(_)) if op == BINARY_MATMUL || op == BINARY_POW => {
+            (Some(_), None) | (None, Some(_))
+                if (op == BINARY_MATMUL || op == BINARY_POW)
+                    && !unsafe {
+                        crate::types::type_::is_payload_subclass_instance(a)
+                            || crate::types::type_::is_payload_subclass_instance(b)
+                    } =>
+            {
                 raise_type_error(binary_unsupported_message(op))
             }
             _ => unsafe { abstract_op::binary_op(op, a, b) },
@@ -76,7 +82,11 @@ pub unsafe extern "C" fn pon_binary_op(
 pub unsafe fn pon_binary_numeric_slot(op: NumberOp, a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
     super::catch_object_helper(|| match unsafe { (numeric_value(a), numeric_value(b)) } {
         (Some(left), Some(right)) => binary_numeric(op, left, right),
-        _ => raise_type_error(binary_unsupported_message(op)),
+        // Foreign operand: report NotImplemented so `abstract_op::binary_op`
+        // falls through to reflected slots, Python-level dunders, and the
+        // payload-subclass terminus instead of aborting (CPython slots return
+        // NotImplemented for operands they do not handle).
+        _ => unsafe { super::pon_not_implemented() },
     })
 }
 

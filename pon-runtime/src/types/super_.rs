@@ -41,14 +41,21 @@ pub unsafe fn new_super(super_type: *const PyType, start: *mut PyType, obj: *mut
     if start.is_null() || obj.is_null() {
         return raise_super("super() arguments must not be NULL");
     }
-    let obj_type = if unsafe { object_type(obj).is_null() } {
-        ptr::null_mut()
-    } else if unsafe { (*object_type(obj)).name() == "type" } {
+    let meta = unsafe { object_type(obj) };
+    if meta.is_null() {
+        return raise_super("super(type, obj): obj is not an instance or subtype of type");
+    }
+    // CPython supercheck ordering: a class receiver that is itself a subtype
+    // of `start` anchors MRO traversal at the class (classmethod / metaclass
+    // super), even when its metatype is a `type` subclass like ABCMeta;
+    // otherwise the receiver must be an instance of `start`.
+    let receiver_is_class = unsafe { crate::types::type_::is_type_object(obj) };
+    let obj_type = if receiver_is_class && unsafe { mro::is_subtype(obj.cast::<PyType>(), start) } {
         obj.cast::<PyType>()
     } else {
-        unsafe { object_type(obj) }
+        meta
     };
-    if obj_type.is_null() || unsafe { !mro::is_subtype(obj_type, start) } {
+    if unsafe { !mro::is_subtype(obj_type, start) } {
         return raise_super("super(type, obj): obj is not an instance or subtype of type");
     }
     Box::into_raw(Box::new(PySuper {

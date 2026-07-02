@@ -21,6 +21,9 @@ const TYPE_ID_DICT_ITER: TypeId = TypeId(102);
 const TYPE_ID_SET: TypeId = TypeId(104);
 const TYPE_ID_SET_ITER: TypeId = TypeId(105);
 const TYPE_ID_FROZENSET: TypeId = TypeId(106);
+/// Heap-class instances embedding dict storage (`PyDictSubclassInstance`).
+/// 103 is retired (former `PyDictItem`); 107 avoids any resurrection clash.
+const TYPE_ID_DICT_SUBCLASS_INSTANCE: TypeId = TypeId(107);
 
 fn register_map_types(runtime: &super::Runtime) {
     runtime.heap.register_type(
@@ -61,6 +64,14 @@ fn register_map_types(runtime: &super::Runtime) {
             size: mem::size_of::<frozenset::PyFrozenSet>(),
             trace: frozenset::trace_frozenset,
             finalize: Some(frozenset::finalize_frozenset),
+        },
+    );
+    runtime.heap.register_type(
+        TYPE_ID_DICT_SUBCLASS_INSTANCE,
+        GcTypeInfo {
+            size: mem::size_of::<dict::PyDictSubclassInstance>(),
+            trace: dict::trace_dict_subclass_instance,
+            finalize: Some(dict::finalize_dict_subclass_instance),
         },
     );
 }
@@ -281,16 +292,36 @@ pub unsafe extern "C" fn pon_dict_set_item_status(map: *mut PyObject, key: *mut 
 }
 
 /// Fetches `map[key]`, raising KeyError on a miss.
+///
+/// CPython `dict_subscript` parity: a miss on a dict-SUBCLASS instance
+/// consults the type's `__missing__` hook (MRO lookup, exact dicts never
+/// pay for it) before raising KeyError — the seam `defaultdict` and
+/// `Counter.__getitem__`-style classes rely on.  The hook re-enters Python,
+/// so the storage probe's critical section is scoped to release first.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_get_item(map: *mut PyObject, key: *mut PyObject) -> *mut PyObject {
     crate::untag_prelude!(map, key);
     super::catch_object_helper(|| {
-        let _guard = crate::sync::begin_critical_section(map);
-        match unsafe { dict::dict_get(map, key) } {
-            Ok(Some(value)) => value,
-            Ok(None) => raise_key_error(key),
-            Err(message) => null_error(message),
+        {
+            let _guard = crate::sync::begin_critical_section(map);
+            match unsafe { dict::dict_get(map, key) } {
+                Ok(Some(value)) => return value,
+                Ok(None) => {}
+                Err(message) => return null_error(message),
+            }
         }
+        if unsafe { dict::is_dict_subclass_instance(map) } {
+            let ty = unsafe { (*map).ob_type.cast_mut() };
+            let missing = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern("__missing__")) };
+            if !missing.is_null() {
+                let bound = unsafe { crate::descr::descriptor_get(missing, map, ty) };
+                if bound.is_null() {
+                    return ptr::null_mut();
+                }
+                return unsafe { crate::descr::call_with_one(bound, key) };
+            }
+        }
+        raise_key_error(key)
     })
 }
 
@@ -353,7 +384,26 @@ pub unsafe extern "C" fn pon_subscript_set(object: *mut PyObject, key: *mut PyOb
                     value
                 }
             } else {
-                null_error("object does not support item assignment")
+                // Python-level `__setitem__` (heap instances, incl. dict
+                // subclasses reaching the natives installed in dict's
+                // tp_dict; user overrides win by MRO order).  Mirrors the
+                // `__delitem__` fallback in `abstract_op::subscript_del`.
+                let setitem = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern("__setitem__")) };
+                if setitem.is_null() {
+                    let message = format!("'{}' object does not support item assignment", unsafe { (*ty).name() });
+                    // SAFETY: Raising TypeError follows the NULL-sentinel contract.
+                    return unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+                }
+                let callable = unsafe { crate::descr::descriptor_get(setitem, object, ty) };
+                if callable.is_null() {
+                    return ptr::null_mut();
+                }
+                let mut argv = [key, value];
+                let result = unsafe { super::pon_call(callable, argv.as_mut_ptr(), argv.len()) };
+                if result.is_null() {
+                    return ptr::null_mut();
+                }
+                value
             }
         }
     })
@@ -446,6 +496,63 @@ fn map_method_args<'a>(argv: *mut *mut PyObject, argc: usize, name: &str) -> Res
     Ok(if argc == 0 { &[] } else { unsafe { core::slice::from_raw_parts(argv, argc) } })
 }
 
+/// Unbound-receiver validation for dict method descriptors reached off the
+/// type (`dict.get(x, …)`): CPython raises the mismatch TypeError before the
+/// method body runs.  `name` is the bare method name.  Returns the untagged
+/// receiver, or the raised NULL sentinel.
+fn ensure_dict_method_receiver(args: &[*mut PyObject], name: &str) -> Result<*mut PyObject, *mut PyObject> {
+    if args.is_empty() {
+        let message = format!("unbound method dict.{name}() needs an argument");
+        return Err(unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) });
+    }
+    let receiver = crate::tag::untag_arg(args[0]);
+    if receiver.is_null() {
+        return Err(ptr::null_mut());
+    }
+    if unsafe { !dict::has_dict_storage(receiver) } {
+        let ty = unsafe { dict::type_name(receiver) }.unwrap_or("object");
+        let message = format!("descriptor '{name}' for 'dict' objects doesn't apply to a '{ty}' object");
+        return Err(unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) });
+    }
+    Ok(receiver)
+}
+
+/// Allocates a heap instance of a dict-derived class: the generic
+/// heap-instance prefix plus empty embedded dict storage.
+pub(crate) fn alloc_dict_subclass_instance(
+    cls: *mut crate::object::PyType,
+    instance_dict: *mut crate::types::type_::PyClassDict,
+    slots: Vec<crate::types::type_::PySlotValue>,
+) -> Result<*mut PyObject, String> {
+    super::with_runtime(|runtime| {
+        register_map_types(runtime);
+        let object = runtime
+            .heap
+            .alloc(mem::size_of::<dict::PyDictSubclassInstance>(), TYPE_ID_DICT_SUBCLASS_INSTANCE)
+            .cast::<dict::PyDictSubclassInstance>();
+        unsafe {
+            ptr::write(
+                object,
+                dict::PyDictSubclassInstance {
+                    base: crate::types::type_::PyHeapInstance {
+                        ob_base: crate::object::PyObjectHeader::new(cls),
+                        dict: instance_dict,
+                        slots,
+                        weakrefs: ptr::null_mut(),
+                        finalized: false,
+                    },
+                    storage: dict::PyDictStorage {
+                        entries: Vec::new(),
+                        buckets: Vec::new(),
+                    },
+                },
+            );
+        }
+        Ok(as_object_ptr(object))
+    })
+    .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
+}
+
 fn map_none() -> *mut PyObject {
     match super::with_runtime(|runtime| none_object(runtime)) {
         Some(none) => none,
@@ -479,92 +586,107 @@ fn alloc_bound_native_method(
     }
 }
 
-unsafe extern "C" fn dict_get_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    super::catch_object_helper(|| {
-        let args = match map_method_args(argv, argc, "dict.get") {
-            Ok(args) => args,
-            Err(message) => return null_error(message),
-        };
-        if !(args.len() == 2 || args.len() == 3) {
-            return null_error(format!("dict.get() expected 1 or 2 arguments, got {}", args.len().saturating_sub(1)));
-        }
-        let default = args.get(2).copied().unwrap_or(ptr::null_mut());
-        unsafe { pon_dict_get_method(args[0], args[1], default) }
-    })
-}
-
-unsafe extern "C" fn dict_keys_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    let args = match map_method_args(argv, argc, "dict.keys") {
+pub(crate) unsafe extern "C" fn dict_get_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject { super::catch_object_helper(|| {
+    let args = match map_method_args(argv, argc, "dict.get") {
         Ok(args) => args,
         Err(message) => return null_error(message),
     };
-    if args.len() != 1 {
-        return null_error(format!("dict.keys() expected 0 arguments, got {}", args.len().saturating_sub(1)));
-    }
-    unsafe { pon_dict_keys(args[0]) }
-}
-
-unsafe extern "C" fn dict_values_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    let args = match map_method_args(argv, argc, "dict.values") {
-        Ok(args) => args,
-        Err(message) => return null_error(message),
-    };
-    if args.len() != 1 {
-        return null_error(format!("dict.values() expected 0 arguments, got {}", args.len().saturating_sub(1)));
-    }
-    unsafe { pon_dict_values(args[0]) }
-}
-
-unsafe extern "C" fn dict_items_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    let args = match map_method_args(argv, argc, "dict.items") {
-        Ok(args) => args,
-        Err(message) => return null_error(message),
-    };
-    if args.len() != 1 {
-        return null_error(format!("dict.items() expected 0 arguments, got {}", args.len().saturating_sub(1)));
-    }
-    unsafe { pon_dict_items(args[0]) }
-}
-
-unsafe extern "C" fn dict_setdefault_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    let args = match map_method_args(argv, argc, "dict.setdefault") {
-        Ok(args) => args,
-        Err(message) => return null_error(message),
+    let receiver = match ensure_dict_method_receiver(args, "get") {
+        Ok(receiver) => receiver,
+        Err(raised) => return raised,
     };
     if !(args.len() == 2 || args.len() == 3) {
-        return null_error(format!("dict.setdefault() expected 1 or 2 arguments, got {}", args.len().saturating_sub(1)));
+        return null_error(format!("dict.get() expected 1 or 2 arguments, got {}", args.len().saturating_sub(1)));
     }
     let default = args.get(2).copied().unwrap_or(ptr::null_mut());
-    unsafe { pon_dict_setdefault(args[0], args[1], default) }
-}
+    unsafe { pon_dict_get_method(receiver, args[1], default) }
+}) }
 
-unsafe extern "C" fn dict_pop_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    let args = match map_method_args(argv, argc, "dict.pop") {
-        Ok(args) => args,
-        Err(message) => return null_error(message),
-    };
-    if !(args.len() == 2 || args.len() == 3) {
-        return null_error(format!("dict.pop() expected 1 or 2 arguments, got {}", args.len().saturating_sub(1)));
-    }
-    let default = args.get(2).copied().unwrap_or(ptr::null_mut());
-    unsafe { pon_dict_pop(args[0], args[1], default) }
+pub(crate) unsafe extern "C" fn dict_keys_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject { let args = match map_method_args(argv, argc, "dict.keys") {
+    Ok(args) => args,
+    Err(message) => return null_error(message),
+};
+let receiver = match ensure_dict_method_receiver(args, "keys") {
+    Ok(receiver) => receiver,
+    Err(raised) => return raised,
+};
+if args.len() != 1 {
+    return null_error(format!("dict.keys() expected 0 arguments, got {}", args.len().saturating_sub(1)));
 }
+unsafe { pon_dict_keys(receiver) } }
 
-unsafe extern "C" fn dict_update_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    let args = match map_method_args(argv, argc, "dict.update") {
-        Ok(args) => args,
-        Err(message) => return null_error(message),
-    };
-    if args.len() != 2 {
-        return null_error(format!("dict.update() expected 1 argument, got {}", args.len().saturating_sub(1)));
-    }
-    let updated = unsafe { pon_dict_update(args[0], args[1]) };
-    if updated.is_null() {
-        updated
-    } else {
-        map_none()
-    }
+pub(crate) unsafe extern "C" fn dict_values_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject { let args = match map_method_args(argv, argc, "dict.values") {
+    Ok(args) => args,
+    Err(message) => return null_error(message),
+};
+let receiver = match ensure_dict_method_receiver(args, "values") {
+    Ok(receiver) => receiver,
+    Err(raised) => return raised,
+};
+if args.len() != 1 {
+    return null_error(format!("dict.values() expected 0 arguments, got {}", args.len().saturating_sub(1)));
 }
+unsafe { pon_dict_values(receiver) } }
+
+pub(crate) unsafe extern "C" fn dict_items_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject { let args = match map_method_args(argv, argc, "dict.items") {
+    Ok(args) => args,
+    Err(message) => return null_error(message),
+};
+let receiver = match ensure_dict_method_receiver(args, "items") {
+    Ok(receiver) => receiver,
+    Err(raised) => return raised,
+};
+if args.len() != 1 {
+    return null_error(format!("dict.items() expected 0 arguments, got {}", args.len().saturating_sub(1)));
+}
+unsafe { pon_dict_items(receiver) } }
+
+pub(crate) unsafe extern "C" fn dict_setdefault_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject { let args = match map_method_args(argv, argc, "dict.setdefault") {
+    Ok(args) => args,
+    Err(message) => return null_error(message),
+};
+let receiver = match ensure_dict_method_receiver(args, "setdefault") {
+    Ok(receiver) => receiver,
+    Err(raised) => return raised,
+};
+if !(args.len() == 2 || args.len() == 3) {
+    return null_error(format!("dict.setdefault() expected 1 or 2 arguments, got {}", args.len().saturating_sub(1)));
+}
+let default = args.get(2).copied().unwrap_or(ptr::null_mut());
+unsafe { pon_dict_setdefault(receiver, args[1], default) } }
+
+pub(crate) unsafe extern "C" fn dict_pop_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject { let args = match map_method_args(argv, argc, "dict.pop") {
+    Ok(args) => args,
+    Err(message) => return null_error(message),
+};
+let receiver = match ensure_dict_method_receiver(args, "pop") {
+    Ok(receiver) => receiver,
+    Err(raised) => return raised,
+};
+if !(args.len() == 2 || args.len() == 3) {
+    return null_error(format!("dict.pop() expected 1 or 2 arguments, got {}", args.len().saturating_sub(1)));
+}
+let default = args.get(2).copied().unwrap_or(ptr::null_mut());
+unsafe { pon_dict_pop(receiver, args[1], default) } }
+
+pub(crate) unsafe extern "C" fn dict_update_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject { let args = match map_method_args(argv, argc, "dict.update") {
+    Ok(args) => args,
+    Err(message) => return null_error(message),
+};
+let receiver = match ensure_dict_method_receiver(args, "update") {
+    Ok(receiver) => receiver,
+    Err(raised) => return raised,
+};
+if args.len() != 2 {
+    return null_error(format!("dict.update() expected 1 argument, got {}", args.len().saturating_sub(1)));
+}
+let updated = unsafe { pon_dict_update(receiver, args[1]) };
+if updated.is_null() {
+    updated
+} else {
+    crate::dynexec::sync_globals_dict_bulk(receiver);
+    map_none()
+} }
 
 /// Returns a bound dict method object for attribute lookup.
 pub unsafe fn pon_dict_bound_method(map: *mut PyObject, name: &str) -> *mut PyObject {
@@ -660,7 +782,7 @@ pub unsafe extern "C" fn pon_dict_items(map: *mut PyObject) -> *mut PyObject {
 pub unsafe extern "C" fn pon_dict_iter_keys(map: *mut PyObject) -> *mut PyObject {
     crate::untag_prelude!(map);
     super::catch_object_helper(|| {
-        if unsafe { !dict::is_dict(map) } {
+        if unsafe { !dict::has_dict_storage(map) } {
             return null_error("expected dict object");
         }
         match super::with_runtime(|runtime| {
@@ -788,17 +910,63 @@ pub unsafe extern "C" fn pon_contains(container: *mut PyObject, item: *mut PyObj
         if unsafe { set_::is_any_set(container) } {
             return contains_result(unsafe { set_::set_contains(container, item) });
         }
-        let Some(slot) = (unsafe { sequence_contains_slot(container) }) else {
-            return status_error("object does not support containment");
-        };
-        let status = unsafe { slot(container, item) };
-        if status < 0 {
-            -1
-        } else if status == 0 {
-            0
-        } else {
-            1
+        if let Some(slot) = unsafe { sequence_contains_slot(container) } {
+            let status = unsafe { slot(container, item) };
+            return if status < 0 {
+                -1
+            } else if status == 0 {
+                0
+            } else {
+                1
+            };
         }
+        // Python-level `__contains__` (heap instances, e.g. WeakSet).
+        let container_type = unsafe { (*container).ob_type.cast_mut() };
+        let hook = unsafe { crate::descr::lookup_in_type(container_type, crate::intern::intern("__contains__")) };
+        if hook.is_null() {
+            // CPython `PySequence_Contains` -> `_PySequence_IterSearch`:
+            // without `__contains__`, membership is equality over iteration
+            // (including the legacy `__getitem__` sequence protocol).
+            let iter = unsafe { super::iter::pon_get_iter(container, ptr::null_mut()) };
+            if iter.is_null() {
+                crate::thread_state::pon_err_clear();
+                let message = format!("argument of type '{}' is not a container or iterable", unsafe { (*container_type).name() });
+                unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+                return -1;
+            }
+            loop {
+                let candidate = unsafe { super::iter::pon_iter_next(iter, ptr::null_mut()) };
+                if candidate.is_null() {
+                    if super::exc::pending_exception_is("StopIteration") {
+                        crate::thread_state::pon_err_clear();
+                        return 0;
+                    }
+                    return -1;
+                }
+                // Identity shortcut mirrors CPython `PyObject_RichCompareBool`.
+                if candidate == item {
+                    return 1;
+                }
+                let verdict = unsafe { crate::abstract_op::rich_compare(crate::abstract_op::RICH_EQ, item, candidate) };
+                if verdict.is_null() {
+                    return -1;
+                }
+                match unsafe { super::pon_is_true(verdict) } {
+                    0 => {}
+                    1 => return 1,
+                    _ => return -1,
+                }
+            }
+        }
+        let bound = unsafe { crate::descr::descriptor_get(hook, container, container_type) };
+        if bound.is_null() {
+            return -1;
+        }
+        let result = unsafe { crate::descr::call_with_one(bound, item) };
+        if result.is_null() {
+            return -1;
+        }
+        unsafe { super::pon_is_true(result) }
     })
 }
 
@@ -1041,6 +1209,81 @@ unsafe extern "C" fn set_issubset_method_trampoline(argv: *mut *mut PyObject, ar
     set_is_subset(args[0], args[1])
 }
 
+unsafe extern "C" fn set_copy_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match map_method_args(argv, argc, "set.copy") {
+        Ok(args) => args,
+        Err(message) => return null_error(message),
+    };
+    if args.len() != 1 {
+        return null_error(format!("set.copy() expected 0 arguments, got {}", args.len().saturating_sub(1)));
+    }
+    let receiver = args[0];
+    // CPython returns the receiver itself for exact frozensets.
+    if unsafe { frozenset::is_frozenset(receiver) } {
+        return receiver;
+    }
+    let _guard = crate::sync::begin_critical_section(receiver);
+    let entries = match unsafe { set_::entries_snapshot(receiver) } {
+        Ok(entries) => entries,
+        Err(message) => return null_error(message),
+    };
+    match super::with_runtime(|runtime| build_set_from_entries(runtime, receiver, entries)) {
+        Some(object) => object,
+        None => null_error("runtime is not initialized"),
+    }
+}
+
+unsafe extern "C" fn set_remove_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match map_method_args(argv, argc, "set.remove") {
+        Ok(args) => args,
+        Err(message) => return null_error(message),
+    };
+    if args.len() != 2 {
+        return null_error(format!("set.remove() expected 1 argument, got {}", args.len().saturating_sub(1)));
+    }
+    let _guard = crate::sync::begin_critical_section(args[0]);
+    match unsafe { set_::set_remove(args[0], args[1]) } {
+        Ok(true) => map_none(),
+        Ok(false) => raise_key_error(args[1]),
+        Err(message) => null_error(message),
+    }
+}
+
+unsafe extern "C" fn set_pop_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match map_method_args(argv, argc, "set.pop") {
+        Ok(args) => args,
+        Err(message) => return null_error(message),
+    };
+    if args.len() != 1 {
+        return null_error(format!("set.pop() expected 0 arguments, got {}", args.len().saturating_sub(1)));
+    }
+    let _guard = crate::sync::begin_critical_section(args[0]);
+    match unsafe { set_::set_pop(args[0]) } {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            let message = "pop from an empty set";
+            let message = unsafe { crate::abi::pon_const_str(message.as_ptr(), message.len()) };
+            raise_key_error(message)
+        }
+        Err(message) => null_error(message),
+    }
+}
+
+unsafe extern "C" fn set_clear_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match map_method_args(argv, argc, "set.clear") {
+        Ok(args) => args,
+        Err(message) => return null_error(message),
+    };
+    if args.len() != 1 {
+        return null_error(format!("set.clear() expected 0 arguments, got {}", args.len().saturating_sub(1)));
+    }
+    let _guard = crate::sync::begin_critical_section(args[0]);
+    match unsafe { set_::set_clear(args[0]) } {
+        Ok(()) => map_none(),
+        Err(message) => null_error(message),
+    }
+}
+
 /// Returns a bound set method object for attribute lookup.
 pub unsafe fn pon_set_bound_method(set: *mut PyObject, name: &str) -> *mut PyObject {
     match name {
@@ -1051,6 +1294,10 @@ pub unsafe fn pon_set_bound_method(set: *mut PyObject, name: &str) -> *mut PyObj
         "difference" => alloc_bound_native_method(set, name, set_difference_method_trampoline),
         "issubset" => alloc_bound_native_method(set, name, set_issubset_method_trampoline),
         "__contains__" => alloc_bound_native_method(set, name, set_contains_method_trampoline),
+        "copy" => alloc_bound_native_method(set, name, set_copy_method_trampoline),
+        "remove" => alloc_bound_native_method(set, name, set_remove_method_trampoline),
+        "clear" => alloc_bound_native_method(set, name, set_clear_method_trampoline),
+        "pop" => alloc_bound_native_method(set, name, set_pop_method_trampoline),
         _ => null_error(format!("attribute '{name}' was not found")),
     }
 }

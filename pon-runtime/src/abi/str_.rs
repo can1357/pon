@@ -8,6 +8,7 @@
 use core::ffi::c_int;
 use core::mem;
 use core::ptr;
+use std::borrow::Cow;
 use std::sync::{LazyLock, OnceLock};
 
 use crate::object::{PyLong, PyMappingMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType, PyUnicode, as_object_ptr, is_exact_type};
@@ -113,6 +114,7 @@ pub const BYTES_METHOD_INSERT: BytesMethodId = 43;
 pub const BYTES_METHOD_POP: BytesMethodId = 44;
 pub const BYTES_METHOD_REMOVE: BytesMethodId = 45;
 pub const BYTES_METHOD_CLEAR: BytesMethodId = 46;
+pub const BYTES_METHOD_TRANSLATE: BytesMethodId = 47;
 
 
 #[repr(C)]
@@ -291,6 +293,23 @@ unsafe extern "C" fn bytes_contains_slot(object: *mut PyObject, item: *mut PyObj
     -1
 }
 
+/// `sq_contains` for str: substring membership (`"lo" in "hello"`); a
+/// non-str needle raises CPython's TypeError.  Str-subclass needles read
+/// through their canonical payload.
+unsafe extern "C" fn str_contains_slot(object: *mut PyObject, item: *mut PyObject) -> c_int {
+    let Ok(haystack) = expect_str(object) else {
+        crate::thread_state::pon_err_set("str contains slot received a non-str receiver");
+        return -1;
+    };
+    let Some(needle) = (unsafe { crate::types::type_::unicode_text(item) }) else {
+        let type_name = unsafe { crate::types::dict::type_name(item) }.unwrap_or("object");
+        let message = format!("'in <string>' requires string as left operand, not {type_name}");
+        unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+        return -1;
+    };
+    c_int::from(haystack.contains(needle))
+}
+
 /// Iterator over an immutable str payload, yielding one-code-point strings.
 #[repr(C)]
 struct PyStrIter {
@@ -357,10 +376,11 @@ unsafe extern "C" fn str_iter_next_slot(object: *mut PyObject) -> *mut PyObject 
 static STR_SEQUENCE_METHODS: LazyLock<usize> = LazyLock::new(|| {
     let methods = PySequenceMethods {
         sq_length: Some(str_len_slot),
-        sq_concat: Some(pon_str_concat),
+        sq_concat: Some(str_concat_slot),
         sq_repeat: Some(str_repeat_slot),
         sq_item: Some(str_item_slot),
         sq_iter: Some(str_iter_slot),
+        sq_contains: Some(str_contains_slot),
         ..PySequenceMethods::EMPTY
     };
     Box::into_raw(Box::new(methods)) as usize
@@ -506,6 +526,9 @@ unsafe extern "C" fn memoryview_getattro(object: *mut PyObject, name: *mut PyObj
     };
     match name {
         "tobytes" => bound_memoryview_method(object, name, memoryview_tobytes_entry),
+        "cast" => bound_memoryview_method(object, name, memoryview_cast_entry),
+        "tolist" => bound_memoryview_method(object, name, memoryview_tolist_entry),
+        "itemsize" => unsafe { super::pon_const_int((*object.cast::<memoryview_type::PyMemoryView>()).itemsize() as i64) },
         "readonly" => unsafe { super::pon_const_bool(i32::from((*object.cast::<memoryview_type::PyMemoryView>()).readonly)) },
         _ => super::return_null_with_error(format!("attribute '{name}' was not found")),
     }
@@ -553,6 +576,7 @@ fn bytes_method_entry_for_name(name: &str) -> Option<unsafe extern "C" fn(*mut *
         "isascii" => bytes_isascii_entry,
         "hex" => bytes_hex_entry,
         "fromhex" => bytes_fromhex_entry,
+        "translate" => bytes_translate_entry,
         _ => return None,
     })
 }
@@ -615,10 +639,21 @@ unsafe extern "C" fn str_len_slot(object: *mut PyObject) -> isize {
     }
 }
 
+/// Mirrors `seq::return_null_with_sequence_error`: the out-of-range sentinel
+/// becomes a typed, catchable IndexError (CPython `except IndexError:` around
+/// string probes, e.g. `re._parser.Tokenizer`).
+fn return_null_with_str_error(message: String) -> *mut PyObject {
+    if message == "string index out of range" {
+        super::exc::raise_index_error_text(&message)
+    } else {
+        super::return_null_with_error(message)
+    }
+}
+
 unsafe extern "C" fn str_item_slot(object: *mut PyObject, index: isize) -> *mut PyObject {
     match str_item_object(object, index) {
         Ok(value) => value,
-        Err(message) => super::return_null_with_error(message),
+        Err(message) => return_null_with_str_error(message),
     }
 }
 
@@ -631,7 +666,7 @@ unsafe extern "C" fn str_subscript_slot(object: *mut PyObject, key: *mut PyObjec
     } else {
         match str_index_value(key).and_then(|index| str_item_object(object, index)) {
             Ok(value) => value,
-            Err(message) => super::return_null_with_error(message),
+            Err(message) => return_null_with_str_error(message),
         }
     }
 }
@@ -643,10 +678,34 @@ unsafe extern "C" fn bytes_len_slot(object: *mut PyObject) -> isize {
     }
 }
 
+/// Byte-sequence OOB messages that must surface as typed `IndexError` so
+/// Python-level `except IndexError` works (re's `_optimize_charset` relies on
+/// catching the bytearray store failure to grow its charmap).
+fn is_byte_index_error(message: &str) -> bool {
+    message == "index out of range" || message == "bytearray index out of range"
+}
+
+fn return_null_with_byte_index_error(message: String) -> *mut PyObject {
+    if is_byte_index_error(&message) {
+        super::exc::raise_index_error_text(&message)
+    } else {
+        super::return_null_with_error(message)
+    }
+}
+
+fn return_minus_one_with_byte_index_error(message: String) -> c_int {
+    if is_byte_index_error(&message) {
+        super::exc::raise_index_error_text(&message);
+        -1
+    } else {
+        super::return_minus_one_with_error(message)
+    }
+}
+
 unsafe extern "C" fn bytes_item_slot(object: *mut PyObject, index: isize) -> *mut PyObject {
     match bytes_item_object(object, index) {
         Ok(value) => value,
-        Err(message) => super::return_null_with_error(message),
+        Err(message) => return_null_with_byte_index_error(message),
     }
 }
 
@@ -659,7 +718,7 @@ unsafe extern "C" fn bytes_subscript_slot(object: *mut PyObject, key: *mut PyObj
     } else {
         match str_index_value(key).and_then(|index| bytes_item_object(object, index)) {
             Ok(value) => value,
-            Err(message) => super::return_null_with_error(message),
+            Err(message) => return_null_with_byte_index_error(message),
         }
     }
 }
@@ -695,7 +754,7 @@ unsafe extern "C" fn bytearray_subscript_slot(object: *mut PyObject, key: *mut P
     } else {
         match str_index_value(key).and_then(|index| bytes_item_object(object, index)) {
             Ok(value) => value,
-            Err(message) => super::return_null_with_error(message),
+            Err(message) => return_null_with_byte_index_error(message),
         }
     }
 }
@@ -703,7 +762,7 @@ unsafe extern "C" fn bytearray_subscript_slot(object: *mut PyObject, key: *mut P
 unsafe extern "C" fn bytearray_ass_item_slot(object: *mut PyObject, index: isize, value: *mut PyObject) -> c_int {
     match expect_byte(value).and_then(|byte| bytearray_object_mut(object).and_then(|array| bytearray_type::set_index(array, index, byte))) {
         Ok(()) => 0,
-        Err(message) => super::return_minus_one_with_error(message),
+        Err(message) => return_minus_one_with_byte_index_error(message),
     }
 }
 
@@ -733,7 +792,8 @@ unsafe extern "C" fn memoryview_len_slot(object: *mut PyObject) -> isize {
     if object.is_null() || !memoryview_type::is_memoryview_type(unsafe { (*object).ob_type }) {
         return -1;
     }
-    isize::try_from(unsafe { (*object.cast::<memoryview_type::PyMemoryView>()).len }).unwrap_or(isize::MAX)
+    let view = unsafe { &*object.cast::<memoryview_type::PyMemoryView>() };
+    isize::try_from(view.len / view.itemsize()).unwrap_or(isize::MAX)
 }
 
 unsafe extern "C" fn memoryview_item_slot(object: *mut PyObject, index: isize) -> *mut PyObject {
@@ -881,6 +941,119 @@ fn str_method_arity(_name: &str) -> usize {
     crate::builtins::variadic_arity()
 }
 
+/// `str.maketrans` reached off the type: CPython exposes it as a STATIC
+/// method (no receiver), so this entry forwards ALL argv into the method
+/// body instead of peeling `argv[0]` the way [`str_method_entry`] does.
+unsafe extern "C" fn str_maketrans_static_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    super::catch_object_helper(|| {
+        let Some(args) = raw_args(argv, argc) else {
+            return super::return_null_with_error("str method argv pointer is null");
+        };
+        str_maketrans_method(args)
+    })
+}
+
+/// One-shot installer for the builtin `str` type object's `tp_dict` method
+/// surface, so type-level access (the unbound `str.upper(s)` /
+/// `maketrans = str.maketrans` patterns) resolves through the regular MRO
+/// lookup.  The entries reuse the bound-path trampolines, which already peel
+/// `argv[0]` as the receiver; `maketrans` installs as a staticmethod carrier
+/// around [`str_maketrans_static_entry`].  Existing `tp_dict` entries
+/// (`__new__`/`__repr__`/`__str__` from the data-type dunder install) are
+/// kept: only missing names are added.
+pub(crate) fn ensure_str_type_methods_installed(ty: *mut PyType) {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if ty.is_null() || INSTALLED.load(AtomicOrdering::SeqCst) {
+        return;
+    }
+    // Pre-runtime call sites must not latch a no-op install: the function
+    // allocations below need a live runtime.
+    if crate::abi::runtime_type_type().is_null() {
+        return;
+    }
+    if INSTALLED.swap(true, AtomicOrdering::SeqCst) {
+        return;
+    }
+    let namespace = unsafe { (*ty).tp_dict.cast::<type_::PyClassDict>() };
+    let namespace = if namespace.is_null() { type_::new_namespace() } else { namespace };
+    type Entry = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
+    let natives: &[(&str, Entry)] = &[
+        ("split", str_split_entry),
+        ("rsplit", str_rsplit_entry),
+        ("splitlines", str_splitlines_entry),
+        ("join", str_join_entry),
+        ("replace", str_replace_entry),
+        ("find", str_find_entry),
+        ("rfind", str_rfind_entry),
+        ("index", str_index_entry),
+        ("rindex", str_rindex_entry),
+        ("count", str_count_entry),
+        ("startswith", str_startswith_entry),
+        ("endswith", str_endswith_entry),
+        ("strip", str_strip_entry),
+        ("lstrip", str_lstrip_entry),
+        ("rstrip", str_rstrip_entry),
+        ("lower", str_lower_entry),
+        ("upper", str_upper_entry),
+        ("title", str_title_entry),
+        ("capitalize", str_capitalize_entry),
+        ("casefold", str_casefold_entry),
+        ("swapcase", str_swapcase_entry),
+        ("center", str_center_entry),
+        ("ljust", str_ljust_entry),
+        ("rjust", str_rjust_entry),
+        ("zfill", str_zfill_entry),
+        ("expandtabs", str_expandtabs_entry),
+        ("partition", str_partition_entry),
+        ("rpartition", str_rpartition_entry),
+        ("encode", str_encode_entry),
+        ("removeprefix", str_removeprefix_entry),
+        ("removesuffix", str_removesuffix_entry),
+        ("isdecimal", str_isdecimal_entry),
+        ("isdigit", str_isdigit_entry),
+        ("isnumeric", str_isnumeric_entry),
+        ("isalpha", str_isalpha_entry),
+        ("isalnum", str_isalnum_entry),
+        ("isspace", str_isspace_entry),
+        ("isupper", str_isupper_entry),
+        ("islower", str_islower_entry),
+        ("istitle", str_istitle_entry),
+        ("isidentifier", str_isidentifier_entry),
+        ("isprintable", str_isprintable_entry),
+        ("isascii", str_isascii_entry),
+        ("translate", str_translate_entry),
+        ("format", str_format_entry),
+        ("format_map", str_format_map_entry),
+    ];
+    for (name, entry) in natives {
+        let interned = crate::intern::intern(name);
+        if unsafe { (&*namespace).get(interned) }.is_some() {
+            continue;
+        }
+        if let Ok(function) = alloc_native_str_function(name, *entry) {
+            unsafe { (&mut *namespace).set(interned, function) };
+        }
+    }
+    let maketrans = crate::intern::intern("maketrans");
+    if unsafe { (&*namespace).get(maketrans) }.is_none() {
+        if let Ok(function) = alloc_native_str_function("maketrans", str_maketrans_static_entry) {
+            let descriptor =
+                unsafe { crate::types::classmethod::new_staticmethod(super::staticmethod_builtin_type(), function) };
+            if !descriptor.is_null() {
+                unsafe { (&mut *namespace).set(maketrans, descriptor) };
+            }
+        }
+    }
+    unsafe {
+        (*ty).tp_dict = namespace.cast::<PyObject>();
+    }
+    // GC rooting for the namespace values plus IC invalidation for any
+    // AttrIC guarding the type object.
+    crate::sync::register_namespaced_type(ty);
+    crate::sync::type_modified(ty);
+}
+
 macro_rules! str_entry {
     ($func:ident, $id:ident) => {
         unsafe extern "C" fn $func(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -991,6 +1164,7 @@ bytes_entry!(bytes_insert_entry, BYTES_METHOD_INSERT);
 bytes_entry!(bytes_pop_entry, BYTES_METHOD_POP);
 bytes_entry!(bytes_remove_entry, BYTES_METHOD_REMOVE);
 bytes_entry!(bytes_clear_entry, BYTES_METHOD_CLEAR);
+bytes_entry!(bytes_translate_entry, BYTES_METHOD_TRANSLATE);
 
 unsafe extern "C" fn memoryview_tobytes_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     if argv.is_null() {
@@ -1004,6 +1178,51 @@ unsafe extern "C" fn memoryview_tobytes_entry(argv: *mut *mut PyObject, argc: us
         Ok(bytes) => as_object_ptr(bytes_type::boxed_bytes(&bytes)),
         Err(message) => super::return_null_with_error(message),
     }
+}
+
+unsafe extern "C" fn memoryview_cast_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = raw_args(argv, argc) else {
+        return super::return_null_with_error("memoryview.cast argv pointer is null");
+    };
+    if args.len() != 2 {
+        return super::return_null_with_error("memoryview.cast expected exactly one argument");
+    }
+    let receiver = args[0];
+    if receiver.is_null() || !memoryview_type::is_memoryview_type(unsafe { (*receiver).ob_type }) {
+        return super::return_null_with_error("memoryview.cast receiver must be a memoryview");
+    }
+    let format = match expect_str(args[1]) {
+        Ok(text) => text,
+        Err(message) => return super::return_null_with_error(message),
+    };
+    let view = unsafe { &*receiver.cast::<memoryview_type::PyMemoryView>() };
+    match memoryview_type::cast(view, &format) {
+        Ok(cast_view) => as_object_ptr(cast_view),
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
+unsafe extern "C" fn memoryview_tolist_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = raw_args(argv, argc) else {
+        return super::return_null_with_error("memoryview.tolist argv pointer is null");
+    };
+    if args.len() != 1 {
+        return super::return_null_with_error("memoryview.tolist expected no arguments");
+    }
+    let receiver = args[0];
+    if receiver.is_null() || !memoryview_type::is_memoryview_type(unsafe { (*receiver).ob_type }) {
+        return super::return_null_with_error("memoryview.tolist receiver must be a memoryview");
+    }
+    let view = unsafe { &*receiver.cast::<memoryview_type::PyMemoryView>() };
+    let values = match unsafe { memoryview_type::tolist(view) } {
+        Ok(values) => values,
+        Err(message) => return super::return_null_with_error(message),
+    };
+    let mut objects = Vec::with_capacity(values.len());
+    for value in values {
+        objects.push(unsafe { super::pon_const_int(value) });
+    }
+    unsafe { super::seq::pon_build_list(objects.as_mut_ptr(), objects.len()) }
 }
 
 unsafe fn bytes_method_entry(method: BytesMethodId, argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -1064,15 +1283,32 @@ pub unsafe extern "C" fn pon_const_bytearray(ptr: *const u8, len: usize) -> *mut
     })
 }
 
-/// Concatenates two boxed strings.
+/// `str` sequence-slot concat: reports NotImplemented for foreign operands so
+/// `abstract_op::binary_op` can continue past it (reflected slots, Python
+/// dunders, payload subclasses).
+unsafe extern "C" fn str_concat_slot(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(left, right);
+    super::catch_object_helper(|| {
+        let (Ok(left), Ok(right)) = (expect_str(left), expect_str(right)) else {
+            return unsafe { super::pon_not_implemented() };
+        };
+        alloc_str_object(&str_type::concat(&left, &right))
+    })
+}
+
+/// Concatenates two boxed strings (helper-table entry).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_str_concat(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
     crate::untag_prelude!(left, right);
     super::catch_object_helper(|| {
-        let (Ok(left), Ok(right)) = (expect_str(left), expect_str(right)) else {
-            return super::return_null_with_error("str concatenation requires str operands");
+        let (Ok(left_text), Ok(right_text)) = (expect_str(left), expect_str(right)) else {
+            // The helper entry keeps full semantics: foreign operands route
+            // through complete binary dispatch (reflected slots, `__radd__`,
+            // payload subclasses).  binary_op's str path is `str_concat_slot`,
+            // never this entry, so the round trip terminates.
+            return unsafe { super::number::pon_binary_op(crate::abstract_op::BINARY_ADD, left, right, core::ptr::null_mut()) };
         };
-        alloc_str_object(&str_type::concat(&left, &right))
+        alloc_str_object(&str_type::concat(&left_text, &right_text))
     })
 }
 
@@ -1301,6 +1537,7 @@ pub unsafe extern "C" fn pon_bytes_method(
             BYTES_METHOD_POP => bytearray_pop_method(receiver_object, args),
             BYTES_METHOD_REMOVE => bytearray_remove_method(receiver_object, args),
             BYTES_METHOD_CLEAR => bytearray_clear_method(receiver_object, args),
+            BYTES_METHOD_TRANSLATE => bytes_translate_method(&receiver, args, mutable_receiver),
             _ => super::return_null_with_error("unknown bytes method selector"),
         }
     })
@@ -1644,7 +1881,7 @@ fn str_predicate_method(args: &[*mut PyObject], result: bool) -> *mut PyObject {
 fn str_translate_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
     if args.len() != 1 { return super::return_null_with_error("str.translate expected exactly one argument"); }
     let table = match expect_translate_table(args[0]) { Ok(table) => table, Err(message) => return super::return_null_with_error(message) };
-    alloc_str_object(&str_type::translate(receiver, table))
+    alloc_str_object(&str_type::translate(receiver, &table))
 }
 
 fn str_maketrans_method(args: &[*mut PyObject]) -> *mut PyObject {
@@ -1693,7 +1930,7 @@ fn str_encode_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
         if errors != "strict" { return super::return_null_with_error(format!("unsupported str.encode errors handler '{errors}'")); }
         match encode_idna_ascii(receiver) { Ok(encoded) => encoded, Err(message) => return super::return_null_with_error(message) }
     } else {
-        match bytes_type::encode(receiver, &encoding, &errors) { Ok(encoded) => encoded, Err(message) => return super::return_null_with_error(message) }
+        match crate::native::codecs::encode_str_to_vec(receiver, &encoding, &errors) { Ok(encoded) => encoded, Err(()) => return ptr::null_mut() }
     };
     unsafe { pon_const_bytes(encoded.as_ptr(), encoded.len()) }
 }
@@ -1790,11 +2027,55 @@ fn alloc_tuple3(a: *mut PyObject, b: *mut PyObject, c: *mut PyObject) -> *mut Py
     unsafe { super::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) }
 }
 
-fn expect_translate_table(value: *mut PyObject) -> Result<&'static str_type::TranslationTable, String> {
-    if value.is_null() || unsafe { (*value).ob_type } != str_translate_table_type().cast_const() {
-        return Err("str.translate expected a table returned by str.maketrans".to_owned());
+const TRANSLATE_TABLE_ERROR: &str = "str.translate expected a table returned by str.maketrans";
+
+fn expect_translate_table(value: *mut PyObject) -> Result<Cow<'static, str_type::TranslationTable>, String> {
+    if value.is_null() {
+        return Err(TRANSLATE_TABLE_ERROR.to_owned());
     }
-    Ok(unsafe { &(*value.cast::<PyStrTranslateTable>()).table })
+    if unsafe { (*value).ob_type } == str_translate_table_type().cast_const() {
+        return Ok(Cow::Borrowed(unsafe { &(*value.cast::<PyStrTranslateTable>()).table }));
+    }
+    translate_table_from_dict(value).map(Cow::Owned)
+}
+
+/// Builds an owned translation table from a plain dict mapping ordinals to
+/// `None` (delete), an ordinal (single-character replacement), or a `str`.
+///
+/// CPython resolves arbitrary mappings lazily through
+/// `table.__getitem__(ord(ch))`; pon snapshots exact dict storage eagerly
+/// instead, so tables relying on `__getitem__` overrides (`defaultdict`,
+/// custom mapping classes) still report [`TRANSLATE_TABLE_ERROR`].
+fn translate_table_from_dict(value: *mut PyObject) -> Result<str_type::TranslationTable, String> {
+    let entries = {
+        let _guard = crate::sync::begin_critical_section(value);
+        unsafe { crate::types::dict::dict_entries_snapshot(value) }.map_err(|_| TRANSLATE_TABLE_ERROR.to_owned())?
+    };
+    let mut table = str_type::TranslationTable::new();
+    for entry in entries {
+        // Lookups go through `ord(ch)`, so non-int keys in a plain dict are
+        // unreachable; CPython leaves such entries inert rather than raising.
+        let Ok(ordinal) = str_long_value(entry.key) else { continue };
+        let source = translate_table_codepoint(ordinal)?;
+        let replacement = if is_none(entry.value) {
+            None
+        } else if let Ok(codepoint) = str_long_value(entry.value) {
+            Some(translate_table_codepoint(codepoint)?.to_string())
+        } else if let Ok(text) = expect_str(entry.value) {
+            Some(text)
+        } else {
+            return Err("character mapping must return integer, None or str".to_owned());
+        };
+        table.insert(source, replacement);
+    }
+    Ok(table)
+}
+
+fn translate_table_codepoint(value: i64) -> Result<char, String> {
+    u32::try_from(value)
+        .ok()
+        .and_then(char::from_u32)
+        .ok_or_else(|| "character mapping must be in range(0x110000)".to_owned())
 }
 
 fn encode_idna_ascii(text: &str) -> Result<Vec<u8>, String> {
@@ -1949,6 +2230,33 @@ fn bytes_replace_method(receiver: &[u8], args: &[*mut PyObject], mutable_receive
     alloc_binary_object(&bytes_type::replace_count(receiver, &old, &new, count), mutable_receiver)
 }
 
+/// Parses a find/index/count needle: bytes-like subsequence or a single int
+/// byte in `range(0, 256)`, per CPython.
+fn bytes_needle_arg(value: *mut PyObject) -> Result<Vec<u8>, String> {
+    if let Some(needle) = object_to_i64(value) {
+        if !(0..=255).contains(&needle) {
+            return Err("byte must be in range(0, 256)".to_owned());
+        }
+        return Ok(vec![needle as u8]);
+    }
+    expect_bytes_like(value)
+}
+
+fn bytes_translate_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool) -> *mut PyObject {
+    if !(1..=2).contains(&args.len()) { return super::return_null_with_error("bytes.translate expected one or two arguments"); }
+    let table = if is_none(args[0]) { None } else {
+        match expect_bytes_like(args[0]) { Ok(table) => Some(table), Err(message) => return super::return_null_with_error(message) }
+    };
+    let delete = match args.get(1).copied() {
+        Some(value) => match expect_bytes_like(value) { Ok(delete) => delete, Err(message) => return super::return_null_with_error(message) },
+        None => Vec::new(),
+    };
+    match bytes_type::translate(receiver, table.as_deref(), &delete) {
+        Ok(out) => alloc_binary_object(&out, mutable_receiver),
+        Err(message) => unsafe { super::exc::pon_raise_value_error(message.as_ptr(), message.len()) },
+    }
+}
+
 fn bytes_find_method(receiver: &[u8], args: &[*mut PyObject]) -> *mut PyObject { bytes_find_like(receiver, args, false, false) }
 fn bytes_rfind_method(receiver: &[u8], args: &[*mut PyObject]) -> *mut PyObject { bytes_find_like(receiver, args, true, false) }
 fn bytes_index_method(receiver: &[u8], args: &[*mut PyObject]) -> *mut PyObject { bytes_find_like(receiver, args, false, true) }
@@ -1956,7 +2264,7 @@ fn bytes_rindex_method(receiver: &[u8], args: &[*mut PyObject]) -> *mut PyObject
 
 fn bytes_find_like(receiver: &[u8], args: &[*mut PyObject], reverse: bool, index_mode: bool) -> *mut PyObject {
     if !(1..=3).contains(&args.len()) { return super::return_null_with_error("bytes.find/index expected one to three arguments"); }
-    let needle = match expect_bytes_like(args[0]) { Ok(needle) => needle, Err(message) => return super::return_null_with_error(message) };
+    let needle = match bytes_needle_arg(args[0]) { Ok(needle) => needle, Err(message) => return super::return_null_with_error(message) };
     let (start, end) = match normalize_bounds_args(&args[1..], receiver.len()) { Ok(bounds) => bounds, Err(message) => return super::return_null_with_error(message) };
     let found = if reverse { bytes_type::rfind_range(receiver, &needle, start, end) } else { bytes_type::find_range(receiver, &needle, start, end) };
     match found {
@@ -1968,7 +2276,7 @@ fn bytes_find_like(receiver: &[u8], args: &[*mut PyObject], reverse: bool, index
 
 fn bytes_count_method(receiver: &[u8], args: &[*mut PyObject]) -> *mut PyObject {
     if !(1..=3).contains(&args.len()) { return super::return_null_with_error("bytes.count expected one to three arguments"); }
-    let needle = match expect_bytes_like(args[0]) { Ok(needle) => needle, Err(message) => return super::return_null_with_error(message) };
+    let needle = match bytes_needle_arg(args[0]) { Ok(needle) => needle, Err(message) => return super::return_null_with_error(message) };
     let (start, end) = match normalize_bounds_args(&args[1..], receiver.len()) { Ok(bounds) => bounds, Err(message) => return super::return_null_with_error(message) };
     unsafe { super::pon_const_int(bytes_type::count_range(receiver, &needle, start, end) as i64) }
 }
@@ -1988,7 +2296,7 @@ fn bytes_decode_method(receiver: &[u8], args: &[*mut PyObject]) -> *mut PyObject
     if args.len() > 2 { return super::return_null_with_error("bytes.decode expected at most two arguments"); }
     let encoding = match optional_str_arg(args.first().copied()) { Ok(Some(value)) => value, Ok(None) => "utf-8".to_owned(), Err(message) => return super::return_null_with_error(message) };
     let errors = match optional_str_arg(args.get(1).copied()) { Ok(Some(value)) => value, Ok(None) => "strict".to_owned(), Err(message) => return super::return_null_with_error(message) };
-    match bytes_type::decode(receiver, &encoding, &errors) { Ok(text) => alloc_str_object(&text), Err(message) => super::return_null_with_error(message) }
+    match crate::native::codecs::decode_bytes_to_string(receiver, &encoding, &errors) { Ok(text) => alloc_str_object(&text), Err(()) => ptr::null_mut() }
 }
 
 fn bytes_strip_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool) -> *mut PyObject { bytes_strip_like(receiver, args, mutable_receiver, StripKind::Both) }
@@ -2177,7 +2485,7 @@ pub unsafe extern "C" fn builtin_bytes(argv: *mut *mut PyObject, argc: usize) ->
                 let text = match expect_str(args[0]) { Ok(text) => text, Err(message) => return super::return_null_with_error(message) };
                 let encoding = match expect_str(args[1]) { Ok(text) => text, Err(message) => return super::return_null_with_error(message) };
                 let errors = match args.get(2).copied().map(expect_str).transpose() { Ok(Some(text)) => text, Ok(None) => "strict".to_owned(), Err(message) => return super::return_null_with_error(message) };
-                match bytes_type::encode(&text, &encoding, &errors) { Ok(bytes) => bytes, Err(message) => return super::return_null_with_error(message) }
+                match crate::native::codecs::encode_str_to_vec(&text, &encoding, &errors) { Ok(bytes) => bytes, Err(()) => return ptr::null_mut() }
             }
             _ => return super::return_null_with_error("bytes() expected at most three arguments"),
         };
@@ -2203,7 +2511,7 @@ pub unsafe extern "C" fn builtin_bytearray(argv: *mut *mut PyObject, argc: usize
                 let text = match expect_str(args[0]) { Ok(text) => text, Err(message) => return super::return_null_with_error(message) };
                 let encoding = match expect_str(args[1]) { Ok(text) => text, Err(message) => return super::return_null_with_error(message) };
                 let errors = match args.get(2).copied().map(expect_str).transpose() { Ok(Some(text)) => text, Ok(None) => "strict".to_owned(), Err(message) => return super::return_null_with_error(message) };
-                match bytes_type::encode(&text, &encoding, &errors) { Ok(bytes) => bytes, Err(message) => return super::return_null_with_error(message) }
+                match crate::native::codecs::encode_str_to_vec(&text, &encoding, &errors) { Ok(bytes) => bytes, Err(()) => return ptr::null_mut() }
             }
             _ => return super::return_null_with_error("bytearray() expected at most three arguments"),
         };
@@ -2324,18 +2632,29 @@ fn memoryview_bytes(object: *mut PyObject) -> Result<Vec<u8>, String> {
 fn memoryview_item_object(object: *mut PyObject, index: isize) -> Result<*mut PyObject, String> {
     if object.is_null() || !memoryview_type::is_memoryview_type(unsafe { (*object).ob_type }) { return Err("expected memoryview object".to_owned()); }
     let view = unsafe { &*object.cast::<memoryview_type::PyMemoryView>() };
-    let index = normalize_byte_index(index, view.len)?;
-    Ok(unsafe { super::pon_const_int(i64::from(view.as_slice()[index])) })
+    let itemsize = view.itemsize();
+    let index = normalize_byte_index(index, view.len / itemsize)?;
+    let bytes = unsafe { view.as_slice() };
+    let value = match itemsize {
+        1 => i64::from(bytes[index]),
+        4 => {
+            let chunk = &bytes[index * 4..index * 4 + 4];
+            i64::from(u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        }
+        _ => return Err("memoryview indexing is not supported for this format".to_owned()),
+    };
+    Ok(unsafe { super::pon_const_int(value) })
 }
 
 fn memoryview_slice_object(object: *mut PyObject, key: *mut PyObject) -> Result<*mut PyObject, String> {
     if let Err(message) = install_memoryview_slots() { return Err(message); }
     if object.is_null() || !memoryview_type::is_memoryview_type(unsafe { (*object).ob_type }) { return Err("expected memoryview object".to_owned()); }
     let view = unsafe { &*object.cast::<memoryview_type::PyMemoryView>() };
+    if view.itemsize() != 1 { return Err("memoryview slicing is only supported for byte views".to_owned()); }
     let indices = normalize_str_slice(unsafe { &*key.cast::<PySlice>() }, view.len)?;
     if indices.step == 1 {
         let data = unsafe { view.data.add(indices.start as usize) };
-        return Ok(as_object_ptr(memoryview_type::boxed_memoryview_from_raw(view.base, data, indices.len, view.readonly)));
+        return Ok(as_object_ptr(memoryview_type::boxed_memoryview_from_raw(view.base, data, indices.len, view.readonly, b'B')));
     }
     let slice = unsafe { view.as_slice() };
     let mut out = Vec::with_capacity(indices.len);
@@ -2348,6 +2667,7 @@ fn memoryview_slice_object(object: *mut PyObject, key: *mut PyObject) -> Result<
 fn memoryview_set_index(object: *mut PyObject, index: isize, value: u8) -> Result<(), String> {
     if object.is_null() || !memoryview_type::is_memoryview_type(unsafe { (*object).ob_type }) { return Err("expected memoryview object".to_owned()); }
     let view = unsafe { &mut *object.cast::<memoryview_type::PyMemoryView>() };
+    if view.itemsize() != 1 { return Err("memoryview writes are only supported for byte views".to_owned()); }
     let index = normalize_byte_index(index, view.len)?;
     let bytes = unsafe { view.as_mut_slice()? };
     bytes[index] = value;
@@ -2357,6 +2677,7 @@ fn memoryview_set_index(object: *mut PyObject, index: isize, value: u8) -> Resul
 fn memoryview_assign_slice(object: *mut PyObject, key: *mut PyObject, replacement: &[u8]) -> Result<(), String> {
     if object.is_null() || !memoryview_type::is_memoryview_type(unsafe { (*object).ob_type }) { return Err("expected memoryview object".to_owned()); }
     let view = unsafe { &mut *object.cast::<memoryview_type::PyMemoryView>() };
+    if view.itemsize() != 1 { return Err("memoryview writes are only supported for byte views".to_owned()); }
     let indices = normalize_str_slice(unsafe { &*key.cast::<PySlice>() }, view.len)?;
     if replacement.len() != indices.len { return Err("memoryview assignment length mismatch".to_owned()); }
     let bytes = unsafe { view.as_mut_slice()? };
@@ -2380,6 +2701,9 @@ fn expect_str(value: *mut PyObject) -> Result<String, String> {
     if value.is_null() {
         return Err("expected str, got NULL".to_owned());
     }
+    // `str`-subclass instances (payload subclasses: `StrEnum` members, ...)
+    // read through their embedded canonical payload.
+    let value = unsafe { crate::types::type_::payload_subclass_value(value) }.unwrap_or(value);
     if let Err(message) = super::ensure_runtime_initialized() {
         return Err(message);
     }

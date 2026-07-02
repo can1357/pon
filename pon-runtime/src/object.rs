@@ -839,6 +839,13 @@ pub struct PyFunction {
     pub deopt_count: AtomicU32,
     /// Completed tier-1 epochs that later thrashed and reset to tier-0.
     pub tier_epoch: AtomicU8,
+    /// Per-function attribute dict backing arbitrary `f.attr = value` stores
+    /// (CPython's function `__dict__`), or NULL until the first store.
+    ///
+    /// Appended last so every existing field offset is unchanged; allocation
+    /// sites all size through `size_of::<PyFunction>()`.  The GC reaches this
+    /// through `trace_function` (see `abi::register_gc_types`).
+    pub attr_dict: *mut PyObject,
 }
 
 impl core::fmt::Debug for PyFunction {
@@ -857,6 +864,7 @@ impl core::fmt::Debug for PyFunction {
             .field("deopt_count", &self.deopt_count.load(core::sync::atomic::Ordering::Relaxed))
             .field("tier_epoch", &self.tier_epoch.load(core::sync::atomic::Ordering::Relaxed))
             .field("annotations", &self.annotations)
+            .field("attr_dict", &self.attr_dict)
             .finish_non_exhaustive()
     }
 }
@@ -881,6 +889,7 @@ impl PyFunction {
             osr_loop_header: AtomicU32::new(0),
             deopt_count: AtomicU32::new(0),
             tier_epoch: AtomicU8::new(0),
+            attr_dict: ptr::null_mut(),
         }
     }
 }

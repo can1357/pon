@@ -39,9 +39,14 @@ pub unsafe fn is_exact_int(object: *mut PyObject) -> bool {
     unsafe { type_name_is(object, "int") }
 }
 
-/// Extracts the arbitrary-precision integer payload for an exact `int`.
+/// Extracts the arbitrary-precision integer payload for an exact `int` or an
+/// int-subclass instance (IntEnum members, `_NamedIntConstant`, ...), reading
+/// the latter through its embedded canonical payload.
 #[must_use]
 pub unsafe fn to_bigint(object: *mut PyObject) -> Option<BigInt> {
+    let object = unsafe { crate::types::type_::payload_subclass_value(object) }
+        .map(crate::tag::untag_arg)
+        .unwrap_or(object);
     if !unsafe { is_exact_int(object) } {
         return None;
     }
@@ -137,6 +142,10 @@ pub fn bigint_from_f64_trunc(value: f64) -> Option<BigInt> {
 }
 
 unsafe fn construct_one(object: *mut PyObject) -> *mut PyObject {
+    // `int`/`str`-subclass instances (IntEnum/StrEnum members, ...) convert
+    // through their embedded canonical payload (CPython `int(x)` reads the
+    // base value of an int subclass).
+    let object = unsafe { crate::types::type_::payload_subclass_value(object) }.unwrap_or(object);
     if let Some(value) = unsafe { to_bigint_including_bool(object) } {
         return from_bigint(value);
     }
@@ -158,23 +167,60 @@ unsafe fn construct_one(object: *mut PyObject) -> *mut PyObject {
             Err(message) => raise_value_error(&message),
         };
     }
+    if let Some(bytes) = unsafe { bytes_like_slice(object) } {
+        return match bytes_like_text(bytes, 10).and_then(|text| parse_int_text(text, 10)) {
+            Ok(value) => from_bigint(value),
+            Err(message) => raise_value_error(&message),
+        };
+    }
     raise_type_error("int() argument must be a string, a bytes-like object or a real number, not object")
 }
 
 unsafe fn construct_with_base(object: *mut PyObject, base_object: *mut PyObject) -> *mut PyObject {
-    let Some(text) = (unsafe { crate::types::type_::unicode_text(object) }) else {
+    let unicode = unsafe { crate::types::type_::unicode_text(object) };
+    let bytes = if unicode.is_none() { unsafe { bytes_like_slice(object) } } else { None };
+    if unicode.is_none() && bytes.is_none() {
         return raise_type_error("int() can't convert non-string with explicit base");
-    };
+    }
     let Some(base) = (unsafe { to_bigint_including_bool(base_object).and_then(|value| value.to_i32()) }) else {
         return raise_value_error("int() base must be >= 2 and <= 36, or 0");
     };
     if base != 0 && !(2..=36).contains(&base) {
         return raise_value_error("int() base must be >= 2 and <= 36, or 0");
     }
+    let text = match (unicode, bytes) {
+        (Some(text), _) => text,
+        (None, Some(bytes)) => match bytes_like_text(bytes, base) {
+            Ok(text) => text,
+            Err(message) => return raise_value_error(&message),
+        },
+        (None, None) => unreachable!("guarded above"),
+    };
     match parse_int_text(text, base) {
         Ok(value) => from_bigint(value),
         Err(message) => raise_value_error(&message),
     }
+}
+
+/// Borrows the payload of an exact bytes or bytearray object.
+unsafe fn bytes_like_slice<'a>(object: *mut PyObject) -> Option<&'a [u8]> {
+    if object.is_null() {
+        return None;
+    }
+    let ty = unsafe { (*object).ob_type };
+    if crate::types::bytes_::is_bytes_type(ty) {
+        return Some(unsafe { (*object.cast::<crate::types::bytes_::PyBytes>()).as_slice() });
+    }
+    if crate::types::bytearray_::is_bytearray_type(ty) {
+        return Some(unsafe { (*object.cast::<crate::types::bytearray_::PyByteArray>()).as_slice() });
+    }
+    None
+}
+
+/// Decodes an int literal payload from a bytes-like object, mirroring
+/// CPython's ASCII requirement for `int(b'...', base)`.
+fn bytes_like_text(bytes: &[u8], base: i32) -> Result<&str, String> {
+    core::str::from_utf8(bytes).map_err(|_| invalid_int_literal(&crate::types::bytes_::repr(bytes), base))
 }
 
 fn parse_int_text(text: &str, requested_base: i32) -> Result<BigInt, String> {
@@ -306,6 +352,62 @@ pub unsafe fn install_slots_for_object(object: *mut PyObject) {
         (*ty).tp_hash = Some(hash_slot);
         (*ty).tp_bool = Some(bool_slot);
         (*ty).tp_as_number = number_methods_ptr();
+    }
+}
+
+/// Instance attribute surface for exact `int`/`bool` receivers (slotless
+/// native types reach here from `abstract_op::get_attr`): `bit_length`/
+/// `bit_count` bound methods plus the numeric-tower value attributes.
+pub unsafe fn int_instance_attr(object: *mut PyObject, name: u32) -> Option<*mut PyObject> {
+    let value = unsafe { to_bigint_including_bool(crate::tag::untag_arg(object)) }?;
+    let name_text = crate::intern::resolve(name)?;
+    match name_text.as_str() {
+        "bit_length" => bound_int_method(object, name, int_bit_length_method),
+        "bit_count" => bound_int_method(object, name, int_bit_count_method),
+        "numerator" | "real" => Some(from_bigint(value)),
+        "denominator" => Some(from_bigint(BigInt::from(1))),
+        "imag" => Some(from_bigint(BigInt::from(0))),
+        _ => None,
+    }
+}
+
+fn bound_int_method(
+    receiver: *mut PyObject,
+    name: u32,
+    entry: unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject,
+) -> Option<*mut PyObject> {
+    let function = unsafe { crate::abi::pon_make_function(entry as *const u8, crate::builtins::variadic_arity(), name) };
+    if function.is_null() {
+        return Some(core::ptr::null_mut());
+    }
+    match crate::types::method::new_bound_method(function, receiver) {
+        Ok(method) => Some(method.cast::<PyObject>()),
+        Err(message) => Some(raise_type_error(&message)),
+    }
+}
+
+unsafe fn int_method_receiver(argv: *mut *mut PyObject, argc: usize, name: &str) -> Result<BigInt, *mut PyObject> {
+    if argc != 1 || argv.is_null() {
+        return Err(raise_type_error(&format!("int.{name}() takes no arguments")));
+    }
+    let receiver = unsafe { crate::tag::untag_arg(*argv) };
+    match unsafe { to_bigint_including_bool(receiver) } {
+        Some(value) => Ok(value),
+        None => Err(raise_type_error(&format!("int.{name}() receiver must be int"))),
+    }
+}
+
+unsafe extern "C" fn int_bit_length_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    match unsafe { int_method_receiver(argv, argc, "bit_length") } {
+        Ok(value) => from_bigint(BigInt::from(value.bits())),
+        Err(error) => error,
+    }
+}
+
+unsafe extern "C" fn int_bit_count_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    match unsafe { int_method_receiver(argv, argc, "bit_count") } {
+        Ok(value) => from_bigint(BigInt::from(value.magnitude().count_ones())),
+        Err(error) => error,
     }
 }
 

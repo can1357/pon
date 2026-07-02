@@ -8,6 +8,8 @@
 //! integer addresses so the global mutex remains `Send`, and every public helper
 //! returns a `Result` instead of unwinding across the C ABI.
 
+use core::ffi::c_int;
+
 use std::collections::{BTreeMap, HashMap};
 use std::mem;
 use std::ptr;
@@ -16,7 +18,7 @@ use std::sync::{LazyLock, Mutex};
 use crate::abi::{CodeInfo, ParamSpec, return_null_with_error};
 use crate::intern::{self, intern, resolve};
 use crate::object::{PyCodeFn, PyFunction, PyObject, PyObjectHeader, PyType, PyUnicode};
-use crate::thread_state::{pon_err_clear, pon_err_occurred};
+use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set};
 use crate::types::{dict, list::PyList, tuple::PyTuple, type_::{self, PyClassDict}};
 
 static FUNCTION_RECORDS: LazyLock<Mutex<HashMap<usize, FunctionRecord>>> =
@@ -65,6 +67,32 @@ impl FunctionRecord {
     #[must_use]
     pub fn closure(&self) -> Vec<*mut PyObject> {
         self.closure.iter().map(|value| *value as *mut PyObject).collect()
+    }
+}
+
+/// Reports the GC-managed objects held by `function`'s side-table record
+/// (positional defaults, keyword-only defaults, and closure cells) to a GC
+/// trace visitor.
+///
+/// The record itself is malloc'd side storage keyed by object address, so the
+/// collector cannot reach these values through the `PyFunction` allocation;
+/// `abi::trace_function` forwards here.  Reported pointers may be tagged
+/// immediates or NULL — the GC's pointer classification filters those.
+pub fn visit_function_gc_refs(function: *mut PyObject, visitor: &mut dyn FnMut(*mut u8)) {
+    let records = FUNCTION_RECORDS.lock().unwrap_or_else(|poison| poison.into_inner());
+    let Some(record) = records.get(&(function as usize)) else {
+        return;
+    };
+    for value in record
+        .defaults
+        .iter()
+        .chain(record.kwdefaults.values())
+        .chain(record.closure.iter())
+    {
+        let object = *value as *mut u8;
+        if !object.is_null() {
+            visitor(object);
+        }
     }
 }
 
@@ -182,6 +210,7 @@ pub unsafe fn install_function_type_attrs(function_type: *mut PyType, type_type:
         if (*function_type).tp_dict.is_null() {
             let dict = type_::new_namespace();
             (*function_type).tp_dict = dict.cast::<PyObject>();
+            crate::sync::register_namespaced_type(function_type);
             dict
         } else {
             (*function_type).tp_dict.cast::<PyClassDict>()
@@ -467,6 +496,19 @@ fn function_attr_by_id(function: *mut PyObject, name_id: u32) -> Option<*mut PyO
     if name_id == intern("__name__") || name_id == intern("__qualname__") {
         return Some(const_name(unsafe { (*function.cast::<PyFunction>()).name_interned }));
     }
+    if name_id == intern("__doc__") {
+        // Lowering does not thread docstring text into function metadata yet,
+        // so every function reports CPython's default.  A `__doc__` store
+        // still wins: `function_getattro` consults the attr dict first.
+        return Some(unsafe { crate::abi::pon_none() });
+    }
+    if name_id == intern("__module__") {
+        // Mirrors `__globals__` below: the runtime only tracks the actively
+        // executing module, so the definition module is approximated by the
+        // active module name (`__main__` outside source-module execution).
+        let module = crate::import::active_module_name_id().unwrap_or_else(|| intern("__main__"));
+        return Some(const_name(module));
+    }
     if name_id == intern("__code__") {
         return Some(alloc_code_object(function));
     }
@@ -516,10 +558,50 @@ fn function_attr_by_id(function: *mut PyObject, name_id: u32) -> Option<*mut PyO
     if name_id == intern("__annotate__") {
         return Some(function_annotate(function).unwrap_or_else(|| unsafe { crate::abi::pon_none() }));
     }
+    if name_id == intern("__get__") {
+        // Python-visible descriptor protocol: `_is_descriptor`-style probes
+        // (`hasattr(f, '__get__')`, enum's member classification) must see
+        // functions as descriptors.  Served as a bound native so
+        // `f.__get__(obj)` binds exactly like implicit method lookup.
+        let carrier = unsafe {
+            crate::abi::pon_make_function(
+                function_dunder_get_native as *const u8,
+                crate::builtins::variadic_arity(),
+                intern("__get__"),
+            )
+        };
+        if carrier.is_null() {
+            return Some(ptr::null_mut());
+        }
+        return Some(match crate::types::method::new_bound_method(carrier, function) {
+            Ok(method) => method.cast::<PyObject>(),
+            Err(message) => return_null_with_error(message),
+        });
+    }
     if name_id == intern("__dict__") {
-        return Some(unsafe { crate::abi::map::pon_build_map(ptr::null_mut(), 0) });
+        return Some(unsafe { ensure_function_attr_dict(function) });
     }
     None
+}
+
+/// Returns the function's instance attribute dict, allocating it on first use.
+///
+/// The pointer lives in the trailing `PyFunction::attr_dict` field, which the
+/// GC visits through `trace_function`, so the dict (and, via `trace_dict`, the
+/// stored keys/values) stays alive exactly as long as the function does.
+unsafe fn ensure_function_attr_dict(function: *mut PyObject) -> *mut PyObject {
+    let function_ref = function.cast::<PyFunction>();
+    let existing = unsafe { (*function_ref).attr_dict };
+    if !existing.is_null() {
+        return existing;
+    }
+    let dict = unsafe { crate::abi::map::pon_build_map(ptr::null_mut(), 0) };
+    if !dict.is_null() {
+        unsafe {
+            (*function_ref).attr_dict = dict;
+        }
+    }
+    dict
 }
 
 /// Attribute lookup for function metadata exposed at Python level.
@@ -532,10 +614,101 @@ pub unsafe extern "C" fn function_getattro(function: *mut PyObject, name: *mut P
         return return_null_with_error("function attribute name is not valid UTF-8");
     };
     let name_id = intern(name_text);
+    // Instance attributes stored by `function_setattro` win for plain names,
+    // matching CPython where the function `__dict__` backs arbitrary
+    // attributes.  `__dict__` itself stays a pseudo-getset served below and is
+    // never looked up inside the dict.
+    if name_id != intern("__dict__") {
+        let dict = unsafe { (*function.cast::<PyFunction>()).attr_dict };
+        if !dict.is_null() {
+            let key = const_str(name_text);
+            if key.is_null() {
+                return return_null_with_error("failed to allocate function attribute key");
+            }
+            match unsafe { dict::dict_get(dict, key) } {
+                Ok(Some(value)) => return value,
+                Ok(None) => {}
+                Err(message) => return return_null_with_error(message),
+            }
+        }
+    }
     if let Some(value) = function_attr_by_id(function, name_id) {
         return value;
     }
-    return_null_with_error(format!("function has no attribute '{name_text}'"))
+    let _ = unsafe { crate::abi::pon_raise_attribute_error(function, name_id) };
+    ptr::null_mut()
+}
+
+/// Attribute assignment/deletion for function objects (`tp_setattro`).
+///
+/// Every plain name lands in the per-function attribute dict — CPython's
+/// function `__dict__` — which `function_getattro` consults first, so special
+/// writable metadata (`__doc__`, `__name__`, `__qualname__`, `__module__`,
+/// `__wrapped__`, `__isabstractmethod__`, ...) shares that storage and
+/// assign-then-read matches CPython without a dedicated slot per name.
+/// Assigning `__dict__` replaces the whole dict and requires a dict object;
+/// deleting it is rejected like CPython's function `__dict__` getset.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn function_setattro(function: *mut PyObject, name: *mut PyObject, value: *mut PyObject) -> c_int {
+    if function.is_null() || name.is_null() {
+        pon_err_set("function attribute assignment received NULL");
+        return -1;
+    }
+    let Some(name_text) = (unsafe { (&*name.cast::<PyUnicode>()).as_str() }) else {
+        pon_err_set("function attribute name is not valid UTF-8");
+        return -1;
+    };
+    if name_text == "__dict__" {
+        if value.is_null() {
+            pon_err_set("function's dictionary may not be deleted");
+            return -1;
+        }
+        if !unsafe { dict::is_dict(value) } {
+            pon_err_set("__dict__ must be set to a dictionary");
+            return -1;
+        }
+        unsafe {
+            (*function.cast::<PyFunction>()).attr_dict = value;
+        }
+        return 0;
+    }
+    if value.is_null() {
+        let dict = unsafe { (*function.cast::<PyFunction>()).attr_dict };
+        if !dict.is_null() {
+            let key = const_str(name_text);
+            if key.is_null() {
+                pon_err_set("failed to allocate function attribute key");
+                return -1;
+            }
+            match unsafe { dict::dict_remove(dict, key) } {
+                Ok(Some(_)) => return 0,
+                Ok(None) => {}
+                Err(message) => {
+                    pon_err_set(message);
+                    return -1;
+                }
+            }
+        }
+        let _ = unsafe { crate::abi::pon_raise_attribute_error(function, intern(name_text)) };
+        return -1;
+    }
+    let dict = unsafe { ensure_function_attr_dict(function) };
+    if dict.is_null() {
+        pon_err_set("failed to allocate function attribute dict");
+        return -1;
+    }
+    let key = const_str(name_text);
+    if key.is_null() {
+        pon_err_set("failed to allocate function attribute key");
+        return -1;
+    }
+    match unsafe { dict::dict_insert(dict, key, value) } {
+        Ok(()) => 0,
+        Err(message) => {
+            pon_err_set(message);
+            -1
+        }
+    }
 }
 
 pub unsafe fn set_function_annotations(
@@ -596,6 +769,48 @@ pub fn function_annotate(function: *mut PyObject) -> Option<*mut PyObject> {
         .ok()
         .and_then(|table| table.get(&(function as usize)).copied())
         .map(|address| address as *mut PyObject)
+}
+
+/// Defining-module side table: function object address -> interned module
+/// name.  Recorded at `pon_make_function`/`pon_make_function_full` time from
+/// the creation context (enclosing function's module, else the actively
+/// executing module), so `pon_load_global`/`pon_store_global` can scope a
+/// function body's global namespace to its defining module (CPython
+/// `__globals__` semantics) instead of the caller's active module.  Entries
+/// are raw unrooted addresses, the same accepted pattern as
+/// `FUNCTION_RECORDS` and `ANNOTATE_FUNCTIONS`; the GC dealloc hook clears
+/// entries so a reused allocation address can never resurrect a stale
+/// module binding.
+static FUNCTION_MODULES: LazyLock<Mutex<HashMap<usize, u32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Record `module` (interned name) as `function`'s defining module.
+pub fn set_function_module(function: *mut PyObject, module: u32) {
+    if function.is_null() {
+        return;
+    }
+    if let Ok(mut table) = FUNCTION_MODULES.lock() {
+        table.insert(function as usize, module);
+    }
+}
+
+/// Return the interned defining-module name recorded for `function`, if any.
+#[must_use]
+pub fn function_module(function: *mut PyObject) -> Option<u32> {
+    if function.is_null() {
+        return None;
+    }
+    FUNCTION_MODULES
+        .lock()
+        .ok()
+        .and_then(|table| table.get(&(function as usize)).copied())
+}
+
+/// Drop the defining-module record for a freed `function` allocation.
+pub fn clear_function_module(function: *mut PyObject) {
+    if let Ok(mut table) = FUNCTION_MODULES.lock() {
+        table.remove(&(function as usize));
+    }
 }
 
 /// Lazy PEP 649 `__annotations__`: return the cached dict, or call
@@ -672,45 +887,63 @@ pub unsafe extern "C" fn function_descr_get(descr: *mut PyObject, obj: *mut PyOb
     }
 }
 
-unsafe fn positional_args_from_star(object: *mut PyObject) -> Result<Vec<*mut PyObject>, String> {
-    match unsafe { dict::type_name(object) } {
-        Some("tuple") => Ok(unsafe { (&*object.cast::<PyTuple>()).as_slice() }.to_vec()),
-        Some("list") => Ok(unsafe { (&*object.cast::<PyList>()).as_slice() }.to_vec()),
-        Some(name) => Err(format!("argument after * must be an iterable, not {name}")),
-        None => Err("argument after * is invalid".to_owned()),
+/// `function.__get__(obj, owner=None)` — the Python-visible spelling of
+/// [`function_descr_get`]: `argv[0]` is the function (bound receiver of the
+/// `__get__` carrier), `argv[1]` the instance, optional `argv[2]` the owner
+/// class.  A `None` instance with an owner returns the function unbound
+/// (CPython `func_descr_get` parity).
+unsafe extern "C" fn function_dunder_get_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc < 2 {
+        return return_null_with_error("expected at least 1 argument, got 0");
+    }
+    let function = unsafe { *argv };
+    let obj = unsafe { *argv.add(1) };
+    let obj_is_none = obj.is_null() || obj == unsafe { crate::abi::pon_none() };
+    if obj_is_none {
+        if argc >= 3 {
+            return function;
+        }
+        return return_null_with_error("__get__(None, None) is invalid");
+    }
+    match crate::types::method::new_bound_method(function, obj) {
+        Ok(method) => method.cast::<PyObject>(),
+        Err(message) => return_null_with_error(message),
     }
 }
 
-unsafe fn extend_keywords_from_mapping(
-    function: *mut PyObject,
-    mapping: *mut PyObject,
-    names: &mut Vec<u32>,
-    values: &mut Vec<*mut PyObject>,
-) -> Result<(), String> {
-    if unsafe { dict::type_name(mapping) } != Some("dict") {
-        let type_name = unsafe { dict::type_name(mapping) }.unwrap_or("object");
-        return Err(format!("argument after ** must be a mapping, not {type_name}"));
-    }
-    for entry in unsafe { dict::dict_entries_snapshot(mapping)? } {
-        if unsafe { dict::type_name(entry.key) } != Some("str") {
-            return Err("keywords must be strings".to_owned());
-        }
-        let Some(name_text) = (unsafe { (&*entry.key.cast::<PyUnicode>()).as_str() }) else {
-            return Err("keyword name is not valid UTF-8".to_owned());
-        };
-        let name = intern::intern(name_text);
-        if names.contains(&name) {
-            return Err(format!(
-                "{} got multiple values for keyword argument '{}'",
-                function_call_name(function),
-                name_text
-            ));
-        }
-        names.push(name);
-        values.push(entry.value);
-    }
-    Ok(())
+pub(crate) unsafe fn positional_args_from_star(object: *mut PyObject) -> Result<Vec<*mut PyObject>, String> { match unsafe { dict::type_name(object) } {
+    Some("tuple") => Ok(unsafe { (&*object.cast::<PyTuple>()).as_slice() }.to_vec()),
+    Some("list") => Ok(unsafe { (&*object.cast::<PyList>()).as_slice() }.to_vec()),
+    Some(name) => Err(format!("argument after * must be an iterable, not {name}")),
+    None => Err("argument after * is invalid".to_owned()),
+} }
+
+pub(crate) unsafe fn extend_keywords_from_mapping(function: *mut PyObject,
+mapping: *mut PyObject,
+names: &mut Vec<u32>,
+values: &mut Vec<*mut PyObject>,) -> Result<(), String> { if unsafe { dict::type_name(mapping) } != Some("dict") {
+    let type_name = unsafe { dict::type_name(mapping) }.unwrap_or("object");
+    return Err(format!("argument after ** must be a mapping, not {type_name}"));
 }
+for entry in unsafe { dict::dict_entries_snapshot(mapping)? } {
+    if unsafe { dict::type_name(entry.key) } != Some("str") {
+        return Err("keywords must be strings".to_owned());
+    }
+    let Some(name_text) = (unsafe { (&*entry.key.cast::<PyUnicode>()).as_str() }) else {
+        return Err("keyword name is not valid UTF-8".to_owned());
+    };
+    let name = intern::intern(name_text);
+    if names.contains(&name) {
+        return Err(format!(
+            "{} got multiple values for keyword argument '{}'",
+            function_call_name(function),
+            name_text
+        ));
+    }
+    names.push(name);
+    values.push(entry.value);
+}
+Ok(()) }
 
 fn function_call_name(function: *mut PyObject) -> String {
     let name = function_name(function).unwrap_or_else(|| "function".to_owned());
@@ -941,7 +1174,15 @@ fn bind_phase_a_arguments(
     if !keywords.names.is_empty() {
         return bind_native_keywords(function, positional, keywords);
     }
-    // SAFETY: The caller only invokes binding after the runtime type check.
+    // Only real function objects carry the Phase-A `arity` field; anything
+    // else (bound methods, descriptor carriers) reaching this binder is a
+    // dispatch bug upstream — fail with the type name instead of reading
+    // garbage through the wrong layout.
+    let ob_type = unsafe { (*function).ob_type };
+    if ob_type.is_null() || unsafe { (*ob_type).name() } != "function" {
+        let type_name = if ob_type.is_null() { "<missing type>" } else { unsafe { (*ob_type).name() } };
+        return Err(format!("cannot bind arguments for '{type_name}' object: expected a function"));
+    }
     let arity = unsafe { (*function.cast::<PyFunction>()).arity };
     if arity != crate::builtins::variadic_arity() && positional.len() != arity {
         return Err(format!("function expected {arity} arguments, got {}", positional.len()));
@@ -959,6 +1200,17 @@ fn bind_native_keywords(
     positional: &[*mut PyObject],
     keywords: KeywordArgs<'_>,
 ) -> Result<Vec<*mut PyObject>, String> {
+    // Only real function objects carry the name/arity layout read below;
+    // anything else reaching this binder is a dispatch bug upstream — fail
+    // with the type name instead of reading garbage through the wrong layout.
+    if function.is_null() {
+        return Err("callee is NULL".to_owned());
+    }
+    let ob_type = unsafe { (*function).ob_type };
+    if ob_type.is_null() || unsafe { (*ob_type).name() } != "function" {
+        let type_name = if ob_type.is_null() { "<missing type>" } else { unsafe { (*ob_type).name() } };
+        return Err(format!("cannot bind keyword arguments for '{type_name}' object: expected a function"));
+    }
     let Some(name) = function_name(function) else {
         return Err("keyword arguments require Phase-B function metadata".to_owned());
     };
@@ -979,8 +1231,148 @@ pub(crate) fn bind_native_keywords_for_name(
         "max" => bind_minmax_keywords(positional, keywords, "max"),
         "zip" => bind_zip_keywords(positional, keywords),
         "enumerate" => bind_single_keyword(positional, keywords, "enumerate", "start", 1, 2),
+        // `type.__prepare__(*args, **kwds)` ignores everything it receives,
+        // so keyword binding degenerates to dropping the keywords.
+        "__prepare__" => Ok(positional.to_vec()),
+        // `type(name, bases, ns, **kwds)`: arbitrary class keywords ride to
+        // the metaclass constructor in a trailing marker (`metaclass`, PEP
+        // 487 `__init_subclass__` keywords, enum's `boundary`/`_simple`).
+        "type" => bind_class_keywords(positional, keywords),
+        // `__import__(name, globals=None, locals=None, fromlist=(), level=0)`:
+        // the vendored `encodings` package search function calls it with
+        // `fromlist=`/`level=` keywords; absent optionals arrive as None and
+        // `builtin_dunder_import` treats None as the CPython default.
+        "__import__" => bind_optional_named_keywords(
+            positional,
+            keywords,
+            "__import__",
+            &["name", "globals", "locals", "fromlist", "level"],
+            5,
+        ),
+        // Native `_colorize` keyword-only signatures (`traceback`,
+        // `unittest.runner`): absent optionals arrive as None/absent-falsy.
+        "can_colorize" => bind_optional_named_keywords(positional, keywords, "can_colorize", &["file"], 0),
+        "get_theme" => bind_optional_named_keywords(
+            positional,
+            keywords,
+            "get_theme",
+            &["tty_file", "force_color", "force_no_color"],
+            0,
+        ),
+        // Native `itertools` constructors (J0.4 lazy module): fixed-shape
+        // signatures flatten keywords into their positional slots with None
+        // filling absent optionals; the variadic constructors carry keywords
+        // in a trailing `lazy_iter::PyKwMarker`.
+        "count" => bind_optional_named_keywords(positional, keywords, "count", &["start", "step"], 2),
+        "repeat" => bind_optional_named_keywords(positional, keywords, "repeat", &["object", "times"], 2),
+        "accumulate" => {
+            bind_optional_named_keywords(positional, keywords, "accumulate", &["iterable", "func", "initial"], 2)
+        }
+        "groupby" => bind_optional_named_keywords(positional, keywords, "groupby", &["iterable", "key"], 2),
+        "permutations" => {
+            bind_optional_named_keywords(positional, keywords, "permutations", &["iterable", "r"], 2)
+        }
+        "combinations" => {
+            bind_optional_named_keywords(positional, keywords, "combinations", &["iterable", "r"], 2)
+        }
+        "batched" => bind_optional_named_keywords(positional, keywords, "batched", &["iterable", "n", "strict"], 2),
+        "zip_longest" => bind_trailing_marker_keywords(positional, keywords, "zip_longest", &["fillvalue"]),
+        "product" => bind_trailing_marker_keywords(positional, keywords, "product", &["repeat"]),
+        "complex" => bind_named_positional_keywords(positional, keywords, "complex", &["real", "imag"], 0, 2),
+        "property" => {
+            bind_optional_named_keywords(positional, keywords, "property", &["fget", "fset", "fdel", "doc"], 4)
+        }
         _ => Err("keyword arguments require Phase-B function metadata".to_owned()),
     }
+}
+
+/// Binds a fixed-shape native signature whose optionals default to None:
+/// keywords land in their named slot and every absent slot is filled with
+/// None, so the native entry sees one canonical positional layout.
+fn bind_optional_named_keywords(
+    positional: &[*mut PyObject],
+    keywords: KeywordArgs<'_>,
+    function_name: &str,
+    names: &[&str],
+    max_positional: usize,
+) -> Result<Vec<*mut PyObject>, String> {
+    if positional.len() > max_positional {
+        return Err(format!(
+            "{function_name}() expected at most {max_positional} positional arguments, got {}",
+            positional.len()
+        ));
+    }
+    let mut argv = positional.to_vec();
+    argv.resize(names.len(), ptr::null_mut());
+    for (name, value) in keywords.names.iter().copied().zip(keywords.values.iter().copied()) {
+        if value.is_null() {
+            return Err(format!("keyword argument {} is NULL", keyword_name(name)));
+        }
+        let actual = keyword_name(name);
+        let Some(index) = names.iter().position(|expected| *expected == actual) else {
+            return Err(format!("{function_name}() got an unexpected keyword argument '{actual}'"));
+        };
+        if index < positional.len() || !argv[index].is_null() {
+            return Err(format!("{function_name}() got multiple values for argument '{actual}'"));
+        }
+        argv[index] = value;
+    }
+    let none = unsafe { crate::abi::pon_none() };
+    if none.is_null() {
+        return Err(format!("failed to allocate None default for {function_name}()"));
+    }
+    for slot in &mut argv {
+        if slot.is_null() {
+            *slot = none;
+        }
+    }
+    Ok(argv)
+}
+
+/// Binds a variadic native signature: positionals pass through untouched and
+/// the validated keywords ride in a trailing `lazy_iter::PyKwMarker`.
+fn bind_trailing_marker_keywords(
+    positional: &[*mut PyObject],
+    keywords: KeywordArgs<'_>,
+    function_name: &str,
+    allowed: &[&str],
+) -> Result<Vec<*mut PyObject>, String> {
+    let mut pairs = Vec::with_capacity(keywords.names.len());
+    for (name, value) in keywords.names.iter().copied().zip(keywords.values.iter().copied()) {
+        if value.is_null() {
+            return Err(format!("keyword argument {} is NULL", keyword_name(name)));
+        }
+        let actual = keyword_name(name);
+        if !allowed.contains(&actual.as_str()) {
+            return Err(format!("{function_name}() got an unexpected keyword argument '{actual}'"));
+        }
+        if pairs.iter().any(|&(existing, _)| existing == name) {
+            return Err(format!("{function_name}() got multiple values for argument '{actual}'"));
+        }
+        pairs.push((name, value));
+    }
+    let mut argv = positional.to_vec();
+    argv.push(crate::types::lazy_iter::new_kw_marker(pairs));
+    Ok(argv)
+}
+
+/// Binds `type(name, bases, ns, **kwds)`: positionals pass through untouched
+/// and every keyword (any name — class keywords are user-defined) rides in a
+/// trailing `lazy_iter::PyKwMarker` that `builtin_type` unpacks.
+fn bind_class_keywords(positional: &[*mut PyObject], keywords: KeywordArgs<'_>) -> Result<Vec<*mut PyObject>, String> {
+    let mut pairs = Vec::with_capacity(keywords.names.len());
+    for (name, value) in keywords.names.iter().copied().zip(keywords.values.iter().copied()) {
+        if value.is_null() {
+            return Err(format!("keyword argument {} is NULL", keyword_name(name)));
+        }
+        if pairs.iter().any(|&(existing, _)| existing == name) {
+            return Err(format!("type() got multiple values for argument '{}'", keyword_name(name)));
+        }
+        pairs.push((name, value));
+    }
+    let mut argv = positional.to_vec();
+    argv.push(crate::types::lazy_iter::new_kw_marker(pairs));
+    Ok(argv)
 }
 
 fn bind_sorted_keywords(positional: &[*mut PyObject], keywords: KeywordArgs<'_>) -> Result<Vec<*mut PyObject>, String> {
@@ -1174,6 +1566,44 @@ mod tests {
 
     unsafe extern "C" fn dummy_entry(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
         ptr::null_mut()
+    }
+
+    #[test]
+    fn getattro_serves_doc_none_default_and_stored_doc_wins() {
+        let _guard = crate::thread_state::test_state_lock();
+        unsafe {
+            assert_eq!(crate::abi::pon_runtime_init(), 0);
+            // The default build keeps process-global thread state: clear any
+            // error sentinel a previous test on this harness thread leaked, or
+            // every helper below can spuriously return NULL (suite convention,
+            // same as abi::number's `init()`).
+            pon_err_clear();
+            let function =
+                crate::abi::pon_make_function(dummy_entry as *const u8, 0, intern("doc_probe"));
+            assert!(!function.is_null());
+            let doc_name = const_str("__doc__");
+            assert!(!doc_name.is_null());
+            let none = crate::abi::pon_none();
+            assert!(!none.is_null());
+            // No docstring metadata is threaded from lowering: default is None.
+            assert_eq!(function_getattro(function, doc_name), none);
+            // A stored __doc__ wins over the default (attr-dict-first lookup).
+            let stored = const_str("stored doc");
+            assert!(!stored.is_null());
+            assert_eq!(function_setattro(function, doc_name, stored), 0);
+            assert_eq!(function_getattro(function, doc_name), stored);
+            // Deleting the stored value falls back to the None default.
+            assert_eq!(function_setattro(function, doc_name, ptr::null_mut()), 0);
+            assert_eq!(function_getattro(function, doc_name), none);
+            // __module__ reports the active module name; outside source-module
+            // execution that is '__main__'.
+            let module_name = const_str("__module__");
+            assert!(!module_name.is_null());
+            let module = function_getattro(function, module_name);
+            assert!(!module.is_null());
+            let text = (&*module.cast::<PyUnicode>()).as_str().unwrap();
+            assert_eq!(text, "__main__");
+        }
     }
 
     #[test]

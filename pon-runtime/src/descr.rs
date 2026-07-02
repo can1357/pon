@@ -22,8 +22,15 @@ fn raise_attr_status(message: impl Into<String>) -> c_int {
     -1
 }
 
+/// Type of `object` for descriptor probing, or NULL when `object` carries no
+/// dereferenceable type.
+///
+/// Tagged immediates report NULL rather than being dereferenced: every caller
+/// already routes NULL through its non-descriptor path (an immediate found in
+/// a class dict is a plain value — it never has `__get__`/`__set__`), which is
+/// the tag-discipline contract for this module's entry points.
 unsafe fn object_type(object: *mut PyObject) -> *mut PyType {
-    if object.is_null() {
+    if object.is_null() || !crate::tag::is_heap(object) {
         ptr::null_mut()
     } else {
         unsafe { (*object).ob_type.cast_mut() }
@@ -106,6 +113,98 @@ unsafe fn set_str_key(dict: *mut PyObject, name: &str, value: *mut PyObject) -> 
     unsafe { abi::map::pon_dict_set_item_status(dict, key, value) >= 0 }
 }
 
+/// `object.__eq__(self, other)` default: identity `True`, else `NotImplemented`.
+///
+/// Raw (possibly tagged) pointers are compared: identical tagged immediates
+/// ARE the same value, mirroring CPython's small-int/str caches making
+/// identity hold for equal immediates.
+unsafe extern "C" fn object_dunder_eq_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { object_dunder_cmp_args(argv, argc, "__eq__") } {
+        Ok(args) => args,
+        Err(raised) => return raised,
+    };
+    if args[0] == args[1] {
+        return unsafe { abi::pon_const_bool(1) };
+    }
+    unsafe { abi::pon_not_implemented() }
+}
+
+/// `object.__ne__(self, other)` default: delegate to self's `__eq__` and
+/// invert, passing `NotImplemented` through (CPython `object_richcompare`).
+unsafe extern "C" fn object_dunder_ne_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { object_dunder_cmp_args(argv, argc, "__ne__") } {
+        Ok(args) => args,
+        Err(raised) => return raised,
+    };
+    let (raw_self, other) = (args[0], args[1]);
+    let this = crate::tag::untag_arg(raw_self);
+    if this.is_null() {
+        return ptr::null_mut();
+    }
+    let self_ty = unsafe { object_type(this) };
+    let eq_descr = if self_ty.is_null() {
+        ptr::null_mut()
+    } else {
+        unsafe { lookup_in_type(self_ty, intern::intern("__eq__")) }
+    };
+    if eq_descr.is_null() {
+        // No `__eq__` anywhere in the MRO: apply object's identity default.
+        if raw_self == other {
+            return unsafe { abi::pon_const_bool(0) };
+        }
+        return unsafe { abi::pon_not_implemented() };
+    }
+    let bound = unsafe { descriptor_get(eq_descr, this, self_ty) };
+    if bound.is_null() {
+        return ptr::null_mut();
+    }
+    let mut argv = [other];
+    let result = unsafe { abi::pon_call(bound, argv.as_mut_ptr(), argv.len()) };
+    if result.is_null() || result == unsafe { abi::pon_not_implemented() } {
+        return result;
+    }
+    match unsafe { abi::object::pon_is_true(result) } {
+        -1 => ptr::null_mut(),
+        truth => unsafe { abi::pon_const_bool(i32::from(truth == 0)) },
+    }
+}
+
+/// Shape validation for the object-default comparison natives; raises the
+/// CPython slot-wrapper TypeErrors.
+unsafe fn object_dunder_cmp_args<'a>(
+    argv: *mut *mut PyObject,
+    argc: usize,
+    name: &str,
+) -> Result<&'a [*mut PyObject], *mut PyObject> {
+    let message = if argv.is_null() && argc != 0 {
+        format!("object.{name} received a null argv pointer")
+    } else if argc == 0 {
+        format!("descriptor '{name}' of 'object' object needs an argument")
+    } else if argc != 2 {
+        format!("{name} expected 1 argument, got {}", argc - 1)
+    } else {
+        return Ok(unsafe { core::slice::from_raw_parts(argv.cast_const(), argc) });
+    };
+    Err(unsafe { abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) })
+}
+
+/// Last-resort type-level fallback for `object`'s slot methods: a full-MRO
+/// miss on a TYPE receiver resolves `__eq__`/`__ne__` to fresh unbound
+/// natives implementing object's defaults, mirroring CPython where these
+/// wrappers live in `object`'s tp_dict at the end of every MRO
+/// (`MutableMapping.__ne__` in collections resolves there).  Kept out of any
+/// real tp_dict so instance-side rich-compare dispatch is untouched.
+unsafe fn object_slot_method_fallback(name_id: u32) -> *mut PyObject {
+    let entry = if name_id == intern::intern("__eq__") {
+        object_dunder_eq_native as *const u8
+    } else if name_id == intern::intern("__ne__") {
+        object_dunder_ne_native as *const u8
+    } else {
+        return ptr::null_mut();
+    };
+    unsafe { abi::pon_make_function(entry, crate::builtins::variadic_arity(), name_id) }
+}
+
 unsafe fn type_dict_object(ty: *mut PyType) -> *mut PyObject {
     if ty.is_null() {
         return ptr::null_mut();
@@ -133,11 +232,21 @@ unsafe fn synthetic_type_attr(ty: *mut PyType, name_id: u32) -> *mut PyObject {
         return ptr::null_mut();
     }
     let type_name = unsafe { (*ty).name() };
-    if type_name == "dict" && name_id == intern::intern("fromkeys") {
+    // Builtin type receivers materialize their native tp_dict method surface
+    // on first type-level access: the unbound `dict.__setitem__(d, k, v)` /
+    // `list.append(lst, x)` patterns (collections.OrderedDict default args)
+    // then resolve through the regular MRO lookup below.
+    if type_name == "dict" {
+        dict::ensure_dict_subclass_methods_installed();
+    } else if type_name == "list" {
+        crate::abi::seq::ensure_list_type_methods_installed(ty);
+    } else if type_name == "str" {
+        crate::abi::str_::ensure_str_type_methods_installed(ty);
+    }
+    if (type_name == "dict" || unsafe { dict::type_is_dict_subclass(ty) }) && name_id == intern::intern("fromkeys") {
         return crate::native::builtins_mod::dict_fromkeys_function();
     }
-    let is_known_descriptor = (type_name == "object" && name_id == intern::intern("__init__"))
-        || (type_name == "str" && name_id == intern::intern("join"));
+    let is_known_descriptor = type_name == "object" && name_id == intern::intern("__init__");
     if is_known_descriptor {
         return unsafe { synthetic_builtin_descriptor() };
     }
@@ -412,6 +521,21 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
     if is_type && name_id == intern::intern("__dict__") {
         return unsafe { type_dict_object(object.cast::<PyType>()) };
     }
+    if is_type && name_id == intern::intern("__mro__") {
+        let mut entries = unsafe { mro::mro_entries(object.cast::<PyType>()) }
+            .into_iter()
+            .map(|ty| ty.cast::<PyObject>())
+            .collect::<Vec<_>>();
+        return unsafe {
+            abi::seq::pon_build_tuple(
+                if entries.is_empty() { ptr::null_mut() } else { entries.as_mut_ptr() },
+                entries.len(),
+            )
+        };
+    }
+    if is_type && name_id == intern::intern("__subclasses__") {
+        return unsafe { type_subclasses_method(object) };
+    }
     if is_type {
         let value = unsafe { synthetic_type_attr(object.cast::<PyType>(), name_id) };
         if !value.is_null() {
@@ -493,9 +617,13 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
         unsafe { lookup_in_type(obj_ty, name_id) }
     };
     if unsafe { is_data_descriptor(class_descr) } {
-        if !is_type {
-            unsafe { record_attr_translation(cell, obj_ty, version, ATTR_DESCR_BLIND, class_descr) };
+        if is_type {
+            // CPython type_getattro: own-MRO hits on a type receiver bind as
+            // `__get__(NULL, cls)` (classmethods bind the class, functions
+            // and properties come back unbound).
+            return unsafe { descriptor_get(class_descr, ptr::null_mut(), object.cast::<PyType>()) };
         }
+        unsafe { record_attr_translation(cell, obj_ty, version, ATTR_DESCR_BLIND, class_descr) };
         return unsafe { descriptor_get(class_descr, object, obj_ty) };
     }
 
@@ -510,6 +638,20 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
         return unsafe { class_dict_to_dict(dict) };
     }
 
+    if is_type {
+        if !class_descr.is_null() {
+            return unsafe { descriptor_get(class_descr, ptr::null_mut(), object.cast::<PyType>()) };
+        }
+        if !meta_descr.is_null() {
+            return unsafe { descriptor_get(meta_descr, object, obj_ty) };
+        }
+        let fallback = unsafe { object_slot_method_fallback(name_id) };
+        if !fallback.is_null() {
+            return fallback;
+        }
+        return unsafe { abi::pon_raise_attribute_error(object, name_id) };
+    }
+
     let dict = unsafe { instance_dict(object) };
     if !dict.is_null() {
         if let Some(value) = unsafe { (&*dict).get(name_id) } {
@@ -521,13 +663,8 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
     }
 
     if !class_descr.is_null() {
-        if !is_type {
-            unsafe { record_attr_translation(cell, obj_ty, version, ATTR_DESCR_PROBE_DICT, class_descr) };
-        }
+        unsafe { record_attr_translation(cell, obj_ty, version, ATTR_DESCR_PROBE_DICT, class_descr) };
         return unsafe { descriptor_get(class_descr, object, obj_ty) };
-    }
-    if !meta_descr.is_null() {
-        return unsafe { descriptor_get(meta_descr, object, obj_ty) };
     }
 
     unsafe { abi::pon_raise_attribute_error(object, name_id) }
@@ -653,11 +790,95 @@ pub unsafe fn super_lookup(start: *mut PyType, obj: *mut PyObject, owner: *mut P
         let dict = unsafe { (*cls).tp_dict };
         if let Some(dict) = unsafe { dict_from_ptr(dict) } {
             if let Some(value) = dict.get(name) {
-                return unsafe { descriptor_get(value, obj, owner) };
+                // CPython super_getattro: a class-bound proxy (obj IS the
+                // owner type, e.g. zero-arg super in a metaclass `__new__` or
+                // a classmethod) binds as `__get__(NULL, owner)` so functions
+                // come back unbound; instance-bound proxies bind the receiver.
+                let bind_obj = if obj == owner.cast::<PyObject>() { ptr::null_mut() } else { obj };
+                return unsafe { descriptor_get(value, bind_obj, owner) };
             }
         }
     }
     raise_attr_error("super attribute was not found")
+}
+
+/// Python-level metaclass hook (`__instancecheck__`/`__subclasscheck__`)
+/// defined strictly below the builtin `type` in `cls`'s metatype MRO.
+unsafe fn metaclass_check_hook(cls: *mut PyObject, name: u32) -> *mut PyObject {
+    let meta = unsafe { object_type(cls) };
+    let type_type = abi::runtime_type_type();
+    if meta.is_null() || meta == type_type {
+        return ptr::null_mut();
+    }
+    for entry in unsafe { mro::mro_entries(meta) } {
+        if entry == type_type {
+            break;
+        }
+        if entry.is_null() {
+            continue;
+        }
+        let dict = unsafe { (*entry).tp_dict.cast::<PyClassDict>() };
+        if dict.is_null() {
+            continue;
+        }
+        if let Some(value) = unsafe { (&*dict).get(name) } {
+            return value;
+        }
+    }
+    ptr::null_mut()
+}
+
+/// Bind and call one metaclass check hook; returns the truth value.
+unsafe fn call_metaclass_check_hook(hook: *mut PyObject, cls: *mut PyObject, arg: *mut PyObject) -> c_int {
+    let meta = unsafe { object_type(cls) };
+    let bound = unsafe { descriptor_get(hook, cls, meta) };
+    if bound.is_null() {
+        return -1;
+    }
+    let result = unsafe { call_with_one(bound, arg) };
+    if result.is_null() {
+        return -1;
+    }
+    unsafe { abi::pon_is_true(result) }
+}
+
+/// `cls.__subclasses__()` support: a bound native method over the runtime's
+/// direct-subclass registry.
+unsafe fn type_subclasses_method(cls: *mut PyObject) -> *mut PyObject {
+    let function = unsafe {
+        abi::pon_make_function(
+            type_subclasses_native as *const u8,
+            crate::builtins::variadic_arity(),
+            intern::intern("__subclasses__"),
+        )
+    };
+    if function.is_null() {
+        return ptr::null_mut();
+    }
+    match crate::types::method::new_bound_method(function, cls) {
+        Ok(method) => method.cast::<PyObject>(),
+        Err(message) => raise_attr_error(message),
+    }
+}
+
+unsafe extern "C" fn type_subclasses_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 1 {
+        return raise_attr_error("__subclasses__() takes no arguments");
+    }
+    let cls = unsafe { *argv };
+    if cls.is_null() || unsafe { !is_type_object(cls) } {
+        return raise_attr_error("__subclasses__ receiver must be a class");
+    }
+    let mut entries = sync::direct_subclasses(cls.cast::<PyType>())
+        .into_iter()
+        .map(|ty| ty.cast::<PyObject>())
+        .collect::<Vec<_>>();
+    unsafe {
+        abi::seq::pon_build_list(
+            if entries.is_empty() { ptr::null_mut() } else { entries.as_mut_ptr() },
+            entries.len(),
+        )
+    }
 }
 
 /// Core hook for `issubclass(cls, base)`.
@@ -665,11 +886,21 @@ pub unsafe fn issubclass(cls: *mut PyObject, base: *mut PyObject) -> c_int {
     if cls.is_null() || base.is_null() || unsafe { !is_type_object(cls) || !is_type_object(base) } {
         return raise_attr_status("issubclass() arguments must be classes");
     }
+    let hook = unsafe { metaclass_check_hook(base, intern::intern("__subclasscheck__")) };
+    if !hook.is_null() {
+        return unsafe { call_metaclass_check_hook(hook, base, cls) };
+    }
     i32::from(unsafe { mro::is_subtype(cls.cast::<PyType>(), base.cast::<PyType>()) })
 }
 
 /// Core hook for `isinstance(obj, cls)`.
 pub unsafe fn isinstance(obj: *mut PyObject, cls: *mut PyObject) -> c_int {
+    // CPython `PyObject_IsInstance` fast-paths `type(obj) is cls` before any
+    // dispatch, so a metaclass `__instancecheck__` hook is NOT consulted for
+    // exact-type matches.
+    if !obj.is_null() && !cls.is_null() && unsafe { (*obj).ob_type }.cast_mut().cast::<PyObject>() == cls {
+        return 1;
+    }
     if typealias::is_union_type(cls) {
         for arg in typealias::union_args(cls) {
             if unsafe { isinstance(obj, *arg) } > 0 {
@@ -680,6 +911,10 @@ pub unsafe fn isinstance(obj: *mut PyObject, cls: *mut PyObject) -> c_int {
     }
     if obj.is_null() || cls.is_null() || unsafe { !is_type_object(cls) } {
         return raise_attr_status("isinstance() arg 2 must be a class");
+    }
+    let hook = unsafe { metaclass_check_hook(cls, intern::intern("__instancecheck__")) };
+    if !hook.is_null() {
+        return unsafe { call_metaclass_check_hook(hook, cls, obj) };
     }
     let ty = unsafe { object_type(obj) };
     i32::from(unsafe { mro::is_subtype(ty, cls.cast::<PyType>()) })

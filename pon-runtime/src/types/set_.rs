@@ -190,6 +190,11 @@ pub unsafe fn set_add(set: *mut PyObject, item: *mut PyObject) -> Result<(), Str
 
 /// Removes an element from a mutable set if present.
 pub unsafe fn set_discard(set: *mut PyObject, item: *mut PyObject) -> Result<(), String> {
+    unsafe { set_remove(set, item) }.map(|_| ())
+}
+
+/// Removes an element from a mutable set, reporting whether it was present.
+pub unsafe fn set_remove(set: *mut PyObject, item: *mut PyObject) -> Result<bool, String> {
     if item.is_null() {
         return Err("set item is NULL".to_owned());
     }
@@ -197,7 +202,28 @@ pub unsafe fn set_discard(set: *mut PyObject, item: *mut PyObject) -> Result<(),
     if let Some(index) = unsafe { find_element_index(&set.entries, item)? } {
         set.entries.remove(index);
         rebuild_set_buckets(set)?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
+}
+
+/// Removes and returns the first insertion-order element, if any.
+pub unsafe fn set_pop(set: *mut PyObject) -> Result<Option<*mut PyObject>, String> {
+    let set = unsafe { set_mut(set)? };
+    if set.entries.is_empty() {
+        return Ok(None);
+    }
+    let value = set.entries.remove(0);
+    rebuild_set_buckets(set)?;
+    Ok(Some(value))
+}
+
+/// Removes every element from a mutable set.
+pub unsafe fn set_clear(set: *mut PyObject) -> Result<(), String> {
+    let set = unsafe { set_mut(set)? };
+    set.entries.clear();
+    set.buckets.clear();
     Ok(())
 }
 
@@ -417,7 +443,8 @@ unsafe extern "C" fn set_getattro_slot(object: *mut PyObject, name: *mut PyObjec
         return crate::abi::return_null_with_error("set attribute name must be str");
     };
     match name {
-        "add" | "discard" | "union" | "intersection" | "difference" | "issubset" | "__contains__" => unsafe {
+        "add" | "discard" | "union" | "intersection" | "difference" | "issubset" | "__contains__" | "copy"
+        | "remove" | "clear" | "pop" => unsafe {
             crate::abi::map::pon_set_bound_method(object, name)
         },
         _ => crate::abi::return_null_with_error(format!("attribute '{name}' was not found")),

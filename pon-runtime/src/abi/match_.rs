@@ -10,13 +10,14 @@ use core::ptr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::vec::Vec;
 
+use super::exc::{pending_exception_is, pending_exception_object};
 use crate::abstract_op;
 use crate::descr;
 use crate::feedback::FeedbackCell;
 use crate::intern;
 use crate::mro;
 use crate::object::{as_object_ptr, PyFunction, PyObject, PyType, PyUnicode};
-use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set_object, thread_state_lock};
+use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set_object};
 use crate::types::exc::PyBaseException;
 use crate::types::{bool_, dict, type_::PyClassDict};
 
@@ -116,34 +117,6 @@ unsafe fn type_name_in(object: *mut PyObject, names: &[&str]) -> bool {
         .any(|entry| !entry.is_null() && names.contains(&unsafe { (**entry).name() }))
 }
 
-/// Returns the pending exception when it is a live boxed exception object.
-///
-/// Diagnostic-only errors raised through `pon_err_set` install a dangling
-/// sentinel; those are never dereferenced here.
-fn pending_exception_object() -> Option<*mut PyObject> {
-    let current = thread_state_lock().current_exc;
-    if current.is_null() || current == core::ptr::NonNull::<PyObject>::dangling().as_ptr() {
-        None
-    } else {
-        Some(current)
-    }
-}
-
-/// Returns true when the pending exception is an instance of the named
-/// builtin exception type (walking `tp_base`).
-fn pending_exception_is(name: &str) -> bool {
-    let Some(exception) = pending_exception_object() else {
-        return false;
-    };
-    let mut ty = unsafe { (*exception).ob_type };
-    while !ty.is_null() {
-        if unsafe { (*ty).name() } == name {
-            return true;
-        }
-        ty = unsafe { (*ty).tp_base };
-    }
-    false
-}
 
 unsafe fn sequence_len(subject: *mut PyObject) -> Result<Option<isize>, *mut PyObject> {
     let Some(ty) = (unsafe { object_type(subject) }) else {

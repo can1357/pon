@@ -53,17 +53,43 @@ fn diagnostic_sentinel() -> *mut PyObject {
     core::ptr::NonNull::<PyObject>::dangling().as_ptr()
 }
 
-fn is_diagnostic_sentinel(value: *mut PyObject) -> bool {
+pub(crate) fn is_diagnostic_sentinel(value: *mut PyObject) -> bool {
     value == diagnostic_sentinel()
 }
 
-fn active_context() -> *mut PyObject {
+/// Returns the pending exception when it is a live boxed exception object.
+///
+/// Message-only diagnostics raised through `pon_err_set` install a dangling
+/// sentinel in `current_exc`; that sentinel is never a dereferenceable object
+/// and is reported here as `None`. All readers that dereference the pending
+/// exception must route through this accessor.
+pub(crate) fn pending_exception_object() -> Option<*mut PyObject> {
     let current = thread_state_lock().current_exc;
     if current.is_null() || is_diagnostic_sentinel(current) {
-        ptr::null_mut()
+        None
     } else {
-        current
+        Some(current)
     }
+}
+
+/// Returns true when the pending exception is an instance of the named
+/// builtin exception type (walking `tp_base`).
+pub(crate) fn pending_exception_is(name: &str) -> bool {
+    let Some(exception) = pending_exception_object() else {
+        return false;
+    };
+    let mut ty = unsafe { (*exception).ob_type };
+    while !ty.is_null() {
+        if unsafe { (*ty).name() } == name {
+            return true;
+        }
+        ty = unsafe { (*ty).tp_base };
+    }
+    false
+}
+
+fn active_context() -> *mut PyObject {
+    pending_exception_object().unwrap_or(ptr::null_mut())
 }
 
 pub(super) fn alloc_exception_object(
@@ -249,6 +275,19 @@ pub fn raise_import_error_text(text: &str) -> *mut PyObject {
     }
 }
 
+/// Raises a typed `AttributeError(text)` for failed attribute lookups whose
+/// caller formats the message itself (e.g. module attributes, where CPython
+/// says `module 'x' has no attribute 'y'`).
+pub fn raise_attribute_error_text(text: &str) -> *mut PyObject {
+    match ensure_runtime_for_exc() {
+        Ok(()) => match super::with_runtime(|runtime| raise_builtin_text(runtime, ExceptionKind::AttributeError, text)) {
+            Some(result) => result,
+            None => super::return_null_with_error("runtime is not initialized"),
+        },
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
 /// Raises a typed `NameError(text)` for failed name/global/builtin lookups.
 pub(super) fn raise_name_error_text(text: &str) -> *mut PyObject {
     match ensure_runtime_for_exc() {
@@ -264,6 +303,43 @@ pub(super) fn raise_name_error_text(text: &str) -> *mut PyObject {
 pub(super) fn raise_index_error_text(text: &str) -> *mut PyObject {
     match ensure_runtime_for_exc() {
         Ok(()) => match super::with_runtime(|runtime| raise_builtin_text(runtime, ExceptionKind::IndexError, text)) {
+            Some(result) => result,
+            None => super::return_null_with_error("runtime is not initialized"),
+        },
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
+/// Raises a typed `LookupError(text)` (native `_contextvars.ContextVar.get`
+/// with no binding, call default, or constructor default).
+pub(crate) fn raise_lookup_error_text(text: &str) -> *mut PyObject {
+    match ensure_runtime_for_exc() {
+        Ok(()) => match super::with_runtime(|runtime| raise_builtin_text(runtime, ExceptionKind::LookupError, text)) {
+            Some(result) => result,
+            None => super::return_null_with_error("runtime is not initialized"),
+        },
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
+/// Raises a typed `RuntimeError(text)` (e.g. re-entered `Context.run` or a
+/// reused `Token`).
+pub(crate) fn raise_runtime_error_text(text: &str) -> *mut PyObject {
+    match ensure_runtime_for_exc() {
+        Ok(()) => match super::with_runtime(|runtime| raise_builtin_text(runtime, ExceptionKind::RuntimeError, text)) {
+            Some(result) => result,
+            None => super::return_null_with_error("runtime is not initialized"),
+        },
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
+/// Raises a typed builtin exception carrying a plain-text message (native
+/// `_codecs`: `Unicode*Error` codec failures, `LookupError` registry misses,
+/// `NotImplementedError` stubs).
+pub(crate) fn raise_kind_error_text(kind: ExceptionKind, text: &str) -> *mut PyObject {
+    match ensure_runtime_for_exc() {
+        Ok(()) => match super::with_runtime(|runtime| raise_builtin_text(runtime, kind, text)) {
             Some(result) => result,
             None => super::return_null_with_error("runtime is not initialized"),
         },
@@ -519,6 +595,12 @@ pub unsafe extern "C" fn pon_raise_index_error(ptr: *const u8, len: usize) -> *m
     super::catch_object_helper(|| raise_message_exception(ExceptionKind::IndexError, ptr, len))
 }
 
+/// Raises `ReferenceError(message)` and returns NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_raise_reference_error(ptr: *const u8, len: usize) -> *mut PyObject {
+    super::catch_object_helper(|| raise_message_exception(ExceptionKind::ReferenceError, ptr, len))
+}
+
 /// Raises `KeyError(key)` and returns NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_raise_key_error(key: *mut PyObject) -> *mut PyObject {
@@ -573,6 +655,18 @@ pub unsafe extern "C" fn pon_exc_matches(exc_type: *mut PyObject) -> c_int {
         if exc_type.is_null() {
             raise_type_error_text("catching classes that do not inherit from BaseException is not allowed");
             return -1;
+        }
+        // CPython `except (A, B):` — a tuple target matches when any element
+        // matches, walked in order; a non-type element reached before a match
+        // raises the same TypeError as a scalar non-type target.
+        if let Some(targets) = unsafe { super::seq::exact_tuple_slice(exc_type) } {
+            for &target in targets {
+                match unsafe { pon_exc_matches(target) } {
+                    0 => {}
+                    result => return result,
+                }
+            }
+            return 0;
         }
         let current = thread_state_lock().current_exc;
         if current.is_null() {
@@ -1287,7 +1381,7 @@ pub unsafe extern "C" fn pon_build_exc_group(excs: *mut *mut PyObject, len: usiz
 mod tests {
     use super::*;
     use crate::intern::intern;
-    use crate::thread_state::{pon_err_clear, pon_err_occurred, test_state_lock};
+    use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set, test_state_lock};
 
     fn reset_exception_state() {
         pon_err_clear();
@@ -1300,6 +1394,30 @@ mod tests {
     fn exception_types() -> crate::types::exc::ExceptionTypeSet {
         super::ensure_runtime_for_exc().unwrap();
         super::super::with_runtime(|runtime| runtime.exception_types).unwrap()
+    }
+
+    #[test]
+    fn pending_exception_object_reports_message_only_diagnostics_as_none() {
+        let _guard = test_state_lock();
+        unsafe {
+            reset_exception_state();
+            ensure_runtime_for_exc().unwrap();
+            assert_eq!(pending_exception_object(), None, "clear state has no pending object");
+
+            pon_err_set("message-only diagnostic");
+            assert!(pon_err_occurred(), "diagnostic must be pending");
+            assert_eq!(
+                pending_exception_object(),
+                None,
+                "dangling sentinel is not a dereferenceable exception object",
+            );
+
+            reset_exception_state();
+            assert!(pon_raise_value_error(b"real".as_ptr(), 4).is_null());
+            let current = thread_state_lock().current_exc;
+            assert_eq!(pending_exception_object(), Some(current));
+            reset_exception_state();
+        }
     }
 
     #[test]

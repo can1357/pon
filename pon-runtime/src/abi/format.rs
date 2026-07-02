@@ -10,7 +10,7 @@ use core::ptr;
 use std::sync::LazyLock;
 
 use num_bigint::{BigInt, Sign};
-use num_traits::{Signed, ToPrimitive};
+use num_traits::{FromPrimitive, Signed, ToPrimitive};
 
 use crate::intern::{intern, resolve};
 use crate::object::{PyNumberMethods, PyObject, PyObjectHeader, PyType, PyUnicode, as_object_ptr, is_exact_type};
@@ -1056,7 +1056,7 @@ fn object_to_repr(value: *mut PyObject) -> Result<String, String> {
     if let Some(value) = unsafe { float_type::to_f64(value) } {
         return Ok(float_type::repr_f64(value));
     }
-    super::format_object_for_print(value)
+    crate::native::builtins_mod::try_repr_text(value).map_err(|()| "repr raised".to_owned())
 }
 
 fn type_name(value: *mut PyObject) -> String {
@@ -1111,6 +1111,410 @@ fn raw_fstring_parts<'a>(parts: *const FStrPartRaw, len: usize) -> Result<&'a [F
         return if len == 0 { Ok(&[]) } else { Err("f-string parts pointer is null".to_owned()) };
     }
     Ok(unsafe { core::slice::from_raw_parts(parts, len) })
+}
+
+/// Positional-argument cursor for `%`-formatting, mirroring CPython's
+/// `getnextarg` index arithmetic: a tuple carries `(len, 0)`, a single
+/// argument carries `(-1, -2)` so it can be consumed exactly once.
+struct PercentArgs<'a> {
+    args: *mut PyObject,
+    items: Option<&'a [*mut PyObject]>,
+    arglen: isize,
+    argidx: isize,
+}
+
+impl PercentArgs<'_> {
+    fn next(&mut self) -> Result<*mut PyObject, String> {
+        if self.argidx < self.arglen {
+            let value = match self.items {
+                Some(items) => items[self.argidx as usize],
+                None => self.args,
+            };
+            self.argidx += 1;
+            Ok(value)
+        } else {
+            Err("not enough arguments for format string".to_owned())
+        }
+    }
+
+    fn leftover(&self) -> bool {
+        self.argidx < self.arglen
+    }
+}
+
+/// Mapping-capability probe for `%(key)s` specs and the trailing
+/// "not all arguments converted" exemption (CPython `PyMapping_Check`).
+fn percent_args_is_mapping(args: *mut PyObject) -> bool {
+    if args.is_null() {
+        return false;
+    }
+    if unsafe { crate::types::dict::has_dict_storage(args) } {
+        return true;
+    }
+    let ty = unsafe { (*args).ob_type.cast_mut() };
+    if ty.is_null() {
+        return false;
+    }
+    unsafe { !crate::descr::lookup_in_type(ty, intern("__getitem__")).is_null() }
+}
+
+fn raise_percent_type_error(message: &str) -> *mut PyObject {
+    unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) }
+}
+
+fn raise_percent_value_error(message: &str) -> *mut PyObject {
+    unsafe { super::exc::pon_raise_value_error(message.as_ptr(), message.len()) }
+}
+
+fn pad_percent_text(text: &str, width: Option<usize>, left: bool) -> String {
+    let Some(width) = width else {
+        return text.to_owned();
+    };
+    let count = text.chars().count();
+    if count >= width {
+        return text.to_owned();
+    }
+    let pad = " ".repeat(width - count);
+    if left { format!("{text}{pad}") } else { format!("{pad}{text}") }
+}
+
+/// Integer body for `%d`/`%o`/`%x`/`%X`: precision zero-extends the digits,
+/// the zero flag pads between sign/prefix and digits (C `printf` rules; the
+/// zero flag is ignored once a precision is given).
+#[allow(clippy::too_many_arguments)]
+fn render_percent_int(
+    value: &BigInt,
+    radix: u32,
+    upper: bool,
+    alternate: bool,
+    plus: bool,
+    space: bool,
+    zero: bool,
+    left: bool,
+    width: Option<usize>,
+    precision: Option<usize>,
+) -> String {
+    let negative = value.sign() == Sign::Minus;
+    let mut digits = value.abs().to_str_radix(radix);
+    if upper {
+        digits.make_ascii_uppercase();
+    }
+    if let Some(precision) = precision {
+        while digits.len() < precision {
+            digits.insert(0, '0');
+        }
+    }
+    let prefix = if alternate {
+        match radix {
+            8 => "0o",
+            16 => {
+                if upper {
+                    "0X"
+                } else {
+                    "0x"
+                }
+            }
+            _ => "",
+        }
+    } else {
+        ""
+    };
+    let sign = if negative {
+        "-"
+    } else if plus {
+        "+"
+    } else if space {
+        " "
+    } else {
+        ""
+    };
+    let body_len = sign.len() + prefix.len() + digits.len();
+    match width {
+        Some(width) if width > body_len => {
+            let pad = width - body_len;
+            if left {
+                format!("{sign}{prefix}{digits}{}", " ".repeat(pad))
+            } else if zero && precision.is_none() {
+                format!("{sign}{prefix}{}{digits}", "0".repeat(pad))
+            } else {
+                format!("{}{sign}{prefix}{digits}", " ".repeat(pad))
+            }
+        }
+        _ => format!("{sign}{prefix}{digits}"),
+    }
+}
+
+/// `%d`/`%i`/`%u` operand: bool/int directly, float by truncation (CPython
+/// routes through `PyNumber_Long`).
+unsafe fn percent_int_operand(arg: *mut PyObject, allow_float: bool, ty: char) -> Result<BigInt, String> {
+    if let Some(value) = unsafe { int_type::to_bigint_including_bool(arg) } {
+        return Ok(value);
+    }
+    if allow_float {
+        if let Some(value) = unsafe { float_type::to_f64(arg) } {
+            return BigInt::from_f64(value.trunc())
+                .ok_or_else(|| "cannot convert float infinity or NaN to integer".to_owned());
+        }
+        return Err(format!("%{ty} format: a real number is required, not {}", type_name(arg)));
+    }
+    Err(format!("%{ty} format: an integer is required, not {}", type_name(arg)))
+}
+
+/// `%e`/`%f`/`%g` operand: float directly, bool/int widened.
+unsafe fn percent_float_operand(arg: *mut PyObject) -> Result<f64, String> {
+    if let Some(value) = unsafe { float_type::to_f64(arg) } {
+        return Ok(value);
+    }
+    if let Some(value) = unsafe { int_type::to_bigint_including_bool(arg) } {
+        return value.to_f64().ok_or_else(|| "int too large to convert to float".to_owned());
+    }
+    Err(format!("must be real number, not {}", type_name(arg)))
+}
+
+/// CPython `str.__mod__` (%-formatting): renders `format % args`.  Raises the
+/// matching Python exception and returns NULL on failure; mapping-key lookups
+/// propagate their own exceptions (`KeyError`).
+pub(crate) unsafe fn percent_format(format: *mut PyObject, args: *mut PyObject) -> *mut PyObject {
+    let template = match exact_str(format) {
+        Ok(Some(template)) => template,
+        Ok(None) => return raise_percent_type_error("descriptor '__mod__' requires a 'str' object"),
+        Err(message) => return raise_percent_type_error(&message),
+    };
+    let items = (type_name(args) == "tuple").then(|| unsafe { (&*args.cast::<PyTuple>()).as_slice() });
+    let (arglen, argidx) = match items {
+        Some(items) => (items.len() as isize, 0),
+        None => (-1, -2),
+    };
+    let mut state = PercentArgs { args, items, arglen, argidx };
+    let arg_is_mapping = items.is_none() && type_name(args) != "str" && percent_args_is_mapping(args);
+
+    let chars: Vec<char> = template.chars().collect();
+    let mut out = String::with_capacity(template.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch != '%' {
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= chars.len() {
+            return raise_percent_value_error("incomplete format");
+        }
+        // Optional parenthesized mapping key, with nesting (CPython parity).
+        let mut key = None;
+        if chars[i] == '(' {
+            let start = i + 1;
+            let mut depth = 1usize;
+            let mut j = start;
+            while j < chars.len() && depth > 0 {
+                match chars[j] {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                return raise_percent_value_error("incomplete format key");
+            }
+            key = Some(chars[start..j - 1].iter().collect::<String>());
+            i = j;
+        }
+        let mut left = false;
+        let mut plus = false;
+        let mut space = false;
+        let mut alternate = false;
+        let mut zero = false;
+        loop {
+            match chars.get(i) {
+                Some('-') => left = true,
+                Some('+') => plus = true,
+                Some(' ') => space = true,
+                Some('#') => alternate = true,
+                Some('0') => zero = true,
+                _ => break,
+            }
+            i += 1;
+        }
+        let mut width = None;
+        if chars.get(i) == Some(&'*') {
+            i += 1;
+            let value = match state.next() {
+                Ok(value) => value,
+                Err(message) => return raise_percent_type_error(&message),
+            };
+            let Some(value) = (unsafe { int_type::to_bigint_including_bool(value) }) else {
+                return raise_percent_type_error("* wants int");
+            };
+            let Some(value) = value.to_isize() else {
+                return raise_percent_value_error("width too big");
+            };
+            if value < 0 {
+                left = true;
+                width = Some(value.unsigned_abs());
+            } else {
+                width = Some(value.unsigned_abs());
+            }
+        } else {
+            let mut value = 0usize;
+            let mut any = false;
+            while let Some(digit) = chars.get(i).and_then(|ch| ch.to_digit(10)) {
+                value = value.saturating_mul(10).saturating_add(digit as usize);
+                any = true;
+                i += 1;
+            }
+            if any {
+                width = Some(value);
+            }
+        }
+        let mut precision = None;
+        if chars.get(i) == Some(&'.') {
+            i += 1;
+            if chars.get(i) == Some(&'*') {
+                i += 1;
+                let value = match state.next() {
+                    Ok(value) => value,
+                    Err(message) => return raise_percent_type_error(&message),
+                };
+                let Some(value) = (unsafe { int_type::to_bigint_including_bool(value) }) else {
+                    return raise_percent_type_error("* wants int");
+                };
+                let Some(value) = value.to_isize() else {
+                    return raise_percent_value_error("precision too big");
+                };
+                precision = Some(value.max(0).unsigned_abs());
+            } else {
+                let mut value = 0usize;
+                while let Some(digit) = chars.get(i).and_then(|ch| ch.to_digit(10)) {
+                    value = value.saturating_mul(10).saturating_add(digit as usize);
+                    i += 1;
+                }
+                precision = Some(value);
+            }
+        }
+        while matches!(chars.get(i), Some('h') | Some('l') | Some('L')) {
+            i += 1;
+        }
+        let Some(&ty) = chars.get(i) else {
+            return raise_percent_value_error("incomplete format");
+        };
+        let ty_index = i;
+        i += 1;
+        if ty == '%' {
+            out.push('%');
+            continue;
+        }
+        let arg = if let Some(key) = key {
+            if !arg_is_mapping {
+                return raise_percent_type_error("format requires a mapping");
+            }
+            let key_object = match boxed_str(&key) {
+                Ok(object) => object,
+                Err(message) => return raise_percent_type_error(&message),
+            };
+            let value = unsafe { super::object::pon_subscript_get(args, key_object, ptr::null_mut()) };
+            if value.is_null() {
+                return ptr::null_mut();
+            }
+            value
+        } else {
+            match state.next() {
+                Ok(value) => value,
+                Err(message) => return raise_percent_type_error(&message),
+            }
+        };
+        let rendered = match ty {
+            's' | 'r' | 'a' => {
+                let text = match ty {
+                    's' => object_to_str(arg),
+                    'r' => object_to_repr(arg),
+                    _ => object_to_repr(arg).map(|text| str_type::escape_non_ascii(&text)),
+                };
+                let text = match text {
+                    Ok(text) => text,
+                    Err(message) => return raise_percent_type_error(&message),
+                };
+                let text = match precision {
+                    Some(precision) => truncate_to_precision(&text, precision),
+                    None => text,
+                };
+                pad_percent_text(&text, width, left)
+            }
+            'd' | 'i' | 'u' => match unsafe { percent_int_operand(arg, true, ty) } {
+                Ok(value) => render_percent_int(&value, 10, false, false, plus, space, zero, left, width, precision),
+                Err(message) => return raise_percent_type_error(&message),
+            },
+            'o' | 'x' | 'X' => match unsafe { percent_int_operand(arg, false, ty) } {
+                Ok(value) => {
+                    render_percent_int(&value, if ty == 'o' { 8 } else { 16 }, ty == 'X', alternate, plus, space, zero, left, width, precision)
+                }
+                Err(message) => return raise_percent_type_error(&message),
+            },
+            'e' | 'E' | 'f' | 'F' | 'g' | 'G' => {
+                let value = match unsafe { percent_float_operand(arg) } {
+                    Ok(value) => value,
+                    Err(message) => return raise_percent_type_error(&message),
+                };
+                let sign = if plus {
+                    "+"
+                } else if space {
+                    " "
+                } else {
+                    ""
+                };
+                let hash = if alternate { "#" } else { "" };
+                let prec = precision.unwrap_or(6);
+                let spec = match width {
+                    Some(w) if left => format!("<{sign}{hash}{w}.{prec}{ty}"),
+                    Some(w) if zero => format!("{sign}{hash}0{w}.{prec}{ty}"),
+                    Some(w) => format!("{sign}{hash}{w}.{prec}{ty}"),
+                    None => format!("{sign}{hash}.{prec}{ty}"),
+                };
+                match format_float(value, &spec) {
+                    Ok(text) => text,
+                    Err(message) => return raise_percent_value_error(&message),
+                }
+            }
+            'c' => {
+                let text = match exact_str(arg) {
+                    Ok(text) => text,
+                    Err(message) => return raise_percent_type_error(&message),
+                };
+                if let Some(text) = text {
+                    if text.chars().count() != 1 {
+                        return raise_percent_type_error("%c requires an int or a unicode character, not str");
+                    }
+                    pad_percent_text(&text, width, left)
+                } else if let Some(value) = unsafe { int_type::to_bigint_including_bool(arg) } {
+                    let Some(ch) = value.to_u32().and_then(char::from_u32) else {
+                        return raise_percent_value_error("%c arg not in range(0x110000)");
+                    };
+                    pad_percent_text(&ch.to_string(), width, left)
+                } else {
+                    return raise_percent_type_error(&format!(
+                        "%c requires an int or a unicode character, not {}",
+                        type_name(arg)
+                    ));
+                }
+            }
+            other => {
+                return raise_percent_value_error(&format!(
+                    "unsupported format character '{other}' (0x{:x}) at index {ty_index}",
+                    other as u32
+                ));
+            }
+        };
+        out.push_str(&rendered);
+    }
+    if !arg_is_mapping && state.leftover() {
+        return raise_percent_type_error("not all arguments converted during string formatting");
+    }
+    match boxed_str(&out) {
+        Ok(object) => object,
+        Err(message) => raise_percent_type_error(&message),
+    }
 }
 
 #[cfg(test)]

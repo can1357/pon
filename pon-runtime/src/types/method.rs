@@ -60,6 +60,19 @@ pub fn new_bound_method(function: *mut PyObject, receiver: *mut PyObject) -> Res
     Ok(Box::into_raw(Box::new(PyMethod::new(function, receiver)?)))
 }
 
+/// Returns `(function, receiver)` when `object` is a bound-method pair.
+///
+/// Used by GC rooting to pierce the malloc'd `PyMethod` box: both fields are
+/// GC-managed objects the collector cannot otherwise reach through it.
+#[must_use]
+pub(crate) fn bound_method_parts(object: *mut PyObject) -> Option<(*mut PyObject, *mut PyObject)> {
+    if object.is_null() || unsafe { (*object).ob_type } != method_type().cast_const() {
+        return None;
+    }
+    let method = unsafe { &*object.cast::<PyMethod>() };
+    Some((method.function, method.receiver))
+}
+
 /// Release a method pair allocated with [`new_bound_method`].
 pub unsafe fn drop_bound_method(method: *mut PyMethod) {
     if !method.is_null() {

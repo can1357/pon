@@ -52,9 +52,29 @@ pub unsafe extern "C" fn pon_call_ex(
             // SAFETY: Delegates to the established Phase-A helper for the hot path.
             return unsafe { pon_call(callee, argv, argc) };
         }
-        let positional = match unsafe { object_slice(argv, argc) } {
+        // A bound-method callee (e.g. a method resolved through a super()
+        // proxy, then called with */** arguments) is a PyMethod pair, not a
+        // PyFunction: pierce it and prepend the receiver so the underlying
+        // function binds `self`.  Mirrors `pon_call`'s Method target, which
+        // covers the no-keyword path above.
+        let (callee, bound_receiver) = match method::bound_method_parts(callee) {
+            Some((function, receiver)) => (function, Some(receiver)),
+            None => (callee, None),
+        };
+        let explicit = match unsafe { object_slice(argv, argc) } {
             Ok(values) => values,
             Err(message) => return return_null_with_error(message),
+        };
+        let bound_positional: Vec<*mut PyObject>;
+        let positional: &[*mut PyObject] = match bound_receiver {
+            Some(receiver) => {
+                let mut values = Vec::with_capacity(explicit.len() + 1);
+                values.push(receiver);
+                values.extend_from_slice(explicit);
+                bound_positional = values;
+                &bound_positional
+            }
+            None => explicit,
         };
         let names = match unsafe { name_slice(kw_names, kw_count) } {
             Ok(values) => values,
@@ -70,12 +90,47 @@ pub unsafe extern "C" fn pon_call_ex(
         if function::function_record(callee).is_some() {
             return unsafe { super::call_phase_b_function(callee, positional, keywords, star, dstar) };
         }
-        if star.is_none() && dstar.is_none() {
-            if let Some(result) = unsafe { super::call_builtin_type_with_keywords(callee, positional, keywords) } {
-                return result;
+        // Non-function callee (type constructor, native callable) reached
+        // with `*`/`**` operands: materialize the expansion once, then reuse
+        // the generic dispatch paths (`str(*args)` in enum's member creation,
+        // `dict(**kw)`, ...).
+        let mut flat_positional: Vec<*mut PyObject> = positional.to_vec();
+        if let Some(star) = star {
+            match unsafe { function::positional_args_from_star(star) } {
+                Ok(extra) => flat_positional.extend_from_slice(&extra),
+                Err(message) => return return_null_with_error(message),
             }
         }
-        match unsafe { function::call_bound_function(callee, positional, keywords, star, dstar) } {
+        let mut flat_names = names.to_vec();
+        let mut flat_values = values.to_vec();
+        if let Some(dstar) = dstar {
+            if let Err(message) =
+                unsafe { function::extend_keywords_from_mapping(callee, dstar, &mut flat_names, &mut flat_values) }
+            {
+                return return_null_with_error(message);
+            }
+        }
+        if flat_names.is_empty() {
+            let argv_ptr = if flat_positional.is_empty() {
+                core::ptr::null_mut()
+            } else {
+                flat_positional.as_mut_ptr()
+            };
+            return unsafe { pon_call(callee, argv_ptr, flat_positional.len()) };
+        }
+        let keywords = function::KeywordArgs {
+            names: &flat_names,
+            values: &flat_values,
+        };
+        if let Some(result) = unsafe { super::call_builtin_type_with_keywords(callee, &flat_positional, keywords) } {
+            return result;
+        }
+        // A class callee (metaclass instances included) with keyword
+        // arguments: `A(x=3)` binds the keywords into `__new__`/`__init__`.
+        if unsafe { crate::types::type_::is_type_object(callee) } {
+            return unsafe { super::call_type_with_keywords(callee, &flat_positional, keywords) };
+        }
+        match unsafe { function::call_bound_function(callee, &flat_positional, keywords, None, None) } {
             Ok(result) => result,
             Err(message) => return_null_with_error(message),
         }
@@ -183,6 +238,7 @@ pub unsafe extern "C" fn pon_make_function_full(
             Some(Err(message)) => return return_null_with_error(message),
             None => return return_null_with_error("runtime is not initialized"),
         };
+        super::record_new_function_module(object);
         if let Err(message) = unsafe { super::install_function_feedback(object, code.n_feedback) } {
             return return_null_with_error(message);
         }

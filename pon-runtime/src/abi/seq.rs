@@ -45,7 +45,7 @@ fn list_type() -> *mut PyType {
     LIST_TYPE.get_or_init(|| {
         let sequence = Box::leak(Box::new(PySequenceMethods {
             sq_length: Some(list_len_slot),
-            sq_concat: None,
+            sq_concat: Some(list_concat_slot),
             sq_repeat: Some(list_repeat_slot),
             sq_item: Some(list_item_slot),
             sq_ass_item: Some(list_ass_item_slot),
@@ -375,7 +375,7 @@ fn is_range(object: *mut PyObject) -> bool {
     unsafe { !object.is_null() && (*object).ob_type == range_type().cast_const() }
 }
 
-fn is_slice(object: *mut PyObject) -> bool {
+pub(crate) fn is_slice(object: *mut PyObject) -> bool {
     unsafe { !object.is_null() && (*object).ob_type == slice_type().cast_const() }
 }
 
@@ -640,6 +640,13 @@ pub(crate) fn sequence_to_vec(object: *mut PyObject) -> Result<Vec<*mut PyObject
             let value = unsafe { super::iter::pon_iter_next(iter, ptr::null_mut()) };
             if value.is_null() {
                 if pon_err_occurred() {
+                    // StopIteration is exhaustion; any other pending
+                    // exception is a genuine error and must stay set for the
+                    // caller (`pon_err_set` never replaces a live boxed
+                    // exception, so the `Err` string below is advisory).
+                    if !super::exc::pending_exception_is("StopIteration") {
+                        return Err("iteration raised an exception".to_owned());
+                    }
                     pon_err_clear();
                 }
                 break;
@@ -693,7 +700,7 @@ fn normalize_slice_bound(value: *mut PyObject, len: isize, default_none: isize, 
     Ok(value.clamp(lower, upper))
 }
 
-fn normalize_slice(slice: &PySlice, len: usize) -> Result<SliceIndices, String> {
+pub(crate) fn normalize_slice(slice: &PySlice, len: usize) -> Result<SliceIndices, String> {
     let len = isize::try_from(len).map_err(|_| "sequence is too large for slice indices".to_owned())?;
     let step = if is_none(slice.step) { 1 } else { index_value(slice.step)? };
     if step == 0 {
@@ -1050,10 +1057,14 @@ unsafe extern "C" fn list_append_method(argv: *mut *mut PyObject, argc: usize) -
             Ok(args) => args,
             Err(message) => return return_null_with_error(message),
         };
+        let receiver = match ensure_list_method_receiver(args, "append") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
         if args.len() != 2 {
             return return_null_with_error(format!("list.append expected 1 argument, got {}", args.len().saturating_sub(1)));
         }
-        match list_append_raw(args[0], args[1]) {
+        match list_append_raw(receiver, args[1]) {
             Ok(()) => seq_none(),
             Err(message) => return_null_with_error(message),
         }
@@ -1441,6 +1452,22 @@ unsafe extern "C" fn tuple_concat_slot(left: *mut PyObject, right: *mut PyObject
     crate::native::builtins_mod::alloc_tuple(values)
 }
 
+unsafe extern "C" fn list_concat_slot(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    if !is_list(left) || !is_list(right) {
+        return return_null_with_error("can only concatenate list to list");
+    }
+    let left_items = unsafe { (&*left.cast::<PyList>()).as_slice() };
+    let right_items = unsafe { (&*right.cast::<PyList>()).as_slice() };
+    let mut values = Vec::with_capacity(left_items.len().saturating_add(right_items.len()));
+    values.extend_from_slice(left_items);
+    values.extend_from_slice(right_items);
+    match with_runtime(|runtime| alloc_list_from_slice(runtime, &values)) {
+        Some(Ok(object)) => object,
+        Some(Err(message)) => return_null_with_error(message),
+        None => return_null_with_error("runtime is not initialized"),
+    }
+}
+
 unsafe extern "C" fn list_repeat_slot(object: *mut PyObject, count: *mut PyObject) -> *mut PyObject {
     if !is_list(object) {
         return return_null_with_error("can only repeat list");
@@ -1516,6 +1543,81 @@ unsafe extern "C" fn list_getattro_slot(object: *mut PyObject, name: *mut PyObje
         "remove" => bound_seq_method(object, &name, list_remove_method),
         _ => return_null_with_error(format!("attribute '{name}' was not found")),
     }
+}
+
+/// Unbound-receiver validation for list method descriptors reached off the
+/// type (`list.append(x, …)`): CPython raises the mismatch TypeError before
+/// the method body runs.  `name` is the bare method name.  Returns the
+/// untagged receiver, or the raised NULL sentinel.
+fn ensure_list_method_receiver(args: &[*mut PyObject], name: &str) -> Result<*mut PyObject, *mut PyObject> {
+    if args.is_empty() {
+        let message = format!("unbound method list.{name}() needs an argument");
+        return Err(unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) });
+    }
+    let receiver = crate::tag::untag_arg(args[0]);
+    if receiver.is_null() {
+        return Err(ptr::null_mut());
+    }
+    if !is_list(receiver) {
+        let ty = unsafe { dict::type_name(receiver) }.unwrap_or("object");
+        let message = format!("descriptor '{name}' for 'list' objects doesn't apply to a '{ty}' object");
+        return Err(unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) });
+    }
+    Ok(receiver)
+}
+
+/// One-shot installer for the builtin `list` type object's `tp_dict` method
+/// surface, so type-level access (the `list.append(lst, x)` unbound pattern)
+/// resolves through the regular MRO lookup.
+///
+/// `ty` is the GLOBAL `list` type object (the receiver of the type-attr
+/// lookup) — distinct from the seq-family instance type returned by
+/// [`list_type`]; the trampolines validate the instance layout themselves.
+/// Existing `tp_dict` entries are kept: only missing names are added.
+pub(crate) fn ensure_list_type_methods_installed(ty: *mut PyType) {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if ty.is_null() || INSTALLED.load(AtomicOrdering::SeqCst) {
+        return;
+    }
+    // Pre-runtime call sites must not latch a no-op install: the function
+    // allocations below need a live runtime.
+    if crate::abi::runtime_type_type().is_null() {
+        return;
+    }
+    if INSTALLED.swap(true, AtomicOrdering::SeqCst) {
+        return;
+    }
+    let namespace = unsafe { (*ty).tp_dict.cast::<type_::PyClassDict>() };
+    let namespace = if namespace.is_null() { type_::new_namespace() } else { namespace };
+    let natives: &[(&str, *const u8)] = &[
+        ("append", list_append_method as *const u8),
+        ("extend", list_extend_method as *const u8),
+        ("sort", list_sort_method as *const u8),
+        ("reverse", list_reverse_method as *const u8),
+        ("pop", list_pop_method as *const u8),
+        ("index", list_index_method as *const u8),
+        ("count", list_count_method as *const u8),
+        ("insert", list_insert_method as *const u8),
+        ("remove", list_remove_method as *const u8),
+    ];
+    for (name, code) in natives {
+        let interned = crate::intern::intern(name);
+        if unsafe { (&*namespace).get(interned) }.is_some() {
+            continue;
+        }
+        let function = unsafe { crate::abi::pon_make_function(*code, crate::builtins::variadic_arity(), interned) };
+        if !function.is_null() {
+            unsafe { (&mut *namespace).set(interned, function) };
+        }
+    }
+    unsafe {
+        (*ty).tp_dict = namespace.cast::<PyObject>();
+    }
+    // GC rooting for the namespace values plus IC invalidation for any
+    // AttrIC guarding the type object.
+    crate::sync::register_namespaced_type(ty);
+    crate::sync::type_modified(ty);
 }
 
 unsafe extern "C" fn tuple_getattro_slot(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
@@ -1829,26 +1931,37 @@ pub unsafe extern "C" fn pon_seq_del_item(object: *mut PyObject, index_or_slice:
     unsafe { pon_seq_set_item(object, index_or_slice, ptr::null_mut()) }
 }
 
-/// Returns a newly allocated C array containing exactly `n` unpacked elements.
+/// Returns a fresh tuple containing exactly `n` unpacked elements.  The
+/// element fetches for the individual targets subscript THIS tuple, never
+/// the source object (mappings/enums unpack their iteration order).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pon_unpack_seq(value: *mut PyObject, n: usize, feedback: *mut FeedbackCell) -> *mut *mut PyObject {
+pub unsafe extern "C" fn pon_unpack_seq(value: *mut PyObject, n: usize, feedback: *mut FeedbackCell) -> *mut PyObject {
     crate::untag_prelude!(value);
     unsafe { super::record_feedback_unary(feedback, value) };
     catch_object_helper(|| {
-        let values = match sequence_to_vec(value) {
+        let mut values = match sequence_to_vec(value) {
             Ok(values) => values,
             Err(message) => return return_null_with_error(message),
         };
         if values.len() != n {
-            return return_null_with_error(format!("too {} values to unpack (expected {})", if values.len() < n { "few" } else { "many" }, n));
+            // Typed, catchable ValueError with CPython's wording (corpus
+            // scripts wrap arity mismatches in `except ValueError:`).
+            let message = if values.len() < n {
+                format!("not enough values to unpack (expected {}, got {})", n, values.len())
+            } else {
+                format!("too many values to unpack (expected {n})")
+            };
+            return unsafe { super::exc::pon_raise_value_error(message.as_ptr(), message.len()) };
         }
-        leak_result_array(values)
-    }) as *mut *mut PyObject
+        let ptr = if values.is_empty() { ptr::null_mut() } else { values.as_mut_ptr() };
+        unsafe { pon_build_tuple(ptr, values.len()) }
+    })
 }
 
-/// Returns unpack-ex results: leading items, a middle list, then trailing items.
+/// Returns unpack-ex results as a fresh tuple: leading items, a middle
+/// list, then trailing items (`before + 1 + after` elements).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pon_unpack_ex(value: *mut PyObject, before: usize, after: usize) -> *mut *mut PyObject {
+pub unsafe extern "C" fn pon_unpack_ex(value: *mut PyObject, before: usize, after: usize) -> *mut PyObject {
     crate::untag_prelude!(value);
     catch_object_helper(|| {
         let values = match sequence_to_vec(value) {
@@ -1857,7 +1970,8 @@ pub unsafe extern "C" fn pon_unpack_ex(value: *mut PyObject, before: usize, afte
         };
         let required = before.saturating_add(after);
         if values.len() < required {
-            return return_null_with_error(format!("not enough values to unpack (expected at least {}, got {})", required, values.len()));
+            let message = format!("not enough values to unpack (expected at least {}, got {})", required, values.len());
+            return unsafe { super::exc::pon_raise_value_error(message.as_ptr(), message.len()) };
         }
         let middle_end = values.len() - after;
         let starred = match with_runtime(|runtime| alloc_list_from_slice(runtime, &values[before..middle_end])) {
@@ -1869,17 +1983,8 @@ pub unsafe extern "C" fn pon_unpack_ex(value: *mut PyObject, before: usize, afte
         out.extend_from_slice(&values[..before]);
         out.push(starred);
         out.extend_from_slice(&values[middle_end..]);
-        leak_result_array(out)
-    }) as *mut *mut PyObject
-}
-
-fn leak_result_array(mut values: Vec<*mut PyObject>) -> *mut PyObject {
-    if values.is_empty() {
-        return ptr::null_mut();
-    }
-    let ptr = values.as_mut_ptr();
-    mem::forget(values);
-    ptr.cast::<PyObject>()
+        unsafe { pon_build_tuple(out.as_mut_ptr(), out.len()) }
+    })
 }
 
 #[cfg(test)]
@@ -1976,12 +2081,12 @@ mod tests {
             let range = pon_build_range(pon_const_int(0), pon_const_int(5), pon_const_int(1));
             let out = pon_unpack_ex(range, 1, 1);
             assert!(!out.is_null());
-            let values = core::slice::from_raw_parts(out, 3);
-            assert_eq!((*values[0].cast::<PyLong>()).value, 0);
-            assert!(is_list(values[1]));
-            assert_eq!(sequence_len_raw(values[1]), Ok(3));
-            assert_eq!(long_at(values[1], 0), 1);
-            assert_eq!((*values[2].cast::<PyLong>()).value, 4);
+            assert_eq!(long_at(out, 0), 0);
+            let middle = sequence_item_raw(out, 1).unwrap();
+            assert!(is_list(middle));
+            assert_eq!(sequence_len_raw(middle), Ok(3));
+            assert_eq!(long_at(middle, 0), 1);
+            assert_eq!(long_at(out, 2), 4);
         }
     }
 

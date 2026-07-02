@@ -410,6 +410,27 @@ pub fn removesuffix(bytes: &[u8], suffix: &[u8]) -> Vec<u8> {
     bytes.strip_suffix(suffix).unwrap_or(bytes).to_vec()
 }
 
+/// Python `bytes.translate`: deletes `delete` members, then maps every
+/// remaining byte through the 256-entry `table` (`None` keeps bytes as-is).
+pub fn translate(bytes: &[u8], table: Option<&[u8]>, delete: &[u8]) -> Result<Vec<u8>, String> {
+    if let Some(table) = table {
+        if table.len() != 256 {
+            return Err("translation table must be 256 characters long".to_owned());
+        }
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    for byte in bytes {
+        if delete.contains(byte) {
+            continue;
+        }
+        out.push(match table {
+            Some(table) => table[usize::from(*byte)],
+            None => *byte,
+        });
+    }
+    Ok(out)
+}
+
 #[must_use]
 pub fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -442,24 +463,6 @@ pub fn fromhex(text: &str) -> Result<Vec<u8>, String> {
         }
     }
     Ok(out)
-}
-
-pub fn decode(bytes: &[u8], encoding: &str, errors: &str) -> Result<String, String> {
-    match normalize_encoding(encoding).as_str() {
-        "utf8" => decode_utf8(bytes, errors),
-        "ascii" => decode_ascii(bytes, errors),
-        "latin1" => Ok(bytes.iter().map(|byte| char::from(*byte)).collect()),
-        _ => Err(format!("unsupported bytes.decode encoding '{encoding}'")),
-    }
-}
-
-pub fn encode(text: &str, encoding: &str, errors: &str) -> Result<Vec<u8>, String> {
-    match normalize_encoding(encoding).as_str() {
-        "utf8" => Ok(text.as_bytes().to_vec()),
-        "ascii" => encode_ascii(text, errors),
-        "latin1" => encode_latin1(text, errors),
-        _ => Err(format!("unsupported str.encode encoding '{encoding}'")),
-    }
 }
 
 #[must_use]
@@ -721,70 +724,6 @@ fn nibble_to_hex(value: u8) -> char {
     char::from(if value < 10 { b'0' + value } else { b'a' + value - 10 })
 }
 
-fn normalize_encoding(encoding: &str) -> String {
-    encoding.chars().filter(|ch| *ch != '_' && *ch != '-').flat_map(char::to_lowercase).collect()
-}
-
-fn encode_ascii(text: &str, errors: &str) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(text.len());
-    for ch in text.chars() {
-        if ch.is_ascii() {
-            out.push(ch as u8);
-        } else {
-            match errors {
-                "strict" => return Err("ascii codec can't encode non-ascii character".to_owned()),
-                "ignore" => {}
-                "replace" => out.push(b'?'),
-                _ => return Err(format!("unsupported error handler '{errors}'")),
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn encode_latin1(text: &str, errors: &str) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(text.len());
-    for ch in text.chars() {
-        if (ch as u32) <= 0xff {
-            out.push(ch as u8);
-        } else {
-            match errors {
-                "strict" => return Err("latin-1 codec can't encode character".to_owned()),
-                "ignore" => {}
-                "replace" => out.push(b'?'),
-                _ => return Err(format!("unsupported error handler '{errors}'")),
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn decode_ascii(bytes: &[u8], errors: &str) -> Result<String, String> {
-    let mut out = String::with_capacity(bytes.len());
-    for byte in bytes {
-        if byte.is_ascii() {
-            out.push(char::from(*byte));
-        } else {
-            match errors {
-                "strict" => return Err("ascii codec can't decode byte".to_owned()),
-                "ignore" => {}
-                "replace" => out.push('\u{FFFD}'),
-                _ => return Err(format!("unsupported error handler '{errors}'")),
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn decode_utf8(bytes: &[u8], errors: &str) -> Result<String, String> {
-    match errors {
-        "strict" => std::str::from_utf8(bytes).map(ToOwned::to_owned).map_err(|_| "utf-8 codec can't decode byte".to_owned()),
-        "ignore" => Ok(String::from_utf8_lossy(bytes).chars().filter(|ch| *ch != '\u{FFFD}').collect()),
-        "replace" => Ok(String::from_utf8_lossy(bytes).into_owned()),
-        _ => Err(format!("unsupported error handler '{errors}'")),
-    }
-}
-
 fn nonempty_all(bytes: &[u8], predicate: impl Fn(&u8) -> bool) -> bool {
     let mut iter = bytes.iter();
     let Some(first) = iter.next() else { return false; };
@@ -813,6 +752,5 @@ mod tests {
         assert_eq!(hex(b"\x00\x7f\xff"), "007fff");
         assert_eq!(fromhex("00 7f ff").unwrap(), b"\x00\x7f\xff");
         assert_eq!(title(b"hello world"), b"Hello World".to_vec());
-        assert_eq!(decode(b"Gr\xfc\xdfe", "latin-1", "strict").unwrap(), "Grüße");
     }
 }
