@@ -183,10 +183,14 @@ pub(crate) struct HelperFuncRefs {
     pub(crate) get_aiter: FuncRef,
     pub(crate) for_next: FuncRef,
     pub(crate) gen_stop_value: FuncRef,
-    pub(crate) yield_value: FuncRef,
-    pub(crate) yield_from: FuncRef,
+    pub(crate) gen_last_stop_value: FuncRef,
+    pub(crate) gen_frame_alloc: FuncRef,
+    pub(crate) make_generator: FuncRef,
+    pub(crate) gen_consume_payload: FuncRef,
+    pub(crate) gen_finish: FuncRef,
+    pub(crate) gen_unwind: FuncRef,
+    pub(crate) gen_delegate_step: FuncRef,
     pub(crate) await_value: FuncRef,
-    pub(crate) eager_yield_generator: FuncRef,
     pub(crate) match_sequence: FuncRef,
     pub(crate) match_mapping: FuncRef,
     pub(crate) match_class: FuncRef,
@@ -201,6 +205,9 @@ pub(crate) struct HelperFuncRefs {
     pub(crate) cell_set: FuncRef,
     pub(crate) cell_delete: FuncRef,
     pub(crate) current_closure_cell: FuncRef,
+    pub(crate) function_set_annotate: FuncRef,
+    pub(crate) make_type_alias: FuncRef,
+    pub(crate) make_typevar: FuncRef,
     pub(crate) setup_annotations: FuncRef,
     pub(crate) build_class: FuncRef,
     pub(crate) load_build_class: FuncRef,
@@ -524,10 +531,14 @@ pub(crate) fn declare_helper_refs<M: Module>(module: &mut M, helpers: &HelperRef
         get_aiter: module.declare_func_in_func(helpers.get_aiter, func),
         for_next: module.declare_func_in_func(helpers.for_next, func),
         gen_stop_value: module.declare_func_in_func(helpers.gen_stop_value, func),
-        yield_value: module.declare_func_in_func(helpers.yield_value, func),
-        yield_from: module.declare_func_in_func(helpers.yield_from, func),
+        gen_last_stop_value: module.declare_func_in_func(helpers.gen_last_stop_value, func),
+        gen_frame_alloc: module.declare_func_in_func(helpers.gen_frame_alloc, func),
+        make_generator: module.declare_func_in_func(helpers.make_generator, func),
+        gen_consume_payload: module.declare_func_in_func(helpers.gen_consume_payload, func),
+        gen_finish: module.declare_func_in_func(helpers.gen_finish, func),
+        gen_unwind: module.declare_func_in_func(helpers.gen_unwind, func),
+        gen_delegate_step: module.declare_func_in_func(helpers.gen_delegate_step, func),
         await_value: module.declare_func_in_func(helpers.await_value, func),
-        eager_yield_generator: module.declare_func_in_func(helpers.eager_yield_generator, func),
         match_sequence: module.declare_func_in_func(helpers.match_sequence, func),
         match_mapping: module.declare_func_in_func(helpers.match_mapping, func),
         match_class: module.declare_func_in_func(helpers.match_class, func),
@@ -541,6 +552,9 @@ pub(crate) fn declare_helper_refs<M: Module>(module: &mut M, helpers: &HelperRef
         cell_set: module.declare_func_in_func(helpers.cell_set, func),
         cell_delete: module.declare_func_in_func(helpers.cell_delete, func),
         current_closure_cell: module.declare_func_in_func(helpers.current_closure_cell, func),
+        function_set_annotate: module.declare_func_in_func(helpers.function_set_annotate, func),
+        make_type_alias: module.declare_func_in_func(helpers.make_type_alias, func),
+        make_typevar: module.declare_func_in_func(helpers.make_typevar, func),
         setup_annotations: module.declare_func_in_func(helpers.setup_annotations, func),
         build_class: module.declare_func_in_func(helpers.build_class, func),
         load_build_class: module.declare_func_in_func(helpers.load_build_class, func),
@@ -1060,6 +1074,38 @@ pub(crate) fn lower_inst<M: Module>(
         }
         InstKind::LoadBuildClass => {
             name::lower_load_build_class(builder, helpers.load_build_class, ptr_ty, exception_exit)
+        }
+        InstKind::FunctionSetAnnotate { function, annotate } => {
+            let function = state.value(*function)?;
+            let annotate = state.value(*annotate)?;
+            Ok(call_pyobject_helper(
+                builder,
+                helpers.function_set_annotate,
+                &[function, annotate],
+                ptr_ty,
+                exception_exit,
+            ))
+        }
+        InstKind::MakeTypeAlias { name, thunk } => {
+            let runtime_name = builder.ins().iconst(ir::types::I32, i64::from(names.runtime_id(name.0)?));
+            let thunk = state.value(*thunk)?;
+            Ok(call_pyobject_helper(
+                builder,
+                helpers.make_type_alias,
+                &[runtime_name, thunk],
+                ptr_ty,
+                exception_exit,
+            ))
+        }
+        InstKind::MakeTypeVar { name } => {
+            let runtime_name = builder.ins().iconst(ir::types::I32, i64::from(names.runtime_id(name.0)?));
+            Ok(call_pyobject_helper(
+                builder,
+                helpers.make_typevar,
+                &[runtime_name],
+                ptr_ty,
+                exception_exit,
+            ))
         }
         _ => control::lower_future_value("unknown future InstKind"),
     }

@@ -130,14 +130,22 @@ pub struct HelperRefs {
     pub for_next: FuncId,
     /// `pon_gen_stop_value() -> *mut PyObject`.
     pub gen_stop_value: FuncId,
-    /// `pon_yield(value) -> *mut PyObject`.
-    pub yield_value: FuncId,
-    /// `pon_yield_from(iterator, feedback) -> *mut PyObject`.
-    pub yield_from: FuncId,
+    /// `pon_gen_last_stop_value() -> *mut PyObject`.
+    pub gen_last_stop_value: FuncId,
+    /// `pon_gen_frame_alloc(slot_count) -> *mut GenFrame`.
+    pub gen_frame_alloc: FuncId,
+    /// `pon_make_generator(body, frame, kind) -> *mut PyObject`.
+    pub make_generator: FuncId,
+    /// `pon_gen_consume_payload(frame) -> *mut PyObject`.
+    pub gen_consume_payload: FuncId,
+    /// `pon_gen_finish(frame, retval) -> *mut PyObject`.
+    pub gen_finish: FuncId,
+    /// `pon_gen_unwind(frame, is_coroutine) -> *mut PyObject`.
+    pub gen_unwind: FuncId,
+    /// `pon_gen_delegate_step(frame, delegate) -> *mut PyObject`.
+    pub gen_delegate_step: FuncId,
     /// `pon_await(awaitable, feedback) -> *mut PyObject`.
     pub await_value: FuncId,
-    /// `pon_eager_yield_generator(return_value) -> *mut PyObject`.
-    pub eager_yield_generator: FuncId,
     /// `pon_match_sequence(subject, feedback) -> *mut PyObject`.
     pub match_sequence: FuncId,
     /// `pon_match_mapping(subject, feedback) -> *mut PyObject`.
@@ -166,6 +174,12 @@ pub struct HelperRefs {
     pub cell_delete: FuncId,
     /// `pon_current_closure_cell(index) -> *mut PyObject`.
     pub current_closure_cell: FuncId,
+    /// `pon_function_set_annotate(function, annotate) -> *mut PyObject`.
+    pub function_set_annotate: FuncId,
+    /// `pon_make_type_alias(name_id, thunk) -> *mut PyObject`.
+    pub make_type_alias: FuncId,
+    /// `pon_make_typevar(name_id) -> *mut PyObject`.
+    pub make_typevar: FuncId,
     /// `pon_setup_annotations() -> *mut PyObject`.
     pub setup_annotations: FuncId,
     /// `pon_build_class(body, name_id, bases, base_count) -> *mut PyObject`.
@@ -313,8 +327,6 @@ pub enum HelperId {
     GetIter,
     GetAIter,
     ForNext,
-    Yield,
-    YieldFrom,
     Await,
     ImportName,
     ImportFrom,
@@ -332,6 +344,9 @@ pub enum HelperId {
     MatchClass,
     MatchKeys,
     MatchLenGe,
+    FunctionSetAnnotate,
+    MakeTypeAlias,
+    MakeTypeVar,
 }
 
 /// Frozen Phase-B helper signature description.
@@ -473,14 +488,12 @@ pub static PHASE_B_HELPERS: &[HelperSig] = &[
     HelperSig { id: HelperId::GetIter, family: HelperFamily::IterGen, symbol: "pon_get_iter", params: P_OBJ_FEEDBACK, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
     HelperSig { id: HelperId::GetAIter, family: HelperFamily::IterGen, symbol: "pon_get_aiter", params: P_OBJ_FEEDBACK, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
     HelperSig { id: HelperId::ForNext, family: HelperFamily::IterGen, symbol: "pon_for_next", params: P_OBJ_FEEDBACK, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
-    HelperSig { id: HelperId::Yield, family: HelperFamily::IterGen, symbol: "pon_yield", params: P_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::FunctionSetClosure, family: HelperFamily::Call, symbol: "pon_function_set_closure", params: P_FUNCTION_SET_CLOSURE, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::MakeCell, family: HelperFamily::Call, symbol: "pon_make_cell", params: P_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::CellGet, family: HelperFamily::Call, symbol: "pon_cell_get", params: P_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::CellSet, family: HelperFamily::Call, symbol: "pon_cell_set", params: P_CELL_SET, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::CellDelete, family: HelperFamily::Call, symbol: "pon_cell_delete", params: P_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::CurrentClosureCell, family: HelperFamily::Call, symbol: "pon_current_closure_cell", params: P_INDEX, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
-    HelperSig { id: HelperId::YieldFrom, family: HelperFamily::IterGen, symbol: "pon_yield_from", params: P_OBJ_FEEDBACK, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
     HelperSig { id: HelperId::Await, family: HelperFamily::IterGen, symbol: "pon_await", params: P_OBJ_FEEDBACK, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
     HelperSig { id: HelperId::ImportName, family: HelperFamily::ImportBuiltins, symbol: "pon_import_name", params: P_IMPORT_NAME, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::ImportFrom, family: HelperFamily::ImportBuiltins, symbol: "pon_import_from", params: P_OBJ_NAME, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
@@ -492,6 +505,9 @@ pub static PHASE_B_HELPERS: &[HelperSig] = &[
     HelperSig { id: HelperId::MatchClass, family: HelperFamily::Match, symbol: "pon_match_class", params: P_MATCH_CLASS, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::MatchKeys, family: HelperFamily::Match, symbol: "pon_match_keys", params: P_MATCH_KEYS, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::MatchLenGe, family: HelperFamily::Match, symbol: "pon_match_len_ge", params: P_MATCH_LEN, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
+    HelperSig { id: HelperId::FunctionSetAnnotate, family: HelperFamily::Call, symbol: "pon_function_set_annotate", params: P_OBJ_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
+    HelperSig { id: HelperId::MakeTypeAlias, family: HelperFamily::Call, symbol: "pon_make_type_alias", params: P_NAME_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
+    HelperSig { id: HelperId::MakeTypeVar, family: HelperFamily::Call, symbol: "pon_make_typevar", params: P_NAME, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
 ];
 
 /// Look up a frozen Phase-B helper signature by id.
@@ -565,10 +581,14 @@ pub fn declare_helpers<M: Module>(module: &mut M) -> ModuleResult<HelperRefs> {
         get_aiter: declare_one(module, "pon_get_aiter")?,
         for_next: declare_one(module, "pon_for_next")?,
         gen_stop_value: declare_one(module, "pon_gen_stop_value")?,
-        yield_value: declare_one(module, "pon_yield")?,
-        yield_from: declare_one(module, "pon_yield_from")?,
+        gen_last_stop_value: declare_one(module, "pon_gen_last_stop_value")?,
+        gen_frame_alloc: declare_one(module, "pon_gen_frame_alloc")?,
+        make_generator: declare_one(module, "pon_make_generator")?,
+        gen_consume_payload: declare_one(module, "pon_gen_consume_payload")?,
+        gen_finish: declare_one(module, "pon_gen_finish")?,
+        gen_unwind: declare_one(module, "pon_gen_unwind")?,
+        gen_delegate_step: declare_one(module, "pon_gen_delegate_step")?,
         await_value: declare_one(module, "pon_await")?,
-        eager_yield_generator: declare_one(module, "pon_eager_yield_generator")?,
         match_sequence: declare_one(module, "pon_match_sequence")?,
         match_mapping: declare_one(module, "pon_match_mapping")?,
         match_class: declare_one(module, "pon_match_class")?,
@@ -583,6 +603,9 @@ pub fn declare_helpers<M: Module>(module: &mut M) -> ModuleResult<HelperRefs> {
         cell_set: declare_one(module, "pon_cell_set")?,
         cell_delete: declare_one(module, "pon_cell_delete")?,
         current_closure_cell: declare_one(module, "pon_current_closure_cell")?,
+        function_set_annotate: declare_one(module, "pon_function_set_annotate")?,
+        make_type_alias: declare_one(module, "pon_make_type_alias")?,
+        make_typevar: declare_one(module, "pon_make_typevar")?,
         setup_annotations: declare_one(module, "pon_setup_annotations")?,
         build_class: declare_one(module, "pon_build_class")?,
         load_build_class: declare_one(module, "pon_load_build_class")?,
