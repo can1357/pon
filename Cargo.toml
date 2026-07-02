@@ -44,6 +44,7 @@ ruff_python_ast     = { git = "https://github.com/astral-sh/ruff", tag = "0.14.0
 
 # --- misc ---
 target-lexicon      = "0.13"
+libc                = "0.2"
 anyhow              = "1"
 num-bigint          = "0.4.6"
 num-integer         = "0.1"
