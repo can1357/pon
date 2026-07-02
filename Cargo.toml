@@ -41,6 +41,7 @@ cranelift-object    = "=0.133.1"
 # --- ruff: git tag dep ---
 ruff_python_parser  = { git = "https://github.com/astral-sh/ruff", tag = "0.14.0" }
 ruff_python_ast     = { git = "https://github.com/astral-sh/ruff", tag = "0.14.0" }
+ruff_text_size      = { git = "https://github.com/astral-sh/ruff", tag = "0.14.0" }
 
 # --- misc ---
 target-lexicon      = "0.13"
