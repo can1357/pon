@@ -186,6 +186,12 @@ impl PonThreadState {
     pub fn gc_safe_region_depth(&self) -> usize {
         self.gc_safe_region_depth
     }
+
+    /// Clears the diagnostic message (the in-lock counterpart of
+    /// [`pon_err_clear`] for callers already holding the state guard).
+    pub fn clear_diagnostic(&mut self) {
+        self.diagnostic_message = None;
+    }
 }
 
 #[cfg(not(feature = "free-threading"))]

@@ -68,6 +68,7 @@ fn run_file_inner(path: &Path, argv: &[String]) -> Result<()> {
     set_dynamic_code_hooks(validate_dynamic_source, execute_dynamic_source);
     let init_status = unsafe { pon_runtime_init() };
     if init_status != 0 {
+        eprintln!("PMRI-DIAG init failed: {:?}", pon_runtime::pon_err_message());
         bail!("runtime initialization failed");
     }
     let mut argv_cstrings = Vec::with_capacity(argv.len());
@@ -83,6 +84,7 @@ fn run_file_inner(path: &Path, argv: &[String]) -> Result<()> {
         .map(|arg| arg.as_ptr().cast::<u8>())
         .collect::<Vec<_>>();
     if unsafe { pon_sys_set_argv(argv_ptrs.len() as i32, argv_ptrs.as_ptr()) } != 0 {
+        eprintln!("PMRI-DIAG set_argv failed: {:?}", pon_runtime::pon_err_message());
         bail!("runtime initialization failed");
     }
     install_module("__main__", []).map_err(anyhow::Error::msg)?;
