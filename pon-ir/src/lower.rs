@@ -388,7 +388,7 @@ impl LoweringDriver {
             Stmt::Continue(stmt) => control::lower_continue_with_targets(scope, stmt, loop_targets),
             Stmt::With(stmt) => with_::lower_with_stmt(self, scope, stmt),
             Stmt::Match(stmt) => match_::lower_match(self, scope, stmt, loop_targets),
-            Stmt::Try(stmt) => try_::lower_try(self, scope, stmt),
+            Stmt::Try(stmt) => try_::lower_try(self, scope, stmt, loop_targets),
             Stmt::Import(stmt) => import::lower_import_stmt(self, scope, stmt),
             Stmt::ImportFrom(stmt) => import::lower_import_from_stmt(self, scope, stmt),
             Stmt::Delete(stmt) => assign::lower_delete(self, scope, stmt),
@@ -396,7 +396,7 @@ impl LoweringDriver {
             Stmt::AnnAssign(stmt) => assign::lower_ann_assign(self, scope, stmt),
             Stmt::TypeAlias(stmt) => assign::lower_type_alias(self, scope, stmt),
             Stmt::Raise(stmt) => try_::lower_raise(self, scope, stmt),
-            Stmt::Assert(stmt) => control::lower_assert(stmt),
+            Stmt::Assert(stmt) => control::lower_assert(self, scope, stmt),
             Stmt::Global(stmt) => import::lower_global(stmt),
             Stmt::Nonlocal(stmt) => import::lower_nonlocal(stmt),
             Stmt::Pass(stmt) => control::lower_pass(stmt),
@@ -629,7 +629,10 @@ impl LoweringDriver {
             Expr::Compare(compare) => control::lower_compare_expr_with_driver(self, scope, compare),
             Expr::BytesLiteral(bytes) => self.lower_bytes_literal(scope, bytes),
             Expr::BooleanLiteral(boolean) => scope.emit(InstKind::Const(PyConst::Bool(boolean.value))),
-            Expr::EllipsisLiteral(_) => scope.emit(InstKind::Const(PyConst::Ellipsis)),
+            Expr::EllipsisLiteral(_) => {
+                let name_id = self.names.intern("Ellipsis")?;
+                scope.emit(InstKind::LoadBuiltin(name_id))
+            }
             Expr::Attribute(attr) => self.lower_attribute_expr(scope, attr),
             Expr::Subscript(subscript) => self.lower_subscript_expr(scope, subscript),
             Expr::Starred(_) => unsupported_expr("starred expression outside container literal or call", expr),

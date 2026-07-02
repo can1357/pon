@@ -143,6 +143,7 @@ pub(crate) fn is_known_builtin_name(name: &str) -> bool {
             | "getattr"
             | "globals"
             | "hasattr"
+            | "Ellipsis"
             | "hash"
             | "int"
             | "isinstance"

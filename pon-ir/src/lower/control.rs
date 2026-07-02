@@ -352,11 +352,43 @@ pub(super) fn lower_continue(stmt: &ruff_python_ast::StmtContinue) -> Result<(),
     )
 }
 
-pub(super) fn lower_assert(stmt: &ruff_python_ast::StmtAssert) -> Result<(), LowerError> {
-    unsupported_at(
-        "assert statement",
-        span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()),
-    )
+pub(super) fn lower_assert(
+    driver: &mut LoweringDriver,
+    scope: &mut BodyScope,
+    stmt: &ruff_python_ast::StmtAssert,
+) -> Result<(), LowerError> {
+    let test = driver.lower_expr(scope, &stmt.test)?;
+    let cond = scope.emit(InstKind::BoolTest { val: test })?;
+    let ok_block = scope.alloc_block()?;
+    let fail_block = scope.alloc_block()?;
+    scope.set_term(Terminator::CondBranch {
+        cond,
+        then_: ok_block,
+        else_: fail_block,
+    })?;
+
+    scope.switch_to(fail_block)?;
+    let assertion_name = driver.names.intern("AssertionError")?;
+    let assertion_type = scope.emit(InstKind::LoadGlobal(assertion_name))?;
+    let exc = if let Some(msg) = stmt.msg.as_deref() {
+        let msg = driver.lower_expr(scope, msg)?;
+        scope.emit(InstKind::Call {
+            callee: assertion_type,
+            args: vec![msg],
+        })?
+    } else {
+        scope.emit(InstKind::Call {
+            callee: assertion_type,
+            args: Vec::new(),
+        })?
+    };
+    scope.emit(InstKind::Raise {
+        exc: Some(exc),
+        cause: None,
+    })?;
+    scope.set_term(Terminator::RaiseTerm)?;
+    scope.switch_to(ok_block)?;
+    Ok(())
 }
 
 pub(super) fn lower_pass(_stmt: &ruff_python_ast::StmtPass) -> Result<(), LowerError> {
