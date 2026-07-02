@@ -5,6 +5,7 @@ pub enum Status {
     Pass,
     Fail,
     SemanticsDivergent,
+    Excluded,
     Unsupported,
 }
 
@@ -14,6 +15,7 @@ impl Status {
             Self::Pass => "pass",
             Self::Fail => "fail",
             Self::SemanticsDivergent => "semantics-divergent",
+            Self::Excluded => "excluded",
             Self::Unsupported => "unsupported",
         }
     }
@@ -94,10 +96,11 @@ impl Scoreboard {
         json.push_str(",\n  \"summary\": {\n");
         write!(
             json,
-            "    \"pass\": {},\n    \"fail\": {},\n    \"semantics-divergent\": {},\n    \"unsupported\": {}\n",
+            "    \"pass\": {},\n    \"fail\": {},\n    \"semantics-divergent\": {},\n    \"excluded\": {},\n    \"unsupported\": {}\n",
             self.status_count(Status::Pass),
             self.status_count(Status::Fail),
             self.status_count(Status::SemanticsDivergent),
+            self.status_count(Status::Excluded),
             self.status_count(Status::Unsupported),
         )
         .expect("write to String cannot fail");
@@ -155,13 +158,20 @@ mod tests {
             Status::Unsupported,
             Some("missing\nmodule".to_owned()),
         );
+        scoreboard.push(
+            "test.test_ctypes.test_numbers",
+            Status::Excluded,
+            Some("excluded by test_ctypes* (c-abi-boundary)".to_owned()),
+        );
 
         let json = scoreboard.to_json();
 
         assert!(json.contains("\"suite\": \"cpython\""));
         assert!(json.contains("\"cpython_tag\": \"v3.14.0\""));
         assert!(json.contains("\"pass\": 1"));
+        assert!(json.contains("\"excluded\": 1"));
         assert!(json.contains("\"unsupported\": 1"));
+        assert!(json.contains("\"status\": \"excluded\""));
         assert!(json.contains("Lib/test/test_quote\\\".py"));
         assert!(json.contains("missing\\nmodule"));
     }

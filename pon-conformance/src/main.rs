@@ -1,6 +1,8 @@
 #![doc = "Differential conformance runner and Phase-B/Phase-C ratchet gates."]
 
 mod aot;
+mod full;
+mod ledger;
 mod ratchet;
 mod scoreboard;
 mod suite;
@@ -22,7 +24,11 @@ struct Cli {
     mode: Mode,
     check_floor: bool,
     update_floor: bool,
-    modules: Vec<PathBuf>,
+    diff_floor: bool,
+    modules: Vec<String>,
+    timeout: Option<u64>,
+    shard: Option<(u32, u32)>,
+    jobs: Option<usize>,
     bench: bool,
 }
 
@@ -56,6 +62,30 @@ fn run_cli() -> Result<()> {
     let cli = parse_cli(env::args().skip(1))?;
     let root = suite::workspace_root();
 
+    // Pinned validation (J0.7 §2): the full-suite flags are CLI errors with
+    // any other suite; floor ops on a partial full run are CLI errors.
+    if cli.suite == SuiteName::CpythonFull {
+        if (cli.check_floor || cli.update_floor || cli.diff_floor) && (cli.shard.is_some() || !cli.modules.is_empty()) {
+            bail!("floor operations require an unsharded, unfiltered run")
+        }
+    } else {
+        if cli.timeout.is_some() {
+            bail!("`--timeout` is only defined for `--suite cpython-full`")
+        }
+        if cli.shard.is_some() {
+            bail!("`--shard` is only defined for `--suite cpython-full`")
+        }
+        if cli.jobs.is_some() {
+            bail!("`--jobs` is only defined for `--suite cpython-full`")
+        }
+        if cli.diff_floor {
+            bail!("`--diff-floor` is only defined for `--suite cpython-full`")
+        }
+    }
+
+    // The four legacy suites take module *paths*; convert verbatim.
+    let module_paths = cli.modules.iter().map(PathBuf::from).collect::<Vec<_>>();
+
     if cli.bench {
         if cli.mode != Mode::Jit {
             bail!("`--bench` uses the JIT tier-up path; omit `--mode` or pass `--mode jit`")
@@ -67,7 +97,7 @@ fn run_cli() -> Result<()> {
             bail!("floor checks are not defined for `--bench`")
         }
 
-        run_bench_gate(&root, &cli.modules)?;
+        run_bench_gate(&root, &module_paths)?;
         return Ok(());
     }
 
@@ -77,7 +107,7 @@ fn run_cli() -> Result<()> {
                 bail!("floor checks are only defined for `--suite cpython`")
             }
 
-            let scoreboard = suite::run_slice_suite(&root, &cli.modules)?;
+            let scoreboard = suite::run_slice_suite(&root, &module_paths)?;
             println!("{}", scoreboard.to_json());
             if scoreboard.has_status(Status::Fail) {
                 bail!("one or more Phase-A slice scripts failed")
@@ -85,7 +115,7 @@ fn run_cli() -> Result<()> {
         }
         (Mode::Jit, SuiteName::Cpython) => {
             let floor = ratchet::Floor::read_or_default(&root)?;
-            let scoreboard = suite::run_cpython_suite(&root, &cli.modules)?;
+            let scoreboard = suite::run_cpython_suite(&root, &module_paths)?;
             println!("{}", scoreboard.to_json());
 
             if cli.check_floor {
@@ -109,7 +139,7 @@ fn run_cli() -> Result<()> {
                 bail!("AoT floor updates are ratcheted in `pon-conformance/src/aot.rs`")
             }
 
-            let scoreboard = aot::run_aot_suite(&root, &cli.modules)?;
+            let scoreboard = aot::run_aot_suite(&root, &module_paths)?;
             println!("{}", scoreboard.to_json());
 
             if cli.check_floor {
@@ -128,14 +158,46 @@ fn run_cli() -> Result<()> {
                 bail!("floor checks are only defined for `--suite cpython`")
             }
 
-            let scoreboard = suite::run_ft_stress_suite(&root, &cli.modules)?;
+            let scoreboard = suite::run_ft_stress_suite(&root, &module_paths)?;
             println!("{}", scoreboard.to_json());
             if scoreboard.has_status(Status::Fail) {
                 bail!("one or more FT stress scripts failed")
             }
         }
+        (Mode::Jit, SuiteName::CpythonFull) => {
+            let opts = full::FullSuiteOptions {
+                modules: cli.modules.clone(),
+                timeout: Duration::from_secs(cli.timeout.unwrap_or(full::DEFAULT_TIMEOUT_SECS)),
+                shard: cli.shard,
+                jobs: cli.jobs.unwrap_or_else(default_jobs),
+            };
+            let floor = ratchet::Floor::read_or_default_at(&root, ratchet::FULL_FLOOR_FILE)?;
+            let scoreboard = full::run_full_suite(&root, &opts)?;
+            println!("{}", scoreboard.to_json());
+
+            if cli.diff_floor {
+                eprint!("{}", ratchet::diff_floor(&floor, &scoreboard));
+            }
+
+            if cli.check_floor {
+                let report = ratchet::check_floor(&floor, &scoreboard);
+                if !report.is_ok() {
+                    bail!("{}", report.message())
+                }
+            }
+
+            if cli.update_floor {
+                let cpython_tag = scoreboard.cpython_tag.as_deref().unwrap_or(&floor.cpython_tag);
+                ratchet::write_floor_from_scoreboard_at(&root, ratchet::FULL_FLOOR_FILE, cpython_tag, &scoreboard)?;
+            }
+            // Pinned exit contract (§10): fail/unsupported records do NOT
+            // affect the exit code for this suite.
+        }
         (Mode::Jit, SuiteName::CpythonAotSubset) => {
             bail!("`--suite cpython-aot-subset` requires `--mode aot`")
+        }
+        (Mode::Aot, SuiteName::CpythonFull) => {
+            bail!("`--suite cpython-full` requires `--mode jit`")
         }
         (Mode::Aot, SuiteName::Slice | SuiteName::Cpython | SuiteName::FtStress) => {
             bail!("`--mode aot` requires `--suite cpython-aot-subset`")
@@ -150,7 +212,11 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
     let mut mode = Mode::Jit;
     let mut check_floor = false;
     let mut update_floor = false;
+    let mut diff_floor = false;
     let mut modules = Vec::new();
+    let mut timeout = None;
+    let mut shard = None;
+    let mut jobs = None;
     let mut bench = false;
     let mut args = args.into_iter().peekable();
 
@@ -166,14 +232,35 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
             }
             "--check-floor" => check_floor = true,
             "--update-floor" => update_floor = true,
+            "--diff-floor" => diff_floor = true,
             "--bench" => bench = true,
+            "--timeout" => {
+                let value = args.next().ok_or_else(usage)?;
+                let secs = value.parse::<u64>().with_context(|| format!("invalid `--timeout` value `{value}`"))?;
+                if secs == 0 {
+                    bail!("`--timeout` must be at least 1 second")
+                }
+                timeout = Some(secs);
+            }
+            "--shard" => {
+                let value = args.next().ok_or_else(usage)?;
+                shard = Some(parse_shard(&value)?);
+            }
+            "--jobs" => {
+                let value = args.next().ok_or_else(usage)?;
+                let count = value.parse::<usize>().with_context(|| format!("invalid `--jobs` value `{value}`"))?;
+                if count == 0 {
+                    bail!("`--jobs` must be at least 1")
+                }
+                jobs = Some(count);
+            }
             "--modules" => {
                 let before = modules.len();
                 while let Some(next) = args.peek() {
                     if next.starts_with("--") {
                         break;
                     }
-                    modules.push(PathBuf::from(args.next().expect("peeked argument exists")));
+                    modules.push(args.next().expect("peeked argument exists"));
                 }
                 if modules.len() == before {
                     bail!("`--modules` requires at least one path")
@@ -188,14 +275,40 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
         mode,
         check_floor,
         update_floor,
+        diff_floor,
         bench,
         modules,
+        timeout,
+        shard,
+        jobs,
     })
+}
+
+/// Parses the pinned `--shard <i>/<N>` grammar: two integers joined by `/`,
+/// `0 <= i < N`, `N >= 1`.
+fn parse_shard(value: &str) -> Result<(u32, u32)> {
+    let Some((index, count)) = value.split_once('/') else {
+        bail!("invalid `--shard` value `{value}` (expected `<i>/<N>`)")
+    };
+    let index = index.parse::<u32>().with_context(|| format!("invalid `--shard` index in `{value}`"))?;
+    let count = count.parse::<u32>().with_context(|| format!("invalid `--shard` count in `{value}`"))?;
+    if count == 0 {
+        bail!("`--shard` count must be at least 1")
+    }
+    if index >= count {
+        bail!("`--shard` index {index} is out of range for {count} shard(s)")
+    }
+    Ok((index, count))
+}
+
+/// Default `--jobs`: `std::thread::available_parallelism()` (pin §2).
+fn default_jobs() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
 }
 
 fn usage() -> anyhow::Error {
     anyhow::anyhow!(
-        "usage: pon-conformance [--bench] [--mode jit|aot] [--suite slice|cpython|cpython-aot-subset|ft-stress] [--check-floor] [--update-floor] [--modules <paths...>]"
+        "usage: pon-conformance [--bench] [--mode jit|aot] [--suite slice|cpython|cpython-aot-subset|cpython-full|ft-stress] [--check-floor] [--update-floor] [--diff-floor] [--modules <selectors...>] [--timeout <secs>] [--shard <i>/<N>] [--jobs <J>]"
     )
 }
 

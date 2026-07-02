@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 use crate::scoreboard::{Scoreboard, Status};
 
 pub const CPYTHON_TAG: &str = "v3.14.0";
-const CPYTHON_VENDOR_DIR: &str = "pon-conformance/vendor/cpython-3.14";
+pub(crate) const CPYTHON_VENDOR_DIR: &str = "pon-conformance/vendor/cpython-3.14";
 const CPYTHON_MANIFEST: &str = "pon-conformance/corpus/MANIFEST";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16,6 +16,7 @@ pub enum SuiteName {
     Slice,
     Cpython,
     CpythonAotSubset,
+    CpythonFull,
     FtStress,
 }
 
@@ -25,6 +26,7 @@ impl SuiteName {
             "slice" => Ok(Self::Slice),
             "cpython" => Ok(Self::Cpython),
             "cpython-aot-subset" => Ok(Self::CpythonAotSubset),
+            "cpython-full" => Ok(Self::CpythonFull),
             "ft-stress" => Ok(Self::FtStress),
             _ => bail!("unsupported suite `{value}`"),
         }
@@ -471,10 +473,16 @@ pub(crate) fn normalize_path(path: &Path) -> String {
 }
 
 fn is_unsupported_pon_result(result: &RunResult) -> bool {
-    if result.exit == 0 {
+    is_unsupported_pon_output(result.exit, &result.stderr)
+}
+
+/// The pin's `is_unsupported_pon_result` predicate on raw exit/stderr: a non-zero
+/// exit whose stderr mentions "unsupported" (ASCII case-insensitively).
+pub(crate) fn is_unsupported_pon_output(exit: i32, stderr: &[u8]) -> bool {
+    if exit == 0 {
         return false;
     }
-    String::from_utf8_lossy(&result.stderr)
+    String::from_utf8_lossy(stderr)
         .to_ascii_lowercase()
         .contains("unsupported")
 }

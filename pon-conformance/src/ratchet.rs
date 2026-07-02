@@ -7,6 +7,8 @@ use crate::scoreboard::{Scoreboard, Status};
 use crate::suite::CPYTHON_TAG;
 
 const FLOOR_FILE: &str = "conformance-floor.json";
+/// Floor file for `--suite cpython-full` (workspace root, sibling of `conformance-floor.json`).
+pub const FULL_FLOOR_FILE: &str = "conformance-full-floor.json";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Floor {
@@ -17,7 +19,12 @@ pub struct Floor {
 
 impl Floor {
     pub fn read_or_default(root: &Path) -> Result<Self> {
-        let path = root.join(FLOOR_FILE);
+        Self::read_or_default_at(root, FLOOR_FILE)
+    }
+
+    /// `read_or_default` twin for an arbitrary floor file name under `root`.
+    pub fn read_or_default_at(root: &Path, file: &str) -> Result<Self> {
+        let path = root.join(file);
         if !path.is_file() {
             return Ok(Self::default_floor());
         }
@@ -106,14 +113,56 @@ pub fn check_floor(floor: &Floor, scoreboard: &Scoreboard) -> FloorCheck {
 }
 
 pub fn write_floor_from_scoreboard(root: &Path, cpython_tag: &str, scoreboard: &Scoreboard) -> Result<()> {
+    write_floor_from_scoreboard_at(root, FLOOR_FILE, cpython_tag, scoreboard)
+}
+
+/// `write_floor_from_scoreboard` twin for an arbitrary floor file name under `root`.
+pub fn write_floor_from_scoreboard_at(root: &Path, file: &str, cpython_tag: &str, scoreboard: &Scoreboard) -> Result<()> {
     let passing_modules = scoreboard.passing_modules();
     let floor = Floor {
         cpython_tag: cpython_tag.to_owned(),
         min_pass_count: passing_modules.len(),
         passing_modules,
     };
-    let path = root.join(FLOOR_FILE);
+    let path = root.join(file);
     fs::write(&path, floor.to_json()).with_context(|| format!("failed to write `{}`", path.display()))
+}
+
+/// Renders the `--diff-floor` report (pin J0.7 §8.3): a summary line, then all
+/// `regressed` lines (floor modules whose status in this run is not `pass`,
+/// absent counting as regressed), then all `progressed` lines (`pass` modules
+/// not in the floor's set), each group sorted.
+pub fn diff_floor(floor: &Floor, scoreboard: &Scoreboard) -> String {
+    let mut regressed = floor
+        .passing_modules
+        .iter()
+        .filter(|module| scoreboard.status_for_module(module) != Some(Status::Pass))
+        .cloned()
+        .collect::<Vec<_>>();
+    regressed.sort();
+    regressed.dedup();
+
+    let floor_set = floor.passing_modules.iter().collect::<std::collections::BTreeSet<_>>();
+    let mut progressed = scoreboard
+        .passing_modules()
+        .into_iter()
+        .filter(|module| !floor_set.contains(module))
+        .collect::<Vec<_>>();
+    progressed.sort();
+
+    let mut report = format!(
+        "floor-diff {}: {} regressed, {} progressed\n",
+        scoreboard.suite,
+        regressed.len(),
+        progressed.len()
+    );
+    for module in &regressed {
+        report.push_str(&format!("floor-diff regressed {module}\n"));
+    }
+    for module in &progressed {
+        report.push_str(&format!("floor-diff progressed {module}\n"));
+    }
+    report
 }
 
 fn parse_floor(text: &str) -> Result<Floor> {
@@ -285,5 +334,29 @@ mod tests {
         assert_eq!(report.regressed_modules, vec!["Lib/test/test_b.py"]);
         assert_eq!(report.pass_count, 1);
         assert!(report.message().contains("pass count 1 below floor 2"));
+    }
+
+    #[test]
+    fn diff_floor_reports_regressed_then_progressed_sorted() {
+        let floor = Floor {
+            cpython_tag: "v3.14.0".to_owned(),
+            passing_modules: vec!["test.test_b".to_owned(), "test.test_a".to_owned()],
+            min_pass_count: 2,
+        };
+        let mut scoreboard = Scoreboard::new("cpython-full", Some("v3.14.0".to_owned()));
+        scoreboard.push("test.test_a", Status::Pass, None);
+        scoreboard.push("test.test_d", Status::Pass, None);
+        scoreboard.push("test.test_c", Status::Pass, None);
+        // test.test_b absent from this run: counts as regressed.
+
+        let report = diff_floor(&floor, &scoreboard);
+
+        assert_eq!(
+            report,
+            "floor-diff cpython-full: 1 regressed, 2 progressed\n\
+             floor-diff regressed test.test_b\n\
+             floor-diff progressed test.test_c\n\
+             floor-diff progressed test.test_d\n"
+        );
     }
 }
