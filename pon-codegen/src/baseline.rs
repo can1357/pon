@@ -630,6 +630,7 @@ pub(crate) fn lower_function_blocks<M: Module>(
                 ir,
                 block.id,
                 &block.term,
+                true,
             )?;
         }
     }
@@ -738,6 +739,7 @@ fn lower_function_blocks_subset<M: Module>(
             ir,
             block.id,
             &block.term,
+            false,
         )?;
     }
     Ok(())

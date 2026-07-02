@@ -98,7 +98,21 @@ pub fn plan_function(function: &Function) -> Option<OptimizingPlan> {
     if function.is_generator {
         return None;
     }
-    region::find_maximal_typed_region(function).map(|region| plan_region(function, region))
+    let region = region::find_maximal_typed_region(function)?;
+    typed_for_nexts_have_fast_range_specs(function, &region).then(|| plan_region(function, region))
+}
+
+fn typed_for_nexts_have_fast_range_specs(function: &Function, region: &TypedRegion) -> bool {
+    let specs = range_iter_specs(function);
+    function
+        .blocks
+        .iter()
+        .filter(|block| region.blocks.contains(&block.id))
+        .flat_map(|block| block.insts.iter())
+        .all(|inst| match &inst.kind {
+            InstKind::ForNext { iter } if region::inst_unboxed_type(inst) == Some(Type::IntI64) => specs.contains_key(iter),
+            _ => true,
+        })
 }
 
 /// Return true when `plan` uses only typed shapes the current optimizing
@@ -750,6 +764,7 @@ fn lower_cold_terminator_with_region_args(
             function,
             current_block,
             term,
+            false,
         ),
     }
 }
@@ -1012,6 +1027,7 @@ fn lower_primary_terminator(
                 function,
                 current_block,
                 term,
+                false,
             )
         }
         Terminator::ForLoop { body, done, .. } => {
@@ -1045,6 +1061,7 @@ fn lower_primary_terminator(
                 function,
                 current_block,
                 term,
+                false,
             )
         }
         Terminator::Branch { cond, then_blk, else_blk } => {
@@ -1090,6 +1107,7 @@ fn lower_primary_terminator(
                     function,
                     current_block,
                     term,
+                    false,
                 )
             }
         }
@@ -1136,6 +1154,7 @@ fn lower_primary_terminator(
                     function,
                     current_block,
                     term,
+                    false,
                 )
             }
         }
@@ -1153,6 +1172,7 @@ fn lower_primary_terminator(
                 function,
                 current_block,
                 term,
+                false,
             )
         }
     }
@@ -1849,9 +1869,17 @@ def mix(seed):
         assert!(clif.contains("imul"));
         assert!(clif.contains("iadd"));
         assert!(clif.contains("srem"));
+        let srem_result = clif
+            .lines()
+            .find_map(|line| line.trim_start().split_once(" = srem").map(|(result, _)| result.trim().to_owned()))
+            .expect("optimized loop should compute the accumulator with an unboxed srem");
+        let expected_backedge_suffix = format!(", {srem_result})");
         assert!(
-            clif.contains("jump block2(") && (clif.contains(", v49)") || clif.contains(", v50)")),
-            "expected the loop backedge to carry the updated unboxed accumulator, got:\n{clif}"
+            clif.lines().any(|line| {
+                let line = line.trim();
+                line.starts_with("jump block2(") && line.ends_with(&expected_backedge_suffix)
+            }),
+            "expected the loop backedge to carry the updated unboxed accumulator {srem_result}, got:\n{clif}"
         );
     }
 
