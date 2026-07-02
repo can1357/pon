@@ -63,19 +63,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
             &format!("{VERSION_INFO_MAJOR}.{VERSION_INFO_MINOR}.{VERSION_INFO_MICRO} (pon)"),
         ),
         version_info_attr(),
-        string_attr(
-            "implementation",
-            &format!(
-                "namespace(name='pon', version={})",
-                format_version_info(
-                    VERSION_INFO_MAJOR,
-                    VERSION_INFO_MINOR,
-                    VERSION_INFO_MICRO,
-                    VERSION_INFO_RELEASELEVEL,
-                    VERSION_INFO_SERIAL,
-                )
-            ),
-        ),
+        implementation_attr(),
         int_attr("hexversion", HEXVERSION),
         int_attr("maxsize", i64::MAX),
         string_attr("platform", PLATFORM),
@@ -305,11 +293,15 @@ type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObjec
 /// The `sys.version_info` singleton, built once and reused across import
 /// re-registration (the class and instance both live for the process).
 fn version_info_attr() -> Result<(u32, *mut PyObject), String> {
+    version_info_object().map(|object| (intern("version_info"), object))
+}
+
+/// The structseq singleton object shared by `sys.version_info` and
+/// `sys.implementation.version` — identity-shared exactly like CPython.
+fn version_info_object() -> Result<*mut PyObject, String> {
     static VERSION_INFO: std::sync::LazyLock<Result<usize, String>> =
         std::sync::LazyLock::new(|| build_version_info().map(|object| object as usize));
-    VERSION_INFO
-        .clone()
-        .map(|object| (intern("version_info"), object as *mut PyObject))
+    VERSION_INFO.clone().map(|object| object as *mut PyObject)
 }
 
 /// Allocates the singleton: builds the `sys.version_info` class, then calls
@@ -556,6 +548,118 @@ unsafe extern "C" fn version_info_repr(argv: *mut *mut PyObject, argc: usize) ->
     };
     let text = format_version_info(major, minor, micro, releaselevel, serial);
     // SAFETY: String allocation helper follows the NULL-sentinel contract.
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+// ---------------------------------------------------------------------------
+// sys.implementation
+//
+// CPython builds this as a `types.SimpleNamespace` in `_PySys_InitCore`, and
+// the vendored `types.py` defines `SimpleNamespace = type(sys.implementation)`,
+// so the singleton's type is named `types.SimpleNamespace`.  `test.support`
+// reads `sys.implementation.name` at import time (`check_impl_detail()` is
+// `guards.get(sys.implementation.name, default)`), and `importlib._bootstrap`'s
+// FrozenImporter would call `type(sys.implementation)(...)` only after
+// `_imp.find_frozen` returns non-None — pon's always returns None, so the
+// type never needs to be callable.
+//
+// Served fields, with documented divergences from the CPython oracle:
+// - `name`: 'pon' (CPython 'cpython').  The honest implementation name:
+//   `check_impl_detail()` then returns False, so CPython-implementation-
+//   detail tests guard/skip — correct under pon.  Corpus modules must stay
+//   shape-only here; printing `.name` diverges from the oracle.
+// - `cache_tag`: 'pon-314' (CPython 'cpython-314'), the same
+//   `{name}-{major}{minor}` derivation off the version pin.
+// - `version`: THE `sys.version_info` structseq singleton, identity-shared
+//   like CPython (`sys.implementation.version is sys.version_info`).
+// - `hexversion`: the `HEXVERSION` pin.
+// - `_multiarch`: ABSENT (CPython darwin: 'darwin').  `sysconfig` probes it
+//   with `hasattr`/`getattr(..., '_multiarch', '')`, so the AttributeError
+//   raise below selects the default — keeping the `_sysconfigdata__darwin_`
+//   module name `native/sysconfigdata.rs` serves.
+// - `supports_isolated_interpreters` (CPython 3.14: True) and every other
+//   name: ABSENT — unknown attributes raise so the next frontier is loud,
+//   not a silently wrong default.
+// ---------------------------------------------------------------------------
+
+const IMPLEMENTATION_NAME: &str = "pon";
+
+/// `sys.implementation.cache_tag`: CPython's `{name}-{major}{minor}` shape
+/// over pon's implementation name and the pinned version block.
+fn implementation_cache_tag() -> String {
+    format!("{IMPLEMENTATION_NAME}-{VERSION_INFO_MAJOR}{VERSION_INFO_MINOR}")
+}
+
+/// `sys.implementation` singleton (the flags/hash_info pattern: an opaque
+/// leaked object whose getattro serves the consumed field set).
+fn implementation_attr() -> Result<(u32, *mut PyObject), String> {
+    // Force the shared structseq singleton so the getattro below can never
+    // observe a failed build: module init surfaces the error instead.
+    version_info_object()?;
+    static IMPLEMENTATION_TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let mut ty = crate::object::PyType::new(
+            std::ptr::null(),
+            "types.SimpleNamespace",
+            std::mem::size_of::<crate::object::PyObjectHeader>(),
+        );
+        ty.tp_getattro = Some(implementation_getattro);
+        ty.tp_repr = Some(implementation_repr);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    static IMPLEMENTATION: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        Box::into_raw(Box::new(crate::object::PyObjectHeader::new(
+            *IMPLEMENTATION_TYPE as *mut crate::object::PyType,
+        ))) as usize
+    });
+    Ok((intern("implementation"), *IMPLEMENTATION as *mut PyObject))
+}
+
+unsafe extern "C" fn implementation_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let name = crate::tag::untag_arg(name);
+    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        crate::thread_state::pon_err_set("attribute name must be str");
+        return std::ptr::null_mut();
+    };
+    match name_text {
+        // SAFETY: Runtime allocation helpers return NULL with the error set.
+        "name" => unsafe { pon_const_str(IMPLEMENTATION_NAME.as_ptr(), IMPLEMENTATION_NAME.len()) },
+        "cache_tag" => {
+            let tag = implementation_cache_tag();
+            // SAFETY: As above; the String outlives the copying allocation.
+            unsafe { pon_const_str(tag.as_ptr(), tag.len()) }
+        }
+        // SAFETY: Integer boxing helper follows the NULL-sentinel contract.
+        "hexversion" => unsafe { pon_const_int(HEXVERSION) },
+        // Identity-shared with `sys.version_info`; the Err arm is unreachable
+        // in practice — `implementation_attr` forced the singleton at init.
+        "version" => match version_info_object() {
+            Ok(object) => object,
+            Err(message) => {
+                crate::thread_state::pon_err_set(&message);
+                std::ptr::null_mut()
+            }
+        },
+        // SAFETY: Raise helper with the interned attribute name.
+        _ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
+    }
+}
+
+/// The SimpleNamespace repr over the served fields in CPython's insertion
+/// order (name, cache_tag, version, hexversion); honest — the name and
+/// cache_tag VALUES diverge from the CPython oracle by design.
+unsafe extern "C" fn implementation_repr(_object: *mut PyObject) -> *mut PyObject {
+    let text = format!(
+        "namespace(name='{IMPLEMENTATION_NAME}', cache_tag='{}', version={}, hexversion={HEXVERSION})",
+        implementation_cache_tag(),
+        format_version_info(
+            VERSION_INFO_MAJOR,
+            VERSION_INFO_MINOR,
+            VERSION_INFO_MICRO,
+            VERSION_INFO_RELEASELEVEL,
+            VERSION_INFO_SERIAL,
+        ),
+    );
+    // SAFETY: Runtime string allocation helper; NULL on failure with the error set.
     unsafe { pon_const_str(text.as_ptr(), text.len()) }
 }
 
