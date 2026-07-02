@@ -171,3 +171,5 @@ pon-conformance/corpus/cpython/unittest_smoke.py
 pon-conformance/corpus/cpython/user_hash_eq.py
 pon-conformance/corpus/cpython/super_attr_miss.py
 pon-conformance/corpus/cpython/signal_sys_exception.py
+pon-conformance/corpus/cpython/sys_import_surface.py
+pon-conformance/corpus/cpython/sys_version_info.py
