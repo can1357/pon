@@ -5,7 +5,7 @@
 //! available to the AoT backend; the linker can dead-strip later, but this pass
 //! never prunes language-level definitions.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::fs;
@@ -27,6 +27,10 @@ pub struct ReachabilityOptions {
 pub struct CompileUnit {
     /// Canonical path to the source file.
     pub path: PathBuf,
+    /// Fully-qualified dotted import name; `__main__` for the entry module.
+    pub module_name: String,
+    /// True when this unit is a package `__init__.py`.
+    pub is_package: bool,
     /// Source text used for dynamic diagnostics and lowering.
     pub source: String,
     /// Tier-0 boxed IR for this module.
@@ -52,8 +56,10 @@ pub struct ReachabilityReport {
 /// A module-name edge discovered from `ImportName` IR.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StaticImport {
-    /// Dotted module path as it appeared after Phase-B import lowering.
+    /// Dotted module target as written; empty for `from . import name` forms.
     pub module: String,
+    /// Relative-import level (`from ..x import y` is level 2); zero = absolute.
+    pub level: u32,
 }
 
 /// A resolved or recorded static import edge.
@@ -144,14 +150,19 @@ pub fn module_closure_with_options(
     options: &ReachabilityOptions,
 ) -> Result<ReachabilityReport, ReachabilityError> {
     let entry = canonicalize_existing(entry)?;
-    let mut worklist = VecDeque::from([entry]);
+    let mut worklist = VecDeque::from([PendingUnit {
+        path: entry,
+        name: "__main__".to_owned(),
+        is_package: false,
+    }]);
     let mut seen = BTreeSet::new();
+    let mut assigned = BTreeMap::new();
     let mut units = Vec::new();
     let mut requires_dynamic_runtime = false;
 
-    while let Some(path) = worklist.pop_front() {
-        let path = canonicalize_existing(&path)?;
-        if !seen.insert(path.clone()) {
+    while let Some(pending) = worklist.pop_front() {
+        let path = canonicalize_existing(&pending.path)?;
+        if !seen.insert((path.clone(), pending.name.clone())) {
             continue;
         }
 
@@ -183,20 +194,35 @@ pub fn module_closure_with_options(
         let imports = static_imports(&module);
         let dynamic_imports = dynamic_import_edges(&module);
         let mut import_edges = Vec::with_capacity(imports.len());
+        let package_root = unit_package_root(&path, &pending.name, pending.is_package);
 
         for import in imports {
-            let resolution = import_resolver.resolve(&path, &import)?;
-            if let ImportResolution::Static(import_path) = &resolution {
+            let absolute = if import.level == 0 {
+                Some(import.module.clone())
+            } else {
+                relative_import_target(&pending.name, pending.is_package, &import)
+            };
+            let resolution = match absolute.as_deref() {
+                None => ImportResolution::Unsupported(
+                    "relative import outside a package is resolved (and refused) at runtime".to_owned(),
+                ),
+                Some(_) if import.level == 0 => import_resolver.resolve(&path, &import)?,
+                Some(absolute) => package_root
+                    .as_deref()
+                    .and_then(|root| resolve_module_under_root(root, absolute))
+                    .map_or(ImportResolution::NotFound, ImportResolution::Static),
+            };
+            if let (Some(absolute), ImportResolution::Static(import_path)) = (absolute.as_deref(), &resolution) {
                 let import_path = canonicalize_existing(import_path)?;
-                if !seen.contains(&import_path) {
-                    worklist.push_back(import_path);
-                }
+                enqueue_with_ancestor_packages(&mut worklist, &mut assigned, absolute, &import_path);
             }
             import_edges.push(ImportEdge { import, resolution });
         }
 
         units.push(CompileUnit {
             path,
+            module_name: pending.name,
+            is_package: pending.is_package,
             source,
             module,
             dynamic_sinks,
@@ -223,22 +249,24 @@ pub fn static_imports(module: &Module) -> Vec<StaticImport> {
                 let InstKind::ImportName { name, fromlist, level } = &inst.kind else {
                     continue;
                 };
-                if *level != 0 {
+                let Some(module_name) = name_string(module, *name) else {
                     continue;
-                }
+                };
+                push_import(&mut imports, &mut seen, module_name.to_owned(), *level);
 
-                if let Some(module_name) = name_string(module, *name) {
-                    push_import(&mut imports, &mut seen, module_name.to_owned());
-
-                    for member in fromlist {
-                        let Some(member_name) = name_string(module, *member) else {
-                            continue;
-                        };
-                        if member_name == "*" {
-                            continue;
-                        }
-                        push_import(&mut imports, &mut seen, format!("{module_name}.{member_name}"));
+                for member in fromlist {
+                    let Some(member_name) = name_string(module, *member) else {
+                        continue;
+                    };
+                    if member_name == "*" {
+                        continue;
                     }
+                    let candidate = if module_name.is_empty() {
+                        member_name.to_owned()
+                    } else {
+                        format!("{module_name}.{member_name}")
+                    };
+                    push_import(&mut imports, &mut seen, candidate, *level);
                 }
             }
         }
@@ -295,10 +323,101 @@ fn push_dynamic_import(edges: &mut Vec<DynamicImportEdge>, seen: &mut BTreeSet<S
     }
 }
 
-fn push_import(imports: &mut Vec<StaticImport>, seen: &mut BTreeSet<String>, module: String) {
-    if seen.insert(module.clone()) {
-        imports.push(StaticImport { module });
+fn push_import(imports: &mut Vec<StaticImport>, seen: &mut BTreeSet<(String, u32)>, module: String, level: u32) {
+    if seen.insert((module.clone(), level)) {
+        imports.push(StaticImport { module, level });
     }
+}
+
+/// A discovered-but-not-yet-lowered module in the reachability worklist.
+struct PendingUnit {
+    path: PathBuf,
+    name: String,
+    is_package: bool,
+}
+
+/// Compute the absolute dotted target of a relative import as seen from
+/// `unit_name`. `None` means the import has no statically-known parent package
+/// (entry module, top-level module, or a level walking past the top); the
+/// runtime raises the matching `ImportError` when the statement executes.
+fn relative_import_target(unit_name: &str, unit_is_package: bool, import: &StaticImport) -> Option<String> {
+    let base = if unit_is_package {
+        unit_name
+    } else {
+        unit_name.rsplit_once('.').map(|(parent, _)| parent)?
+    };
+    let mut parts = base.split('.').collect::<Vec<_>>();
+    let strip = import.level.saturating_sub(1) as usize;
+    if strip >= parts.len() {
+        return None;
+    }
+    parts.truncate(parts.len() - strip);
+    if !import.module.is_empty() {
+        parts.extend(import.module.split('.'));
+    }
+    Some(parts.join("."))
+}
+
+/// Directory against which this unit's absolute dotted imports resolve: the
+/// unit's own directory with one component removed per dotted-name component
+/// below the top-level package.
+fn unit_package_root(path: &Path, name: &str, is_package: bool) -> Option<PathBuf> {
+    let mut root = path.parent()?.to_path_buf();
+    let pops = name.matches('.').count() + usize::from(is_package);
+    for _ in 0..pops {
+        root = root.parent()?.to_path_buf();
+    }
+    Some(root)
+}
+
+/// Queue a statically resolved module plus every ancestor package
+/// `__init__.py` on the filesystem path to it: importing `a.b.c` at runtime
+/// imports `a` and `a.b` first, so the closure must embed them too.
+fn enqueue_with_ancestor_packages(
+    worklist: &mut VecDeque<PendingUnit>,
+    assigned: &mut BTreeMap<String, PathBuf>,
+    absolute: &str,
+    import_path: &Path,
+) {
+    let is_package = import_path.file_name().is_some_and(|name| name == "__init__.py");
+    enqueue_module(worklist, assigned, absolute, import_path, is_package);
+
+    let mut dir = import_path.parent();
+    if is_package {
+        dir = dir.and_then(Path::parent);
+    }
+    let mut name = absolute;
+    while let Some((parent_name, _)) = name.rsplit_once('.') {
+        let Some(parent_dir) = dir else {
+            break;
+        };
+        let init = parent_dir.join("__init__.py");
+        if init.is_file() {
+            enqueue_module(worklist, assigned, parent_name, &init, true);
+        }
+        dir = parent_dir.parent();
+        name = parent_name;
+    }
+}
+
+/// Queue one module unit unless its dotted name is already owned by an earlier
+/// resolution (first wins, mirroring ordered import roots at runtime).
+fn enqueue_module(
+    worklist: &mut VecDeque<PendingUnit>,
+    assigned: &mut BTreeMap<String, PathBuf>,
+    name: &str,
+    path: &Path,
+    is_package: bool,
+) {
+    if assigned.contains_key(name) {
+        return;
+    }
+    assigned.insert(name.to_owned(), path.to_owned());
+    worklist.push_back(PendingUnit {
+        path: path.to_owned(),
+        name: name.to_owned(),
+        is_package,
+    });
 }
 
 fn name_string(module: &Module, name: NameId) -> Option<&str> {

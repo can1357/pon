@@ -38,6 +38,16 @@ pub fn resolve(id: u32) -> Option<String> {
     interner.by_id.get(id as usize).cloned()
 }
 
+/// Snapshot of every interned name in id order (index `i` holds id `i`).
+///
+/// AoT builds replay this snapshot in the produced executable so name ids baked
+/// into object data resolve to the same strings in the fresh process interner.
+#[must_use]
+pub fn snapshot() -> Vec<String> {
+    let interner = INTERNER.lock().unwrap_or_else(|poison| poison.into_inner());
+    interner.by_id.clone()
+}
+
 /// Internable spelling for Python's addition dunder.
 pub const DUNDER_ADD: &str = "__add__";
 /// Internable spelling for Python's reflected addition dunder.

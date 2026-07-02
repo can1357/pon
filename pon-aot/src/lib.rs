@@ -29,14 +29,15 @@ pub struct BuildOptions {
 
 /// Build `entry_path` into a native executable and return the output path.
 ///
-/// Phase C WS-C1 wires the backend retarget and object/link pipeline. Whole-program
-/// reachability and dynamic-code policy are supplied by later Phase C workstreams;
-/// until then this compiles the entry module itself through the existing boxed
-/// baseline lowering and exports a zero-argument `pon_module_main` wrapper.
+/// The boxed baseline path compiles the whole static module closure: the entry
+/// module exports the zero-argument `pon_module_main` wrapper, and every other
+/// reachability unit becomes its own object file whose body the generated
+/// `pon_aot_init_modules` registrar announces to the runtime import machinery.
+/// The typed `--opt` path still compiles the entry module alone.
 pub fn build(entry_path: &Path, opts: &BuildOptions) -> anyhow::Result<PathBuf> {
-
-    let ir_module = if opts.opt {
-        typed_ir_module(entry_path, opts.allow_dynamic).context("failed to seed typed AoT IR")?
+    let (entry_module, embedded_units) = if opts.opt {
+        let module = typed_ir_module(entry_path, opts.allow_dynamic).context("failed to seed typed AoT IR")?;
+        (module, Vec::new())
     } else {
         let resolver = reachable::PathImportResolver::default();
         let reachability = reachable::module_closure_with_options(
@@ -47,17 +48,51 @@ pub fn build(entry_path: &Path, opts: &BuildOptions) -> anyhow::Result<PathBuf> 
             },
         )
         .context("failed to compute AoT reachability")?;
-        reachability
-            .units
-            .first()
-            .context("AoT reachability produced no entry module")?
-            .module
-            .clone()
+        let mut units = reachability.units.into_iter();
+        let entry_unit = units.next().context("AoT reachability produced no entry module")?;
+        (entry_unit.module, units.collect())
     };
 
-    let runtime_names = aot_runtime_name_prefix(&ir_module.names);
-
     let triple = opts.target.clone().unwrap_or_else(Triple::host);
+    let mut object_paths = vec![object_path_for(&opts.out_path)];
+    let mut embedded_specs = Vec::with_capacity(embedded_units.len());
+
+    // Embedded (non-entry) reachability units: one object file per module, each
+    // exporting a unique zero-argument body wrapper that the entry object's
+    // registrar hands to the runtime. These compile before the interner
+    // snapshot below so every name id they bake into object data is replayed
+    // by the generated initializer.
+    for (index, unit) in embedded_units.iter().enumerate() {
+        let isa = isa::build_isa(opts.target.clone());
+        let mut unit_object = object_module::new_object_module(isa, &format!("pon_unit_{index}"))?;
+        let mut unit_ctx = unit_object.make_context();
+        let mut unit_fctx = FunctionBuilderContext::new();
+        let func_ids = pon_codegen::compile_ir_module(
+            &mut unit_object,
+            &unit.module,
+            pon_codegen::CompileMode::Aot,
+            &mut unit_ctx,
+            &mut unit_fctx,
+        )
+        .with_context(|| format!("failed to compile embedded module `{}`", unit.module_name))?;
+        let body_id = func_ids
+            .get(unit.module.main.0 as usize)
+            .copied()
+            .with_context(|| format!("embedded module `{}` is missing its main function id", unit.module_name))?;
+        let symbol = format!("__pon_embedded_body_{index}");
+        entry::define_zero_arg_body_wrapper(&mut unit_object, body_id, &symbol)
+            .with_context(|| format!("failed to emit body wrapper for `{}`", unit.module_name))?;
+        let unit_object_path = unit_object_path_for(&opts.out_path, index);
+        object_module::finish_to_object_file(unit_object, &triple, &unit_object_path)
+            .with_context(|| format!("failed to emit object file {}", unit_object_path.display()))?;
+        object_paths.push(unit_object_path);
+        embedded_specs.push(entry::EmbeddedModuleSpec {
+            name: unit.module_name.clone(),
+            is_package: unit.is_package,
+            symbol,
+        });
+    }
+
     let isa = isa::build_isa(opts.target.clone());
     let mut module = object_module::new_object_module(isa, "pon_module")?;
     let mut ctx = module.make_context();
@@ -66,7 +101,7 @@ pub fn build(entry_path: &Path, opts: &BuildOptions) -> anyhow::Result<PathBuf> 
     let func_ids = if opts.opt {
         pon_codegen::compile_optimized_ir_module(
             &mut module,
-            &ir_module,
+            &entry_module,
             pon_codegen::CompileMode::Aot,
             &mut ctx,
             &mut fctx,
@@ -75,7 +110,7 @@ pub fn build(entry_path: &Path, opts: &BuildOptions) -> anyhow::Result<PathBuf> 
     } else {
         pon_codegen::compile_ir_module(
             &mut module,
-            &ir_module,
+            &entry_module,
             pon_codegen::CompileMode::Aot,
             &mut ctx,
             &mut fctx,
@@ -83,42 +118,45 @@ pub fn build(entry_path: &Path, opts: &BuildOptions) -> anyhow::Result<PathBuf> 
         .context("failed to compile AoT module body")?
     };
     let module_body_id = func_ids
-        .get(ir_module.main.0 as usize)
+        .get(entry_module.main.0 as usize)
         .copied()
         .context("AoT IR main function id missing")?;
+    // Snapshot the build-process interner only after every unit's codegen:
+    // object data bakes interned ids for names the IR name table never
+    // mentions (parameter specs, keyword-name arrays), and the executable must
+    // replay every id it embeds.
+    let runtime_names = aot_runtime_name_snapshot(&entry_module.names);
     entry::define_aot_name_initializer(&mut module, &runtime_names)
         .context("failed to emit AoT runtime name initializer")?;
 
     entry::define_module_main_wrapper(&mut module, module_body_id)
         .context("failed to emit AoT module main wrapper")?;
+    entry::define_aot_module_registrar(&mut module, &embedded_specs)
+        .context("failed to emit AoT embedded-module registrar")?;
     entry::define_main_trampoline(&mut module).context("failed to emit AoT main trampoline")?;
 
-    let object_path = object_path_for(&opts.out_path);
-    object_module::finish_to_object_file(module, &triple, &object_path)
-        .with_context(|| format!("failed to emit object file {}", object_path.display()))?;
+    object_module::finish_to_object_file(module, &triple, &object_paths[0])
+        .with_context(|| format!("failed to emit object file {}", object_paths[0].display()))?;
+    debug_assert_eq!(
+        pon_runtime::intern::snapshot().len(),
+        runtime_names.len(),
+        "interner grew after the AoT name snapshot; embedded ids would not replay"
+    );
 
     let runtime_archive = link::locate_runtime_archive()?;
-    link::link_executable(&object_path, &runtime_archive, &opts.out_path, &triple)?;
+    link::link_executable(&object_paths, &runtime_archive, &opts.out_path, &triple)?;
 
     Ok(opts.out_path.clone())
 }
 
-fn aot_runtime_name_prefix(module_names: &[String]) -> Vec<String> {
-    let max_name_id = module_names
-        .iter()
-        .map(|name| pon_runtime::intern::intern(name))
-        .max();
-
-    let Some(max_name_id) = max_name_id else {
-        return Vec::new();
-    };
-
-    (0..=max_name_id)
-        .map(|id| {
-            pon_runtime::intern::resolve(id)
-                .expect("AoT name ids interned during this build should resolve")
-        })
-        .collect()
+fn aot_runtime_name_snapshot(module_names: &[String]) -> Vec<String> {
+    // Ensure IR-referenced names hold build-process ids even when codegen never
+    // touched them, then replay the complete interner so every id baked into
+    // object data resolves identically in the produced executable.
+    for name in module_names {
+        let _ = pon_runtime::intern::intern(name);
+    }
+    pon_runtime::intern::snapshot()
 }
 
 fn typed_ir_module(entry_path: &Path, allow_dynamic: bool) -> anyhow::Result<pon_ir::Module> {
@@ -150,4 +188,8 @@ fn typed_ir_module(entry_path: &Path, allow_dynamic: bool) -> anyhow::Result<pon
 
 fn object_path_for(out_path: &Path) -> PathBuf {
     out_path.with_extension("o")
+}
+
+fn unit_object_path_for(out_path: &Path, index: usize) -> PathBuf {
+    out_path.with_extension(format!("unit{index}.o"))
 }

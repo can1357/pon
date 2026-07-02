@@ -10,6 +10,7 @@ use crate::thread_state::{pon_err_message, pon_err_occurred, pon_err_set, thread
 unsafe extern "C" {
     fn pon_module_main() -> *mut PyObject;
     fn pon_aot_init_names();
+    fn pon_aot_init_modules();
 }
 
 /// Seeds one AoT-embedded name into the runtime interner.
@@ -66,6 +67,15 @@ unsafe fn pon_aot_entry_impl(argc: i32, argv: *const *const u8) -> i32 {
         return 1;
     }
 
+    // Register AoT-embedded module bodies before runtime init so the first
+    // `import` executed by the module main already sees the full registry.
+    unsafe { pon_aot_init_modules() };
+    if pon_err_occurred() {
+        unsafe { pon_err_report_uncaught() };
+        let _ = unsafe { crate::sys::pon_io_flush_std() };
+        return 1;
+    }
+
     if unsafe { crate::abi::pon_runtime_init() } != 0 {
         unsafe { pon_err_report_uncaught() };
         let _ = unsafe { crate::sys::pon_io_flush_std() };
@@ -80,7 +90,21 @@ unsafe fn pon_aot_entry_impl(argc: i32, argv: *const *const u8) -> i32 {
         return 1;
     }
 
+    // Mirror the JIT driver (pon-cli `run_file_inner`): top-level code executes
+    // inside a `__main__` module-execution context. The globals()/compiled-slot
+    // coherence hooks (`sync_globals_dict_set`, `sync_global_store_for_active_module`)
+    // all key on `active_module_name_id()`; without this context a dict write
+    // through globals() never lands in the store compiled loads consult.
+    let main_context = crate::import::install_module("__main__", []).and_then(|_| crate::import::begin_module_execution("__main__"));
+    if let Err(message) = main_context {
+        pon_err_set(&message);
+        unsafe { pon_err_report_uncaught() };
+        let _ = unsafe { crate::sys::pon_io_flush_std() };
+        return 1;
+    }
+
     let module_result = unsafe { pon_module_main() };
+    crate::import::end_module_execution("__main__");
     let mut exit_code = if module_result.is_null() {
         if !pon_err_occurred() {
             pon_err_set("module main returned NULL without setting an exception");
@@ -160,6 +184,9 @@ mod tests {
 
     #[unsafe(no_mangle)]
     unsafe extern "C" fn pon_aot_init_names() {}
+
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn pon_aot_init_modules() {}
 
     #[test]
     fn aot_entry_invokes_zero_arg_module_main_once() {

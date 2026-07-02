@@ -102,6 +102,69 @@ pub fn register_native_modules() -> Result<(), String> {
     crate::native::register_modules()
 }
 
+/// Compiled top-level body of one AoT-embedded module.
+///
+/// Matches the zero-argument wrapper the AoT backend exports per embedded
+/// reachability unit: runs the module body and returns a non-NULL object, or
+/// NULL with the thread-state diagnostic set.
+pub type EmbeddedModuleBody = unsafe extern "C" fn() -> *mut PyObject;
+
+struct EmbeddedModule {
+    is_package: bool,
+    body: EmbeddedModuleBody,
+}
+
+/// AoT-embedded module registry keyed by fully-qualified dotted import name.
+///
+/// Populated by the generated `pon_aot_init_modules` hook before runtime
+/// initialization; consulted by `import_module_by_name` after native curated
+/// modules and the C-accelerated refusal list so an embedded file never
+/// shadows either, mirroring JIT source-import resolution order.
+static EMBEDDED_MODULES: LazyLock<Mutex<HashMap<String, EmbeddedModule>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Registers one AoT-embedded module body under its dotted import name.
+///
+/// Called from the generated `pon_aot_init_modules` hook with build-time
+/// constant data, before `pon_runtime_init`. Invalid input records a
+/// thread-state diagnostic and skips the entry, matching
+/// `pon_aot_intern_name`'s error posture.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_aot_register_module(
+    name: *const u8,
+    name_len: usize,
+    is_package: c_int,
+    body: Option<EmbeddedModuleBody>,
+) {
+    // TAG-OK: build-time constant byte pointer and function pointer, never tagged values.
+    let Some(body) = body else {
+        crate::thread_state::pon_err_set("AoT module registrar received a null body pointer");
+        return;
+    };
+    if name.is_null() {
+        crate::thread_state::pon_err_set("AoT module registrar received a null name pointer");
+        return;
+    }
+    // SAFETY: The generated registrar passes `name_len` contiguous constant bytes.
+    let bytes = unsafe { core::slice::from_raw_parts(name, name_len) };
+    let Ok(name) = std::str::from_utf8(bytes) else {
+        crate::thread_state::pon_err_set("AoT module registrar received invalid UTF-8");
+        return;
+    };
+    let mut modules = EMBEDDED_MODULES.lock().unwrap_or_else(|poison| poison.into_inner());
+    modules.insert(
+        name.to_owned(),
+        EmbeddedModule {
+            is_package: is_package != 0,
+            body,
+        },
+    );
+}
+
+fn embedded_module(name: &str) -> Option<(bool, EmbeddedModuleBody)> {
+    let modules = EMBEDDED_MODULES.lock().unwrap_or_else(|poison| poison.into_inner());
+    modules.get(name).map(|module| (module.is_package, module.body))
+}
+
 /// Imports a module by interned dotted name.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_import_name(
@@ -240,6 +303,23 @@ fn import_module_by_name(name: &str) -> Result<*mut PyObject, String> {
 
     if is_unsupported_c_accelerated(name) {
         return Err(format!("module '{name}' is C-accelerated and unsupported"));
+    }
+
+    if let Some((is_package, body)) = embedded_module(name) {
+        let module = create_module(name, is_package, [])?;
+        bind_child_to_parent(name, module);
+        begin_module_execution(name)?;
+        // SAFETY: The body is compiled top-level code registered by this
+        // process's AoT image; it follows the NULL-sentinel error contract.
+        let loaded = unsafe { body() };
+        end_module_execution(name);
+        if loaded.is_null() {
+            if pon_err_occurred() {
+                return Err(format!("embedded module '{name}' returned NULL"));
+            }
+            return Err(format!("embedded module '{name}' returned NULL without setting an exception"));
+        }
+        return Ok(module);
     }
 
     if let Some(spec) = find_source_module(name) {

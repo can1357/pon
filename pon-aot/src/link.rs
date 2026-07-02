@@ -8,21 +8,21 @@ use target_lexicon::{BinaryFormat, Triple};
 
 const RUNTIME_ARCHIVE: &str = "libpon_runtime.a";
 
-/// Link a Cranelift object file with the Pon runtime static archive.
-pub fn link_executable(obj: &Path, runtime_a: &Path, out: &Path, triple: &Triple) -> anyhow::Result<()> {
+/// Link Cranelift object files with the Pon runtime static archive.
+pub fn link_executable(objects: &[PathBuf], runtime_a: &Path, out: &Path, triple: &Triple) -> anyhow::Result<()> {
     if let Some(parent) = out.parent().filter(|parent| !parent.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_owned());
     let mut command = Command::new(&cc);
-    command.arg(obj).arg(runtime_a).arg("-o").arg(out);
+    command.args(objects).arg(runtime_a).arg("-o").arg(out);
 
     if triple.binary_format == BinaryFormat::Elf {
         command.args(["-lpthread", "-ldl", "-lm"]);
     }
 
-    let rendered = render_command(&cc, obj, runtime_a, out, triple);
+    let rendered = render_command(&cc, objects, runtime_a, out, triple);
     let output = command
         .output()
         .with_context(|| format!("failed to invoke linker: {rendered}"))?;
@@ -90,14 +90,14 @@ fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
 }
 
-fn render_command(cc: &str, obj: &Path, runtime_a: &Path, out: &Path, triple: &Triple) -> String {
-    let mut parts = vec![
-        cc.to_owned(),
-        obj.display().to_string(),
+fn render_command(cc: &str, objects: &[PathBuf], runtime_a: &Path, out: &Path, triple: &Triple) -> String {
+    let mut parts = vec![cc.to_owned()];
+    parts.extend(objects.iter().map(|obj| obj.display().to_string()));
+    parts.extend([
         runtime_a.display().to_string(),
         "-o".to_owned(),
         out.display().to_string(),
-    ];
+    ]);
     if triple.binary_format == BinaryFormat::Elf {
         parts.extend(["-lpthread".to_owned(), "-ldl".to_owned(), "-lm".to_owned()]);
     }
