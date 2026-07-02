@@ -103,7 +103,9 @@ unsafe fn construct_two(real_object: *mut PyObject, imag_object: *mut PyObject) 
     let Some((imag_real, imag_imag)) = (unsafe { object_to_complex_parts(imag_object) }) else {
         return raise_type_error("complex() second argument must be a real number");
     };
-    from_f64s(real_real - imag_imag, real_imag + imag_real)
+    let imag = real_imag + imag_real;
+    let imag = if imag == 0.0 && real_imag == 0.0 { imag_real } else { imag };
+    from_f64s(real_real - imag_imag, imag)
 }
 
 unsafe fn object_to_complex_parts(object: *mut PyObject) -> Option<(f64, f64)> {

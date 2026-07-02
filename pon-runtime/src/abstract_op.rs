@@ -145,23 +145,8 @@ pub unsafe fn unary_op(op: u8, operand: *mut PyObject) -> *mut PyObject {
 /// other objects use `tp_richcmp` with the same reflected-subtype ordering shape
 /// as binary operations, swapping the comparison op for the right-hand call.
 pub unsafe fn rich_compare(op: u8, a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
-    if unsafe { is_exact_pylong(a) && is_exact_pylong(b) } {
-        let Some(left) = (unsafe { crate::types::int::to_bigint(a) }) else {
-            return raise_type_error("left int operand is invalid");
-        };
-        let Some(right) = (unsafe { crate::types::int::to_bigint(b) }) else {
-            return raise_type_error("right int operand is invalid");
-        };
-        let result = match op {
-            RICH_LT => left < right,
-            RICH_LE => left <= right,
-            RICH_EQ => left == right,
-            RICH_NE => left != right,
-            RICH_GT => left > right,
-            RICH_GE => left >= right,
-            _ => return raise_type_error("unknown rich comparison operation"),
-        };
-        return unsafe { abi::pon_const_int(if result { 1 } else { 0 }) };
+    if let Some(result) = unsafe { rich_compare_numeric(op, a, b) } {
+        return result;
     }
 
     let Some(left_type) = (unsafe { object_type(a) }) else {
@@ -256,6 +241,134 @@ pub unsafe fn rich_compare(op: u8, a: *mut PyObject, b: *mut PyObject) -> *mut P
             let message = unsafe { rich_unsupported_message(op, a, b) };
             raise_type_error(&message)
         }
+    }
+}
+
+enum RichNumericValue {
+    Int(num_bigint::BigInt),
+    Float(f64),
+    Complex(f64, f64),
+}
+
+unsafe fn rich_compare_numeric(op: u8, a: *mut PyObject, b: *mut PyObject) -> Option<*mut PyObject> {
+    let left = unsafe { rich_numeric_value(a)? };
+    let right = unsafe { rich_numeric_value(b)? };
+    Some(match (left, right) {
+        (RichNumericValue::Complex(left_real, left_imag), RichNumericValue::Complex(right_real, right_imag)) => {
+            rich_compare_complex(op, left_real, left_imag, right_real, right_imag)
+        }
+        (RichNumericValue::Complex(real, imag), other) => rich_compare_complex_to_real(op, real, imag, other),
+        (other, RichNumericValue::Complex(real, imag)) => {
+            rich_compare_complex_to_real(swapped_rich_op(op), real, imag, other)
+        }
+        (RichNumericValue::Int(left), RichNumericValue::Int(right)) => rich_compare_ordering(op, left.cmp(&right)),
+        (RichNumericValue::Int(left), RichNumericValue::Float(right)) => rich_compare_int_float(op, &left, right),
+        (RichNumericValue::Float(left), RichNumericValue::Int(right)) => {
+            rich_compare_int_float(swapped_rich_op(op), &right, left)
+        }
+        (RichNumericValue::Float(left), RichNumericValue::Float(right)) => rich_compare_floats(op, left, right),
+    })
+}
+
+unsafe fn rich_numeric_value(object: *mut PyObject) -> Option<RichNumericValue> {
+    if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(object) } {
+        return Some(RichNumericValue::Int(value));
+    }
+    if let Some(value) = unsafe { crate::types::float::to_f64(object) } {
+        return Some(RichNumericValue::Float(value));
+    }
+    unsafe { crate::types::complex_::to_f64s(object).map(|(real, imag)| RichNumericValue::Complex(real, imag)) }
+}
+
+fn rich_compare_complex_to_real(op: u8, real: f64, imag: f64, other: RichNumericValue) -> *mut PyObject {
+    match op {
+        RICH_EQ | RICH_NE => {
+            let real_equal = match other {
+                RichNumericValue::Int(value) => compare_int_float(&value, real).is_some_and(core::cmp::Ordering::is_eq),
+                RichNumericValue::Float(value) => real == value,
+                RichNumericValue::Complex(_, _) => false,
+            };
+            let equal = imag == 0.0 && real_equal;
+            unsafe { abi::pon_const_int(i64::from(if op == RICH_EQ { equal } else { !equal })) }
+        }
+        _ => raise_type_error("complex numbers are not orderable"),
+    }
+}
+
+fn rich_compare_complex(op: u8, left_real: f64, left_imag: f64, right_real: f64, right_imag: f64) -> *mut PyObject {
+    match op {
+        RICH_EQ | RICH_NE => {
+            let equal = left_real == right_real && left_imag == right_imag;
+            unsafe { abi::pon_const_int(i64::from(if op == RICH_EQ { equal } else { !equal })) }
+        }
+        _ => raise_type_error("complex numbers are not orderable"),
+    }
+}
+
+fn rich_compare_floats(op: u8, left: f64, right: f64) -> *mut PyObject {
+    let result = match op {
+        RICH_EQ => left == right,
+        RICH_NE => left != right,
+        RICH_LT => left < right,
+        RICH_LE => left <= right,
+        RICH_GT => left > right,
+        RICH_GE => left >= right,
+        _ => return raise_type_error("unknown rich comparison operation"),
+    };
+    unsafe { abi::pon_const_int(i64::from(result)) }
+}
+
+fn rich_compare_int_float(op: u8, integer: &num_bigint::BigInt, float: f64) -> *mut PyObject {
+    if float.is_nan() {
+        let result = op == RICH_NE;
+        return unsafe { abi::pon_const_int(i64::from(result)) };
+    }
+    let Some(ordering) = compare_int_float(integer, float) else {
+        return raise_type_error("unknown rich comparison operation");
+    };
+    rich_compare_ordering(op, ordering)
+}
+
+fn rich_compare_ordering(op: u8, ordering: core::cmp::Ordering) -> *mut PyObject {
+    let result = match op {
+        RICH_EQ => ordering.is_eq(),
+        RICH_NE => !ordering.is_eq(),
+        RICH_LT => ordering.is_lt(),
+        RICH_LE => !ordering.is_gt(),
+        RICH_GT => ordering.is_gt(),
+        RICH_GE => !ordering.is_lt(),
+        _ => return raise_type_error("unknown rich comparison operation"),
+    };
+    unsafe { abi::pon_const_int(i64::from(result)) }
+}
+
+fn compare_int_float(integer: &num_bigint::BigInt, float: f64) -> Option<core::cmp::Ordering> {
+    if float.is_nan() {
+        return None;
+    }
+    if float == f64::INFINITY {
+        return Some(core::cmp::Ordering::Less);
+    }
+    if float == f64::NEG_INFINITY {
+        return Some(core::cmp::Ordering::Greater);
+    }
+    let bits = float.to_bits();
+    let negative = bits >> 63 != 0;
+    let exp_bits = ((bits >> 52) & 0x7ff) as i32;
+    let frac = bits & ((1_u64 << 52) - 1);
+    let (mantissa, exponent) = if exp_bits == 0 {
+        (frac, 1 - 1023 - 52)
+    } else {
+        ((1_u64 << 52) | frac, exp_bits - 1023 - 52)
+    };
+    let mut numerator = num_bigint::BigInt::from(mantissa);
+    if negative {
+        numerator = -numerator;
+    }
+    if exponent >= 0 {
+        Some(integer.cmp(&(numerator << exponent as usize)))
+    } else {
+        Some((integer << (-exponent) as usize).cmp(&numerator))
     }
 }
 
