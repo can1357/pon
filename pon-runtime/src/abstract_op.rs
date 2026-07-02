@@ -521,6 +521,10 @@ pub unsafe fn subscript_get(object: *mut PyObject, key: *mut PyObject) -> *mut P
         return alias;
     }
 
+    if let Some(alias) = unsafe { builtin_type_generic_alias(object, key) } {
+        return alias;
+    }
+
     raise_type_error("object is not subscriptable")
 }
 
@@ -584,6 +588,24 @@ unsafe fn builtin_constructor_generic_alias(object: *mut PyObject, key: *mut PyO
     let function = unsafe { &*object.cast::<crate::object::PyFunction>() };
     let name = crate::intern::resolve(function.name_interned)?;
     if !crate::types::typealias::is_subscriptable_builtin_constructor(&name) {
+        return None;
+    }
+    let key_is_tuple = unsafe { object_type(key) }.is_some_and(|key_ty| unsafe { (*key_ty).name() } == "tuple");
+    let args = if key_is_tuple {
+        unsafe { (&*key.cast::<crate::types::tuple::PyTuple>()).as_slice() }.to_vec()
+    } else {
+        vec![key]
+    };
+    Some(crate::types::typealias::new_generic_alias(object, args))
+}
+
+unsafe fn builtin_type_generic_alias(object: *mut PyObject, key: *mut PyObject) -> Option<*mut PyObject> {
+    let ty = unsafe { object_type(object)? };
+    if unsafe { (*ty).name() } != "type" {
+        return None;
+    }
+    let name = unsafe { (*object.cast::<PyType>()).name() };
+    if !crate::types::typealias::is_subscriptable_builtin_constructor(name) {
         return None;
     }
     let key_is_tuple = unsafe { object_type(key) }.is_some_and(|key_ty| unsafe { (*key_ty).name() } == "tuple");

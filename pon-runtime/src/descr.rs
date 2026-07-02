@@ -10,7 +10,7 @@ use crate::mro;
 use crate::object::{PyObject, PyType, update_slot_from_dunder};
 use crate::sync;
 use crate::thread_state::pon_err_set;
-use crate::types::{dict, type_::{self, PyClassDict, PyHeapInstance}};
+use crate::types::{dict, type_::{self, PyClassDict, PyHeapInstance}, typealias};
 
 fn raise_attr_error(message: impl Into<String>) -> *mut PyObject {
     pon_err_set(message);
@@ -667,6 +667,14 @@ pub unsafe fn issubclass(cls: *mut PyObject, base: *mut PyObject) -> c_int {
 
 /// Core hook for `isinstance(obj, cls)`.
 pub unsafe fn isinstance(obj: *mut PyObject, cls: *mut PyObject) -> c_int {
+    if typealias::is_union_type(cls) {
+        for arg in typealias::union_args(cls) {
+            if unsafe { isinstance(obj, *arg) } > 0 {
+                return 1;
+            }
+        }
+        return 0;
+    }
     if obj.is_null() || cls.is_null() || unsafe { !is_type_object(cls) } {
         return raise_attr_status("isinstance() arg 2 must be a class");
     }

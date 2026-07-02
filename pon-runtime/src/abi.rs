@@ -52,7 +52,7 @@ use crate::object::{
     NewFunc, PyCodeFn, PyFunction, PyLong, PyNone, PyObject, PyObjectHeader, PyType, PyUnicode, TIER_STATE_DEFERRED,
     TIER_STATE_DISABLED, TIER_STATE_QUEUED, TIER_STATE_TIER0, TIER_STATE_TIER1, as_object_ptr, is_exact_type,
 };
-use crate::types::{bool_, bytearray_, bytes_, classmethod, complex_, float, function, int, memoryview, type_};
+use crate::types::{bool_, bytearray_, bytes_, classmethod, complex_, float, function, int, memoryview, type_, typealias};
 use crate::types::exc::{ExceptionTypeSet, PyBaseException, is_exception_subclass, trace_base_exception, trace_exception_group};
 use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set, thread_state_lock};
 
@@ -1800,6 +1800,12 @@ fn register_builtin_type_globals(runtime: &mut Runtime) {
         return;
     };
     unsafe {
+        typealias::install_type_or_slots(runtime._type_type);
+        let union_type = typealias::union_type();
+        (*union_type).ob_base.ob_type = runtime._type_type;
+        if (*union_type).tp_base.is_null() {
+            (*union_type).tp_base = object_type;
+        }
         install_builtin_type(runtime, "object", object_type, Some(builtin_object_new), object_type);
         install_builtin_type(runtime, "type", runtime._type_type, Some(builtin_type_new), object_type);
         install_builtin_type(runtime, "int", runtime.long_type, Some(builtin_int_new), object_type);

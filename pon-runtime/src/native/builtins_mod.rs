@@ -936,6 +936,8 @@ pub unsafe extern "C" fn builtin_hash(argv: *mut *mut PyObject, argc: usize) -> 
         crate::types::float::hash_f64(float.value) as i64
     } else if let Some((real, imag)) = unsafe { crate::types::complex_::to_f64s(args[0]) } {
         crate::types::complex_::hash_complex(real, imag) as i64
+    } else if crate::types::typealias::is_union_type(args[0]) {
+        crate::types::typealias::union_hash(args[0]) as i64
     } else {
         stable_hash(&repr_text(args[0]))
     };
@@ -1392,6 +1394,9 @@ pub fn repr_text(object: *mut PyObject) -> String {
     }
     if crate::types::typealias::is_generic_alias(object) {
         return crate::types::typealias::generic_alias_repr(object);
+    }
+    if crate::types::typealias::is_union_type(object) {
+        return crate::types::typealias::union_repr(object);
     }
     unsafe {
         if let Some(native) = as_native(object) {
@@ -1901,6 +1906,12 @@ unsafe fn object_is_instance(object: *mut PyObject, classinfo: *mut PyObject) ->
     if object.is_null() || classinfo.is_null() {
         return false;
     }
+    if crate::types::typealias::is_union_type(classinfo) {
+        return crate::types::typealias::union_args(classinfo)
+            .iter()
+            .copied()
+            .any(|arg| unsafe { object_is_instance(object, arg) });
+    }
     let classinfo_type = unsafe { (*classinfo).ob_type };
     if !classinfo_type.is_null() && unsafe { (*classinfo_type).name() } == "type" {
         return unsafe { crate::descr::isinstance(object, classinfo) > 0 };
@@ -2025,5 +2036,20 @@ mod tests {
         let stopped = unsafe { builtin_next(default_args.as_mut_ptr(), default_args.len()) };
         assert_eq!(stopped, default);
         assert!(!crate::thread_state::pon_err_occurred());
+    }
+
+    #[test]
+    fn object_placeholder_exposes_bound_str_method() {
+        let _guard = test_state_lock();
+        init_runtime();
+        let mut args = [];
+        let object = unsafe { builtin_object(args.as_mut_ptr(), args.len()) };
+        assert!(!object.is_null());
+        let method = unsafe { abi::pon_get_attr(object, intern("__str__"), ptr::null_mut()) };
+        assert!(!method.is_null());
+        assert_eq!(unsafe { type_name(method) }, Some("method"));
+        let text = unsafe { abi::pon_call(method, ptr::null_mut(), 0) };
+        assert!(!text.is_null());
+        assert_eq!(object_to_string(text).as_deref(), Some("<object object>"));
     }
 }
