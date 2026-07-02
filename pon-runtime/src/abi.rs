@@ -14,6 +14,7 @@ pub use exc::{
     pon_raise_index_error, pon_raise_key_error, pon_raise_stop_iteration, pon_raise_type_error, pon_raise_value_error,
     pon_reraise, raise_import_error_text,
 };
+pub mod format;
 pub mod r#gen;
 pub mod import;
 pub mod iter;
@@ -33,6 +34,7 @@ pub use crate::thread::{
 pub use crate::sys::{pon_io_flush_std, pon_sys_set_argv};
 
 use std::cell::RefCell;
+use std::ffi::c_void;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::mem;
@@ -48,10 +50,10 @@ use crate::intern::resolve;
 use crate::feedback::{FeedbackCell, FeedbackVec, GlobalIC, TypeTag};
 use crate::object::{
     PyCodeFn, PyFunction, PyLong, PyNone, PyObject, PyObjectHeader, PyType, PyUnicode, TIER_STATE_DEFERRED,
-    TIER_STATE_QUEUED, TIER_STATE_TIER0, as_object_ptr, is_exact_type,
+    TIER_STATE_DISABLED, TIER_STATE_QUEUED, TIER_STATE_TIER0, TIER_STATE_TIER1, as_object_ptr, is_exact_type,
 };
 use crate::types::{bool_, float, function, int, type_};
-use crate::types::exc::{ExceptionTypeSet, PyBaseException, is_exception_subclass, trace_base_exception};
+use crate::types::exc::{ExceptionTypeSet, PyBaseException, is_exception_subclass, trace_base_exception, trace_exception_group};
 use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set, thread_state_lock};
 
 const TYPE_ID_TYPE: TypeId = TypeId(1);
@@ -68,9 +70,22 @@ pub const TIER1_LOOP_THRESHOLD: u32 = 10_000;
 
 /// Runtime-to-tier-up backend hook.  The concrete installer lives outside
 /// `pon-runtime`; the runtime calls through this pointer only after CAS-queuing.
-pub type TierUpHook = unsafe extern "C" fn(*mut PyFunction);
+///
+/// `reason == 0` means function-entry heat; `reason > 0` means a loop back-edge
+/// crossed the threshold and names IR block `reason - 1` as the OSR header.
+pub type TierUpHook = unsafe extern "C" fn(*mut PyFunction, u32);
+
+/// Visitor used by the tier-up root hook to publish pinned function objects to GC.
+pub type TierUpRootVisit = unsafe extern "C" fn(*mut u8, *mut c_void);
+/// Optional root provider installed by the JIT while a tier-up driver is active.
+pub type TierUpRootHook = unsafe extern "C" fn(TierUpRootVisit, *mut c_void);
 
 static TIERUP_HOOK: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+static TIERUP_ROOT_HOOK: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+
+const DEOPT_THRASH_THRESHOLD: u32 = 64;
+const DEOPT_BACKOFF_MAX_SHIFT: u32 = 6;
+const DEOPT_PIN_EPOCH: u8 = 8;
 
 #[derive(Clone, Copy)]
 struct CurrentCall {
@@ -133,7 +148,9 @@ const TYPE_ID_LONG: TypeId = TypeId(2);
 const TYPE_ID_UNICODE: TypeId = TypeId(3);
 const TYPE_ID_FUNCTION: TypeId = TypeId(4);
 const TYPE_ID_NONE: TypeId = TypeId(5);
+const TYPE_ID_NOT_IMPLEMENTED: TypeId = TypeId(7);
 const TYPE_ID_EXCEPTION: TypeId = TypeId(6);
+pub(crate) const TYPE_ID_EXCEPTION_GROUP: TypeId = TypeId(8);
 
 /// Compiled function metadata shared across Phase-B call, frame, and tier-up helpers.
 ///
@@ -252,20 +269,22 @@ pub struct FStrPartRaw {
     pub format_spec: *mut PyObject,
 }
 
-/// Raw template-string part consumed by the future string helper family.
+/// Raw template-string part consumed by the string helper family.
 ///
-/// This mirrors [`FStrPartRaw`] while preserving an interned expression name for
-/// template interpolation objects.
+/// For interpolation parts, `literal`/`literal_len` carry the UTF-8 source
+/// spelling of the expression.  `expression_interned` remains available for
+/// future intern-table producers and is zero for baseline codegen.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TStrPartRaw {
     /// Interpolated value, or NULL when this part is a literal.
     pub value: *mut PyObject,
-    /// UTF-8 literal bytes for literal parts, or NULL for value parts.
+    /// UTF-8 literal bytes for raw literal parts; for interpolation parts this
+    /// is the source spelling stored on `Interpolation.expression`.
     pub literal: *const u8,
     /// Byte length of `literal`.
     pub literal_len: usize,
-    /// Interned interpolation expression/name, or `0` when absent.
+    /// Interned interpolation expression/name fallback, or `0` when absent.
     pub expression_interned: u32,
     /// Conversion marker (`0`, `b's'`, `b'r'`, or `b'a'`).
     pub conversion: u8,
@@ -351,6 +370,15 @@ const PARAMS_OBJ_OBJ_FEEDBACK: &[AbiTy] = &[AbiTy::PyObjectPtr, AbiTy::PyObjectP
 const PARAMS_CALL: &[AbiTy] = &[AbiTy::PyObjectPtr, AbiTy::PyObjectPtrPtr, AbiTy::Usize];
 const PARAMS_LOAD_BUILD_CLASS: &[AbiTy] = &[];
 const PARAMS_BUILD_CLASS: &[AbiTy] = &[AbiTy::PyObjectPtr, AbiTy::U32, AbiTy::PyObjectPtrPtr, AbiTy::Usize];
+const PARAMS_BUILD_CLASS_EX: &[AbiTy] = &[
+    AbiTy::PyObjectPtr,
+    AbiTy::U32,
+    AbiTy::PyObjectPtrPtr,
+    AbiTy::Usize,
+    AbiTy::ConstU32Ptr,
+    AbiTy::PyObjectPtrPtr,
+    AbiTy::Usize,
+];
 const PARAMS_LOAD_GLOBAL: &[AbiTy] = &[AbiTy::U32, AbiTy::FeedbackCellPtr];
 const PARAMS_LOAD_BUILTIN: &[AbiTy] = &[AbiTy::U32];
 const PARAMS_LOAD_NAME: &[AbiTy] = &[AbiTy::U32];
@@ -423,6 +451,8 @@ const PARAMS_MAKE_GENERATOR: &[AbiTy] = &[AbiTy::GenResumePtr, AbiTy::PyFramePtr
 const PARAMS_FUNCTION_SET_ANNOTATE: &[AbiTy] = &[AbiTy::PyObjectPtr, AbiTy::PyObjectPtr];
 const PARAMS_MAKE_TYPE_ALIAS: &[AbiTy] = &[AbiTy::U32, AbiTy::PyObjectPtr];
 const PARAMS_MAKE_TYPEVAR: &[AbiTy] = &[AbiTy::U32];
+const PARAMS_OSR_POLL: &[AbiTy] = &[AbiTy::U32];
+const PARAMS_DEOPT_NOTE: &[AbiTy] = &[AbiTy::PyObjectPtr];
 
 /// Exported helper table consumed by later codegen/JIT stages.
 pub static HELPERS: &[HelperDecl] = &[
@@ -1356,6 +1386,78 @@ pub static HELPERS: &[HelperDecl] = &[
         params: PARAMS_MAKE_TYPEVAR,
         ret: AbiTy::PyObjectPtr,
     },
+    HelperDecl {
+        symbol: "pon_osr_poll",
+        address: pon_osr_poll as *const (),
+        params: PARAMS_OSR_POLL,
+        ret: AbiTy::CodePtr,
+    },
+    HelperDecl {
+        symbol: "pon_deopt_note",
+        address: pon_deopt_note as *const (),
+        params: PARAMS_DEOPT_NOTE,
+        ret: AbiTy::I32,
+    },
+    HelperDecl {
+        symbol: "pon_load_local",
+        address: pon_load_local as *const (),
+        params: PARAMS_OBJ,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_delete_local",
+        address: pon_delete_local as *const (),
+        params: PARAMS_OBJ,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_delete_global",
+        address: pon_delete_global as *const (),
+        params: PARAMS_LOAD_BUILTIN,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_delete_name",
+        address: pon_delete_name as *const (),
+        params: PARAMS_LOAD_BUILTIN,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_build_class_ex",
+        address: pon_build_class_ex as *const (),
+        params: PARAMS_BUILD_CLASS_EX,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_exc_star_enter",
+        address: exc::pon_exc_star_enter as *const (),
+        params: PARAMS_NONE,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_exc_star_match",
+        address: exc::pon_exc_star_match as *const (),
+        params: PARAMS_OBJ,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_exc_star_body_ok",
+        address: exc::pon_exc_star_body_ok as *const (),
+        params: PARAMS_NONE,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_exc_star_body_raised",
+        address: exc::pon_exc_star_body_raised as *const (),
+        params: PARAMS_NONE,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
+        symbol: "pon_exc_star_finish",
+        address: exc::pon_exc_star_finish as *const (),
+        params: PARAMS_NONE,
+        ret: AbiTy::PyObjectPtr,
+    },
 ];
 
 struct Runtime {
@@ -1365,8 +1467,10 @@ struct Runtime {
     unicode_type: *mut PyType,
     function_type: *mut PyType,
     none_type: *mut PyType,
+    not_implemented_type: *mut PyType,
     exception_types: ExceptionTypeSet,
     none: *mut PyNone,
+    not_implemented: *mut PyNone,
     globals: HashMap<u32, *mut PyObject>,
     class_namespace_stack: Vec<*mut type_::PyClassDict>,
 }
@@ -1387,6 +1491,37 @@ fn with_runtime<T>(f: impl FnOnce(&mut Runtime) -> T) -> Option<T> {
 /// Returns whether `pon_runtime_init` has completed in this process.
 pub(crate) fn runtime_is_initialized() -> bool {
     runtime_lock().is_some()
+}
+
+pub(crate) fn runtime_type_type() -> *mut PyType {
+    with_runtime(|runtime| runtime._type_type).unwrap_or(ptr::null_mut())
+}
+
+pub(crate) fn alloc_heap_instance(
+    cls: *mut PyType,
+    dict: *mut type_::PyClassDict,
+    slots: Vec<type_::PySlotValue>,
+) -> Result<*mut PyObject, String> {
+    with_runtime(|runtime| {
+        let object = runtime
+            .heap
+            .alloc(mem::size_of::<type_::PyHeapInstance>(), type_::TYPE_ID_HEAP_INSTANCE)
+            .cast::<type_::PyHeapInstance>();
+        unsafe {
+            ptr::write(
+                object,
+                type_::PyHeapInstance {
+                    ob_base: PyObjectHeader::new(cls),
+                    dict,
+                    slots,
+                    weakrefs: ptr::null_mut(),
+                    finalized: false,
+                },
+            );
+        }
+        Ok(as_object_ptr(object))
+    })
+    .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
 }
 
 fn init_runtime() -> Result<(), String> {
@@ -1413,6 +1548,11 @@ fn init_runtime() -> Result<(), String> {
             function_type.tp_getattro = Some(function::function_getattro);
             let function_type = Box::into_raw(function_type);
             let none_type = Box::into_raw(Box::new(PyType::new(type_type, "NoneType", mem::size_of::<PyNone>())));
+            let not_implemented_type = Box::into_raw(Box::new(PyType::new(
+                type_type,
+                "NotImplementedType",
+                mem::size_of::<PyNone>(),
+            )));
             let exception_types = ExceptionTypeSet::new(type_type);
 
             // SAFETY: The leaked type object remains valid for the process lifetime.
@@ -1430,6 +1570,17 @@ fn init_runtime() -> Result<(), String> {
                     },
                 );
             }
+            let not_implemented = heap.alloc(mem::size_of::<PyNone>(), TYPE_ID_NOT_IMPLEMENTED).cast::<PyNone>();
+            // SAFETY: `not_implemented` points to a freshly allocated zeroed block of the right size.
+            unsafe {
+                ptr::write(
+                    not_implemented,
+                    PyNone {
+                        ob_base: PyObjectHeader::new(not_implemented_type),
+                    },
+                );
+            }
+
 
             let mut runtime = Runtime {
                 heap,
@@ -1438,8 +1589,10 @@ fn init_runtime() -> Result<(), String> {
                 unicode_type,
                 function_type,
                 none_type,
+                not_implemented_type,
                 exception_types,
                 none,
+                not_implemented,
                 globals: HashMap::new(),
                 class_namespace_stack: Vec::new(),
             };
@@ -1498,11 +1651,43 @@ fn register_gc_types(heap: &Heap) {
         },
     );
     heap.register_type(
+        TYPE_ID_NOT_IMPLEMENTED,
+        GcTypeInfo {
+            size: mem::size_of::<PyNone>(),
+            trace: trace_no_refs,
+            finalize: None,
+        },
+    );
+    heap.register_type(
         TYPE_ID_EXCEPTION,
         GcTypeInfo {
             size: mem::size_of::<PyBaseException>(),
             trace: trace_base_exception,
             finalize: None,
+        },
+    );
+    heap.register_type(
+        TYPE_ID_EXCEPTION_GROUP,
+        GcTypeInfo {
+            size: mem::size_of::<crate::types::exc::PyExceptionGroup>(),
+            trace: trace_exception_group,
+            finalize: None,
+        },
+    );
+    heap.register_type(
+        type_::TYPE_ID_HEAP_INSTANCE,
+        GcTypeInfo {
+            size: mem::size_of::<type_::PyHeapInstance>(),
+            trace: crate::types::weakref::trace_heap_instance,
+            finalize: Some(crate::types::weakref::finalize_heap_instance),
+        },
+    );
+    heap.register_type(
+        crate::types::weakref::TYPE_ID_WEAKREF,
+        GcTypeInfo {
+            size: mem::size_of::<crate::types::weakref::PyWeakRef>(),
+            trace: crate::types::weakref::trace_weakref,
+            finalize: Some(crate::types::weakref::finalize_weakref),
         },
     );
 }
@@ -1535,6 +1720,7 @@ unsafe extern "C" fn finalize_function(object: *mut u8) {
         return;
     }
 
+    crate::types::weakref::clear_weakrefs(object.cast::<PyObject>());
     let function = object.cast::<PyFunction>();
     function::unregister_function_record(function.cast::<PyObject>());
     // SAFETY: The GC calls this only for unreachable PyFunction allocations, so
@@ -1552,6 +1738,9 @@ fn register_builtins(runtime: &mut Runtime) -> Result<(), String> {
             runtime.globals.insert(name, function);
         }
     });
+    runtime
+        .globals
+        .insert(crate::intern::intern("NotImplemented"), as_object_ptr(runtime.not_implemented));
     register_exception_builtins(runtime);
     if runtime.globals.contains_key(&runtime_builtins::print_name_interned()) && runtime.globals.contains_key(&crate::intern::intern("ValueError")) {
         Ok(())
@@ -1765,6 +1954,7 @@ pub unsafe extern "C" fn pon_const_str(ptr: *const u8, len: usize) -> *mut PyObj
 /// Adds two boxed Phase-A integers through the Phase-B binary dispatcher.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_binary_add(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(a, b);
     unsafe { number::pon_binary_op(crate::abstract_op::BINARY_ADD, a, b, ptr::null_mut()) }
 }
 
@@ -1776,11 +1966,13 @@ enum CallTarget {
     },
     Type,
     Method,
+    Slot(crate::object::CallFunc),
 }
 
 /// Calls a boxed callable, including native builtins, heap types, and bound methods.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_call(callee: *mut PyObject, argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    crate::untag_prelude!(callee);
     catch_object_helper(|| {
         if let Err(message) = ensure_runtime_initialized() {
             return return_null_with_error(message);
@@ -1802,6 +1994,8 @@ pub unsafe extern "C" fn pon_call(callee: *mut PyObject, argv: *mut *mut PyObjec
                 Ok(CallTarget::Type)
             } else if object_type_name(callee).as_deref() == Some("method") {
                 Ok(CallTarget::Method)
+            } else if !callee.is_null() && !(*callee).ob_type.is_null() && (*(*callee).ob_type).tp_call.is_some() {
+                Ok(CallTarget::Slot((*(*callee).ob_type).tp_call.expect("checked Some")))
             } else {
                 Err("callee is not callable".to_owned())
             }
@@ -1829,6 +2023,7 @@ pub unsafe extern "C" fn pon_call(callee: *mut PyObject, argv: *mut *mut PyObjec
             }
             CallTarget::Type => unsafe { call_type_from_argv(callee, argv, argc) },
             CallTarget::Method => unsafe { call_method_from_argv(callee, argv, argc) },
+            CallTarget::Slot(call) => unsafe { call_slot_from_argv(callee, call, argv, argc) },
         }
     })
 }
@@ -1966,7 +2161,15 @@ fn bump_saturating(counter: &std::sync::atomic::AtomicU32) -> u32 {
     previous.saturating_add(1)
 }
 
-fn maybe_queue_tierup(function: *mut PyFunction) {
+fn backoff_shift(function: &PyFunction) -> u32 {
+    u32::from(function.tier_epoch.load(Ordering::Acquire)).min(DEOPT_BACKOFF_MAX_SHIFT)
+}
+
+fn backed_off_threshold(base: u32, function: &PyFunction) -> u32 {
+    base.saturating_mul(1_u32 << backoff_shift(function))
+}
+
+fn maybe_queue_tierup(function: *mut PyFunction, reason: u32) {
     if function.is_null() {
         return;
     }
@@ -1975,7 +2178,7 @@ fn maybe_queue_tierup(function: *mut PyFunction) {
         return;
     }
     // SAFETY: `function` is a live PyFunction while a runtime call/backedge is
-    // executing.  The CAS ensures one transition into the queued state.
+    // executing. The CAS ensures one transition into the queued state.
     let queued = unsafe {
         let function_ref = &*function;
         match function_ref.tier_state.load(Ordering::Acquire) {
@@ -1984,8 +2187,10 @@ fn maybe_queue_tierup(function: *mut PyFunction) {
                 .compare_exchange(TIER_STATE_TIER0, TIER_STATE_QUEUED, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok(),
             TIER_STATE_DEFERRED
-                if function_ref.hotness.load(Ordering::Acquire) >= TIER1_DEFERRED_CALL_THRESHOLD
-                    || function_ref.loop_hotness.load(Ordering::Acquire) >= TIER1_LOOP_THRESHOLD =>
+                if function_ref.hotness.load(Ordering::Acquire)
+                    >= backed_off_threshold(TIER1_DEFERRED_CALL_THRESHOLD, function_ref)
+                    || function_ref.loop_hotness.load(Ordering::Acquire)
+                        >= backed_off_threshold(TIER1_LOOP_THRESHOLD, function_ref) =>
             {
                 function_ref
                     .tier_state
@@ -1999,20 +2204,29 @@ fn maybe_queue_tierup(function: *mut PyFunction) {
         // SAFETY: The hook is installed through `pon_tierup_set_hook` with the
         // `TierUpHook` ABI contract.
         let hook: TierUpHook = unsafe { mem::transmute(hook) };
-        unsafe { hook(function) };
+        unsafe { hook(function, reason) };
     }
 }
 
 /// Installs or clears the runtime-to-tier-up hook.
 ///
-/// Passing NULL clears the hook.  Non-NULL values must point at a `TierUpHook`
+/// Passing NULL clears the hook. Non-NULL values must point at a `TierUpHook`
 /// function; `pon-runtime` keeps the pointer opaque to avoid depending on JIT.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_tierup_set_hook(hook: *mut ()) {
     TIERUP_HOOK.store(hook, Ordering::Release);
 }
 
-/// Function-entry tier-up probe.  Bumps hotness and queues tier-up once hot.
+/// Installs or clears the tier-up pin-root provider.
+///
+/// Passing NULL clears the hook. Non-NULL values must point at a
+/// `TierUpRootHook` function.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_tierup_set_root_hook(hook: *mut ()) {
+    TIERUP_ROOT_HOOK.store(hook, Ordering::Release);
+}
+
+/// Function-entry tier-up probe. Bumps hotness and queues tier-up once hot.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_tierup_bump_call(function: *mut PyFunction) {
     if function.is_null() {
@@ -2022,27 +2236,90 @@ pub unsafe extern "C" fn pon_tierup_bump_call(function: *mut PyFunction) {
     let function_ref = unsafe { &*function };
     let hotness = bump_saturating(&function_ref.hotness);
     match function_ref.tier_state.load(Ordering::Acquire) {
-        TIER_STATE_TIER0 if hotness >= TIER1_CALL_THRESHOLD => maybe_queue_tierup(function),
-        TIER_STATE_DEFERRED if hotness >= TIER1_DEFERRED_CALL_THRESHOLD => maybe_queue_tierup(function),
+        TIER_STATE_TIER0 if hotness >= TIER1_CALL_THRESHOLD => maybe_queue_tierup(function, 0),
+        TIER_STATE_DEFERRED if hotness >= backed_off_threshold(TIER1_DEFERRED_CALL_THRESHOLD, function_ref) => {
+            maybe_queue_tierup(function, 0);
+        }
         _ => {}
     }
 }
 
-/// Loop back-edge probe for tier-0 code.  Uses the current runtime call context.
+/// Loop back-edge probe + OSR gate for tier-0 code.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pon_backedge_poll() {
+pub unsafe extern "C" fn pon_osr_poll(loop_header: u32) -> *const u8 {
     let function = current_function_for_tierup();
     if function.is_null() {
-        return;
+        return ptr::null();
     }
     // SAFETY: The current-function stack only contains live frames while their
     // compiled entrypoint is executing.
     let function_ref = unsafe { &*function };
     let hotness = bump_saturating(&function_ref.loop_hotness);
     match function_ref.tier_state.load(Ordering::Acquire) {
-        TIER_STATE_TIER0 | TIER_STATE_DEFERRED if hotness >= TIER1_LOOP_THRESHOLD => maybe_queue_tierup(function),
+        TIER_STATE_TIER0 if hotness >= TIER1_LOOP_THRESHOLD => {
+            maybe_queue_tierup(function, loop_header.saturating_add(1));
+        }
+        TIER_STATE_DEFERRED if hotness >= backed_off_threshold(TIER1_LOOP_THRESHOLD, function_ref) => {
+            maybe_queue_tierup(function, loop_header.saturating_add(1));
+        }
         _ => {}
     }
+
+    if function_ref.tier_state.load(Ordering::Acquire) != TIER_STATE_TIER1 {
+        return ptr::null();
+    }
+    let entry = function_ref.osr_entry.load(Ordering::Acquire);
+    if !entry.is_null() && function_ref.osr_loop_header.load(Ordering::Relaxed) == loop_header {
+        entry.cast_const()
+    } else {
+        ptr::null()
+    }
+}
+
+/// Backward-compatible loop probe without OSR transfer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_backedge_poll() {
+    let _ = unsafe { pon_osr_poll(0) };
+}
+
+/// Notes one tier-1 fast-path-to-cold-twin transfer and applies deopt back-off.
+#[unsafe(no_mangle)]
+// TAG-OK: `function` is a PyFunction pointer sentinel, not a Python value.
+pub unsafe extern "C" fn pon_deopt_note(function: *mut PyObject) -> i32 {
+    let function = if function.is_null() {
+        current_function_for_tierup()
+    } else {
+        function.cast::<PyFunction>()
+    };
+    if function.is_null() {
+        return 0;
+    }
+    // SAFETY: Non-NULL callers pass a PyFunction pointer or use the current call.
+    let function_ref = unsafe { &*function };
+    let n = function_ref.deopt_count.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+    if n < DEOPT_THRASH_THRESHOLD {
+        return 0;
+    }
+    let epoch = function_ref.tier_epoch.load(Ordering::Acquire);
+    let target = if epoch >= DEOPT_PIN_EPOCH {
+        TIER_STATE_DISABLED
+    } else {
+        TIER_STATE_DEFERRED
+    };
+    if function_ref
+        .tier_state
+        .compare_exchange(TIER_STATE_TIER1, target, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        function_ref.entry.store(function_ref.code.cast_mut(), Ordering::Release);
+        let _ = function_ref
+            .tier_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| Some(value.saturating_add(1)));
+        function_ref.deopt_count.store(0, Ordering::Release);
+        function_ref.hotness.store(0, Ordering::Release);
+        function_ref.loop_hotness.store(0, Ordering::Release);
+    }
+    0
 }
 
 unsafe fn call_method_from_argv(callee: *mut PyObject, argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -2067,6 +2344,28 @@ unsafe fn call_method_from_argv(callee: *mut PyObject, argv: *mut *mut PyObject,
     }
 }
 
+unsafe fn call_slot_from_argv(
+    callee: *mut PyObject,
+    call: crate::object::CallFunc,
+    argv: *mut *mut PyObject,
+    argc: usize,
+) -> *mut PyObject {
+    let args = match unsafe { argv_slice(argv, argc) } {
+        Ok(args) => args,
+        Err(message) => return return_null_with_error(message),
+    };
+    let args_object = if args.is_empty() {
+        ptr::null_mut()
+    } else {
+        match with_runtime(|runtime| seq::alloc_tuple_from_slice(runtime, args)) {
+            Some(Ok(tuple)) => tuple,
+            Some(Err(message)) => return return_null_with_error(message),
+            None => return return_null_with_error("runtime is not initialized"),
+        }
+    };
+    unsafe { call(callee, args_object, ptr::null_mut()) }
+}
+
 unsafe fn call_type_from_argv(callee: *mut PyObject, argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let args = match unsafe { argv_slice(argv, argc) } {
         Ok(args) => args,
@@ -2078,16 +2377,33 @@ unsafe fn call_type_from_argv(callee: *mut PyObject, argv: *mut *mut PyObject, a
     })
     .unwrap_or(false);
     if is_exception_type {
-        let message = args.first().copied().unwrap_or(ptr::null_mut());
-        return match with_runtime(|runtime| exc::alloc_exception_object(runtime, cls, message, ptr::null_mut())) {
-            Some(Ok(exception)) => exception,
-            Some(Err(message)) => return_null_with_error(message),
+        return match with_runtime(|runtime| {
+            if unsafe { runtime.exception_types.is_exception_group_type(cls.cast_const()) } {
+                exc::build_exception_group_checked(runtime, cls, args)
+            } else {
+                let message = args.first().copied().unwrap_or(ptr::null_mut());
+                match exc::alloc_exception_object(runtime, cls, message, ptr::null_mut()) {
+                    Ok(exception) => exception,
+                    Err(message) => return_null_with_error(message),
+                }
+            }
+        }) {
+            Some(exception) => exception,
             None => return_null_with_error("runtime is not initialized"),
         };
     }
 
     let new = unsafe { (*cls).tp_new.unwrap_or(type_::type_new) };
-    let instance = unsafe { new(cls, ptr::null_mut(), ptr::null_mut()) };
+    let args_object = if args.is_empty() {
+        ptr::null_mut()
+    } else {
+        match with_runtime(|runtime| seq::alloc_tuple_from_slice(runtime, args)) {
+            Some(Ok(tuple)) => tuple,
+            Some(Err(message)) => return return_null_with_error(message),
+            None => return return_null_with_error("runtime is not initialized"),
+        }
+    };
+    let instance = unsafe { new(cls, args_object, ptr::null_mut()) };
     if instance.is_null() {
         return ptr::null_mut();
     }
@@ -2133,7 +2449,11 @@ unsafe fn argv_slice<'a>(argv: *mut *mut PyObject, argc: usize) -> Result<&'a [*
 }
 
 unsafe fn is_runtime_type_object(runtime: &Runtime, object: *mut PyObject) -> bool {
-    !object.is_null() && unsafe { (*object).ob_type == runtime._type_type.cast_const() }
+    if object.is_null() {
+        return false;
+    }
+    let meta = unsafe { (*object).ob_type.cast_mut() };
+    !meta.is_null() && unsafe { crate::mro::is_subtype(meta, runtime._type_type) }
 }
 
 unsafe fn object_type_name(object: *mut PyObject) -> Option<String> {
@@ -2162,6 +2482,7 @@ pub unsafe extern "C" fn pon_build_class(
     bases: *const *mut PyObject,
     base_count: usize,
 ) -> *mut PyObject {
+    crate::untag_prelude!(body);
     catch_object_helper(|| {
         if let Err(message) = ensure_runtime_initialized() {
             return return_null_with_error(message);
@@ -2197,6 +2518,103 @@ pub unsafe extern "C" fn pon_build_class(
             unsafe { core::slice::from_raw_parts(bases, base_count) }
         };
         let class = unsafe { type_::build_class_from_namespace(&name, base_slice, namespace, &[]) };
+        if class.is_null() {
+            return ptr::null_mut();
+        }
+        let _ = with_runtime(|runtime| unsafe {
+            if (*class).ob_type.is_null() {
+                (*class).ob_type = runtime._type_type.cast_const();
+            }
+        });
+        class
+    })
+}
+
+/// Builds a heap Python class with class-statement keyword arguments.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_build_class_ex(
+    body: *mut PyObject,
+    name_interned: u32,
+    bases: *const *mut PyObject,
+    base_count: usize,
+    kw_names: *const u32,
+    kw_values: *mut *mut PyObject,
+    kw_count: usize,
+) -> *mut PyObject {
+    crate::untag_prelude!(body);
+    catch_object_helper(|| {
+        if let Err(message) = ensure_runtime_initialized() {
+            return return_null_with_error(message);
+        }
+        if bases.is_null() && base_count != 0 {
+            return return_null_with_error("class bases pointer is null");
+        }
+        if kw_names.is_null() && kw_count != 0 {
+            return return_null_with_error("class keyword names pointer is null");
+        }
+        if kw_values.is_null() && kw_count != 0 {
+            return return_null_with_error("class keyword values pointer is null");
+        }
+        let Some(name) = crate::intern::resolve(name_interned) else {
+            return return_null_with_error(format!("class name id {name_interned} is not interned"));
+        };
+        let namespace = type_::new_namespace();
+        if with_runtime(|runtime| runtime.class_namespace_stack.push(namespace)).is_none() {
+            return return_null_with_error("runtime is not initialized");
+        }
+        if !body.is_null() {
+            let result = unsafe { pon_call(body, ptr::null_mut(), 0) };
+            let popped = with_runtime(|runtime| runtime.class_namespace_stack.pop()).flatten();
+            if popped != Some(namespace) {
+                return return_null_with_error("class namespace stack is corrupted");
+            }
+            if result.is_null() {
+                return ptr::null_mut();
+            }
+        } else {
+            let popped = with_runtime(|runtime| runtime.class_namespace_stack.pop()).flatten();
+            if popped != Some(namespace) {
+                return return_null_with_error("class namespace stack is corrupted");
+            }
+        }
+        let mut base_vec = if base_count == 0 {
+            Vec::new()
+        } else {
+            unsafe { core::slice::from_raw_parts(bases, base_count) }.to_vec()
+        };
+        for base in &mut base_vec {
+            let original = *base;
+            let normalized = crate::tag::untag_arg(original);
+            if crate::tag::is_small_int(original) && normalized.is_null() {
+                return ptr::null_mut();
+            }
+            *base = normalized;
+        }
+        let names = if kw_count == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(kw_names, kw_count) }
+        };
+        let mut values = if kw_count == 0 {
+            Vec::new()
+        } else {
+            unsafe { core::slice::from_raw_parts(kw_values, kw_count) }.to_vec()
+        };
+        for value in &mut values {
+            let original = *value;
+            let normalized = crate::tag::untag_arg(original);
+            if crate::tag::is_small_int(original) && normalized.is_null() {
+                return ptr::null_mut();
+            }
+            *value = normalized;
+        }
+        let keywords = names
+            .iter()
+            .copied()
+            .zip(values.iter().copied())
+            .map(|(name, value)| type_::ClassKeyword { name, value })
+            .collect::<Vec<_>>();
+        let class = unsafe { type_::build_class_from_namespace(&name, &base_vec, namespace, &keywords) };
         if class.is_null() {
             return ptr::null_mut();
         }
@@ -2275,6 +2693,109 @@ unsafe extern "C" fn module_annotations_annotate(_argv: *mut *mut PyObject, argc
         .unwrap_or_else(|| unsafe { pon_setup_annotations() })
 }
 
+fn raise_unbound_local_error() -> *mut PyObject {
+    const MESSAGE: &str = "cannot access local variable where it is not associated with a value";
+    if let Err(message) = ensure_runtime_initialized() {
+        return return_null_with_error(message);
+    }
+    match with_runtime(|runtime| {
+        let message = match alloc_unicode(runtime, MESSAGE.as_bytes()) {
+            Ok(message) => message,
+            Err(message) => return return_null_with_error(message),
+        };
+        match exc::alloc_exception_object(
+            runtime,
+            runtime
+                .exception_types
+                .get(crate::types::exc::ExceptionKind::UnboundLocalError),
+            message,
+            ptr::null_mut(),
+        ) {
+            Ok(exception) => unsafe { exc::pon_raise(exception, ptr::null_mut()) },
+            Err(message) => return_null_with_error(message),
+        }
+    }) {
+        Some(result) => result,
+        None => return_null_with_error("runtime is not initialized"),
+    }
+}
+
+/// Loads a local-slot value, raising when the slot is currently unbound.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_load_local(value: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(value);
+    catch_object_helper(|| {
+        if value.is_null() {
+            raise_unbound_local_error()
+        } else {
+            value
+        }
+    })
+}
+
+/// Deletes a local-slot value, raising when the slot is already unbound.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_delete_local(value: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(value);
+    catch_object_helper(|| {
+        if value.is_null() {
+            raise_unbound_local_error()
+        } else {
+            unsafe { pon_none() }
+        }
+    })
+}
+
+/// Deletes a module-global binding by interned name.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_delete_global(name_interned: u32) -> *mut PyObject {
+    catch_object_helper(|| {
+        if let Err(message) = ensure_runtime_initialized() {
+            return return_null_with_error(message);
+        }
+        let removed_module_attr = crate::import::delete_active_module_attr(name_interned);
+        let removed_global = with_runtime(|runtime| {
+            let removed = runtime.globals.remove(&name_interned).is_some();
+            if removed {
+                // J0.3 GlobalIC site: flat-map delete.
+                bump_namespace_version();
+            }
+            removed
+        })
+        .unwrap_or(false);
+        if removed_module_attr || removed_global {
+            unsafe { pon_none() }
+        } else {
+            let name = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
+            exc::raise_name_error_text(&format!("name '{name}' is not defined"))
+        }
+    })
+}
+
+/// Deletes from the active class namespace, or from globals outside class bodies.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_delete_name(name_interned: u32) -> *mut PyObject {
+    catch_object_helper(|| {
+        if let Err(message) = ensure_runtime_initialized() {
+            return return_null_with_error(message);
+        }
+        let class_delete = with_runtime(|runtime| {
+            runtime.class_namespace_stack.last().copied().map(|namespace| unsafe {
+                (&mut *namespace).del(name_interned)
+            })
+        });
+        match class_delete {
+            Some(Some(true)) => unsafe { pon_none() },
+            Some(Some(false)) => {
+                let name = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
+                exc::raise_name_error_text(&format!("name '{name}' is not defined"))
+            }
+            Some(None) => unsafe { pon_delete_global(name_interned) },
+            None => return_null_with_error("runtime is not initialized"),
+        }
+    })
+}
+
 /// Loads a module-global or builtin value by interned name.
 ///
 /// With a non-NULL `feedback` cell this consults a [`GlobalIC`] guarded by
@@ -2351,6 +2872,7 @@ pub unsafe extern "C" fn pon_load_name(name_interned: u32) -> *mut PyObject {
 /// Prints a boxed Phase-A value followed by a newline and returns immortal `None`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_print(value: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(value);
     catch_object_helper(|| {
         if let Err(message) = ensure_runtime_initialized() {
             return return_null_with_error(message);
@@ -2384,8 +2906,32 @@ pub unsafe extern "C" fn pon_make_function(code: *const u8, arity: usize, name_i
 }
 
 /// Stores a module-global value by interned name.
+pub(crate) fn store_flat_global_for_dynexec(name_interned: u32, value: *mut PyObject) {
+    if value.is_null() {
+        return;
+    }
+    let _ = with_runtime(|runtime| {
+        runtime.globals.insert(name_interned, value);
+        // J0.3 GlobalIC site: flat-map insert/replace through globals().
+        bump_namespace_version();
+    });
+}
+
+pub(crate) fn delete_flat_global_for_dynexec(name_interned: u32) -> bool {
+    with_runtime(|runtime| {
+        let removed = runtime.globals.remove(&name_interned).is_some();
+        if removed {
+            // J0.3 GlobalIC site: flat-map removal through globals().
+            bump_namespace_version();
+        }
+        removed
+    })
+    .unwrap_or(false)
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_store_global(name_interned: u32, value: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(value);
     catch_object_helper(|| {
         if value.is_null() {
             return return_null_with_error("cannot store NULL global value");
@@ -2394,7 +2940,7 @@ pub unsafe extern "C" fn pon_store_global(name_interned: u32, value: *mut PyObje
             return return_null_with_error(message);
         }
         crate::import::store_active_module_attr(name_interned, value);
-        match with_runtime(|runtime| {
+        let stored = match with_runtime(|runtime| {
             runtime.globals.insert(name_interned, value);
             // J0.3 GlobalIC site: flat-map insert/replace.
             bump_namespace_version();
@@ -2402,13 +2948,16 @@ pub unsafe extern "C" fn pon_store_global(name_interned: u32, value: *mut PyObje
         }) {
             Some(stored) => stored,
             None => return_null_with_error("runtime is not initialized"),
-        }
+        };
+        crate::dynexec::sync_global_store_for_active_module(name_interned, value);
+        stored
     })
 }
 
 /// Stores into the active class-body namespace, falling back to module globals.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_store_name(name_interned: u32, value: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(value);
     catch_object_helper(|| {
         if value.is_null() {
             return return_null_with_error("cannot store NULL namespace value");
@@ -2416,21 +2965,25 @@ pub unsafe extern "C" fn pon_store_name(name_interned: u32, value: *mut PyObject
         if let Err(message) = ensure_runtime_initialized() {
             return return_null_with_error(message);
         }
-        match with_runtime(|runtime| {
+        let Some((stored, module_scope)) = with_runtime(|runtime| {
             if let Some(namespace) = runtime.class_namespace_stack.last().copied() {
                 unsafe {
                     (&mut *namespace).set(name_interned, value);
                 }
+                (value, false)
             } else {
                 runtime.globals.insert(name_interned, value);
                 // J0.3 GlobalIC site: module-scope StoreName lands in the flat map.
                 bump_namespace_version();
+                (value, true)
             }
-            value
-        }) {
-            Some(stored) => stored,
-            None => return_null_with_error("runtime is not initialized"),
+        }) else {
+            return return_null_with_error("runtime is not initialized");
+        };
+        if module_scope {
+            crate::dynexec::sync_global_store_for_active_module(name_interned, value);
         }
+        stored
     })
 }
 
@@ -2442,6 +2995,18 @@ pub unsafe extern "C" fn pon_none() -> *mut PyObject {
             return return_null_with_error(message);
         }
         with_runtime(|runtime| as_object_ptr(runtime.none)).unwrap_or_else(|| return_null_with_error("runtime is not initialized"))
+    })
+}
+
+/// Returns the immortal `NotImplemented` singleton.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_not_implemented() -> *mut PyObject {
+    catch_object_helper(|| {
+        if let Err(message) = ensure_runtime_initialized() {
+            return return_null_with_error(message);
+        }
+        with_runtime(|runtime| as_object_ptr(runtime.not_implemented))
+            .unwrap_or_else(|| return_null_with_error("runtime is not initialized"))
     })
 }
 
@@ -2488,6 +3053,9 @@ pub fn format_object_for_print(value: *mut PyObject) -> Result<String, String> {
             if is_exact_type(value, runtime.none_type) {
                 return Ok("None".to_owned());
             }
+            if is_exact_type(value, runtime.not_implemented_type) {
+                return Ok("NotImplemented".to_owned());
+            }
             Ok(crate::native::builtins_mod::str_text(value))
         }
     })
@@ -2506,6 +3074,26 @@ impl RootSource for LocalRoots {
     }
 }
 
+unsafe extern "C" fn push_tierup_root(root: *mut u8, ctx: *mut c_void) {
+    if root.is_null() || ctx.is_null() {
+        return;
+    }
+    // SAFETY: `collect` passes a live `Vec<*mut u8>` as the callback context for
+    // the duration of the root-hook call.
+    unsafe { (&mut *ctx.cast::<Vec<*mut u8>>()).push(root) };
+}
+
+fn extend_tierup_roots(roots: &mut Vec<*mut u8>) {
+    let hook = TIERUP_ROOT_HOOK.load(Ordering::Acquire);
+    if hook.is_null() {
+        return;
+    }
+    // SAFETY: The JIT installs only `TierUpRootHook` function pointers through
+    // `pon_tierup_set_root_hook`; the callback context is the live roots vector.
+    let hook: TierUpRootHook = unsafe { mem::transmute(hook) };
+    unsafe { hook(push_tierup_root, (roots as *mut Vec<*mut u8>).cast::<c_void>()) };
+}
+
 /// Runs a stop-the-world collection using the runtime's current root set.
 pub fn collect() -> Result<(), String> {
     let mut slot = runtime_lock();
@@ -2513,8 +3101,9 @@ pub fn collect() -> Result<(), String> {
         return Err("runtime is not initialized".to_owned());
     };
 
-    let mut roots = Vec::with_capacity(runtime.globals.len() + 2);
+    let mut roots = Vec::with_capacity(runtime.globals.len() + 3);
     roots.push(runtime.none.cast::<u8>());
+    roots.push(runtime.not_implemented.cast::<u8>());
     for value in runtime.globals.values().copied() {
         roots.push(value.cast::<u8>());
     }
@@ -2542,6 +3131,19 @@ pub fn collect() -> Result<(), String> {
                 roots.push(value.cast::<u8>());
             }
         }
+        for frame in &state.exc_star_stack {
+            if !frame.original.is_null() {
+                roots.push(frame.original.cast::<u8>());
+            }
+            if !frame.rest.is_null() {
+                roots.push(frame.rest.cast::<u8>());
+            }
+            for raised in frame.raised.iter().copied() {
+                if !raised.is_null() {
+                    roots.push(raised.cast::<u8>());
+                }
+            }
+        }
     }
 
     {
@@ -2552,6 +3154,12 @@ pub fn collect() -> Result<(), String> {
             roots.push(stash.cast::<u8>());
         }
     }
+    for value in crate::dynexec::rooted_globals_dicts() {
+        if !value.is_null() {
+            roots.push(value.cast::<u8>());
+        }
+    }
+    extend_tierup_roots(&mut roots);
 
     let mut roots = LocalRoots { roots };
     runtime.heap.collect(&mut roots);

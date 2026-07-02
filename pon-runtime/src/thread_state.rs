@@ -14,6 +14,29 @@ use crate::abi::{HandlerInfo, PyFrame};
 
 use crate::object::PyObject;
 
+
+/// Live `except*` dispatch bookkeeping; one frame per dynamically-active
+/// dispatcher, innermost last.
+#[derive(Debug)]
+pub struct ExcStarFrame {
+    /// Exception pending when the dispatcher was entered.
+    pub original: *mut PyObject,
+    /// Unmatched remainder after clauses processed so far.
+    pub rest: *mut PyObject,
+    /// Exceptions raised by clause bodies, in clause order.
+    pub raised: Vec<*mut PyObject>,
+}
+
+impl ExcStarFrame {
+    #[must_use]
+    pub fn new(original: *mut PyObject) -> Self {
+        Self {
+            original,
+            rest: original,
+            raised: Vec::new(),
+        }
+    }
+}
 /// Interpreter state observed by runtime helpers.
 #[derive(Debug)]
 pub struct PonThreadState {
@@ -25,6 +48,8 @@ pub struct PonThreadState {
     pub handler_chain: Vec<HandlerInfo>,
     /// Saved exception states for `finally`, generators, and exception-group flows.
     pub exception_state_stack: Vec<*mut PyObject>,
+    /// Active `except*` dispatcher frames, innermost handler last.
+    pub exc_star_stack: Vec<ExcStarFrame>,
     /// Conservative stack-base capture for stop-the-world collection.
     pub stack_base: *mut u8,
     /// Approximate top frame/stack pointer recorded when entering a GC-safe region.
@@ -43,6 +68,7 @@ impl Default for PonThreadState {
             frame_stack: Vec::new(),
             handler_chain: Vec::new(),
             exception_state_stack: Vec::new(),
+            exc_star_stack: Vec::new(),
             stack_base: ptr::null_mut(),
             stack_top_fp: ptr::null_mut(),
             gc_safe_region_depth: 0,

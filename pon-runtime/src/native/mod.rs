@@ -10,6 +10,7 @@
 //! frozen to [`EAGER_MODULES`]; everything else imports lazily on first use.
 
 pub mod builtins_mod;
+pub mod builtins_batch;
 mod installed;
 
 use crate::object::PyObject;
@@ -21,6 +22,7 @@ mod os;
 mod sys;
 mod thread;
 mod time;
+mod weakref;
 
 /// Sorted, insert-only lookup table of curated native modules: Python module
 /// name -> factory that allocates the module object and installs it into the
@@ -33,6 +35,7 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
     ("os", os::make_module),
     ("sys", sys::make_module),
     ("time", time::make_module),
+    ("weakref", weakref::make_module),
 ];
 
 /// Modules registered eagerly by [`register_modules`] at runtime init, in

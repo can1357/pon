@@ -14,6 +14,7 @@ use pon_codegen::baseline::{CodegenError, NameMap, compile_function};
 use pon_codegen::helpers::declare_helpers;
 use pon_codegen::isa::{OptLevel, make_isa};
 use pon_ir::ir::Module as IrModule;
+use pon_ir::lower_source;
 use pon_runtime::abi::{HELPERS, pon_runtime_init};
 use pon_runtime::object::PyObject;
 use pon_runtime::thread_state::pon_err_message;
@@ -35,6 +36,30 @@ pub struct JitEngine {
     tierup: Box<tierup::TierUpDriver>,
 }
 
+/// Opaque dynamic-execution handle for the runtime eval/exec seam.
+///
+/// The handle owns its JIT engine, so compiled code and tier-up state stay alive
+/// for every later [`execute`] call. Runtime globals/locals rebinding is owned by
+/// `pon-runtime`; this seam only compiles source and re-enters the compiled body.
+pub struct DynExecHandle {
+    engine: JitEngine,
+    main: MainFn,
+    filename: String,
+    mode: String,
+}
+
+impl DynExecHandle {
+    #[must_use]
+    pub fn filename(&self) -> &str {
+        &self.filename
+    }
+
+    #[must_use]
+    pub fn mode(&self) -> &str {
+        &self.mode
+    }
+}
+
 /// Error reported while compiling or running Phase-A JIT code.
 #[derive(Debug)]
 pub enum JitError {
@@ -42,6 +67,8 @@ pub enum JitError {
     Module(ModuleError),
     /// Baseline IR-to-Cranelift lowering failed.
     Codegen(CodegenError),
+    /// Source parsing/lowering failed before JIT codegen started.
+    Lower(String),
     /// The IR module did not contain its declared `__main__` function.
     MissingMain { main: u32 },
     /// Runtime initialization failed before user code executed.
@@ -55,6 +82,7 @@ impl fmt::Display for JitError {
         match self {
             Self::Module(error) => write!(f, "JIT module error: {error}"),
             Self::Codegen(error) => write!(f, "JIT codegen error: {error}"),
+            Self::Lower(message) => write!(f, "source lowering error: {message}"),
             Self::MissingMain { main } => write!(f, "IR main function index {main} is out of range"),
             Self::RuntimeInit(message) => write!(f, "runtime initialization failed: {message}"),
             Self::Runtime(message) => write!(f, "runtime error: {message}"),
@@ -185,6 +213,47 @@ impl JitEngine {
             })
             .collect()
     }
+}
+
+/// Compile source text for the runtime dynamic-execution seam.
+///
+/// `filename` and `mode` are retained for diagnostics and future mode-specific
+/// lowering; today the parser accepts the same module grammar as `pon-cli run`.
+pub fn compile_source_to_module(source: &str, filename: &str, mode: &str) -> Result<DynExecHandle, JitError> {
+    // SAFETY: `pon_runtime_init` is idempotent for the process.
+    let init_status = unsafe { pon_runtime_init() };
+    if init_status != 0 {
+        return Err(JitError::RuntimeInit(runtime_message()));
+    }
+
+    let ir_module = lower_source(source).map_err(|error| JitError::Lower(error.to_string()))?;
+    let mut engine = JitEngine::new();
+    let main = engine.compile(&ir_module)?;
+    Ok(DynExecHandle {
+        engine,
+        main,
+        filename: filename.to_owned(),
+        mode: mode.to_owned(),
+    })
+}
+
+/// Execute a previously compiled dynamic source handle.
+///
+/// The globals/locals pointers are accepted for the runtime-owned eval/exec
+/// bridge; this thin JIT seam preserves the compiled engine lifetime and invokes
+/// the compiled module body.
+///
+/// # Safety
+/// `handle` must be the live handle returned by [`compile_source_to_module`].
+/// `globals_dict` and `locals_dict`, when non-NULL, must be live Python objects
+/// managed by `pon-runtime`; this function does not dereference them yet.
+pub unsafe fn execute(
+    handle: &mut DynExecHandle,
+    _globals_dict: *mut PyObject,
+    _locals_dict: *mut PyObject,
+) -> *mut PyObject {
+    let _keep_engine_alive = &handle.engine;
+    unsafe { (handle.main)(ptr::null_mut(), 0) }
 }
 
 impl Default for JitEngine {

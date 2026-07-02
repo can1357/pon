@@ -13,10 +13,14 @@ mod traceback;
 
 use crate::intern;
 use crate::object::{PyObject, PyType, as_object_ptr, is_exact_type};
-use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set_object, thread_state_lock};
-use crate::types::exc::{ExceptionKind, PyBaseException, is_exception_instance, is_exception_subclass};
+use crate::thread_state::{ExcStarFrame, pon_err_clear, pon_err_occurred, pon_err_set_object, thread_state_lock};
+use crate::types::exc::{
+    EXC_GROUP_METHOD_DERIVE, EXC_GROUP_METHOD_SPLIT, EXC_GROUP_METHOD_SUBGROUP, ExceptionKind, PyBaseException,
+    PyExceptionGroup, as_exception_group, is_exception_group_instance, is_exception_instance, is_exception_subclass,
+};
+use crate::types::tuple::PyTuple;
 
-use super::{HandlerInfo, Runtime, TYPE_ID_EXCEPTION};
+use super::{HandlerInfo, Runtime, TYPE_ID_EXCEPTION, TYPE_ID_EXCEPTION_GROUP};
 
 /// Exception-handler kind selector; concrete values are assigned by lowering.
 pub type HandlerKind = u8;
@@ -83,6 +87,47 @@ pub(super) fn alloc_exception_object(
         );
     }
     Ok(as_object_ptr(object))
+}
+
+fn alloc_exception_group_object(
+    runtime: &Runtime,
+    ty: *mut PyType,
+    message: *mut PyObject,
+    exceptions: *mut PyObject,
+    cause: *mut PyObject,
+) -> Result<*mut PyObject, String> {
+    if ty.is_null() {
+        return Err("exception group type is null".to_owned());
+    }
+    if exceptions.is_null() {
+        return Err("exception group members tuple is null".to_owned());
+    }
+
+    let object = runtime
+        .heap
+        .alloc(core::mem::size_of::<PyExceptionGroup>(), TYPE_ID_EXCEPTION_GROUP)
+        .cast::<PyExceptionGroup>();
+    let context = active_context();
+    unsafe {
+        ptr::write(
+            object,
+            PyExceptionGroup {
+                base: PyBaseException::new(ty.cast_const(), message, cause, context, ptr::null_mut()),
+                exceptions,
+            },
+        );
+    }
+    Ok(as_object_ptr(object))
+}
+
+fn alloc_exception_group_from_members(
+    runtime: &Runtime,
+    ty: *mut PyType,
+    message: *mut PyObject,
+    members: &[*mut PyObject],
+) -> Result<*mut PyObject, String> {
+    let exceptions = super::seq::alloc_tuple_from_slice(runtime, members)?;
+    alloc_exception_group_object(runtime, ty, message, exceptions, ptr::null_mut())
 }
 
 fn install_current_exception(exception: *mut PyObject, diagnostic: String) {
@@ -183,12 +228,14 @@ fn exception_kind_name(kind: ExceptionKind) -> &'static str {
         ExceptionKind::BaseException => "BaseException",
         ExceptionKind::Exception => "Exception",
         ExceptionKind::ImportError => "ImportError",
+        ExceptionKind::EOFError => "EOFError",
         ExceptionKind::TypeError => "TypeError",
         ExceptionKind::ValueError => "ValueError",
         ExceptionKind::KeyError => "KeyError",
         ExceptionKind::IndexError => "IndexError",
         ExceptionKind::AttributeError => "AttributeError",
         ExceptionKind::NameError => "NameError",
+        ExceptionKind::UnboundLocalError => "UnboundLocalError",
         ExceptionKind::NotImplementedError => "NotImplementedError",
         ExceptionKind::StopIteration => "StopIteration",
         ExceptionKind::GeneratorExit => "GeneratorExit",
@@ -255,6 +302,7 @@ unsafe fn set_exception_links(exception: *mut PyObject, cause: *mut PyObject) {
 /// Raises an existing exception instance or exception type, records `cause`, and returns NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_raise(exc: *mut PyObject, cause: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(exc, cause);
     super::catch_object_helper(|| {
         if exc.is_null() {
             return raise_type_error_text("exceptions must derive from BaseException");
@@ -335,12 +383,14 @@ pub unsafe extern "C" fn pon_raise_index_error(ptr: *const u8, len: usize) -> *m
 /// Raises `KeyError(key)` and returns NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_raise_key_error(key: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(key);
     super::catch_object_helper(|| raise_value_exception(ExceptionKind::KeyError, key, "KeyError".to_owned()))
 }
 
 /// Raises `AttributeError` for `obj.name` and returns NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_raise_attribute_error(obj: *mut PyObject, name: u32) -> *mut PyObject {
+    crate::untag_prelude!(obj);
     super::catch_object_helper(|| {
         let attribute = intern::resolve(name).unwrap_or_else(|| format!("<intern:{name}>"));
         let object_name = if obj.is_null() {
@@ -372,12 +422,14 @@ pub unsafe extern "C" fn pon_raise_attribute_error(obj: *mut PyObject, name: u32
 /// Raises `StopIteration(value)` and returns NULL.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_raise_stop_iteration(value: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(value);
     super::catch_object_helper(|| raise_value_exception(ExceptionKind::StopIteration, value, "StopIteration".to_owned()))
 }
 
 /// Returns `1` when the current exception matches `exc_type`, `0` for no match, and `-1` on misuse.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_exc_matches(exc_type: *mut PyObject) -> c_int {
+    crate::untag_prelude!(err = -1; exc_type);
     catch_i32_helper(|| {
         if exc_type.is_null() {
             raise_type_error_text("catching classes that do not inherit from BaseException is not allowed");
@@ -443,6 +495,7 @@ pub unsafe extern "C" fn pon_exc_fetch() -> *mut PyObject {
 /// Restores a saved exception, consuming the matching saved state stack entry when present.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_exc_restore(saved: *mut PyObject) -> c_int {
+    crate::untag_prelude!(err = -1; saved);
     catch_i32_helper(|| {
         let stacked = {
             let mut state = thread_state_lock();
@@ -466,81 +519,252 @@ pub unsafe extern "C" fn pon_exc_restore(saved: *mut PyObject) -> c_int {
     })
 }
 
-/// Conservatively splits the current exception group against `types`.
-///
-/// Until exception groups carry member lists, an actual group is returned wholly
-/// as the match when its group object type matches `types`; otherwise the whole
-/// pending exception is returned through `out_rest`.  Non-groups never report a
-/// fake successful match.
+enum SplitCond {
+    Types(Vec<*mut PyType>),
+    Callable(*mut PyObject),
+}
+
+struct SplitOutcome {
+    matched: *mut PyObject,
+    rest: *mut PyObject,
+}
+
+fn type_name_is(object: *mut PyObject, expected: &str) -> bool {
+    if object.is_null() {
+        return false;
+    }
+    let ty = unsafe { (*object).ob_type };
+    !ty.is_null() && unsafe { (*ty).name() == expected }
+}
+
+fn validate_exception_type(runtime: &Runtime, ty: *mut PyType, forbid_groups: bool) -> Result<(), *mut PyObject> {
+    if ty.is_null() || unsafe { !is_exception_subclass(ty.cast_const(), runtime.exception_types.base_exception.cast_const()) } {
+        return Err(raise_builtin_text(
+            runtime,
+            ExceptionKind::TypeError,
+            "catching classes that do not inherit from BaseException is not allowed",
+        ));
+    }
+    if forbid_groups && unsafe { is_exception_subclass(ty.cast_const(), runtime.exception_types.base_exception_group.cast_const()) } {
+        return Err(raise_builtin_text(
+            runtime,
+            ExceptionKind::TypeError,
+            "catching ExceptionGroup with except* is not allowed",
+        ));
+    }
+    Ok(())
+}
+
+fn split_condition(types: *mut PyObject, allow_callable: bool, forbid_groups: bool) -> Result<SplitCond, *mut PyObject> {
+    if types.is_null() {
+        return Err(raise_type_error_text("exception-group split target is null"));
+    }
+    super::with_runtime(|runtime| {
+        if is_type_object(runtime, types) {
+            let ty = types.cast::<PyType>();
+            validate_exception_type(runtime, ty, forbid_groups)?;
+            return Ok(SplitCond::Types(vec![ty]));
+        }
+        if type_name_is(types, "tuple") || type_name_is(types, "list") {
+            let values = match unsafe { crate::types::type_::positional_args_from_object(types) } {
+                Ok(values) => values,
+                Err(message) => return Err(raise_builtin_text(runtime, ExceptionKind::TypeError, &message)),
+            };
+            let mut out = Vec::with_capacity(values.len());
+            for value in values {
+                if !is_type_object(runtime, value) {
+                    return Err(raise_builtin_text(
+                        runtime,
+                        ExceptionKind::TypeError,
+                        "catch target must be an exception type",
+                    ));
+                }
+                let ty = value.cast::<PyType>();
+                validate_exception_type(runtime, ty, forbid_groups)?;
+                out.push(ty);
+            }
+            return Ok(SplitCond::Types(out));
+        }
+        if allow_callable {
+            Ok(SplitCond::Callable(types))
+        } else {
+            Err(raise_builtin_text(
+                runtime,
+                ExceptionKind::TypeError,
+                "catch target must be an exception type or tuple of exception types",
+            ))
+        }
+    })
+    .unwrap_or_else(|| Err(super::return_null_with_error("runtime is not initialized")))
+}
+
+fn condition_matches(cond: &SplitCond, node: *mut PyObject) -> Result<bool, ()> {
+    match cond {
+        SplitCond::Types(types) => Ok(types
+            .iter()
+            .copied()
+            .any(|ty| unsafe { is_exception_instance(node, ty.cast_const()) })),
+        SplitCond::Callable(callable) => {
+            let mut argv = [node];
+            let result = unsafe { super::pon_call(*callable, argv.as_mut_ptr(), 1) };
+            if result.is_null() {
+                return Err(());
+            }
+            let truth = unsafe { super::object::pon_is_true(result) };
+            if truth < 0 {
+                Err(())
+            } else {
+                Ok(truth != 0)
+            }
+        }
+    }
+}
+
+fn group_members(group: *mut PyObject) -> Result<Vec<*mut PyObject>, ()> {
+    let Some(group_ref) = (unsafe { as_exception_group(group) }) else {
+        super::return_null_with_error("exception group payload is not a group");
+        return Err(());
+    };
+    if group_ref.exceptions.is_null() {
+        super::return_null_with_error("exception group members tuple is null");
+        return Err(());
+    }
+    let tuple = unsafe { &*group_ref.exceptions.cast::<PyTuple>() };
+    Ok(unsafe { tuple.as_slice() }.to_vec())
+}
+
+fn alloc_group_like(source: *mut PyObject, members: &[*mut PyObject], copy_metadata: bool) -> Result<*mut PyObject, ()> {
+    let Some(source_group) = (unsafe { as_exception_group(source) }) else {
+        super::return_null_with_error("derive source is not an exception group");
+        return Err(());
+    };
+    let ty = source_group.base.ob_base.ob_type.cast_mut();
+    let message = source_group.base.message;
+    let group = match super::with_runtime(|runtime| alloc_exception_group_from_members(runtime, ty, message, members)) {
+        Some(Ok(group)) => group,
+        Some(Err(message)) => {
+            super::return_null_with_error(message);
+            return Err(());
+        }
+        None => {
+            super::return_null_with_error("runtime is not initialized");
+            return Err(());
+        }
+    };
+    if copy_metadata {
+        unsafe {
+            let derived = &mut *group.cast::<PyBaseException>();
+            derived.cause = source_group.base.cause;
+            derived.context = source_group.base.context;
+            derived.traceback = source_group.base.traceback;
+        }
+    }
+    Ok(group)
+}
+
+fn split_exception(node: *mut PyObject, cond: &SplitCond) -> Result<SplitOutcome, ()> {
+    if condition_matches(cond, node)? {
+        return Ok(SplitOutcome {
+            matched: node,
+            rest: ptr::null_mut(),
+        });
+    }
+    if unsafe { !is_exception_group_instance(node) } {
+        return Ok(SplitOutcome {
+            matched: ptr::null_mut(),
+            rest: node,
+        });
+    }
+
+    let mut matched_parts = Vec::new();
+    let mut rest_parts = Vec::new();
+    for child in group_members(node)? {
+        let split = split_exception(child, cond)?;
+        if !split.matched.is_null() {
+            matched_parts.push(split.matched);
+        }
+        if !split.rest.is_null() {
+            rest_parts.push(split.rest);
+        }
+    }
+
+    let matched = if matched_parts.is_empty() {
+        ptr::null_mut()
+    } else {
+        alloc_group_like(node, &matched_parts, true)?
+    };
+    let rest = if rest_parts.is_empty() {
+        ptr::null_mut()
+    } else {
+        alloc_group_like(node, &rest_parts, true)?
+    };
+    Ok(SplitOutcome { matched, rest })
+}
+
+fn none_or_object(object: *mut PyObject) -> *mut PyObject {
+    if object.is_null() {
+        unsafe { super::pon_none() }
+    } else {
+        object
+    }
+}
+
+fn empty_message(runtime: &Runtime) -> Result<*mut PyObject, String> {
+    super::alloc_unicode(runtime, b"")
+}
+
+fn wrap_naked_for_exc_star(runtime: &Runtime, exception: *mut PyObject) -> Result<*mut PyObject, String> {
+    let message = empty_message(runtime)?;
+    let ty = if unsafe { is_exception_instance(exception, runtime.exception_types.exception.cast_const()) } {
+        runtime.exception_types.exception_group
+    } else {
+        runtime.exception_types.base_exception_group
+    };
+    alloc_exception_group_from_members(runtime, ty, message, &[exception])
+}
+
+fn unwrap_exc_star_rest(was_naked: bool, rest: *mut PyObject) -> *mut PyObject {
+    if !was_naked || rest.is_null() {
+        return rest;
+    }
+    let Ok(members) = group_members(rest) else {
+        return rest;
+    };
+    if members.len() == 1 {
+        members[0]
+    } else {
+        rest
+    }
+}
+
+/// Splits the current exception group against `types`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_exc_group_split(types: *mut PyObject, out_rest: *mut *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(types);
     super::catch_object_helper(|| {
         if out_rest.is_null() {
             return raise_type_error_text("exception-group split rest pointer is null");
         }
-        // SAFETY: `out_rest` is non-NULL and owned by the caller.
-        unsafe {
-            *out_rest = ptr::null_mut();
-        }
+        unsafe { *out_rest = ptr::null_mut() };
 
-        if types.is_null() {
-            return raise_type_error_text("exception-group split target is null");
-        }
-
+        let cond = match split_condition(types, true, false) {
+            Ok(cond) => cond,
+            Err(result) => return result,
+        };
         let current = thread_state_lock().current_exc;
         if current.is_null() {
             return ptr::null_mut();
         }
         if is_diagnostic_sentinel(current) {
-            // SAFETY: `out_rest` is non-NULL and owned by the caller.
-            unsafe {
-                *out_rest = current;
-            }
+            unsafe { *out_rest = current };
             return ptr::null_mut();
         }
-
-        match ensure_runtime_for_exc() {
-            Ok(()) => match super::with_runtime(|runtime| {
-                if !is_type_object(runtime, types) {
-                    return raise_builtin_text(runtime, ExceptionKind::TypeError, "exception-group split target must be an exception type");
-                }
-                let match_ty = types.cast::<PyType>();
-                // SAFETY: `match_ty` is a live type object.
-                if unsafe { !is_exception_subclass(match_ty.cast_const(), runtime.exception_types.base_exception.cast_const()) } {
-                    return raise_builtin_text(
-                        runtime,
-                        ExceptionKind::TypeError,
-                        "catching classes that do not inherit from BaseException is not allowed",
-                    );
-                }
-
-                // SAFETY: `current` is a live boxed object.
-                let current_ty = unsafe { (*current).ob_type };
-                // SAFETY: `current_ty` is a live type descriptor for a boxed object.
-                let is_group = unsafe { runtime.exception_types.is_exception_group_type(current_ty) };
-                if !is_group {
-                    // SAFETY: `out_rest` is non-NULL and owned by the caller.
-                    unsafe {
-                        *out_rest = current;
-                    }
-                    return ptr::null_mut();
-                }
-
-                // SAFETY: Both pointers are live type descriptors.
-                if unsafe { is_exception_subclass(current_ty, match_ty.cast_const()) } {
-                    current
-                } else {
-                    // SAFETY: `out_rest` is non-NULL and owned by the caller.
-                    unsafe {
-                        *out_rest = current;
-                    }
-                    ptr::null_mut()
-                }
-            }) {
-                Some(result) => result,
-                None => super::return_null_with_error("runtime is not initialized"),
-            },
-            Err(message) => super::return_null_with_error(message),
+        match split_exception(current, &cond) {
+            Ok(split) => {
+                unsafe { *out_rest = split.rest };
+                split.matched
+            }
+            Err(()) => ptr::null_mut(),
         }
     })
 }
@@ -569,6 +793,7 @@ pub unsafe extern "C" fn pon_pop_exc_info() -> *mut PyObject {
 /// Returns the active exception object when it matches `exc_type`, or `None` on miss.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_match_exc(exc_type: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(exc_type);
     super::catch_object_helper(|| {
         let matched = unsafe { pon_exc_matches(exc_type) };
         if matched < 0 {
@@ -587,27 +812,173 @@ pub unsafe extern "C" fn pon_match_exc(exc_type: *mut PyObject) -> *mut PyObject
     })
 }
 
-/// Representative `except*` split.
-///
-/// Full exception-group member storage is not available yet, so this helper
-/// returns the whole active group when its group type matches `exc_types`, and
-/// returns `None` when no group match exists.  NULL remains reserved for helper
-/// misuse or runtime allocation errors.
+/// Legacy representative `except*` split; retained for older IR.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_check_exc_star(exc_types: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(exc_types);
+    unsafe { pon_exc_star_match(exc_types) }
+}
+
+/// Enter an `except*` dispatcher for the pending exception.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_exc_star_enter() -> *mut PyObject {
     super::catch_object_helper(|| {
-        let before = thread_state_lock().current_exc;
-        let mut rest = ptr::null_mut();
-        let matched = unsafe { pon_exc_group_split(exc_types, &mut rest) };
-        if matched.is_null() {
-            let after = thread_state_lock().current_exc;
-            if !core::ptr::eq(before, after) {
-                ptr::null_mut()
-            } else {
-                unsafe { super::pon_none() }
+        let current = thread_state_lock().current_exc;
+        if current.is_null() || is_diagnostic_sentinel(current) {
+            return raise_type_error_text("except* on a non-object exception");
+        }
+        thread_state_lock().exc_star_stack.push(ExcStarFrame::new(current));
+        unsafe { super::pon_none() }
+    })
+}
+
+fn exc_star_split_current(runtime: &Runtime, rest: *mut PyObject, cond: &SplitCond) -> Result<SplitOutcome, ()> {
+    if rest.is_null() {
+        return Ok(SplitOutcome {
+            matched: ptr::null_mut(),
+            rest: ptr::null_mut(),
+        });
+    }
+    let was_naked = unsafe { !is_exception_group_instance(rest) };
+    let subject = if was_naked {
+        match wrap_naked_for_exc_star(runtime, rest) {
+            Ok(group) => group,
+            Err(message) => {
+                super::return_null_with_error(message);
+                return Err(());
             }
+        }
+    } else {
+        rest
+    };
+    let mut split = split_exception(subject, cond)?;
+    split.rest = unwrap_exc_star_rest(was_naked, split.rest);
+    Ok(split)
+}
+
+/// Split the active `except*` frame remainder against one clause type expression.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_exc_star_match(exc_types: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(exc_types);
+    super::catch_object_helper(|| {
+        let cond = match split_condition(exc_types, false, true) {
+            Ok(cond) => cond,
+            Err(result) => {
+                thread_state_lock().exc_star_stack.pop();
+                return result;
+            }
+        };
+        let rest = match thread_state_lock().exc_star_stack.last().map(|frame| frame.rest) {
+            Some(rest) => rest,
+            None => return raise_type_error_text("except* stack underflow"),
+        };
+        let split = match super::with_runtime(|runtime| exc_star_split_current(runtime, rest, &cond)) {
+            Some(Ok(split)) => split,
+            Some(Err(())) => return ptr::null_mut(),
+            None => return super::return_null_with_error("runtime is not initialized"),
+        };
+        if split.matched.is_null() {
+            return unsafe { super::pon_none() };
+        }
+        {
+            let mut state = thread_state_lock();
+            let Some(frame) = state.exc_star_stack.last_mut() else {
+                return raise_type_error_text("except* stack underflow");
+            };
+            frame.rest = split.rest;
+        }
+        match super::with_runtime(|runtime| set_current_exception(runtime, split.matched)) {
+            Some(()) => split.matched,
+            None => super::return_null_with_error("runtime is not initialized"),
+        }
+    })
+}
+
+/// Mark an `except*` clause body as completed normally.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_exc_star_body_ok() -> *mut PyObject {
+    super::catch_object_helper(|| {
+        let original = match thread_state_lock().exc_star_stack.last().map(|frame| frame.original) {
+            Some(original) => original,
+            None => return raise_type_error_text("except* stack underflow"),
+        };
+        match super::with_runtime(|runtime| set_current_exception(runtime, original)) {
+            Some(()) => unsafe { super::pon_none() },
+            None => super::return_null_with_error("runtime is not initialized"),
+        }
+    })
+}
+
+/// Collect a new exception raised by an `except*` clause body.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_exc_star_body_raised() -> *mut PyObject {
+    super::catch_object_helper(|| {
+        let raised = thread_state_lock().current_exc;
+        let original = {
+            let mut state = thread_state_lock();
+            let Some(frame) = state.exc_star_stack.last_mut() else {
+                return raise_type_error_text("except* stack underflow");
+            };
+            if !raised.is_null() && !is_diagnostic_sentinel(raised) {
+                frame.raised.push(raised);
+            }
+            frame.original
+        };
+        match super::with_runtime(|runtime| set_current_exception(runtime, original)) {
+            Some(()) => unsafe { super::pon_none() },
+            None => super::return_null_with_error("runtime is not initialized"),
+        }
+    })
+}
+
+fn finish_raised_group(runtime: &Runtime, frame: &ExcStarFrame) -> Result<*mut PyObject, String> {
+    let mut members = frame.raised.clone();
+    if !frame.rest.is_null() {
+        members.push(frame.rest);
+    }
+    let message = empty_message(runtime)?;
+    let ty = if members
+        .iter()
+        .copied()
+        .all(|member| unsafe { is_exception_instance(member, runtime.exception_types.exception.cast_const()) })
+    {
+        runtime.exception_types.exception_group
+    } else {
+        runtime.exception_types.base_exception_group
+    };
+    let group = alloc_exception_group_from_members(runtime, ty, message, &members)?;
+    unsafe {
+        (*group.cast::<PyBaseException>()).context = frame.original;
+    }
+    Ok(group)
+}
+
+/// Pop an `except*` frame and install the recomposed remainder/raised exception.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_exc_star_finish() -> *mut PyObject {
+    super::catch_object_helper(|| {
+        let frame = match thread_state_lock().exc_star_stack.pop() {
+            Some(frame) => frame,
+            None => return raise_type_error_text("except* stack underflow"),
+        };
+        if frame.raised.is_empty() && frame.rest.is_null() {
+            pon_err_clear();
+            return unsafe { super::pon_none() };
+        }
+        let reraised = if frame.raised.is_empty() {
+            frame.rest
+        } else if frame.raised.len() == 1 && frame.rest.is_null() && unsafe { !is_exception_group_instance(frame.original) } {
+            frame.raised[0]
         } else {
-            matched
+            match super::with_runtime(|runtime| finish_raised_group(runtime, &frame)) {
+                Some(Ok(group)) => group,
+                Some(Err(message)) => return super::return_null_with_error(message),
+                None => return super::return_null_with_error("runtime is not initialized"),
+            }
+        };
+        match super::with_runtime(|runtime| set_current_exception(runtime, reraised)) {
+            Some(()) => ptr::null_mut(),
+            None => super::return_null_with_error("runtime is not initialized"),
         }
     })
 }
@@ -625,11 +996,95 @@ pub unsafe extern "C" fn pon_get_current_exc() -> *mut PyObject {
     })
 }
 
-/// Builds a representative `ExceptionGroup`.
-///
-/// Until the exception payload grows member-list storage, the helper validates
-/// that every supplied value is an exception instance and returns a boxed
-/// `ExceptionGroup` carrying only a diagnostic message.
+pub(super) fn build_exception_group_checked(runtime: &Runtime, cls: *mut PyType, args: &[*mut PyObject]) -> *mut PyObject {
+    if args.len() != 2 {
+        return raise_builtin_text(runtime, ExceptionKind::TypeError, "BaseExceptionGroup() takes exactly 2 arguments");
+    }
+    let message = args[0];
+    if message.is_null() || unsafe { !is_exact_type(message, runtime.unicode_type.cast_const()) } {
+        return raise_builtin_text(runtime, ExceptionKind::TypeError, "BaseExceptionGroup() argument 1 must be str");
+    }
+    let values = match unsafe { crate::types::type_::positional_args_from_object(args[1]) } {
+        Ok(values) => values,
+        Err(error) => return raise_builtin_text(runtime, ExceptionKind::TypeError, &error),
+    };
+    if values.is_empty() {
+        return raise_builtin_text(
+            runtime,
+            ExceptionKind::ValueError,
+            "second argument (exceptions) must be a non-empty sequence",
+        );
+    }
+    for value in values.iter().copied() {
+        if value.is_null() || unsafe { !is_exception_instance(value, runtime.exception_types.base_exception.cast_const()) } {
+            return raise_builtin_text(runtime, ExceptionKind::TypeError, "second argument (exceptions) must contain only exceptions");
+        }
+    }
+    let all_exception = values
+        .iter()
+        .copied()
+        .all(|value| unsafe { is_exception_instance(value, runtime.exception_types.exception.cast_const()) });
+    let ty = if cls == runtime.exception_types.base_exception_group && all_exception {
+        runtime.exception_types.exception_group
+    } else {
+        cls
+    };
+    if cls == runtime.exception_types.exception_group && !all_exception {
+        return raise_builtin_text(runtime, ExceptionKind::TypeError, "Cannot nest BaseExceptions in an ExceptionGroup");
+    }
+    match alloc_exception_group_from_members(runtime, ty, message, &values) {
+        Ok(group) => group,
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
+pub unsafe fn call_exception_group_method(receiver: *mut PyObject, kind: u8, args: *mut PyObject) -> *mut PyObject {
+    let positional = match unsafe { crate::types::type_::positional_args_from_object(args) } {
+        Ok(args) => args,
+        Err(message) => return super::return_null_with_error(message),
+    };
+    if positional.len() != 1 {
+        return raise_type_error_text("ExceptionGroup method expected exactly one argument");
+    }
+    match kind {
+        EXC_GROUP_METHOD_SPLIT | EXC_GROUP_METHOD_SUBGROUP => {
+            let cond = match split_condition(positional[0], true, false) {
+                Ok(cond) => cond,
+                Err(result) => return result,
+            };
+            let split = match split_exception(receiver, &cond) {
+                Ok(split) => split,
+                Err(()) => return ptr::null_mut(),
+            };
+            if kind == EXC_GROUP_METHOD_SUBGROUP {
+                none_or_object(split.matched)
+            } else {
+                let values = [none_or_object(split.matched), none_or_object(split.rest)];
+                match super::with_runtime(|runtime| super::seq::alloc_tuple_from_slice(runtime, &values)) {
+                    Some(Ok(tuple)) => tuple,
+                    Some(Err(message)) => super::return_null_with_error(message),
+                    None => super::return_null_with_error("runtime is not initialized"),
+                }
+            }
+        }
+        EXC_GROUP_METHOD_DERIVE => {
+            let values = match super::seq::sequence_to_vec(positional[0]) {
+                Ok(values) => values,
+                Err(message) => return super::return_null_with_error(message),
+            };
+            if values.is_empty() {
+                return raise_type_error_text("second argument (exceptions) must be a non-empty sequence");
+            }
+            match alloc_group_like(receiver, &values, false) {
+                Ok(group) => group,
+                Err(()) => ptr::null_mut(),
+            }
+        }
+        _ => raise_type_error_text("unknown ExceptionGroup method"),
+    }
+}
+
+/// Builds an `ExceptionGroup` from boxed exception values.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_build_exc_group(excs: *mut *mut PyObject, len: usize) -> *mut PyObject {
     super::catch_object_helper(|| {
@@ -639,31 +1094,20 @@ pub unsafe extern "C" fn pon_build_exc_group(excs: *mut *mut PyObject, len: usiz
         if excs.is_null() {
             return raise_type_error_text("ExceptionGroup exception array is null");
         }
-        if let Err(message) = ensure_runtime_for_exc() {
-            return super::return_null_with_error(message);
-        }
-
         match super::with_runtime(|runtime| {
             let values = unsafe { core::slice::from_raw_parts(excs, len) };
-            for value in values {
-                if (*value).is_null()
-                    || unsafe { !is_exception_instance(*value, runtime.exception_types.base_exception.cast_const()) }
-                {
-                    return raise_builtin_text(runtime, ExceptionKind::TypeError, "ExceptionGroup members must be exceptions");
-                }
-            }
-            match super::alloc_unicode(runtime, b"exception group") {
-                Ok(message) => match alloc_exception_object(
-                    runtime,
-                    runtime.exception_types.exception_group,
-                    message,
-                    ptr::null_mut(),
-                ) {
-                    Ok(group) => group,
-                    Err(message) => super::return_null_with_error(message),
-                },
-                Err(message) => super::return_null_with_error(message),
-            }
+            let message = match super::alloc_unicode(runtime, b"exception group") {
+                Ok(message) => message,
+                Err(message) => return super::return_null_with_error(message),
+            };
+            build_exception_group_checked(
+                runtime,
+                runtime.exception_types.exception_group,
+                &[message, match super::seq::alloc_tuple_from_slice(runtime, values) {
+                    Ok(tuple) => tuple,
+                    Err(message) => return super::return_null_with_error(message),
+                }],
+            )
         }) {
             Some(group) => group,
             None => super::return_null_with_error("runtime is not initialized"),
@@ -682,6 +1126,7 @@ mod tests {
         thread_state_lock().exception_state_stack.clear();
         thread_state_lock().handler_chain.clear();
         thread_state_lock().frame_stack.clear();
+        thread_state_lock().exc_star_stack.clear();
         traceback::clear_records();
     }
 

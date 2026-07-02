@@ -6,52 +6,64 @@
 //! the entry through `PyFunction::entry`, and keeps the executable module alive
 //! for as long as the owning [`TierUpDriver`] lives.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use cranelift_codegen::ir::AbiParam;
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module as ClifModule, ModuleError, default_libcall_names};
-use pon_codegen::baseline::{CodegenError, NameMap, compile_function as compile_baseline_function};
+use pon_codegen::baseline::{
+    CodegenError, NameMap, compile_function as compile_baseline_function, compile_osr_function, osr_live_values,
+};
 use pon_codegen::helpers::declare_helpers;
 use pon_codegen::isa::{OptLevel, make_isa};
 use pon_codegen::optimizing;
 use pon_codegen::{ModuleAnnotations, OptimizingPlan, infer_module_types, lowering_steps, plan_function};
-use pon_ir::ir::{BlockId, Function, InstKind, Module as IrModule, PyConst, Value};
-use pon_runtime::abi::{HELPERS, TIER1_CALL_THRESHOLD, TIER1_DEFERRED_CALL_THRESHOLD, TIER1_LOOP_THRESHOLD, pon_tierup_set_hook};
+use pon_ir::ir::{BlockId, Function, Module as IrModule};
+use pon_runtime::abi::{
+    HELPERS, TIER1_CALL_THRESHOLD, TIER1_LOOP_THRESHOLD, TierUpRootVisit, pon_tierup_set_hook,
+    pon_tierup_set_root_hook,
+};
 use pon_runtime::feedback::{FeedbackVec, TypeTag};
 use pon_runtime::object::{
-    PyFunction, PyObject, TIER_STATE_DEFERRED, TIER_STATE_DISABLED, TIER_STATE_QUEUED, TIER_STATE_TIER0,
-    TIER_STATE_TIER1, Tier1Code,
+    PyFunction, PyObject, TIER_STATE_DISABLED, TIER_STATE_QUEUED, TIER_STATE_TIER0, TIER_STATE_TIER1, Tier1Code,
 };
 
 /// Function-entry hotness threshold mirrored from the runtime probe.
 pub const CALL_THRESHOLD: u32 = TIER1_CALL_THRESHOLD;
 /// Loop-backedge hotness threshold mirrored from the runtime probe.
 pub const LOOP_THRESHOLD: u32 = TIER1_LOOP_THRESHOLD;
-const EAGER_RANGE_TRIP_THRESHOLD: i64 = 512;
-const HOT_RANGE_TRIP_THRESHOLD: i64 = 16;
 
 static ACTIVE_DRIVER: AtomicPtr<TierUpDriver> = AtomicPtr::new(ptr::null_mut());
 
 /// Process-local owner for tier-up metadata and installed tier-1 modules.
 pub struct TierUpDriver {
+    shared: Arc<Mutex<DriverShared>>,
+    pins: Arc<Mutex<HashSet<usize>>>,
+    compile_tx: Option<mpsc::Sender<CompileRequest>>,
+    compiler: Option<JoinHandle<()>>,
+    shutting_down: Arc<AtomicBool>,
+}
+
+struct DriverShared {
     modules: Vec<RegisteredModule>,
     functions: Vec<RegisteredFunction>,
     installed: Vec<Box<Tier1Compilation>>,
-    /// Producer half of the background compile queue (J0.5).  `None` until O1
-    /// spawns the compiler thread; the synchronous hook path stays authoritative.
-    /// `mpsc::Sender` is `Sync` (Rust ≥1.72), so FT-build producers share it directly.
-    #[allow(dead_code, reason = "J0.5 pin: consumed by O1 in a later wave")]
-    compile_tx: Option<mpsc::Sender<CompileRequest>>,
-    /// Background compiler thread handle, joined on Drop (J0.5).  `None` until O1.
-    #[allow(dead_code, reason = "J0.5 pin: consumed by O1 in a later wave")]
-    compiler: Option<JoinHandle<()>>,
+}
+
+impl DriverShared {
+    fn new() -> Self {
+        Self {
+            modules: Vec::new(),
+            functions: Vec::new(),
+            installed: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -62,6 +74,10 @@ struct RegisteredFunction {
     feedback_len: usize,
 }
 
+// SAFETY: Registered tier-0 entry pointers are immutable executable addresses
+// produced by Cranelift finalization and are used only for identity comparisons.
+unsafe impl Send for RegisteredFunction {}
+
 struct RegisteredModule {
     ir: IrModule,
 }
@@ -70,12 +86,20 @@ struct RegisteredModule {
 struct Tier1Compilation {
     module: JITModule,
     entry: *const u8,
+    osr_entry: *const u8,
+    osr_loop_header: Option<BlockId>,
     function_index: usize,
     feedback_len: usize,
     plan: OptimizingPlan,
     lowering_steps: Vec<pon_codegen::LoweringStep>,
     feedback: Vec<Option<(TypeTag, TypeTag)>>,
 }
+
+// SAFETY: A finalized `Tier1Compilation` is moved wholesale from the background
+// compiler into the driver-retained installed list. Its executable code is
+// immutable after `finalize_definitions`; the driver joins the compiler before
+// dropping retained modules.
+unsafe impl Send for Tier1Compilation {}
 
 #[allow(dead_code, reason = "tier-up failures are intentionally swallowed by the runtime hook after resetting the tier state")]
 #[derive(Debug)]
@@ -98,25 +122,37 @@ impl From<ModuleError> for TierUpCompileError {
 }
 
 impl TierUpDriver {
-    /// Build an empty driver. Call [`register_runtime_hook`] once the boxed driver
-    /// has a stable address.
+    /// Build an empty driver and spawn its single background compiler thread.
     #[must_use]
     pub fn new() -> Self {
+        let shared = Arc::new(Mutex::new(DriverShared::new()));
+        let pins = Arc::new(Mutex::new(HashSet::new()));
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let compiler_shared = Arc::clone(&shared);
+        let compiler_pins = Arc::clone(&pins);
+        let compiler_shutdown = Arc::clone(&shutting_down);
+        let compiler = std::thread::Builder::new()
+            .name("pon-tierup".to_owned())
+            .spawn(move || compiler_loop(compiler_shared, compiler_pins, compiler_shutdown, rx))
+            .expect("failed to spawn pon tier-up compiler thread");
         Self {
-            modules: Vec::new(),
-            functions: Vec::new(),
-            installed: Vec::new(),
-            compile_tx: None,
-            compiler: None,
+            shared,
+            pins,
+            compile_tx: Some(tx),
+            compiler: Some(compiler),
+            shutting_down,
         }
     }
 
     /// Record finalized tier-0 entrypoints for a just-compiled IR module.
     pub fn register_module(&mut self, ir_module: &IrModule, func_ids: &[FuncId], module: &JITModule) {
-        let module_index = self.modules.len();
-        self.modules.push(RegisteredModule { ir: ir_module.clone() });
+        let mut shared = self.shared.lock().expect("tier-up registry mutex poisoned");
+        let module_index = shared.modules.len();
+        shared.modules.push(RegisteredModule { ir: ir_module.clone() });
 
-        self.functions
+        shared
+            .functions
             .extend(ir_module.functions.iter().enumerate().filter_map(|(function_index, function)| {
                 let func_id = *func_ids.get(function_index)?;
                 let tier0_entry = module.get_finalized_function(func_id);
@@ -129,66 +165,68 @@ impl TierUpDriver {
             }));
     }
 
-    unsafe fn compile_and_install(&mut self, function: *mut PyFunction) {
-        if function.is_null() {
+    unsafe fn compile_and_install(&self, function: *mut PyFunction) {
+        let Some(request) = unsafe { self.prepare_request(function, CompileReason::Call) } else {
             return;
-        }
+        };
+        process_request(&self.shared, &self.pins, &self.shutting_down, request);
+    }
 
+    unsafe fn enqueue(&self, function: *mut PyFunction, reason: CompileReason) {
+        let Some(request) = unsafe { self.prepare_request(function, reason) } else {
+            return;
+        };
+        let Some(tx) = self.compile_tx.as_ref() else {
+            retire_queued_to_tier0(request.function.as_ptr());
+            unpin(&self.pins, request.function.as_ptr());
+            return;
+        };
+        if tx.send(request).is_err() {
+            retire_queued_to_tier0(function);
+            unpin(&self.pins, function);
+        }
+    }
+
+    unsafe fn prepare_request(&self, function: *mut PyFunction, reason: CompileReason) -> Option<CompileRequest> {
+        if function.is_null() {
+            return None;
+        }
         let function_ref = unsafe { &*function };
         if function_ref.tier_state.load(Ordering::Acquire) != TIER_STATE_QUEUED {
-            return;
+            return None;
         }
-
-        let Some(record) = self.find_record(function_ref.code).cloned() else {
-            disable_tierup(function_ref);
-            return;
+        let Some(ir_snapshot_id) = self.find_record_id(function_ref.code) else {
+            disable_queued(function_ref);
+            return None;
         };
-
-
-        let mut ir_module = self.modules[record.module_index].ir.clone();
-        infer_module_types(&mut ir_module, &ModuleAnnotations::default());
-        let Some(ir_function) = ir_module.functions.get(record.function_index) else {
-            disable_tierup(function_ref);
-            return;
+        let feedback_len = {
+            let shared = self.shared.lock().expect("tier-up registry mutex poisoned");
+            shared
+                .functions
+                .get(ir_snapshot_id.0 as usize)
+                .map(|record| record.feedback_len)
+                .unwrap_or(0)
         };
-        let static_range_trip = max_static_range_trip(&ir_module, ir_function);
-        if static_range_trip.is_none() {
-            disable_tierup(function_ref);
-            return;
-        }
-        if should_defer_tierup(function_ref, static_range_trip.unwrap_or(0)) {
-            defer_tierup(function_ref);
-            return;
-        }
-
-        unsafe { ensure_feedback(function_ref, record.feedback_len) };
-        let feedback = unsafe { feedback_snapshot(function_ref, record.feedback_len) };
-        let Some(plan) = plan_function(ir_function) else {
-            disable_tierup(function_ref);
-            return;
-        };
-        let steps = lowering_steps(&plan);
-        match compile_tier1_module(&ir_module, record.function_index, record.feedback_len, feedback, plan, steps) {
-            Ok(compilation) if compilation.entry != record.tier0_entry => self.install(function_ref, compilation),
-            Ok(_) | Err(_) => disable_tierup(function_ref),
-        }
+        unsafe { ensure_feedback(function_ref, feedback_len) };
+        let feedback_snapshot = unsafe { feedback_snapshot(function_ref, feedback_len) };
+        pin(&self.pins, function);
+        Some(CompileRequest {
+            // SAFETY: `pin` inserted the function into the GC-visible pin set.
+            function: unsafe { SendPtr::new(function) },
+            ir_snapshot_id,
+            feedback_snapshot,
+            reason,
+        })
     }
 
-    fn find_record(&self, tier0_entry: *const u8) -> Option<&RegisteredFunction> {
-        self.functions.iter().rev().find(|record| record.tier0_entry == tier0_entry)
-    }
-
-    fn install(&mut self, function: &PyFunction, compilation: Tier1Compilation) {
-        let mut compilation = Box::new(compilation);
-        let entry = compilation.entry;
-        let handle = (&mut *compilation as *mut Tier1Compilation).cast::<c_void>();
-
-        unsafe {
-            *function.tier1.get() = Some(Tier1Code { entry, handle });
-        }
-        function.entry.store(entry.cast_mut(), Ordering::Release);
-        function.tier_state.store(TIER_STATE_TIER1, Ordering::Release);
-        self.installed.push(compilation);
+    fn find_record_id(&self, tier0_entry: *const u8) -> Option<IrSnapshotId> {
+        let shared = self.shared.lock().expect("tier-up registry mutex poisoned");
+        shared
+            .functions
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, record)| (record.tier0_entry == tier0_entry).then_some(IrSnapshotId(index as u32)))
     }
 }
 
@@ -199,15 +237,8 @@ impl Default for TierUpDriver {
 }
 
 impl Drop for TierUpDriver {
-    /// J0.5 shutdown contract: close the queue, then drain-join the compiler.
-    ///
-    /// Dropping `compile_tx` hangs up the channel; the compiler thread observes
-    /// the hangup, resets every still-`QUEUED` request back to tier-0 without
-    /// compiling, and exits.  `join` then blocks until that drain finishes so no
-    /// compiler-thread access to driver-owned registries can outlive the driver.
-    /// The owning `JitEngine` unregisters the runtime hook before this runs, so
-    /// no new requests can be enqueued during the drain.
     fn drop(&mut self) {
+        self.shutting_down.store(true, Ordering::Release);
         drop(self.compile_tx.take());
         if let Some(compiler) = self.compiler.take() {
             let _ = compiler.join();
@@ -221,7 +252,12 @@ impl Drop for TierUpDriver {
 /// stable across moves of the owning JIT engine.
 pub fn register_runtime_hook(driver: &mut TierUpDriver) {
     ACTIVE_DRIVER.store(driver as *mut TierUpDriver, Ordering::Release);
-    unsafe { pon_tierup_set_hook((tierup_hook as *const ()).cast_mut()) };
+    unsafe { pon_tierup_set_root_hook((tierup_pin_roots as *const ()).cast_mut()) };
+    if std::env::var_os("PON_TIER0_ONLY").is_some() {
+        unsafe { pon_tierup_set_hook(ptr::null_mut()) };
+    } else {
+        unsafe { pon_tierup_set_hook((tierup_hook as *const ()).cast_mut()) };
+    }
 }
 
 /// Clear the runtime hook if it still points at `driver`.
@@ -231,20 +267,159 @@ pub fn unregister_runtime_hook(driver: &TierUpDriver) {
         .compare_exchange(expected, ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
-        unsafe { pon_tierup_set_hook(ptr::null_mut()) };
+        unsafe {
+            pon_tierup_set_hook(ptr::null_mut());
+            pon_tierup_set_root_hook(ptr::null_mut());
+        }
     }
 }
 
-unsafe extern "C" fn tierup_hook(function: *mut PyFunction) {
+unsafe extern "C" fn tierup_hook(function: *mut PyFunction, reason: u32) {
     let driver = ACTIVE_DRIVER.load(Ordering::Acquire);
     if driver.is_null() {
         if !function.is_null() {
-            reset_to_tier0(unsafe { &*function });
+            retire_queued_to_tier0(function);
         }
         return;
     }
 
-    unsafe { (*driver).compile_and_install(function) };
+    let reason = decode_reason(reason);
+    unsafe { (*driver).enqueue(function, reason) };
+}
+
+unsafe extern "C" fn tierup_pin_roots(visit: TierUpRootVisit, ctx: *mut c_void) {
+    let driver = ACTIVE_DRIVER.load(Ordering::Acquire);
+    if driver.is_null() {
+        return;
+    }
+    let pins = unsafe { (*driver).pins.lock().expect("tier-up pin mutex poisoned") };
+    for address in pins.iter().copied() {
+        unsafe { visit(address as *mut u8, ctx) };
+    }
+}
+
+fn decode_reason(reason: u32) -> CompileReason {
+    if reason == 0 {
+        CompileReason::Call
+    } else {
+        CompileReason::LoopBackEdge(BlockId(reason - 1))
+    }
+}
+
+fn compiler_loop(
+    shared: Arc<Mutex<DriverShared>>,
+    pins: Arc<Mutex<HashSet<usize>>>,
+    shutting_down: Arc<AtomicBool>,
+    rx: mpsc::Receiver<CompileRequest>,
+) {
+    while let Ok(request) = rx.recv() {
+        if shutting_down.load(Ordering::Acquire) {
+            retire_queued_to_tier0(request.function.as_ptr());
+            unpin(&pins, request.function.as_ptr());
+            continue;
+        }
+        process_request(&shared, &pins, &shutting_down, request);
+    }
+}
+
+fn process_request(
+    shared: &Arc<Mutex<DriverShared>>,
+    pins: &Arc<Mutex<HashSet<usize>>>,
+    shutting_down: &AtomicBool,
+    request: CompileRequest,
+) {
+    let function = request.function.as_ptr();
+    if function.is_null() {
+        return;
+    }
+    if shutting_down.load(Ordering::Acquire) {
+        retire_queued_to_tier0(function);
+        unpin(pins, function);
+        return;
+    }
+    let function_ref = unsafe { &*function };
+    if function_ref.tier_state.load(Ordering::Acquire) != TIER_STATE_QUEUED {
+        unpin(pins, function);
+        return;
+    }
+
+    let Some((record, mut ir_module)) = clone_registered_ir(shared, request.ir_snapshot_id) else {
+        disable_queued(function_ref);
+        unpin(pins, function);
+        return;
+    };
+    infer_module_types(&mut ir_module, &ModuleAnnotations::default());
+    let Some(ir_function) = ir_module.functions.get(record.function_index) else {
+        disable_queued(function_ref);
+        unpin(pins, function);
+        return;
+    };
+    let Some(plan) = plan_function(ir_function) else {
+        disable_queued(function_ref);
+        unpin(pins, function);
+        return;
+    };
+    let steps = lowering_steps(&plan);
+    let compile_result = compile_tier1_module(
+        &ir_module,
+        record.function_index,
+        record.feedback_len,
+        request.feedback_snapshot,
+        request.reason,
+        plan,
+        steps,
+    );
+    match compile_result {
+        Ok(compilation) if compilation.entry != record.tier0_entry => {
+            install_compilation(shared, function_ref, compilation);
+        }
+        Ok(_) | Err(_) => {
+            disable_queued(function_ref);
+        }
+    }
+    unpin(pins, function);
+}
+
+fn clone_registered_ir(shared: &Arc<Mutex<DriverShared>>, snapshot: IrSnapshotId) -> Option<(RegisteredFunction, IrModule)> {
+    let shared = shared.lock().expect("tier-up registry mutex poisoned");
+    let record = shared.functions.get(snapshot.0 as usize)?.clone();
+    let module = shared.modules.get(record.module_index)?.ir.clone();
+    Some((record, module))
+}
+
+fn install_compilation(shared: &Arc<Mutex<DriverShared>>, function: &PyFunction, compilation: Tier1Compilation) -> bool {
+    if function
+        .tier_state
+        .compare_exchange(TIER_STATE_QUEUED, TIER_STATE_TIER1, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+
+    let mut compilation = Box::new(compilation);
+    let entry = compilation.entry;
+    let osr_entry = compilation.osr_entry;
+    let osr_loop_header = compilation.osr_loop_header;
+    let handle = (&mut *compilation as *mut Tier1Compilation).cast::<c_void>();
+
+    unsafe {
+        *function.tier1.get() = Some(Tier1Code { entry, handle });
+    }
+    function.deopt_count.store(0, Ordering::Release);
+    function.entry.store(entry.cast_mut(), Ordering::Release);
+    if let Some(header) = osr_loop_header {
+        function.osr_loop_header.store(header.0, Ordering::Relaxed);
+        function.osr_entry.store(osr_entry.cast_mut(), Ordering::Release);
+    } else {
+        function.osr_entry.store(ptr::null_mut(), Ordering::Release);
+    }
+
+    shared
+        .lock()
+        .expect("tier-up registry mutex poisoned")
+        .installed
+        .push(compilation);
+    true
 }
 
 fn compile_tier1_module(
@@ -252,12 +427,14 @@ fn compile_tier1_module(
     function_index: usize,
     feedback_len: usize,
     feedback: Vec<Option<(TypeTag, TypeTag)>>,
+    reason: CompileReason,
     plan: OptimizingPlan,
     lowering_steps: Vec<pon_codegen::LoweringStep>,
 ) -> Result<Tier1Compilation, TierUpCompileError> {
     let mut module = make_tier1_module();
     let helpers = declare_helpers(&mut module)?;
     let func_ids = declare_tier1_functions(&mut module, ir_module)?;
+    let osr = prepare_osr_entry(&mut module, ir_module, function_index, reason)?;
     let names = NameMap::from_ir_module(ir_module);
     let entry_arg_counts = pon_codegen::baseline::entry_arg_counts(ir_module);
     let mut ctx = module.make_context();
@@ -289,15 +466,40 @@ fn compile_tier1_module(
         }
         module.define_function(func_ids[index], &mut ctx)?;
     }
+    if let Some((osr_id, header, live_values)) = &osr {
+        let function = ir_module
+            .functions
+            .get(function_index)
+            .ok_or(TierUpCompileError::MissingFunction { function_index })?;
+        compile_osr_function(
+            &mut module,
+            &helpers,
+            &func_ids,
+            &ir_module.functions,
+            &names,
+            function,
+            *header,
+            live_values,
+            &mut ctx,
+            &mut fctx,
+        )?;
+        module.define_function(*osr_id, &mut ctx)?;
+    }
     module.finalize_definitions()?;
     let func_id = *func_ids
         .get(function_index)
         .ok_or(TierUpCompileError::MissingFunction { function_index })?;
     let entry = module.get_finalized_function(func_id);
+    let (osr_entry, osr_loop_header) = osr
+        .as_ref()
+        .map(|(id, header, _)| (module.get_finalized_function(*id), Some(*header)))
+        .unwrap_or((ptr::null(), None));
 
     Ok(Tier1Compilation {
         module,
         entry,
+        osr_entry,
+        osr_loop_header,
         function_index,
         feedback_len,
         plan,
@@ -331,6 +533,34 @@ fn declare_tier1_functions(module: &mut JITModule, ir_module: &IrModule) -> Resu
         .collect()
 }
 
+fn prepare_osr_entry(
+    module: &mut JITModule,
+    ir_module: &IrModule,
+    function_index: usize,
+    reason: CompileReason,
+) -> Result<Option<(FuncId, BlockId, Vec<pon_ir::ir::Value>)>, ModuleError> {
+    let CompileReason::LoopBackEdge(header) = reason else {
+        return Ok(None);
+    };
+    let Some(function) = ir_module.functions.get(function_index) else {
+        return Ok(None);
+    };
+    let live_values = osr_live_values(function, header);
+    if function.n_locals.saturating_add(live_values.len()) > OSR_MAX_LIVE {
+        return Ok(None);
+    }
+    let mut sig = module.make_signature();
+    let ptr_ty = module.target_config().pointer_type();
+    sig.params.push(AbiParam::new(ptr_ty));
+    sig.returns.push(AbiParam::new(ptr_ty));
+    let id = module.declare_function(
+        &format!("__pon_tier1_osr_fn_{function_index}_block_{}", header.0),
+        Linkage::Local,
+        &sig,
+    )?;
+    Ok(Some((id, header, live_values)))
+}
+
 fn feedback_len(function: &Function) -> usize {
     function
         .blocks
@@ -341,7 +571,6 @@ fn feedback_len(function: &Function) -> usize {
         .max()
         .unwrap_or(0)
 }
-
 
 unsafe fn feedback_snapshot(function: &PyFunction, len: usize) -> Vec<Option<(TypeTag, TypeTag)>> {
     if len == 0 {
@@ -370,87 +599,42 @@ unsafe fn ensure_feedback(function: &PyFunction, len: usize) {
     }
 }
 
-fn reset_to_tier0(function: &PyFunction) {
-    function.entry.store(function.code.cast_mut(), Ordering::Release);
-    function.tier_state.store(TIER_STATE_TIER0, Ordering::Release);
+fn pin(pins: &Arc<Mutex<HashSet<usize>>>, function: *mut PyFunction) {
+    pins.lock()
+        .expect("tier-up pin mutex poisoned")
+        .insert(function as usize);
 }
 
-fn disable_tierup(function: &PyFunction) {
-    function.entry.store(function.code.cast_mut(), Ordering::Release);
-    function.tier_state.store(TIER_STATE_DISABLED, Ordering::Release);
+fn unpin(pins: &Arc<Mutex<HashSet<usize>>>, function: *mut PyFunction) {
+    pins.lock()
+        .expect("tier-up pin mutex poisoned")
+        .remove(&(function as usize));
 }
 
-fn defer_tierup(function: &PyFunction) {
-    function.entry.store(function.code.cast_mut(), Ordering::Release);
-    function.tier_state.store(TIER_STATE_DEFERRED, Ordering::Release);
-}
-
-fn should_defer_tierup(function_ref: &PyFunction, max_trip: i64) -> bool {
-    if max_trip >= EAGER_RANGE_TRIP_THRESHOLD {
-        return false;
+fn retire_queued_to_tier0(function: *mut PyFunction) {
+    if function.is_null() {
+        return;
     }
-
-    let call_hotness = function_ref.hotness.load(Ordering::Acquire);
-    let loop_hotness = function_ref.loop_hotness.load(Ordering::Acquire);
-    if max_trip >= HOT_RANGE_TRIP_THRESHOLD
-        && (call_hotness >= TIER1_DEFERRED_CALL_THRESHOLD || loop_hotness >= TIER1_LOOP_THRESHOLD)
+    let function = unsafe { &*function };
+    if function
+        .tier_state
+        .compare_exchange(TIER_STATE_QUEUED, TIER_STATE_TIER0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
     {
-        return false;
-    }
-
-    true
-}
-
-fn max_static_range_trip(ir_module: &IrModule, function: &Function) -> Option<i64> {
-    let mut const_ints = HashMap::<Value, i64>::new();
-    let mut range_callees = HashSet::<Value>::new();
-    let mut max_trip = None;
-
-    for inst in function.blocks.iter().flat_map(|block| block.insts.iter()) {
-        match &inst.kind {
-            InstKind::Const(PyConst::Int(value)) => {
-                const_ints.insert(inst.result, *value);
-            }
-            InstKind::LoadBuiltin(name) | InstKind::LoadGlobal(name) | InstKind::LoadName(name)
-                if ir_module.names.get(name.0 as usize).is_some_and(|name| name == "range") =>
-            {
-                range_callees.insert(inst.result);
-            }
-            InstKind::Call { callee, args } if range_callees.contains(callee) => {
-                if let Some(trip) = static_range_trip(args, &const_ints) {
-                    max_trip = Some(max_trip.map_or(trip, |current: i64| current.max(trip)));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    max_trip
-}
-
-fn static_range_trip(args: &[Value], const_ints: &HashMap<Value, i64>) -> Option<i64> {
-    match args {
-        [stop] => range_trip(0, *const_ints.get(stop)?, 1),
-        [start, stop] => range_trip(*const_ints.get(start)?, *const_ints.get(stop)?, 1),
-        [start, stop, step] => range_trip(
-            *const_ints.get(start)?,
-            *const_ints.get(stop)?,
-            *const_ints.get(step)?,
-        ),
-        _ => None,
+        function.entry.store(function.code.cast_mut(), Ordering::Release);
+        function.osr_entry.store(ptr::null_mut(), Ordering::Release);
     }
 }
 
-fn range_trip(start: i64, stop: i64, step: i64) -> Option<i64> {
-    if step == 0 {
-        return None;
+fn disable_queued(function: &PyFunction) {
+    if function
+        .tier_state
+        .compare_exchange(TIER_STATE_QUEUED, TIER_STATE_DISABLED, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        function.entry.store(function.code.cast_mut(), Ordering::Release);
+        function.osr_entry.store(ptr::null_mut(), Ordering::Release);
     }
-    let distance = if step > 0 { stop - start } else { start - stop };
-    if distance <= 0 {
-        return Some(0);
-    }
-    let step = step.abs();
-    Some((distance + step - 1) / step)
 }
 
 // ─── J0.5 pin: OSR + background compilation (implemented by O1) ─────────────
@@ -458,7 +642,7 @@ fn range_trip(start: i64, stop: i64, step: i64) -> Option<i64> {
 // Frozen interfaces for the background-compilation and OSR-entry contracts.
 // See `plans/pon-pin-J05-osr-bg-compile.md` for the full design: queue
 // lifecycle, install protocol, tier-state machine, OSR transfer layout, and
-// the deopt-thrash suppression policy that replaces `should_defer_tierup`.
+// deopt-thrash back-off.
 
 /// Maximum number of boxed slots an [`OsrTransferBuffer`] can carry.
 ///
@@ -467,7 +651,7 @@ fn range_trip(start: i64, stop: i64, step: i64) -> Option<i64> {
 pub const OSR_MAX_LIVE: usize = 16;
 
 /// Deopt count within one tier-1 epoch that triggers a thrash reset (J0.5
-/// suppression replacement; see the design doc, §5).
+/// back-off policy; see the design doc, §5).
 pub const DEOPT_THRASH_THRESHOLD: u32 = 64;
 /// Maximum exponent for the thrash re-try hotness backoff (`threshold << epoch`).
 pub const DEOPT_BACKOFF_MAX_SHIFT: u32 = 6;
@@ -591,6 +775,7 @@ pub type OsrEntryFn = unsafe extern "C" fn(buffer: *mut OsrTransferBuffer) -> *m
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
     use pon_codegen::{ModuleAnnotations, infer_module_types, plan_function};
     use pon_ir::Type;
@@ -623,23 +808,26 @@ mod tests {
         );
 
         let tier0_entry = 1_usize as *const u8;
-        let mut driver = TierUpDriver::new();
-        driver.modules.push(RegisteredModule { ir: ir_module });
-        driver.functions.push(RegisteredFunction {
-            tier0_entry,
-            module_index: 0,
-            function_index: 0,
-            feedback_len: 0,
-        });
+        let driver = TierUpDriver::new();
+        {
+            let mut shared = driver.shared.lock().expect("test tier-up mutex");
+            shared.modules.push(RegisteredModule { ir: ir_module });
+            shared.functions.push(RegisteredFunction {
+                tier0_entry,
+                module_index: 0,
+                function_index: 0,
+                feedback_len: 0,
+            });
+        }
 
         let mut function = PyFunction::new(std::ptr::null(), tier0_entry, 0, 0);
         function.tier_state.store(TIER_STATE_QUEUED, Ordering::Release);
-        function.hotness.store(TIER1_DEFERRED_CALL_THRESHOLD, Ordering::Release);
+        function.hotness.store(CALL_THRESHOLD, Ordering::Release);
 
         unsafe { driver.compile_and_install(&mut function) };
 
         assert_eq!(
-            inferred_type(&driver.modules[0].ir, Value(7)),
+            inferred_type(&driver.shared.lock().expect("test tier-up mutex").modules[0].ir, Value(7)),
             Type::Bottom,
             "tier-up should infer a cloned module and leave the registered tier-0 IR raw"
         );
@@ -653,7 +841,8 @@ mod tests {
             TIER_STATE_DISABLED,
             "successful tier-up must not leave the function permanently disabled"
         );
-        let compilation = driver
+        let shared = driver.shared.lock().expect("test tier-up mutex");
+        let compilation = shared
             .installed
             .first()
             .expect("typed clone should produce an optimizing tier-1 compilation");
@@ -673,16 +862,19 @@ mod tests {
     fn failed_tier_up_disables_future_queue_attempts() {
         let tier0_entry = 1_usize as *const u8;
         let unknown_entry = 2_usize as *const u8;
-        let mut driver = TierUpDriver::new();
-        driver.modules.push(RegisteredModule {
-            ir: arithmetic_range_loop_module(),
-        });
-        driver.functions.push(RegisteredFunction {
-            tier0_entry,
-            module_index: 0,
-            function_index: 0,
-            feedback_len: 0,
-        });
+        let driver = TierUpDriver::new();
+        {
+            let mut shared = driver.shared.lock().expect("test tier-up mutex");
+            shared.modules.push(RegisteredModule {
+                ir: arithmetic_range_loop_module(),
+            });
+            shared.functions.push(RegisteredFunction {
+                tier0_entry,
+                module_index: 0,
+                function_index: 0,
+                feedback_len: 0,
+            });
+        }
 
         let mut function = PyFunction::new(std::ptr::null(), unknown_entry, 0, 0);
         function.entry.store(unknown_entry.cast_mut(), Ordering::Release);
@@ -700,6 +892,99 @@ mod tests {
             unknown_entry,
             "failed tier-up keeps dispatching through the tier-0 entry"
         );
+    }
+
+    #[test]
+    fn background_queue_installs_and_unpins_function() {
+        let tier0_entry = 1_usize as *const u8;
+        let driver = TierUpDriver::new();
+        {
+            let mut shared = driver.shared.lock().expect("test tier-up mutex");
+            shared.modules.push(RegisteredModule {
+                ir: arithmetic_range_loop_module(),
+            });
+            shared.functions.push(RegisteredFunction {
+                tier0_entry,
+                module_index: 0,
+                function_index: 0,
+                feedback_len: 0,
+            });
+        }
+
+        let mut function = PyFunction::new(std::ptr::null(), tier0_entry, 0, 0);
+        function.tier_state.store(TIER_STATE_QUEUED, Ordering::Release);
+        unsafe { driver.enqueue(&mut function, CompileReason::Call) };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while function.tier_state.load(Ordering::Acquire) == TIER_STATE_QUEUED && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(function.tier_state.load(Ordering::Acquire), TIER_STATE_TIER1);
+        assert!(
+            driver.pins.lock().expect("test pin mutex").is_empty(),
+            "completed background request must unpin the function"
+        );
+        assert_eq!(driver.shared.lock().expect("test tier-up mutex").installed.len(), 1);
+    }
+
+    #[test]
+    fn install_publishes_osr_entry_when_compilation_has_one() {
+        let tier0_entry = 1_usize as *const u8;
+        let tier1_entry = 2_usize as *const u8;
+        let osr_entry = 3_usize as *const u8;
+        let driver = TierUpDriver::new();
+        let mut inferred_module = arithmetic_range_loop_module();
+        infer_module_types(&mut inferred_module, &ModuleAnnotations::default());
+        let plan = plan_function(&inferred_module.functions[0]).expect("fixture should plan");
+        let compilation = Tier1Compilation {
+            module: make_tier1_module(),
+            entry: tier1_entry,
+            osr_entry,
+            osr_loop_header: Some(BlockId(1)),
+            function_index: 0,
+            feedback_len: 0,
+            plan,
+            lowering_steps: Vec::new(),
+            feedback: Vec::new(),
+        };
+        let mut function = PyFunction::new(std::ptr::null(), tier0_entry, 0, 0);
+        function.tier_state.store(TIER_STATE_QUEUED, Ordering::Release);
+
+        assert!(install_compilation(&driver.shared, &function, compilation));
+        assert_eq!(function.tier_state.load(Ordering::Acquire), TIER_STATE_TIER1);
+        assert_eq!(function.entry.load(Ordering::Acquire).cast_const(), tier1_entry);
+        assert_eq!(function.osr_loop_header.load(Ordering::Relaxed), 1);
+        assert_eq!(function.osr_entry.load(Ordering::Acquire).cast_const(), osr_entry);
+    }
+
+    #[test]
+    fn deopt_note_defers_then_eventually_disables_thrashing_function() {
+        let tier0_entry = 1_usize as *const u8;
+        let tier1_entry = 2_usize as *mut u8;
+        let mut function = PyFunction::new(std::ptr::null(), tier0_entry, 0, 0);
+        function.entry.store(tier1_entry, Ordering::Release);
+        function.tier_state.store(TIER_STATE_TIER1, Ordering::Release);
+        function.deopt_count.store(DEOPT_THRASH_THRESHOLD - 1, Ordering::Release);
+        function.hotness.store(CALL_THRESHOLD, Ordering::Release);
+        function.loop_hotness.store(LOOP_THRESHOLD, Ordering::Release);
+
+        unsafe { pon_runtime::abi::pon_deopt_note((&mut function as *mut PyFunction).cast::<PyObject>()) };
+        assert_eq!(function.tier_state.load(Ordering::Acquire), pon_runtime::object::TIER_STATE_DEFERRED);
+        assert_eq!(function.entry.load(Ordering::Acquire).cast_const(), tier0_entry);
+        assert_eq!(function.tier_epoch.load(Ordering::Acquire), 1);
+        assert_eq!(function.deopt_count.load(Ordering::Acquire), 0);
+        assert_eq!(function.hotness.load(Ordering::Acquire), 0);
+        assert_eq!(function.loop_hotness.load(Ordering::Acquire), 0);
+
+        function.entry.store(tier1_entry, Ordering::Release);
+        function.tier_state.store(TIER_STATE_TIER1, Ordering::Release);
+        function.tier_epoch.store(DEOPT_PIN_EPOCH, Ordering::Release);
+        function.deopt_count.store(DEOPT_THRASH_THRESHOLD - 1, Ordering::Release);
+
+        unsafe { pon_runtime::abi::pon_deopt_note((&mut function as *mut PyFunction).cast::<PyObject>()) };
+        assert_eq!(function.tier_state.load(Ordering::Acquire), TIER_STATE_DISABLED);
+        assert_eq!(function.entry.load(Ordering::Acquire).cast_const(), tier0_entry);
     }
 
     fn arithmetic_range_loop_module() -> IrModule {
