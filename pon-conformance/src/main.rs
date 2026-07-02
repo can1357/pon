@@ -2,6 +2,7 @@
 
 mod aot;
 mod full;
+mod fuzz;
 mod ledger;
 mod ratchet;
 mod scoreboard;
@@ -29,6 +30,8 @@ struct Cli {
     timeout: Option<u64>,
     shard: Option<(u32, u32)>,
     jobs: Option<usize>,
+    seed: Option<u64>,
+    count: Option<usize>,
     bench: bool,
 }
 
@@ -63,27 +66,43 @@ fn run_cli() -> Result<()> {
     let root = suite::workspace_root();
 
     // Pinned validation (J0.7 §2): the full-suite flags are CLI errors with
-    // any other suite; floor ops on a partial full run are CLI errors.
-    if cli.suite == SuiteName::CpythonFull {
-        if (cli.check_floor || cli.update_floor || cli.diff_floor) && (cli.shard.is_some() || !cli.modules.is_empty()) {
-            bail!("floor operations require an unsharded, unfiltered run")
-        }
-    } else {
+    // most other suites; floor ops on partial full/parity runs are CLI errors.
+    if matches!(cli.suite, SuiteName::CpythonFull | SuiteName::AotParity)
+        && (cli.check_floor || cli.update_floor || cli.diff_floor)
+        && (cli.shard.is_some() || !cli.modules.is_empty())
+    {
+        bail!("floor operations require an unsharded, unfiltered run")
+    }
+    if cli.suite != SuiteName::CpythonFull {
         if cli.timeout.is_some() {
             bail!("`--timeout` is only defined for `--suite cpython-full`")
         }
         if cli.shard.is_some() {
             bail!("`--shard` is only defined for `--suite cpython-full`")
         }
-        if cli.jobs.is_some() {
-            bail!("`--jobs` is only defined for `--suite cpython-full`")
+    }
+    if !matches!(cli.suite, SuiteName::CpythonFull | SuiteName::Fuzz) && cli.jobs.is_some() {
+        bail!("`--jobs` is only defined for `--suite cpython-full` or `--suite fuzz`")
+    }
+    if cli.seed.is_some() && cli.suite != SuiteName::Fuzz {
+        bail!("`--seed` is only defined for `--suite fuzz`")
+    }
+    if cli.count.is_some() && cli.suite != SuiteName::Fuzz {
+        bail!("`--count` is only defined for `--suite fuzz`")
+    }
+    if cli.suite == SuiteName::Fuzz {
+        if cli.check_floor || cli.update_floor || cli.diff_floor {
+            bail!("floor operations are not defined for `--suite fuzz`")
         }
-        if cli.diff_floor {
-            bail!("`--diff-floor` is only defined for `--suite cpython-full`")
+        if !cli.modules.is_empty() {
+            bail!("`--modules` is not defined for `--suite fuzz`")
         }
     }
+    if cli.diff_floor && !matches!(cli.suite, SuiteName::CpythonFull | SuiteName::AotParity) {
+        bail!("`--diff-floor` is only defined for `--suite cpython-full` or `--suite aot-parity`")
+    }
 
-    // The four legacy suites take module *paths*; convert verbatim.
+    // Path-taking suites convert selectors to workspace/vendored paths verbatim.
     let module_paths = cli.modules.iter().map(PathBuf::from).collect::<Vec<_>>();
 
     if cli.bench {
@@ -153,6 +172,30 @@ fn run_cli() -> Result<()> {
                 bail!("one or more AoT subset scripts failed differential verification")
             }
         }
+        (_, SuiteName::AotParity) => {
+            let floor = ratchet::Floor::read_or_default_at(&root, aot::AOT_PARITY_FLOOR_FILE)?;
+            let report = aot::run_aot_parity_suite(&root, &module_paths)?;
+            aot::write_aot_parity_results(&root, &report)?;
+            println!("{}", report.to_json());
+
+            if cli.diff_floor {
+                eprint!("{}", ratchet::diff_floor(&floor, report.scoreboard()));
+            }
+
+            if cli.check_floor {
+                let floor_check = ratchet::check_floor(&floor, report.scoreboard());
+                if !floor_check.is_ok() {
+                    bail!("{}", floor_check.message())
+                }
+            }
+
+            if cli.update_floor {
+                let cpython_tag = report.scoreboard().cpython_tag.as_deref().unwrap_or(&floor.cpython_tag);
+                ratchet::write_floor_from_scoreboard_at(&root, aot::AOT_PARITY_FLOOR_FILE, cpython_tag, report.scoreboard())?;
+            }
+            // Meter contract: aot-fail/aot-error records are bugs to report, not
+            // process-failing conditions. Floor checks are the gate.
+        }
         (Mode::Jit, SuiteName::FtStress) => {
             if cli.check_floor || cli.update_floor {
                 bail!("floor checks are only defined for `--suite cpython`")
@@ -193,14 +236,26 @@ fn run_cli() -> Result<()> {
             // Pinned exit contract (§10): fail/unsupported records do NOT
             // affect the exit code for this suite.
         }
+        (Mode::Jit, SuiteName::Fuzz) => {
+            let opts = fuzz::FuzzOptions {
+                seed: cli.seed.unwrap_or(0),
+                count: cli.count.unwrap_or(100),
+                jobs: cli.jobs.unwrap_or_else(default_jobs),
+            };
+            let summary = fuzz::run_fuzz_suite(&root, &opts)?;
+            println!("{}", summary.summary_line(&root));
+        }
         (Mode::Jit, SuiteName::CpythonAotSubset) => {
             bail!("`--suite cpython-aot-subset` requires `--mode aot`")
         }
         (Mode::Aot, SuiteName::CpythonFull) => {
             bail!("`--suite cpython-full` requires `--mode jit`")
         }
+        (Mode::Aot, SuiteName::Fuzz) => {
+            bail!("`--suite fuzz` requires `--mode jit`")
+        }
         (Mode::Aot, SuiteName::Slice | SuiteName::Cpython | SuiteName::FtStress) => {
-            bail!("`--mode aot` requires `--suite cpython-aot-subset`")
+            bail!("`--mode aot` requires `--suite cpython-aot-subset` or `--suite aot-parity`")
         }
     }
 
@@ -217,6 +272,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
     let mut timeout = None;
     let mut shard = None;
     let mut jobs = None;
+    let mut seed = None;
+    let mut count = None;
     let mut bench = false;
     let mut args = args.into_iter().peekable();
 
@@ -254,6 +311,18 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
                 }
                 jobs = Some(count);
             }
+            "--seed" => {
+                let value = args.next().ok_or_else(usage)?;
+                seed = Some(value.parse::<u64>().with_context(|| format!("invalid `--seed` value `{value}`"))?);
+            }
+            "--count" => {
+                let value = args.next().ok_or_else(usage)?;
+                let parsed = value.parse::<usize>().with_context(|| format!("invalid `--count` value `{value}`"))?;
+                if parsed == 0 {
+                    bail!("`--count` must be at least 1")
+                }
+                count = Some(parsed);
+            }
             "--modules" => {
                 let before = modules.len();
                 while let Some(next) = args.peek() {
@@ -281,6 +350,8 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
         timeout,
         shard,
         jobs,
+        seed,
+        count,
     })
 }
 
@@ -308,7 +379,7 @@ fn default_jobs() -> usize {
 
 fn usage() -> anyhow::Error {
     anyhow::anyhow!(
-        "usage: pon-conformance [--bench] [--mode jit|aot] [--suite slice|cpython|cpython-aot-subset|cpython-full|ft-stress] [--check-floor] [--update-floor] [--diff-floor] [--modules <selectors...>] [--timeout <secs>] [--shard <i>/<N>] [--jobs <J>]"
+        "usage: pon-conformance [--bench] [--mode jit|aot] [--suite slice|cpython|cpython-aot-subset|aot-parity|cpython-full|ft-stress|fuzz] [--check-floor] [--update-floor] [--diff-floor] [--modules <selectors...>] [--timeout <secs>] [--shard <i>/<N>] [--jobs <J>] [--seed N] [--count K]"
     )
 }
 

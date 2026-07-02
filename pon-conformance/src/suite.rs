@@ -16,8 +16,10 @@ pub enum SuiteName {
     Slice,
     Cpython,
     CpythonAotSubset,
+    AotParity,
     CpythonFull,
     FtStress,
+    Fuzz,
 }
 
 impl SuiteName {
@@ -26,8 +28,10 @@ impl SuiteName {
             "slice" => Ok(Self::Slice),
             "cpython" => Ok(Self::Cpython),
             "cpython-aot-subset" => Ok(Self::CpythonAotSubset),
+            "aot-parity" => Ok(Self::AotParity),
             "cpython-full" => Ok(Self::CpythonFull),
             "ft-stress" => Ok(Self::FtStress),
+            "fuzz" => Ok(Self::Fuzz),
             _ => bail!("unsupported suite `{value}`"),
         }
     }
@@ -209,7 +213,7 @@ pub fn run_ft_stress_suite(root: &Path, requested_modules: &[PathBuf]) -> Result
 }
 
 
-fn cpython_manifest_modules(root: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn cpython_manifest_modules(root: &Path) -> Result<Vec<PathBuf>> {
     let manifest = root.join(CPYTHON_MANIFEST);
     let text = fs::read_to_string(&manifest).with_context(|| format!("failed to read `{}`", manifest.display()))?;
     let mut modules = Vec::new();
