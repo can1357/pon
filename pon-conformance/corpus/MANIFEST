@@ -3,6 +3,7 @@ pon-conformance/corpus/cpython/classes_inheritance_super.py
 pon-conformance/corpus/cpython/exceptions_finally_else.py
 pon-conformance/corpus/cpython/exceptions_raise_from.py
 pon-conformance/corpus/cpython/generators_plain_yield.py
+pon-conformance/corpus/cpython/gen_try_stack.py
 pon-conformance/corpus/cpython/dict_methods.py
 pon-conformance/corpus/cpython/list_methods.py
 pon-conformance/corpus/cpython/str_methods.py
@@ -89,3 +90,9 @@ pon-conformance/corpus/cpython/richcmp.py
 pon-conformance/corpus/cpython/builtins_math.py
 pon-conformance/corpus/cpython/builtins_seq.py
 pon-conformance/corpus/cpython/builtins_lazy.py
+pon-conformance/corpus/cpython/metaclasses.py
+pon-conformance/corpus/cpython/slots.py
+pon-conformance/corpus/cpython/init_subclass.py
+pon-conformance/corpus/cpython/seq_repeat.py
+pon-conformance/corpus/cpython/lang_except_break.py
+pon-conformance/corpus/cpython/lang_assert_stmt.py

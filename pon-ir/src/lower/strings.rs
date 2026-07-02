@@ -42,7 +42,7 @@ fn lower_f_string_parts<'a>(
             InterpolatedStringElement::Interpolation(interpolation) => {
                 let expression = interpolation_expression_text(driver, &interpolation.expression);
                 if let Some(debug) = &interpolation.debug_text {
-                    let debug_literal = format!("{}{}{}=", debug.leading, expression, debug.trailing);
+                    let debug_literal = format!("{}{}{}", debug.leading, expression, debug.trailing);
                     let value = scope.emit(InstKind::Const(PyConst::Str(debug_literal)))?;
                     parts.push(FStrPart::Interp {
                         value,
@@ -96,7 +96,7 @@ fn lower_t_string_parts<'a>(
             InterpolatedStringElement::Interpolation(interpolation) => {
                 let expression = interpolation_expression_text(driver, &interpolation.expression);
                 if let Some(debug) = &interpolation.debug_text {
-                    let debug_literal = format!("{}{}{}=", debug.leading, expression, debug.trailing);
+                    let debug_literal = format!("{}{}{}", debug.leading, expression, debug.trailing);
                     let value = scope.emit(InstKind::Const(PyConst::Str(debug_literal)))?;
                     parts.push(TStrPart::Interp {
                         value,

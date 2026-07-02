@@ -98,3 +98,13 @@ class Sub(Base):
 
 
 print("subclass reflected first", Base() < Sub(), log)
+
+
+print("tuple lexicographic", (1, 2, 3) < (1, 3, 0), (1, 2) < (1, 2, 0), (1, 2, 0) > (1, 2), (1, (2, 3)) <= (1, (2, 3)))
+print("tuple equality", (1, 2) == (1, 2), (1, 2) != (1, 3), (1, 2) == [1, 2], (1, 2) != [1, 2])
+print("list lexicographic", [1, 2, 3] < [1, 3, 0], [1, 2] < [1, 2, 0], [1, 2, 0] > [1, 2], [1, [2, 3]] <= [1, [2, 3]])
+print("list equality", [1, 2] == [1, 2], [1, 2] != [1, 3], [1, 2] == (1, 2), [1, 2] != (1, 2))
+try:
+    print("tuple list order", (1, 2) < [1, 2])
+except TypeError as exc:
+    print("tuple list order TypeError", str(exc))

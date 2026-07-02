@@ -189,9 +189,11 @@ fn split_suspend_points(function: &mut Function, ids: &mut GenIds) -> Result<(),
             InstKind::Yield { val } => {
                 // head: pops, Suspend(state, val) -> resume
                 // resume: re-pushes, GenResumePayload(result), tail...
-                for _ in &handler_stack {
+                let active_handlers = handler_stack.clone();
+                for _ in &active_handlers {
                     head_insts.push(Inst::new(ids.value()?, InstKind::PopExcInfo));
                 }
+                handler_stack.clear();
                 let resume_blk = ids.block()?;
                 result.push(Block {
                     id,
@@ -203,8 +205,8 @@ fn split_suspend_points(function: &mut Function, ids: &mut GenIds) -> Result<(),
                     },
                 });
 
-                let mut resume_insts = Vec::with_capacity(handler_stack.len() + 1 + tail_insts.len());
-                for spec in &handler_stack {
+                let mut resume_insts = Vec::with_capacity(active_handlers.len() + 1 + tail_insts.len());
+                for spec in &active_handlers {
                     resume_insts.push(Inst::new(
                         ids.value()?,
                         InstKind::PushExcInfo {
@@ -216,9 +218,10 @@ fn split_suspend_points(function: &mut Function, ids: &mut GenIds) -> Result<(),
                 }
                 resume_insts.push(Inst::new(suspend_inst.result, InstKind::GenResumePayload));
                 resume_insts.extend(tail_insts);
-                // The scanner sees head's pops then resume's re-pushes: net
-                // zero.  Keep `handler_stack` unchanged so the tail (and later
-                // blocks) still observe the enclosing handlers.
+                // Keep the scanner's static stack in sync with the emitted
+                // head pops: a suspended generator owns no handler records.
+                // The pending resume block below re-pushes `active_handlers`
+                // before the tail is scanned, restoring the original nesting.
                 pending.push_front(Block {
                     id: resume_blk,
                     insts: resume_insts,

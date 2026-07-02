@@ -1,0 +1,8 @@
+print("ab" * 3, 3 * "xy", "x" * -2)
+print("é" * 2, 2 * "𐍈", "x" * True, "x" * False)
+b = "ab".encode()
+print((b * 3).decode(), (3 * b).decode(), (b * -1).decode())
+ba = bytearray("ab", "ascii")
+print((ba * 2).decode(), (2 * ba).decode(), (ba * -1).decode())
+print([1, 2] * 2, 2 * [3], [4] * -1)
+print(("a", 2) * 2, 2 * ("z",), ("x",) * False)
