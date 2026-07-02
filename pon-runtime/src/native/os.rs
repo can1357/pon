@@ -96,9 +96,57 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
             }
             attrs.push((intern(name), set));
         }
+        // CPython defines `_get_exports_list` in `os.py` itself (never
+        // re-exported into `posix`); `socket.py` consumes it at module body:
+        // `__all__.extend(os._get_exports_list(_socket))`.
+        // SAFETY: Live builtin entry point with the runtime calling convention.
+        let exports_list = unsafe {
+            crate::abi::pon_make_function(os_get_exports_list as *const u8, 1, intern("_get_exports_list"))
+        };
+        if exports_list.is_null() {
+            return Err(format!("failed to allocate {module}._get_exports_list"));
+        }
+        attrs.push((intern("_get_exports_list"), exports_list));
         attrs.push((intern("PathLike"), pathlike_class()?));
     }
     Ok(attrs)
+}
+
+/// `os._get_exports_list(module)`: CPython os.py's own helper, served
+/// natively because pon's `os` is a curated seed rather than the source
+/// module.  `list(module.__all__)` when the module defines `__all__`, else
+/// the sorted non-underscore namespace names — exactly os.py's
+/// `[n for n in dir(module) if n[0] != '_']`.
+unsafe extern "C" fn os_get_exports_list(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 1 || argv.is_null() {
+        return crate::abi::return_null_with_error("os._get_exports_list expected one argument");
+    }
+    // SAFETY: One live argument slot per the check above.
+    let module = crate::tag::untag_arg(unsafe { *argv });
+    // `__all__` arm: any iterable, materialized as a fresh list (CPython's
+    // `list(module.__all__)`).
+    if let Some(all) = unsafe { super::builtins_batch::try_get_attr(module, "__all__") } {
+        return match super::builtins_batch::collect_iterable(all) {
+            // SAFETY: List builder reads exactly `len` live slots.
+            Ok(mut values) => unsafe { crate::abi::seq::pon_build_list(values.as_mut_ptr(), values.len()) },
+            // SAFETY: Typed raise helper.
+            Err(message) => unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) },
+        };
+    }
+    // `dir()` fallback arm: modules enumerate their registered namespace
+    // dict (the `builtin_dir` module arm); anything else walks the MRO.
+    let names = match crate::import::module_namespace_for_object(module) {
+        Some(Ok(namespace)) => match unsafe { super::builtins_batch::names_from_mapping(namespace) } {
+            Ok(names) => names,
+            Err(message) => return crate::abi::return_null_with_error(message),
+        },
+        Some(Err(message)) => return crate::abi::return_null_with_error(message),
+        None => super::builtins_batch::names_for_object(module),
+    };
+    let mut names: Vec<String> = names.into_iter().filter(|name| !name.starts_with('_')).collect();
+    names.sort();
+    names.dedup();
+    super::builtins_batch::build_str_list(names)
 }
 
 /// `os.fspath(path)`: str/bytes pass through unchanged; other objects defer
