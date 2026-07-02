@@ -71,6 +71,10 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
         }
         attrs.push((intern(name), function));
     }
+    // `terminal_size` is defined by CPython's C `posix` module, so both
+    // names serve the shared class object (see the section comment for why
+    // `get_terminal_size` itself stays absent).
+    attrs.push((intern("terminal_size"), terminal_size_class()?));
     if module == "os" {
         // `os.py`-level surface that CPython does NOT re-export into `posix`.
         //
@@ -1034,4 +1038,129 @@ unsafe extern "C" fn pathlike_class_getitem(argv: *mut *mut PyObject, argc: usiz
 /// `PathLike.__fspath__` abstract body: CPython's `raise NotImplementedError`.
 unsafe extern "C" fn pathlike_fspath_abstract(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
     crate::abi::exc::raise_kind_error_text(ExceptionKind::NotImplementedError, "")
+}
+
+// ---------------------------------------------------------------------------
+// os.terminal_size
+//
+// CPython's `os.terminal_size` is a structseq (a tuple subclass with named
+// fields) defined by the C `posix` module; `shutil.get_terminal_size`'s
+// final fallback constructs one from a 2-int sequence and `argparse` reads
+// `.columns`.  pon builds the same shape through the tuple-embedding heap
+// class machinery (`class terminal_size(tuple)` with `columns`/`lines`
+// properties and the CPython repr).  `os.get_terminal_size` is DELIBERATELY
+// absent: `shutil` catches the AttributeError and takes its deterministic
+// `(80, 24)`-shaped env fallback, which keeps differential runs stable
+// whether or not a real tty is attached.
+
+fn terminal_size_class() -> Result<*mut PyObject, String> {
+    static CLASS: std::sync::LazyLock<Result<usize, String>> =
+        std::sync::LazyLock::new(|| build_terminal_size_class().map(|class| class as usize));
+    CLASS.clone().map(|class| class as *mut PyObject)
+}
+
+fn build_terminal_size_class() -> Result<*mut PyObject, String> {
+    // SAFETY: `pon_load_global` returns NULL with a raised NameError on miss.
+    let tuple_class = unsafe { crate::abi::pon_load_global(intern("tuple"), std::ptr::null_mut()) };
+    if tuple_class.is_null() {
+        crate::thread_state::pon_err_clear();
+        return Err("builtin 'tuple' is not registered for os.terminal_size".to_owned());
+    }
+    // SAFETY: Same contract for the builtin `property` constructor.
+    let property_class = unsafe { crate::abi::pon_load_global(intern("property"), std::ptr::null_mut()) };
+    if property_class.is_null() {
+        crate::thread_state::pon_err_clear();
+        return Err("builtin 'property' is not registered for os.terminal_size".to_owned());
+    }
+    let namespace = crate::types::type_::new_namespace();
+    if namespace.is_null() {
+        return Err("failed to allocate the os.terminal_size namespace".to_owned());
+    }
+    class_str_attr(namespace, "__module__", "os")?;
+    class_str_attr(namespace, "__doc__", "A tuple of (columns, lines) for holding terminal window size")?;
+    class_function_attr(namespace, "__repr__", terminal_size_repr)?;
+    for (name, entry) in [
+        ("columns", terminal_size_columns as BuiltinFn),
+        ("lines", terminal_size_lines as BuiltinFn),
+    ] {
+        // SAFETY: Live builtin entry point with the runtime calling convention.
+        let fget = unsafe {
+            crate::abi::pon_make_function(entry as *const u8, 1, intern(name))
+        };
+        if fget.is_null() {
+            return Err(format!("failed to allocate os.terminal_size.{name} getter"));
+        }
+        let mut argv = [fget];
+        // SAFETY: The builtin `property` class is callable with one fget slot.
+        let descriptor = unsafe { crate::abi::pon_call(property_class, argv.as_mut_ptr(), argv.len()) };
+        if descriptor.is_null() {
+            let detail = crate::thread_state::pon_err_message().unwrap_or_else(|| "unknown error".to_owned());
+            crate::thread_state::pon_err_clear();
+            return Err(format!("failed to build os.terminal_size.{name} property: {detail}"));
+        }
+        // SAFETY: `new_namespace` returned a live namespace box.
+        unsafe { (&mut *namespace).set(intern(name), descriptor) };
+    }
+    // SAFETY: The base is the live builtin `tuple` class object.
+    let class = unsafe {
+        crate::types::type_::build_class_from_namespace("terminal_size", &[tuple_class], namespace, &[])
+    };
+    finish_class(class, "terminal_size", crate::abi::runtime_type_type())
+}
+
+/// Reads element `index` of a terminal_size receiver as an i64.
+fn terminal_size_element(args: &[*mut PyObject], index: i64, what: &str) -> Result<i64, *mut PyObject> {
+    if args.len() != 1 {
+        return Err(crate::abi::return_null_with_error(format!("{what} expected only a receiver")));
+    }
+    // SAFETY: Integer boxing helper follows the NULL-sentinel error contract.
+    let key = unsafe { crate::abi::pon_const_int(index) };
+    if key.is_null() {
+        return Err(std::ptr::null_mut());
+    }
+    // SAFETY: Subscript dispatch resolves the tuple-embedded layout.
+    let element = unsafe { crate::abstract_op::subscript_get(args[0], key) };
+    if element.is_null() {
+        return Err(std::ptr::null_mut());
+    }
+    int_arg(element, what)
+}
+
+/// `terminal_size.columns` property getter: `self[0]`.
+unsafe extern "C" fn terminal_size_columns(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    match terminal_size_element(args, 0, "terminal_size.columns") {
+        // SAFETY: Integer boxing helper follows the NULL-sentinel contract.
+        Ok(value) => unsafe { crate::abi::pon_const_int(value) },
+        Err(error) => error,
+    }
+}
+
+/// `terminal_size.lines` property getter: `self[1]`.
+unsafe extern "C" fn terminal_size_lines(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    match terminal_size_element(args, 1, "terminal_size.lines") {
+        // SAFETY: Integer boxing helper follows the NULL-sentinel contract.
+        Ok(value) => unsafe { crate::abi::pon_const_int(value) },
+        Err(error) => error,
+    }
+}
+
+/// CPython's structseq repr: `os.terminal_size(columns=80, lines=24)`.
+unsafe extern "C" fn terminal_size_repr(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    let columns = match terminal_size_element(args, 0, "terminal_size.columns") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let lines = match terminal_size_element(args, 1, "terminal_size.lines") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let text = format!("os.terminal_size(columns={columns}, lines={lines})");
+    // SAFETY: String allocation helper follows the NULL-sentinel contract.
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
 }

@@ -153,14 +153,10 @@ fn unregister_weakref(referent: *mut PyObject, weakref: *mut PyObject) {
     }
 }
 
-unsafe extern "C" fn weakref_new(cls: *mut PyType, args: *mut PyObject, _kwargs: *mut PyObject) -> *mut PyObject {
-    let positional = match unsafe { type_::positional_args_from_object(args) } {
-        Ok(args) => args,
-        Err(message) => {
-            pon_err_set(message);
-            return ptr::null_mut();
-        }
-    };
+/// Validates `(referent[, callback])` positionals and allocates a canonical
+/// registered `PyWeakRef` typed as `ty`.  Shared by the `tp_new` slot and the
+/// Python-visible `__new__` staticmethod carrier.
+unsafe fn alloc_weakref(ty: *mut PyType, positional: &[*mut PyObject]) -> *mut PyObject {
     if !(positional.len() == 1 || positional.len() == 2) {
         let message = "weakref.ref expected object and optional callback";
         return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
@@ -173,7 +169,6 @@ unsafe extern "C" fn weakref_new(cls: *mut PyType, args: *mut PyObject, _kwargs:
     }
     let callback = positional.get(1).copied().unwrap_or(ptr::null_mut());
     let callback = if callback.is_null() || unsafe { is_none(callback) } { ptr::null_mut() } else { callback };
-    let ty = if cls.is_null() { weakref_type() } else { cls };
     let object = Box::into_raw(Box::new(PyWeakRef {
         ob_base: PyObjectHeader::new(ty),
         referent,
@@ -182,10 +177,23 @@ unsafe extern "C" fn weakref_new(cls: *mut PyType, args: *mut PyObject, _kwargs:
         hash_valid: false,
         builtin_hash: -1,
         builtin_hash_valid: false,
+        wrapper: ptr::null_mut(),
     }))
     .cast::<PyObject>();
     register_weakref(referent, object);
     object
+}
+
+unsafe extern "C" fn weakref_new(cls: *mut PyType, args: *mut PyObject, _kwargs: *mut PyObject) -> *mut PyObject {
+    let positional = match unsafe { type_::positional_args_from_object(args) } {
+        Ok(args) => args,
+        Err(message) => {
+            pon_err_set(message);
+            return ptr::null_mut();
+        }
+    };
+    let ty = if cls.is_null() { weakref_type() } else { cls };
+    unsafe { alloc_weakref(ty, &positional) }
 }
 
 unsafe extern "C" fn weakref_call(object: *mut PyObject, _args: *mut PyObject, _kwargs: *mut PyObject) -> *mut PyObject {
@@ -284,6 +292,178 @@ unsafe extern "C" fn weakref_getattro(object: *mut PyObject, name: *mut PyObject
     }
 }
 
+// ---------------------------------------------------------------------------
+// Subclass surface (`class KeyedRef(weakref.ref)`, importlib's module-lock
+// bookkeeping): instances use the payload-subclass layout with a canonical
+// registered `PyWeakRef` payload, and the type dict carries the `__new__`/
+// `__call__` entries MRO dispatch (including `super()`) resolves.
+
+/// Returns whether some base linearizes over the builtin `weakref.ref` type,
+/// so class construction can install the subclass surface first (the
+/// `class_bases_embed_dict` pattern).
+#[must_use]
+pub unsafe fn class_bases_embed_weakref(bases: &[*mut PyType]) -> bool {
+    let ty = weakref_type();
+    bases.iter().copied().any(|base| unsafe { crate::mro::mro_entries(base) }.contains(&ty))
+}
+
+/// Canonical `PyWeakRef` payload of a weakref-subclass wrapper instance, when
+/// `object` is one.
+unsafe fn wrapper_payload(object: *mut PyObject) -> Option<*mut PyWeakRef> {
+    let value = unsafe { type_::payload_subclass_value(object)? };
+    unsafe { is_weakref_layout(value) }.then(|| value.cast::<PyWeakRef>())
+}
+
+/// True when `object` is a `PyWeakRef`-layout allocation: exactly the builtin
+/// ref/proxy types (subclass wrappers use the payload-subclass layout).
+unsafe fn is_weakref_layout(object: *mut PyObject) -> bool {
+    if object.is_null() || !crate::tag::is_heap(object) {
+        return false;
+    }
+    let ty = unsafe { (*object).ob_type };
+    ty == weakref_type().cast_const() || ty == (*WEAKPROXY_TYPE as *mut PyType).cast_const()
+}
+
+/// Detaches the canonical payload of a dying wrapper instance: unregisters it
+/// so referent death can never call back into freed wrapper memory.
+pub(crate) unsafe fn detach_wrapper_payload(object: *mut PyObject) {
+    let Some(payload) = (unsafe { wrapper_payload(object) }) else {
+        return;
+    };
+    let payload = unsafe { &mut *payload };
+    unregister_weakref(payload.referent, (payload as *mut PyWeakRef).cast::<PyObject>());
+    payload.referent = ptr::null_mut();
+    payload.callback = ptr::null_mut();
+    payload.wrapper = ptr::null_mut();
+}
+
+/// `ref.__new__(cls, referent[, callback])` — the staticmethod carrier
+/// terminus for `super().__new__(cls, ob, cb)` in weakref subclasses
+/// (importlib bootstrap's `KeyedRef`).  The builtin class returns a canonical
+/// ref; a payload-subclass heap class returns a wrapper instance embedding
+/// the canonical, registered ref.
+unsafe extern "C" fn weakref_dunder_new(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc == 0 {
+        let message = "ref.__new__(): not enough arguments";
+        return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    let args = unsafe { core::slice::from_raw_parts(argv, argc) };
+    let cls = args[0];
+    if unsafe { !type_::is_type_object(cls) } {
+        let message = "ref.__new__(X): X is not a type object";
+        return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    let cls_ty = cls.cast::<PyType>();
+    if unsafe { !crate::mro::is_subtype(cls_ty, weakref_type()) } {
+        let cls_name = unsafe { (*cls_ty).name() };
+        let message = format!("ref.__new__({cls_name}): {cls_name} is not a subtype of ref");
+        return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    if cls_ty == weakref_type() {
+        return unsafe { alloc_weakref(cls_ty, &args[1..]) };
+    }
+    if unsafe { !type_::type_is_payload_subclass(cls_ty) } {
+        let cls_name = unsafe { (*cls_ty).name() };
+        let message = format!("ref.__new__({cls_name}): {cls_name} does not embed a ref payload");
+        return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    let canonical = unsafe { alloc_weakref(weakref_type(), &args[1..]) };
+    if canonical.is_null() {
+        return ptr::null_mut();
+    }
+    match unsafe { type_::alloc_payload_instance_for_class(cls_ty, canonical) } {
+        Ok(wrapper) => {
+            // The callback receiver: referent death reports the wrapper the
+            // user constructed, not the embedded canonical ref.
+            unsafe { (*canonical.cast::<PyWeakRef>()).wrapper = wrapper };
+            wrapper
+        }
+        Err(message) => {
+            pon_err_set(message);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `ref.__call__(self)` — dereference for subclass wrapper instances (plain
+/// refs stay on the `tp_call` slot).
+unsafe extern "C" fn weakref_dunder_call(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc == 0 {
+        let message = "ref.__call__(): not enough arguments";
+        return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    if argc != 1 {
+        let message = format!("ref.__call__ expected no arguments, got {}", argc - 1);
+        return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    let receiver = unsafe { *argv };
+    let payload = if unsafe { is_weakref_layout(receiver) } {
+        receiver.cast::<PyWeakRef>()
+    } else if let Some(payload) = unsafe { wrapper_payload(receiver) } {
+        payload
+    } else {
+        let message = "ref.__call__ expected a weakref receiver";
+        return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    };
+    let referent = unsafe { (*payload).referent };
+    if referent.is_null() { unsafe { crate::abi::pon_none() } } else { referent }
+}
+
+/// One-shot installer for the builtin ref type's `tp_dict` surface: the
+/// `__new__` staticmethod carrier plus `__call__`, resolved through subclass
+/// MROs (the `ensure_tuple_type_methods_installed` pattern).  Idempotent;
+/// called from class construction when a class linearizes over `ref`.
+pub(crate) fn ensure_weakref_subclass_surface() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.load(Ordering::SeqCst) {
+        return;
+    }
+    // Pre-runtime call sites must not latch a no-op install.
+    if crate::abi::runtime_type_type().is_null() {
+        return;
+    }
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let ty = weakref_type();
+    let namespace = unsafe { (*ty).tp_dict.cast::<type_::PyClassDict>() };
+    let namespace = if namespace.is_null() { type_::new_namespace() } else { namespace };
+    let new_name = intern::intern("__new__");
+    if unsafe { (&*namespace).get(new_name) }.is_none() {
+        // A staticmethod carrier keeps `super().__new__` and `cls.__new__`
+        // lookups from binding the receiver (CPython: `__new__` is
+        // implicitly static).
+        let function = unsafe {
+            crate::abi::pon_make_function(weakref_dunder_new as *const u8, crate::builtins::variadic_arity(), new_name)
+        };
+        if !function.is_null() {
+            let descriptor = unsafe {
+                crate::types::classmethod::new_staticmethod(crate::abi::staticmethod_builtin_type(), function)
+            };
+            if !descriptor.is_null() {
+                unsafe { (&mut *namespace).set(new_name, descriptor.cast::<PyObject>()) };
+            }
+        }
+    }
+    let call_name = intern::intern("__call__");
+    if unsafe { (&*namespace).get(call_name) }.is_none() {
+        let function = unsafe {
+            crate::abi::pon_make_function(weakref_dunder_call as *const u8, crate::builtins::variadic_arity(), call_name)
+        };
+        if !function.is_null() {
+            unsafe { (&mut *namespace).set(call_name, function) };
+        }
+    }
+    unsafe {
+        (*ty).tp_dict = namespace.cast::<PyObject>();
+    }
+    // GC rooting for the namespace values plus IC invalidation for any AttrIC
+    // guarding the type object.
+    crate::sync::register_namespaced_type(ty);
+    crate::sync::type_modified(ty);
+}
+
 /// `weakref.proxy` type: a transparent forwarder to a weakly-held referent.
 ///
 /// Proxies share `PyWeakRef`'s layout (same registry, clearing, and callback
@@ -373,13 +553,17 @@ pub fn clear_weakrefs(referent: *mut PyObject) {
         if weakref.is_null() {
             continue;
         }
-        let callback = unsafe {
+        let (callback, receiver) = unsafe {
             let weakref_ref = &mut *weakref;
             weakref_ref.referent = ptr::null_mut();
-            weakref_ref.callback
+            // Subclass refs deliver the wrapper instance to the callback
+            // (CPython passes the weakref object the user constructed).
+            let receiver =
+                if weakref_ref.wrapper.is_null() { weakref.cast::<PyObject>() } else { weakref_ref.wrapper };
+            (weakref_ref.callback, receiver)
         };
         if !callback.is_null() {
-            let mut argv = [weakref.cast::<PyObject>()];
+            let mut argv = [receiver];
             let result = unsafe { crate::abi::pon_call(callback, argv.as_mut_ptr(), 1) };
             if result.is_null() && pon_err_occurred() {
                 if let Some(message) = pon_err_message() {
