@@ -23,6 +23,7 @@ use crate::types::range_::{self, PyRange};
 use crate::types::slice_::{self, PySlice, SliceIndices};
 use crate::types::tuple::{self, PyTuple};
 use crate::types::{method, type_};
+use crate::types::exc::ExceptionKind;
 
 use super::{Runtime, alloc_long, catch_object_helper, catch_status_helper, return_minus_one_with_error, return_null_with_error, with_runtime};
 
@@ -414,6 +415,43 @@ fn return_minus_one_with_sequence_error(message: String) -> c_int {
         -1
     } else {
         return_minus_one_with_error(message)
+    }
+}
+
+/// Raises a typed builtin exception carrying the diagnostic text — unless a
+/// live boxed exception is already pending (advisory Err strings such as
+/// `iteration raised an exception`), which stays authoritative, mirroring
+/// `pon_err_set`'s preserve discipline.
+fn raise_typed(kind: ExceptionKind, message: &str) -> *mut PyObject {
+    if super::exc::pending_exception_object().is_some() {
+        return ptr::null_mut();
+    }
+    super::exc::raise_kind_error_text(kind, message)
+}
+
+/// Typed `TypeError` for arity and argument-type misuse of list/tuple
+/// methods and constructors (CPython `except TypeError:` must fire).
+fn raise_seq_type_error(message: impl AsRef<str>) -> *mut PyObject {
+    raise_typed(ExceptionKind::TypeError, message.as_ref())
+}
+
+/// Classifies list/tuple method `Result` streams by CPython kind: the
+/// index/remove miss sentinels are ValueError, out-of-range indices
+/// IndexError, non-int index arguments and receiver mismatches TypeError;
+/// unrecognized diagnostics (advisory iteration/comparison failures,
+/// internal invariants) keep the bare fallback.
+fn raise_seq_stream_error(message: String) -> *mut PyObject {
+    if message == "list.index(x): x not in list" || message == "tuple.index(x): x not in tuple" {
+        raise_typed(ExceptionKind::ValueError, &message)
+    } else if is_sequence_index_error(&message) || message == "sequence index is out of range for this platform" {
+        super::exc::raise_index_error_text(&message)
+    } else if message.starts_with("expected int, got ")
+        || message.contains(" expected list, got ")
+        || message.contains(" expected tuple, got ")
+    {
+        raise_typed(ExceptionKind::TypeError, &message)
+    } else {
+        return_null_with_error(message)
     }
 }
 
@@ -1062,11 +1100,11 @@ unsafe extern "C" fn list_append_method(argv: *mut *mut PyObject, argc: usize) -
             Err(raised) => return raised,
         };
         if args.len() != 2 {
-            return return_null_with_error(format!("list.append expected 1 argument, got {}", args.len().saturating_sub(1)));
+            return raise_seq_type_error(format!("list.append expected 1 argument, got {}", args.len().saturating_sub(1)));
         }
         match list_append_raw(receiver, args[1]) {
             Ok(()) => seq_none(),
-            Err(message) => return_null_with_error(message),
+            Err(message) => raise_seq_stream_error(message),
         }
     })
 }
@@ -1078,15 +1116,15 @@ unsafe extern "C" fn list_extend_method(argv: *mut *mut PyObject, argc: usize) -
             Err(message) => return return_null_with_error(message),
         };
         if args.len() != 2 {
-            return return_null_with_error(format!("list.extend expected 1 argument, got {}", args.len().saturating_sub(1)));
+            return raise_seq_type_error(format!("list.extend expected 1 argument, got {}", args.len().saturating_sub(1)));
         }
         let values = match sequence_to_vec(args[1]) {
             Ok(values) => values,
-            Err(message) => return return_null_with_error(message),
+            Err(message) => return raise_seq_type_error(message),
         };
         for value in values {
             if let Err(message) = list_append_raw(args[0], value) {
-                return return_null_with_error(message);
+                return raise_seq_stream_error(message);
             }
         }
         seq_none()
@@ -1098,10 +1136,51 @@ unsafe extern "C" fn list_sort_method(argv: *mut *mut PyObject, argc: usize) -> 
         Ok(args) => args,
         Err(message) => return return_null_with_error(message),
     };
+    // Keyword form (`key=`/`reverse=`): the binder flattens the keywords
+    // into a trailing sort-options marker, mirroring `sorted()`.
+    if args.len() == 2 {
+        if let Some(options) = unsafe { crate::types::lazy_iter::sort_options_value(args[1]) } {
+            return unsafe { list_sort_with_options(args[0], options.key, options.reverse) };
+        }
+    }
     if args.len() != 1 {
-        return return_null_with_error(format!("list.sort expected 0 arguments, got {}", args.len().saturating_sub(1)));
+        return raise_seq_type_error(format!("list.sort expected 0 arguments, got {}", args.len().saturating_sub(1)));
     }
     unsafe { pon_list_sort(args[0]) }
+}
+
+/// In-place `list.sort(key=…, reverse=…)`.
+///
+/// Items are copied out, ordered by the shared `stable_sort` (key calls run
+/// arbitrary Python, so no list critical section is held around them), and
+/// written back.  A length change observed at write-back raises CPython's
+/// "list modified during sort" ValueError.
+unsafe fn list_sort_with_options(list: *mut PyObject, key: *mut PyObject, reverse: bool) -> *mut PyObject {
+    let list = crate::tag::untag_arg(list);
+    if list.is_null() {
+        return ptr::null_mut();
+    }
+    if !is_list(list) {
+        return raise_seq_type_error(format!("list.sort expected list, got {}", object_type_name(list)));
+    }
+    let mut items = {
+        let _guard = crate::sync::begin_critical_section(list);
+        // SAFETY: `list` is a live PyList per the check above.
+        unsafe { (&*list.cast::<PyList>()).as_slice() }.to_vec()
+    };
+    if crate::native::builtins_batch::stable_sort(&mut items, key, reverse).is_err() {
+        return ptr::null_mut();
+    }
+    let _guard = crate::sync::begin_critical_section(list);
+    // SAFETY: As above; the critical section serializes the write-back.
+    let values = unsafe { (&mut *list.cast::<PyList>()).as_mut_slice() };
+    if values.len() != items.len() {
+        let message = "list modified during sort";
+        // SAFETY: Typed raise helper with a static message.
+        return unsafe { super::exc::pon_raise_value_error(message.as_ptr(), message.len()) };
+    }
+    values.copy_from_slice(&items);
+    seq_none()
 }
 
 unsafe extern "C" fn list_reverse_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -1111,10 +1190,10 @@ unsafe extern "C" fn list_reverse_method(argv: *mut *mut PyObject, argc: usize) 
             Err(message) => return return_null_with_error(message),
         };
         if args.len() != 1 {
-            return return_null_with_error(format!("list.reverse expected 0 arguments, got {}", args.len().saturating_sub(1)));
+            return raise_seq_type_error(format!("list.reverse expected 0 arguments, got {}", args.len().saturating_sub(1)));
         }
         if !is_list(args[0]) {
-            return return_null_with_error(format!("list.reverse expected list, got {}", object_type_name(args[0])));
+            return raise_seq_type_error(format!("list.reverse expected list, got {}", object_type_name(args[0])));
         }
         let _guard = crate::sync::begin_critical_section(args[0]);
         let list = unsafe { &mut *args[0].cast::<PyList>() };
@@ -1130,19 +1209,19 @@ unsafe extern "C" fn list_pop_method(argv: *mut *mut PyObject, argc: usize) -> *
             Err(message) => return return_null_with_error(message),
         };
         if !(args.len() == 1 || args.len() == 2) {
-            return return_null_with_error(format!("list.pop expected at most 1 argument, got {}", args.len().saturating_sub(1)));
+            return raise_seq_type_error(format!("list.pop expected at most 1 argument, got {}", args.len().saturating_sub(1)));
         }
         let index = if args.len() == 2 {
             match index_value(args[1]) {
                 Ok(index) => index,
-                Err(message) => return return_null_with_error(message),
+                Err(message) => return raise_seq_stream_error(message),
             }
         } else {
             -1
         };
         match list_pop_raw(args[0], index) {
             Ok(value) => value,
-            Err(message) => return_null_with_error(message),
+            Err(message) => raise_seq_stream_error(message),
         }
     })
 }
@@ -1154,11 +1233,11 @@ unsafe extern "C" fn list_index_method(argv: *mut *mut PyObject, argc: usize) ->
             Err(message) => return return_null_with_error(message),
         };
         if args.len() != 2 {
-            return return_null_with_error(format!("list.index expected 1 argument, got {}", args.len().saturating_sub(1)));
+            return raise_seq_type_error(format!("list.index expected 1 argument, got {}", args.len().saturating_sub(1)));
         }
         match list_index_raw(args[0], args[1]) {
             Ok(index) => unsafe { super::pon_const_int(index as i64) },
-            Err(message) => return_null_with_error(message),
+            Err(message) => raise_seq_stream_error(message),
         }
     })
 }
@@ -1170,11 +1249,11 @@ unsafe extern "C" fn list_count_method(argv: *mut *mut PyObject, argc: usize) ->
             Err(message) => return return_null_with_error(message),
         };
         if args.len() != 2 {
-            return return_null_with_error(format!("list.count expected 1 argument, got {}", args.len().saturating_sub(1)));
+            return raise_seq_type_error(format!("list.count expected 1 argument, got {}", args.len().saturating_sub(1)));
         }
         match list_count_raw(args[0], args[1]) {
             Ok(count) => unsafe { super::pon_const_int(count as i64) },
-            Err(message) => return_null_with_error(message),
+            Err(message) => raise_seq_stream_error(message),
         }
     })
 }
@@ -1186,14 +1265,14 @@ unsafe extern "C" fn list_insert_method(argv: *mut *mut PyObject, argc: usize) -
             Err(message) => return return_null_with_error(message),
         };
         if args.len() != 3 {
-            return return_null_with_error(format!("list.insert expected 2 arguments, got {}", args.len().saturating_sub(1)));
+            return raise_seq_type_error(format!("list.insert expected 2 arguments, got {}", args.len().saturating_sub(1)));
         }
         let index = match index_value(args[1]) {
             Ok(index) => index,
-            Err(message) => return return_null_with_error(message),
+            Err(message) => return raise_seq_stream_error(message),
         };
         if !is_list(args[0]) {
-            return return_null_with_error(format!("list.insert expected list, got {}", object_type_name(args[0])));
+            return raise_seq_type_error(format!("list.insert expected list, got {}", object_type_name(args[0])));
         }
         let _guard = crate::sync::begin_critical_section(args[0]);
         let list = unsafe { &mut *args[0].cast::<PyList>() };
@@ -1218,15 +1297,15 @@ unsafe extern "C" fn list_remove_method(argv: *mut *mut PyObject, argc: usize) -
             Err(message) => return return_null_with_error(message),
         };
         if args.len() != 2 {
-            return return_null_with_error(format!("list.remove expected 1 argument, got {}", args.len().saturating_sub(1)));
+            return raise_seq_type_error(format!("list.remove expected 1 argument, got {}", args.len().saturating_sub(1)));
         }
         let index = match list_index_raw(args[0], args[1]) {
             Ok(index) => index,
-            Err(message) => return return_null_with_error(message),
+            Err(message) => return raise_seq_stream_error(message),
         };
         match list_delete_index_raw(args[0], index as isize) {
             Ok(()) => seq_none(),
-            Err(message) => return_null_with_error(message),
+            Err(message) => raise_seq_stream_error(message),
         }
     })
 }
@@ -1238,11 +1317,11 @@ unsafe extern "C" fn tuple_count_method(argv: *mut *mut PyObject, argc: usize) -
             Err(message) => return return_null_with_error(message),
         };
         if args.len() != 2 {
-            return return_null_with_error(format!("tuple.count expected 1 argument, got {}", args.len().saturating_sub(1)));
+            return raise_seq_type_error(format!("tuple.count expected 1 argument, got {}", args.len().saturating_sub(1)));
         }
         match tuple_count_raw(args[0], args[1]) {
             Ok(count) => unsafe { super::pon_const_int(count as i64) },
-            Err(message) => return_null_with_error(message),
+            Err(message) => raise_seq_stream_error(message),
         }
     })
 }
@@ -1254,11 +1333,11 @@ unsafe extern "C" fn tuple_index_method(argv: *mut *mut PyObject, argc: usize) -
             Err(message) => return return_null_with_error(message),
         };
         if args.len() != 2 {
-            return return_null_with_error(format!("tuple.index expected 1 argument, got {}", args.len().saturating_sub(1)));
+            return raise_seq_type_error(format!("tuple.index expected 1 argument, got {}", args.len().saturating_sub(1)));
         }
         match tuple_index_raw(args[0], args[1]) {
             Ok(index) => unsafe { super::pon_const_int(index as i64) },
-            Err(message) => return_null_with_error(message),
+            Err(message) => raise_seq_stream_error(message),
         }
     })
 }

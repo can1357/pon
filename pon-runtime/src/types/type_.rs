@@ -1634,9 +1634,6 @@ mod tests {
 
     #[test]
     fn class_namespace_stores_attrs_and_dunders() {
-        let mut type_type = PyType::new(ptr::null(), "type", mem::size_of::<PyType>());
-        let type_ptr = &mut type_type as *mut PyType;
-        type_type.ob_base.ob_type = type_ptr;
         let ns = new_namespace();
         let value = unsafe { fake_str("callable") };
         unsafe {
@@ -1666,7 +1663,7 @@ mod tests {
     fn most_derived_metaclass_wins_across_bases() {
         let mut type_type = PyType::new(ptr::null(), "type", mem::size_of::<PyType>());
         let type_ptr = &mut type_type as *mut PyType;
-        type_type.ob_base.ob_type = type_ptr;
+        unsafe { (*type_ptr).ob_base.ob_type = type_ptr };
 
         let mut meta_base = PyType::new(type_ptr, "MetaBase", mem::size_of::<PyType>());
         meta_base.tp_base = type_ptr;
@@ -1702,7 +1699,7 @@ mod tests {
     fn unrelated_base_metaclasses_conflict() {
         let mut type_type = PyType::new(ptr::null(), "type", mem::size_of::<PyType>());
         let type_ptr = &mut type_type as *mut PyType;
-        type_type.ob_base.ob_type = type_ptr;
+        unsafe { (*type_ptr).ob_base.ob_type = type_ptr };
 
         let mut meta_a = PyType::new(type_ptr, "MetaA", mem::size_of::<PyType>());
         meta_a.tp_base = type_ptr;
@@ -1757,7 +1754,7 @@ mod tests {
 
     unsafe fn fake_str(text: &'static str) -> *mut PyObject {
         static mut STR_TYPE: PyType = PyType::new(ptr::null(), "str", mem::size_of::<PyUnicode>());
-        let ptr = unsafe { &raw mut STR_TYPE };
+        let ptr = &raw mut STR_TYPE;
         unsafe { (*ptr).ob_base.ob_type = ptr };
         Box::into_raw(Box::new(PyUnicode {
             ob_base: PyObjectHeader::new(ptr),

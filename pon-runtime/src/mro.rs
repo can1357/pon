@@ -148,7 +148,7 @@ mod tests {
     fn c3_linearizes_diamond() {
         let mut type_type = PyType::new(ptr::null(), "type", core::mem::size_of::<PyType>());
         let type_ptr = &mut type_type as *mut PyType;
-        type_type.ob_base.ob_type = type_ptr;
+        unsafe { (*type_ptr).ob_base.ob_type = type_ptr };
 
         let mut object = PyType::new(type_ptr, "object", 0);
         let object_ptr = &mut object as *mut PyType;
@@ -169,7 +169,7 @@ mod tests {
             assert_eq!(set_c3_mro(b_ptr, &[a_ptr]), 0);
             assert_eq!(set_c3_mro(c_ptr, &[a_ptr]), 0);
             assert_eq!(set_c3_mro(d_ptr, &[b_ptr, c_ptr]), 0);
-            let names: Vec<_> = mro_entries(d_ptr).iter().map(|ty| unsafe { (**ty).name() }).collect();
+            let names: Vec<_> = mro_entries(d_ptr).iter().map(|ty| (**ty).name()).collect();
             assert_eq!(names, ["D", "B", "C", "A", "object"]);
         }
     }
@@ -178,7 +178,7 @@ mod tests {
     fn c3_rejects_inconsistent_base_order() {
         let mut type_type = PyType::new(ptr::null(), "type", core::mem::size_of::<PyType>());
         let type_ptr = &mut type_type as *mut PyType;
-        type_type.ob_base.ob_type = type_ptr;
+        unsafe { (*type_ptr).ob_base.ob_type = type_ptr };
 
         let mut object = PyType::new(type_ptr, "object", 0);
         let object_ptr = &mut object as *mut PyType;

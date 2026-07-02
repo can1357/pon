@@ -95,7 +95,7 @@ mod tests {
     fn rejects_unrelated_type() {
         let mut type_type = PyType::new(ptr::null(), "type", core::mem::size_of::<PyType>());
         let type_ptr = &mut type_type as *mut PyType;
-        type_type.ob_base.ob_type = type_ptr;
+        unsafe { (*type_ptr).ob_base.ob_type = type_ptr };
         let mut a = PyType::new(type_ptr, "A", 0);
         let mut b = PyType::new(type_ptr, "B", 0);
         let obj = (&mut b as *mut PyType).cast::<PyObject>();

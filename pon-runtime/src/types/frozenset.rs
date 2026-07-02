@@ -5,8 +5,8 @@ use core::ptr;
 use std::sync::LazyLock;
 
 use crate::object::{PyNumberMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType};
-use crate::types::dict::{hash_object, type_name};
-use crate::types::set_::{insert_unique_entries, set_equal};
+use crate::types::dict::type_name;
+use crate::types::set_::{hash_set_element, insert_unique_entries, set_equal};
 
 /// Boxed immutable Python `frozenset`.
 #[repr(C)]
@@ -127,7 +127,7 @@ pub unsafe fn unique_entries(items: &[*mut PyObject]) -> Result<Vec<*mut PyObjec
 
 /// Returns true when an item is present in a frozenset.
 pub unsafe fn frozenset_contains(object: *mut PyObject, item: *mut PyObject) -> Result<bool, String> {
-    let hash = unsafe { hash_object(item)? };
+    let hash = unsafe { hash_set_element(item)? };
     let set = unsafe { frozenset_ref(object)? };
     if set.buckets.is_empty() {
         return Ok(false);
@@ -138,7 +138,7 @@ pub unsafe fn frozenset_contains(object: *mut PyObject, item: *mut PyObject) -> 
             return Ok(false);
         };
         let entry = set.entries[index];
-        if unsafe { hash_object(entry)? } == hash && unsafe { crate::types::dict::object_equal(entry, item)? } {
+        if unsafe { hash_set_element(entry)? } == hash && unsafe { crate::types::dict::object_equal(entry, item)? } {
             return Ok(true);
         }
         bucket = (bucket + 1) & (set.buckets.len() - 1);
@@ -164,7 +164,7 @@ pub unsafe fn frozenset_hash_value(object: *mut PyObject) -> Result<isize, Strin
     // insertion order.
     let mut mixed: usize = 0;
     for item in &set.entries {
-        let item_hash = unsafe { hash_object(*item)? } as usize;
+        let item_hash = unsafe { hash_set_element(*item)? } as usize;
         mixed ^= shuffle_bits(item_hash);
     }
     mixed ^= set.entries.len().wrapping_add(1).wrapping_mul(1_927_868_237);
@@ -238,7 +238,7 @@ unsafe extern "C" fn frozenset_difference_slot(left: *mut PyObject, right: *mut 
 fn build_buckets(entries: &[*mut PyObject]) -> Result<Vec<Option<usize>>, String> {
     let mut buckets = vec![None; bucket_capacity(entries.len())];
     for index in 0..entries.len() {
-        let hash = unsafe { hash_object(entries[index])? };
+        let hash = unsafe { hash_set_element(entries[index])? };
         let mut bucket = bucket_index(hash, buckets.len());
         for _ in 0..buckets.len() {
             if buckets[bucket].is_none() {

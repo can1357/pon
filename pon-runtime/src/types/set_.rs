@@ -176,7 +176,7 @@ pub unsafe fn set_add(set: *mut PyObject, item: *mut PyObject) -> Result<(), Str
     if item.is_null() {
         return Err("set item is NULL".to_owned());
     }
-    let hash = unsafe { hash_object(item)? };
+    let hash = unsafe { hash_set_element(item)? };
     let set = unsafe { set_mut(set)? };
     ensure_set_buckets(set)?;
     if unsafe { find_set_index(set, item, hash)? }.is_none() {
@@ -186,6 +186,19 @@ pub unsafe fn set_add(set: *mut PyObject, item: *mut PyObject) -> Result<(), Str
         insert_bucket(&mut set.buckets, &set.entries, index)?;
     }
     Ok(())
+}
+
+/// Hashes a prospective set element, wrapping hash failures the way CPython
+/// 3.14 reports them: `cannot use 'list' as a set element (unhashable type: 'list')`.
+pub unsafe fn hash_set_element(item: *mut PyObject) -> Result<isize, String> {
+    unsafe { hash_object(item) }.map_err(|message| {
+        if message.starts_with("unhashable type") {
+            let name = unsafe { type_name(item) }.unwrap_or("object");
+            format!("cannot use '{name}' as a set element ({message})")
+        } else {
+            message
+        }
+    })
 }
 
 /// Removes an element from a mutable set if present.
@@ -232,7 +245,7 @@ pub unsafe fn set_contains(set: *mut PyObject, item: *mut PyObject) -> Result<bo
     if item.is_null() {
         return Err("set item is NULL".to_owned());
     }
-    let hash = unsafe { hash_object(item)? };
+    let hash = unsafe { hash_set_element(item)? };
     if unsafe { is_set(set) } {
         let set = unsafe { set_mut(set)? };
         ensure_set_buckets(set)?;
@@ -310,7 +323,7 @@ unsafe fn set_richcmp_bool(left: *mut PyObject, right: *mut PyObject, op: c_int)
 /// Adds every element from `other_entries` into `target_entries`.
 pub unsafe fn insert_unique_entries(target_entries: &mut Vec<*mut PyObject>, other_entries: &[*mut PyObject]) -> Result<(), String> {
     for item in other_entries {
-        let _ = unsafe { hash_object(*item)? };
+        let _ = unsafe { hash_set_element(*item)? };
         if unsafe { find_element_index(target_entries, *item)? }.is_none() {
             target_entries.push(*item);
         }
@@ -338,7 +351,7 @@ unsafe fn find_set_index(set: &PySet, item: *mut PyObject, hash: isize) -> Resul
             return Ok(None);
         };
         let entry = set.entries[index];
-        if unsafe { hash_object(entry)? } == hash && unsafe { object_equal(entry, item)? } {
+        if unsafe { hash_set_element(entry)? } == hash && unsafe { object_equal(entry, item)? } {
             return Ok(Some(index));
         }
         bucket = (bucket + 1) & (set.buckets.len() - 1);
@@ -378,7 +391,7 @@ fn insert_bucket(buckets: &mut [Option<usize>], entries: &[*mut PyObject], index
     if buckets.is_empty() {
         return Err("set bucket table is empty".to_owned());
     }
-    let hash = unsafe { hash_object(entries[index])? };
+    let hash = unsafe { hash_set_element(entries[index])? };
     let mut bucket = bucket_index(hash, buckets.len());
     for _ in 0..buckets.len() {
         if buckets[bucket].is_none() {

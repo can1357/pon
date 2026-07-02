@@ -13,6 +13,7 @@ use std::sync::{LazyLock, OnceLock};
 
 use crate::object::{PyLong, PyMappingMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType, PyUnicode, as_object_ptr, is_exact_type};
 use crate::types::{bytearray_ as bytearray_type, bytes_ as bytes_type, memoryview as memoryview_type, method, slice_::PySlice, str_ as str_type, type_};
+use crate::types::exc::ExceptionKind;
 
 /// String method selector passed through the helper ABI.
 pub type StrMethodId = u16;
@@ -506,7 +507,7 @@ unsafe extern "C" fn bytes_getattro(object: *mut PyObject, name: *mut PyObject) 
     };
     match bytes_method_entry_for_name(name) {
         Some(entry) => bound_bytes_method(object, name, entry),
-        None => super::return_null_with_error(format!("attribute '{name}' was not found")),
+        None => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
     }
 }
 
@@ -516,7 +517,7 @@ unsafe extern "C" fn bytearray_getattro(object: *mut PyObject, name: *mut PyObje
     };
     match bytearray_method_entry_for_name(name) {
         Some(entry) => bound_bytes_method(object, name, entry),
-        None => super::return_null_with_error(format!("attribute '{name}' was not found")),
+        None => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
     }
 }
 
@@ -530,7 +531,7 @@ unsafe extern "C" fn memoryview_getattro(object: *mut PyObject, name: *mut PyObj
         "tolist" => bound_memoryview_method(object, name, memoryview_tolist_entry),
         "itemsize" => unsafe { super::pon_const_int((*object.cast::<memoryview_type::PyMemoryView>()).itemsize() as i64) },
         "readonly" => unsafe { super::pon_const_bool(i32::from((*object.cast::<memoryview_type::PyMemoryView>()).readonly)) },
-        _ => super::return_null_with_error(format!("attribute '{name}' was not found")),
+        _ => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
     }
 }
 
@@ -639,12 +640,100 @@ unsafe extern "C" fn str_len_slot(object: *mut PyObject) -> isize {
     }
 }
 
-/// Mirrors `seq::return_null_with_sequence_error`: the out-of-range sentinel
-/// becomes a typed, catchable IndexError (CPython `except IndexError:` around
-/// string probes, e.g. `re._parser.Tokenizer`).
-fn return_null_with_str_error(message: String) -> *mut PyObject {
-    if message == "string index out of range" {
+/// Raises a typed, catchable builtin exception carrying the native
+/// diagnostic text unchanged — unless a live boxed exception is already
+/// pending.  Advisory `Err` strings ("iteration raised an exception",
+/// "truth conversion failed") flow through these raisers while the genuine
+/// user exception is still set; that exception stays authoritative,
+/// mirroring `pon_err_set`'s preserve discipline.
+fn raise_typed(kind: ExceptionKind, message: &str) -> *mut PyObject {
+    if super::exc::pending_exception_object().is_some() {
+        return ptr::null_mut();
+    }
+    super::exc::raise_kind_error_text(kind, message)
+}
+
+/// Typed `TypeError` (CPython: arity and argument-type misuse of str/bytes
+/// methods surfaces as TypeError that `except TypeError:` must catch).
+fn raise_type_error(message: impl AsRef<str>) -> *mut PyObject {
+    raise_typed(ExceptionKind::TypeError, message.as_ref())
+}
+
+/// Typed `ValueError` (CPython sentinel texts such as `empty separator` and
+/// `substring not found`).
+fn raise_value_error(message: impl AsRef<str>) -> *mut PyObject {
+    raise_typed(ExceptionKind::ValueError, message.as_ref())
+}
+
+/// `str.split`/`bytes.split`-family failures: the CPython
+/// `ValueError: empty separator` sentinel; every other message in this
+/// closed stream (arity, non-str separator, non-int maxsplit) is TypeError.
+fn raise_split_error(message: String) -> *mut PyObject {
+    if message == "empty separator" { raise_value_error(message) } else { raise_type_error(message) }
+}
+
+/// Byte-valued argument failures (`bytearray.append`, int needles, byte
+/// stores): out-of-range ints are CPython ValueError, non-int arguments
+/// TypeError.
+fn raise_byte_arg_error(message: String) -> *mut PyObject {
+    if message == "byte must be in range(0, 256)" { raise_value_error(message) } else { raise_type_error(message) }
+}
+
+/// Translate-table failures: the codepoint-range sentinel is CPython
+/// ValueError; table-shape failures (non-mapping argument, bad replacement
+/// type) are TypeError.
+fn raise_translate_error(message: String) -> *mut PyObject {
+    if message == "character mapping must be in range(0x110000)" { raise_value_error(message) } else { raise_type_error(message) }
+}
+
+/// `bytearray.pop` failures: empty pops and out-of-range indices are CPython
+/// IndexError; a non-bytearray receiver is TypeError.
+fn raise_bytearray_pop_error(message: String) -> *mut PyObject {
+    if message == "pop from empty bytearray" || message == "bytearray index out of range" || message == "pop index out of range" {
         super::exc::raise_index_error_text(&message)
+    } else {
+        raise_type_error(message)
+    }
+}
+
+/// `bytearray.remove` failures: a missing value is CPython ValueError; a
+/// non-bytearray receiver is TypeError.
+fn raise_bytearray_remove_error(message: String) -> *mut PyObject {
+    if message == "value not found in bytearray" { raise_value_error(message) } else { raise_type_error(message) }
+}
+
+/// Slice-key failures on str/bytes/bytearray/memoryview subscripts: a zero
+/// step is CPython ValueError, non-int bounds are TypeError; anything else
+/// (receiver invariants, unsupported formats) keeps the bare diagnostic.
+fn raise_slice_error(message: String) -> *mut PyObject {
+    if message == "slice step cannot be zero" {
+        raise_value_error(message)
+    } else if message == "expected int object" {
+        raise_type_error(message)
+    } else {
+        super::return_null_with_error(message)
+    }
+}
+
+/// Sequence-repeat count failures: non-int counts are CPython TypeError;
+/// counts beyond the index range are OverflowError.
+fn raise_repeat_error(message: String) -> *mut PyObject {
+    if message == "repeat count is out of range" {
+        raise_typed(ExceptionKind::OverflowError, &message)
+    } else {
+        raise_type_error(message)
+    }
+}
+
+/// Mirrors `seq::return_null_with_sequence_error`: the out-of-range sentinels
+/// become a typed, catchable IndexError (CPython `except IndexError:` around
+/// string probes, e.g. `re._parser.Tokenizer`); a non-int subscript is the
+/// CPython TypeError.  Receiver invariants keep the bare diagnostic.
+fn return_null_with_str_error(message: String) -> *mut PyObject {
+    if message == "string index out of range" || message == "string index is out of range for this platform" {
+        super::exc::raise_index_error_text(&message)
+    } else if message == "expected int object" {
+        raise_type_error(message)
     } else {
         super::return_null_with_error(message)
     }
@@ -661,7 +750,7 @@ unsafe extern "C" fn str_subscript_slot(object: *mut PyObject, key: *mut PyObjec
     if unsafe { crate::types::dict::type_name(key) } == Some("slice") {
         match str_slice_object(object, key) {
             Ok(value) => value,
-            Err(message) => super::return_null_with_error(message),
+            Err(message) => raise_slice_error(message),
         }
     } else {
         match str_index_value(key).and_then(|index| str_item_object(object, index)) {
@@ -688,6 +777,10 @@ fn is_byte_index_error(message: &str) -> bool {
 fn return_null_with_byte_index_error(message: String) -> *mut PyObject {
     if is_byte_index_error(&message) {
         super::exc::raise_index_error_text(&message)
+    } else if message == "byte must be in range(0, 256)" {
+        raise_value_error(message)
+    } else if message == "expected int object" {
+        raise_type_error(message)
     } else {
         super::return_null_with_error(message)
     }
@@ -696,6 +789,12 @@ fn return_null_with_byte_index_error(message: String) -> *mut PyObject {
 fn return_minus_one_with_byte_index_error(message: String) -> c_int {
     if is_byte_index_error(&message) {
         super::exc::raise_index_error_text(&message);
+        -1
+    } else if message == "byte must be in range(0, 256)" {
+        raise_value_error(message);
+        -1
+    } else if message == "expected int object" {
+        raise_type_error(message);
         -1
     } else {
         super::return_minus_one_with_error(message)
@@ -713,7 +812,7 @@ unsafe extern "C" fn bytes_subscript_slot(object: *mut PyObject, key: *mut PyObj
     if unsafe { crate::types::dict::type_name(key) } == Some("slice") {
         match bytes_slice_object(object, key, false) {
             Ok(value) => value,
-            Err(message) => super::return_null_with_error(message),
+            Err(message) => raise_slice_error(message),
         }
     } else {
         match str_index_value(key).and_then(|index| bytes_item_object(object, index)) {
@@ -726,14 +825,14 @@ unsafe extern "C" fn bytes_subscript_slot(object: *mut PyObject, key: *mut PyObj
 unsafe extern "C" fn str_repeat_slot(object: *mut PyObject, count_object: *mut PyObject) -> *mut PyObject {
     match repeat_count_value(count_object) {
         Ok(count) => unsafe { pon_str_repeat(object, count) },
-        Err(message) => super::return_null_with_error(message),
+        Err(message) => raise_repeat_error(message),
     }
 }
 
 unsafe extern "C" fn bytes_repeat_slot(object: *mut PyObject, count_object: *mut PyObject) -> *mut PyObject {
     match repeat_count_value(count_object) {
         Ok(count) => unsafe { pon_bytes_repeat(object, count) },
-        Err(message) => super::return_null_with_error(message),
+        Err(message) => raise_repeat_error(message),
     }
 }
 
@@ -749,7 +848,7 @@ unsafe extern "C" fn bytearray_subscript_slot(object: *mut PyObject, key: *mut P
     if unsafe { crate::types::dict::type_name(key) } == Some("slice") {
         match bytes_slice_object(object, key, true) {
             Ok(value) => value,
-            Err(message) => super::return_null_with_error(message),
+            Err(message) => raise_slice_error(message),
         }
     } else {
         match str_index_value(key).and_then(|index| bytes_item_object(object, index)) {
@@ -770,21 +869,24 @@ unsafe extern "C" fn bytearray_ass_subscript_slot(object: *mut PyObject, key: *m
     if unsafe { crate::types::dict::type_name(key) } == Some("slice") {
         let replacement = match expect_bytes_like(value) {
             Ok(bytes) => bytes,
-            Err(message) => return super::return_minus_one_with_error(message),
+            Err(message) => {
+                raise_type_error(message);
+                return -1;
+            }
         };
         match bytearray_assign_slice(object, key, &replacement) {
             Ok(()) => 0,
-            Err(message) => super::return_minus_one_with_error(message),
+            Err(message) => bytearray_slice_store_error(message),
         }
     } else {
-        unsafe { bytearray_ass_item_slot(object, match str_index_value(key) { Ok(index) => index, Err(message) => return super::return_minus_one_with_error(message) }, value) }
+        unsafe { bytearray_ass_item_slot(object, match str_index_value(key) { Ok(index) => index, Err(message) => return return_minus_one_with_byte_index_error(message) }, value) }
     }
 }
 
 unsafe extern "C" fn bytearray_repeat_slot(object: *mut PyObject, count_object: *mut PyObject) -> *mut PyObject {
     match repeat_count_value(count_object) {
         Ok(count) => unsafe { pon_bytearray_repeat(object, count) },
-        Err(message) => super::return_null_with_error(message),
+        Err(message) => raise_repeat_error(message),
     }
 }
 
@@ -799,7 +901,7 @@ unsafe extern "C" fn memoryview_len_slot(object: *mut PyObject) -> isize {
 unsafe extern "C" fn memoryview_item_slot(object: *mut PyObject, index: isize) -> *mut PyObject {
     match memoryview_item_object(object, index) {
         Ok(value) => value,
-        Err(message) => super::return_null_with_error(message),
+        Err(message) => return_null_with_byte_index_error(message),
     }
 }
 
@@ -807,12 +909,12 @@ unsafe extern "C" fn memoryview_subscript_slot(object: *mut PyObject, key: *mut 
     if unsafe { crate::types::dict::type_name(key) } == Some("slice") {
         match memoryview_slice_object(object, key) {
             Ok(value) => value,
-            Err(message) => super::return_null_with_error(message),
+            Err(message) => raise_slice_error(message),
         }
     } else {
         match str_index_value(key).and_then(|index| memoryview_item_object(object, index)) {
             Ok(value) => value,
-            Err(message) => super::return_null_with_error(message),
+            Err(message) => return_null_with_byte_index_error(message),
         }
     }
 }
@@ -828,22 +930,46 @@ unsafe extern "C" fn memoryview_ass_subscript_slot(object: *mut PyObject, key: *
     if unsafe { crate::types::dict::type_name(key) } == Some("slice") {
         let replacement = match expect_bytes_like(value) {
             Ok(bytes) => bytes,
-            Err(message) => return super::return_minus_one_with_error(message),
+            Err(message) => {
+                raise_type_error(message);
+                return -1;
+            }
         };
         match memoryview_assign_slice(object, key, &replacement) {
             Ok(()) => 0,
             Err(message) => memoryview_write_error_status(message),
         }
     } else {
-        unsafe { memoryview_ass_item_slot(object, match str_index_value(key) { Ok(index) => index, Err(message) => return super::return_minus_one_with_error(message) }, value) }
+        unsafe { memoryview_ass_item_slot(object, match str_index_value(key) { Ok(index) => index, Err(message) => return memoryview_write_error_status(message) }, value) }
     }
 }
 
+/// Store-side failures on bytearray/memoryview: readonly writes and non-int
+/// values are CPython TypeError, out-of-range bytes/indices ValueError and
+/// IndexError; unsupported-format invariants keep the bare diagnostic.
 fn memoryview_write_error_status(message: String) -> c_int {
-    if message == memoryview_type::READONLY_WRITE_ERROR {
-        unsafe {
-            super::exc::pon_raise_type_error(message.as_ptr(), message.len());
-        }
+    if message == memoryview_type::READONLY_WRITE_ERROR || message == "expected int object" {
+        raise_type_error(message);
+        -1
+    } else if message == "byte must be in range(0, 256)" || message == "memoryview assignment length mismatch" {
+        raise_value_error(message);
+        -1
+    } else if message == "index out of range" {
+        super::exc::raise_index_error_text(&message);
+        -1
+    } else {
+        super::return_minus_one_with_error(message)
+    }
+}
+
+/// `bytearray` extended-slice store failures: size mismatches and zero steps
+/// are CPython ValueError, non-int bounds TypeError.
+fn bytearray_slice_store_error(message: String) -> c_int {
+    if message == "attempt to assign bytes of different size to extended slice" || message == "slice step cannot be zero" {
+        raise_value_error(message);
+        -1
+    } else if message == "expected int object" {
+        raise_type_error(message);
         -1
     } else {
         super::return_minus_one_with_error(message)
@@ -902,7 +1028,7 @@ unsafe extern "C" fn str_getattro(object: *mut PyObject, name: *mut PyObject) ->
         "maketrans" => bound_str_method(object, name, str_maketrans_entry),
         "format" => bound_str_method(object, name, str_format_entry),
         "format_map" => bound_str_method(object, name, str_format_map_entry),
-        _ => super::return_null_with_error(format!("attribute '{name}' was not found")),
+        _ => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
     }
 }
 
@@ -1171,7 +1297,7 @@ unsafe extern "C" fn memoryview_tobytes_entry(argv: *mut *mut PyObject, argc: us
         return super::return_null_with_error("memoryview.tobytes argv pointer is null");
     }
     if argc != 1 {
-        return super::return_null_with_error("memoryview.tobytes expected no arguments");
+        return raise_type_error("memoryview.tobytes expected no arguments");
     }
     let receiver = unsafe { *argv };
     match memoryview_bytes(receiver) {
@@ -1185,7 +1311,7 @@ unsafe extern "C" fn memoryview_cast_entry(argv: *mut *mut PyObject, argc: usize
         return super::return_null_with_error("memoryview.cast argv pointer is null");
     };
     if args.len() != 2 {
-        return super::return_null_with_error("memoryview.cast expected exactly one argument");
+        return raise_type_error("memoryview.cast expected exactly one argument");
     }
     let receiver = args[0];
     if receiver.is_null() || !memoryview_type::is_memoryview_type(unsafe { (*receiver).ob_type }) {
@@ -1193,7 +1319,7 @@ unsafe extern "C" fn memoryview_cast_entry(argv: *mut *mut PyObject, argc: usize
     }
     let format = match expect_str(args[1]) {
         Ok(text) => text,
-        Err(message) => return super::return_null_with_error(message),
+        Err(message) => return raise_type_error(message),
     };
     let view = unsafe { &*receiver.cast::<memoryview_type::PyMemoryView>() };
     match memoryview_type::cast(view, &format) {
@@ -1207,7 +1333,7 @@ unsafe extern "C" fn memoryview_tolist_entry(argv: *mut *mut PyObject, argc: usi
         return super::return_null_with_error("memoryview.tolist argv pointer is null");
     };
     if args.len() != 1 {
-        return super::return_null_with_error("memoryview.tolist expected no arguments");
+        return raise_type_error("memoryview.tolist expected no arguments");
     }
     let receiver = args[0];
     if receiver.is_null() || !memoryview_type::is_memoryview_type(unsafe { (*receiver).ob_type }) {
@@ -1589,7 +1715,7 @@ fn object_to_i64(value: *mut PyObject) -> Option<i64> {
 fn str_split_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
     let (sep, maxsplit) = match str_split_args(args, "str.split") {
         Ok(values) => values,
-        Err(message) => return super::return_null_with_error(message),
+        Err(message) => return raise_split_error(message),
     };
     alloc_str_list(str_type::split_limited(receiver, sep.as_deref(), maxsplit))
 }
@@ -1597,32 +1723,32 @@ fn str_split_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
 fn str_rsplit_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
     let (sep, maxsplit) = match str_split_args(args, "str.rsplit") {
         Ok(values) => values,
-        Err(message) => return super::return_null_with_error(message),
+        Err(message) => return raise_split_error(message),
     };
     alloc_str_list(str_type::rsplit_limited(receiver, sep.as_deref(), maxsplit))
 }
 
 fn str_splitlines_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
     if args.len() > 1 {
-        return super::return_null_with_error("str.splitlines expected at most one argument");
+        return raise_type_error("str.splitlines expected at most one argument");
     }
-    let keepends = if let Some(arg) = args.first().copied() { match object_truth(arg) { Ok(value) => value, Err(message) => return super::return_null_with_error(message) } } else { false };
+    let keepends = if let Some(arg) = args.first().copied() { match object_truth(arg) { Ok(value) => value, Err(message) => return raise_type_error(message) } } else { false };
     alloc_str_list(str_type::splitlines(receiver, keepends))
 }
 
 fn str_join_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
     if args.len() != 1 {
-        return super::return_null_with_error("str.join expected exactly one argument");
+        return raise_type_error("str.join expected exactly one argument");
     }
     let values = match super::seq::sequence_to_vec(args[0]) {
         Ok(values) => values,
-        Err(message) => return super::return_null_with_error(message),
+        Err(message) => return raise_type_error(message),
     };
     let mut items = Vec::with_capacity(values.len());
     for value in values {
         match expect_str(value) {
             Ok(item) => items.push(item),
-            Err(_) => return super::return_null_with_error("str.join expected every item to be str"),
+            Err(_) => return raise_type_error("str.join expected every item to be str"),
         }
     }
     alloc_str_object(&str_type::join(receiver, &items))
@@ -1630,14 +1756,14 @@ fn str_join_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
 
 fn str_replace_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
     if !(args.len() == 2 || args.len() == 3) {
-        return super::return_null_with_error("str.replace expected two or three arguments");
+        return raise_type_error("str.replace expected two or three arguments");
     }
     let (Ok(old), Ok(new)) = (expect_str(args[0]), expect_str(args[1])) else {
-        return super::return_null_with_error("str.replace arguments must be str");
+        return raise_type_error("str.replace arguments must be str");
     };
     let count = match args.get(2).copied().map(str_long_value).transpose() {
         Ok(value) => value.map(|value| value as isize),
-        Err(message) => return super::return_null_with_error(message),
+        Err(message) => return raise_type_error(message),
     };
     alloc_str_object(&str_type::replace_count(receiver, &old, &new, count))
 }
@@ -1660,35 +1786,35 @@ fn str_rindex_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
 
 fn str_find_like(receiver: &str, args: &[*mut PyObject], reverse: bool, index_mode: bool) -> *mut PyObject {
     if !(1..=3).contains(&args.len()) {
-        return super::return_null_with_error("str.find/index expected one to three arguments");
+        return raise_type_error("str.find/index expected one to three arguments");
     }
     let needle = match expect_str(args[0]) {
         Ok(needle) => needle,
-        Err(message) => return super::return_null_with_error(message),
+        Err(message) => return raise_type_error(message),
     };
     let (start, end) = match normalize_bounds_args(&args[1..], str_type::codepoint_len(receiver)) {
         Ok(bounds) => bounds,
-        Err(message) => return super::return_null_with_error(message),
+        Err(message) => return raise_type_error(message),
     };
     let found = if reverse { str_type::rfind_range(receiver, &needle, start, end) } else { str_type::find_range(receiver, &needle, start, end) };
     match found {
         Some(index) => unsafe { super::pon_const_int(index as i64) },
-        None if index_mode => super::return_null_with_error("substring not found"),
+        None if index_mode => raise_value_error("substring not found"),
         None => unsafe { super::pon_const_int(-1) },
     }
 }
 
 fn str_count_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
     if !(1..=3).contains(&args.len()) {
-        return super::return_null_with_error("str.count expected one to three arguments");
+        return raise_type_error("str.count expected one to three arguments");
     }
     let needle = match expect_str(args[0]) {
         Ok(needle) => needle,
-        Err(message) => return super::return_null_with_error(message),
+        Err(message) => return raise_type_error(message),
     };
     let (start, end) = match normalize_bounds_args(&args[1..], str_type::codepoint_len(receiver)) {
         Ok(bounds) => bounds,
-        Err(message) => return super::return_null_with_error(message),
+        Err(message) => return raise_type_error(message),
     };
     unsafe { super::pon_const_int(str_type::count_range(receiver, &needle, start, end) as i64) }
 }
@@ -1703,15 +1829,15 @@ fn str_endswith_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject 
 
 fn str_affix_method(receiver: &str, args: &[*mut PyObject], starts: bool) -> *mut PyObject {
     if !(1..=3).contains(&args.len()) {
-        return super::return_null_with_error("str.startswith/endswith expected one to three arguments");
+        return raise_type_error("str.startswith/endswith expected one to three arguments");
     }
     let prefixes = match str_affix_values(args[0]) {
         Ok(prefixes) => prefixes,
-        Err(message) => return super::return_null_with_error(message),
+        Err(message) => return raise_type_error(message),
     };
     let (start, end) = match normalize_bounds_args(&args[1..], str_type::codepoint_len(receiver)) {
         Ok(bounds) => bounds,
-        Err(message) => return super::return_null_with_error(message),
+        Err(message) => return raise_type_error(message),
     };
     let result = prefixes.iter().any(|prefix| {
         if starts {
@@ -1740,11 +1866,11 @@ enum StripKind { Left, Right, Both }
 
 fn str_strip_like(receiver: &str, args: &[*mut PyObject], kind: StripKind) -> *mut PyObject {
     if args.len() > 1 {
-        return super::return_null_with_error("str.strip expected at most one argument");
+        return raise_type_error("str.strip expected at most one argument");
     }
     let chars = match optional_str_arg(args.first().copied()) {
         Ok(chars) => chars,
-        Err(message) => return super::return_null_with_error(message),
+        Err(message) => return raise_type_error(message),
     };
     let out = match kind {
         StripKind::Left => str_type::lstrip(receiver, chars.as_deref()),
@@ -1780,7 +1906,7 @@ fn str_swapcase_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject 
 
 fn str_unary_text_method(args: &[*mut PyObject], value: &str, name: &str) -> *mut PyObject {
     if !args.is_empty() {
-        return super::return_null_with_error(format!("{name} expected no arguments"));
+        return raise_type_error(format!("{name} expected no arguments"));
     }
     alloc_str_object(value)
 }
@@ -1799,17 +1925,17 @@ fn str_rjust_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
 
 fn str_pad_method(receiver: &str, args: &[*mut PyObject], f: fn(&str, usize, char) -> String, name: &str) -> *mut PyObject {
     if !(1..=2).contains(&args.len()) {
-        return super::return_null_with_error(format!("{name} expected one or two arguments"));
+        return raise_type_error(format!("{name} expected one or two arguments"));
     }
     let width = match usize_arg(args[0], "width") {
         Ok(width) => width,
-        Err(message) => return super::return_null_with_error(message),
+        Err(message) => return raise_type_error(message),
     };
     let fill = if let Some(arg) = args.get(1).copied() {
-        let fill = match expect_str(arg) { Ok(fill) => fill, Err(message) => return super::return_null_with_error(message) };
+        let fill = match expect_str(arg) { Ok(fill) => fill, Err(message) => return raise_type_error(message) };
         let mut chars = fill.chars();
-        let Some(fill) = chars.next() else { return super::return_null_with_error("fill character must be exactly one character long"); };
-        if chars.next().is_some() { return super::return_null_with_error("fill character must be exactly one character long"); }
+        let Some(fill) = chars.next() else { return raise_type_error("fill character must be exactly one character long"); };
+        if chars.next().is_some() { return raise_type_error("fill character must be exactly one character long"); }
         fill
     } else { ' ' };
     alloc_str_object(&f(receiver, width, fill))
@@ -1817,20 +1943,20 @@ fn str_pad_method(receiver: &str, args: &[*mut PyObject], f: fn(&str, usize, cha
 
 fn str_zfill_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
     if args.len() != 1 {
-        return super::return_null_with_error("str.zfill expected exactly one argument");
+        return raise_type_error("str.zfill expected exactly one argument");
     }
-    let width = match usize_arg(args[0], "width") { Ok(width) => width, Err(message) => return super::return_null_with_error(message) };
+    let width = match usize_arg(args[0], "width") { Ok(width) => width, Err(message) => return raise_type_error(message) };
     alloc_str_object(&str_type::zfill(receiver, width))
 }
 
 fn str_expandtabs_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
     if args.len() > 1 {
-        return super::return_null_with_error("str.expandtabs expected at most one argument");
+        return raise_type_error("str.expandtabs expected at most one argument");
     }
     let tabsize = match args.first().copied().map(str_long_value).transpose() {
         Ok(Some(value)) => value as isize,
         Ok(None) => 8,
-        Err(message) => return super::return_null_with_error(message),
+        Err(message) => return raise_type_error(message),
     };
     alloc_str_object(&str_type::expandtabs(receiver, tabsize))
 }
@@ -1845,53 +1971,53 @@ fn str_rpartition_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObjec
 
 fn str_partition_like(receiver: &str, args: &[*mut PyObject], reverse: bool) -> *mut PyObject {
     if args.len() != 1 {
-        return super::return_null_with_error("str.partition expected exactly one argument");
+        return raise_type_error("str.partition expected exactly one argument");
     }
-    let sep = match expect_str(args[0]) { Ok(sep) => sep, Err(message) => return super::return_null_with_error(message) };
+    let sep = match expect_str(args[0]) { Ok(sep) => sep, Err(message) => return raise_type_error(message) };
     if sep.is_empty() {
-        return super::return_null_with_error("empty separator");
+        return raise_value_error("empty separator");
     }
     let (a, b, c) = if reverse { str_type::rpartition(receiver, &sep) } else { str_type::partition(receiver, &sep) };
     alloc_tuple3(alloc_str_object(&a), alloc_str_object(&b), alloc_str_object(&c))
 }
 
 fn str_removeprefix_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
-    if args.len() != 1 { return super::return_null_with_error("str.removeprefix expected exactly one argument"); }
+    if args.len() != 1 { return raise_type_error("str.removeprefix expected exactly one argument"); }
     match expect_str(args[0]) {
         Ok(prefix) => alloc_str_object(&str_type::removeprefix(receiver, &prefix)),
-        Err(message) => super::return_null_with_error(message),
+        Err(message) => raise_type_error(message),
     }
 }
 
 fn str_removesuffix_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
-    if args.len() != 1 { return super::return_null_with_error("str.removesuffix expected exactly one argument"); }
+    if args.len() != 1 { return raise_type_error("str.removesuffix expected exactly one argument"); }
     match expect_str(args[0]) {
         Ok(suffix) => alloc_str_object(&str_type::removesuffix(receiver, &suffix)),
-        Err(message) => super::return_null_with_error(message),
+        Err(message) => raise_type_error(message),
     }
 }
 
 fn str_predicate_method(args: &[*mut PyObject], result: bool) -> *mut PyObject {
     if !args.is_empty() {
-        return super::return_null_with_error("str predicate expected no arguments");
+        return raise_type_error("str predicate expected no arguments");
     }
     unsafe { super::pon_const_bool(i32::from(result)) }
 }
 
 fn str_translate_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
-    if args.len() != 1 { return super::return_null_with_error("str.translate expected exactly one argument"); }
-    let table = match expect_translate_table(args[0]) { Ok(table) => table, Err(message) => return super::return_null_with_error(message) };
+    if args.len() != 1 { return raise_type_error("str.translate expected exactly one argument"); }
+    let table = match expect_translate_table(args[0]) { Ok(table) => table, Err(message) => return raise_translate_error(message) };
     alloc_str_object(&str_type::translate(receiver, &table))
 }
 
 fn str_maketrans_method(args: &[*mut PyObject]) -> *mut PyObject {
     if !(2..=3).contains(&args.len()) {
-        return super::return_null_with_error("str.maketrans expected two or three arguments");
+        return raise_type_error("str.maketrans expected two or three arguments");
     }
-    let from = match expect_str(args[0]) { Ok(value) => value, Err(message) => return super::return_null_with_error(message) };
-    let to = match expect_str(args[1]) { Ok(value) => value, Err(message) => return super::return_null_with_error(message) };
-    let delete = match args.get(2).copied().map(expect_str).transpose() { Ok(value) => value, Err(message) => return super::return_null_with_error(message) };
-    let table = match str_type::maketrans(&from, &to, delete.as_deref()) { Ok(table) => table, Err(message) => return super::return_null_with_error(message) };
+    let from = match expect_str(args[0]) { Ok(value) => value, Err(message) => return raise_type_error(message) };
+    let to = match expect_str(args[1]) { Ok(value) => value, Err(message) => return raise_type_error(message) };
+    let delete = match args.get(2).copied().map(expect_str).transpose() { Ok(value) => value, Err(message) => return raise_type_error(message) };
+    let table = match str_type::maketrans(&from, &to, delete.as_deref()) { Ok(table) => table, Err(message) => return raise_value_error(message) };
     as_object_ptr(Box::into_raw(Box::new(PyStrTranslateTable { ob_base: PyObjectHeader::new(str_translate_table_type()), table })))
 }
 
@@ -1904,7 +2030,7 @@ fn str_format_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
 
 fn str_format_map_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
     if args.len() != 1 {
-        return super::return_null_with_error("str.format_map expected exactly one argument");
+        return raise_type_error("str.format_map expected exactly one argument");
     }
     match unsafe { super::format::format_template(receiver, &[], Some(args[0])) } {
         Ok(text) => alloc_str_object(&text),
@@ -1914,21 +2040,21 @@ fn str_format_map_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObjec
 
 fn str_encode_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
     if args.len() > 2 {
-        return super::return_null_with_error("str.encode expected at most two arguments");
+        return raise_type_error("str.encode expected at most two arguments");
     }
     let encoding = match optional_str_arg(args.first().copied()) {
         Ok(Some(encoding)) => encoding,
         Ok(None) => "utf-8".to_owned(),
-        Err(message) => return super::return_null_with_error(message),
+        Err(message) => return raise_type_error(message),
     };
     let errors = match optional_str_arg(args.get(1).copied()) {
         Ok(Some(errors)) => errors,
         Ok(None) => "strict".to_owned(),
-        Err(message) => return super::return_null_with_error(message),
+        Err(message) => return raise_type_error(message),
     };
     let encoded = if encoding.eq_ignore_ascii_case("idna") {
-        if errors != "strict" { return super::return_null_with_error(format!("unsupported str.encode errors handler '{errors}'")); }
-        match encode_idna_ascii(receiver) { Ok(encoded) => encoded, Err(message) => return super::return_null_with_error(message) }
+        if errors != "strict" { return raise_typed(ExceptionKind::LookupError, &format!("unsupported str.encode errors handler '{errors}'")); }
+        match encode_idna_ascii(receiver) { Ok(encoded) => encoded, Err(message) => return raise_typed(ExceptionKind::UnicodeError, &message) }
     } else {
         match crate::native::codecs::encode_str_to_vec(receiver, &encoding, &errors) { Ok(encoded) => encoded, Err(()) => return ptr::null_mut() }
     };
@@ -2198,35 +2324,35 @@ fn encode_punycode_digit(value: u32) -> Result<char, String> {
 }
 
 fn bytes_split_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool) -> *mut PyObject {
-    let (sep, maxsplit) = match bytes_split_args(args, "bytes.split") { Ok(values) => values, Err(message) => return super::return_null_with_error(message) };
+    let (sep, maxsplit) = match bytes_split_args(args, "bytes.split") { Ok(values) => values, Err(message) => return raise_split_error(message) };
     alloc_binary_list(bytes_type::split_limited(receiver, sep.as_deref(), maxsplit), mutable_receiver)
 }
 
 fn bytes_rsplit_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool) -> *mut PyObject {
-    let (sep, maxsplit) = match bytes_split_args(args, "bytes.rsplit") { Ok(values) => values, Err(message) => return super::return_null_with_error(message) };
+    let (sep, maxsplit) = match bytes_split_args(args, "bytes.rsplit") { Ok(values) => values, Err(message) => return raise_split_error(message) };
     alloc_binary_list(bytes_type::rsplit_limited(receiver, sep.as_deref(), maxsplit), mutable_receiver)
 }
 
 fn bytes_splitlines_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool) -> *mut PyObject {
-    if args.len() > 1 { return super::return_null_with_error("bytes.splitlines expected at most one argument"); }
-    let keepends = if let Some(arg) = args.first().copied() { match object_truth(arg) { Ok(value) => value, Err(message) => return super::return_null_with_error(message) } } else { false };
+    if args.len() > 1 { return raise_type_error("bytes.splitlines expected at most one argument"); }
+    let keepends = if let Some(arg) = args.first().copied() { match object_truth(arg) { Ok(value) => value, Err(message) => return raise_type_error(message) } } else { false };
     alloc_binary_list(bytes_type::splitlines(receiver, keepends), mutable_receiver)
 }
 
 fn bytes_join_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool) -> *mut PyObject {
-    if args.len() != 1 { return super::return_null_with_error("bytes.join expected exactly one argument"); }
-    let values = match super::seq::sequence_to_vec(args[0]) { Ok(values) => values, Err(message) => return super::return_null_with_error(message) };
+    if args.len() != 1 { return raise_type_error("bytes.join expected exactly one argument"); }
+    let values = match super::seq::sequence_to_vec(args[0]) { Ok(values) => values, Err(message) => return raise_type_error(message) };
     let mut items = Vec::with_capacity(values.len());
     for value in values {
-        match expect_bytes_like(value) { Ok(item) => items.push(item), Err(_) => return super::return_null_with_error("bytes.join expected every item to be bytes-like") }
+        match expect_bytes_like(value) { Ok(item) => items.push(item), Err(_) => return raise_type_error("bytes.join expected every item to be bytes-like") }
     }
     alloc_binary_object(&bytes_type::join(receiver, &items), mutable_receiver)
 }
 
 fn bytes_replace_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool) -> *mut PyObject {
-    if !(args.len() == 2 || args.len() == 3) { return super::return_null_with_error("bytes.replace expected two or three arguments"); }
-    let (Ok(old), Ok(new)) = (expect_bytes_like(args[0]), expect_bytes_like(args[1])) else { return super::return_null_with_error("bytes.replace arguments must be bytes-like"); };
-    let count = match args.get(2).copied().map(str_long_value).transpose() { Ok(value) => value.map(|v| v as isize), Err(message) => return super::return_null_with_error(message) };
+    if !(args.len() == 2 || args.len() == 3) { return raise_type_error("bytes.replace expected two or three arguments"); }
+    let (Ok(old), Ok(new)) = (expect_bytes_like(args[0]), expect_bytes_like(args[1])) else { return raise_type_error("bytes.replace arguments must be bytes-like"); };
+    let count = match args.get(2).copied().map(str_long_value).transpose() { Ok(value) => value.map(|v| v as isize), Err(message) => return raise_type_error(message) };
     alloc_binary_object(&bytes_type::replace_count(receiver, &old, &new, count), mutable_receiver)
 }
 
@@ -2243,12 +2369,12 @@ fn bytes_needle_arg(value: *mut PyObject) -> Result<Vec<u8>, String> {
 }
 
 fn bytes_translate_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool) -> *mut PyObject {
-    if !(1..=2).contains(&args.len()) { return super::return_null_with_error("bytes.translate expected one or two arguments"); }
+    if !(1..=2).contains(&args.len()) { return raise_type_error("bytes.translate expected one or two arguments"); }
     let table = if is_none(args[0]) { None } else {
-        match expect_bytes_like(args[0]) { Ok(table) => Some(table), Err(message) => return super::return_null_with_error(message) }
+        match expect_bytes_like(args[0]) { Ok(table) => Some(table), Err(message) => return raise_type_error(message) }
     };
     let delete = match args.get(1).copied() {
-        Some(value) => match expect_bytes_like(value) { Ok(delete) => delete, Err(message) => return super::return_null_with_error(message) },
+        Some(value) => match expect_bytes_like(value) { Ok(delete) => delete, Err(message) => return raise_type_error(message) },
         None => Vec::new(),
     };
     match bytes_type::translate(receiver, table.as_deref(), &delete) {
@@ -2263,21 +2389,21 @@ fn bytes_index_method(receiver: &[u8], args: &[*mut PyObject]) -> *mut PyObject 
 fn bytes_rindex_method(receiver: &[u8], args: &[*mut PyObject]) -> *mut PyObject { bytes_find_like(receiver, args, true, true) }
 
 fn bytes_find_like(receiver: &[u8], args: &[*mut PyObject], reverse: bool, index_mode: bool) -> *mut PyObject {
-    if !(1..=3).contains(&args.len()) { return super::return_null_with_error("bytes.find/index expected one to three arguments"); }
-    let needle = match bytes_needle_arg(args[0]) { Ok(needle) => needle, Err(message) => return super::return_null_with_error(message) };
-    let (start, end) = match normalize_bounds_args(&args[1..], receiver.len()) { Ok(bounds) => bounds, Err(message) => return super::return_null_with_error(message) };
+    if !(1..=3).contains(&args.len()) { return raise_type_error("bytes.find/index expected one to three arguments"); }
+    let needle = match bytes_needle_arg(args[0]) { Ok(needle) => needle, Err(message) => return raise_byte_arg_error(message) };
+    let (start, end) = match normalize_bounds_args(&args[1..], receiver.len()) { Ok(bounds) => bounds, Err(message) => return raise_type_error(message) };
     let found = if reverse { bytes_type::rfind_range(receiver, &needle, start, end) } else { bytes_type::find_range(receiver, &needle, start, end) };
     match found {
         Some(index) => unsafe { super::pon_const_int(index as i64) },
-        None if index_mode => super::return_null_with_error("subsection not found"),
+        None if index_mode => raise_value_error("subsection not found"),
         None => unsafe { super::pon_const_int(-1) },
     }
 }
 
 fn bytes_count_method(receiver: &[u8], args: &[*mut PyObject]) -> *mut PyObject {
-    if !(1..=3).contains(&args.len()) { return super::return_null_with_error("bytes.count expected one to three arguments"); }
-    let needle = match bytes_needle_arg(args[0]) { Ok(needle) => needle, Err(message) => return super::return_null_with_error(message) };
-    let (start, end) = match normalize_bounds_args(&args[1..], receiver.len()) { Ok(bounds) => bounds, Err(message) => return super::return_null_with_error(message) };
+    if !(1..=3).contains(&args.len()) { return raise_type_error("bytes.count expected one to three arguments"); }
+    let needle = match bytes_needle_arg(args[0]) { Ok(needle) => needle, Err(message) => return raise_byte_arg_error(message) };
+    let (start, end) = match normalize_bounds_args(&args[1..], receiver.len()) { Ok(bounds) => bounds, Err(message) => return raise_type_error(message) };
     unsafe { super::pon_const_int(bytes_type::count_range(receiver, &needle, start, end) as i64) }
 }
 
@@ -2285,17 +2411,17 @@ fn bytes_startswith_method(receiver: &[u8], args: &[*mut PyObject]) -> *mut PyOb
 fn bytes_endswith_method(receiver: &[u8], args: &[*mut PyObject]) -> *mut PyObject { bytes_affix_method(receiver, args, false) }
 
 fn bytes_affix_method(receiver: &[u8], args: &[*mut PyObject], starts: bool) -> *mut PyObject {
-    if !(1..=3).contains(&args.len()) { return super::return_null_with_error("bytes.startswith/endswith expected one to three arguments"); }
-    let prefixes = match bytes_affix_values(args[0]) { Ok(prefixes) => prefixes, Err(message) => return super::return_null_with_error(message) };
-    let (start, end) = match normalize_bounds_args(&args[1..], receiver.len()) { Ok(bounds) => bounds, Err(message) => return super::return_null_with_error(message) };
+    if !(1..=3).contains(&args.len()) { return raise_type_error("bytes.startswith/endswith expected one to three arguments"); }
+    let prefixes = match bytes_affix_values(args[0]) { Ok(prefixes) => prefixes, Err(message) => return raise_type_error(message) };
+    let (start, end) = match normalize_bounds_args(&args[1..], receiver.len()) { Ok(bounds) => bounds, Err(message) => return raise_type_error(message) };
     let result = prefixes.iter().any(|prefix| if starts { bytes_type::startswith_range(receiver, prefix, start, end) } else { bytes_type::endswith_range(receiver, prefix, start, end) });
     unsafe { super::pon_const_bool(i32::from(result)) }
 }
 
 fn bytes_decode_method(receiver: &[u8], args: &[*mut PyObject]) -> *mut PyObject {
-    if args.len() > 2 { return super::return_null_with_error("bytes.decode expected at most two arguments"); }
-    let encoding = match optional_str_arg(args.first().copied()) { Ok(Some(value)) => value, Ok(None) => "utf-8".to_owned(), Err(message) => return super::return_null_with_error(message) };
-    let errors = match optional_str_arg(args.get(1).copied()) { Ok(Some(value)) => value, Ok(None) => "strict".to_owned(), Err(message) => return super::return_null_with_error(message) };
+    if args.len() > 2 { return raise_type_error("bytes.decode expected at most two arguments"); }
+    let encoding = match optional_str_arg(args.first().copied()) { Ok(Some(value)) => value, Ok(None) => "utf-8".to_owned(), Err(message) => return raise_type_error(message) };
+    let errors = match optional_str_arg(args.get(1).copied()) { Ok(Some(value)) => value, Ok(None) => "strict".to_owned(), Err(message) => return raise_type_error(message) };
     match crate::native::codecs::decode_bytes_to_string(receiver, &encoding, &errors) { Ok(text) => alloc_str_object(&text), Err(()) => ptr::null_mut() }
 }
 
@@ -2304,33 +2430,33 @@ fn bytes_lstrip_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver
 fn bytes_rstrip_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool) -> *mut PyObject { bytes_strip_like(receiver, args, mutable_receiver, StripKind::Right) }
 
 fn bytes_strip_like(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool, kind: StripKind) -> *mut PyObject {
-    if args.len() > 1 { return super::return_null_with_error("bytes.strip expected at most one argument"); }
-    let chars = match optional_bytes_arg(args.first().copied()) { Ok(chars) => chars, Err(message) => return super::return_null_with_error(message) };
+    if args.len() > 1 { return raise_type_error("bytes.strip expected at most one argument"); }
+    let chars = match optional_bytes_arg(args.first().copied()) { Ok(chars) => chars, Err(message) => return raise_type_error(message) };
     let out = match kind { StripKind::Left => bytes_type::lstrip(receiver, chars.as_deref()), StripKind::Right => bytes_type::rstrip(receiver, chars.as_deref()), StripKind::Both => bytes_type::strip(receiver, chars.as_deref()) };
     alloc_binary_object(&out, mutable_receiver)
 }
 
 fn bytes_unary_bytes_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool, f: fn(&[u8]) -> Vec<u8>) -> *mut PyObject {
-    if !args.is_empty() { return super::return_null_with_error("bytes method expected no arguments"); }
+    if !args.is_empty() { return raise_type_error("bytes method expected no arguments"); }
     alloc_binary_object(&f(receiver), mutable_receiver)
 }
 
 fn bytes_pad_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool, f: fn(&[u8], usize, u8) -> Vec<u8>) -> *mut PyObject {
-    if !(1..=2).contains(&args.len()) { return super::return_null_with_error("bytes pad expected one or two arguments"); }
-    let width = match usize_arg(args[0], "width") { Ok(width) => width, Err(message) => return super::return_null_with_error(message) };
-    let fill = if let Some(arg) = args.get(1).copied() { match expect_single_byte(arg) { Ok(byte) => byte, Err(message) => return super::return_null_with_error(message) } } else { b' ' };
+    if !(1..=2).contains(&args.len()) { return raise_type_error("bytes pad expected one or two arguments"); }
+    let width = match usize_arg(args[0], "width") { Ok(width) => width, Err(message) => return raise_type_error(message) };
+    let fill = if let Some(arg) = args.get(1).copied() { match expect_single_byte(arg) { Ok(byte) => byte, Err(message) => return raise_type_error(message) } } else { b' ' };
     alloc_binary_object(&f(receiver, width, fill), mutable_receiver)
 }
 
 fn bytes_zfill_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool) -> *mut PyObject {
-    if args.len() != 1 { return super::return_null_with_error("bytes.zfill expected exactly one argument"); }
-    let width = match usize_arg(args[0], "width") { Ok(width) => width, Err(message) => return super::return_null_with_error(message) };
+    if args.len() != 1 { return raise_type_error("bytes.zfill expected exactly one argument"); }
+    let width = match usize_arg(args[0], "width") { Ok(width) => width, Err(message) => return raise_type_error(message) };
     alloc_binary_object(&bytes_type::zfill(receiver, width), mutable_receiver)
 }
 
 fn bytes_expandtabs_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool) -> *mut PyObject {
-    if args.len() > 1 { return super::return_null_with_error("bytes.expandtabs expected at most one argument"); }
-    let tabsize = match args.first().copied().map(str_long_value).transpose() { Ok(Some(value)) => value as isize, Ok(None) => 8, Err(message) => return super::return_null_with_error(message) };
+    if args.len() > 1 { return raise_type_error("bytes.expandtabs expected at most one argument"); }
+    let tabsize = match args.first().copied().map(str_long_value).transpose() { Ok(Some(value)) => value as isize, Ok(None) => 8, Err(message) => return raise_type_error(message) };
     alloc_binary_object(&bytes_type::expandtabs(receiver, tabsize), mutable_receiver)
 }
 
@@ -2338,76 +2464,76 @@ fn bytes_partition_method(receiver: &[u8], args: &[*mut PyObject], mutable_recei
 fn bytes_rpartition_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool) -> *mut PyObject { bytes_partition_like(receiver, args, mutable_receiver, true) }
 
 fn bytes_partition_like(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool, reverse: bool) -> *mut PyObject {
-    if args.len() != 1 { return super::return_null_with_error("bytes.partition expected exactly one argument"); }
-    let sep = match expect_bytes_like(args[0]) { Ok(sep) => sep, Err(message) => return super::return_null_with_error(message) };
-    if sep.is_empty() { return super::return_null_with_error("empty separator"); }
+    if args.len() != 1 { return raise_type_error("bytes.partition expected exactly one argument"); }
+    let sep = match expect_bytes_like(args[0]) { Ok(sep) => sep, Err(message) => return raise_type_error(message) };
+    if sep.is_empty() { return raise_value_error("empty separator"); }
     let (a, b, c) = if reverse { bytes_type::rpartition(receiver, &sep) } else { bytes_type::partition(receiver, &sep) };
     alloc_tuple3(alloc_binary_object(&a, mutable_receiver), alloc_binary_object(&b, mutable_receiver), alloc_binary_object(&c, mutable_receiver))
 }
 
 fn bytes_removeprefix_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool) -> *mut PyObject {
-    if args.len() != 1 { return super::return_null_with_error("bytes.removeprefix expected exactly one argument"); }
-    match expect_bytes_like(args[0]) { Ok(prefix) => alloc_binary_object(&bytes_type::removeprefix(receiver, &prefix), mutable_receiver), Err(message) => super::return_null_with_error(message) }
+    if args.len() != 1 { return raise_type_error("bytes.removeprefix expected exactly one argument"); }
+    match expect_bytes_like(args[0]) { Ok(prefix) => alloc_binary_object(&bytes_type::removeprefix(receiver, &prefix), mutable_receiver), Err(message) => raise_type_error(message) }
 }
 
 fn bytes_removesuffix_method(receiver: &[u8], args: &[*mut PyObject], mutable_receiver: bool) -> *mut PyObject {
-    if args.len() != 1 { return super::return_null_with_error("bytes.removesuffix expected exactly one argument"); }
-    match expect_bytes_like(args[0]) { Ok(suffix) => alloc_binary_object(&bytes_type::removesuffix(receiver, &suffix), mutable_receiver), Err(message) => super::return_null_with_error(message) }
+    if args.len() != 1 { return raise_type_error("bytes.removesuffix expected exactly one argument"); }
+    match expect_bytes_like(args[0]) { Ok(suffix) => alloc_binary_object(&bytes_type::removesuffix(receiver, &suffix), mutable_receiver), Err(message) => raise_type_error(message) }
 }
 
 fn bytes_predicate_method(args: &[*mut PyObject], result: bool) -> *mut PyObject {
-    if !args.is_empty() { return super::return_null_with_error("bytes predicate expected no arguments"); }
+    if !args.is_empty() { return raise_type_error("bytes predicate expected no arguments"); }
     unsafe { super::pon_const_bool(i32::from(result)) }
 }
 
 fn bytes_hex_method(receiver: &[u8], args: &[*mut PyObject]) -> *mut PyObject {
-    if !args.is_empty() { return super::return_null_with_error("representative bytes.hex does not support separators"); }
+    if !args.is_empty() { return raise_type_error("representative bytes.hex does not support separators"); }
     alloc_str_object(&bytes_type::hex(receiver))
 }
 
 fn bytes_fromhex_method(args: &[*mut PyObject], mutable_receiver: bool) -> *mut PyObject {
-    if args.len() != 1 { return super::return_null_with_error("bytes.fromhex expected exactly one argument"); }
-    let text = match expect_str(args[0]) { Ok(text) => text, Err(message) => return super::return_null_with_error(message) };
-    match bytes_type::fromhex(&text) { Ok(bytes) => alloc_binary_object(&bytes, mutable_receiver), Err(message) => super::return_null_with_error(message) }
+    if args.len() != 1 { return raise_type_error("bytes.fromhex expected exactly one argument"); }
+    let text = match expect_str(args[0]) { Ok(text) => text, Err(message) => return raise_type_error(message) };
+    match bytes_type::fromhex(&text) { Ok(bytes) => alloc_binary_object(&bytes, mutable_receiver), Err(message) => raise_value_error(message) }
 }
 
 fn bytearray_append_method(receiver: *mut PyObject, args: &[*mut PyObject]) -> *mut PyObject {
-    if args.len() != 1 { return super::return_null_with_error("bytearray.append expected exactly one argument"); }
-    let byte = match expect_byte(args[0]) { Ok(byte) => byte, Err(message) => return super::return_null_with_error(message) };
-    match bytearray_object_mut(receiver) { Ok(array) => bytearray_type::append(array, byte), Err(message) => return super::return_null_with_error(message) }
+    if args.len() != 1 { return raise_type_error("bytearray.append expected exactly one argument"); }
+    let byte = match expect_byte(args[0]) { Ok(byte) => byte, Err(message) => return raise_byte_arg_error(message) };
+    match bytearray_object_mut(receiver) { Ok(array) => bytearray_type::append(array, byte), Err(message) => return raise_type_error(message) }
     unsafe { super::pon_none() }
 }
 
 fn bytearray_extend_method(receiver: *mut PyObject, args: &[*mut PyObject]) -> *mut PyObject {
-    if args.len() != 1 { return super::return_null_with_error("bytearray.extend expected exactly one argument"); }
-    let values = match expect_bytes_like(args[0]) { Ok(values) => values, Err(message) => return super::return_null_with_error(message) };
-    match bytearray_object_mut(receiver) { Ok(array) => bytearray_type::extend(array, &values), Err(message) => return super::return_null_with_error(message) }
+    if args.len() != 1 { return raise_type_error("bytearray.extend expected exactly one argument"); }
+    let values = match expect_bytes_like(args[0]) { Ok(values) => values, Err(message) => return raise_type_error(message) };
+    match bytearray_object_mut(receiver) { Ok(array) => bytearray_type::extend(array, &values), Err(message) => return raise_type_error(message) }
     unsafe { super::pon_none() }
 }
 
 fn bytearray_insert_method(receiver: *mut PyObject, args: &[*mut PyObject]) -> *mut PyObject {
-    if args.len() != 2 { return super::return_null_with_error("bytearray.insert expected exactly two arguments"); }
-    let index = match str_long_value(args[0]) { Ok(value) => value as isize, Err(message) => return super::return_null_with_error(message) };
-    let byte = match expect_byte(args[1]) { Ok(byte) => byte, Err(message) => return super::return_null_with_error(message) };
-    match bytearray_object_mut(receiver) { Ok(array) => bytearray_type::insert(array, index, byte), Err(message) => return super::return_null_with_error(message) }
+    if args.len() != 2 { return raise_type_error("bytearray.insert expected exactly two arguments"); }
+    let index = match str_long_value(args[0]) { Ok(value) => value as isize, Err(message) => return raise_type_error(message) };
+    let byte = match expect_byte(args[1]) { Ok(byte) => byte, Err(message) => return raise_byte_arg_error(message) };
+    match bytearray_object_mut(receiver) { Ok(array) => bytearray_type::insert(array, index, byte), Err(message) => return raise_type_error(message) }
     unsafe { super::pon_none() }
 }
 
 fn bytearray_pop_method(receiver: *mut PyObject, args: &[*mut PyObject]) -> *mut PyObject {
-    if args.len() > 1 { return super::return_null_with_error("bytearray.pop expected at most one argument"); }
-    let index = match args.first().copied().map(str_long_value).transpose() { Ok(value) => value.map(|v| v as isize), Err(message) => return super::return_null_with_error(message) };
-    match bytearray_object_mut(receiver).and_then(|array| bytearray_type::pop(array, index)) { Ok(byte) => unsafe { super::pon_const_int(i64::from(byte)) }, Err(message) => super::return_null_with_error(message) }
+    if args.len() > 1 { return raise_type_error("bytearray.pop expected at most one argument"); }
+    let index = match args.first().copied().map(str_long_value).transpose() { Ok(value) => value.map(|v| v as isize), Err(message) => return raise_type_error(message) };
+    match bytearray_object_mut(receiver).and_then(|array| bytearray_type::pop(array, index)) { Ok(byte) => unsafe { super::pon_const_int(i64::from(byte)) }, Err(message) => raise_bytearray_pop_error(message) }
 }
 
 fn bytearray_remove_method(receiver: *mut PyObject, args: &[*mut PyObject]) -> *mut PyObject {
-    if args.len() != 1 { return super::return_null_with_error("bytearray.remove expected exactly one argument"); }
-    let byte = match expect_byte(args[0]) { Ok(byte) => byte, Err(message) => return super::return_null_with_error(message) };
-    match bytearray_object_mut(receiver).and_then(|array| bytearray_type::remove(array, byte)) { Ok(()) => unsafe { super::pon_none() }, Err(message) => super::return_null_with_error(message) }
+    if args.len() != 1 { return raise_type_error("bytearray.remove expected exactly one argument"); }
+    let byte = match expect_byte(args[0]) { Ok(byte) => byte, Err(message) => return raise_byte_arg_error(message) };
+    match bytearray_object_mut(receiver).and_then(|array| bytearray_type::remove(array, byte)) { Ok(()) => unsafe { super::pon_none() }, Err(message) => raise_bytearray_remove_error(message) }
 }
 
 fn bytearray_clear_method(receiver: *mut PyObject, args: &[*mut PyObject]) -> *mut PyObject {
-    if !args.is_empty() { return super::return_null_with_error("bytearray.clear expected no arguments"); }
-    match bytearray_object_mut(receiver) { Ok(array) => bytearray_type::clear(array), Err(message) => return super::return_null_with_error(message) }
+    if !args.is_empty() { return raise_type_error("bytearray.clear expected no arguments"); }
+    match bytearray_object_mut(receiver) { Ok(array) => bytearray_type::clear(array), Err(message) => return raise_type_error(message) }
     unsafe { super::pon_none() }
 }
 
@@ -2482,12 +2608,12 @@ pub unsafe extern "C" fn builtin_bytes(argv: *mut *mut PyObject, argc: usize) ->
                 }
             }
             2 | 3 => {
-                let text = match expect_str(args[0]) { Ok(text) => text, Err(message) => return super::return_null_with_error(message) };
-                let encoding = match expect_str(args[1]) { Ok(text) => text, Err(message) => return super::return_null_with_error(message) };
-                let errors = match args.get(2).copied().map(expect_str).transpose() { Ok(Some(text)) => text, Ok(None) => "strict".to_owned(), Err(message) => return super::return_null_with_error(message) };
+                let text = match expect_str(args[0]) { Ok(text) => text, Err(message) => return raise_type_error(message) };
+                let encoding = match expect_str(args[1]) { Ok(text) => text, Err(message) => return raise_type_error(message) };
+                let errors = match args.get(2).copied().map(expect_str).transpose() { Ok(Some(text)) => text, Ok(None) => "strict".to_owned(), Err(message) => return raise_type_error(message) };
                 match crate::native::codecs::encode_str_to_vec(&text, &encoding, &errors) { Ok(bytes) => bytes, Err(()) => return ptr::null_mut() }
             }
-            _ => return super::return_null_with_error("bytes() expected at most three arguments"),
+            _ => return raise_type_error("bytes() expected at most three arguments"),
         };
         as_object_ptr(bytes_type::boxed_bytes(&bytes))
     })
@@ -2501,19 +2627,19 @@ pub unsafe extern "C" fn builtin_bytearray(argv: *mut *mut PyObject, argc: usize
             0 => Vec::new(),
             1 => {
                 if let Some(count) = object_to_i64(args[0]) {
-                    if count < 0 { return super::return_null_with_error("negative count"); }
+                    if count < 0 { return raise_value_error("negative count"); }
                     vec![0; count as usize]
                 } else {
-                    match expect_bytes_like(args[0]) { Ok(bytes) => bytes, Err(message) => return super::return_null_with_error(message) }
+                    match expect_bytes_like(args[0]) { Ok(bytes) => bytes, Err(message) => return raise_type_error(message) }
                 }
             }
             2 | 3 => {
-                let text = match expect_str(args[0]) { Ok(text) => text, Err(message) => return super::return_null_with_error(message) };
-                let encoding = match expect_str(args[1]) { Ok(text) => text, Err(message) => return super::return_null_with_error(message) };
-                let errors = match args.get(2).copied().map(expect_str).transpose() { Ok(Some(text)) => text, Ok(None) => "strict".to_owned(), Err(message) => return super::return_null_with_error(message) };
+                let text = match expect_str(args[0]) { Ok(text) => text, Err(message) => return raise_type_error(message) };
+                let encoding = match expect_str(args[1]) { Ok(text) => text, Err(message) => return raise_type_error(message) };
+                let errors = match args.get(2).copied().map(expect_str).transpose() { Ok(Some(text)) => text, Ok(None) => "strict".to_owned(), Err(message) => return raise_type_error(message) };
                 match crate::native::codecs::encode_str_to_vec(&text, &encoding, &errors) { Ok(bytes) => bytes, Err(()) => return ptr::null_mut() }
             }
-            _ => return super::return_null_with_error("bytearray() expected at most three arguments"),
+            _ => return raise_type_error("bytearray() expected at most three arguments"),
         };
         as_object_ptr(bytearray_type::boxed_bytearray(&bytes))
     })
@@ -2521,10 +2647,10 @@ pub unsafe extern "C" fn builtin_bytearray(argv: *mut *mut PyObject, argc: usize
 
 pub unsafe extern "C" fn builtin_memoryview(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     super::catch_object_helper(|| {
-        if argc != 1 { return super::return_null_with_error("memoryview() expected exactly one argument"); }
+        if argc != 1 { return raise_type_error("memoryview() expected exactly one argument"); }
         let Some(args) = raw_args(argv, argc) else { return super::return_null_with_error("memoryview() received a null argv pointer"); };
         if let Err(message) = install_memoryview_slots() { return super::return_null_with_error(message); }
-        match unsafe { memoryview_type::boxed_memoryview_from_object(args[0]) } { Ok(view) => as_object_ptr(view), Err(message) => super::return_null_with_error(message) }
+        match unsafe { memoryview_type::boxed_memoryview_from_object(args[0]) } { Ok(view) => as_object_ptr(view), Err(message) => raise_type_error(message) }
     })
 }
 
