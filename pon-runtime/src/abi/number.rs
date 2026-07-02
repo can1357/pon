@@ -75,6 +75,20 @@ pub unsafe extern "C" fn pon_binary_op(
 ) -> *mut PyObject {
     crate::untag_prelude!(a, b);
     unsafe { super::record_feedback_binary(feedback, a, b) };
+    unsafe { binary_op_with_flavor(op, a, b, false) }
+}
+
+/// Shared binary entry with the terminal-TypeError flavor threaded through
+/// (`|` vs `|=`).  Numeric pairs compute directly; a numeric-domain
+/// `NotImplemented` (`1.5 | 2`, `1 @ 2`) re-enters the full slot dispatch so
+/// reflected slots and Python dunders still get a look before the
+/// operand-typed TypeError.
+pub(crate) unsafe fn binary_op_with_flavor(
+    op: NumberOp,
+    a: *mut PyObject,
+    b: *mut PyObject,
+    inplace: bool,
+) -> *mut PyObject {
     super::catch_object_helper(|| {
         unsafe {
             install_runtime_int_slots(a);
@@ -82,7 +96,14 @@ pub unsafe extern "C" fn pon_binary_op(
         }
 
         match unsafe { (numeric_value(a), numeric_value(b)) } {
-            (Some(left), Some(right)) => binary_numeric(op, left, right),
+            (Some(left), Some(right)) => {
+                let result = binary_numeric(op, left, right);
+                if !result.is_null() && unsafe { abstract_op::is_not_implemented(result) } {
+                    unsafe { abstract_op::binary_op_flavored(op, a, b, inplace) }
+                } else {
+                    result
+                }
+            }
             (Some(_), None) | (None, Some(_))
                 if (op == BINARY_MATMUL || op == BINARY_POW)
                     && !unsafe {
@@ -90,9 +111,9 @@ pub unsafe extern "C" fn pon_binary_op(
                             || crate::types::type_::is_payload_subclass_instance(b)
                     } =>
             {
-                raise_type_error(binary_unsupported_message(op))
+                unsafe { abstract_op::raise_binary_unsupported(op, a, b, inplace) }
             }
-            _ => unsafe { abstract_op::binary_op(op, a, b) },
+            _ => unsafe { abstract_op::binary_op_flavored(op, a, b, inplace) },
         }
     })
 }
@@ -144,7 +165,10 @@ pub unsafe extern "C" fn pon_number_unary(op: NumberOp, a: *mut PyObject, feedba
     unsafe { pon_unary_op(op, a, feedback) }
 }
 
-/// In-place numeric operations share immutable built-in semantics at tier 0.
+/// Augmented assignment: the receiver's in-place slot/`__i*__` dunder runs
+/// first (CPython `binary_iop1`; PEP 584 `dict.__ior__` mutates and returns
+/// the SAME object); anything unhandled falls back to the plain binary
+/// dispatch, whose terminal TypeError uses the `=`-suffixed spelling.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_number_inplace(
     op: NumberOp,
@@ -153,7 +177,13 @@ pub unsafe extern "C" fn pon_number_inplace(
     feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
     crate::untag_prelude!(a, b);
-    unsafe { pon_binary_op(op, a, b, feedback) }
+    unsafe { super::record_feedback_binary(feedback, a, b) };
+    super::catch_object_helper(|| {
+        if let Some(result) = unsafe { abstract_op::try_inplace_binary(op, a, b) } {
+            return result;
+        }
+        unsafe { binary_op_with_flavor(op, a, b, true) }
+    })
 }
 
 /// Implements `operator.index`: exact ints pass through, bool converts to `0`
@@ -311,7 +341,9 @@ fn binary_int(op: NumberOp, left: &BigInt, right: &BigInt) -> *mut PyObject {
             (Some(left), Some(right)) => float::from_f64(left / right),
             _ => raise_type_error("int too large to convert to float"),
         },
-        _ => raise_type_error(binary_unsupported_message(op)),
+        // Numeric domain rejection (`1 @ 2`): NotImplemented lets the caller
+        // run the full dispatch and raise the operand-typed TypeError.
+        _ => unsafe { super::pon_not_implemented() },
     }
 }
 
@@ -385,7 +417,7 @@ fn binary_float(op: NumberOp, left: NumericValue, right: NumericValue) -> *mut P
                 float::from_f64(left.powf(right))
             }
         }
-        _ => raise_type_error(binary_unsupported_message(op)),
+        _ => unsafe { super::pon_not_implemented() },
     }
 }
 
@@ -416,7 +448,7 @@ fn binary_complex(op: NumberOp, left: NumericValue, right: NumericValue) -> *mut
             }
         }
         BINARY_POW => pow_complex(left_real, left_imag, right_real, right_imag),
-        _ => raise_type_error(binary_unsupported_message(op)),
+        _ => unsafe { super::pon_not_implemented() },
     }
 }
 
@@ -489,25 +521,6 @@ fn raise_value_error(message: &str) -> *mut PyObject {
 
 fn raise_zero_division_error(message: &str) -> *mut PyObject {
     unsafe { crate::abi::exc::pon_raise_zero_division_error(message.as_ptr(), message.len()) }
-}
-
-fn binary_unsupported_message(op: NumberOp) -> &'static str {
-    match op {
-        BINARY_ADD => "unsupported operands for +",
-        BINARY_SUB => "unsupported operands for -",
-        BINARY_MUL => "unsupported operands for *",
-        BINARY_MATMUL => "unsupported operands for @",
-        BINARY_DIV => "unsupported operands for /",
-        BINARY_FLOORDIV => "unsupported operands for //",
-        BINARY_MOD => "unsupported operands for %",
-        BINARY_POW => "unsupported operands for **",
-        BINARY_LSHIFT => "unsupported operands for <<",
-        BINARY_RSHIFT => "unsupported operands for >>",
-        BINARY_AND => "unsupported operands for &",
-        BINARY_OR => "unsupported operands for |",
-        BINARY_XOR => "unsupported operands for ^",
-        _ => "unknown binary numeric operation",
-    }
 }
 
 fn unary_unsupported_message(op: NumberOp) -> &'static str {

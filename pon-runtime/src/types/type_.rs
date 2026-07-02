@@ -1039,6 +1039,26 @@ unsafe fn wrap_dunder_new_as_staticmethod(namespace: *mut PyClassDict) {
     }
 }
 
+/// CPython `type_new` rule: a class whose namespace defines `__eq__` without
+/// defining `__hash__` gets `__hash__ = None` stamped into the namespace
+/// before it becomes `tp_dict` — instances then resolve the None marker
+/// through the MRO and raise `unhashable type: '...'` when hashed.
+/// Subclasses re-enable hashing by defining `__hash__` themselves.
+unsafe fn stamp_unhashable_for_eq_without_hash(namespace: *mut PyClassDict) {
+    let ns = unsafe { &mut *namespace };
+    if ns.get(intern::intern("__eq__")).is_none() {
+        return;
+    }
+    let hash_name = intern::intern("__hash__");
+    if ns.get(hash_name).is_some() {
+        return;
+    }
+    let none = unsafe { abi::pon_none() };
+    if !none.is_null() {
+        ns.set(hash_name, none);
+    }
+}
+
 /// `type.__new__` core: allocate and publish the heap type object.
 #[must_use]
 unsafe fn construct_class(
@@ -1052,6 +1072,7 @@ unsafe fn construct_class(
         return raise_object("class namespace is NULL");
     }
     unsafe { wrap_dunder_new_as_staticmethod(namespace) };
+    unsafe { stamp_unhashable_for_eq_without_hash(namespace) };
     // CPython: `class C:` means `class C(object):` — the implicit terminus
     // applies to the CONSTRUCTED type (tp_base, MRO, registries) while the
     // Python-visible `bases` tuple handed to metaclasses stays as written.

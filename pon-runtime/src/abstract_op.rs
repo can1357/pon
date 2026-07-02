@@ -66,6 +66,14 @@ enum SlotOutcome {
 /// slot.  A slot result that is `NotImplemented` falls through to the next
 /// candidate.  A NULL slot result is treated as an error sentinel and propagated.
 pub unsafe fn binary_op(op: u8, a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
+    unsafe { binary_op_flavored(op, a, b, false) }
+}
+
+/// [`binary_op`] with the terminal-TypeError flavor threaded through:
+/// `inplace` selects the `=`-suffixed operator spelling (`|=` vs `|`),
+/// matching CPython's `binary_iop` wording after the in-place slot has
+/// already been tried and declined.
+pub(crate) unsafe fn binary_op_flavored(op: u8, a: *mut PyObject, b: *mut PyObject, inplace: bool) -> *mut PyObject {
     if op == BINARY_ADD && unsafe { is_exact_pylong(a) && is_exact_pylong(b) } {
         // SAFETY: The exact-type checks above prove both operands use PyLong's layout.
         let left = unsafe { (*a.cast::<PyLong>()).value };
@@ -182,10 +190,10 @@ pub unsafe fn binary_op(op: u8, a: *mut PyObject, b: *mut PyObject) -> *mut PyOb
         // tables have no forward `**` wiring (`nb_power` is ternary), while
         // `pon_binary_op` computes every numeric op directly and falls back
         // here for non-numeric payloads (str concat, `%`-format).
-        return unsafe { abi::number::pon_binary_op(op, left_payload.unwrap_or(a), right_payload.unwrap_or(b), ptr::null_mut()) };
+        return unsafe { abi::number::binary_op_with_flavor(op, left_payload.unwrap_or(a), right_payload.unwrap_or(b), inplace) };
     }
 
-    raise_type_error(binary_unsupported_message(op))
+    unsafe { raise_binary_unsupported(op, a, b, inplace) }
 }
 
 /// Dispatches a Python unary operation through the numeric protocol table.
@@ -931,6 +939,70 @@ unsafe fn reflected_binary_slot(ty: *mut PyType, op: u8) -> Option<BinaryFunc> {
     }
 }
 
+unsafe fn inplace_binary_slot(ty: *mut PyType, op: u8) -> Option<BinaryFunc> {
+    unsafe {
+        (*ty).tp_as_number.as_ref().and_then(|methods| match op {
+            BINARY_ADD => methods.nb_inplace_add,
+            BINARY_SUB => methods.nb_inplace_subtract,
+            BINARY_MUL => methods.nb_inplace_multiply,
+            BINARY_DIV => methods.nb_inplace_true_divide,
+            BINARY_FLOORDIV => methods.nb_inplace_floor_divide,
+            BINARY_MOD => methods.nb_inplace_remainder,
+            // `nb_inplace_power` is ternary; `**=` falls back to the binary path.
+            BINARY_POW => None,
+            BINARY_LSHIFT => methods.nb_inplace_lshift,
+            BINARY_RSHIFT => methods.nb_inplace_rshift,
+            BINARY_AND => methods.nb_inplace_and,
+            BINARY_OR => methods.nb_inplace_or,
+            BINARY_XOR => methods.nb_inplace_xor,
+            BINARY_MATMUL => methods.nb_inplace_matrix_multiply,
+            _ => None,
+        })
+    }
+}
+
+/// Augmented-assignment dunder spellings for a binary numeric op.
+fn inplace_dunder_name(op: u8) -> Option<&'static str> {
+    Some(match op {
+        BINARY_ADD => "__iadd__",
+        BINARY_SUB => "__isub__",
+        BINARY_MUL => "__imul__",
+        BINARY_DIV => "__itruediv__",
+        BINARY_FLOORDIV => "__ifloordiv__",
+        BINARY_MOD => "__imod__",
+        BINARY_POW => "__ipow__",
+        BINARY_LSHIFT => "__ilshift__",
+        BINARY_RSHIFT => "__irshift__",
+        BINARY_AND => "__iand__",
+        BINARY_OR => "__ior__",
+        BINARY_XOR => "__ixor__",
+        BINARY_MATMUL => "__imatmul__",
+        _ => return None,
+    })
+}
+
+/// CPython `binary_iop1` first phase: the receiver's in-place slot (native
+/// types: PEP 584 `dict.__ior__`) or `__i*__` dunder (heap classes) sees the
+/// operands before the plain binary dispatch.  `Some` carries the handled
+/// result (possibly NULL with an exception set); `None` means "not handled —
+/// fall through to the binary path".
+pub(crate) unsafe fn try_inplace_binary(op: u8, a: *mut PyObject, b: *mut PyObject) -> Option<*mut PyObject> {
+    let ty = unsafe { object_type(a) }?;
+    match unsafe { call_binary_slot(inplace_binary_slot(ty, op), a, b) } {
+        SlotOutcome::Value(value) => return Some(value),
+        SlotOutcome::Error => return Some(ptr::null_mut()),
+        SlotOutcome::Missing | SlotOutcome::NotImplemented => {}
+    }
+    if let Some(name) = inplace_dunder_name(op) {
+        match unsafe { call_binary_dunder(ty, name, a, b) } {
+            SlotOutcome::Value(value) => return Some(value),
+            SlotOutcome::Error => return Some(ptr::null_mut()),
+            SlotOutcome::Missing | SlotOutcome::NotImplemented => {}
+        }
+    }
+    None
+}
+
 unsafe fn rich_dunder(ty: *mut PyType, op: u8) -> *mut PyObject {
     let name = match op {
         RICH_LT => "__lt__",
@@ -1138,7 +1210,7 @@ unsafe fn is_exact_pylong(object: *mut PyObject) -> bool {
     ty.tp_basicsize == mem::size_of::<PyLong>() && ty.name() == "int"
 }
 
-unsafe fn is_not_implemented(object: *mut PyObject) -> bool {
+pub(crate) unsafe fn is_not_implemented(object: *mut PyObject) -> bool {
     let Some(ty) = (unsafe { object_type(object) }) else {
         return false;
     };
@@ -1207,23 +1279,49 @@ fn raise_type_error_status(message: &str) -> i32 {
     -1
 }
 
-fn binary_unsupported_message(op: u8) -> &'static str {
-    match op {
-        BINARY_ADD => "unsupported operands for +",
-        BINARY_SUB => "unsupported operands for -",
-        BINARY_MUL => "unsupported operands for *",
-        BINARY_MATMUL => "unsupported operands for @",
-        BINARY_DIV => "unsupported operands for /",
-        BINARY_FLOORDIV => "unsupported operands for //",
-        BINARY_MOD => "unsupported operands for %",
-        BINARY_POW => "unsupported operands for **",
-        BINARY_LSHIFT => "unsupported operands for <<",
-        BINARY_RSHIFT => "unsupported operands for >>",
-        BINARY_AND => "unsupported operands for &",
-        BINARY_OR => "unsupported operands for |",
-        BINARY_XOR => "unsupported operands for ^",
-        _ => "unknown binary operation",
-    }
+/// Operator spelling for the terminal binary TypeError: augmented forms carry
+/// the `=` suffix and forward `**` reports "** or pow()", both per CPython.
+fn binary_op_spelling(op: u8, inplace: bool) -> Option<&'static str> {
+    Some(match (op, inplace) {
+        (BINARY_ADD, false) => "+",
+        (BINARY_ADD, true) => "+=",
+        (BINARY_SUB, false) => "-",
+        (BINARY_SUB, true) => "-=",
+        (BINARY_MUL, false) => "*",
+        (BINARY_MUL, true) => "*=",
+        (BINARY_MATMUL, false) => "@",
+        (BINARY_MATMUL, true) => "@=",
+        (BINARY_DIV, false) => "/",
+        (BINARY_DIV, true) => "/=",
+        (BINARY_FLOORDIV, false) => "//",
+        (BINARY_FLOORDIV, true) => "//=",
+        (BINARY_MOD, false) => "%",
+        (BINARY_MOD, true) => "%=",
+        (BINARY_POW, false) => "** or pow()",
+        (BINARY_POW, true) => "**=",
+        (BINARY_LSHIFT, false) => "<<",
+        (BINARY_LSHIFT, true) => "<<=",
+        (BINARY_RSHIFT, false) => ">>",
+        (BINARY_RSHIFT, true) => ">>=",
+        (BINARY_AND, false) => "&",
+        (BINARY_AND, true) => "&=",
+        (BINARY_OR, false) => "|",
+        (BINARY_OR, true) => "|=",
+        (BINARY_XOR, false) => "^",
+        (BINARY_XOR, true) => "^=",
+        _ => return None,
+    })
+}
+
+/// Raises the CPython-shaped terminal TypeError for a binary operation no
+/// candidate handled: `unsupported operand type(s) for |: 'dict' and 'list'`.
+pub(crate) unsafe fn raise_binary_unsupported(op: u8, a: *mut PyObject, b: *mut PyObject, inplace: bool) -> *mut PyObject {
+    let Some(spelling) = binary_op_spelling(op, inplace) else {
+        return raise_type_error("unknown binary operation");
+    };
+    let left = unsafe { object_type(a) }.map_or("object", |ty| unsafe { (*ty).name() });
+    let right = unsafe { object_type(b) }.map_or("object", |ty| unsafe { (*ty).name() });
+    raise_type_error(&format!("unsupported operand type(s) for {spelling}: '{left}' and '{right}'"))
 }
 
 fn unary_unsupported_message(op: u8) -> &'static str {

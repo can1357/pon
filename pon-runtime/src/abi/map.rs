@@ -196,6 +196,12 @@ unsafe fn object_array<'a>(items: *mut *mut PyObject, count: usize) -> Result<&'
 
 /// Builds an insertion-ordered dict from `pair_count` key/value pairs stored as
 /// `[key0, value0, key1, value1, ...]`.
+///
+/// DEADLOCK CONTRACT: key hashing and duplicate-key equality dispatch
+/// Python-level `__hash__`/`__eq__` hooks, and user code re-enters runtime
+/// helpers that take the runtime mutex.  The entries are therefore pre-hashed
+/// and pre-deduplicated BEFORE `with_runtime`; the lock scope only allocates
+/// and bulk-fills storage (no Python dispatch, no re-entry).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_build_map(items: *mut *mut PyObject, pair_count: usize) -> *mut PyObject {
     super::catch_object_helper(|| {
@@ -209,11 +215,15 @@ pub unsafe extern "C" fn pon_build_map(items: *mut *mut PyObject, pair_count: us
             Ok(pairs) => pairs,
             Err(message) => return null_error(message),
         };
-        let result: Option<Result<*mut PyObject, String>> = super::with_runtime(|runtime| {
-            let dict_obj = alloc_dict(runtime, pair_count);
-            for pair in pairs.chunks_exact(2) {
-                unsafe { dict::dict_insert(dict_obj, pair[0], pair[1])? };
+        let mut entries: Vec<dict::DictEntry> = Vec::with_capacity(pair_count);
+        for pair in pairs.chunks_exact(2) {
+            if let Err(message) = unsafe { dict::collect_prehashed_entry(&mut entries, pair[0], pair[1]) } {
+                return null_error(message);
             }
+        }
+        let result: Option<Result<*mut PyObject, String>> = super::with_runtime(|runtime| {
+            let dict_obj = alloc_dict(runtime, entries.len());
+            unsafe { dict::dict_fill_prehashed(dict_obj, &entries)? };
             Ok(dict_obj)
         });
         match result {
@@ -225,6 +235,11 @@ pub unsafe extern "C" fn pon_build_map(items: *mut *mut PyObject, pair_count: us
 }
 
 /// Builds a mutable set from `count` elements.
+///
+/// Same deadlock contract as [`pon_build_map`]: element hashing and dedup
+/// equality run BEFORE `with_runtime`; the lock scope allocates and fills
+/// storage from the pre-computed hashes (the set layout stores no hashes, so
+/// the fill must never rehash elements).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_build_set(items: *mut *mut PyObject, count: usize) -> *mut PyObject {
     super::catch_object_helper(|| {
@@ -235,11 +250,15 @@ pub unsafe extern "C" fn pon_build_set(items: *mut *mut PyObject, count: usize) 
             Ok(values) => values,
             Err(message) => return null_error(message),
         };
-        let result: Option<Result<*mut PyObject, String>> = super::with_runtime(|runtime| {
-            let set_obj = alloc_set(runtime, count);
-            for value in values {
-                unsafe { set_::set_add(set_obj, *value)? };
+        let mut elements: Vec<(*mut PyObject, isize)> = Vec::with_capacity(count);
+        for value in values {
+            if let Err(message) = unsafe { set_::collect_prehashed_element(&mut elements, *value) } {
+                return null_error(message);
             }
+        }
+        let result: Option<Result<*mut PyObject, String>> = super::with_runtime(|runtime| {
+            let set_obj = alloc_set(runtime, elements.len());
+            unsafe { set_::set_fill_prehashed(set_obj, &elements)? };
             Ok(set_obj)
         });
         match result {

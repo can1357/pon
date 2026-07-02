@@ -1189,9 +1189,16 @@ pub unsafe extern "C" fn builtin_hash(argv: *mut *mut PyObject, argc: usize) -> 
     };
     match unsafe { builtin_hash_value(args[0]) } {
         Ok(value) => unsafe { abi::pon_const_int(value) },
-        // Every `hash()` failure is a TypeError in CPython (unhashable
+        // Every native `hash()` failure is a TypeError in CPython (unhashable
         // containers, dead weakrefs); raise typed so `except TypeError` works.
-        Err(message) => unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) },
+        // A boxed exception a user `__hash__` already raised is authoritative
+        // — the advisory message must not repackage it as a TypeError.
+        Err(message) => {
+            if crate::abi::exc::pending_exception_object().is_some() {
+                return ptr::null_mut();
+            }
+            unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) }
+        }
     }
 }
 
@@ -1226,10 +1233,11 @@ unsafe fn builtin_hash_value(object: *mut PyObject) -> Result<i64, String> {
         return Err("unhashable type: 'set'".to_owned());
     } else if matches!(
         unsafe { crate::types::dict::type_name(object) },
-        Some("bytes" | "dict" | "list" | "bytearray")
+        Some("str" | "bytes" | "dict" | "list" | "bytearray")
     ) || unsafe { crate::types::dict::is_dict_subclass_instance(object) }
     {
-        // `hash_object` owns the content-hash (bytes) and the CPython
+        // `hash_object` owns the content-hash (str/bytes CPython seed-0
+        // siphash13 via `crate::pyhash`) and the CPython
         // `unhashable type: '...'` rejections (dict/list/bytearray).
         unsafe { crate::types::dict::hash_object(object)? as i64 }
     } else if unsafe { crate::types::weakref::is_weakref(object) } {
@@ -1246,6 +1254,16 @@ unsafe fn builtin_hash_value(object: *mut PyObject) -> Result<i64, String> {
             unsafe { crate::types::weakref::weakref_store_builtin_hash(object, hash) };
             hash
         }
+    } else if !object.is_null()
+        && crate::tag::is_heap(object)
+        && crate::types::type_::type_dispatches_python_dunders(unsafe { (*object).ob_type })
+    {
+        // Python class instances share ONE hash authority with the dict/set
+        // key domain (`types::dict::hash_object`): user `__hash__` hooks
+        // dispatch, the `__hash__ = None` marker raises the CPython
+        // `unhashable type: '...'` TypeError, and plain classes keep the
+        // identity default — `hash(obj)` and `d[obj]` can never disagree.
+        unsafe { crate::types::dict::hash_object(object)? as i64 }
     } else {
         stable_hash(&repr_text(object))
     };
@@ -1611,6 +1629,36 @@ pub(crate) unsafe fn collect_dict_update_pairs(source: *mut PyObject, pairs: &mu
         }
         return Ok(());
     }
+    // Mapping protocol (CPython `PyDict_Merge` non-dict leg): any source with
+    // a `keys` attribute merges via `for key in source.keys(): d[key] = source[key]`.
+    match unsafe { mapping_keys_attr(source) } {
+        Err(()) => return Err(()),
+        Ok(Some(keys_method)) => {
+            let keys_iterable = unsafe { abi::pon_call(keys_method, ptr::null_mut(), 0) };
+            if keys_iterable.is_null() {
+                return Err(());
+            }
+            let keys = match collect_iterable(keys_iterable) {
+                Ok(keys) => keys,
+                Err(message) => {
+                    let _ = fail(message);
+                    return Err(());
+                }
+            };
+            pairs.reserve(keys.len() * 2);
+            for key in keys {
+                // SAFETY: Subscript dispatch follows the NULL-sentinel error contract.
+                let value = unsafe { crate::abstract_op::subscript_get(source, key) };
+                if value.is_null() {
+                    return Err(());
+                }
+                pairs.push(key);
+                pairs.push(value);
+            }
+            return Ok(());
+        }
+        Ok(None) => {}
+    }
     let Ok(elements) = collect_iterable(source) else {
         let name = unsafe { crate::types::dict::type_name(source) }.unwrap_or("object");
         let message = format!("'{name}' object is not iterable");
@@ -1637,6 +1685,28 @@ pub(crate) unsafe fn collect_dict_update_pairs(source: *mut PyObject, pairs: &mu
         pairs.extend(pair);
     }
     Ok(())
+}
+
+/// Fetches `source.keys` when present: `Ok(Some)` is the bound attribute,
+/// `Ok(None)` a clean miss (AttributeError cleared, per CPython's
+/// `dict_update_arg` hasattr probe), `Err` a propagating lookup error.
+unsafe fn mapping_keys_attr(source: *mut PyObject) -> Result<Option<*mut PyObject>, ()> {
+    // Slotless native receivers (int, float, ...) cannot carry `keys` at all;
+    // skipping the probe lets the pairs leg report CPython's "'int' object is
+    // not iterable" instead of the slotless attribute-lookup diagnostic.
+    let ty = unsafe { (*source).ob_type };
+    if ty.is_null() || unsafe { (*ty).tp_getattro }.is_none() {
+        return Ok(None);
+    }
+    let method = unsafe { crate::abstract_op::get_attr(source, intern("keys")) };
+    if !method.is_null() {
+        return Ok(Some(method));
+    }
+    if crate::abi::exc::pending_exception_object().is_none() || crate::abi::exc::pending_exception_is("AttributeError") {
+        crate::thread_state::pon_err_clear();
+        return Ok(None);
+    }
+    Err(())
 }
 
 /// `dict.fromkeys(iterable, value=None)`. A classmethod in CPython, so the

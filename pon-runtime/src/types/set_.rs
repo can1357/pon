@@ -173,18 +173,22 @@ pub unsafe fn entries_snapshot(object: *mut PyObject) -> Result<Vec<*mut PyObjec
 }
 
 /// Adds an element to a mutable set, preserving original insertion position for duplicates.
+///
+/// Element hashing and equality may dispatch Python-level hooks (user code):
+/// borrows are scoped so none lives across a dispatch, and the bucket insert
+/// reuses the already-computed hash instead of rehashing the element.
 pub unsafe fn set_add(set: *mut PyObject, item: *mut PyObject) -> Result<(), String> {
     if item.is_null() {
         return Err("set item is NULL".to_owned());
     }
     let hash = unsafe { hash_set_element(item)? };
-    let set = unsafe { set_mut(set)? };
-    ensure_set_buckets(set)?;
+    ensure_set_buckets(unsafe { set_mut(set)? })?;
     if unsafe { find_set_index(set, item, hash)? }.is_none() {
-        ensure_set_insert_capacity(set)?;
-        let index = set.entries.len();
-        set.entries.push(item);
-        insert_bucket(&mut set.buckets, &set.entries, index)?;
+        let storage = unsafe { set_mut(set)? };
+        ensure_set_insert_capacity(storage)?;
+        let index = storage.entries.len();
+        storage.entries.push(item);
+        insert_bucket_hashed(&mut storage.buckets, hash, index)?;
     }
     Ok(())
 }
@@ -202,20 +206,60 @@ pub unsafe fn hash_set_element(item: *mut PyObject) -> Result<isize, String> {
     })
 }
 
+/// Phase-1 accumulator for set displays (`pon_build_set`): hashes and dedups
+/// BEFORE the runtime lock is taken — user `__hash__`/`__eq__` re-enter
+/// runtime helpers that take the runtime mutex, so they must never run
+/// inside `with_runtime`.  First occurrence wins (CPython set semantics).
+/// `entries` is caller-local, so hook re-entrancy cannot touch it.
+pub unsafe fn collect_prehashed_element(entries: &mut Vec<(*mut PyObject, isize)>, item: *mut PyObject) -> Result<(), String> {
+    if item.is_null() {
+        return Err("set item is NULL".to_owned());
+    }
+    let hash = unsafe { hash_set_element(item)? };
+    for (entry, entry_hash) in entries.iter() {
+        if *entry_hash == hash && unsafe { object_equal(*entry, item)? } {
+            return Ok(());
+        }
+    }
+    entries.push((item, hash));
+    Ok(())
+}
+
+/// Phase-2 bulk fill for `pon_build_set`, safe under the runtime lock:
+/// entries and buckets are built from the pre-computed hashes with NO rehash
+/// (the set layout stores no hashes, and `insert_bucket`'s rehash would
+/// re-enter user `__hash__` inside `with_runtime`).
+pub unsafe fn set_fill_prehashed(set: *mut PyObject, elements: &[(*mut PyObject, isize)]) -> Result<(), String> {
+    let storage = unsafe { set_mut(set)? };
+    storage.entries.extend(elements.iter().map(|(item, _)| *item));
+    let mut buckets = vec![None; bucket_capacity(storage.entries.len())];
+    for (index, (_, hash)) in elements.iter().enumerate() {
+        insert_bucket_hashed(&mut buckets, *hash, index)?;
+    }
+    storage.buckets = buckets;
+    Ok(())
+}
+
 /// Removes an element from a mutable set if present.
 pub unsafe fn set_discard(set: *mut PyObject, item: *mut PyObject) -> Result<(), String> {
     unsafe { set_remove(set, item) }.map(|_| ())
 }
 
 /// Removes an element from a mutable set, reporting whether it was present.
+///
+/// CPython parity: the probe element is hashed (unhashable probes raise the
+/// wrapped TypeError) and located through the bucket chain, with any
+/// Python-level hook dispatch running outside the storage borrows.
 pub unsafe fn set_remove(set: *mut PyObject, item: *mut PyObject) -> Result<bool, String> {
     if item.is_null() {
         return Err("set item is NULL".to_owned());
     }
-    let set = unsafe { set_mut(set)? };
-    if let Some(index) = unsafe { find_element_index(&set.entries, item)? } {
-        set.entries.remove(index);
-        rebuild_set_buckets(set)?;
+    let hash = unsafe { hash_set_element(item)? };
+    ensure_set_buckets(unsafe { set_mut(set)? })?;
+    if let Some(index) = unsafe { find_set_index(set, item, hash)? } {
+        let storage = unsafe { set_mut(set)? };
+        storage.entries.remove(index);
+        rebuild_set_buckets(storage)?;
         Ok(true)
     } else {
         Ok(false)
@@ -248,8 +292,7 @@ pub unsafe fn set_contains(set: *mut PyObject, item: *mut PyObject) -> Result<bo
     }
     let hash = unsafe { hash_set_element(item)? };
     if unsafe { is_set(set) } {
-        let set = unsafe { set_mut(set)? };
-        ensure_set_buckets(set)?;
+        ensure_set_buckets(unsafe { set_mut(set)? })?;
         Ok(unsafe { find_set_index(set, item, hash)? }.is_some())
     } else if unsafe { crate::types::frozenset::is_frozenset(set) } {
         unsafe { crate::types::frozenset::frozenset_contains(set, item) }
@@ -342,22 +385,67 @@ pub unsafe fn find_element_index(entries: &[*mut PyObject], item: *mut PyObject)
     Ok(None)
 }
 
-unsafe fn find_set_index(set: &PySet, item: *mut PyObject, hash: isize) -> Result<Option<usize>, String> {
-    if set.buckets.is_empty() {
+/// Storage-shape witness for the deferred probe: every set mutation (add
+/// grows `entries`; remove/pop shrink it AND swap in a fresh bucket
+/// allocation; clear empties both) changes at least one component.
+fn set_witness(storage: &PySet) -> (usize, usize, usize, usize) {
+    (
+        storage.entries.len(),
+        storage.entries.as_ptr() as usize,
+        storage.buckets.len(),
+        storage.buckets.as_ptr() as usize,
+    )
+}
+
+/// Locates `item`'s entry index for `hash`.
+///
+/// The set layout stores no element hashes, so candidate verification
+/// (rehash + equality) may dispatch Python-level hooks: the bucket chain is
+/// snapshotted under the borrow, hooks run with the borrow released, and
+/// every affirmative match is re-validated by slot identity — restarting
+/// whenever the storage shape changed underneath a dispatch (CPython
+/// `lookdict`'s `goto restart` discipline).
+unsafe fn find_set_index(set: *mut PyObject, item: *mut PyObject, hash: isize) -> Result<Option<usize>, String> {
+    'restart: loop {
+        let mut candidates: Vec<(usize, *mut PyObject)> = Vec::new();
+        let witness;
+        {
+            let storage = unsafe { set_ref(set)? };
+            if storage.buckets.is_empty() {
+                return Ok(None);
+            }
+            witness = set_witness(storage);
+            let mut bucket = bucket_index(hash, storage.buckets.len());
+            for _ in 0..storage.buckets.len() {
+                let Some(index) = storage.buckets[bucket] else {
+                    break;
+                };
+                candidates.push((index, storage.entries[index]));
+                bucket = (bucket + 1) & (storage.buckets.len() - 1);
+            }
+            if candidates.is_empty() {
+                return Ok(None);
+            }
+        }
+        // Deferred pass: rehash + equality run with the borrow released.
+        for (index, entry) in candidates {
+            if entry == item {
+                return Ok(Some(index));
+            }
+            let matches = unsafe { hash_set_element(entry)? } == hash && unsafe { object_equal(entry, item)? };
+            let storage = unsafe { set_ref(set)? };
+            if matches {
+                if storage.entries.len() > index && storage.entries[index] == entry {
+                    return Ok(Some(index));
+                }
+                continue 'restart;
+            }
+            if set_witness(storage) != witness {
+                continue 'restart;
+            }
+        }
         return Ok(None);
     }
-    let mut bucket = bucket_index(hash, set.buckets.len());
-    for _ in 0..set.buckets.len() {
-        let Some(index) = set.buckets[bucket] else {
-            return Ok(None);
-        };
-        let entry = set.entries[index];
-        if unsafe { hash_set_element(entry)? } == hash && unsafe { object_equal(entry, item)? } {
-            return Ok(Some(index));
-        }
-        bucket = (bucket + 1) & (set.buckets.len() - 1);
-    }
-    Ok(None)
 }
 
 fn ensure_set_buckets(set: &mut PySet) -> Result<(), String> {
@@ -389,10 +477,16 @@ fn rebuild_set_buckets_with_capacity(set: &mut PySet, capacity: usize) -> Result
 }
 
 fn insert_bucket(buckets: &mut [Option<usize>], entries: &[*mut PyObject], index: usize) -> Result<(), String> {
+    let hash = unsafe { hash_set_element(entries[index])? };
+    insert_bucket_hashed(buckets, hash, index)
+}
+
+/// Places `index` into the bucket chain for a KNOWN hash — the dispatch-free
+/// core of [`insert_bucket`], usable under the runtime lock.
+fn insert_bucket_hashed(buckets: &mut [Option<usize>], hash: isize, index: usize) -> Result<(), String> {
     if buckets.is_empty() {
         return Err("set bucket table is empty".to_owned());
     }
-    let hash = unsafe { hash_set_element(entries[index])? };
     let mut bucket = bucket_index(hash, buckets.len());
     for _ in 0..buckets.len() {
         if buckets[bucket].is_none() {

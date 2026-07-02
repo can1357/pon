@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 
 use num_bigint::BigInt;
 
-use crate::object::{PyMappingMethods, PyObject, PyObjectHeader, PyType, PyUnicode};
+use crate::object::{PyMappingMethods, PyNumberMethods, PyObject, PyObjectHeader, PyType, PyUnicode};
 use crate::thread_state::pon_err_set;
 use core::ops::RangeInclusive;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -99,8 +99,14 @@ pub fn dict_type(type_type: *const PyType) -> *mut PyType {
         mapping.mp_subscript = Some(dict_subscript_slot);
         mapping.mp_ass_subscript = Some(dict_ass_subscript_slot);
 
+        let mut number = PyNumberMethods::EMPTY;
+        number.nb_or = Some(dict_or_slot);
+        number.nb_reflected_or = Some(dict_ror_slot);
+        number.nb_inplace_or = Some(dict_ior_slot);
+
         let mut ty = PyType::new(ptr::null(), "dict", size_of::<PyDict>());
         ty.tp_as_mapping = Box::into_raw(Box::new(mapping));
+        ty.tp_as_number = Box::into_raw(Box::new(number));
         ty.tp_richcmp = Some(dict_richcmp_slot);
         ty.tp_iter = Some(dict_iter_slot);
         ty.tp_getattro = Some(dict_getattro_slot);
@@ -283,6 +289,10 @@ pub unsafe fn dict_ref(object: *mut PyObject) -> Result<&'static PyDictStorage, 
 }
 
 /// Inserts or updates `key` in insertion order. Existing equal keys keep their original slot.
+///
+/// Key hashing and equality may dispatch Python-level `__hash__`/`__eq__`
+/// hooks (arbitrary user code): every storage borrow is scoped so none lives
+/// across a dispatch, and `find_entry_index` re-validates indices itself.
 pub unsafe fn dict_insert(dict: *mut PyObject, key: *mut PyObject, value: *mut PyObject) -> Result<(), String> {
     if key.is_null() {
         return Err("dict key is NULL".to_owned());
@@ -291,15 +301,19 @@ pub unsafe fn dict_insert(dict: *mut PyObject, key: *mut PyObject, value: *mut P
         return Err("dict value is NULL".to_owned());
     }
     let hash = unsafe { hash_dict_key(key)? };
-    let dict = unsafe { dict_mut(dict)? };
-    ensure_dict_buckets(dict)?;
-    if let Some(index) = unsafe { find_entry_index(dict, key, hash)? } {
-        dict.entries[index].value = value;
-    } else {
-        ensure_dict_insert_capacity(dict)?;
-        let index = dict.entries.len();
-        dict.entries.push(DictEntry { key, value, hash });
-        insert_bucket(&mut dict.buckets, &dict.entries, index)?;
+    ensure_dict_buckets(unsafe { dict_mut(dict)? })?;
+    match unsafe { find_entry_index(dict, key, hash)? } {
+        Some(index) => {
+            let storage = unsafe { dict_mut(dict)? };
+            storage.entries[index].value = value;
+        }
+        None => {
+            let storage = unsafe { dict_mut(dict)? };
+            ensure_dict_insert_capacity(storage)?;
+            let index = storage.entries.len();
+            storage.entries.push(DictEntry { key, value, hash });
+            insert_bucket(&mut storage.buckets, &storage.entries, index)?;
+        }
     }
     Ok(())
 }
@@ -323,10 +337,9 @@ pub unsafe fn dict_get(dict: *mut PyObject, key: *mut PyObject) -> Result<Option
         return Err("dict key is NULL".to_owned());
     }
     let hash = unsafe { hash_dict_key(key)? };
-    let dict = unsafe { dict_mut(dict)? };
-    ensure_dict_buckets(dict)?;
+    ensure_dict_buckets(unsafe { dict_mut(dict)? })?;
     Ok(match unsafe { find_entry_index(dict, key, hash)? } {
-        Some(index) => Some(dict.entries[index].value),
+        Some(index) => Some(unsafe { dict_ref(dict)? }.entries[index].value),
         None => None,
     })
 }
@@ -337,12 +350,12 @@ pub unsafe fn dict_remove(dict: *mut PyObject, key: *mut PyObject) -> Result<Opt
         return Err("dict key is NULL".to_owned());
     }
     let hash = unsafe { hash_dict_key(key)? };
-    let dict = unsafe { dict_mut(dict)? };
-    ensure_dict_buckets(dict)?;
+    ensure_dict_buckets(unsafe { dict_mut(dict)? })?;
     Ok(match unsafe { find_entry_index(dict, key, hash)? } {
         Some(index) => {
-            let value = dict.entries.remove(index).value;
-            rebuild_dict_buckets(dict)?;
+            let storage = unsafe { dict_mut(dict)? };
+            let value = storage.entries.remove(index).value;
+            rebuild_dict_buckets(storage)?;
             Some(value)
         }
         None => None,
@@ -362,6 +375,39 @@ pub unsafe fn dict_merge_exact(dict: *mut PyObject, other: *mut PyObject) -> Res
     }
     Ok(())
 }
+/// Phase-1 accumulator for dict displays (`pon_build_map`): hashes `key` and
+/// resolves duplicate keys with full Python equality BEFORE any runtime lock
+/// is taken — user `__hash__`/`__eq__` re-enter runtime helpers that take the
+/// runtime mutex, so they must never run inside `with_runtime`.  CPython
+/// display semantics: the first duplicate key keeps its slot, the last value
+/// wins.  `entries` is caller-local, so hook re-entrancy cannot touch it.
+pub unsafe fn collect_prehashed_entry(entries: &mut Vec<DictEntry>, key: *mut PyObject, value: *mut PyObject) -> Result<(), String> {
+    if key.is_null() {
+        return Err("dict key is NULL".to_owned());
+    }
+    if value.is_null() {
+        return Err("dict value is NULL".to_owned());
+    }
+    let hash = unsafe { hash_dict_key(key)? };
+    for entry in entries.iter_mut() {
+        if entry.hash == hash && unsafe { object_equal(entry.key, key)? } {
+            entry.value = value;
+            return Ok(());
+        }
+    }
+    entries.push(DictEntry { key, value, hash });
+    Ok(())
+}
+
+/// Phase-2 bulk fill for `pon_build_map`, safe under the runtime lock: keys
+/// arrive pre-hashed and pre-deduplicated, so this is pure structural work
+/// (the dict bucket build reads stored hashes, never objects).
+pub unsafe fn dict_fill_prehashed(dict: *mut PyObject, entries: &[DictEntry]) -> Result<(), String> {
+    let storage = unsafe { dict_mut(dict)? };
+    storage.entries.extend_from_slice(entries);
+    rebuild_dict_buckets(storage)
+}
+
 
 /// Returns a stable insertion-order snapshot of dictionary entries.
 pub unsafe fn dict_entries_snapshot(dict: *mut PyObject) -> Result<Vec<DictEntry>, String> {
@@ -369,16 +415,40 @@ pub unsafe fn dict_entries_snapshot(dict: *mut PyObject) -> Result<Vec<DictEntry
 }
 
 /// Returns true when two boxed objects compare equal for the Phase-B mapping key domain.
+///
+/// Structural fast paths (numeric, weakref, str/bytes/tuple/frozenset) never
+/// run Python code; a pair involving a heap-class operand whose MRO defines a
+/// user `__eq__` dispatches the full rich-compare protocol instead (reflected
+/// operand and identity fallback included), so user equality decides dict/set
+/// key identity exactly like CPython's `lookdict`.  Callers holding a storage
+/// borrow must use [`object_equal_structural`] and defer the `None` outcome.
 pub unsafe fn object_equal(left: *mut PyObject, right: *mut PyObject) -> Result<bool, String> {
+    match unsafe { object_equal_structural(left, right) } {
+        Some(result) => result,
+        None => unsafe { dispatch_user_eq(left, right) },
+    }
+}
+
+/// Structural-only equality: `None` means the pair needs Python-level
+/// `__eq__` dispatch, which the caller must run WITHOUT holding a storage
+/// borrow or the runtime lock.
+unsafe fn object_equal_structural(left: *mut PyObject, right: *mut PyObject) -> Option<Result<bool, String>> {
     if left == right {
-        return Ok(true);
+        return Some(Ok(true));
     }
     if left.is_null() || right.is_null() {
-        return Ok(false);
+        return Some(Ok(false));
+    }
+
+    // The user-override probe precedes the numeric arms: `UserEq(1) == 1`
+    // must consult the override (CPython dispatches the reflected `__eq__`),
+    // never the numeric-domain fast path.
+    if unsafe { !user_dunder(left, "__eq__").is_null() || !user_dunder(right, "__eq__").is_null() } {
+        return None;
     }
 
     if let Some(equal) = unsafe { numeric_object_equal(left, right) } {
-        return Ok(equal);
+        return Some(Ok(equal));
     }
 
     // Weak references compare through live referents (CPython: both live ->
@@ -388,9 +458,9 @@ pub unsafe fn object_equal(left: *mut PyObject, right: *mut PyObject) -> Result<
         let left_referent = unsafe { crate::types::weakref::weakref_target(left) };
         let right_referent = unsafe { crate::types::weakref::weakref_target(right) };
         if left_referent.is_null() || right_referent.is_null() {
-            return Ok(false);
+            return Some(Ok(false));
         }
-        return unsafe { object_equal(left_referent, right_referent) };
+        return unsafe { object_equal_structural(left_referent, right_referent) };
     }
 
     // Tuple-storage keying parity across layouts: an exact tuple and a
@@ -404,49 +474,129 @@ pub unsafe fn object_equal(left: *mut PyObject, right: *mut PyObject) -> Result<
             unsafe { crate::abi::seq::tuple_storage_slice(left) },
             unsafe { crate::abi::seq::tuple_storage_slice(right) },
         ) else {
-            return Ok(false);
+            return Some(Ok(false));
         };
-        if l.len() != r.len() {
-            return Ok(false);
-        }
-        for (a, b) in l.iter().zip(r.iter()) {
-            if !unsafe { object_equal(*a, *b)? } {
-                return Ok(false);
-            }
-        }
-        return Ok(true);
+        return unsafe { slices_equal_structural(l, r) };
     }
     match (unsafe { type_name(left) }, unsafe { type_name(right) }) {
         (Some("str"), Some("str")) => {
             let l = unsafe { &*left.cast::<PyUnicode>() };
             let r = unsafe { &*right.cast::<PyUnicode>() };
-            Ok(unsafe { unicode_bytes(l) == unicode_bytes(r) })
+            Some(Ok(unsafe { unicode_bytes(l) == unicode_bytes(r) }))
         }
         (Some("bytes"), Some("bytes")) => {
             let l = unsafe { &*left.cast::<crate::types::bytes_::PyBytes>() };
             let r = unsafe { &*right.cast::<crate::types::bytes_::PyBytes>() };
-            Ok(unsafe { l.as_slice() == r.as_slice() })
+            Some(Ok(unsafe { l.as_slice() == r.as_slice() }))
         }
-        (Some("frozenset"), Some("frozenset")) => crate::types::frozenset::frozenset_equal(left, right),
+        (Some("frozenset"), Some("frozenset")) => Some(crate::types::frozenset::frozenset_equal(left, right)),
         (Some("tuple"), Some("tuple")) => {
             let (Some(l), Some(r)) = (
                 unsafe { crate::abi::seq::exact_tuple_slice(left) },
                 unsafe { crate::abi::seq::exact_tuple_slice(right) },
             ) else {
-                return Ok(false);
+                return Some(Ok(false));
             };
-            if l.len() != r.len() {
-                return Ok(false);
-            }
-            for (a, b) in l.iter().zip(r.iter()) {
-                if !unsafe { object_equal(*a, *b)? } {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
+            unsafe { slices_equal_structural(l, r) }
         }
-        _ => Ok(false),
+        _ => Some(Ok(false)),
     }
+}
+
+/// Element-wise structural equality for tuple storage: any element pair
+/// needing Python-level dispatch defers the WHOLE comparison (`None`), so the
+/// deferred pass re-runs it through the tuple rich-compare protocol with no
+/// borrow held.
+unsafe fn slices_equal_structural(l: &[*mut PyObject], r: &[*mut PyObject]) -> Option<Result<bool, String>> {
+    if l.len() != r.len() {
+        return Some(Ok(false));
+    }
+    for (a, b) in l.iter().zip(r.iter()) {
+        match unsafe { object_equal_structural(*a, *b) } {
+            Some(Ok(true)) => {}
+            other => return other,
+        }
+    }
+    Some(Ok(true))
+}
+
+/// Runs Python-level equality through the full rich-compare protocol.
+/// Error convention: a boxed exception raised by user `__eq__` stays
+/// authoritative on the thread state (`pon_err_set` preserves it); the
+/// returned message only feeds diagnostics.
+unsafe fn dispatch_user_eq(left: *mut PyObject, right: *mut PyObject) -> Result<bool, String> {
+    let result = unsafe { crate::abstract_op::rich_compare(crate::abstract_op::RICH_EQ, left, right) };
+    if result.is_null() {
+        return Err("__eq__ raised an exception".to_owned());
+    }
+    match unsafe { crate::abstract_op::is_true(result) } {
+        truth if truth < 0 => Err("__eq__ result truth test raised an exception".to_owned()),
+        0 => Ok(false),
+        _ => Ok(true),
+    }
+}
+
+/// Python-level dunder override for `object`, resolved through its heap
+/// class's MRO — but ONLY from heap-class namespaces: builtin bases (`dict`,
+/// `str`, `object`) never shadow the native fast paths.  NULL when `object`
+/// is outside the class-instance family or no user entry exists.  Lock-free
+/// and non-forcing (tag bits, type metadata, and namespace tables only), so
+/// it is safe on every hash/equality path.
+unsafe fn user_dunder(object: *mut PyObject, name: &str) -> *mut PyObject {
+    if object.is_null() || !crate::tag::is_heap(object) {
+        return core::ptr::null_mut();
+    }
+    let ty = unsafe { (*object).ob_type }.cast_mut();
+    if !crate::types::type_::type_dispatches_python_dunders(ty) {
+        return core::ptr::null_mut();
+    }
+    let name = crate::intern::intern(name);
+    for cls in unsafe { crate::mro::mro_entries(ty) } {
+        if cls.is_null() || !crate::types::type_::type_dispatches_python_dunders(cls) {
+            continue;
+        }
+        let dict = unsafe { (*cls).tp_dict }.cast::<crate::types::type_::PyClassDict>();
+        if dict.is_null() {
+            continue;
+        }
+        if let Some(value) = unsafe { (*dict).get(name) } {
+            return value;
+        }
+    }
+    core::ptr::null_mut()
+}
+
+/// Calls a user `__hash__` hook: CPython `slot_tp_hash`.  The returned int
+/// reduces through int hashing (arbitrary width collapses into the modular
+/// hash domain), non-ints raise the CPython TypeError, and the `__hash__ =
+/// None` marker (written directly or stamped by class creation for classes
+/// defining `__eq__` without `__hash__`) is the unhashable signal.
+unsafe fn dispatch_user_hash(object: *mut PyObject, hook: *mut PyObject) -> Result<isize, String> {
+    if unsafe { type_name(hook) } == Some("NoneType") {
+        let name = unsafe { type_name(object) }.unwrap_or("object");
+        return Err(format!("unhashable type: '{name}'"));
+    }
+    let ty = unsafe { (*object).ob_type }.cast_mut();
+    let bound = unsafe { crate::descr::descriptor_get(hook, object, ty) };
+    if bound.is_null() {
+        return Err("__hash__ descriptor binding raised an exception".to_owned());
+    }
+    let result = unsafe { crate::abi::pon_call(bound, core::ptr::null_mut(), 0) };
+    if result.is_null() {
+        return Err("__hash__ raised an exception".to_owned());
+    }
+    let Some(value) = (unsafe { crate::types::int::to_bigint_including_bool(result) }) else {
+        return Err("__hash__ method should return an integer".to_owned());
+    };
+    // CPython `slot_tp_hash` value rule: a result already within `Py_hash_t`
+    // range is preserved EXACTLY (so `x.__hash__() == hash(y)` implies
+    // `hash(x) == hash(y)` — returning 42 hashes as 42, NOT as a reduction);
+    // only out-of-range ints fall back to long hashing.  `hash_object`
+    // normalizes the reserved -1 afterwards.
+    Ok(match num_traits::ToPrimitive::to_isize(&value) {
+        Some(hash) => hash,
+        None => crate::types::int::hash_bigint(&value),
+    })
 }
 
 unsafe fn numeric_object_equal(left: *mut PyObject, right: *mut PyObject) -> Option<bool> {
@@ -539,6 +689,16 @@ fn hash_object_non_numeric(object: *mut PyObject) -> Result<isize, String> {
     if unsafe { crate::types::weakref::is_weakref(object) } {
         return unsafe { crate::types::weakref::weakref_container_hash(object) };
     }
+    // Python-level `__hash__` resolved from a heap class's MRO (CPython
+    // `slot_tp_hash`): a user hook computes the hash; the `__hash__ = None`
+    // marker makes the instance unhashable.  Classes without a user-level
+    // entry fall through to the layout arms and the identity default below
+    // (CPython `object.__hash__` is id-derived), so plain-object keying is
+    // untouched.  The probe is lock-free and non-forcing.
+    let hook = unsafe { user_dunder(object, "__hash__") };
+    if !hook.is_null() {
+        return unsafe { dispatch_user_hash(object, hook) };
+    }
     // Dict-layout objects are unhashable exactly like exact dicts (CPython:
     // `dict.__hash__` is None, inherited by subclasses).  Checked before the
     // name match so subclass type names don't fall into the identity default.
@@ -556,11 +716,17 @@ fn hash_object_non_numeric(object: *mut PyObject) -> Result<isize, String> {
     let hash = match unsafe { type_name(object) } {
         Some("str") => {
             let unicode = unsafe { &*object.cast::<PyUnicode>() };
-            hash_bytes(unsafe { unicode_bytes(unicode) }) as isize
+            // CPython seed-0 value parity (`pyhash::str_hash`); an invalid
+            // UTF-8 payload (never produced by the runtime) defensively
+            // hashes its raw bytes.
+            match unsafe { unicode.as_str() } {
+                Some(text) => crate::pyhash::str_hash(text) as isize,
+                None => crate::pyhash::bytes_hash(unsafe { unicode_bytes(unicode) }) as isize,
+            }
         }
         Some("bytes") => {
             let bytes = unsafe { &*object.cast::<crate::types::bytes_::PyBytes>() };
-            hash_bytes(unsafe { bytes.as_slice() }) as isize
+            crate::pyhash::bytes_hash(unsafe { bytes.as_slice() }) as isize
         }
         Some("NoneType") => 0x3456_789a_isize,
         Some("frozenset") => unsafe { crate::types::frozenset::frozenset_hash_value(object)? },
@@ -594,22 +760,81 @@ pub unsafe fn type_name(object: *mut PyObject) -> Option<&'static str> {
     Some(unsafe { core::mem::transmute::<&str, &'static str>((*ty).name()) })
 }
 
-unsafe fn find_entry_index(dict: &PyDictStorage, key: *mut PyObject, hash: isize) -> Result<Option<usize>, String> {
-    if dict.buckets.is_empty() {
+/// Storage-shape witness for the deferred-equality probe: any key-structure
+/// mutation (insert grows `entries`; removal shrinks it AND swaps in a fresh
+/// bucket allocation via `rebuild_dict_buckets_with_capacity`) changes at
+/// least one component.  Value overwrites keep every component — they never
+/// invalidate probe indices.
+fn storage_witness(storage: &PyDictStorage) -> (usize, usize, usize, usize) {
+    (
+        storage.entries.len(),
+        storage.entries.as_ptr() as usize,
+        storage.buckets.len(),
+        storage.buckets.as_ptr() as usize,
+    )
+}
+
+/// Locates `key`'s entry index for `hash`.
+///
+/// Structural candidates resolve inside the collection pass; a candidate
+/// needing Python-level `__eq__` is deferred and dispatched with NO storage
+/// borrow held (user code may re-enter the dict mutators).  Every
+/// affirmative deferred match is re-validated by slot identity, and the
+/// probe restarts whenever the storage shape changed underneath a dispatch —
+/// CPython `lookdict`'s `goto restart` discipline.
+unsafe fn find_entry_index(dict: *mut PyObject, key: *mut PyObject, hash: isize) -> Result<Option<usize>, String> {
+    'restart: loop {
+        let mut deferred: Vec<(usize, *mut PyObject)> = Vec::new();
+        let witness;
+        {
+            let storage = unsafe { dict_ref(dict)? };
+            if storage.buckets.is_empty() {
+                return Ok(None);
+            }
+            witness = storage_witness(storage);
+            let mut bucket = bucket_index(hash, storage.buckets.len());
+            let mut matched = None;
+            for _ in 0..storage.buckets.len() {
+                let Some(index) = storage.buckets[bucket] else {
+                    break;
+                };
+                let entry = storage.entries[index];
+                if entry.hash == hash {
+                    match unsafe { object_equal_structural(entry.key, key) } {
+                        Some(Ok(true)) => {
+                            matched = Some(index);
+                            break;
+                        }
+                        Some(Ok(false)) => {}
+                        Some(Err(message)) => return Err(message),
+                        None => deferred.push((index, entry.key)),
+                    }
+                }
+                bucket = (bucket + 1) & (storage.buckets.len() - 1);
+            }
+            if let Some(index) = matched {
+                return Ok(Some(index));
+            }
+            if deferred.is_empty() {
+                return Ok(None);
+            }
+        }
+        // Deferred pass: Python-level `__eq__` runs with the borrow released.
+        for (index, entry_key) in deferred {
+            let equal = unsafe { dispatch_user_eq(entry_key, key)? };
+            let storage = unsafe { dict_ref(dict)? };
+            if equal {
+                if storage.entries.len() > index && storage.entries[index].key == entry_key {
+                    return Ok(Some(index));
+                }
+                continue 'restart;
+            }
+            if storage_witness(storage) != witness {
+                continue 'restart;
+            }
+        }
         return Ok(None);
     }
-    let mut bucket = bucket_index(hash, dict.buckets.len());
-    for _ in 0..dict.buckets.len() {
-        let Some(index) = dict.buckets[bucket] else {
-            return Ok(None);
-        };
-        let entry = dict.entries[index];
-        if entry.hash == hash && unsafe { object_equal(entry.key, key)? } {
-            return Ok(Some(index));
-        }
-        bucket = (bucket + 1) & (dict.buckets.len() - 1);
-    }
-    Ok(None)
 }
 
 fn ensure_dict_buckets(dict: &mut PyDictStorage) -> Result<(), String> {
@@ -833,14 +1058,6 @@ unsafe fn unicode_bytes(unicode: &PyUnicode) -> &[u8] {
     }
 }
 
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
 
 fn normalize_hash(hash: isize) -> isize {
     if hash == -1 { -2 } else { hash }
@@ -1079,6 +1296,113 @@ unsafe extern "C" fn dict_dunder_ne(argv: *mut *mut PyObject, argc: usize) -> *m
     unsafe { dict_dunder_compare(argv, argc, "__ne__", false) }
 }
 
+// ---- PEP 584 dict union ------------------------------------------------------
+
+/// PEP 584 `|` core: a NEW exact dict holding `left`'s entries updated by
+/// `right`'s — insertion order is left-then-right, right wins on key
+/// conflicts, and the result is a plain dict even for subclass operands
+/// (CPython `dict_or` via `PyDict_Copy`).  Reports `NotImplemented` unless
+/// BOTH operands carry concrete dict storage so the dispatcher can continue
+/// to reflected candidates and the operand-typed TypeError.
+unsafe fn dict_union(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    if unsafe { !has_dict_storage(left) || !has_dict_storage(right) } {
+        return unsafe { crate::abi::pon_not_implemented() };
+    }
+    let mut pairs = Vec::new();
+    for source in [left, right] {
+        let entries = match unsafe { dict_entries_snapshot(source) } {
+            Ok(entries) => entries,
+            Err(message) => return crate::abi::return_null_with_error(message),
+        };
+        pairs.reserve(entries.len() * 2);
+        for entry in entries {
+            pairs.push(entry.key);
+            pairs.push(entry.value);
+        }
+    }
+    unsafe { crate::abi::map::pon_build_map(pairs.as_mut_ptr(), pairs.len() / 2) }
+}
+
+/// PEP 584 `|=` core: `dict.update` semantics over any mapping or iterable of
+/// key-value pairs, mutating `receiver` and returning the SAME object (NULL
+/// with the update error raised on failure — `d |= 5` reports CPython's
+/// "'int' object is not iterable", not an unsupported-operand TypeError).
+unsafe fn dict_inplace_union(receiver: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    let mut pairs = Vec::new();
+    if unsafe { crate::native::builtins_mod::collect_dict_update_pairs(other, &mut pairs) }.is_err() {
+        return ptr::null_mut();
+    }
+    for pair in pairs.chunks_exact(2) {
+        if unsafe { crate::abi::map::pon_dict_set_item_status(receiver, pair[0], pair[1]) } < 0 {
+            return ptr::null_mut();
+        }
+    }
+    receiver
+}
+
+/// `nb_or` slot: `self | other`.
+unsafe extern "C" fn dict_or_slot(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    unsafe { dict_union(left, right) }
+}
+
+/// `nb_reflected_or` slot: the receiver is the RIGHT operand of `other | self`,
+/// so the union runs other-first with the receiver's entries winning conflicts.
+unsafe extern "C" fn dict_ror_slot(receiver: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    unsafe { dict_union(other, receiver) }
+}
+
+/// `nb_inplace_or` slot: `self |= other`.
+unsafe extern "C" fn dict_ior_slot(receiver: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    if unsafe { !has_dict_storage(receiver) } {
+        return unsafe { crate::abi::pon_not_implemented() };
+    }
+    unsafe { dict_inplace_union(receiver, other) }
+}
+
+/// Shared `__or__`/`__ror__` body for the subclass method surface.
+unsafe fn dict_dunder_union(argv: *mut *mut PyObject, argc: usize, name: &str, reflected: bool) -> *mut PyObject {
+    let args = match unsafe { dunder_args(argv, argc, name, 2..=2) } {
+        Ok(args) => args,
+        Err(message) => return raise_dict_type_error(message),
+    };
+    let receiver = args[0];
+    let other = args[1];
+    crate::untag_prelude!(receiver, other);
+    if unsafe { !ensure_dict_receiver(receiver, name, DictDescrFlavor::SlotWrapper) } {
+        return ptr::null_mut();
+    }
+    if reflected {
+        unsafe { dict_union(other, receiver) }
+    } else {
+        unsafe { dict_union(receiver, other) }
+    }
+}
+
+/// `dict.__or__(self, other)`.
+unsafe extern "C" fn dict_dunder_or(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { dict_dunder_union(argv, argc, "__or__", false) }
+}
+
+/// `dict.__ror__(self, other)`.
+unsafe extern "C" fn dict_dunder_ror(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { dict_dunder_union(argv, argc, "__ror__", true) }
+}
+
+/// `dict.__ior__(self, other)`: in-place update, returning the receiver.
+unsafe extern "C" fn dict_dunder_ior(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { dunder_args(argv, argc, "__ior__", 2..=2) } {
+        Ok(args) => args,
+        Err(message) => return raise_dict_type_error(message),
+    };
+    let receiver = args[0];
+    let other = args[1];
+    crate::untag_prelude!(receiver, other);
+    if unsafe { !ensure_dict_receiver(receiver, "__ior__", DictDescrFlavor::SlotWrapper) } {
+        return ptr::null_mut();
+    }
+    unsafe { dict_inplace_union(receiver, other) }
+}
+
 /// One-shot installer for the builtin dict type's `tp_dict` method surface.
 ///
 /// Runs lazily from class construction the first time a dict-derived class is
@@ -1115,6 +1439,9 @@ pub fn ensure_dict_subclass_methods_installed() {
         ("__iter__", dict_dunder_iter as *const u8),
         ("__eq__", dict_dunder_eq as *const u8),
         ("__ne__", dict_dunder_ne as *const u8),
+        ("__or__", dict_dunder_or as *const u8),
+        ("__ror__", dict_dunder_ror as *const u8),
+        ("__ior__", dict_dunder_ior as *const u8),
         ("get", crate::abi::map::dict_get_method_trampoline as *const u8),
         ("keys", crate::abi::map::dict_keys_method_trampoline as *const u8),
         ("values", crate::abi::map::dict_values_method_trampoline as *const u8),
