@@ -8,7 +8,10 @@ use cranelift_codegen::ir::{self, InstBuilder, StackSlotData, StackSlotKind};
 use cranelift_frontend::FunctionBuilder;
 use pon_ir::ir::{NameId, Value as IrValue};
 
-use super::{CodegenError, HelperFuncRefs, LowerState, NameMap, build_call_argv, call_pyobject_helper, offset_i32};
+use super::{
+    CodegenError, HelperFuncRefs, LowerState, NameMap, build_call_argv, call_pyobject_helper,
+    call_pyobject_helper_consuming, offset_i32,
+};
 
 #[allow(dead_code)]
 pub(crate) const MATCH_SEQUENCE_HELPER: &str = "pon_match_sequence";
@@ -91,7 +94,7 @@ pub(crate) fn lower_match_keys(
     let key_count = keys.len();
     let keys = build_call_argv(builder, helpers, state, keys, ptr_ty, ptr_bytes)?;
     let count = builder.ins().iconst(ptr_ty, key_count as i64);
-    Ok(call_pyobject_helper(builder, helper, &[subj, keys, count], ptr_ty, exception_exit))
+    call_pyobject_helper_consuming(builder, helper, &[subj, keys.addr, count], &[&keys], ptr_ty, ptr_bytes, exception_exit)
 }
 
 /// Pattern-length predicate lowering.

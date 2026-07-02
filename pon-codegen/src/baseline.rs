@@ -94,6 +94,8 @@ pub enum CodegenError {
     OffsetTooLarge { offset: usize },
     /// Phase A received an IR operation reserved for a later phase.
     Unsupported(&'static str),
+    /// A cell id below the own-cell (`MakeCell`) count missed the cell map.
+    ClosureCellUnderflow { cell: u32, own_cells: usize },
 }
 
 impl fmt::Display for CodegenError {
@@ -115,6 +117,9 @@ impl fmt::Display for CodegenError {
             Self::ValueNotDefined(value) => write!(f, "SSA value {:?} was used before definition", value),
             Self::OffsetTooLarge { offset } => write!(f, "offset {offset} does not fit in i32"),
             Self::Unsupported(op) => write!(f, "unsupported Phase-A lowering operation: {op}"),
+            Self::ClosureCellUnderflow { cell, own_cells } => {
+                write!(f, "cell id {cell} is below the own-cell count {own_cells} but has no MakeCell")
+            }
         }
     }
 }
@@ -237,7 +242,13 @@ pub(crate) struct LowerState {
     pub(crate) values: HashMap<IrValue, ir::Value>,
     pub(crate) locals: Vec<Variable>,
     pub(crate) local_defined: Vec<bool>,
-    pub(crate) cells: HashMap<u32, ir::Value>,
+    /// Own closure cells (`MakeCell` results) by dense cell id.  Cells are
+    /// SSA `Variable`s, not raw values: generator bodies redefine them from
+    /// frame spill slots in the dispatch block, so resume paths that never
+    /// execute the entry prologue still see a dominating definition.
+    pub(crate) cells: HashMap<u32, Variable>,
+    /// Next dense cell id handed to a lowered `MakeCell`.
+    pub(crate) next_cell_id: u32,
     pub(crate) last_value: Option<ir::Value>,
     /// Present exactly while lowering a resumable generator body (pin J0.1):
     /// carries the frame pointer for suspend spills and the gen epilogues.
@@ -251,6 +262,7 @@ impl LowerState {
             locals: Vec::with_capacity(local_count),
             local_defined: vec![false; local_count],
             cells: HashMap::new(),
+            next_cell_id: 0,
             last_value: None,
             gen_ctx: None,
         }
@@ -272,11 +284,11 @@ impl LowerState {
             .ok_or(CodegenError::ValueNotDefined(ir_value))
     }
 
-    pub(crate) fn define_cell(&mut self, cell: u32, value: ir::Value) {
-        self.cells.insert(cell, value);
+    pub(crate) fn define_cell(&mut self, cell: u32, var: Variable) {
+        self.cells.insert(cell, var);
     }
 
-    pub(crate) fn cell(&self, cell: u32) -> Option<ir::Value> {
+    pub(crate) fn cell(&self, cell: u32) -> Option<Variable> {
         self.cells.get(&cell).copied()
     }
 }
@@ -1435,11 +1447,13 @@ pub(crate) fn lower_inst<M: Module>(
             bases,
             keywords,
             decorators,
+            closure,
         } => call::lower_build_class(
             module,
             builder,
             helpers,
             func_ids,
+            functions,
             names,
             state,
             *body,
@@ -1447,6 +1461,7 @@ pub(crate) fn lower_inst<M: Module>(
             bases,
             keywords,
             decorators,
+            closure,
             ptr_ty,
             ptr_bytes,
             exception_exit,
@@ -1620,6 +1635,52 @@ pub(crate) fn declare_feedback_cells<M: Module>(
     Ok(Some(data_id))
 }
 
+/// A pointer-carrying `ExplicitSlot` array built for one consuming helper call.
+///
+/// `addr` is the array base passed to the helper.  `scrub` names the backing
+/// stack slot and its byte length so the call site can zero the words after
+/// the callee returns (helpers copy what they keep before returning).  Without
+/// that scrub, the dead copies stay in the frame for the rest of the enclosing
+/// function and the AoT conservative stack scan keeps re-rooting them, so a
+/// `del`'d object is falsely retained and its weakrefs never clear
+/// (aot-parity `weakref_basic`).  Empty arrays carry no slot.
+pub(crate) struct PyObjectArray {
+    pub(crate) addr: ir::Value,
+    scrub: Option<(ir::StackSlot, usize)>,
+}
+
+impl PyObjectArray {
+    /// Wraps an already-populated slot holding `bytes` bytes of call input.
+    pub(crate) fn slot(addr: ir::Value, slot: ir::StackSlot, bytes: usize) -> Self {
+        Self {
+            addr,
+            scrub: Some((slot, bytes)),
+        }
+    }
+
+    /// An empty array: NULL base pointer, nothing to scrub.
+    pub(crate) fn empty(builder: &mut FunctionBuilder<'_>, ptr_ty: ir::Type) -> Self {
+        Self {
+            addr: builder.ins().iconst(ptr_ty, 0),
+            scrub: None,
+        }
+    }
+
+    /// Emits stores clearing every pointer-sized word of the backing slot.
+    fn emit_scrub(&self, builder: &mut FunctionBuilder<'_>, ptr_ty: ir::Type, ptr_bytes: usize) -> Result<(), CodegenError> {
+        let Some((slot, bytes)) = self.scrub else {
+            return Ok(());
+        };
+        let zero = builder.ins().iconst(ptr_ty, 0);
+        let mut offset = 0;
+        while offset + ptr_bytes <= bytes {
+            builder.ins().stack_store(zero, slot, offset_i32(offset)?);
+            offset += ptr_bytes;
+        }
+        Ok(())
+    }
+}
+
 pub(crate) fn build_call_argv(
     builder: &mut FunctionBuilder<'_>,
     helpers: &HelperFuncRefs,
@@ -1627,9 +1688,9 @@ pub(crate) fn build_call_argv(
     args: &[IrValue],
     ptr_ty: ir::Type,
     ptr_bytes: usize,
-) -> Result<ir::Value, CodegenError> {
+) -> Result<PyObjectArray, CodegenError> {
     if args.is_empty() {
-        return Ok(builder.ins().iconst(ptr_ty, 0));
+        return Ok(PyObjectArray::empty(builder, ptr_ty));
     }
 
     let size = args
@@ -1647,7 +1708,8 @@ pub(crate) fn build_call_argv(
         let offset = offset_i32(index * ptr_bytes)?;
         store_stack_pyobject(builder, helpers, slot, offset, value, ptr_ty);
     }
-    Ok(builder.ins().stack_addr(ptr_ty, slot, 0))
+    let addr = builder.ins().stack_addr(ptr_ty, slot, 0);
+    Ok(PyObjectArray::slot(addr, slot, size))
 }
 
 fn store_stack_pyobject(
@@ -1692,6 +1754,30 @@ pub(crate) fn call_pyobject_helper(
     let result = builder.func.dfg.inst_results(call)[0];
     emit_null_check(builder, result, ptr_ty, exception_exit);
     result
+}
+
+/// [`call_pyobject_helper`] for helpers that consume stack-slot arrays.
+///
+/// Zeroes every array's backing slot between the call and its NULL check, so
+/// the dead copies are cleared on the success AND exception edges before
+/// control can reach another collection point.  See [`PyObjectArray`].
+pub(crate) fn call_pyobject_helper_consuming(
+    builder: &mut FunctionBuilder<'_>,
+    helper: FuncRef,
+    args: &[ir::Value],
+    arrays: &[&PyObjectArray],
+    ptr_ty: ir::Type,
+    ptr_bytes: usize,
+    exception_exit: ir::Block,
+) -> Result<ir::Value, CodegenError> {
+    // PHASE-D: stack-map safepoint
+    let call = builder.ins().call(helper, args);
+    let result = builder.func.dfg.inst_results(call)[0];
+    for array in arrays {
+        array.emit_scrub(builder, ptr_ty, ptr_bytes)?;
+    }
+    emit_null_check(builder, result, ptr_ty, exception_exit);
+    Ok(result)
 }
 
 fn emit_null_check(

@@ -21,6 +21,21 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
     install_module("os", attrs.into_iter().collect::<Result<Vec<_>, _>>()?)
 }
 
+/// `os.path`: CPython's `os.py` publishes `sys.modules['os.path'] =
+/// posixpath`; the native seed mirrors that aliasing lazily by resolving the
+/// vendored `posixpath` source module on first import.  The importer then
+/// binds it under both names and as the parent's `path` attribute.
+pub(super) fn make_path_module() -> Result<*mut PyObject, String> {
+    // SAFETY: Import entry point follows the NULL-sentinel error contract.
+    let module = unsafe {
+        crate::import::pon_import_name(intern(if cfg!(windows) { "ntpath" } else { "posixpath" }), std::ptr::null(), 0, 0)
+    };
+    if module.is_null() {
+        return Err("failed to import posixpath for os.path".to_owned());
+    }
+    Ok(module)
+}
+
 fn os_name() -> &'static str {
     if cfg!(windows) {
         "nt"

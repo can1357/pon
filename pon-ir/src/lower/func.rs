@@ -198,15 +198,20 @@ fn store_function_value(
         let name_interned = ensure_name_id(driver, name, &mut name_interned)?;
         scope.emit(InstKind::StoreGlobal(name_interned, value))?;
     } else if scope.is_class() {
-        let name_interned = ensure_name_id(driver, name, &mut name_interned)?;
-        scope.emit(InstKind::StoreName(name_interned, value))?;
+        if let Some(cell) = scope.class_deref_cell(name) {
+            scope.emit(InstKind::StoreCell(cell, value))?;
+        } else {
+            let name_interned = ensure_name_id(driver, name, &mut name_interned)?;
+            scope.emit(InstKind::StoreName(name_interned, value))?;
+        }
     } else {
         match scope.name_class(name) {
             Some(NameClass::Cell { cell_slot, .. }) => {
                 scope.emit(InstKind::StoreCell(CellId(*cell_slot), value))?;
             }
             Some(NameClass::Free { slot }) => {
-                scope.emit(InstKind::StoreCell(CellId(*slot), value))?;
+                let cell = scope.free_cell(*slot);
+                scope.emit(InstKind::StoreCell(cell, value))?;
             }
             Some(NameClass::Local { slot }) => {
                 scope.emit(InstKind::StoreLocal(LocalId(*slot), value))?;

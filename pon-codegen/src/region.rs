@@ -542,6 +542,7 @@ fn push_inst_operands(kind: &InstKind, operands: &mut Vec<IrValue>) {
             bases,
             keywords,
             decorators,
+            closure: _,
         } => {
             operands.extend(bases.iter().copied());
             operands.extend(keywords.iter().map(|(_, value)| *value));

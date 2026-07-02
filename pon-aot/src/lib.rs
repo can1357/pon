@@ -39,15 +39,30 @@ pub fn build(entry_path: &Path, opts: &BuildOptions) -> anyhow::Result<PathBuf> 
         let module = typed_ir_module(entry_path, opts.allow_dynamic).context("failed to seed typed AoT IR")?;
         (module, Vec::new())
     } else {
-        let resolver = reachable::PathImportResolver::default();
+        let resolver = reachable::PathImportResolver::with_runtime_import_order(
+            pon_runtime::import::source_search_roots(),
+            pon_runtime::import::import_shadowed_from_source,
+        );
         let reachability = reachable::module_closure_with_options(
             entry_path,
             &resolver,
             &reachable::ReachabilityOptions {
                 allow_dynamic: opts.allow_dynamic,
+                ..Default::default()
             },
         )
         .context("failed to compute AoT reachability")?;
+        if std::env::var_os("PON_AOT_DEBUG_CLOSURE").is_some() {
+            for unit in &reachability.units {
+                eprintln!("unit: {} <- {}", unit.module_name, unit.path.display());
+                for edge in &unit.imports {
+                    eprintln!("    import {:?} -> {:?}", edge.import.module, edge.resolution);
+                }
+            }
+            for skip in &reachability.skipped {
+                eprintln!("skip: {} ({})", skip.module_name, skip.reason);
+            }
+        }
         let mut units = reachability.units.into_iter();
         let entry_unit = units.next().context("AoT reachability produced no entry module")?;
         (entry_unit.module, units.collect())
@@ -67,14 +82,27 @@ pub fn build(entry_path: &Path, opts: &BuildOptions) -> anyhow::Result<PathBuf> 
         let mut unit_object = object_module::new_object_module(isa, &format!("pon_unit_{index}"))?;
         let mut unit_ctx = unit_object.make_context();
         let mut unit_fctx = FunctionBuilderContext::new();
-        let func_ids = pon_codegen::compile_ir_module(
+        let compiled = pon_codegen::compile_ir_module(
             &mut unit_object,
             &unit.module,
             pon_codegen::CompileMode::Aot,
             &mut unit_ctx,
             &mut unit_fctx,
-        )
-        .with_context(|| format!("failed to compile embedded module `{}`", unit.module_name))?;
+        );
+        let func_ids = match compiled {
+            Ok(func_ids) => func_ids,
+            // Best-effort units (runtime import roots) may outrun codegen
+            // support; dropping one reproduces the no-embedding runtime
+            // behavior for that module instead of failing the whole build.
+            Err(error) if unit.best_effort => {
+                eprintln!("pon: warning: not embedding module `{}`: {error:#}", unit.module_name);
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to compile embedded module `{}`", unit.module_name));
+            }
+        };
         let body_id = func_ids
             .get(unit.module.main.0 as usize)
             .copied()

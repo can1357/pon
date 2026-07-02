@@ -6,8 +6,8 @@ use cranelift_module::{DataDescription, FuncId, Module};
 use pon_ir::ir::{CellId, Function, FunctionId, NameId, Value as IrValue};
 
 use super::{
-    CodegenError, HelperFuncRefs, LowerState, NameMap, build_call_argv, call_pyobject_helper,
-    offset_i32,
+    CodegenError, HelperFuncRefs, LowerState, NameMap, PyObjectArray, build_call_argv,
+    call_pyobject_helper, call_pyobject_helper_consuming, offset_i32,
 };
 
 const CODE_INFO_ENTRY_OFFSET: usize = core::mem::offset_of!(pon_runtime::abi::CodeInfo, entry);
@@ -38,7 +38,15 @@ pub(crate) fn lower_call(
     let callee = state.value(callee)?;
     let argv = build_call_argv(builder, helpers, state, args, ptr_ty, ptr_bytes)?;
     let argc = builder.ins().iconst(ptr_ty, args.len() as i64);
-    Ok(call_pyobject_helper(builder, helpers.call, &[callee, argv, argc], ptr_ty, exception_exit))
+    call_pyobject_helper_consuming(
+        builder,
+        helpers.call,
+        &[callee, argv.addr, argc],
+        &[&argv],
+        ptr_ty,
+        ptr_bytes,
+        exception_exit,
+    )
 }
 
 /// Lower a Phase-A function object construction through `pon_make_function`.
@@ -102,13 +110,15 @@ pub(crate) fn lower_call_ex(
     let kw_count = builder.ins().iconst(ptr_ty, call.kwargs.len() as i64);
     let dstar = optional_value(builder, state, call.dstar, ptr_ty)?;
     let feedback = feedback_cell.unwrap_or_else(|| builder.ins().iconst(ptr_ty, 0));
-    Ok(call_pyobject_helper(
+    call_pyobject_helper_consuming(
         builder,
         helpers.call_ex,
-        &[callee, argv, argc, star, kw_names, kw_values, kw_count, dstar, feedback],
+        &[callee, argv.addr, argc, star, kw_names, kw_values.addr, kw_count, dstar, feedback],
+        &[&argv, &kw_values],
         ptr_ty,
+        ptr_bytes,
         exception_exit,
-    ))
+    )
 }
 
 /// Method-call payload accepted by the central `CallMethod` dispatch arm.
@@ -133,13 +143,15 @@ pub(crate) fn lower_call_method(
     let argv = build_call_argv(builder, helpers, state, call.args, ptr_ty, ptr_bytes)?;
     let argc = builder.ins().iconst(ptr_ty, call.args.len() as i64);
     let feedback = feedback_cell.unwrap_or_else(|| builder.ins().iconst(ptr_ty, 0));
-    Ok(call_pyobject_helper(
+    call_pyobject_helper_consuming(
         builder,
         helpers.call_method,
-        &[recv_pair, argv, argc, feedback],
+        &[recv_pair, argv.addr, argc, feedback],
+        &[&argv],
         ptr_ty,
+        ptr_bytes,
         exception_exit,
-    ))
+    )
 }
 
 pub(crate) struct MakeFunctionFullArgs<'a> {
@@ -168,6 +180,7 @@ pub(crate) fn lower_build_class<M: Module>(
     builder: &mut FunctionBuilder<'_>,
     helpers: &HelperFuncRefs,
     func_ids: &[FuncId],
+    functions: &[Function],
     names: &NameMap,
     state: &LowerState,
     body: pon_ir::ir::FunctionId,
@@ -175,35 +188,64 @@ pub(crate) fn lower_build_class<M: Module>(
     bases: &[IrValue],
     keywords: &[(NameId, IrValue)],
     decorators: &[IrValue],
+    closure: &[CellId],
     ptr_ty: ir::Type,
     ptr_bytes: usize,
     exception_exit: ir::Block,
 ) -> Result<ir::Value, CodegenError> {
-    let body = lower_make_function(
-        module,
-        builder,
-        helpers,
-        func_ids,
-        names,
-        body.0,
-        name.0,
-        0,
-        ptr_ty,
-        exception_exit,
-    )?;
+    let body = if closure.is_empty() {
+        lower_make_function(
+            module,
+            builder,
+            helpers,
+            func_ids,
+            names,
+            body.0,
+            name.0,
+            0,
+            ptr_ty,
+            exception_exit,
+        )?
+    } else {
+        // The class body function captures enclosing-function cells exactly
+        // like a nested `def`: build it through the Phase-B full constructor
+        // (closure storage needs the metadata record) so `__build_class__`
+        // runs the body with the closure tuple attached.
+        lower_make_function_full(
+            module,
+            builder,
+            helpers,
+            func_ids,
+            functions,
+            names,
+            state,
+            MakeFunctionFullArgs {
+                code: body,
+                defaults: &[],
+                kwdefaults: &[],
+                closure,
+                annotations: &[],
+            },
+            ptr_ty,
+            ptr_bytes,
+            exception_exit,
+        )?
+    };
     let bases_ptr = build_call_argv(builder, helpers, state, bases, ptr_ty, ptr_bytes)?;
     let base_count = builder.ins().iconst(ptr_ty, bases.len() as i64);
     let kw_names = build_kw_name_array(builder, names, keywords, ptr_ty)?;
     let kw_values = build_kw_value_array(builder, state, keywords, ptr_ty, ptr_bytes)?;
     let kw_count = builder.ins().iconst(ptr_ty, keywords.len() as i64);
     let runtime_name = builder.ins().iconst(ir::types::I32, i64::from(names.runtime_id(name.0)?));
-    let mut class_value = call_pyobject_helper(
+    let mut class_value = call_pyobject_helper_consuming(
         builder,
         helpers.build_class,
-        &[body, runtime_name, bases_ptr, base_count, kw_names, kw_values, kw_count],
+        &[body, runtime_name, bases_ptr.addr, base_count, kw_names, kw_values.addr, kw_count],
+        &[&bases_ptr, &kw_values],
         ptr_ty,
+        ptr_bytes,
         exception_exit,
-    );
+    )?;
     for decorator in decorators.iter().rev().copied() {
         let decorator = state.value(decorator)?;
         let slot = builder.create_sized_stack_slot(StackSlotData {
@@ -213,9 +255,17 @@ pub(crate) fn lower_build_class<M: Module>(
             key: None,
         });
         builder.ins().stack_store(class_value, slot, 0);
-        let argv = builder.ins().stack_addr(ptr_ty, slot, 0);
+        let argv = PyObjectArray::slot(builder.ins().stack_addr(ptr_ty, slot, 0), slot, ptr_bytes);
         let argc = builder.ins().iconst(ptr_ty, 1);
-        class_value = call_pyobject_helper(builder, helpers.call, &[decorator, argv, argc], ptr_ty, exception_exit);
+        class_value = call_pyobject_helper_consuming(
+            builder,
+            helpers.call,
+            &[decorator, argv.addr, argc],
+            &[&argv],
+            ptr_ty,
+            ptr_bytes,
+            exception_exit,
+        )?;
     }
     Ok(class_value)
 }
@@ -250,35 +300,39 @@ pub(crate) fn lower_make_function_full<M: Module>(
     let annotation_names = build_kw_name_array(builder, names, function.annotations, ptr_ty)?;
     let annotations = build_kw_value_array(builder, state, function.annotations, ptr_ty, ptr_bytes)?;
     let annotation_count = builder.ins().iconst(ptr_ty, function.annotations.len() as i64);
-    let object = call_pyobject_helper(
+    let object = call_pyobject_helper_consuming(
         builder,
         helpers.make_function_full,
         &[
             code_info,
-            defaults,
+            defaults.addr,
             default_count,
             kwdefault_names,
-            kwdefaults,
+            kwdefaults.addr,
             kwdefault_count,
             annotation_names,
-            annotations,
+            annotations.addr,
             annotation_count,
         ],
+        &[&defaults, &kwdefaults, &annotations],
         ptr_ty,
+        ptr_bytes,
         exception_exit,
-    );
+    )?;
     if function.closure.is_empty() {
         return Ok(object);
     }
     let closure = build_closure_array(builder, helpers, state, function.closure, ptr_ty, ptr_bytes, exception_exit)?;
     let closure_count = builder.ins().iconst(ptr_ty, function.closure.len() as i64);
-    Ok(call_pyobject_helper(
+    call_pyobject_helper_consuming(
         builder,
         helpers.function_set_closure,
-        &[object, closure, closure_count],
+        &[object, closure.addr, closure_count],
+        &[&closure],
         ptr_ty,
+        ptr_bytes,
         exception_exit,
-    ))
+    )
 }
 
 fn declare_code_info<M: Module>(
@@ -396,7 +450,7 @@ fn build_value_array(
     values: &[IrValue],
     ptr_ty: ir::Type,
     ptr_bytes: usize,
-) -> Result<ir::Value, CodegenError> {
+) -> Result<PyObjectArray, CodegenError> {
     build_call_argv(builder, helpers, state, values, ptr_ty, ptr_bytes)
 }
 
@@ -408,9 +462,9 @@ fn build_closure_array(
     ptr_ty: ir::Type,
     ptr_bytes: usize,
     exception_exit: ir::Block,
-) -> Result<ir::Value, CodegenError> {
+) -> Result<PyObjectArray, CodegenError> {
     if closure.is_empty() {
-        return Ok(builder.ins().iconst(ptr_ty, 0));
+        return Ok(PyObjectArray::empty(builder, ptr_ty));
     }
     let size = closure
         .len()
@@ -426,7 +480,8 @@ fn build_closure_array(
         let value = super::name::cell_object(builder, helpers, state, cell.0, ptr_ty, exception_exit)?;
         builder.ins().stack_store(value, slot, offset_i32(index * ptr_bytes)?);
     }
-    Ok(builder.ins().stack_addr(ptr_ty, slot, 0))
+    let addr = builder.ins().stack_addr(ptr_ty, slot, 0);
+    Ok(PyObjectArray::slot(addr, slot, size))
 }
 
 fn build_kw_name_array(
@@ -461,9 +516,9 @@ fn build_kw_value_array(
     kwargs: &[(NameId, IrValue)],
     ptr_ty: ir::Type,
     ptr_bytes: usize,
-) -> Result<ir::Value, CodegenError> {
+) -> Result<PyObjectArray, CodegenError> {
     if kwargs.is_empty() {
-        return Ok(builder.ins().iconst(ptr_ty, 0));
+        return Ok(PyObjectArray::empty(builder, ptr_ty));
     }
     let size = kwargs
         .len()
@@ -479,7 +534,8 @@ fn build_kw_value_array(
         let value = state.value(*value)?;
         builder.ins().stack_store(value, slot, offset_i32(index * ptr_bytes)?);
     }
-    Ok(builder.ins().stack_addr(ptr_ty, slot, 0))
+    let addr = builder.ins().stack_addr(ptr_ty, slot, 0);
+    Ok(PyObjectArray::slot(addr, slot, size))
 }
 
 #[cfg(test)]

@@ -20,6 +20,9 @@ fn make_module_named(name: &'static str) -> Result<*mut PyObject, String> {
             (intern("__name__"), unsafe { crate::abi::pon_const_str(name.as_ptr(), name.len()) }),
             (intern("ref"), crate::types::weakref::weakref_ref_type()),
             (intern("ReferenceType"), crate::types::weakref::weakref_ref_type()),
+            (intern("proxy"), crate::types::weakref::weakref_proxy_type()),
+            (intern("ProxyType"), crate::types::weakref::weakref_proxy_type()),
+            (intern("CallableProxyType"), crate::types::weakref::weakref_proxy_type()),
         ],
     )
 }

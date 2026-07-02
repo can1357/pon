@@ -274,10 +274,20 @@ pub(crate) fn cell_object(
     ptr_ty: ir::Type,
     exception_exit: ir::Block,
 ) -> Result<ir::Value, CodegenError> {
-    if let Some(cell) = state.cell(cell) {
-        return Ok(cell);
+    if let Some(var) = state.cell(cell) {
+        return Ok(builder.use_var(var));
     }
-    let index = builder.ins().iconst(ptr_ty, i64::from(cell));
+    // Cell ids form one per-function space: ids below the own-cell count are
+    // `MakeCell` results (resolved above); the rest index the current
+    // function's closure tuple.  All `MakeCell`s live in the entry prologue,
+    // so the map is complete before any closure-cell use lowers.
+    let closure_index = (cell as usize)
+        .checked_sub(state.cells.len())
+        .ok_or(CodegenError::ClosureCellUnderflow {
+            cell,
+            own_cells: state.cells.len(),
+        })?;
+    let index = builder.ins().iconst(ptr_ty, closure_index as i64);
     Ok(call_pyobject_helper(
         builder,
         helpers.current_closure_cell,
@@ -345,8 +355,20 @@ pub(crate) fn lower_make_cell(
 ) -> Result<ir::Value, CodegenError> {
     let value = load_local(builder, state, local)?;
     let cell = call_pyobject_helper(builder, helpers.make_cell, &[value], ptr_ty, exception_exit);
-    let cell_id = state.cells.len() as u32;
-    state.define_cell(cell_id, cell);
+    let cell_id = state.next_cell_id;
+    state.next_cell_id += 1;
+    // Generator bodies pre-declare every own-cell variable in the dispatch
+    // block (primed from the frame spill slot); everything else declares the
+    // variable at the defining `MakeCell`.
+    let var = match state.cell(cell_id) {
+        Some(var) => var,
+        None => {
+            let var = builder.declare_var(ptr_ty);
+            state.define_cell(cell_id, var);
+            var
+        }
+    };
+    builder.def_var(var, cell);
     Ok(cell)
 }
 

@@ -24,6 +24,24 @@ pub const DEFAULT_HEAP_ALIGNMENT: usize = 16;
 pub const IMMEDIATE_TAG_MASK: usize = 0b11;
 /// Low-two-bits pattern of every real GC heap pointer candidate.
 pub const IMMEDIATE_TAG_HEAP: usize = 0b00;
+/// Environment variable that turns on per-collection root diagnostics.
+///
+/// When set, every root that resolves to a live allocation is logged to stderr
+/// with its provenance: an explicit runtime root, a precise stack-map root, or
+/// the conservative stack slot address that produced it.
+pub const TRACE_ROOTS_ENV: &str = "PON_GC_TRACE_ROOTS";
+
+/// Where one collection root came from, for [`TRACE_ROOTS_ENV`] diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RootProvenance {
+    /// Enumerated by the runtime's [`RootSource`].
+    Explicit,
+    /// Reported by the installed precise stack-root hook.
+    Precise,
+    /// Read from `slot` during the conservative external-stack scan.
+    StackSlot { slot: usize },
+}
+
 
 /// Conservative stack boundary plus the thread that captured it.
 ///
@@ -482,16 +500,50 @@ impl Heap {
     /// pointers to allocation starts, traces registered object layouts, and then
     /// finalizes and frees every unreached allocation.
     pub fn collect(&self, roots: &mut dyn RootSource) {
-        let mut root_values = Vec::new();
-        roots.for_each_root(&mut |root| root_values.push(root));
-        if !collect_precise_stack_roots(&mut |root| root_values.push(root)) {
-            collect_external_stack_roots(&mut |root| root_values.push(root));
+        let trace_roots = std::env::var_os(TRACE_ROOTS_ENV).is_some();
+        let mut root_values: Vec<*mut u8> = Vec::new();
+        // Provenance is recorded only under [`TRACE_ROOTS_ENV`]; the default
+        // path keeps the compact root vector and does no extra bookkeeping.
+        let mut root_provenance: Vec<RootProvenance> = Vec::new();
+        roots.for_each_root(&mut |root| {
+            root_values.push(root);
+            if trace_roots {
+                root_provenance.push(RootProvenance::Explicit);
+            }
+        });
+        if !collect_precise_stack_roots(&mut |root| {
+            root_values.push(root);
+            if trace_roots {
+                root_provenance.push(RootProvenance::Precise);
+            }
+        }) {
+            collect_external_stack_roots(&mut |slot, root| {
+                root_values.push(root);
+                if trace_roots {
+                    root_provenance.push(RootProvenance::StackSlot { slot });
+                }
+            });
+        }
+        if trace_roots {
+            eprintln!(
+                "[pon-gc] collect begin: {} roots, external base {:#x}",
+                root_values.len(),
+                external_stack_base() as usize,
+            );
         }
         let mut state = self.lock_state();
         let mut mark_queue = MarkQueue::new();
 
-        for root in root_values {
-            mark_pointer(&mut state, &mut mark_queue, root);
+        for (index, root) in root_values.into_iter().enumerate() {
+            let marked = mark_pointer(&mut state, &mut mark_queue, root);
+            if trace_roots && marked {
+                if let Some(classification) = state.classify_pointer(root) {
+                    eprintln!(
+                        "[pon-gc] root {root:p} -> alloc {:p} (index {}) via {:?}",
+                        classification.representative, classification.index, root_provenance[index],
+                    );
+                }
+            }
         }
 
         while let Some(index) = mark_queue.pop() {
@@ -998,7 +1050,7 @@ fn collect_precise_stack_roots(visitor: &mut dyn FnMut(*mut u8)) -> bool {
     unsafe { hook(visitor) }
 }
 
-fn collect_external_stack_roots(visitor: &mut dyn FnMut(*mut u8)) {
+fn collect_external_stack_roots(visitor: &mut dyn FnMut(usize, *mut u8)) {
     let base = external_stack_base();
     if base.is_null() {
         return;
@@ -1018,7 +1070,7 @@ fn collect_external_stack_roots(visitor: &mut dyn FnMut(*mut u8)) {
     while slot + word <= high {
         let candidate = unsafe { ptr::read_unaligned(slot as *const usize) } as *mut u8;
         if !candidate.is_null() {
-            visitor(candidate);
+            visitor(slot, candidate);
         }
         slot += word;
     }

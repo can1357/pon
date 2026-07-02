@@ -42,11 +42,98 @@ pub(super) fn lower_await_expr(
 }
 
 /// One enclosing static handler record active at a suspend point.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct HandlerSpec {
     target: BlockId,
     stack_depth: u32,
     kind: u8,
+}
+
+/// Computes every block's handler-record stack at entry by propagating
+/// `PushExcInfo`/`PopExcInfo` effects over the CFG — the same dataflow
+/// pon-codegen's `block_exception_entry_stacks` runs.  Which handlers
+/// enclose a program point is a static property of the body (pin J0.1 §5),
+/// but it is a property of the CFG, not of the linear block order: handler
+/// blocks and loop bodies appear at arbitrary positions in `blocks`, so a
+/// single running stack threaded through the block list miscounts the
+/// records active at a suspend point.
+///
+/// The AST lowering keeps predecessors consistent by unwinding departing
+/// edges (`try_.rs` trampolines), so a join mismatch here is an internal
+/// invariant violation, not user error.
+fn block_entry_handler_stacks(
+    function: &Function,
+) -> Result<std::collections::HashMap<BlockId, Vec<HandlerSpec>>, LowerError> {
+    use std::collections::{HashMap, VecDeque};
+
+    fn merge(
+        entries: &mut HashMap<BlockId, Vec<HandlerSpec>>,
+        worklist: &mut VecDeque<BlockId>,
+        block: BlockId,
+        stack: &[HandlerSpec],
+    ) -> Result<(), LowerError> {
+        if let Some(existing) = entries.get(&block) {
+            if existing == stack {
+                return Ok(());
+            }
+            return Err(LowerError::internal(
+                "inconsistent handler stack at generator block join",
+            ));
+        }
+        entries.insert(block, stack.to_vec());
+        worklist.push_back(block);
+        Ok(())
+    }
+
+    let blocks: HashMap<BlockId, &Block> = function.blocks.iter().map(|block| (block.id, block)).collect();
+    let mut entries: HashMap<BlockId, Vec<HandlerSpec>> = HashMap::new();
+    let mut worklist: VecDeque<BlockId> = VecDeque::new();
+    let Some(entry) = function.blocks.first().map(|block| block.id) else {
+        return Ok(entries);
+    };
+    entries.insert(entry, Vec::new());
+    worklist.push_back(entry);
+
+    while let Some(block_id) = worklist.pop_front() {
+        let block = *blocks
+            .get(&block_id)
+            .ok_or_else(|| LowerError::internal("handler-stack dataflow references missing block"))?;
+        let mut stack = entries.get(&block_id).cloned().unwrap_or_default();
+        for inst in &block.insts {
+            match &inst.kind {
+                InstKind::PushExcInfo {
+                    target,
+                    stack_depth,
+                    kind,
+                } => {
+                    stack.push(HandlerSpec {
+                        target: *target,
+                        stack_depth: *stack_depth,
+                        kind: *kind,
+                    });
+                    merge(&mut entries, &mut worklist, *target, &stack)?;
+                }
+                InstKind::PopExcInfo => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+        let successors: Vec<BlockId> = match &block.term {
+            Terminator::Jump(target) => vec![*target],
+            Terminator::Branch { then_blk, else_blk, .. } => vec![*then_blk, *else_blk],
+            Terminator::CondBranch { then_, else_, .. } => vec![*then_, *else_],
+            Terminator::ForLoop { body, done, .. } => vec![*body, *done],
+            Terminator::Suspend { resume, .. } => vec![*resume],
+            Terminator::RaiseTerm => stack.last().map(|spec| spec.target).into_iter().collect(),
+            _ => Vec::new(),
+        };
+        for successor in successors {
+            merge(&mut entries, &mut worklist, successor, &stack)?;
+        }
+    }
+
+    Ok(entries)
 }
 
 /// Fresh-id allocation state threaded through the transform.
@@ -141,12 +228,16 @@ fn max_block_id(function: &Function) -> Result<u32, LowerError> {
 /// Splits every `Yield`/`YieldFrom` into suspend-point blocks with dense
 /// `1..=N` state numbering in visit order.
 fn split_suspend_points(function: &mut Function, ids: &mut GenIds) -> Result<(), LowerError> {
+    // Per-block handler stacks at entry, from the CFG dataflow.  Blocks the
+    // splitting below creates get their entry stacks registered on creation;
+    // unreachable originals default to the empty stack.
+    let mut entry_stacks = block_entry_handler_stacks(function)?;
     let mut result: Vec<Block> = Vec::with_capacity(function.blocks.len());
     let mut pending: std::collections::VecDeque<Block> = function.blocks.drain(..).collect();
-    let mut handler_stack: Vec<HandlerSpec> = Vec::new();
     let mut next_state: u32 = 1;
 
     while let Some(block) = pending.pop_front() {
+        let mut handler_stack = entry_stacks.get(&block.id).cloned().unwrap_or_default();
         let mut split_at = None;
         for (index, inst) in block.insts.iter().enumerate() {
             match &inst.kind {
@@ -193,7 +284,6 @@ fn split_suspend_points(function: &mut Function, ids: &mut GenIds) -> Result<(),
                 for _ in &active_handlers {
                     head_insts.push(Inst::new(ids.value()?, InstKind::PopExcInfo));
                 }
-                handler_stack.clear();
                 let resume_blk = ids.block()?;
                 result.push(Block {
                     id,
@@ -218,10 +308,11 @@ fn split_suspend_points(function: &mut Function, ids: &mut GenIds) -> Result<(),
                 }
                 resume_insts.push(Inst::new(suspend_inst.result, InstKind::GenResumePayload));
                 resume_insts.extend(tail_insts);
-                // Keep the scanner's static stack in sync with the emitted
-                // head pops: a suspended generator owns no handler records.
-                // The pending resume block below re-pushes `active_handlers`
-                // before the tail is scanned, restoring the original nesting.
+                // A suspended generator owns no handler records (pin J0.1
+                // §5): the head pops every active record, so the resume
+                // block enters with an empty stack and its re-pushes restore
+                // the original nesting before the tail runs.
+                entry_stacks.insert(resume_blk, Vec::new());
                 pending.push_front(Block {
                     id: resume_blk,
                     insts: resume_insts,
@@ -305,9 +396,12 @@ fn split_suspend_points(function: &mut Function, ids: &mut GenIds) -> Result<(),
                     term,
                 };
 
-                // Scan order must mirror codegen's linear walk: loop and done
-                // run under the enclosing handlers; yield's pops and resume's
-                // re-pushes cancel between them.
+                // loop and done run under the enclosing handlers; yield's
+                // pops and resume's re-pushes cancel between them.
+                entry_stacks.insert(loop_blk, handler_stack.clone());
+                entry_stacks.insert(yield_blk, handler_stack.clone());
+                entry_stacks.insert(resume_blk, Vec::new());
+                entry_stacks.insert(done_blk, handler_stack.clone());
                 pending.push_front(done_block);
                 pending.push_front(resume_block);
                 pending.push_front(yield_block);

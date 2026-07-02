@@ -72,6 +72,8 @@ pub struct SymbolInfo {
     pub is_used: bool,
     /// Whether the name is bound in this scope before global/nonlocal filtering.
     pub is_bound: bool,
+    /// Whether the name was declared `nonlocal` in this scope.
+    pub is_nonlocal: bool,
     /// Whether the name came from a formal parameter.
     pub is_parameter: bool,
 }
@@ -907,16 +909,42 @@ fn finalize_scope(mut builder: ScopeBuilder, enclosing_locals: &BTreeSet<String>
         if local_names.contains(name) || builder.global_decl.contains(name) {
             continue;
         }
+        // A name bound in a class body resolves through the class namespace
+        // (CPython LOAD_NAME): `p = p` in a class body raises NameError even
+        // when the enclosing function binds `p`.  Only `nonlocal` names keep
+        // their cell linkage.
+        if matches!(builder.kind, ScopeKind::Class)
+            && builder.bound.contains(name)
+            && !builder.nonlocal_decl.contains(name)
+        {
+            continue;
+        }
         if enclosing_locals.contains(name) {
             free_names.insert(name.clone());
         }
     }
-    if matches!(builder.kind, ScopeKind::Function | ScopeKind::Comprehension) {
-        for name in &names_needed_by_children {
-            if !local_names.contains(name) && !builder.global_decl.contains(name) {
-                free_names.insert(name.clone());
+    match builder.kind {
+        ScopeKind::Function | ScopeKind::Comprehension => {
+            for name in &names_needed_by_children {
+                if !local_names.contains(name) && !builder.global_decl.contains(name) {
+                    free_names.insert(name.clone());
+                }
             }
         }
+        // A class body owns no cells (its bindings live in the namespace
+        // mapping), so every name a nested method/comprehension closes over
+        // is threaded through the class scope as a free variable of the class
+        // body.  CPython threads the same way; a class-body binding of the
+        // name does NOT satisfy the capture (methods still see the enclosing
+        // function's cell).
+        ScopeKind::Class => {
+            for name in &names_needed_by_children {
+                if enclosing_locals.contains(name) {
+                    free_names.insert(name.clone());
+                }
+            }
+        }
+        ScopeKind::Module => {}
     }
 
     let cell_names: BTreeSet<_> = names_needed_by_children
@@ -978,6 +1006,7 @@ fn finalize_scope(mut builder: ScopeBuilder, enclosing_locals: &BTreeSet<String>
                 class,
                 is_used: builder.used.contains(&name),
                 is_bound: builder.bound.contains(&name),
+                is_nonlocal: builder.nonlocal_decl.contains(&name),
                 is_parameter,
             },
         );
@@ -1172,5 +1201,116 @@ def gen(n):
             .expect("generator function should be discovered");
         assert!(generator.is_generator);
         assert_eq!(generator.parameters.arity(), 1);
+    }
+
+    #[test]
+    fn threads_method_captures_through_class_scope() {
+        let analysis = analyze(
+            r#"
+def cmp_to_key(mycmp):
+    class K:
+        def __lt__(self, other):
+            return mycmp(self.obj, other.obj) < 0
+    return K
+"#,
+        );
+
+        let outer = analysis
+            .root
+            .child(ScopeKind::Function, "cmp_to_key")
+            .expect("outer function should be discovered");
+        assert_eq!(outer.cell_vars, vec!["mycmp".to_owned()]);
+
+        let class_scope = outer
+            .child(ScopeKind::Class, "K")
+            .expect("class scope should be discovered");
+        assert_eq!(class_scope.free_vars, vec!["mycmp".to_owned()]);
+        assert!(class_scope.cell_vars.is_empty());
+        assert!(matches!(
+            class_scope.symbol("mycmp").map(|symbol| &symbol.class),
+            Some(NameClass::Free { slot: 0 })
+        ));
+
+        let method = class_scope
+            .child(ScopeKind::Function, "__lt__")
+            .expect("method scope should be discovered");
+        assert_eq!(method.free_vars, vec!["mycmp".to_owned()]);
+    }
+
+    #[test]
+    fn class_bound_names_resolve_through_namespace_not_cells() {
+        // CPython: `p = p` in a class body is LOAD_NAME (NameError at
+        // runtime), so a class-bound name never demands a parent cell...
+        let analysis = analyze(
+            r#"
+def f(p):
+    class C:
+        y = p
+        p = 99
+    return C
+"#,
+        );
+        let outer = analysis
+            .root
+            .child(ScopeKind::Function, "f")
+            .expect("outer function should be discovered");
+        assert!(outer.cell_vars.is_empty());
+        let class_scope = outer
+            .child(ScopeKind::Class, "C")
+            .expect("class scope should be discovered");
+        assert!(class_scope.free_vars.is_empty());
+
+        // ...but a METHOD capture is satisfied by the enclosing function's
+        // cell even when the class body shadows the same name.
+        let analysis = analyze(
+            r#"
+def g(q):
+    class D:
+        q = 7
+        def m(self):
+            return q
+    return D
+"#,
+        );
+        let outer = analysis
+            .root
+            .child(ScopeKind::Function, "g")
+            .expect("outer function should be discovered");
+        assert_eq!(outer.cell_vars, vec!["q".to_owned()]);
+        let class_scope = outer
+            .child(ScopeKind::Class, "D")
+            .expect("class scope should be discovered");
+        assert_eq!(class_scope.free_vars, vec!["q".to_owned()]);
+        let symbol = class_scope.symbol("q").expect("q should be classified");
+        assert!(matches!(symbol.class, NameClass::Free { slot: 0 }));
+        assert!(symbol.is_bound);
+        assert!(!symbol.is_nonlocal);
+    }
+
+    #[test]
+    fn nonlocal_in_class_body_keeps_cell_linkage() {
+        let analysis = analyze(
+            r#"
+def h(s):
+    class E:
+        nonlocal s
+        s += 1
+        def read(self):
+            return s
+    return E
+"#,
+        );
+        let outer = analysis
+            .root
+            .child(ScopeKind::Function, "h")
+            .expect("outer function should be discovered");
+        assert_eq!(outer.cell_vars, vec!["s".to_owned()]);
+        let class_scope = outer
+            .child(ScopeKind::Class, "E")
+            .expect("class scope should be discovered");
+        assert_eq!(class_scope.free_vars, vec!["s".to_owned()]);
+        let symbol = class_scope.symbol("s").expect("s should be classified");
+        assert!(matches!(symbol.class, NameClass::Free { slot: 0 }));
+        assert!(symbol.is_nonlocal);
     }
 }

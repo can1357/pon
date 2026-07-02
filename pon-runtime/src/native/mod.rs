@@ -17,13 +17,20 @@ use crate::object::PyObject;
 
 pub(crate) use crate::import::install_module;
 
+pub(crate) mod codecs;
+pub(crate) mod collections;
+mod colorize;
+pub(crate) mod contextvars;
+mod errno;
 mod gc;
 mod io;
+mod itertools;
 mod os;
 mod sre;
 mod sys;
 mod thread;
 mod time;
+mod tokenize;
 mod weakref;
 
 /// Sorted, insert-only lookup table of curated native modules: Python module
@@ -31,13 +38,21 @@ mod weakref;
 /// import cache. Table order is irrelevant to behavior (names are unique);
 /// factories must be self-contained and never rely on another row having run.
 pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>)] = &[
+    ("_codecs", codecs::make_module),
+    ("_collections", collections::make_module),
+    ("_colorize", colorize::make_module),
+    ("_contextvars", contextvars::make_module),
     ("_io", io::make_module),
     ("_sre", sre::make_module),
     ("_thread", thread::make_module),
+    ("_tokenize", tokenize::make_module),
     ("_weakref", weakref::make_underscore_module),
     ("builtins", builtins_mod::make_module),
+    ("errno", errno::make_module),
     ("gc", gc::make_module),
+    ("itertools", itertools::make_module),
     ("os", os::make_module),
+    ("os.path", os::make_path_module),
     ("sys", sys::make_module),
     ("time", time::make_module),
     ("weakref", weakref::make_module),
@@ -58,6 +73,12 @@ pub(crate) fn make_module(name: &str) -> Result<Option<*mut PyObject>, String> {
         }
     }
     installed::make_module(name)
+}
+
+/// True when `name` has a curated native factory row in [`NATIVE_MODULES`].
+/// Environment-dependent installed-package fixtures are deliberately excluded.
+pub(crate) fn is_native_module(name: &str) -> bool {
+    NATIVE_MODULES.iter().any(|&(module_name, _)| module_name == name)
 }
 
 /// Installs the eager curated modules into the import cache once core runtime

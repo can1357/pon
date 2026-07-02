@@ -6,7 +6,8 @@ use cranelift_module::Module;
 use pon_ir::ir::{FStrPart, TStrPart};
 
 use super::{
-    CodegenError, HelperFuncRefs, LowerState, call_pyobject_helper, declare_bytes_data, declare_string_data, offset_i32,
+    CodegenError, HelperFuncRefs, LowerState, PyObjectArray, call_pyobject_helper,
+    call_pyobject_helper_consuming, declare_bytes_data, declare_string_data, offset_i32,
 };
 
 const RAW_PART_BYTES: usize = 40;
@@ -67,7 +68,8 @@ pub(crate) fn lower_build_string<M: Module>(
 ) -> Result<ir::Value, CodegenError> {
     let parts_ptr = build_fstring_parts(builder, state, parts, ptr_ty)?;
     let count = builder.ins().iconst(ptr_ty, parts.len() as i64);
-    Ok(call_pyobject_helper(builder, helper, &[parts_ptr, count], ptr_ty, exception_exit))
+    let ptr_bytes = ptr_ty.bytes() as usize;
+    call_pyobject_helper_consuming(builder, helper, &[parts_ptr.addr, count], &[&parts_ptr], ptr_ty, ptr_bytes, exception_exit)
 }
 
 /// Lower template-string interpolation parts through `pon_build_template`.
@@ -82,7 +84,8 @@ pub(crate) fn lower_build_template<M: Module>(
 ) -> Result<ir::Value, CodegenError> {
     let parts_ptr = build_template_parts(module, builder, state, parts, ptr_ty)?;
     let count = builder.ins().iconst(ptr_ty, parts.len() as i64);
-    Ok(call_pyobject_helper(builder, helper, &[parts_ptr, count], ptr_ty, exception_exit))
+    let ptr_bytes = ptr_ty.bytes() as usize;
+    call_pyobject_helper_consuming(builder, helper, &[parts_ptr.addr, count], &[&parts_ptr], ptr_ty, ptr_bytes, exception_exit)
 }
 
 fn build_fstring_parts(
@@ -90,9 +93,9 @@ fn build_fstring_parts(
     state: &LowerState,
     parts: &[FStrPart],
     ptr_ty: ir::Type,
-) -> Result<ir::Value, CodegenError> {
+) -> Result<PyObjectArray, CodegenError> {
     let Some(slot) = raw_part_slot(builder, parts.len())? else {
-        return Ok(builder.ins().iconst(ptr_ty, 0));
+        return Ok(PyObjectArray::empty(builder, ptr_ty));
     };
     let null = builder.ins().iconst(ptr_ty, 0);
     for (index, part) in parts.iter().enumerate() {
@@ -118,7 +121,8 @@ fn build_fstring_parts(
             }
         }
     }
-    Ok(builder.ins().stack_addr(ptr_ty, slot, 0))
+    let addr = builder.ins().stack_addr(ptr_ty, slot, 0);
+    Ok(PyObjectArray::slot(addr, slot, parts.len() * RAW_PART_BYTES))
 }
 
 fn build_template_parts<M: Module>(
@@ -127,9 +131,9 @@ fn build_template_parts<M: Module>(
     state: &LowerState,
     parts: &[TStrPart],
     ptr_ty: ir::Type,
-) -> Result<ir::Value, CodegenError> {
+) -> Result<PyObjectArray, CodegenError> {
     let Some(slot) = raw_part_slot(builder, parts.len())? else {
-        return Ok(builder.ins().iconst(ptr_ty, 0));
+        return Ok(PyObjectArray::empty(builder, ptr_ty));
     };
     let null = builder.ins().iconst(ptr_ty, 0);
     for (index, part) in parts.iter().enumerate() {
@@ -162,7 +166,8 @@ fn build_template_parts<M: Module>(
             }
         }
     }
-    Ok(builder.ins().stack_addr(ptr_ty, slot, 0))
+    let addr = builder.ins().stack_addr(ptr_ty, slot, 0);
+    Ok(PyObjectArray::slot(addr, slot, parts.len() * RAW_PART_BYTES))
 }
 
 fn raw_part_slot(

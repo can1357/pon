@@ -10,9 +10,14 @@ pub(super) fn lower_class_def(
         .child(scope::ScopeKind::Class, stmt.name.as_str())
         .cloned()
         .ok_or_else(|| LowerError::internal(format!("missing class scope for {}", stmt.name)))?;
-    if !class_info.free_vars.is_empty() || !class_info.cell_vars.is_empty() {
-        return unsupported_at("class closure variables", span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()));
+    if !class_info.cell_vars.is_empty() {
+        return unsupported_at("class body cell variables", span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()));
     }
+    // Free variables of the class scope are enclosing-function locals that
+    // the class body (or a method/comprehension nested in it) closes over.
+    // Resolve them against the enclosing scope NOW and attach them as the
+    // body function's closure via `BuildClass`.
+    let closure = synth::closure_cells(scope, &class_info)?;
     if class_info.is_generator || class_info.is_async {
         return unsupported_at("generator or async class body", span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()));
     }
@@ -73,6 +78,7 @@ pub(super) fn lower_class_def(
         bases,
         keywords,
         decorators,
+        closure,
     })?;
 
     if scope.is_global_name(stmt.name.as_str()) {

@@ -9,7 +9,7 @@ use cranelift_codegen::ir::{self, InstBuilder};
 use cranelift_frontend::FunctionBuilder;
 use pon_ir::ir::Value as IrValue;
 
-use super::{CodegenError, HelperFuncRefs, LowerState, build_call_argv, call_pyobject_helper};
+use super::{CodegenError, HelperFuncRefs, LowerState, build_call_argv, call_pyobject_helper, call_pyobject_helper_consuming};
 
 
 /// Lowers `BuildMap` through `pon_build_map(flat_pairs, pair_count)`.
@@ -30,7 +30,7 @@ pub(crate) fn lower_build_map_with_helper(
     }
     let argv = build_call_argv(builder, helpers, state, &flat, ptr_ty, ptr_bytes)?;
     let count = builder.ins().iconst(ptr_ty, pairs.len() as i64);
-    Ok(call_pyobject_helper(builder, helper, &[argv, count], ptr_ty, exception_exit))
+    call_pyobject_helper_consuming(builder, helper, &[argv.addr, count], &[&argv], ptr_ty, ptr_bytes, exception_exit)
 }
 
 /// Lowers `MapInsert` through `pon_map_insert(map, key, value)`.

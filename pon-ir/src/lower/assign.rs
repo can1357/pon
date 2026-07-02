@@ -70,15 +70,20 @@ fn lower_delete_name(
         let name = driver.names.intern(raw_name)?;
         scope.emit(InstKind::DeleteGlobal(name))?;
     } else if scope.is_class() {
-        let name = driver.names.intern(raw_name)?;
-        scope.emit(InstKind::DeleteName(name))?;
+        if let Some(cell) = scope.class_deref_cell(raw_name) {
+            scope.emit(InstKind::DeleteCell(cell))?;
+        } else {
+            let name = driver.names.intern(raw_name)?;
+            scope.emit(InstKind::DeleteName(name))?;
+        }
     } else {
         match scope.name_class(raw_name).cloned() {
             Some(NameClass::Cell { cell_slot, .. }) => {
                 scope.emit(InstKind::DeleteCell(CellId(cell_slot)))?;
             }
             Some(NameClass::Free { slot }) => {
-                scope.emit(InstKind::DeleteCell(CellId(slot)))?;
+                let cell = scope.free_cell(slot);
+                scope.emit(InstKind::DeleteCell(cell))?;
             }
             Some(NameClass::Local { slot }) => {
                 scope.emit(InstKind::DeleteLocal(LocalId(slot)))?;
@@ -173,6 +178,15 @@ fn lower_aug_target(
                 });
             }
             if scope.is_class() {
+                // `nonlocal` targets in a class body augment the enclosing
+                // function's cell; everything else goes through the namespace.
+                if let Some(cell) = scope.class_deref_cell(raw_name) {
+                    let current = scope.emit(InstKind::LoadCell(cell))?;
+                    return Ok(AugTarget {
+                        current,
+                        store: AugStore::Cell(cell),
+                    });
+                }
                 let name = driver.names.intern(raw_name)?;
                 let current = scope.emit(InstKind::LoadName(name))?;
                 return Ok(AugTarget {
@@ -190,7 +204,7 @@ fn lower_aug_target(
                     })
                 }
                 Some(NameClass::Free { slot }) => {
-                    let cell = CellId(*slot);
+                    let cell = scope.free_cell(*slot);
                     let current = scope.emit(InstKind::LoadCell(cell))?;
                     Ok(AugTarget {
                         current,

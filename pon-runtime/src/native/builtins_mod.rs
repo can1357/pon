@@ -16,7 +16,7 @@ use num_traits::{Signed, ToPrimitive, Zero};
 
 use crate::abi::{self, pon_get_iter, pon_iter_next};
 use crate::intern::{intern, resolve};
-use crate::object::{PyFunction, PyObject, PyObjectHeader, PyType, PyUnicode};
+use crate::object::{PyFunction, PyMappingMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType, PyUnicode, UnaryFunc};
 use crate::thread_state::{pon_err_clear, pon_err_message, pon_err_occurred, pon_err_set};
 use crate::types::{bool_, property};
 use crate::types::exc::PyBaseException;
@@ -98,6 +98,7 @@ pub fn for_each_builtin(mut f: impl FnMut(&'static str, usize, *const u8)) {
     builtin!("bytearray", VARIADIC_ARITY, builtin_bytearray);
     builtin!("memoryview", 1, builtin_memoryview);
     builtin!("frozenset", VARIADIC_ARITY, builtin_frozenset);
+    builtin!("delattr", 2, builtin_delattr);
 }
 
 pub(crate) fn make_module() -> Result<*mut PyObject, String> {
@@ -200,6 +201,11 @@ enum SequenceKind {
 
 #[derive(Debug)]
 enum NativePayload {
+    /// Dead since `alloc_sequence` began emitting real seq-family objects;
+    /// the arms consuming it (iter/bool/richcmp/repr/len/classinfo) are
+    /// unreachable.  Excision, incl. the placeholder list/tuple slot surface,
+    /// belongs to the build-hygiene lane.
+    #[allow(dead_code)]
     Sequence { kind: SequenceKind, items: Vec<*mut PyObject> },
     Range { start: i64, stop: i64, step: i64 },
     RangeIterator { current: i64, stop: i64, step: i64 },
@@ -302,7 +308,34 @@ fn tuple_type() -> *mut PyType {
 
 
 fn range_type() -> *mut PyType {
-    type_from(&RANGE_TYPE, "range", Some(range_iter_slot), None)
+    // Unlike the other `type_from` natives, range carries real
+    // sequence/mapping tables: `subscript_get` dispatches `r[i]`/`r[a:b]`
+    // through `mp_subscript`, so the tables are installed inside the
+    // once-init to keep the leaked boxes single-shot.
+    *RANGE_TYPE.get_or_init(|| {
+        let mut ty = Box::new(PyType::new(ptr::null(), "range", std::mem::size_of::<NativeObject>()));
+        ty.tp_iter = Some(range_iter_slot);
+        ty.tp_bool = Some(native_bool_slot);
+        ty.tp_hash = Some(native_hash_slot);
+        ty.tp_as_sequence = Box::into_raw(Box::new(PySequenceMethods {
+            sq_length: Some(native_range_len_slot),
+            sq_concat: None,
+            sq_repeat: None,
+            sq_item: Some(native_range_item_slot),
+            sq_ass_item: None,
+            sq_contains: Some(native_range_contains_slot),
+            sq_inplace_concat: None,
+            sq_inplace_repeat: None,
+            sq_iter: None,
+            sq_iternext: None,
+        }));
+        ty.tp_as_mapping = Box::into_raw(Box::new(PyMappingMethods {
+            mp_length: Some(native_range_len_slot),
+            mp_subscript: Some(native_range_subscript_slot),
+            mp_ass_subscript: None,
+        }));
+        Box::into_raw(ty) as usize
+    }) as *mut PyType
 }
 
 fn range_iter_type() -> *mut PyType {
@@ -345,7 +378,7 @@ fn placeholder_type() -> *mut PyType {
     ty
 }
 
-fn property_type() -> *mut PyType {
+pub(crate) fn property_type() -> *mut PyType {
     *PROPERTY_TYPE as *mut PyType
 }
 
@@ -372,32 +405,19 @@ unsafe extern "C" fn placeholder_getattro_slot(object: *mut PyObject, name: *mut
     let Some(name) = (unsafe { crate::types::type_::unicode_text(name) }) else {
         return fail("object attribute name must be str");
     };
-    match name {
-        "__str__" | "__repr__" => bound_placeholder_method(object, name, placeholder_str_method),
-        _ => fail(format!("attribute '{name}' was not found")),
+    // Uniform resolution through object's tp_dict (the `install_object_dunders`
+    // carriers: `__repr__`/`__str__`/`__format__`/`__reduce_ex__`/`__init__`
+    // plus the `__new__` staticmethod), bound through the descriptor protocol
+    // exactly like heap-instance lookup; previously only a hardcoded
+    // `__str__`/`__repr__` pair resolved here, so `object().__init__` raised.
+    let ty = unsafe { (*object).ob_type.cast_mut() };
+    if !ty.is_null() {
+        let hook = unsafe { crate::descr::lookup_in_type(ty, intern(name)) };
+        if !hook.is_null() {
+            return unsafe { crate::descr::descriptor_get(hook, object, ty) };
+        }
     }
-}
-
-fn bound_placeholder_method(
-    receiver: *mut PyObject,
-    name: &str,
-    entry: unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject,
-) -> *mut PyObject {
-    let function = unsafe { abi::pon_make_function(entry as *const u8, VARIADIC_ARITY, intern(name)) };
-    if function.is_null() {
-        return ptr::null_mut();
-    }
-    match crate::types::method::new_bound_method(function, receiver) {
-        Ok(method) => method.cast::<PyObject>(),
-        Err(message) => fail(message),
-    }
-}
-
-unsafe extern "C" fn placeholder_str_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    let Some(args) = (unsafe { exact_args(argv, argc, 1, "object.__str__") }) else {
-        return ptr::null_mut();
-    };
-    alloc_str(&repr_text(args[0]))
+    fail(format!("attribute '{name}' was not found"))
 }
 
 
@@ -409,12 +429,18 @@ fn alloc_native(payload: NativePayload, ty: *mut PyType) -> *mut PyObject {
     .cast::<PyObject>()
 }
 
-fn alloc_sequence(kind: SequenceKind, items: Vec<*mut PyObject>) -> *mut PyObject {
-    let ty = match kind {
-        SequenceKind::List => list_type(),
-        SequenceKind::Tuple => tuple_type(),
-    };
-    alloc_native(NativePayload::Sequence { kind, items }, ty)
+fn alloc_sequence(kind: SequenceKind, mut items: Vec<*mut PyObject>) -> *mut PyObject {
+    // Real seq-family objects: placeholder `NativePayload::Sequence` results
+    // had no subscript slots, so `list(...)[0]` raised TypeError while list
+    // literals worked.  The payload branches in this file stay for values
+    // routed through them, but constructor results are full-protocol objects.
+    // SAFETY: The builders copy `items.len()` slots and follow the
+    // NULL-sentinel error contract; an empty Vec's dangling pointer is legal
+    // for a zero count.
+    match kind {
+        SequenceKind::List => unsafe { crate::abi::seq::pon_build_list(items.as_mut_ptr(), items.len()) },
+        SequenceKind::Tuple => unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) },
+    }
 }
 
 pub(crate) fn alloc_tuple(items: Vec<*mut PyObject>) -> *mut PyObject {
@@ -509,6 +535,178 @@ unsafe extern "C" fn range_iter_slot(object: *mut PyObject) -> *mut PyObject {
     }
 }
 
+/// Start/step/length of a native range payload, promoted to `BigInt` so the
+/// `Range` (i64) and `LongRange` arms share one arithmetic path.  Returns
+/// `None` for non-range payloads.
+fn range_payload_parts(payload: &NativePayload) -> Option<(BigInt, BigInt, BigInt)> {
+    match payload {
+        NativePayload::Range { start, stop, step } => {
+            Some((BigInt::from(*start), BigInt::from(*step), BigInt::from(range_len(*start, *stop, *step))))
+        }
+        NativePayload::LongRange { start, stop, step } => {
+            Some((start.clone(), step.clone(), longrange_len(start, stop, step)))
+        }
+        _ => None,
+    }
+}
+
+/// Boxes a `BigInt` as a Python int, using the fixed-width constructor for
+/// values that fit i64.
+fn bigint_result(value: BigInt) -> *mut PyObject {
+    match value.to_i64() {
+        Some(fixed) => unsafe { abi::pon_const_int(fixed) },
+        None => crate::types::int::from_bigint(value),
+    }
+}
+
+fn raise_range_index_error() -> *mut PyObject {
+    let message = "range object index out of range";
+    unsafe { crate::abi::exc::pon_raise_index_error(message.as_ptr(), message.len()) }
+}
+
+/// `range[index]` with Python index semantics (negative wraps once); `None`
+/// means out of range.
+fn range_payload_item(start: &BigInt, step: &BigInt, len: &BigInt, mut index: BigInt) -> Option<BigInt> {
+    if index.is_negative() {
+        index += len;
+    }
+    if index.is_negative() || index >= *len {
+        return None;
+    }
+    Some(start + index * step)
+}
+
+unsafe extern "C" fn native_range_len_slot(object: *mut PyObject) -> isize {
+    let Some(native) = (unsafe { as_native(object) }) else {
+        pon_err_set("range length receiver is not a range");
+        return -1;
+    };
+    let Some((_, _, len)) = range_payload_parts(&native.payload) else {
+        pon_err_set("range length receiver is not a range");
+        return -1;
+    };
+    match len.to_isize() {
+        Some(value) => value,
+        None => {
+            pon_err_set("Python int too large to convert to C ssize_t");
+            -1
+        }
+    }
+}
+
+unsafe extern "C" fn native_range_item_slot(object: *mut PyObject, index: isize) -> *mut PyObject {
+    let Some(native) = (unsafe { as_native(object) }) else {
+        return fail("range item receiver is not a range");
+    };
+    let Some((start, step, len)) = range_payload_parts(&native.payload) else {
+        return fail("range item receiver is not a range");
+    };
+    match range_payload_item(&start, &step, &len, BigInt::from(index)) {
+        Some(value) => bigint_result(value),
+        None => raise_range_index_error(),
+    }
+}
+
+unsafe extern "C" fn native_range_subscript_slot(object: *mut PyObject, key: *mut PyObject) -> *mut PyObject {
+    let Some(native) = (unsafe { as_native(object) }) else {
+        return fail("range subscript receiver is not a range");
+    };
+    let Some((start, step, len)) = range_payload_parts(&native.payload) else {
+        return fail("range subscript receiver is not a range");
+    };
+    if crate::abi::seq::is_slice(key) {
+        return range_payload_slice(&start, &step, &len, key);
+    }
+    let index = match unsafe { bool_::to_bool(key) } {
+        Some(flag) => Some(BigInt::from(i64::from(flag))),
+        None => unsafe { crate::types::int::to_bigint(key) },
+    };
+    let Some(index) = index else {
+        let message = format!(
+            "range indices must be integers or slices, not {}",
+            unsafe { type_name(key) }.unwrap_or("object")
+        );
+        return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    };
+    match range_payload_item(&start, &step, &len, index) {
+        Some(value) => bigint_result(value),
+        None => raise_range_index_error(),
+    }
+}
+
+/// `range[a:b:c]` -> a new range: CPython's `compute_slice` composes the
+/// receiver's start/step with the clamped slice indices.
+fn range_payload_slice(start: &BigInt, step: &BigInt, len: &BigInt, key: *mut PyObject) -> *mut PyObject {
+    let Some(len) = len.to_usize() else {
+        return fail("range is too large to slice");
+    };
+    let indices = match crate::abi::seq::normalize_slice(unsafe { &*key.cast::<crate::types::slice_::PySlice>() }, len) {
+        Ok(indices) => indices,
+        Err(message) => {
+            return if message == "slice step cannot be zero" {
+                unsafe { crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) }
+            } else {
+                unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) }
+            };
+        }
+    };
+    let sub_start = start + BigInt::from(indices.start) * step;
+    let sub_stop = start + BigInt::from(indices.stop) * step;
+    let sub_step = step * BigInt::from(indices.step);
+    match (sub_start.to_i64(), sub_stop.to_i64(), sub_step.to_i64()) {
+        (Some(start), Some(stop), Some(step)) => alloc_range(start, stop, step),
+        _ => alloc_longrange(sub_start, sub_stop, sub_step),
+    }
+}
+
+/// `sq_contains` for range: int-like members resolve arithmetically
+/// (CPython `range_contains`); any other needle falls back to the linear
+/// equality scan over produced values.
+unsafe extern "C" fn native_range_contains_slot(object: *mut PyObject, item: *mut PyObject) -> c_int {
+    let Some(native) = (unsafe { as_native(object) }) else {
+        pon_err_set("range contains receiver is not a range");
+        return -1;
+    };
+    let Some((start, step, len)) = range_payload_parts(&native.payload) else {
+        pon_err_set("range contains receiver is not a range");
+        return -1;
+    };
+    if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(item) } {
+        if len.is_zero() {
+            return 0;
+        }
+        let offset = value - &start;
+        if (&offset % &step).is_zero() {
+            let index = offset / &step;
+            return c_int::from(!index.is_negative() && index < len);
+        }
+        return 0;
+    }
+    // Non-int needle: equality scan, mirroring CPython's fallback to
+    // `PySequence_Contains` semantics (`3.0 in range(5)` is True).
+    let Some(count) = len.to_u64() else {
+        pon_err_set("range is too large to scan for containment");
+        return -1;
+    };
+    let mut value = start;
+    for _ in 0..count {
+        let candidate = bigint_result(value.clone());
+        if candidate.is_null() {
+            return -1;
+        }
+        match unsafe { crate::types::dict::object_equal(candidate, item) } {
+            Ok(true) => return 1,
+            Ok(false) => {}
+            Err(message) => {
+                pon_err_set(message);
+                return -1;
+            }
+        }
+        value += &step;
+    }
+    0
+}
+
 unsafe extern "C" fn native_next_slot(object: *mut PyObject) -> *mut PyObject {
     let Some(native) = (unsafe { as_native(object) }) else {
         return fail("iterator receiver is not native");
@@ -590,7 +788,7 @@ unsafe extern "C" fn native_next_slot(object: *mut PyObject) -> *mut PyObject {
             match keep {
                 Ok(true) => return value,
                 Ok(false) => {}
-                Err(message) => return fail(message),
+                Err(message) => return fail_preserving(message),
             }
         },
         NativePayload::CallableSentinelIterator { callable, sentinel } => {
@@ -608,7 +806,7 @@ unsafe extern "C" fn native_next_slot(object: *mut PyObject) -> *mut PyObject {
             match unsafe { truth(equal) } {
                 Ok(true) => stop_iteration(),
                 Ok(false) => value,
-                Err(message) => fail(message),
+                Err(message) => fail_preserving(message),
             }
         }
         _ => fail("object is not an iterator"),
@@ -683,7 +881,7 @@ unsafe fn native_sequence_richcmp(
         }
         let is_equal = match unsafe { truth(equal) } {
             Ok(value) => value,
-            Err(message) => return fail(message),
+            Err(message) => return fail_preserving(message),
         };
         if !is_equal {
             return match op {
@@ -725,15 +923,18 @@ pub unsafe extern "C" fn builtin_print(argv: *mut *mut PyObject, argc: usize) ->
     let Some(args) = (unsafe { argv_slice(argv, argc) }) else {
         return fail("print() received a null argv pointer");
     };
+    // Stringify before taking the stdout lock: `__str__` dispatch can run
+    // arbitrary Python (including a nested `print`).
+    let mut texts = Vec::with_capacity(args.len());
+    for value in args.iter().copied() {
+        match try_str_text(value) {
+            Ok(text) => texts.push(text),
+            Err(()) => return ptr::null_mut(),
+        }
+    }
     let mut stdout = io::stdout().lock();
-    for (index, value) in args.iter().copied().enumerate() {
-        if index != 0 && write!(stdout, " ").is_err() {
-            return fail("failed to write stdout");
-        }
-        let text = str_text(value);
-        if write!(stdout, "{text}").is_err() {
-            return fail("failed to write stdout");
-        }
+    if write!(stdout, "{}", texts.join(" ")).is_err() {
+        return fail("failed to write stdout");
     }
     if writeln!(stdout).and_then(|()| stdout.flush()).is_err() {
         return fail("failed to write stdout");
@@ -856,7 +1057,10 @@ pub unsafe extern "C" fn builtin_isinstance(argv: *mut *mut PyObject, argc: usiz
         return ptr::null_mut();
     };
     let result = unsafe { object_is_instance(args[0], args[1]) };
-    unsafe { abi::number::pon_const_bool(i32::from(result)) }
+    if result < 0 {
+        return ptr::null_mut();
+    }
+    unsafe { abi::number::pon_const_bool(result) }
 }
 
 pub unsafe extern "C" fn builtin_type(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -897,6 +1101,21 @@ pub unsafe extern "C" fn builtin_setattr(argv: *mut *mut PyObject, argc: usize) 
     }
 }
 
+pub unsafe extern "C" fn builtin_delattr(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { exact_args(argv, argc, 2, "delattr") }) else {
+        return ptr::null_mut();
+    };
+    let Some(name) = object_to_string(args[1]) else {
+        return fail("delattr() attribute name must be str");
+    };
+    let status = unsafe { abi::object::pon_del_attr(args[0], intern(&name)) };
+    if status < 0 {
+        ptr::null_mut()
+    } else {
+        unsafe { abi::pon_none() }
+    }
+}
+
 pub unsafe extern "C" fn builtin_hasattr(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let Some(args) = (unsafe { exact_args(argv, argc, 2, "hasattr") }) else {
         return ptr::null_mut();
@@ -916,7 +1135,10 @@ pub unsafe extern "C" fn builtin_repr(argv: *mut *mut PyObject, argc: usize) -> 
     let Some(args) = (unsafe { exact_args(argv, argc, 1, "repr") }) else {
         return ptr::null_mut();
     };
-    alloc_str(&repr_text(args[0]))
+    match try_repr_text(args[0]) {
+        Ok(text) => alloc_str(&text),
+        Err(()) => ptr::null_mut(),
+    }
 }
 
 pub unsafe extern "C" fn builtin_str(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -925,8 +1147,12 @@ pub unsafe extern "C" fn builtin_str(argv: *mut *mut PyObject, argc: usize) -> *
     };
     match args.len() {
         0 => alloc_str(""),
-        1 => alloc_str(&str_text(args[0])),
-        _ => fail("str() encoding/errors forms are not implemented"),
+        1 => match try_str_text(args[0]) {
+            Ok(text) => alloc_str(&text),
+            Err(()) => ptr::null_mut(),
+        },
+        2 | 3 => crate::native::codecs::builtin_str_decode(args[0], args[1], args.get(2).copied()),
+        _ => fail("str() takes at most 3 arguments"),
     }
 }
 
@@ -955,38 +1181,58 @@ pub unsafe extern "C" fn builtin_hash(argv: *mut *mut PyObject, argc: usize) -> 
     let Some(args) = (unsafe { exact_args(argv, argc, 1, "hash") }) else {
         return ptr::null_mut();
     };
-    let value = if let Some(value) = unsafe { bool_::to_bool(args[0]) } {
+    match unsafe { builtin_hash_value(args[0]) } {
+        Ok(value) => unsafe { abi::pon_const_int(value) },
+        // Every `hash()` failure is a TypeError in CPython (unhashable
+        // containers, dead weakrefs); raise typed so `except TypeError` works.
+        Err(message) => unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) },
+    }
+}
+
+/// `hash()`-builtin value domain, shared by the boxed entry point and the
+/// weakref delegation (which must recurse on values to cache them).
+unsafe fn builtin_hash_value(object: *mut PyObject) -> Result<i64, String> {
+    let value = if let Some(value) = unsafe { bool_::to_bool(object) } {
         i64::from(value)
-    } else if let Some(value) = unsafe { crate::types::int::to_bigint(args[0]) } {
+    } else if let Some(value) = unsafe { crate::types::int::to_bigint(object) } {
         crate::types::int::hash_bigint(&value) as i64
-    } else if unsafe { crate::types::float::is_exact_float(args[0]) } {
-        let float = unsafe { &*args[0].cast::<crate::types::float::PyFloat>() };
+    } else if unsafe { crate::types::float::is_exact_float(object) } {
+        let float = unsafe { &*object.cast::<crate::types::float::PyFloat>() };
         crate::types::float::hash_f64(float.value) as i64
-    } else if let Some((real, imag)) = unsafe { crate::types::complex_::to_f64s(args[0]) } {
+    } else if let Some((real, imag)) = unsafe { crate::types::complex_::to_f64s(object) } {
         crate::types::complex_::hash_complex(real, imag) as i64
-    } else if crate::types::typealias::is_union_type(args[0]) {
-        crate::types::typealias::union_hash(args[0]) as i64
-    } else if unsafe { crate::types::frozenset::is_frozenset(args[0]) } {
-        match unsafe { crate::types::frozenset::frozenset_hash_value(args[0]) } {
-            Ok(hash) => hash as i64,
-            Err(message) => return fail(message),
-        }
-    } else if unsafe { crate::types::set_::is_set(args[0]) } {
-        return fail("unhashable type: 'set'");
+    } else if crate::types::typealias::is_union_type(object) {
+        crate::types::typealias::union_hash(object) as i64
+    } else if unsafe { crate::types::frozenset::is_frozenset(object) } {
+        unsafe { crate::types::frozenset::frozenset_hash_value(object)? as i64 }
+    } else if unsafe { crate::types::set_::is_set(object) } {
+        return Err("unhashable type: 'set'".to_owned());
     } else if matches!(
-        unsafe { crate::types::dict::type_name(args[0]) },
+        unsafe { crate::types::dict::type_name(object) },
         Some("bytes" | "dict" | "list" | "bytearray")
-    ) {
+    ) || unsafe { crate::types::dict::is_dict_subclass_instance(object) }
+    {
         // `hash_object` owns the content-hash (bytes) and the CPython
         // `unhashable type: '...'` rejections (dict/list/bytearray).
-        match unsafe { crate::types::dict::hash_object(args[0]) } {
-            Ok(hash) => hash as i64,
-            Err(message) => return fail(message),
+        unsafe { crate::types::dict::hash_object(object)? as i64 }
+    } else if unsafe { crate::types::weakref::is_weakref(object) } {
+        // CPython: hash(ref) == hash(referent), cached while the referent is
+        // alive so it survives referent death; dead and never hashed raises.
+        if let Some(hash) = unsafe { crate::types::weakref::weakref_cached_builtin_hash(object) } {
+            hash
+        } else {
+            let referent = unsafe { crate::types::weakref::weakref_target(object) };
+            if referent.is_null() {
+                return Err("weak object has gone away".to_owned());
+            }
+            let hash = unsafe { builtin_hash_value(referent)? };
+            unsafe { crate::types::weakref::weakref_store_builtin_hash(object, hash) };
+            hash
         }
     } else {
-        stable_hash(&repr_text(args[0]))
+        stable_hash(&repr_text(object))
     };
-    unsafe { abi::pon_const_int(value) }
+    Ok(value)
 }
 
 pub unsafe extern "C" fn builtin_sorted(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -1006,7 +1252,7 @@ pub unsafe extern "C" fn builtin_sorted(argv: *mut *mut PyObject, argc: usize) -
         match unsafe { truth(reverse) } {
             Ok(true) => items.reverse(),
             Ok(false) => {}
-            Err(message) => return fail(message),
+            Err(message) => return fail_preserving(message),
         }
     }
     alloc_sequence(SequenceKind::List, items)
@@ -1084,7 +1330,7 @@ pub unsafe extern "C" fn builtin_all(argv: *mut *mut PyObject, argc: usize) -> *
     };
     match iterate_truth(args[0], true) {
         Ok(value) => unsafe { abi::number::pon_const_bool(i32::from(value)) },
-        Err(message) => fail(message),
+        Err(message) => fail_preserving(message),
     }
 }
 
@@ -1094,7 +1340,7 @@ pub unsafe extern "C" fn builtin_any(argv: *mut *mut PyObject, argc: usize) -> *
     };
     match iterate_truth(args[0], false) {
         Ok(value) => unsafe { abi::number::pon_const_bool(i32::from(value)) },
-        Err(message) => fail(message),
+        Err(message) => fail_preserving(message),
     }
 }
 
@@ -1233,8 +1479,40 @@ pub unsafe extern "C" fn builtin_issubclass(argv: *mut *mut PyObject, argc: usiz
     let Some(args) = (unsafe { exact_args(argv, argc, 2, "issubclass") }) else {
         return ptr::null_mut();
     };
-    let result = unsafe { type_object_name(args[0]) == type_object_name(args[1]) };
-    unsafe { abi::number::pon_const_bool(i32::from(result)) }
+    let result = unsafe { class_is_subclass(args[0], args[1]) };
+    if result < 0 {
+        return ptr::null_mut();
+    }
+    unsafe { abi::number::pon_const_bool(result) }
+}
+
+/// `issubclass(cls, classinfo)` core: tuple-of-classes recursion (first hit
+/// wins), then real class objects (metatype below `type`) get full MRO plus
+/// metaclass `__subclasscheck__` semantics; bare native shims keep the
+/// historical name comparison.  Returns 1/0 and -1 with a pending exception.
+unsafe fn class_is_subclass(cls: *mut PyObject, classinfo: *mut PyObject) -> c_int {
+    if let Some(entries) = unsafe { tuple_classinfo_entries(classinfo) } {
+        for entry in entries.iter().copied() {
+            let result = unsafe { class_is_subclass(cls, entry) };
+            if result != 0 {
+                return result;
+            }
+        }
+        return 0;
+    }
+    if unsafe { is_real_class(cls) && is_real_class(classinfo) } {
+        return unsafe { crate::descr::issubclass(cls, classinfo) };
+    }
+    i32::from(unsafe { type_object_name(cls) == type_object_name(classinfo) })
+}
+
+/// True for objects whose metatype inherits from the builtin `type`.
+unsafe fn is_real_class(object: *mut PyObject) -> bool {
+    if object.is_null() {
+        return false;
+    }
+    let meta = unsafe { (*object).ob_type.cast_mut() };
+    !meta.is_null() && unsafe { crate::mro::is_subtype(meta, abi::runtime_type_type()) }
 }
 
 pub unsafe extern "C" fn builtin_int(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -1263,7 +1541,7 @@ pub unsafe extern "C" fn builtin_bool(argv: *mut *mut PyObject, argc: usize) -> 
         0 => unsafe { abi::number::pon_const_bool(0) },
         1 => match unsafe { truth(args[0]) } {
             Ok(value) => unsafe { abi::number::pon_const_bool(i32::from(value)) },
-            Err(message) => fail(message),
+            Err(message) => fail_preserving(message),
         },
         _ => fail(format!("bool() expected at most 1 argument, got {}", args.len())),
     }
@@ -1297,8 +1575,11 @@ pub unsafe extern "C" fn builtin_dict(argv: *mut *mut PyObject, argc: usize) -> 
 /// protocol: exact dicts copy entries in insertion order; anything else must be
 /// an iterable of length-2 iterables. On failure the CPython-shaped
 /// TypeError/ValueError is already raised and `Err(())` is returned.
-unsafe fn collect_dict_update_pairs(source: *mut PyObject, pairs: &mut Vec<*mut PyObject>) -> Result<(), ()> {
-    if unsafe { crate::types::dict::is_dict(source) } {
+pub(crate) unsafe fn collect_dict_update_pairs(source: *mut PyObject, pairs: &mut Vec<*mut PyObject>) -> Result<(), ()> {
+    // Dict-layout sources (exact dicts AND dict-subclass instances) copy
+    // concrete storage in insertion order, mirroring CPython's
+    // `PyDict_Merge` which reads `ma_keys` directly for dict subclasses.
+    if unsafe { crate::types::dict::has_dict_storage(source) } {
         let entries = match unsafe { crate::types::dict::dict_entries_snapshot(source) } {
             Ok(entries) => entries,
             Err(message) => {
@@ -1454,15 +1735,14 @@ pub unsafe extern "C" fn builtin_property(argv: *mut *mut PyObject, argc: usize)
     if args.len() > 4 {
         return fail(format!("property() expected at most 4 arguments, got {}", args.len()));
     }
-    unsafe {
-        property::new_property(
-            property_type(),
-            args.first().copied().unwrap_or(ptr::null_mut()),
-            args.get(1).copied().unwrap_or(ptr::null_mut()),
-            args.get(2).copied().unwrap_or(ptr::null_mut()),
-            args.get(3).copied().unwrap_or(ptr::null_mut()),
-        )
-    }
+    // CPython's `property(fget=None, fset=None, fdel=None, doc=None)` treats
+    // an explicit None exactly like an absent argument; `PyProperty` marks
+    // absence with NULL, so normalize at the constructor boundary.
+    let slot = |index: usize| {
+        let value = args.get(index).copied().unwrap_or(ptr::null_mut());
+        if is_none(value) { ptr::null_mut() } else { value }
+    };
+    unsafe { property::new_property(property_type(), slot(0), slot(1), slot(2), slot(3)) }
 }
 
 pub unsafe extern "C" fn builtin_classmethod(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -1511,49 +1791,154 @@ pub unsafe extern "C" fn builtin_locals(argv: *mut *mut PyObject, argc: usize) -
 }
 
 pub fn str_text(object: *mut PyObject) -> String {
-    if let Some(text) = object_to_string(object) {
-        return text;
+    try_str_text(object).unwrap_or_else(|()| {
+        pon_err_clear();
+        "<object>".to_owned()
+    })
+}
+
+/// `str(object)` with Python-level `__str__`/`__repr__` dispatch for heap
+/// instances (CPython `PyObject_Str`).  `Err(())` leaves a Python exception
+/// pending.
+pub fn try_str_text(object: *mut PyObject) -> Result<String, ()> {
+    if let Some(result) = dispatch_str_dunder(object, "__str__", crate::abi::object_dunder_str_carrier()) {
+        return result;
     }
-    repr_text(object)
+    if let Some(result) = dispatch_str_dunder(object, "__repr__", crate::abi::object_dunder_repr_carrier()) {
+        return result;
+    }
+    if let Some(text) = object_to_string(object) {
+        return Ok(text);
+    }
+    if let Some(result) = dispatch_text_slot(object, "__str__", |ty| ty.tp_str.or(ty.tp_repr)) {
+        return result;
+    }
+    repr_text_no_dispatch(object)
 }
 
 pub fn repr_text(object: *mut PyObject) -> String {
+    try_repr_text(object).unwrap_or_else(|()| {
+        pon_err_clear();
+        "<object>".to_owned()
+    })
+}
+
+/// `repr(object)` with Python-level `__repr__` dispatch for heap instances
+/// (CPython `PyObject_Repr`).  `Err(())` leaves a Python exception pending.
+pub fn try_repr_text(object: *mut PyObject) -> Result<String, ()> {
+    if let Some(result) = dispatch_str_dunder(object, "__repr__", crate::abi::object_dunder_repr_carrier()) {
+        return result;
+    }
+    if let Some(result) = dispatch_text_slot(object, "__repr__", |ty| ty.tp_repr) {
+        return result;
+    }
+    repr_text_no_dispatch(object)
+}
+
+/// Python-level `__str__`/`__repr__` dispatch: a heap-class receiver whose
+/// MRO resolves `name` past object's default carrier calls the hook through
+/// the descriptor protocol.  `None` keeps the native fallback text; builtin
+/// receivers never dispatch (their reprs are the native branches below).
+fn dispatch_str_dunder(object: *mut PyObject, name: &str, terminus: *mut PyObject) -> Option<Result<String, ()>> {
+    if object.is_null() || !crate::tag::is_heap(object) {
+        return None;
+    }
+    let ty = unsafe { (*object).ob_type.cast_mut() };
+    if ty.is_null() || unsafe { (*ty).gc_type_id } != crate::types::type_::TYPE_ID_HEAP_INSTANCE.0 as usize {
+        return None;
+    }
+    let hook = unsafe { crate::descr::lookup_in_type(ty, intern(name)) };
+    if hook.is_null() || hook == terminus {
+        return None;
+    }
+    let bound = unsafe { crate::descr::descriptor_get(hook, object, ty) };
+    if bound.is_null() {
+        return Some(Err(()));
+    }
+    let result = unsafe { abi::pon_call(bound, ptr::null_mut(), 0) };
+    if result.is_null() {
+        return Some(Err(()));
+    }
+    let Some(text) = object_to_string(result) else {
+        let _ = fail(format!("{name} returned non-string"));
+        return Some(Err(()));
+    };
+    Some(Ok(text))
+}
+
+/// Native `tp_repr`/`tp_str` slot dispatch (CPython `PyObject_Repr`/
+/// `PyObject_Str` for extension types such as `re.Pattern`/`re.Match`): a
+/// boxed receiver whose type registers the picked slot produces its text
+/// through it.  `None` means "no slot registered" and keeps the native
+/// whitelist fallback; a NULL slot result propagates the slot's pending
+/// exception as `Err(())`.  `str()` picks `tp_str.or(tp_repr)`, mirroring
+/// CPython's `PyObject_Str` fallback to `PyObject_Repr`.
+fn dispatch_text_slot(
+    object: *mut PyObject,
+    name: &str,
+    pick: fn(&PyType) -> Option<UnaryFunc>,
+) -> Option<Result<String, ()>> {
+    if object.is_null() || !crate::tag::is_heap(object) {
+        return None;
+    }
+    // SAFETY: `object` is a heap pointer per the tag check above.
+    let ty = unsafe { (*object).ob_type };
+    if ty.is_null() {
+        return None;
+    }
+    // SAFETY: non-NULL `ob_type` references a live type object.
+    let slot = pick(unsafe { &*ty })?;
+    // SAFETY: `slot` is a live slot function registered by the receiver's type.
+    let result = unsafe { slot(object) };
+    if result.is_null() {
+        return Some(Err(()));
+    }
+    let Some(text) = object_to_string(result) else {
+        let _ = fail(format!("{name} returned non-string"));
+        return Some(Err(()));
+    };
+    Some(Ok(text))
+}
+
+/// Native repr whitelist (no Python-level dispatch).  `Err(())` propagates a
+/// pending exception raised by a container element's `__repr__`.
+pub(crate) fn repr_text_no_dispatch(object: *mut PyObject) -> Result<String, ()> {
     if object.is_null() {
-        return "<NULL>".to_owned();
+        return Ok("<NULL>".to_owned());
     }
     if let Some(value) = unsafe { bool_::to_bool(object) } {
-        return if value { "True".to_owned() } else { "False".to_owned() };
+        return Ok(if value { "True".to_owned() } else { "False".to_owned() });
     }
     if let Some(value) = unsafe { crate::types::int::to_bigint(object) } {
-        return value.to_string();
+        return Ok(value.to_string());
     }
     if let Some(value) = object_to_i64(object) {
-        return value.to_string();
+        return Ok(value.to_string());
     }
     if unsafe { crate::types::float::is_exact_float(object) } {
         let float = unsafe { &*object.cast::<crate::types::float::PyFloat>() };
-        return crate::types::float::repr_f64(float.value);
+        return Ok(crate::types::float::repr_f64(float.value));
     }
     if let Some((real, imag)) = unsafe { crate::types::complex_::to_f64s(object) } {
-        return crate::types::complex_::repr_complex(real, imag);
+        return Ok(crate::types::complex_::repr_complex(real, imag));
     }
     if let Some(text) = object_to_string(object) {
-        return format!("'{text}'");
+        return Ok(crate::types::str_::repr(&text));
     }
     if is_none(object) {
-        return "None".to_owned();
+        return Ok("None".to_owned());
     }
     if crate::types::typealias::is_type_alias(object) {
-        return crate::types::typealias::type_alias_repr(object);
+        return Ok(crate::types::typealias::type_alias_repr(object));
     }
     if crate::types::typealias::is_typevar(object) {
-        return crate::types::typealias::typevar_repr(object);
+        return Ok(crate::types::typealias::typevar_repr(object));
     }
     if crate::types::typealias::is_generic_alias(object) {
-        return crate::types::typealias::generic_alias_repr(object);
+        return Ok(crate::types::typealias::generic_alias_repr(object));
     }
     if crate::types::typealias::is_union_type(object) {
-        return crate::types::typealias::union_repr(object);
+        return Ok(crate::types::typealias::union_repr(object));
     }
     unsafe {
         if let Some(native) = as_native(object) {
@@ -1561,45 +1946,53 @@ pub fn repr_text(object: *mut PyObject) -> String {
                 NativePayload::Sequence { kind, items } => format_sequence(*kind, items),
                 NativePayload::Range { start, stop, step } => {
                     if *step == 1 {
-                        format!("range({start}, {stop})")
+                        Ok(format!("range({start}, {stop})"))
                     } else {
-                        format!("range({start}, {stop}, {step})")
+                        Ok(format!("range({start}, {stop}, {step})"))
                     }
                 }
                 NativePayload::LongRange { start, stop, step } => {
                     if *step == BigInt::from(1) {
-                        format!("range({start}, {stop})")
+                        Ok(format!("range({start}, {stop})"))
                     } else {
-                        format!("range({start}, {stop}, {step})")
+                        Ok(format!("range({start}, {stop}, {step})"))
                     }
                 }
-                NativePayload::RangeIterator { .. } => "<range_iterator object>".to_owned(),
-                NativePayload::LongRangeIterator { .. } => "<longrange_iterator object>".to_owned(),
-                NativePayload::VecIterator { .. } => "<list_iterator object>".to_owned(),
-                NativePayload::Enumerate { .. } => "<enumerate object>".to_owned(),
-                NativePayload::Zip { .. } => "<zip object>".to_owned(),
-                NativePayload::Map { .. } => "<map object>".to_owned(),
-                NativePayload::Filter { .. } => "<filter object>".to_owned(),
-                NativePayload::CallableSentinelIterator { .. } => "<callable_iterator object>".to_owned(),
-                NativePayload::Placeholder(name) => format!("<{name} object>"),
+                NativePayload::RangeIterator { .. } => Ok("<range_iterator object>".to_owned()),
+                NativePayload::LongRangeIterator { .. } => Ok("<longrange_iterator object>".to_owned()),
+                NativePayload::VecIterator { .. } => Ok("<list_iterator object>".to_owned()),
+                NativePayload::Enumerate { .. } => Ok("<enumerate object>".to_owned()),
+                NativePayload::Zip { .. } => Ok("<zip object>".to_owned()),
+                NativePayload::Map { .. } => Ok("<map object>".to_owned()),
+                NativePayload::Filter { .. } => Ok("<filter object>".to_owned()),
+                NativePayload::CallableSentinelIterator { .. } => Ok("<callable_iterator object>".to_owned()),
+                NativePayload::Placeholder(name) => Ok(format!("<{name} object>")),
             };
+        }
+        // Dict-subclass instances repr like dicts (CPython inherits
+        // `dict.__repr__`).  Checked before the name whitelist below, which
+        // returns None for user-defined class names.
+        if crate::types::dict::is_dict_subclass_instance(object) {
+            return dict_repr(object);
         }
         if let Some(name) = type_name(object) {
             if name == "function" {
                 let function = &*object.cast::<PyFunction>();
                 let fname = resolve(function.name_interned).unwrap_or_else(|| "<lambda>".to_owned());
                 if matches!(fname.as_str(), "int" | "str" | "bool" | "float") {
-                    return format!("<class '{fname}'>");
+                    return Ok(format!("<class '{fname}'>"));
                 }
-                return format!("<function {fname}>");
+                return Ok(format!("<function {fname}>"));
             }
             if name == "type" {
                 let ty = &*object.cast::<PyType>();
-                return format!("<class '{}'>", ty.name());
+                return Ok(format!("<class '{}'>", ty.name()));
             }
             if name == "list" {
-                if let Ok(text) = crate::types::list::list_repr(object) {
-                    return text;
+                match crate::types::list::list_repr(object) {
+                    Ok(text) => return Ok(text),
+                    Err(_) if pon_err_occurred() => return Err(()),
+                    Err(_) => {}
                 }
             }
             if name == "tuple" {
@@ -1607,68 +2000,76 @@ pub fn repr_text(object: *mut PyObject) -> String {
                 return format_sequence(SequenceKind::Tuple, tuple.as_slice());
             }
             if name == "dict" {
-                if let Ok(text) = dict_repr(object) {
-                    return text;
-                }
+                return dict_repr(object);
             }
             if name == "bytes" {
                 let bytes = &*object.cast::<crate::types::bytes_::PyBytes>();
-                return crate::types::bytes_::repr(bytes.as_slice());
+                return Ok(crate::types::bytes_::repr(bytes.as_slice()));
             }
             if name == "bytearray" {
                 let bytearray = &*object.cast::<crate::types::bytearray_::PyByteArray>();
-                return crate::types::bytearray_::repr(bytearray.as_slice());
+                return Ok(crate::types::bytearray_::repr(bytearray.as_slice()));
             }
             if name == "memoryview" {
                 let view = object.cast::<crate::types::memoryview::PyMemoryView>();
-                return format!("<memory at {}>", crate::types::bytes_::repr(&crate::types::memoryview::tobytes(view)));
+                return Ok(format!("<memory at {}>", crate::types::bytes_::repr(&crate::types::memoryview::tobytes(view))));
             }
             if name == "set" {
                 if let Ok(entries) = crate::types::set_::entries_snapshot(object) {
                     return if entries.is_empty() {
-                        "set()".to_owned()
+                        Ok("set()".to_owned())
                     } else {
-                        format!("{{{}}}", join_repr(&entries))
+                        Ok(format!("{{{}}}", join_repr(&entries)?))
                     };
                 }
             }
             if name == "frozenset" {
                 if let Ok(entries) = crate::types::frozenset::entries_snapshot(object) {
                     return if entries.is_empty() {
-                        "frozenset()".to_owned()
+                        Ok("frozenset()".to_owned())
                     } else {
-                        format!("frozenset({{{}}})", join_repr(&entries))
+                        Ok(format!("frozenset({{{}}})", join_repr(&entries)?))
                     };
                 }
             }
-            return format!("<{name} object>");
+            return Ok(format!("<{name} object>"));
         }
     }
-    "<object>".to_owned()
+    Ok("<object>".to_owned())
 }
 
-fn format_sequence(kind: SequenceKind, items: &[*mut PyObject]) -> String {
-    match kind {
-        SequenceKind::List => format!("[{}]", join_repr(items)),
+fn format_sequence(kind: SequenceKind, items: &[*mut PyObject]) -> Result<String, ()> {
+    Ok(match kind {
+        SequenceKind::List => format!("[{}]", join_repr(items)?),
         SequenceKind::Tuple => {
             if items.len() == 1 {
-                format!("({},)", repr_text(items[0]))
+                format!("({},)", try_repr_text(items[0])?)
             } else {
-                format!("({})", join_repr(items))
+                format!("({})", join_repr(items)?)
             }
         }
+    })
+}
+
+fn join_repr(items: &[*mut PyObject]) -> Result<String, ()> {
+    let mut parts = Vec::with_capacity(items.len());
+    for item in items.iter().copied() {
+        parts.push(try_repr_text(item)?);
     }
+    Ok(parts.join(", "))
 }
 
-fn join_repr(items: &[*mut PyObject]) -> String {
-    items.iter().copied().map(repr_text).collect::<Vec<_>>().join(", ")
-}
-
-fn dict_repr(object: *mut PyObject) -> Result<String, String> {
-    let entries = unsafe { crate::types::dict::dict_entries_snapshot(object)? };
+fn dict_repr(object: *mut PyObject) -> Result<String, ()> {
+    let entries = match unsafe { crate::types::dict::dict_entries_snapshot(object) } {
+        Ok(entries) => entries,
+        Err(message) => {
+            let _ = fail(message);
+            return Err(());
+        }
+    };
     let mut parts = Vec::with_capacity(entries.len());
     for entry in entries {
-        parts.push(format!("{}: {}", repr_text(entry.key), repr_text(entry.value)));
+        parts.push(format!("{}: {}", try_repr_text(entry.key)?, try_repr_text(entry.value)?));
     }
     Ok(format!("{{{}}}", parts.join(", ")))
 }
@@ -1697,6 +2098,16 @@ unsafe fn exact_args<'a>(argv: *mut *mut PyObject, argc: usize, expected: usize,
 
 fn fail(message: impl Into<String>) -> *mut PyObject {
     pon_err_set(message);
+    ptr::null_mut()
+}
+
+/// Like [`fail`], but a pending typed exception (raised by a nested protocol
+/// call such as `__bool__`/`__len__` dispatch) wins over the fallback
+/// message, so `except TypeError:`-style handlers keep working.
+fn fail_preserving(message: impl Into<String>) -> *mut PyObject {
+    if !pon_err_occurred() {
+        pon_err_set(message);
+    }
     ptr::null_mut()
 }
 
@@ -1825,19 +2236,35 @@ fn arg_bigint(object: *mut PyObject) -> Result<BigInt, *mut PyObject> {
 }
 
 unsafe fn type_object(object: *mut PyObject) -> Option<*mut PyType> {
-    if object.is_null() {
-        return None;
+    // Metatype-MRO-aware: accepts classes whose metatype is a `type` subclass
+    // (ABCMeta, user metaclasses), matching `super(SomeABC, obj)` in CPython.
+    if unsafe { crate::types::type_::is_type_object(object) } {
+        Some(object.cast::<PyType>())
+    } else {
+        None
     }
-    let ty = unsafe { (*object).ob_type };
-    if ty.is_null() || unsafe { (*ty).name() } != "type" {
-        return None;
-    }
-    Some(object.cast::<PyType>())
 }
 unsafe fn is_callable_object(object: *mut PyObject) -> bool {
     unsafe { type_name(object).is_some_and(|name| matches!(name, "function" | "method" | "type")) }
 }
 
+
+fn find_defining_class(function: *mut PyObject, ty: *mut PyType) -> Option<*mut PyType> {
+    for class in unsafe { crate::mro::mro_entries(ty) } {
+        if class.is_null() {
+            continue;
+        }
+        let dict = unsafe { (*class).tp_dict };
+        if dict.is_null() {
+            continue;
+        }
+        let dict = unsafe { &*dict.cast::<crate::types::type_::PyClassDict>() };
+        if dict.iter().any(|(_, value)| value == function) {
+            return Some(class);
+        }
+    }
+    None
+}
 
 fn infer_zero_arg_super() -> Result<(*mut PyType, *mut PyObject), String> {
     let mut saw_call_with_args = false;
@@ -1847,16 +2274,13 @@ fn infer_zero_arg_super() -> Result<(*mut PyType, *mut PyObject), String> {
         if obj_type.is_null() {
             continue;
         }
-        for class in unsafe { crate::mro::mro_entries(obj_type) } {
-            if class.is_null() {
-                continue;
-            }
-            let dict = unsafe { (*class).tp_dict };
-            if dict.is_null() {
-                continue;
-            }
-            let dict = unsafe { &*dict.cast::<crate::types::type_::PyClassDict>() };
-            if dict.iter().any(|(_, value)| value == function) {
+        if let Some(class) = find_defining_class(function, obj_type) {
+            return Ok((class, self_arg));
+        }
+        // Metaclass methods receive a class as `self`; the defining class
+        // then lives in the receiver's own MRO, not its metatype's.
+        if unsafe { crate::mro::is_subtype(obj_type, abi::runtime_type_type()) } {
+            if let Some(class) = find_defining_class(function, self_arg.cast::<PyType>()) {
                 return Ok((class, self_arg));
             }
         }
@@ -1900,6 +2324,27 @@ fn length(object: *mut PyObject) -> Result<i64, String> {
                     return Ok(len as i64);
                 }
                 return Err("mapping __len__ returned a negative value".to_owned());
+            }
+        }
+        // Python-level `__len__` on heap instances (e.g. WeakSet).
+        if !ty.is_null() {
+            let hook = crate::descr::lookup_in_type(ty.cast_mut(), intern("__len__"));
+            if !hook.is_null() {
+                let bound = crate::descr::descriptor_get(hook, object, ty.cast_mut());
+                if bound.is_null() {
+                    return Err("__len__ descriptor binding failed".to_owned());
+                }
+                let result = abi::pon_call(bound, ptr::null_mut(), 0);
+                if result.is_null() {
+                    return Err("__len__ call failed".to_owned());
+                }
+                let Some(len) = object_to_i64(result) else {
+                    return Err("__len__ must return an int".to_owned());
+                };
+                if len < 0 {
+                    return Err("__len__ returned a negative value".to_owned());
+                }
+                return Ok(len);
             }
         }
     }
@@ -1952,6 +2397,13 @@ fn collect_iterable(object: *mut PyObject) -> Result<Vec<*mut PyObject>, String>
         let value = unsafe { pon_iter_next(iter, ptr::null_mut()) };
         if value.is_null() {
             if pon_err_occurred() {
+                // StopIteration is exhaustion; any other pending exception is
+                // a genuine error and must stay set for the caller (the
+                // `Err` message below is discarded by `pon_err_set`, which
+                // never replaces a live boxed exception).
+                if !crate::abi::exc::pending_exception_is("StopIteration") {
+                    return Err("iteration raised an exception".to_owned());
+                }
                 pon_err_clear();
             }
             break;
@@ -2130,35 +2582,88 @@ fn is_builtin_class_name(name: &str) -> bool {
     )
 }
 
-unsafe fn object_is_instance(object: *mut PyObject, classinfo: *mut PyObject) -> bool {
+/// `isinstance(object, classinfo)` core, shaped like CPython's
+/// `PyObject_IsInstance`: exact-type fast path, tuple-of-classes recursion,
+/// union args, builtin-name shims, then real-class dispatch through
+/// `descr::isinstance` (metaclass `__instancecheck__` hook or default MRO
+/// walk).  Returns 1/0 and -1 with a pending exception.
+unsafe fn object_is_instance(object: *mut PyObject, classinfo: *mut PyObject) -> c_int {
     if object.is_null() || classinfo.is_null() {
-        return false;
+        return 0;
+    }
+    // `type(obj) is cls` wins before any dispatch, so a metaclass
+    // `__instancecheck__` hook is NOT consulted for exact matches.
+    if unsafe { (*object).ob_type }.cast_mut().cast::<PyObject>() == classinfo {
+        return 1;
+    }
+    // Tuple of classes: first hit short-circuits, before later entries are
+    // even validated (CPython parity).
+    if let Some(entries) = unsafe { tuple_classinfo_entries(classinfo) } {
+        for entry in entries.iter().copied() {
+            let result = unsafe { object_is_instance(object, entry) };
+            if result != 0 {
+                return result;
+            }
+        }
+        return 0;
     }
     if crate::types::typealias::is_union_type(classinfo) {
-        return crate::types::typealias::union_args(classinfo)
-            .iter()
-            .copied()
-            .any(|arg| unsafe { object_is_instance(object, arg) });
+        for arg in crate::types::typealias::union_args(classinfo).iter().copied() {
+            let result = unsafe { object_is_instance(object, arg) };
+            if result != 0 {
+                return result;
+            }
+        }
+        return 0;
     }
     if let Some(expected_name) = unsafe { type_object_name(classinfo) }.filter(|name| is_builtin_class_name(name)) {
         let object_type = unsafe { (*object).ob_type };
         if object_type.is_null() {
-            return false;
+            return 0;
         }
-        return unsafe { (*object_type).name() == expected_name || ((*object_type).name() == "bool" && expected_name == "int") };
+        let matches_exact =
+            unsafe { (*object_type).name() == expected_name || ((*object_type).name() == "bool" && expected_name == "int") };
+        if matches_exact {
+            return 1;
+        }
+        // Builtin-name classinfo with a subclass receiver: accept when any
+        // MRO ancestor is the named builtin (e.g. `isinstance(D(), dict)`
+        // for `class D(dict)`), excluding heap types so a user class merely
+        // NAMED like a builtin does not qualify.
+        return i32::from(unsafe { crate::mro::mro_entries(object_type.cast_mut()) }.iter().any(|ancestor| {
+            !ancestor.is_null()
+                && unsafe {
+                    (**ancestor).gc_type_id != crate::types::type_::TYPE_ID_HEAP_INSTANCE.0 as usize
+                        && (**ancestor).name() == expected_name
+                }
+        }));
     }
-    let classinfo_type = unsafe { (*classinfo).ob_type };
-    if !classinfo_type.is_null() && unsafe { (*classinfo_type).name() } == "type" {
-        return unsafe { crate::descr::isinstance(object, classinfo) > 0 };
+    let classinfo_type = unsafe { (*classinfo).ob_type.cast_mut() };
+    if !classinfo_type.is_null() && unsafe { crate::mro::is_subtype(classinfo_type, abi::runtime_type_type()) } {
+        return unsafe { crate::descr::isinstance(object, classinfo) };
     }
     let object_type = unsafe { (*object).ob_type };
     if object_type.is_null() {
-        return false;
+        return 0;
     }
     let Some(expected_name) = (unsafe { type_object_name(classinfo) }) else {
-        return false;
+        return 0;
     };
-    unsafe { (*object_type).name() == expected_name }
+    i32::from(unsafe { (*object_type).name() == expected_name })
+}
+
+/// Elements of a tuple-of-classes `classinfo`, accepting both runtime tuple
+/// representations: the seq-family `PyTuple` and the native builtins_mod
+/// `NativePayload::Sequence` tuple.
+unsafe fn tuple_classinfo_entries<'a>(classinfo: *mut PyObject) -> Option<&'a [*mut PyObject]> {
+    if let Some(items) = unsafe { abi::seq::exact_tuple_slice(classinfo) } {
+        return Some(items);
+    }
+    let native: &'a NativeObject = unsafe { as_native(classinfo) }?;
+    match &native.payload {
+        NativePayload::Sequence { kind: SequenceKind::Tuple, items } => Some(items.as_slice()),
+        _ => None,
+    }
 }
 
 
@@ -2286,5 +2791,59 @@ mod tests {
         let text = unsafe { abi::pon_call(method, ptr::null_mut(), 0) };
         assert!(!text.is_null());
         assert_eq!(object_to_string(text).as_deref(), Some("<object object>"));
+    }
+
+    unsafe extern "C" fn fixed_repr_slot(_object: *mut PyObject) -> *mut PyObject {
+        alloc_str("<slot repr>")
+    }
+
+    unsafe extern "C" fn fixed_str_slot(_object: *mut PyObject) -> *mut PyObject {
+        alloc_str("slot str")
+    }
+
+    unsafe extern "C" fn failing_repr_slot(_object: *mut PyObject) -> *mut PyObject {
+        fail("slot repr failed")
+    }
+
+    /// Header-only instance of a fresh leaked native type carrying the given
+    /// text slots (the `re.Pattern`/`re.Match` shape: a boxed extension type
+    /// outside the repr whitelist).
+    fn slot_test_object(tp_repr: Option<UnaryFunc>, tp_str: Option<UnaryFunc>) -> *mut PyObject {
+        let mut ty = Box::new(PyType::new(ptr::null(), "slottest", std::mem::size_of::<PyObjectHeader>()));
+        ty.tp_repr = tp_repr;
+        ty.tp_str = tp_str;
+        let ty = Box::into_raw(ty);
+        Box::into_raw(Box::new(PyObjectHeader::new(ty))).cast::<PyObject>()
+    }
+
+    #[test]
+    fn repr_and_str_consult_native_text_slots() {
+        let _guard = test_state_lock();
+        init_runtime();
+        // No slots: the whitelist fallback stays "<object>" for unknown types.
+        let bare = slot_test_object(None, None);
+        assert_eq!(repr_text(bare), "<object>");
+        // tp_repr only: repr() uses it and str() falls back to it (CPython
+        // `PyObject_Str` with a NULL `tp_str`).
+        let repr_only = slot_test_object(Some(fixed_repr_slot), None);
+        assert_eq!(repr_text(repr_only), "<slot repr>");
+        assert_eq!(str_text(repr_only), "<slot repr>");
+        // Both slots: str() prefers tp_str, repr() keeps tp_repr.
+        let both = slot_test_object(Some(fixed_repr_slot), Some(fixed_str_slot));
+        assert_eq!(str_text(both), "slot str");
+        assert_eq!(repr_text(both), "<slot repr>");
+    }
+
+    #[test]
+    fn failing_text_slot_propagates_pending_exception() {
+        let _guard = test_state_lock();
+        init_runtime();
+        let object = slot_test_object(Some(failing_repr_slot), None);
+        assert!(try_repr_text(object).is_err());
+        assert!(crate::thread_state::pon_err_occurred());
+        // The infallible wrapper clears the pending error and keeps the
+        // legacy fallback text.
+        assert_eq!(repr_text(object), "<object>");
+        assert!(!crate::thread_state::pon_err_occurred());
     }
 }

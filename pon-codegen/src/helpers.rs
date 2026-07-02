@@ -90,9 +90,9 @@ pub struct HelperRefs {
     pub list_to_tuple: FuncId,
     /// `pon_set_update(set, iterable) -> *mut PyObject`.
     pub set_update: FuncId,
-    /// `pon_unpack_seq(value, n, feedback) -> *mut *mut PyObject`.
+    /// `pon_unpack_seq(value, n, feedback) -> *mut PyObject` (tuple).
     pub unpack_seq: FuncId,
-    /// `pon_unpack_ex(value, before, after) -> *mut *mut PyObject`.
+    /// `pon_unpack_ex(value, before, after) -> *mut PyObject` (tuple).
     pub unpack_ex: FuncId,
     /// `pon_get_len(value, feedback) -> *mut PyObject`.
     pub get_len: FuncId,
@@ -494,7 +494,7 @@ pub static PHASE_B_HELPERS: &[HelperSig] = &[
     HelperSig { id: HelperId::BuildSlice, family: HelperFamily::Seq, symbol: "pon_build_slice", params: P_OBJ_OBJ_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::ListAppend, family: HelperFamily::Seq, symbol: "pon_list_append", params: P_OBJ_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::SetAdd, family: HelperFamily::Seq, symbol: "pon_set_add", params: P_OBJ_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
-    HelperSig { id: HelperId::UnpackSeq, family: HelperFamily::Seq, symbol: "pon_unpack_seq", params: P_OBJ_ARR_FEEDBACK, ret: AbiShape::PyObjectPtrPtr, feedback_trailing: 1 },
+    HelperSig { id: HelperId::UnpackSeq, family: HelperFamily::Seq, symbol: "pon_unpack_seq", params: P_OBJ_ARR_FEEDBACK, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
     HelperSig { id: HelperId::GetLen, family: HelperFamily::Seq, symbol: "pon_get_len", params: P_OBJ_FEEDBACK, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
     HelperSig { id: HelperId::BuildMap, family: HelperFamily::Map, symbol: "pon_build_map", params: P_OBJ_ARR, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::MapInsert, family: HelperFamily::Map, symbol: "pon_map_insert", params: P_OBJ_OBJ_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },

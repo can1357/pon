@@ -7,7 +7,7 @@ use cranelift_codegen::ir::{self, InstBuilder};
 use cranelift_frontend::FunctionBuilder;
 use pon_ir::ir::Value as IrValue;
 
-use super::{CodegenError, HelperFuncRefs, LowerState, build_call_argv, call_pyobject_helper};
+use super::{CodegenError, HelperFuncRefs, LowerState, build_call_argv, call_pyobject_helper, call_pyobject_helper_consuming};
 
 /// Lower tuple construction through `pon_build_tuple(argv, argc)`.
 pub(crate) fn lower_build_tuple(
@@ -200,5 +200,5 @@ fn lower_build_sequence(
 ) -> Result<ir::Value, CodegenError> {
     let argv = build_call_argv(builder, helpers, state, elts, ptr_ty, ptr_bytes)?;
     let argc = builder.ins().iconst(ptr_ty, elts.len() as i64);
-    Ok(call_pyobject_helper(builder, helper, &[argv, argc], ptr_ty, exception_exit))
+    call_pyobject_helper_consuming(builder, helper, &[argv.addr, argc], &[&argv], ptr_ty, ptr_bytes, exception_exit)
 }

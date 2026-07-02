@@ -4,7 +4,7 @@ use cranelift_codegen::ir::{self, InstBuilder};
 use cranelift_frontend::FunctionBuilder;
 use pon_ir::ir::{Value as IrValue, ValueId};
 
-use super::{CodegenError, HelperFuncRefs, LowerState, build_call_argv, call_pyobject_helper};
+use super::{CodegenError, HelperFuncRefs, LowerState, build_call_argv, call_pyobject_helper, call_pyobject_helper_consuming};
 
 fn null_ptr(builder: &mut FunctionBuilder<'_>, ptr_ty: ir::Type) -> ir::Value {
     builder.ins().iconst(ptr_ty, 0)
@@ -189,5 +189,5 @@ pub(crate) fn lower_build_exc_group(
 ) -> Result<ir::Value, CodegenError> {
     let argv = build_call_argv(builder, helpers, state, excs, ptr_ty, ptr_bytes)?;
     let argc = builder.ins().iconst(ptr_ty, excs.len() as i64);
-    Ok(call_pyobject_helper(builder, build_exc_group, &[argv, argc], ptr_ty, exception_exit))
+    call_pyobject_helper_consuming(builder, build_exc_group, &[argv.addr, argc], &[&argv], ptr_ty, ptr_bytes, exception_exit)
 }

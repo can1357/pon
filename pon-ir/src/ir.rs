@@ -539,6 +539,11 @@ pub enum InstKind {
         keywords: Vec<(NameId, ValueId)>,
         /// Decorators applied after class creation.
         decorators: Vec<ValueId>,
+        /// Enclosing-scope cells captured by the class body (free variables
+        /// of the class scope, in `ScopeInfo::free_vars` order).  The runtime
+        /// attaches them as the body function's closure so nested methods and
+        /// class-level reads reach the enclosing function's cells.
+        closure: Vec<CellId>,
     },
     /// Box a lowered function object using the Phase-A constructor shape.
     MakeFunction {

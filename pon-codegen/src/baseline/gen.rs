@@ -25,7 +25,7 @@ use cranelift_codegen::Context;
 use cranelift_codegen::ir::{self, AbiParam, InstBuilder, JumpTableData, MemFlagsData};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{FuncId, Module};
-use pon_ir::ir::{Function, Terminator, Value as IrValue};
+use pon_ir::ir::{Function, InstKind, Terminator, Value as IrValue};
 use pon_runtime::types::generator::{GEN_FRAME_HEADER_SIZE, GenFrame, RESUME_RUNNING};
 
 use super::{
@@ -63,6 +63,20 @@ fn generator_kind_flag(function: &Function) -> u8 {
 /// Byte offset of spill slot `slot` inside a [`GenFrame`] allocation.
 fn frame_slot_offset(slot: usize, ptr_bytes: usize) -> Result<i32, CodegenError> {
     offset_i32(GEN_FRAME_HEADER_SIZE + slot * ptr_bytes)
+}
+
+/// Number of own closure cells (`MakeCell` results) in `function`.
+///
+/// Own cells get frame spill slots after the `n_locals` local slots: the cell
+/// object must survive suspension (dominance for resume paths + GC
+/// reachability from the suspended frame), exactly like locals.
+fn own_cell_count(function: &Function) -> usize {
+    function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.insts)
+        .filter(|inst| matches!(inst.kind, InstKind::MakeCell(_)))
+        .count()
 }
 
 /// Store `value` into frame spill slot `slot` (+ FT write barrier, mirroring
@@ -158,11 +172,13 @@ fn compile_generator_stub<M: Module>(
     let argv = builder.func.dfg.block_params(entry)[0];
     emit_safepoint_poll(&mut builder, &helper_refs);
 
-    // frame = pon_gen_frame_alloc(n_locals): every local owns a spill slot
-    // (slot k = local k), so the body's whole-frame spill/reload covers all
-    // live state (pin J0.1 §1).
-    let slot_count = u32::try_from(ir_function.n_locals)
-        .map_err(|_| CodegenError::OffsetTooLarge { offset: ir_function.n_locals })?;
+    // frame = pon_gen_frame_alloc(n_locals + own_cells): every local owns a
+    // spill slot (slot k = local k) and every own closure cell owns one after
+    // them (slot n_locals + c = cell c), so the body's whole-frame
+    // spill/reload covers all live state (pin J0.1 §1).
+    let total_slots = ir_function.n_locals + own_cell_count(ir_function);
+    let slot_count = u32::try_from(total_slots)
+        .map_err(|_| CodegenError::OffsetTooLarge { offset: total_slots })?;
     let slot_count_value = builder.ins().iconst(ir::types::I32, i64::from(slot_count));
     let frame = call_pyobject_helper(&mut builder, helper_refs.gen_frame_alloc, &[slot_count_value], ptr_ty, exception_exit);
 
@@ -239,9 +255,10 @@ fn compile_generator_body<M: Module>(
     let running = builder.ins().iconst(ir::types::I32, i64::from(RESUME_RUNNING as i32));
     builder.ins().store(MemFlagsData::new(), running, frame, RESUME_STATE_OFFSET);
 
-    // Reload ALL locals from their spill slots.  The dispatch block dominates
-    // every other block, so every local has a defining store before any use,
-    // including in resume blocks entered straight from the br_table.
+    // Reload ALL locals and own closure cells from their spill slots.  The
+    // dispatch block dominates every other block, so every local and cell has
+    // a defining store before any use, including in resume blocks entered
+    // straight from the br_table.
     let mut lower_state = LowerState::new(ir_function.n_locals);
     for slot in 0..ir_function.n_locals {
         let var = builder.declare_var(ptr_ty);
@@ -250,6 +267,13 @@ fn compile_generator_body<M: Module>(
         let value = builder.ins().load(ptr_ty, MemFlagsData::new(), frame, offset);
         builder.def_var(var, value);
         lower_state.local_defined[slot] = true;
+    }
+    for cell in 0..own_cell_count(ir_function) {
+        let var = builder.declare_var(ptr_ty);
+        let offset = frame_slot_offset(ir_function.n_locals + cell, ptr_bytes)?;
+        let value = builder.ins().load(ptr_ty, MemFlagsData::new(), frame, offset);
+        builder.def_var(var, value);
+        lower_state.define_cell(cell as u32, var);
     }
     lower_state.gen_ctx = Some(GenBodyCtx { frame });
 
@@ -347,11 +371,21 @@ pub(crate) fn lower_suspend(
     let ptr_bytes = ptr_ty.bytes() as usize;
     let yielded = state.value(val)?;
 
-    // 1. Spill all locals (+ barriers).  Handler-record pops were already
-    //    emitted by the IR transform as explicit PopExcInfo instructions.
+    // 1. Spill all locals and own closure cells (+ barriers).  Handler-record
+    //    pops were already emitted by the IR transform as explicit PopExcInfo
+    //    instructions.
     for slot in 0..state.locals.len() {
         let value = builder.use_var(state.locals[slot]);
         store_frame_slot(builder, helpers, ctx.frame, slot, value, ptr_ty, ptr_bytes)?;
+    }
+    for cell in 0..state.cells.len() {
+        let cell_id = cell as u32;
+        let var = state.cell(cell_id).ok_or(CodegenError::ClosureCellUnderflow {
+            cell: cell_id,
+            own_cells: state.cells.len(),
+        })?;
+        let value = builder.use_var(var);
+        store_frame_slot(builder, helpers, ctx.frame, state.locals.len() + cell, value, ptr_ty, ptr_bytes)?;
     }
 
     // 2. Set resume_state = k.

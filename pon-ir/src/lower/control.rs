@@ -16,7 +16,18 @@ pub(super) fn lower_return(
         Some(expr) => driver.lower_expr(scope, expr)?,
         None => scope.emit(InstKind::Const(PyConst::None))?,
     };
-    scope.set_term(Terminator::Return(value))
+    // A `return` inside a protected `try` phase departs through the phase's
+    // trampoline (pop handler records + run `finally` bodies on the edge)
+    // with the value parked in the shared return slot; the outermost
+    // trampoline performs the actual `Return`.
+    match scope.return_route {
+        Some(route) => {
+            let slot = scope.ensure_return_slot();
+            scope.emit(InstKind::StoreLocal(slot, value))?;
+            scope.set_term(Terminator::Jump(route))
+        }
+        None => scope.set_term(Terminator::Return(value)),
+    }
 }
 
 pub(super) fn lower_unary_expr_with_driver(
@@ -90,37 +101,34 @@ pub(super) fn lower_bool_expr_with_driver(
     scope: &mut BodyScope,
     bool_op: &ruff_python_ast::ExprBoolOp,
 ) -> Result<Value, LowerError> {
-    let mut values = bool_op.values.iter();
-    let Some(first) = values.next() else {
+    if bool_op.values.is_empty() {
         return Err(LowerError::internal("empty boolean operation"));
-    };
-    let mut result = driver.lower_expr(scope, first)?;
-    for expr in values {
-        let rhs = driver.lower_expr(scope, expr)?;
-        result = match bool_op.op {
-            ruff_python_ast::BoolOp::And => {
-                let lhs_truth = scope.emit(InstKind::BoolTest { val: result })?;
-                let rhs_truth = scope.emit(InstKind::BoolTest { val: rhs })?;
-                let combined = scope.emit(InstKind::BinaryOp {
-                    op: BinOp::And,
-                    lhs: lhs_truth,
-                    rhs: rhs_truth,
-                })?;
-                scope.emit(InstKind::BoolTest { val: combined })?
-            }
-            ruff_python_ast::BoolOp::Or => {
-                let lhs_truth = scope.emit(InstKind::BoolTest { val: result })?;
-                let rhs_truth = scope.emit(InstKind::BoolTest { val: rhs })?;
-                let combined = scope.emit(InstKind::BinaryOp {
-                    op: BinOp::Or,
-                    lhs: lhs_truth,
-                    rhs: rhs_truth,
-                })?;
-                scope.emit(InstKind::BoolTest { val: combined })?
-            }
-        };
     }
-    Ok(result)
+    // CPython semantics: `a or b` / `a and b` evaluate operands left to right,
+    // short-circuit, and yield the deciding OPERAND VALUE (not its truthiness).
+    let result_slot = scope.alloc_temp_local();
+    let done_block = scope.alloc_block()?;
+    let last = bool_op.values.len() - 1;
+    for (index, expr) in bool_op.values.iter().enumerate() {
+        let value = driver.lower_expr(scope, expr)?;
+        scope.emit(InstKind::StoreLocal(result_slot, value))?;
+        if index == last {
+            scope.jump_if_open(done_block)?;
+            break;
+        }
+        let cond = scope.emit(InstKind::BoolTest { val: value })?;
+        let next_block = scope.alloc_block()?;
+        let (then_, else_) = match bool_op.op {
+            // `and`: falsy operand short-circuits and is the result
+            ruff_python_ast::BoolOp::And => (next_block, done_block),
+            // `or`: truthy operand short-circuits and is the result
+            ruff_python_ast::BoolOp::Or => (done_block, next_block),
+        };
+        scope.set_term(Terminator::CondBranch { cond, then_, else_ })?;
+        scope.switch_to(next_block)?;
+    }
+    scope.switch_to(done_block)?;
+    scope.emit(InstKind::LoadLocal(result_slot))
 }
 
 pub(super) fn lower_if_expr_with_driver(

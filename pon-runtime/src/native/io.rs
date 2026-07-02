@@ -12,6 +12,7 @@ use crate::object::{PyLong, PyObject, PyObjectHeader, PyType};
 use crate::thread_state::{pon_err_clear, pon_err_message, pon_err_occurred, pon_err_set};
 use crate::types::{bytearray_, bytes_, method, type_};
 
+use super::builtins_mod::VARIADIC_ARITY;
 use super::install_module;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,7 +63,11 @@ pub(crate) struct PyNativeFile {
 unsafe impl Send for PyNativeFile {}
 
 static TEXT_FILE_TYPE: LazyLock<usize> = LazyLock::new(|| {
-    let mut ty = Box::new(PyType::new(ptr::null(), "TextIOWrapper", std::mem::size_of::<PyNativeFile>()));
+    let mut ty = Box::new(PyType::new(
+        abi::runtime_type_type().cast_const(),
+        "TextIOWrapper",
+        std::mem::size_of::<PyNativeFile>(),
+    ));
     ty.tp_getattro = Some(file_getattro);
     ty.tp_iter = Some(file_iter_slot);
     ty.tp_iternext = Some(file_iternext_slot);
@@ -70,7 +75,11 @@ static TEXT_FILE_TYPE: LazyLock<usize> = LazyLock::new(|| {
 });
 
 static BINARY_FILE_TYPE: LazyLock<usize> = LazyLock::new(|| {
-    let mut ty = Box::new(PyType::new(ptr::null(), "FileIO", std::mem::size_of::<PyNativeFile>()));
+    let mut ty = Box::new(PyType::new(
+        abi::runtime_type_type().cast_const(),
+        "FileIO",
+        std::mem::size_of::<PyNativeFile>(),
+    ));
     ty.tp_getattro = Some(file_getattro);
     ty.tp_iter = Some(file_iter_slot);
     ty.tp_iternext = Some(file_iternext_slot);
@@ -85,15 +94,141 @@ fn binary_file_type() -> *mut PyType {
     *BINARY_FILE_TYPE as *mut PyType
 }
 
+/// Stream methods stubbed on `_io._IOBase`: `import io` only needs the heap
+/// classes to exist for subclassing/ABC registration, so unimplemented
+/// operations raise an honest `NotImplementedError` when actually called.
+const STREAM_METHOD_STUBS: &[&str] = &[
+    "read",
+    "read1",
+    "readinto",
+    "readline",
+    "readlines",
+    "write",
+    "writelines",
+    "seek",
+    "tell",
+    "truncate",
+    "flush",
+    "close",
+    "detach",
+    "fileno",
+    "isatty",
+    "readable",
+    "writable",
+    "seekable",
+    "getvalue",
+];
+
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
-    let attrs = [
-        string_attr("__name__", "_io"),
-        string_attr("DEFAULT_BUFFER_SIZE", "8192"),
-        string_attr("TextIOWrapper", "<class '_io.TextIOWrapper'>"),
-        string_attr("FileIO", "<class '_io.FileIO'>"),
-        string_attr("stdout", "<stdout>"),
+    let os_error = builtin_class("OSError")?;
+    let value_error = builtin_class("ValueError")?;
+    let io_base = heap_class(
+        "_IOBase",
+        &[],
+        "The abstract base class for all I/O classes.",
+        STREAM_METHOD_STUBS,
+    )?;
+    let raw_io_base = heap_class("_RawIOBase", &[io_base], "Base class for raw binary I/O.", &[])?;
+    let buffered_io_base = heap_class("_BufferedIOBase", &[io_base], "Base class for buffered IO objects.", &[])?;
+    let text_io_base = heap_class("_TextIOBase", &[io_base], "Base class for text I/O.", &[])?;
+    // Link the pinned native file types under the fresh abstract bases so
+    // `FileIO.__mro__`/`isinstance` walk the CPython-shaped chain. Guarded for
+    // idempotence: the statics survive module re-creation.
+    unsafe {
+        let binary = binary_file_type();
+        if (*binary).tp_base.is_null() {
+            (*binary).tp_base = raw_io_base.cast::<PyType>();
+            (*binary).bump_version();
+        }
+        let text = text_file_type();
+        if (*text).tp_base.is_null() {
+            (*text).tp_base = text_io_base.cast::<PyType>();
+            (*text).bump_version();
+        }
+    }
+    let attrs = vec![
+        string_attr("__name__", "_io")?,
+        int_attr("DEFAULT_BUFFER_SIZE", 131_072)?,
+        string_attr("stdout", "<stdout>")?,
+        function_attr("open", builtin_open, VARIADIC_ARITY)?,
+        function_attr("open_code", open_code_entry, 1)?,
+        function_attr("text_encoding", text_encoding_entry, VARIADIC_ARITY)?,
+        (intern("BlockingIOError"), builtin_class("BlockingIOError")?),
+        (
+            intern("UnsupportedOperation"),
+            heap_class(
+                "UnsupportedOperation",
+                &[os_error, value_error],
+                "The stream does not support this operation.",
+                &[],
+            )?,
+        ),
+        (intern("_IOBase"), io_base),
+        (intern("_RawIOBase"), raw_io_base),
+        (intern("_BufferedIOBase"), buffered_io_base),
+        (intern("_TextIOBase"), text_io_base),
+        (intern("FileIO"), binary_file_type().cast::<PyObject>()),
+        (intern("TextIOWrapper"), text_file_type().cast::<PyObject>()),
+        (
+            intern("BytesIO"),
+            heap_class(
+                "BytesIO",
+                &[buffered_io_base],
+                "Buffered I/O implementation using an in-memory bytes buffer.",
+                &[],
+            )?,
+        ),
+        (
+            intern("StringIO"),
+            heap_class("StringIO", &[text_io_base], "Text I/O implementation using an in-memory buffer.", &[])?,
+        ),
+        (
+            intern("BufferedReader"),
+            heap_class(
+                "BufferedReader",
+                &[buffered_io_base],
+                "Create a new buffered reader using the given readable raw IO object.",
+                &[],
+            )?,
+        ),
+        (
+            intern("BufferedWriter"),
+            heap_class(
+                "BufferedWriter",
+                &[buffered_io_base],
+                "A buffer for a writeable sequential RawIO object.",
+                &[],
+            )?,
+        ),
+        (
+            intern("BufferedRandom"),
+            heap_class(
+                "BufferedRandom",
+                &[buffered_io_base],
+                "A buffered interface to random access streams.",
+                &[],
+            )?,
+        ),
+        (
+            intern("BufferedRWPair"),
+            heap_class(
+                "BufferedRWPair",
+                &[buffered_io_base],
+                "A buffered reader and writer object together.",
+                &[],
+            )?,
+        ),
+        (
+            intern("IncrementalNewlineDecoder"),
+            heap_class(
+                "IncrementalNewlineDecoder",
+                &[],
+                "Codec used when reading a file in universal newlines mode.",
+                &[],
+            )?,
+        ),
     ];
-    install_module("_io", attrs.into_iter().collect::<Result<Vec<_>, _>>()?)
+    install_module("_io", attrs)
 }
 
 fn string_attr(name: &str, value: &str) -> Result<(u32, *mut PyObject), String> {
@@ -102,6 +237,138 @@ fn string_attr(name: &str, value: &str) -> Result<(u32, *mut PyObject), String> 
     (!object.is_null())
         .then_some((intern(name), object))
         .ok_or_else(|| format!("failed to allocate _io.{name}"))
+}
+
+fn int_attr(name: &str, value: i64) -> Result<(u32, *mut PyObject), String> {
+    // SAFETY: `pon_const_int` returns NULL with a diagnostic on failure.
+    let object = unsafe { abi::pon_const_int(value) };
+    (!object.is_null())
+        .then_some((intern(name), object))
+        .ok_or_else(|| format!("failed to allocate _io.{name}"))
+}
+
+fn function_attr(
+    name: &str,
+    entry: unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject,
+    arity: usize,
+) -> Result<(u32, *mut PyObject), String> {
+    // SAFETY: `pon_make_function` returns NULL with a diagnostic on failure.
+    let object = unsafe { abi::pon_make_function(entry as *const u8, arity, intern(name)) };
+    (!object.is_null())
+        .then_some((intern(name), object))
+        .ok_or_else(|| format!("failed to allocate _io.{name}"))
+}
+
+/// Resolves a builtin class object (exception types live in the builtin
+/// globals) for re-export from `_io`; CPython's `_io.BlockingIOError` IS
+/// `builtins.BlockingIOError`.
+fn builtin_class(name: &str) -> Result<*mut PyObject, String> {
+    // SAFETY: `pon_load_global` returns NULL with a raised NameError on miss.
+    let object = unsafe { abi::pon_load_global(intern(name), ptr::null_mut()) };
+    if object.is_null() {
+        pon_err_clear();
+        return Err(format!("builtin class '{name}' is not registered"));
+    }
+    Ok(object)
+}
+
+/// Builds one minimally-correct `_io` heap class: real `type` instance with
+/// `__doc__`/`__module__` set (vendored `io.py` copies `__doc__` from the
+/// abstract bases) plus optional honest-failure method stubs.
+fn heap_class(
+    name: &str,
+    bases: &[*mut PyObject],
+    doc: &str,
+    method_stubs: &[&str],
+) -> Result<*mut PyObject, String> {
+    let namespace = type_::new_namespace();
+    if namespace.is_null() {
+        return Err(format!("failed to allocate _io.{name} namespace"));
+    }
+    let doc_object = unsafe { pon_const_str(doc.as_ptr(), doc.len()) };
+    if doc_object.is_null() {
+        return Err(format!("failed to allocate _io.{name}.__doc__"));
+    }
+    let module_object = unsafe { pon_const_str("_io".as_ptr(), "_io".len()) };
+    if module_object.is_null() {
+        return Err(format!("failed to allocate _io.{name}.__module__"));
+    }
+    // SAFETY: `new_namespace` returned a live namespace box.
+    unsafe {
+        (*namespace).set(intern("__doc__"), doc_object);
+        (*namespace).set(intern("__module__"), module_object);
+    }
+    for &method_name in method_stubs {
+        let function =
+            unsafe { abi::pon_make_function(io_stub_method as *const u8, VARIADIC_ARITY, intern(method_name)) };
+        if function.is_null() {
+            return Err(format!("failed to allocate _io.{name}.{method_name}"));
+        }
+        // SAFETY: Namespace is live; the function object is a valid attr value.
+        unsafe { (*namespace).set(intern(method_name), function) };
+    }
+    // SAFETY: Bases are live class objects owned by the runtime.
+    let class = unsafe { type_::build_class_from_namespace(name, bases, namespace, &[]) };
+    if class.is_null() {
+        let detail = pon_err_message().unwrap_or_else(|| "unknown error".to_owned());
+        pon_err_clear();
+        return Err(format!("failed to create _io.{name}: {detail}"));
+    }
+    // SAFETY: Freshly built class object; mirror `pon_build_class`'s ob_type fix.
+    unsafe {
+        if (*class).ob_type.is_null() {
+            (*class).ob_type = abi::runtime_type_type().cast_const();
+        }
+    }
+    Ok(class)
+}
+
+/// `_io.open_code(path)`: CPython semantics minus audit hooks — a binary
+/// read-only stream over `path`.
+unsafe extern "C" fn open_code_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { argv_slice(argv, argc) } {
+        Ok(args) => args,
+        Err(message) => return raise_type_error(&message),
+    };
+    if args.len() != 1 {
+        return raise_type_error(&format!("open_code() takes 1 positional argument but {} were given", args.len()));
+    }
+    let mode = alloc_str("rb");
+    if mode.is_null() {
+        return ptr::null_mut();
+    }
+    match open_from_args(&[args[0], mode]) {
+        Ok(object) => object,
+        Err(OpenError::Type(message)) => raise_type_error(&message),
+        Err(OpenError::Value(message)) => raise_value_error(&message),
+        Err(OpenError::Io(message)) => raise_io_error(&message),
+    }
+}
+
+/// `_io.text_encoding(encoding, stacklevel=2)`: pass a concrete encoding
+/// through; `None` selects "locale" (CPython default without UTF-8 mode,
+/// which pon does not model).
+unsafe extern "C" fn text_encoding_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { argv_slice(argv, argc) } {
+        Ok(args) => args,
+        Err(message) => return raise_type_error(&message),
+    };
+    if args.is_empty() || args.len() > 2 {
+        return raise_type_error(&format!(
+            "text_encoding() takes 1 or 2 positional arguments but {} were given",
+            args.len()
+        ));
+    }
+    if is_none(args[0]) {
+        alloc_str("locale")
+    } else {
+        args[0]
+    }
+}
+
+/// Honest shared failure body for `_io` heap-class stream method stubs.
+unsafe extern "C" fn io_stub_method(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+    abi::return_null_with_error("NotImplementedError: this _io stream method is not implemented in pon".to_owned())
 }
 
 /// Builtin `open()` entry point registered by `builtins_mod`.

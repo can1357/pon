@@ -4,6 +4,12 @@
 //! a module is statically reachable, every lowered function in that module stays
 //! available to the AoT backend; the linker can dead-strip later, but this pass
 //! never prunes language-level definitions.
+//!
+//! Units resolved under the runtime's own import roots (installed packages,
+//! conformance corpus, vendored stdlib) join the closure best-effort: a unit
+//! that cannot lower, or that trips dynamic-code policy, is recorded as
+//! skipped instead of failing the build, because leaving it out reproduces
+//! exactly the no-embedding runtime behavior for that module.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
@@ -12,15 +18,32 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use pon_ir::lower::{DynamicSink, LowerError, SourceSpan, scan_dynamic_sinks_source};
-use pon_ir::{InstKind, Module, NameId, lower_source};
+use pon_ir::{Function, InstKind, Module, NameId, lower_source};
 
 /// Options that affect AoT reachability policy.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReachabilityOptions {
     /// Allow statically-reached dynamic code sinks and mark the build as needing
     /// the optional runtime/JIT dynamic-code path.
     pub allow_dynamic: bool,
+    /// Longest prerequisite import chain followed from the entry module.
+    /// Modules discovered past this depth are skipped (and reported) instead
+    /// of embedded, bounding pathological import graphs.
+    pub max_import_depth: usize,
 }
+
+impl Default for ReachabilityOptions {
+    fn default() -> Self {
+        Self {
+            allow_dynamic: false,
+            max_import_depth: DEFAULT_MAX_IMPORT_DEPTH,
+        }
+    }
+}
+
+/// Default [`ReachabilityOptions::max_import_depth`]: deep enough for real
+/// stdlib prerequisite chains, small enough to stop runaway graphs.
+pub const DEFAULT_MAX_IMPORT_DEPTH: usize = 32;
 
 /// One Python source file selected for AoT compilation.
 #[derive(Clone, Debug, PartialEq)]
@@ -42,6 +65,9 @@ pub struct CompileUnit {
     /// Dynamic import APIs observed in this module. These are intentionally not
     /// followed by the static module closure.
     pub dynamic_imports: Vec<DynamicImportEdge>,
+    /// True when this unit joined the closure best-effort (runtime import
+    /// root); the build may drop it instead of failing when it cannot compile.
+    pub best_effort: bool,
 }
 
 /// Full reachability result consumed by the AoT build pipeline.
@@ -51,6 +77,19 @@ pub struct ReachabilityReport {
     pub units: Vec<CompileUnit>,
     /// True when `--allow-dynamic` permitted at least one reached dynamic sink.
     pub requires_dynamic_runtime: bool,
+    /// Best-effort units discovered but left out of the closure, with reasons.
+    pub skipped: Vec<SkippedUnit>,
+}
+
+/// A best-effort module discovered by reachability but not embedded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedUnit {
+    /// Fully-qualified dotted import name the unit would have owned.
+    pub module_name: String,
+    /// Canonical path to the source file.
+    pub path: PathBuf,
+    /// Human-readable reason the unit was skipped.
+    pub reason: String,
 }
 
 /// A module-name edge discovered from `ImportName` IR.
@@ -81,8 +120,14 @@ pub struct DynamicImportEdge {
 /// Static import resolution outcome.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImportResolution {
-    /// Resolved to a pure-Python file that should join the closure.
+    /// Resolved to a pure-Python file that must join the closure; a unit that
+    /// fails to lower fails the build.
     Static(PathBuf),
+    /// Resolved under a runtime-managed import root (installed packages,
+    /// conformance corpus, vendored stdlib last). Embedded best-effort: a unit
+    /// that cannot lower or trips dynamic-code policy is skipped, reproducing
+    /// the no-embedding runtime behavior for that module.
+    StaticBestEffort(PathBuf),
     /// Known dynamic edge; not embedded unless later `--allow-dynamic` support
     /// ships source and a JIT path.
     Dynamic(String),
@@ -99,9 +144,17 @@ pub trait StaticImportResolver {
 }
 
 /// Filesystem resolver for sibling modules and explicit search roots.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// Resolution mirrors the runtime import order: names the runtime serves
+/// ahead of source roots (curated native modules, C-accelerated refusals)
+/// never resolve to a file, strict roots (the importing module's directory,
+/// then explicit roots) produce hard compile units, and runtime import roots
+/// produce best-effort units.
+#[derive(Clone, Debug, Default)]
 pub struct PathImportResolver {
     search_roots: Vec<PathBuf>,
+    runtime_roots: Vec<PathBuf>,
+    shadow: Option<fn(&str) -> bool>,
 }
 
 impl PathImportResolver {
@@ -109,7 +162,24 @@ impl PathImportResolver {
     /// importing module's own directory.
     #[must_use]
     pub fn new(search_roots: Vec<PathBuf>) -> Self {
-        Self { search_roots }
+        Self {
+            search_roots,
+            ..Self::default()
+        }
+    }
+
+    /// Create a resolver that mirrors the runtime import machinery: `shadow`
+    /// names (curated native modules and C-accelerated refusals) never
+    /// resolve to source, and `runtime_roots` (the runtime's ordered source
+    /// roots, vendored stdlib last) resolve to best-effort units embedded
+    /// like sibling modules.
+    #[must_use]
+    pub fn with_runtime_import_order(runtime_roots: Vec<PathBuf>, shadow: fn(&str) -> bool) -> Self {
+        Self {
+            search_roots: Vec::new(),
+            runtime_roots,
+            shadow: Some(shadow),
+        }
     }
 
     fn candidate_roots(&self, importer: &Path) -> Vec<PathBuf> {
@@ -120,6 +190,16 @@ impl PathImportResolver {
         roots.extend(self.search_roots.iter().cloned());
         roots
     }
+
+    /// True when the runtime resolves `module` (or its top-level package)
+    /// ahead of every source root, making a source-file embed unreachable.
+    fn shadowed(&self, module: &str) -> bool {
+        let Some(shadow) = self.shadow else {
+            return false;
+        };
+        let top = module.split('.').next().unwrap_or(module);
+        shadow(module) || shadow(top)
+    }
 }
 
 impl StaticImportResolver for PathImportResolver {
@@ -128,9 +208,22 @@ impl StaticImportResolver for PathImportResolver {
             return Ok(ImportResolution::Dynamic("empty import target".to_owned()));
         }
 
+        if self.shadowed(&import.module) {
+            return Ok(ImportResolution::Unsupported(format!(
+                "module '{}' is served by the runtime ahead of source roots",
+                import.module
+            )));
+        }
+
         for root in self.candidate_roots(importer) {
             if let Some(path) = resolve_module_under_root(&root, &import.module) {
                 return Ok(ImportResolution::Static(path));
+            }
+        }
+
+        for root in &self.runtime_roots {
+            if let Some(path) = resolve_module_under_root(root, &import.module) {
+                return Ok(ImportResolution::StaticBestEffort(path));
             }
         }
 
@@ -154,10 +247,13 @@ pub fn module_closure_with_options(
         path: entry,
         name: "__main__".to_owned(),
         is_package: false,
+        best_effort: false,
+        depth: 0,
     }]);
     let mut seen = BTreeSet::new();
     let mut assigned = BTreeMap::new();
     let mut units = Vec::new();
+    let mut skipped = Vec::new();
     let mut requires_dynamic_runtime = false;
 
     while let Some(pending) = worklist.pop_front() {
@@ -166,18 +262,50 @@ pub fn module_closure_with_options(
             continue;
         }
 
+        if pending.depth > options.max_import_depth {
+            skipped.push(SkippedUnit {
+                module_name: pending.name,
+                path,
+                reason: format!(
+                    "prerequisite chain depth {} exceeds the embedding cap of {}",
+                    pending.depth, options.max_import_depth
+                ),
+            });
+            continue;
+        }
+
         let source = fs::read_to_string(&path).map_err(|err| ReachabilityError::Io {
             path: path.clone(),
             message: err.to_string(),
         })?;
 
-        let dynamic_sinks = scan_dynamic_sinks_source(&source).map_err(|error| ReachabilityError::Lower {
-            path: path.clone(),
-            error,
-        })?;
+        let dynamic_sinks = match scan_dynamic_sinks_source(&source) {
+            Ok(dynamic_sinks) => dynamic_sinks,
+            Err(error) if pending.best_effort => {
+                skipped.push(SkippedUnit {
+                    module_name: pending.name,
+                    path,
+                    reason: format!("failed to lower: {error}"),
+                });
+                continue;
+            }
+            Err(error) => {
+                return Err(ReachabilityError::Lower { path, error });
+            }
+        };
         if !dynamic_sinks.is_empty() {
             if options.allow_dynamic {
                 requires_dynamic_runtime = true;
+            } else if pending.best_effort {
+                skipped.push(SkippedUnit {
+                    module_name: pending.name,
+                    path,
+                    reason: format!(
+                        "dynamic-code sink `{}` requires --allow-dynamic",
+                        dynamic_sinks[0].kind.as_str()
+                    ),
+                });
+                continue;
             } else {
                 return Err(ReachabilityError::DynamicCode {
                     path: path.clone(),
@@ -187,11 +315,31 @@ pub fn module_closure_with_options(
             }
         }
 
-        let module = lower_source(&source).map_err(|error| ReachabilityError::Lower {
-            path: path.clone(),
-            error,
-        })?;
-        let imports = static_imports(&module);
+        let module = match lower_source(&source) {
+            Ok(module) => module,
+            Err(error) if pending.best_effort => {
+                skipped.push(SkippedUnit {
+                    module_name: pending.name,
+                    path,
+                    reason: format!("failed to lower: {error}"),
+                });
+                continue;
+            }
+            Err(error) => {
+                return Err(ReachabilityError::Lower { path, error });
+            }
+        };
+        // Best-effort units follow only imports the module body executes:
+        // imports deferred inside `def` bodies are cold paths by author intent
+        // (the stdlib's lazy-import idiom), and chasing them drags large,
+        // often-unlowerable graphs into every build. Strict units keep the
+        // conservative all-functions scan so a sibling imported from a helper
+        // function is still embedded for its call site.
+        let imports = if pending.best_effort {
+            static_imports_module_level(&module)
+        } else {
+            static_imports(&module)
+        };
         let dynamic_imports = dynamic_import_edges(&module);
         let mut import_edges = Vec::with_capacity(imports.len());
         let package_root = unit_package_root(&path, &pending.name, pending.is_package);
@@ -212,9 +360,18 @@ pub fn module_closure_with_options(
                     .and_then(|root| resolve_module_under_root(root, absolute))
                     .map_or(ImportResolution::NotFound, ImportResolution::Static),
             };
-            if let (Some(absolute), ImportResolution::Static(import_path)) = (absolute.as_deref(), &resolution) {
+            if let (Some(absolute), Some((import_path, resolved_best_effort))) =
+                (absolute.as_deref(), static_resolution_target(&resolution))
+            {
                 let import_path = canonicalize_existing(import_path)?;
-                enqueue_with_ancestor_packages(&mut worklist, &mut assigned, absolute, &import_path);
+                enqueue_with_ancestor_packages(
+                    &mut worklist,
+                    &mut assigned,
+                    absolute,
+                    &import_path,
+                    pending.best_effort || resolved_best_effort,
+                    pending.depth + 1,
+                );
             }
             import_edges.push(ImportEdge { import, resolution });
         }
@@ -228,22 +385,36 @@ pub fn module_closure_with_options(
             dynamic_sinks,
             imports: import_edges,
             dynamic_imports,
+            best_effort: pending.best_effort,
         });
     }
 
     Ok(ReachabilityReport {
         units,
         requires_dynamic_runtime,
+        skipped,
     })
 }
 
-/// Extract statically named imports from lowered IR.
+/// Extract statically named imports from lowered IR, across every function.
 #[must_use]
 pub fn static_imports(module: &Module) -> Vec<StaticImport> {
+    collect_static_imports(module, module.functions.iter())
+}
+
+/// Extract statically named imports that execute while the module body runs
+/// (its synthetic `main` function only). Imports deferred inside `def` bodies
+/// are excluded: they are not prerequisites for importing the module itself.
+#[must_use]
+pub fn static_imports_module_level(module: &Module) -> Vec<StaticImport> {
+    collect_static_imports(module, module.functions.get(module.main.0 as usize).into_iter())
+}
+
+fn collect_static_imports<'m>(module: &'m Module, functions: impl Iterator<Item = &'m Function>) -> Vec<StaticImport> {
     let mut imports = Vec::new();
     let mut seen = BTreeSet::new();
 
-    for function in &module.functions {
+    for function in functions {
         for block in &function.blocks {
             for inst in &block.insts {
                 let InstKind::ImportName { name, fromlist, level } = &inst.kind else {
@@ -334,6 +505,12 @@ struct PendingUnit {
     path: PathBuf,
     name: String,
     is_package: bool,
+    /// Skip (with a report entry) instead of failing when this unit cannot
+    /// join the closure. Set for runtime-root resolutions and inherited by
+    /// everything they import.
+    best_effort: bool,
+    /// Prerequisite-chain length from the entry module (entry = 0).
+    depth: usize,
 }
 
 /// Compute the absolute dotted target of a relative import as seen from
@@ -378,9 +555,11 @@ fn enqueue_with_ancestor_packages(
     assigned: &mut BTreeMap<String, PathBuf>,
     absolute: &str,
     import_path: &Path,
+    best_effort: bool,
+    depth: usize,
 ) {
     let is_package = import_path.file_name().is_some_and(|name| name == "__init__.py");
-    enqueue_module(worklist, assigned, absolute, import_path, is_package);
+    enqueue_module(worklist, assigned, absolute, import_path, is_package, best_effort, depth);
 
     let mut dir = import_path.parent();
     if is_package {
@@ -393,7 +572,7 @@ fn enqueue_with_ancestor_packages(
         };
         let init = parent_dir.join("__init__.py");
         if init.is_file() {
-            enqueue_module(worklist, assigned, parent_name, &init, true);
+            enqueue_module(worklist, assigned, parent_name, &init, true, best_effort, depth);
         }
         dir = parent_dir.parent();
         name = parent_name;
@@ -408,6 +587,8 @@ fn enqueue_module(
     name: &str,
     path: &Path,
     is_package: bool,
+    best_effort: bool,
+    depth: usize,
 ) {
     if assigned.contains_key(name) {
         return;
@@ -417,7 +598,18 @@ fn enqueue_module(
         path: path.to_owned(),
         name: name.to_owned(),
         is_package,
+        best_effort,
+        depth,
     });
+}
+
+/// Path of a statically resolved import and whether it joins best-effort.
+fn static_resolution_target(resolution: &ImportResolution) -> Option<(&Path, bool)> {
+    match resolution {
+        ImportResolution::Static(path) => Some((path, false)),
+        ImportResolution::StaticBestEffort(path) => Some((path, true)),
+        _ => None,
+    }
 }
 
 fn name_string(module: &Module, name: NameId) -> Option<&str> {
@@ -562,7 +754,10 @@ mod tests {
         let report = module_closure_with_options(
             &app,
             &resolver,
-            &ReachabilityOptions { allow_dynamic: true },
+            &ReachabilityOptions {
+                allow_dynamic: true,
+                ..ReachabilityOptions::default()
+            },
         )
         .expect("allow_dynamic should permit closure construction");
         assert!(report.requires_dynamic_runtime);
@@ -619,6 +814,148 @@ mod tests {
         assert_eq!(report.units.len(), 1);
         assert_eq!(report.units[0].dynamic_imports.len(), 1);
         assert_eq!(report.units[0].dynamic_imports[0].description, "importlib.import_module(...)");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn shadow_nat(name: &str) -> bool {
+        name == "nat" || name == "sys"
+    }
+
+    #[test]
+    fn embeds_runtime_root_modules_best_effort_and_transitively() {
+        let root = temp_root("runtime-root");
+        let stdlib = root.join("lib");
+        fs::create_dir_all(&stdlib).expect("stdlib root should be creatable");
+        let app = root.join("app.py");
+        fs::write(&app, "import vend\nprint(vend.value)\n").expect("app should be writable");
+        fs::write(stdlib.join("vend.py"), "import deep\nvalue = deep.value\n").expect("vend should be writable");
+        fs::write(stdlib.join("deep.py"), "value = 3\n").expect("deep should be writable");
+
+        let resolver = PathImportResolver::with_runtime_import_order(vec![stdlib.clone()], shadow_nat);
+        let report = module_closure_with_options(&app, &resolver, &ReachabilityOptions::default())
+            .expect("runtime-root imports should close");
+
+        let names: Vec<&str> = report.units.iter().map(|unit| unit.module_name.as_str()).collect();
+        assert_eq!(names, ["__main__", "vend", "deep"]);
+        assert!(report.skipped.is_empty());
+        assert!(matches!(
+            report.units[0].imports[0].resolution,
+            ImportResolution::StaticBestEffort(_)
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skips_best_effort_units_that_cannot_join() {
+        let root = temp_root("best-effort-skip");
+        let stdlib = root.join("lib");
+        fs::create_dir_all(&stdlib).expect("stdlib root should be creatable");
+        let app = root.join("app.py");
+        fs::write(&app, "import vend\n").expect("app should be writable");
+        // `sinky` resolves through vend's own directory (a strict-position
+        // root), so this also proves best-effort status propagates through
+        // the importing unit rather than tracking the matched root.
+        fs::write(stdlib.join("vend.py"), "import sinky\nvalue = 1\n").expect("vend should be writable");
+        fs::write(stdlib.join("sinky.py"), "eval('1')\n").expect("sinky should be writable");
+
+        let resolver = PathImportResolver::with_runtime_import_order(vec![stdlib.clone()], shadow_nat);
+        let report = module_closure_with_options(&app, &resolver, &ReachabilityOptions::default())
+            .expect("unembeddable best-effort units skip instead of failing");
+
+        let names: Vec<&str> = report.units.iter().map(|unit| unit.module_name.as_str()).collect();
+        assert_eq!(names, ["__main__", "vend"]);
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].module_name, "sinky");
+        assert!(
+            report.skipped[0].reason.contains("dynamic-code sink"),
+            "reason: {}",
+            report.skipped[0].reason
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shadowed_names_never_resolve_to_source() {
+        let root = temp_root("shadow");
+        let stdlib = root.join("lib");
+        fs::create_dir_all(&stdlib).expect("stdlib root should be creatable");
+        let app = root.join("app.py");
+        fs::write(&app, "import nat\n").expect("app should be writable");
+        fs::write(stdlib.join("nat.py"), "value = 9\n").expect("nat should be writable");
+
+        let resolver = PathImportResolver::with_runtime_import_order(vec![stdlib.clone()], shadow_nat);
+        let report = module_closure_with_options(&app, &resolver, &ReachabilityOptions::default())
+            .expect("shadowed imports stay out of the closure");
+
+        assert_eq!(report.units.len(), 1);
+        assert!(matches!(
+            report.units[0].imports[0].resolution,
+            ImportResolution::Unsupported(_)
+        ));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn depth_cap_skips_over_deep_chains() {
+        let root = temp_root("depth-cap");
+        let stdlib = root.join("lib");
+        fs::create_dir_all(&stdlib).expect("stdlib root should be creatable");
+        let app = root.join("app.py");
+        fs::write(&app, "import a\n").expect("app should be writable");
+        fs::write(stdlib.join("a.py"), "import b\n").expect("a should be writable");
+        fs::write(stdlib.join("b.py"), "value = 1\n").expect("b should be writable");
+
+        let resolver = PathImportResolver::with_runtime_import_order(vec![stdlib.clone()], shadow_nat);
+        let report = module_closure_with_options(
+            &app,
+            &resolver,
+            &ReachabilityOptions {
+                allow_dynamic: false,
+                max_import_depth: 1,
+            },
+        )
+        .expect("depth cap skips, not fails");
+
+        let names: Vec<&str> = report.units.iter().map(|unit| unit.module_name.as_str()).collect();
+        assert_eq!(names, ["__main__", "a"]);
+        assert_eq!(report.skipped.len(), 1);
+        assert_eq!(report.skipped[0].module_name, "b");
+        assert!(report.skipped[0].reason.contains("depth"), "reason: {}", report.skipped[0].reason);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn follows_both_arms_of_try_except_imports() {
+        let root = temp_root("try-arms");
+        let stdlib = root.join("lib");
+        fs::create_dir_all(&stdlib).expect("stdlib root should be creatable");
+        let app = root.join("app.py");
+        fs::write(
+            &app,
+            "try:\n    import c_accel\nexcept ImportError:\n    import fallback\n",
+        )
+        .expect("app should be writable");
+        fs::write(stdlib.join("fallback.py"), "value = 2\n").expect("fallback should be writable");
+
+        let resolver = PathImportResolver::with_runtime_import_order(vec![stdlib.clone()], shadow_nat);
+        let report = module_closure_with_options(&app, &resolver, &ReachabilityOptions::default())
+            .expect("try/except import arms should both be scanned");
+
+        let names: Vec<&str> = report.units.iter().map(|unit| unit.module_name.as_str()).collect();
+        assert_eq!(names, ["__main__", "fallback"]);
+        let resolutions: Vec<&ImportResolution> =
+            report.units[0].imports.iter().map(|edge| &edge.resolution).collect();
+        assert!(resolutions.iter().any(|resolution| matches!(resolution, ImportResolution::NotFound)));
+        assert!(
+            resolutions
+                .iter()
+                .any(|resolution| matches!(resolution, ImportResolution::StaticBestEffort(_)))
+        );
 
         let _ = fs::remove_dir_all(root);
     }

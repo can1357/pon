@@ -15,12 +15,17 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         ),
         string_attr("implementation", "namespace(name='pon', version=sys.version_info(major=3, minor=14, micro=0, releaselevel='final', serial=0))"),
         int_attr("hexversion", 0x030e00f0),
+        int_attr("maxsize", i64::MAX),
         string_attr("platform", std::env::consts::OS),
+        string_attr("byteorder", if cfg!(target_endian = "little") { "little" } else { "big" }),
         string_attr("executable", "pon"),
         string_attr("prefix", ""),
         string_attr("base_prefix", ""),
-        string_attr("modules", "<sys.modules>"),
+        flags_attr(),
+        warnoptions_attr(),
+        modules_attr(),
         function_attr("_getframe", sys_getframe),
+        function_attr("intern", sys_intern),
     ];
     install_module("sys", attrs.into_iter().collect::<Result<Vec<_>, _>>()?)
 }
@@ -31,6 +36,59 @@ fn string_attr(name: &str, value: &str) -> Result<(u32, *mut PyObject), String> 
     (!object.is_null())
         .then_some((intern(name), object))
         .ok_or_else(|| format!("failed to allocate sys.{name}"))
+}
+
+/// `sys.modules` is the live import-registry dict owned by `crate::import`;
+/// mutations through it (insert/replace/delete) steer later imports.
+fn modules_attr() -> Result<(u32, *mut PyObject), String> {
+    crate::import::sys_modules_dict().map(|object| (intern("modules"), object))
+}
+
+/// `sys.warnoptions`: no `-W` options reach an embedded interpreter, so the
+/// list `warnings._processoptions` consumes at import is always empty.
+fn warnoptions_attr() -> Result<(u32, *mut PyObject), String> {
+    let object = super::builtins_mod::alloc_list(Vec::new());
+    (!object.is_null())
+        .then_some((intern("warnoptions"), object))
+        .ok_or_else(|| "failed to allocate sys.warnoptions".to_owned())
+}
+
+/// `sys.flags` singleton exposing the interpreter flags the vendored stdlib
+/// reads at import time.  Only the consumed subset is served — an unknown
+/// attribute raises `AttributeError` so the next frontier is loud, not a
+/// silently wrong default.  `context_aware_warnings` is 0 to match the
+/// reference CPython default (GIL) build `_py_warnings` is compared against.
+fn flags_attr() -> Result<(u32, *mut PyObject), String> {
+    static FLAGS_TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let mut ty = crate::object::PyType::new(
+            std::ptr::null(),
+            "sys.flags",
+            std::mem::size_of::<crate::object::PyObjectHeader>(),
+        );
+        ty.tp_getattro = Some(flags_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    static FLAGS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        Box::into_raw(Box::new(crate::object::PyObjectHeader::new(*FLAGS_TYPE as *mut crate::object::PyType)))
+            as usize
+    });
+    Ok((intern("flags"), *FLAGS as *mut PyObject))
+}
+
+unsafe extern "C" fn flags_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let name = crate::tag::untag_arg(name);
+    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        crate::thread_state::pon_err_set("attribute name must be str");
+        return std::ptr::null_mut();
+    };
+    match name_text {
+        // Plain `python3` invocation values (no -X/-O/-W switches reach pon).
+        "context_aware_warnings" | "debug" | "optimize" | "verbose" | "dev_mode" | "ignore_environment" => unsafe {
+            pon_const_int(0)
+        },
+        // SAFETY: Raise helper with the interned attribute name.
+        _ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
+    }
 }
 
 fn int_attr(name: &str, value: i64) -> Result<(u32, *mut PyObject), String> {
@@ -81,4 +139,29 @@ unsafe extern "C" fn sys_getframe(argv: *mut *mut PyObject, argc: usize) -> *mut
         }
     }
     crate::types::frame::synthesize_frame_object()
+}
+
+/// `sys.intern(string)`.
+///
+/// pon has no canonical-identity string table, so the argument itself is
+/// returned after the CPython str type check: `intern` only promises an
+/// equal string usable as a dict key, and the embedded stdlib (`collections`
+/// namedtuple) never relies on cross-call identity folding.
+unsafe extern "C" fn sys_intern(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 1 {
+        return return_null_with_error(format!("intern() takes exactly 1 argument ({argc} given)"));
+    }
+    if argv.is_null() {
+        return return_null_with_error("argv pointer is null");
+    }
+    // SAFETY: `argv` carries `argc` argument slots per the call ABI.
+    let value = crate::tag::untag_arg(unsafe { *argv });
+    if value.is_null() {
+        // Boxing a tagged immediate failed; the error is already recorded.
+        return core::ptr::null_mut();
+    }
+    if unsafe { !crate::types::int::type_name_is(value, "str") } {
+        return return_null_with_error("intern() argument must be str");
+    }
+    value
 }

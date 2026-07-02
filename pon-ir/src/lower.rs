@@ -565,15 +565,26 @@ impl LoweringDriver {
             Expr::Name(name) if matches!(name.ctx, ExprContext::Load) => {
                 let raw_name = name.id.as_str();
                 if scope.is_class() && !scope.is_global_name(raw_name) {
-                    let name_id = self.names.intern(raw_name)?;
-                    scope.emit(InstKind::LoadName(name_id))
+                    // Class-body reads normally resolve through the namespace
+                    // mapping (LOAD_NAME); names captured from an enclosing
+                    // function read the closure cell instead (CPython
+                    // LOAD_FROM_DICT_OR_DEREF).
+                    if let Some(cell) = scope.class_deref_cell(raw_name) {
+                        scope.emit(InstKind::LoadCell(cell))
+                    } else {
+                        let name_id = self.names.intern(raw_name)?;
+                        scope.emit(InstKind::LoadName(name_id))
+                    }
                 } else {
                     match scope.name_class(raw_name) {
                         Some(NameClass::Local { slot }) => scope.emit(InstKind::LoadLocal(LocalId(*slot))),
                         Some(NameClass::Cell { cell_slot, .. }) => {
                             scope.emit(InstKind::LoadCell(CellId(*cell_slot)))
                         }
-                        Some(NameClass::Free { slot }) => scope.emit(InstKind::LoadCell(CellId(*slot))),
+                        Some(NameClass::Free { slot }) => {
+                            let cell = scope.free_cell(*slot);
+                            scope.emit(InstKind::LoadCell(cell))
+                        }
                         Some(NameClass::Builtin) => {
                             let name_id = self.names.intern(raw_name)?;
                             scope.emit(InstKind::LoadBuiltin(name_id))
@@ -847,27 +858,31 @@ impl LoweringDriver {
         if let Some(starred_index) = starred_index {
             let before = starred_index;
             let after = elts.len() - starred_index - 1;
-            scope.emit(InstKind::UnpackEx { val: value, before, after })?;
+            // `pon_unpack_ex` returns a fresh tuple: leading items, the
+            // middle list, then trailing items.  Targets subscript THAT
+            // tuple — never the source object (mappings/enums/generators).
+            let unpacked = scope.emit(InstKind::UnpackEx { val: value, before, after })?;
             for (index, elt) in elts[..before].iter().enumerate() {
-                let item = self.lower_sequence_item(scope, value, index as i64)?;
+                let item = self.lower_sequence_item(scope, unpacked, index as i64)?;
                 self.lower_store_target(scope, elt, item)?;
             }
             if let Expr::Starred(starred) = &elts[starred_index] {
-                let rest = self.lower_sequence_rest(scope, value, before as i64, after as i64)?;
+                let rest = self.lower_sequence_item(scope, unpacked, before as i64)?;
                 self.lower_store_target(scope, &starred.value, rest)?;
             }
             for (offset, elt) in elts[starred_index + 1..].iter().enumerate() {
-                let index = -((after - offset) as i64);
-                let item = self.lower_sequence_item(scope, value, index)?;
+                let index = before + 1 + offset;
+                let item = self.lower_sequence_item(scope, unpacked, index as i64)?;
                 self.lower_store_target(scope, elt, item)?;
             }
         } else {
-            scope.emit(InstKind::UnpackSeq {
+            // `pon_unpack_seq` returns a fresh tuple of exactly `n` items.
+            let unpacked = scope.emit(InstKind::UnpackSeq {
                 val: value,
                 n: elts.len(),
             })?;
             for (index, elt) in elts.iter().enumerate() {
-                let item = self.lower_sequence_item(scope, value, index as i64)?;
+                let item = self.lower_sequence_item(scope, unpacked, index as i64)?;
                 self.lower_store_target(scope, elt, item)?;
             }
         }
@@ -884,6 +899,9 @@ impl LoweringDriver {
         scope.emit(InstKind::SubscriptGet { obj: value, index })
     }
 
+    /// Slice `value[before..len-after]` into a fresh list.  Used by match
+    /// sequence patterns, whose subjects are guaranteed Sequences; plain
+    /// unpack assignment reads the `UnpackEx` result tuple instead.
     fn lower_sequence_rest(
         &mut self,
         scope: &mut BodyScope,
@@ -947,8 +965,12 @@ impl LoweringDriver {
             let name_id = self.names.intern(raw_name)?;
             scope.emit(InstKind::StoreGlobal(name_id, value))?;
         } else if scope.is_class() {
-            let name_id = self.names.intern(raw_name)?;
-            scope.emit(InstKind::StoreName(name_id, value))?;
+            if let Some(cell) = scope.class_deref_cell(raw_name) {
+                scope.emit(InstKind::StoreCell(cell, value))?;
+            } else {
+                let name_id = self.names.intern(raw_name)?;
+                scope.emit(InstKind::StoreName(name_id, value))?;
+            }
         } else {
             match scope.name_class(raw_name).cloned() {
                 Some(NameClass::Cell { cell_slot, local_slot }) => {
@@ -956,7 +978,8 @@ impl LoweringDriver {
                     scope.mark_local_defined(local_slot);
                 }
                 Some(NameClass::Free { slot }) => {
-                    scope.emit(InstKind::StoreCell(CellId(slot), value))?;
+                    let cell = scope.free_cell(slot);
+                    scope.emit(InstKind::StoreCell(cell, value))?;
                 }
                 Some(NameClass::Local { slot }) => {
                     scope.emit(InstKind::StoreLocal(LocalId(slot), value))?;
@@ -984,6 +1007,12 @@ pub(crate) struct BodyScope {
     next_block: u32,
     temp_locals: usize,
     reraise_exc: Option<LocalId>,
+    /// Innermost `try`-phase return trampoline: `return` parks its value in
+    /// [`Self::return_slot`] and jumps here so departing edges pop handler
+    /// records and run `finally` bodies (pin J0.6 §3.1 exit-edge discipline).
+    return_route: Option<BlockId>,
+    /// Shared spill slot for routed return values.
+    return_slot: Option<LocalId>,
     /// Next J0.3 inline-cache feedback slot (one per specializable site).
     next_feedback: u32,
 }
@@ -1005,6 +1034,8 @@ impl BodyScope {
             next_block: 1,
             temp_locals: 0,
             reraise_exc: None,
+            return_route: None,
+            return_slot: None,
             next_feedback: 0,
         };
         scope.emit_cell_prologue();
@@ -1065,6 +1096,16 @@ impl BodyScope {
         LocalId(slot as u32)
     }
 
+    /// Lazily allocates the shared spill slot used by routed `return`s.
+    fn ensure_return_slot(&mut self) -> LocalId {
+        if let Some(slot) = self.return_slot {
+            return slot;
+        }
+        let slot = self.alloc_temp_local();
+        self.return_slot = Some(slot);
+        slot
+    }
+
     fn emit_cell_prologue(&mut self) {
         for index in 0..self.info.cell_vars.len() {
             let name = &self.info.cell_vars[index];
@@ -1101,7 +1142,34 @@ impl BodyScope {
     }
 
     fn closure_slot(&self, name: &str) -> Option<CellId> {
-        self.info.closure_slot(name).map(CellId)
+        match self.name_class(name)? {
+            NameClass::Cell { cell_slot, .. } => Some(CellId(*cell_slot)),
+            NameClass::Free { slot } => Some(self.free_cell(*slot)),
+            NameClass::Local { .. } | NameClass::Global { .. } | NameClass::Builtin => None,
+        }
+    }
+
+    /// Cell id for one of this function's free variables.
+    ///
+    /// Cell ids form a single per-function space: `0..cell_vars.len()` are
+    /// the function's own `MakeCell` results; closure cells received from the
+    /// enclosing function follow at `cell_vars.len()..`.
+    fn free_cell(&self, slot: u32) -> CellId {
+        CellId(self.info.cell_vars.len() as u32 + slot)
+    }
+
+    /// For class scopes: the closure cell a name access must use instead of
+    /// the namespace — the name is captured from an enclosing function and is
+    /// either never bound in the class body or explicitly declared `nonlocal`.
+    fn class_deref_cell(&self, name: &str) -> Option<CellId> {
+        let symbol = self.info.symbol(name)?;
+        let NameClass::Free { slot } = symbol.class else {
+            return None;
+        };
+        if symbol.is_bound && !symbol.is_nonlocal {
+            return None;
+        }
+        Some(self.free_cell(slot))
     }
 
     fn cell_slot_for_local(&self, local: LocalId) -> Option<CellId> {

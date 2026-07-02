@@ -333,7 +333,7 @@ fn lower_keyword_defaults(
     Ok(defaults)
 }
 
-fn closure_cells(scope: &BodyScope, info: &ScopeInfo) -> Result<Vec<CellId>, LowerError> {
+pub(super) fn closure_cells(scope: &BodyScope, info: &ScopeInfo) -> Result<Vec<CellId>, LowerError> {
     info.free_vars
         .iter()
         .map(|name| {

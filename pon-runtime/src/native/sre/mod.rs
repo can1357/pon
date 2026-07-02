@@ -301,6 +301,17 @@ fn to_i64(object: *mut PyObject) -> Option<i64> {
     unsafe { crate::types::int::to_bigint_including_bool(object) }.and_then(|value| value.to_i64())
 }
 
+/// CPython `%.<limit>R` formatting (`_sre.c` uses `%.200R` for the pattern in
+/// `Pattern.__repr__` and `%.50R` for the matched text in `Match.__repr__`):
+/// the argument's repr clipped to at most `limit` code points.
+fn clipped_repr(object: *mut PyObject, limit: usize) -> String {
+    let text = repr_text(object);
+    match text.char_indices().nth(limit) {
+        Some((offset, _)) => text[..offset].to_owned(),
+        None => text,
+    }
+}
+
 fn collect_iterable(object: *mut PyObject) -> Result<Vec<*mut PyObject>, String> {
     // SAFETY: `pon_get_iter`/`pon_iter_next` self-normalize their arguments.
     let iter = unsafe { pon_get_iter(object, ptr::null_mut()) };
@@ -535,11 +546,56 @@ unsafe extern "C" fn pattern_getattro(object: *mut PyObject, name: *mut PyObject
     }
 }
 
+/// CPython `pattern_repr` flag table (Modules/_sre/sre.c order).
+const FLAG_NAMES: [(&str, i64); 8] = [
+    ("re.IGNORECASE", 2),
+    ("re.LOCALE", 4),
+    ("re.MULTILINE", 8),
+    ("re.DOTALL", 16),
+    ("re.UNICODE", 32),
+    ("re.VERBOSE", 64),
+    ("re.DEBUG", 128),
+    ("re.ASCII", 256),
+];
+
+/// Renders `flags` the way CPython's `Pattern.__repr__` does: named flags in
+/// table order joined by `|`, leftover bits as a trailing hex literal, and the
+/// implicit `re.UNICODE` omitted for str patterns.
+fn pattern_flags_repr(mut flags: i64, pattern_is_str: bool) -> Option<String> {
+    const LOCALE: i64 = 4;
+    const UNICODE: i64 = 32;
+    const ASCII: i64 = 256;
+    if pattern_is_str && flags & (LOCALE | UNICODE | ASCII) == UNICODE {
+        flags &= !UNICODE;
+    }
+    if flags == 0 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for (name, value) in FLAG_NAMES {
+        if flags & value != 0 {
+            parts.push((*name).to_owned());
+            flags &= !value;
+        }
+    }
+    if flags != 0 {
+        parts.push(format!("{flags:#x}"));
+    }
+    Some(parts.join("|"))
+}
+
 unsafe extern "C" fn pattern_repr(object: *mut PyObject) -> *mut PyObject {
     let Some(pattern) = (unsafe { as_pattern(object) }) else {
         return fail("re.Pattern receiver is invalid");
     };
-    alloc_str_object(&format!("re.compile({})", repr_text(pattern.pattern_obj)))
+    // SAFETY: `pattern_obj` is heap-or-NULL; `unicode_text` rejects NULL.
+    let is_str = unsafe { unicode_text(pattern.pattern_obj) }.is_some();
+    let flags_suffix = pattern_flags_repr(pattern.flags, is_str)
+        .map_or_else(String::new, |text| format!(", {text}"));
+    alloc_str_object(&format!(
+        "re.compile({}{flags_suffix})",
+        clipped_repr(pattern.pattern_obj, 200)
+    ))
 }
 
 fn bound_method(receiver: *mut PyObject, name: &str, entry: BuiltinFn) -> *mut PyObject {
@@ -1020,7 +1076,7 @@ unsafe extern "C" fn match_repr(object: *mut PyObject) -> *mut PyObject {
         .map_or_else(|| none(), |value| matched_value_object(&value));
     alloc_str_object(&format!(
         "<re.Match object; span=({start}, {end}), match={}>",
-        repr_text(group0)
+        clipped_repr(group0, 50)
     ))
 }
 
@@ -1181,4 +1237,83 @@ unsafe extern "C" fn match_end_method(argv: *mut *mut PyObject, argc: usize) -> 
         return ptr::null_mut();
     };
     alloc_int_object(matched.matched.end(index).map_or(-1, |end| end as i64))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::native::builtins_mod::str_text;
+    use crate::thread_state::test_state_lock;
+
+    /// `_sre` code units for `re.compile('a+')` (fixtures.json
+    /// `sre_curated_019`, CPython 3.14 encoding): INFO block followed by
+    /// `REPEAT_ONE LITERAL 'a' SUCCESS`.
+    const A_PLUS_CODE: [u32; 13] = [14, 4, 0, 1, 4_294_967_295, 24, 6, 1, 4_294_967_295, 16, 97, 1, 1];
+    /// `re.UNICODE`, the compiler-implied flag for str patterns.
+    const FLAG_UNICODE: i64 = 32;
+
+    fn init_runtime() {
+        assert_eq!(unsafe { abi::pon_runtime_init() }, 0);
+        pon_err_clear();
+    }
+
+    fn compiled_a_plus() -> vm::Pattern {
+        vm::compile(
+            vm::PatternText::Str("a+".to_owned()),
+            FLAG_UNICODE as u32,
+            A_PLUS_CODE.to_vec(),
+            0,
+            BTreeMap::new(),
+            vec![None],
+        )
+        .expect("a+ opcode vector compiles")
+    }
+
+    fn pattern_object(pattern_text: &str) -> *mut PyObject {
+        alloc_pattern(compiled_a_plus(), alloc_str_object(pattern_text), none(), FLAG_UNICODE)
+    }
+
+    #[test]
+    fn pattern_and_match_repr_dispatch_matches_cpython() {
+        let _guard = test_state_lock();
+        init_runtime();
+        let pattern_obj = pattern_object("a+");
+        // repr()/str() route through tp_repr/tp_str via the dispatch layer;
+        // neither type name is in the native repr whitelist.
+        assert_eq!(repr_text(pattern_obj), "re.compile('a+')");
+        assert_eq!(str_text(pattern_obj), "re.compile('a+')");
+
+        let matched = compiled_a_plus()
+            .match_str("aaab")
+            .expect("a+ executes")
+            .expect("a+ matches aaab");
+        let match_obj = alloc_match(matched, pattern_obj, alloc_str_object("aaab"));
+        assert_eq!(repr_text(match_obj), "<re.Match object; span=(0, 3), match='aaa'>");
+        assert_eq!(str_text(match_obj), "<re.Match object; span=(0, 3), match='aaa'>");
+    }
+
+    #[test]
+    fn pattern_and_match_reprs_clip_like_cpython() {
+        let _guard = test_state_lock();
+        init_runtime();
+        // CPython `%.200R`: `repr(re.compile('a' * 210))` keeps the first 200
+        // code points of the pattern repr (opening quote plus 199 chars, no
+        // closing quote).
+        let long_pattern = "a".repeat(210);
+        let pattern_obj = pattern_object(&long_pattern);
+        let expected = format!("re.compile('{})", "a".repeat(199));
+        assert_eq!(repr_text(pattern_obj), expected);
+
+        // CPython `%.50R`: the matched text repr is clipped to 50 code points.
+        let subject = "a".repeat(80);
+        let matched = compiled_a_plus()
+            .match_str(&subject)
+            .expect("a+ executes")
+            .expect("a+ matches the long subject");
+        let match_obj = alloc_match(matched, pattern_obj, alloc_str_object(&subject));
+        let expected = format!("<re.Match object; span=(0, 80), match='{}>", "a".repeat(49));
+        assert_eq!(repr_text(match_obj), expected);
+    }
 }
