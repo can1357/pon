@@ -1570,11 +1570,13 @@ print("hello", add(1, 2))
         assert_eq!(main_block.term, Terminator::Return(Value(9)));
         assert!(matches!(
             main_block.insts[0].kind,
-            InstKind::MakeFunction {
-                func_index: 1,
-                name_interned: NameId(0),
-                arity: 2
-            }
+            InstKind::MakeFunctionFull {
+                code: FunctionId(1),
+                ref defaults,
+                ref kwdefaults,
+                ref closure,
+                ref annotations,
+            } if defaults.is_empty() && kwdefaults.is_empty() && closure.is_empty() && annotations.is_empty()
         ));
         assert_eq!(main_block.insts[1].kind, InstKind::StoreGlobal(NameId(0), Value(0)));
         assert_eq!(main_block.insts[2].kind, InstKind::LoadBuiltin(NameId(1)));

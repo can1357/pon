@@ -446,22 +446,27 @@ def outer(x):
     }
 
     #[test]
-    fn phase_a_function_shape_is_preserved() {
+    fn simple_function_uses_full_shape_for_keyword_metadata() {
+        // A plain positional signature still needs a Phase-B FunctionRecord:
+        // `add(a=1, b=2)` binds keywords through the parameter-name table,
+        // which only `MakeFunctionFull` registers.
         let module = lower_source(
             r#"
 def add(a, b):
     return a + b
 "#,
         )
-        .expect("Phase-A function shape should still lower");
+        .expect("simple function should lower");
         let main = &module.functions[module.main.0 as usize];
         assert!(matches!(
             main.blocks[0].insts[0].kind,
-            InstKind::MakeFunction {
-                func_index: 1,
-                arity: 2,
+            InstKind::MakeFunctionFull {
+                code: FunctionId(1),
+                ref defaults,
+                ref kwdefaults,
+                ref closure,
                 ..
-            }
+            } if defaults.is_empty() && kwdefaults.is_empty() && closure.is_empty()
         ));
         assert_eq!(main.blocks[0].insts[2].kind, InstKind::Const(PyConst::None));
     }

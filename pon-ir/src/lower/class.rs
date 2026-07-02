@@ -132,6 +132,20 @@ pub(super) fn lower_class_def(
 mod tests {
     use super::*;
 
+    /// Every instruction kind of `func` across all of its blocks, in layout order.
+    fn inst_kinds(func: &Function) -> impl Iterator<Item = &InstKind> {
+        func.blocks.iter().flat_map(|block| block.insts.iter().map(|inst| &inst.kind))
+    }
+
+    /// Entry-block index of the sole `BuildClass` emitted by the module body.
+    fn build_class_at(main: &Function) -> usize {
+        main.blocks[0]
+            .insts
+            .iter()
+            .position(|inst| matches!(inst.kind, InstKind::BuildClass { .. }))
+            .expect("module body should emit a BuildClass")
+    }
+
     #[test]
     fn lowers_class_definition_to_build_class() {
         let module = lower_source(
@@ -150,9 +164,150 @@ class Child(Base, metaclass=Base):
         assert!(matches!(main.blocks[0].insts[2].kind, InstKind::StoreGlobal(_, _)));
         assert!(matches!(main.blocks[0].insts[5].kind, InstKind::LoadBuildClass));
         assert!(matches!(main.blocks[0].insts[6].kind, InstKind::BuildClass { .. }));
-        if let InstKind::BuildClass { bases, keywords, .. } = &main.blocks[0].insts[6].kind {
+        if let InstKind::BuildClass { bases, bases_seq, keywords, dstar, .. } = &main.blocks[0].insts[6].kind {
             assert_eq!(bases.len(), 1);
+            assert!(bases_seq.is_none(), "static bases keep the direct-operand fast path");
             assert_eq!(keywords.len(), 1);
+            assert!(dstar.is_none(), "no ** in the header leaves dstar empty");
         }
+    }
+
+    #[test]
+    fn dstar_keyword_forces_bases_into_sequence() {
+        let module = lower_source(
+            r#"
+kw = {"slot": 1}
+
+class C(int, **kw):
+    pass
+"#,
+        )
+        .expect("class with ** keywords should lower");
+        let main = &module.functions[module.main.0 as usize];
+        let insts = &main.blocks[0].insts;
+        let at = build_class_at(main);
+        let InstKind::BuildClass { bases, bases_seq, keywords, dstar, .. } = &insts[at].kind else {
+            unreachable!();
+        };
+        assert!(bases.is_empty(), "dynamic path moves every base into bases_seq");
+        assert!(bases_seq.is_some(), "bases materialize as one sequence operand");
+        assert!(keywords.is_empty(), "header has no statically named keywords");
+        assert!(dstar.is_some(), "a single ** mapping passes through as dstar");
+        assert!(
+            insts[..at].iter().any(|inst| matches!(inst.kind, InstKind::BuildList { .. })),
+            "bases list is built before BuildClass"
+        );
+        assert!(
+            insts[..at].iter().any(|inst| matches!(inst.kind, InstKind::ListAppend { .. })),
+            "the static base appends into the bases list"
+        );
+    }
+
+    #[test]
+    fn starred_bases_lower_through_list_extend() {
+        let module = lower_source(
+            r#"
+bases = (int,)
+
+class C(*bases):
+    pass
+"#,
+        )
+        .expect("class with starred bases should lower");
+        let main = &module.functions[module.main.0 as usize];
+        let insts = &main.blocks[0].insts;
+        let at = build_class_at(main);
+        let InstKind::BuildClass { bases, bases_seq, keywords, dstar, .. } = &insts[at].kind else {
+            unreachable!();
+        };
+        assert!(bases.is_empty());
+        assert!(bases_seq.is_some(), "starred bases force the sequence operand");
+        assert!(keywords.is_empty());
+        assert!(dstar.is_none(), "no ** keyword leaves dstar empty");
+        assert!(
+            insts[..at].iter().any(|inst| matches!(inst.kind, InstKind::ListExtend { .. })),
+            "the starred base extends the bases list"
+        );
+    }
+
+    #[test]
+    fn repeated_dstar_folds_into_fresh_map() {
+        let module = lower_source(
+            r#"
+k1 = {"a": 1}
+k2 = {"b": 2}
+
+class C(int, x=1, **k1, **k2):
+    pass
+"#,
+        )
+        .expect("class with repeated ** keywords should lower");
+        let main = &module.functions[module.main.0 as usize];
+        let insts = &main.blocks[0].insts;
+        let at = build_class_at(main);
+        let InstKind::BuildClass { keywords, dstar, .. } = &insts[at].kind else {
+            unreachable!();
+        };
+        assert_eq!(keywords.len(), 1, "x=1 keeps the interned-name fast path");
+        let fold_map = dstar.expect("repeated ** folds into a dstar map");
+        let merges: Vec<Value> = insts[..at]
+            .iter()
+            .filter_map(|inst| match inst.kind {
+                InstKind::DictMergeUnique { map, .. } => Some(map),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(merges.len(), 2, "one duplicate-checking merge per ** mapping");
+        assert!(merges.iter().all(|&map| map == fold_map), "every ** merges into the dstar map");
+        assert!(
+            insts[..at]
+                .iter()
+                .any(|inst| matches!(&inst.kind, InstKind::BuildMap { pairs } if pairs.is_empty())),
+            "the fold target is a fresh empty map"
+        );
+    }
+
+    #[test]
+    fn pep646_starred_annotation_unpacks_in_annotate() {
+        let module = lower_source(
+            r#"
+X = (int,)
+
+def f(*args: *X):
+    pass
+"#,
+        )
+        .expect("PEP 646 starred parameter annotation should lower");
+        let main_index = module.main.0 as usize;
+        let mut unpackers = module.functions.iter().enumerate().filter(|(_, func)| {
+            inst_kinds(func).any(|kind| matches!(kind, InstKind::UnpackSeq { n: 1, .. }))
+        });
+        let (index, annotate) = unpackers
+            .next()
+            .expect("a synthesized function unpacks the starred annotation");
+        assert!(unpackers.next().is_none(), "only __annotate__ unpacks the annotation");
+        assert_ne!(index, main_index, "UnpackSeq belongs to synthesized __annotate__, not the module body");
+        assert!(
+            inst_kinds(annotate).any(|kind| matches!(kind, InstKind::SubscriptGet { .. })),
+            "the unpacked annotation is read back by subscript"
+        );
+    }
+
+    #[test]
+    fn plain_annotation_does_not_unpack() {
+        let module = lower_source(
+            r#"
+def g(x: int):
+    pass
+"#,
+        )
+        .expect("plain parameter annotation should lower");
+        assert!(
+            module
+                .functions
+                .iter()
+                .all(|func| inst_kinds(func).all(|kind| !matches!(kind, InstKind::UnpackSeq { .. }))),
+            "plain annotations must not route through the PEP 646 unpack arm"
+        );
     }
 }

@@ -34,16 +34,37 @@ pub(crate) fn synthesize_scope_function_with_annotate(
     lower_body: impl FnOnce(&mut LoweringDriver, &mut BodyScope) -> Result<(), LowerError>,
 ) -> Result<Value, LowerError> {
     let closure = closure_cells(enclosing, &child_info)?;
-    let mut name_interned = if function_shape_requires_full(parameters, &child_info, &closure) {
-        None
-    } else {
+    // Closure-free non-generator comprehension scopes keep the record-less
+    // Phase-A shape: they are synthesized callees, invoked exactly once with
+    // the iterator as the sole positional argument, so they never need
+    // keyword metadata.  Every OTHER function object — def/lambda in any
+    // position, plus comprehensions with captures or generator/async bodies —
+    // materializes through `MakeFunctionFull` so the runtime registers a
+    // FunctionRecord: keyword binding (`A(x=1)` reaching `__init__`,
+    // namedtuple's eval'd `__new__`) is impossible without the
+    // parameter-name table, regardless of how simple the signature is.
+    let phase_a_comprehension = child_info.kind == ScopeKind::Comprehension
+        && closure.is_empty()
+        && child_info.cell_vars.is_empty()
+        && !child_info.is_generator
+        && !child_info.is_async;
+    let name_interned = if phase_a_comprehension {
         Some(driver.names.intern(&child_info.name)?)
+    } else {
+        None
     };
     let function = lower_function_body(driver, &child_info, lower_body)?;
     let defaults = lower_positional_defaults(driver, enclosing, parameters)?;
     let kwdefaults = lower_keyword_defaults(driver, enclosing, parameters)?;
 
-    let value = if needs_full_function(parameters, &child_info, &defaults, &kwdefaults, &closure) {
+    let value = if let Some(name_interned) = name_interned {
+        let arity = parameters.posonlyargs.len() + parameters.args.len();
+        enclosing.emit(InstKind::MakeFunction {
+            func_index: function.0,
+            name_interned,
+            arity,
+        })?
+    } else {
         enclosing.emit(InstKind::MakeFunctionFull {
             code: function,
             defaults,
@@ -52,17 +73,6 @@ pub(crate) fn synthesize_scope_function_with_annotate(
             // PEP 649: annotations are never eagerly evaluated; the field is
             // frozen-ABI legacy and always empty (see `InstKind` docs).
             annotations: Vec::new(),
-        })?
-    } else {
-        let name_interned = match name_interned.take() {
-            Some(name_interned) => name_interned,
-            None => driver.names.intern(&child_info.name)?,
-        };
-        let arity = positional_parameters(parameters)?.len();
-        enclosing.emit(InstKind::MakeFunction {
-            func_index: function.0,
-            name_interned,
-            arity,
         })?
     };
 
@@ -357,49 +367,4 @@ pub(super) fn closure_cells(scope: &BodyScope, info: &ScopeInfo) -> Result<Vec<C
             })
         })
         .collect()
-}
-
-fn function_shape_requires_full(parameters: &Parameters, info: &ScopeInfo, closure: &[CellId]) -> bool {
-    positional_parameters_have_defaults(parameters)
-        || parameters.vararg.is_some()
-        || parameters.kwarg.is_some()
-        || !parameters.kwonlyargs.is_empty()
-        || !closure.is_empty()
-        || !info.cell_vars.is_empty()
-        || info.is_generator
-        || info.is_async
-}
-
-fn positional_parameters_have_defaults(parameters: &Parameters) -> bool {
-    parameters
-        .posonlyargs
-        .iter()
-        .chain(&parameters.args)
-        .any(|parameter| parameter.default().is_some())
-}
-
-fn needs_full_function(
-    parameters: &Parameters,
-    info: &ScopeInfo,
-    defaults: &[Value],
-    kwdefaults: &[(NameId, Value)],
-    closure: &[CellId],
-) -> bool {
-    !defaults.is_empty()
-        || !kwdefaults.is_empty()
-        || parameters.vararg.is_some()
-        || parameters.kwarg.is_some()
-        || !parameters.kwonlyargs.is_empty()
-        || !closure.is_empty()
-        || !info.cell_vars.is_empty()
-        || info.is_generator
-        || info.is_async
-}
-
-fn positional_parameters(parameters: &Parameters) -> Result<Vec<String>, LowerError> {
-    let mut params = Vec::with_capacity(parameters.posonlyargs.len() + parameters.args.len());
-    for parameter in parameters.posonlyargs.iter().chain(&parameters.args) {
-        params.push(parameter.name().as_str().to_owned());
-    }
-    Ok(params)
 }
