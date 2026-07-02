@@ -75,20 +75,42 @@ pub unsafe extern "C" fn finalize_frozenset(object: *mut u8) {
 }
 
 /// Initializes a freshly allocated frozenset from already unique entries.
+///
+/// The bucket table stays EMPTY here: building it hashes elements, and
+/// Python-level `__hash__` hooks must never run inside `with_runtime` (the
+/// allocation helpers call this under the runtime lock; user code re-enters
+/// helpers that take the same mutex).  Probe paths materialize the table
+/// lazily via [`ensure_frozenset_buckets`], outside any lock.
 pub unsafe fn init_frozenset(ptr: *mut PyFrozenSet, ob_type: *const PyType, entries: Vec<*mut PyObject>) {
-    let buckets = build_buckets(&entries).unwrap_or_default();
     unsafe {
         ptr::write(
             ptr,
             PyFrozenSet {
                 ob_base: PyObjectHeader::new(ob_type),
                 entries,
-                buckets,
+                buckets: Vec::new(),
                 hash: 0,
                 hash_computed: false,
             },
         );
     }
+}
+
+/// Builds the lazy bucket table on first probe.  Element hashing may
+/// dispatch user `__hash__`, so the build runs on an entries snapshot with
+/// no storage borrow held (frozensets are immutable — the snapshot IS the
+/// content).
+unsafe fn ensure_frozenset_buckets(object: *mut PyObject) -> Result<(), String> {
+    let entries = {
+        let set = unsafe { frozenset_ref(object)? };
+        if !set.buckets.is_empty() || set.entries.is_empty() {
+            return Ok(());
+        }
+        set.entries.clone()
+    };
+    let buckets = build_buckets(&entries)?;
+    unsafe { frozenset_mut(object)? }.buckets = buckets;
+    Ok(())
 }
 
 /// Returns whether `object` is an exact frozenset.
@@ -128,6 +150,7 @@ pub unsafe fn unique_entries(items: &[*mut PyObject]) -> Result<Vec<*mut PyObjec
 /// Returns true when an item is present in a frozenset.
 pub unsafe fn frozenset_contains(object: *mut PyObject, item: *mut PyObject) -> Result<bool, String> {
     let hash = unsafe { hash_set_element(item)? };
+    unsafe { ensure_frozenset_buckets(object)? };
     let set = unsafe { frozenset_ref(object)? };
     if set.buckets.is_empty() {
         return Ok(false);

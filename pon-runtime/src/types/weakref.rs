@@ -27,6 +27,12 @@ pub struct PyWeakRef {
     hash_valid: bool,
     builtin_hash: i64,
     builtin_hash_valid: bool,
+    /// Subclass wrapper owning this canonical ref (`PyPayloadSubclassInstance`
+    /// whose payload is this object), or NULL for a plain `weakref.ref`.  The
+    /// death callback receives the wrapper — CPython invokes callbacks with
+    /// the subclass instance, and importlib's `KeyedRef.remove(wr)` reads
+    /// `wr.key` off it.
+    wrapper: *mut PyObject,
 }
 
 static WEAKREFS: LazyLock<Mutex<HashMap<usize, Vec<usize>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -38,6 +44,11 @@ static WEAKREF_TYPE: LazyLock<usize> = LazyLock::new(|| {
     ty.tp_hash = Some(weakref_hash);
     ty.tp_richcmp = Some(weakref_richcmp);
     ty.tp_getattro = Some(weakref_getattro);
+    // A real `object` base completes subclass MROs (`class KeyedRef(ref)`),
+    // so `super().__init__` and cooperative dunders resolve past this type —
+    // the WeakKeyDictionary type follows the same pattern.
+    ty.tp_base = crate::abi::runtime_global(intern::intern("object"))
+        .map_or(ptr::null_mut(), |object| object.cast::<PyType>());
     Box::into_raw(Box::new(ty)) as usize
 });
 
