@@ -187,7 +187,7 @@ unsafe fn is_generator_exit(object: *mut PyObject) -> bool {
     }
     super::with_runtime(|runtime| {
         let exit_ty = runtime.exception_types.generator_exit.cast_const();
-        if super::is_type_object_for_gen(runtime, object) {
+        if super::exc::is_type_object(runtime, object) {
             // SAFETY: `object` is a live type object.
             return unsafe { is_exception_subclass(object.cast::<PyType>().cast_const(), exit_ty) };
         }
@@ -357,7 +357,7 @@ unsafe fn pon_gen_resume(generator: *mut PyObject, sent: *mut PyObject, thrown: 
     // captured function object is pushed as the current call so closure-cell
     // loads inside the body resolve across suspensions.
     let body = generator_ref.body;
-    let call_guard = super::push_current_call(generator_ref.function.cast::<crate::abi::PyFunction>(), ptr::null_mut(), 0);
+    let call_guard = super::push_current_call(generator_ref.function.cast::<crate::object::PyFunction>(), ptr::null_mut(), 0);
     // SAFETY: `body` was supplied by codegen with the GenResumeBodyFn ABI; `frame` is live.
     let result = unsafe { body(frame) };
     drop(call_guard);

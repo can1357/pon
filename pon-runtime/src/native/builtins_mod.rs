@@ -1105,6 +1105,15 @@ pub fn repr_text(object: *mut PyObject) -> String {
     if is_none(object) {
         return "None".to_owned();
     }
+    if crate::types::typealias::is_type_alias(object) {
+        return crate::types::typealias::type_alias_repr(object);
+    }
+    if crate::types::typealias::is_typevar(object) {
+        return crate::types::typealias::typevar_repr(object);
+    }
+    if crate::types::typealias::is_generic_alias(object) {
+        return crate::types::typealias::generic_alias_repr(object);
+    }
     unsafe {
         if let Some(native) = as_native(object) {
             return match &native.payload {

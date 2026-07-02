@@ -170,7 +170,7 @@ fn raise_value_exception(kind: ExceptionKind, value: *mut PyObject, diagnostic: 
     }
 }
 
-fn is_type_object(runtime: &Runtime, object: *mut PyObject) -> bool {
+pub(super) fn is_type_object(runtime: &Runtime, object: *mut PyObject) -> bool {
     if object.is_null() {
         return false;
     }
