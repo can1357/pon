@@ -30,7 +30,9 @@ pub fn install_sdist_with_builder(
         version: &resolved_record.version,
         filename,
     })?;
-    crate::wheel::install_wheel(env, &ResolvedRecord::wheel(&resolved_record.name, &resolved_record.version, &build_artifact.wheel_filename), &build_artifact.wheel_filename)
+    let wheel_path = std::path::PathBuf::from(&build_artifact.wheel_filename);
+    let wheel_record = ResolvedRecord::wheel(&resolved_record.name, &resolved_record.version, &wheel_path);
+    crate::wheel::install_wheel(env, &wheel_record, &wheel_path, None)
 }
 
 fn normalized_name_from_sdist(filename: &str) -> Result<String> {
@@ -66,9 +68,9 @@ mod tests {
     #[test]
     fn builds_flit_fixture_sdist_and_installs_wheel_contents() {
         let layout = EnvLayout::new(temp_project("flit-fixture-sdist"));
-        let filename = fixture_sdist_path("pon-flit-fixture-0.1.0.tar.gz");
-        let filename = filename.display().to_string();
-        let record = ResolvedRecord::sdist("pon-flit-fixture", "0.1.0", &filename);
+        let path = fixture_sdist_path("pon-flit-fixture-0.1.0.tar.gz");
+        let filename = path.display().to_string();
+        let record = ResolvedRecord::sdist("pon-flit-fixture", "0.1.0", &path);
 
         let report = install_sdist(&layout, &record, &filename).expect("install sdist");
 
@@ -103,16 +105,17 @@ mod tests {
     #[test]
     fn rejects_setuptools_backend_sdist_with_backend_name() {
         let layout = EnvLayout::new(temp_project("setuptools-sdist"));
-        let filename = fixture_sdist_path("pon-setuptools-fixture-0.1.0.tar.gz");
-        let filename = filename.display().to_string();
-        let record = ResolvedRecord::sdist("pon-setuptools-fixture", "0.1.0", &filename);
+        let path = fixture_sdist_path("pon-setuptools-fixture-0.1.0.tar.gz");
+        let filename = path.display().to_string();
+        let record = ResolvedRecord::sdist("pon-setuptools-fixture", "0.1.0", &path);
 
         let error = install_sdist(&layout, &record, &filename).expect_err("unsupported backend");
 
         let Error::UnsupportedArtifact(message) = error else {
             panic!("expected UnsupportedArtifact");
         };
-        assert!(message.contains("setuptools.build_meta"));
+        assert!(message.starts_with("unsupported PEP 517 build backend `setuptools.build_meta`: backend import failed under pon:"), "{message}");
+        assert!(!message.contains("not available in the isolated Pon build environment"), "{message}");
     }
 
     fn fixture_sdist_path(filename: &str) -> std::path::PathBuf {
