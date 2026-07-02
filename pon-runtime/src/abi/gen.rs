@@ -19,7 +19,7 @@ use crate::types::coroutine::{TYPE_ID_COROUTINE, ensure_coroutine_type};
 use crate::types::exc::{ExceptionKind, PyBaseException, is_exception_instance, is_exception_subclass};
 use crate::types::frame::{TYPE_ID_FRAME, ensure_frame_type, finalize_frame, trace_frame};
 use crate::types::generator::{
-    GEN_FRAME_HEADER_SIZE, GenFrame, GeneratorKind, PyGenerator, RESUME_FINISHED, RESUME_RUNNING,
+    GenFrame, GeneratorKind, PyGenerator, RESUME_FINISHED, RESUME_RUNNING,
     RESUME_START, TYPE_ID_GEN_FRAME, TYPE_ID_GENERATOR, as_generator_mut, as_generator_object,
     ensure_generator_type, gen_frame_alloc_size, trace_gen_frame, trace_generator,
 };

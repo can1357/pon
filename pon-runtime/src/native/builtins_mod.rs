@@ -434,9 +434,6 @@ pub unsafe extern "C" fn builtin_print(argv: *mut *mut PyObject, argc: usize) ->
     let Some(args) = (unsafe { argv_slice(argv, argc) }) else {
         return fail("print() received a null argv pointer");
     };
-    if abi::r#gen::suppress_eager_print() {
-        return unsafe { abi::pon_none() };
-    }
     let mut stdout = io::stdout().lock();
     for (index, value) in args.iter().copied().enumerate() {
         if index != 0 && write!(stdout, " ").is_err() {

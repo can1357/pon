@@ -14,11 +14,10 @@ use std::ptr;
 use std::sync::{LazyLock, Mutex};
 
 use crate::abi::{CodeInfo, ParamSpec, return_null_with_error};
-use crate::abi::call::{CODE_FLAG_COROUTINE, CODE_FLAG_GENERATOR};
 use crate::intern::{self, intern, resolve};
 use crate::object::{PyCodeFn, PyFunction, PyObject, PyUnicode};
 use crate::thread_state::{pon_err_clear, pon_err_occurred};
-use crate::types::{dict, generator::GeneratorKind, list::PyList, tuple::PyTuple};
+use crate::types::{dict, list::PyList, tuple::PyTuple};
 
 static FUNCTION_RECORDS: LazyLock<Mutex<HashMap<usize, FunctionRecord>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -579,182 +578,6 @@ pub fn bind_arguments(
     Ok(bound)
 }
 
-unsafe fn resume_lazy_delegate(
-    frame_ref: &mut crate::abi::PyFrame,
-    sent: *mut PyObject,
-) -> *mut PyObject {
-    // SAFETY: `frame_ref.parent` stores the eager-yield generator materialized
-    // by an earlier lazy resume.
-    let result = unsafe { crate::abi::r#gen::pon_gen_send(frame_ref.parent, sent) };
-    if !result.is_null() || !pon_err_occurred() {
-        return result;
-    }
-
-    // When the eager delegate finishes, consume its StopIteration.value and raise a
-    // fresh StopIteration with the same value from the wrapper.  This makes the
-    // lazy layer's public exhaustion path carry the delegate's return value
-    // instead of relying on callers to observe the delegate's pending exception.
-    let stop_value = unsafe { crate::abi::r#gen::pon_gen_stop_value() };
-    if stop_value.is_null() {
-        return ptr::null_mut();
-    }
-    frame_ref.mark_exhausted();
-    unsafe { crate::abi::exc::pon_raise_stop_iteration(stop_value) }
-}
-
-unsafe fn exhaust_delegate_for_return(delegate: *mut PyObject) -> *mut PyObject {
-    loop {
-        // SAFETY: The delegate is a generator-family object produced by the eager fallback.
-        let item = unsafe { crate::abi::r#gen::pon_gen_send(delegate, ptr::null_mut()) };
-        if !item.is_null() {
-            continue;
-        }
-        if !pon_err_occurred() {
-            return return_null_with_error("coroutine delegate ended without StopIteration");
-        }
-        let stop_value = unsafe { crate::abi::r#gen::pon_gen_stop_value() };
-        if stop_value.is_null() {
-            return ptr::null_mut();
-        }
-        return unsafe { crate::abi::exc::pon_raise_stop_iteration(stop_value) };
-    }
-}
-
-unsafe extern "C" fn lazy_eager_generator_resume(
-    frame: *mut crate::abi::PyFrame,
-    sent: *mut PyObject,
-) -> *mut PyObject {
-    unsafe { lazy_eager_resume(frame, sent, false) }
-}
-
-unsafe extern "C" fn lazy_eager_coroutine_resume(
-    frame: *mut crate::abi::PyFrame,
-    sent: *mut PyObject,
-) -> *mut PyObject {
-    unsafe { lazy_eager_resume(frame, sent, true) }
-}
-
-unsafe fn lazy_eager_resume(
-    frame: *mut crate::abi::PyFrame,
-    sent: *mut PyObject,
-    is_coroutine: bool,
-) -> *mut PyObject {
-    if frame.is_null() {
-        return return_null_with_error("generator frame pointer is null");
-    }
-    // SAFETY: The generator owns this heap frame while it is resumable.
-    let frame_ref = unsafe { &mut *frame };
-    if !frame_ref.parent.is_null() {
-        return unsafe { resume_lazy_delegate(frame_ref, sent) };
-    }
-    if frame_ref.n_locals == 0 {
-        return return_null_with_error("lazy generator frame has no function slot");
-    }
-
-    // SAFETY: Slot 0 stores the boxed function; later slots store bound arguments.
-    let function = unsafe { crate::abi::r#gen::pon_frame_get_local(frame, 0) };
-    if function.is_null() {
-        return ptr::null_mut();
-    }
-    let Some(record) = function_record(function) else {
-        return return_null_with_error("lazy generator function has no metadata record");
-    };
-    if record.entry.is_null() {
-        return return_null_with_error("lazy generator function code pointer is null");
-    }
-    let argc = frame_ref.n_locals.saturating_sub(1) as usize;
-    let mut argv = Vec::with_capacity(argc);
-    for index in 0..argc {
-        // SAFETY: The loop stays inside the frame's advertised local count.
-        let value = unsafe { crate::abi::r#gen::pon_frame_get_local(frame, (index + 1) as u32) };
-        if value.is_null() {
-            return ptr::null_mut();
-        }
-        argv.push(value);
-    }
-
-    // SAFETY: Function entrypoints are emitted with the compiled-code ABI.
-    let entry: PyCodeFn = unsafe { mem::transmute(record.entry) };
-    let result = if is_coroutine {
-        let (sent_override, print_suppression) = if frame_ref.state == 0 {
-            (ptr::null_mut(), 1)
-        } else {
-            (sent, 2)
-        };
-        crate::abi::r#gen::with_eager_coroutine_replay(sent_override, print_suppression, || {
-            let _guard = crate::abi::push_current_call(function.cast::<PyFunction>(), argv.as_mut_ptr(), argv.len());
-            pon_err_clear();
-            // SAFETY: `argv` is contiguous and lives for the duration of the call.
-            unsafe { entry(argv.as_mut_ptr(), argv.len()) }
-        })
-    } else {
-        crate::abi::r#gen::with_eager_yield_recording(|| {
-            let _guard = crate::abi::push_current_call(function.cast::<PyFunction>(), argv.as_mut_ptr(), argv.len());
-            pon_err_clear();
-            // SAFETY: `argv` is contiguous and lives for the duration of the call.
-            unsafe { entry(argv.as_mut_ptr(), argv.len()) }
-        })
-    };
-    if result.is_null() {
-        return ptr::null_mut();
-    }
-    // Compiled generator bodies return the delegate produced by the eager
-    // fallback (`GetIter(None)` for fallthrough or `pon_eager_yield_generator`
-    // for explicit `return value`).  Do not wrap it again, or the stored
-    // StopIteration.value is lost behind a second empty generator.
-    let delegate = result;
-    if delegate.is_null() {
-        return ptr::null_mut();
-    }
-    if is_coroutine {
-        if frame_ref.state == 0 {
-            frame_ref.state = 1;
-            return unsafe { crate::abi::r#gen::pon_gen_send(delegate, sent) };
-        }
-        frame_ref.mark_exhausted();
-        return unsafe { exhaust_delegate_for_return(delegate) };
-    }
-    unsafe { crate::sync::store_heap_pointer(ptr::addr_of_mut!(frame_ref.parent), delegate) };
-    unsafe { resume_lazy_delegate(frame_ref, sent) }
-}
-
-unsafe fn make_lazy_eager_generator(
-    function: *mut PyObject,
-    argv: &[*mut PyObject],
-    kind: GeneratorKind,
-) -> Result<*mut PyObject, String> {
-    let n_locals = u32::try_from(argv.len().saturating_add(1))
-        .map_err(|_| "generator/coroutine call has too many bound arguments".to_owned())?;
-    // SAFETY: Allocates a frame with one function slot plus bound argument slots.
-    let frame = unsafe { crate::abi::r#gen::pon_make_frame(n_locals) };
-    if frame.is_null() {
-        return Ok(ptr::null_mut());
-    }
-    // SAFETY: The frame was allocated with `n_locals` slots.
-    if unsafe { crate::abi::r#gen::pon_frame_set_local(frame, 0, function) }.is_null() {
-        return Ok(ptr::null_mut());
-    }
-    for (index, value) in argv.iter().copied().enumerate() {
-        // SAFETY: Slots 1..=argv.len() are in bounds by construction.
-        if unsafe { crate::abi::r#gen::pon_frame_set_local(frame, (index + 1) as u32, value) }.is_null() {
-            return Ok(ptr::null_mut());
-        }
-    }
-    let resume = if kind == GeneratorKind::Coroutine {
-        lazy_eager_coroutine_resume
-    } else {
-        lazy_eager_generator_resume
-    };
-    // SAFETY: `resume` follows `GenResumeFn`; `frame` is live.
-    Ok(unsafe {
-        crate::abi::r#gen::pon_make_generator(
-            resume,
-            frame,
-            kind.as_u8(),
-        )
-    })
-}
-
 /// Bind and call a boxed function through Phase-B metadata when present.
 pub unsafe fn call_bound_function(
     function: *mut PyObject,
@@ -765,14 +588,9 @@ pub unsafe fn call_bound_function(
 ) -> Result<*mut PyObject, String> {
     let record = function_record(function);
     let mut argv = bind_arguments(function, positional, keywords, star, dstar)?;
-    if let Some(record) = record.as_ref() {
-        if record.flags & CODE_FLAG_COROUTINE != 0 {
-            return unsafe { make_lazy_eager_generator(function, &argv, GeneratorKind::Coroutine) };
-        }
-        if record.flags & CODE_FLAG_GENERATOR != 0 {
-            return unsafe { make_lazy_eager_generator(function, &argv, GeneratorKind::Generator) };
-        }
-    }
+    // Generator/coroutine functions need no special casing here: the compiled
+    // stub at the function's entry allocates the frame and returns the
+    // generator object itself (pin J0.1 §4.0).
     let code = if let Some(record) = record {
         record.entry
     } else {
@@ -1110,69 +928,4 @@ mod tests {
         unregister_function_record(function);
     }
 
-    unsafe extern "C" fn lazy_return_six_entry(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
-        for value in [2, 4] {
-            let object = unsafe { crate::abi::pon_const_int(value) };
-            if object.is_null() {
-                return ptr::null_mut();
-            }
-            if unsafe { crate::abi::r#gen::pon_yield(object) }.is_null() {
-                return ptr::null_mut();
-            }
-        }
-        let stop_value = unsafe { crate::abi::pon_const_int(6) };
-        if stop_value.is_null() {
-            return ptr::null_mut();
-        }
-        unsafe { crate::abi::r#gen::pon_eager_yield_generator(stop_value) }
-    }
-
-    #[test]
-    fn lazy_eager_generator_preserves_delegate_return_value() {
-        let _guard = crate::thread_state::test_state_lock();
-        unsafe {
-            assert_eq!(crate::abi::pon_runtime_init(), 0);
-            crate::thread_state::pon_err_clear();
-            let function = crate::abi::pon_make_function(
-                lazy_return_six_entry as *const u8,
-                0,
-                crate::intern::intern("lazy_return_six_entry"),
-            );
-            assert!(!function.is_null());
-            let code = CodeInfo {
-                entry: lazy_return_six_entry as *const u8,
-                params: ptr::null(),
-                name_interned: crate::intern::intern("lazy_return_six_entry"),
-                n_locals: 0,
-                n_feedback: 0,
-                flags: CODE_FLAG_GENERATOR,
-            };
-            register_function_record(function, &code, &[], &[], &[], &[]).unwrap();
-
-            let generator = call_bound_function(
-                function,
-                &[],
-                KeywordArgs {
-                    names: &[],
-                    values: &[],
-                },
-                None,
-                None,
-            )
-            .unwrap();
-            assert!(!generator.is_null());
-
-            let first = crate::abi::r#gen::pon_gen_send(generator, crate::abi::pon_none());
-            assert_eq!(crate::abi::format_object_for_print(first).as_deref(), Ok("2"));
-            let second = crate::abi::r#gen::pon_gen_send(generator, crate::abi::pon_none());
-            assert_eq!(crate::abi::format_object_for_print(second).as_deref(), Ok("4"));
-            let done = crate::abi::r#gen::pon_gen_send(generator, crate::abi::pon_none());
-            assert!(done.is_null());
-            assert!(crate::thread_state::pon_err_occurred());
-            let stop_value = crate::abi::r#gen::pon_gen_stop_value();
-            assert_eq!(crate::abi::format_object_for_print(stop_value).as_deref(), Ok("6"));
-            assert!(!crate::thread_state::pon_err_occurred());
-            unregister_function_record(function);
-        }
-    }
 }
