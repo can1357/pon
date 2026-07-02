@@ -373,17 +373,27 @@ pub(crate) fn target_dir(root: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(&rest[..end]))
 }
 
+/// Determinism pins shared by both corpus sides (the `cpython-full`/`fuzz`
+/// runners scrub the whole environment per §5.2; the corpus suite only pins
+/// the two variables differential output depends on): `TZ=UTC` so
+/// `time.localtime` agrees between pon's pinned-UTC clock and the reference
+/// interpreter on any host, and `PYTHONHASHSEED=0` so reference hash order
+/// is reproducible.
+fn pin_determinism(command: &mut Command) -> &mut Command {
+    command.env("TZ", "UTC").env("PYTHONHASHSEED", "0")
+}
+
 pub(crate) fn run_pon(root: &Path, pon_binary: &Path, script: &Path) -> Result<RunResult> {
-    run_command(
+    run_command(pin_determinism(
         Command::new(pon_binary)
             .arg("run")
             .arg(script)
             .current_dir(root),
-    )
+    ))
 }
 
 pub(crate) fn run_python314(root: &Path, script: &Path) -> Result<RunResult> {
-    run_command(Command::new("python3.14").arg(script).current_dir(root))
+    run_command(pin_determinism(Command::new("python3.14").arg(script).current_dir(root)))
 }
 
 pub(crate) fn run_command(command: &mut Command) -> Result<RunResult> {

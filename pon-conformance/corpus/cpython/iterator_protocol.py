@@ -70,3 +70,19 @@ try:
     next(ri)
 except StopIteration:
     print("range exhausted")
+li2 = iter([21, 22])
+print(li2.__next__(), li2.__iter__() is li2)
+si2 = iter("pq")
+print(si2.__next__(), si2.__next__())
+try:
+    si2.__next__()
+except StopIteration:
+    print("dunder exhausted")
+gi = (x * 2 for x in [3, 4])
+print(gi.__next__(), next(gi), gi.__iter__() is gi)
+zi2 = iter(range(1 << 1000))
+print(zi2.__next__(), zi2.__next__())
+try:
+    iter([]).nope
+except AttributeError:
+    print("AttributeError nope")
