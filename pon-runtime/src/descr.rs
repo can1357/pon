@@ -247,6 +247,8 @@ unsafe fn synthetic_type_attr(ty: *mut PyType, name_id: u32) -> *mut PyObject {
         crate::abi::str_::ensure_bytes_type_methods_installed(ty);
     } else if type_name == "bytearray" {
         crate::abi::str_::ensure_bytearray_type_methods_installed(ty);
+    } else if type_name == "float" {
+        crate::types::float::ensure_float_type_methods_installed(ty);
     }
     if (type_name == "dict" || unsafe { dict::type_is_dict_subclass(ty) }) && name_id == intern::intern("fromkeys") {
         return crate::native::builtins_mod::dict_fromkeys_function();
