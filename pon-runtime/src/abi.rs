@@ -40,7 +40,7 @@ use std::io::{self, Write};
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::{Condvar, LazyLock, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use pon_gc::{GcTypeInfo, Heap, RootSource, TypeId};
@@ -1642,7 +1642,78 @@ pub(crate) fn alloc_heap_instance(
     .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
 }
 
+/// One-shot gate serializing full runtime initialization across threads.
+///
+/// `RUNTIME` alone cannot express "publishing finished but eager module
+/// registration is still running": `init_runtime` must release the runtime
+/// mutex before `register_native_modules`/`ensure_tuple_subclass_surface`
+/// (their factories re-enter the runtime through `with_runtime`), so the
+/// occupied slot is visible while `sys` and the other eager modules are
+/// still missing.  Treating "slot occupied" as "initialized" let a second
+/// initializer race into `pon_sys_set_argv` during that window and fail
+/// with "sys module is not initialized" (pon-pm PEP 517 hook flake).
+///
+/// The gate closes the window: exactly one thread performs initialization;
+/// concurrent callers block until it reaches `Ready` (or `Failed`), while
+/// re-entrant calls from the initializing thread itself (ABI entry points
+/// invoked by eager module factories) return immediately — the runtime slot
+/// is already published, which is all nested runtime use needs.
+enum InitPhase {
+    Uninit,
+    Running(std::thread::ThreadId),
+    Ready,
+    Failed(String),
+}
+
+static INIT_PHASE: LazyLock<(Mutex<InitPhase>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(InitPhase::Uninit), Condvar::new()));
+
 fn init_runtime() -> Result<(), String> {
+    let (phase_lock, phase_signal) = &*INIT_PHASE;
+    let mut phase = phase_lock.lock().unwrap_or_else(|poison| poison.into_inner());
+    loop {
+        match &*phase {
+            InitPhase::Ready => return Ok(()),
+            InitPhase::Failed(message) => return Err(message.clone()),
+            InitPhase::Running(thread) if *thread == std::thread::current().id() => return Ok(()),
+            InitPhase::Running(_) => {
+                phase = phase_signal.wait(phase).unwrap_or_else(|poison| poison.into_inner());
+            }
+            InitPhase::Uninit => break,
+        }
+    }
+    *phase = InitPhase::Running(std::thread::current().id());
+    drop(phase);
+
+    // A panic inside `perform_runtime_init` unwinds to `pon_runtime_init`'s
+    // `catch_unwind`; without this guard the phase would stay `Running`
+    // forever and every waiter would deadlock.
+    struct FailOnUnwind;
+    impl Drop for FailOnUnwind {
+        fn drop(&mut self) {
+            let (phase_lock, phase_signal) = &*INIT_PHASE;
+            let mut phase = phase_lock.lock().unwrap_or_else(|poison| poison.into_inner());
+            if matches!(&*phase, InitPhase::Running(_)) {
+                *phase = InitPhase::Failed("runtime initialization panicked".to_owned());
+            }
+            phase_signal.notify_all();
+        }
+    }
+    let guard = FailOnUnwind;
+
+    let result = perform_runtime_init();
+    let mut phase = phase_lock.lock().unwrap_or_else(|poison| poison.into_inner());
+    *phase = match &result {
+        Ok(()) => InitPhase::Ready,
+        Err(message) => InitPhase::Failed(message.clone()),
+    };
+    drop(phase);
+    mem::forget(guard);
+    phase_signal.notify_all();
+    result
+}
+
+fn perform_runtime_init() -> Result<(), String> {
     let should_register_native = {
         let mut slot = runtime_lock();
         if slot.is_some() {
@@ -2574,6 +2645,10 @@ fn builtin_constructor_for_name(name: &str) -> Option<BuiltinConstructor> {
         // `property(fget=None, fset=None, fdel=None, doc=None)`: the binder
         // flattens keywords into the four positional slots (None = absent).
         "property" => Some(crate::native::builtins_mod::builtin_property),
+        // `dict(*args, **kwargs)`: arbitrary keyword entries ride the
+        // binder's trailing marker into `builtin_dict`, which merges them
+        // after the positional source (argparse's `dict(kwargs, dest=...)`).
+        "dict" => Some(crate::native::builtins_mod::builtin_dict),
         _ => None,
     }
 }
@@ -2725,7 +2800,7 @@ fn classmethod_builtin_type() -> *mut PyType {
     *TYPE as *mut PyType
 }
 
-fn staticmethod_builtin_type() -> *mut PyType {
+pub(crate) fn staticmethod_builtin_type() -> *mut PyType {
     static TYPE: LazyLock<usize> = LazyLock::new(|| {
         let mut ty = PyType::new(ptr::null(), "staticmethod", mem::size_of::<classmethod::PyStaticMethod>());
         classmethod::install_staticmethod_slots(&mut ty);
@@ -3239,8 +3314,7 @@ unsafe fn call_bound_code_pointer(
     }
 
     let _guard = CurrentFunctionGuard::push(function, argv, argc);
-    let _handled_guard = HandledExcGuard::enter();
-    pon_err_clear();
+    let _handled_guard = HandledExcGuard::enter_clearing_pending();
     let entry: PyCodeFn = unsafe { mem::transmute(code) };
     let result = unsafe { entry(argv, argc) };
     if result.is_null() && !pon_err_occurred() {
@@ -3292,6 +3366,19 @@ impl HandledExcGuard {
         let mut state = thread_state_lock();
         let current = state.handled_exc;
         state.handled_exc_saves.push(current);
+        Self
+    }
+
+    /// Single-lock fusion of [`Self::enter`] and `pon_err_clear` for the hot
+    /// call boundaries: one thread-state acquisition saves the caller's
+    /// handled exception AND clears the pending-error state the callee must
+    /// start without.
+    pub(crate) fn enter_clearing_pending() -> Self {
+        let mut state = thread_state_lock();
+        let current = state.handled_exc;
+        state.handled_exc_saves.push(current);
+        state.current_exc = ptr::null_mut();
+        state.clear_diagnostic();
         Self
     }
 }

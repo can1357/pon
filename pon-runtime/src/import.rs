@@ -467,9 +467,13 @@ fn resolve_module_by_name(name: &str) -> Result<*mut PyObject, String> {
         let module = create_module(name, is_package, [])?;
         bind_child_to_parent(name, module);
         begin_module_execution(name)?;
+        // Module top-level `try/except` parks the handled exception like any
+        // frame; bracket the body so the park never outlives the import.
+        let handled_guard = crate::abi::HandledExcGuard::enter();
         // SAFETY: The body is compiled top-level code registered by this
         // process's AoT image; it follows the NULL-sentinel error contract.
         let loaded = unsafe { body() };
+        drop(handled_guard);
         end_module_execution(name);
         if loaded.is_null() {
             if pon_err_occurred() {
@@ -497,12 +501,16 @@ fn resolve_module_by_name(name: &str) -> Result<*mut PyObject, String> {
             let module = create_module(name, spec.is_package, [(intern("__file__"), file_object)])?;
             bind_child_to_parent(name, module);
             begin_module_execution(name)?;
+            // Bracket the module body like any call boundary (see the
+            // embedded-module leg above).
+            let handled_guard = crate::abi::HandledExcGuard::enter();
             let loaded = loader(SourceModuleRequest {
                 name,
                 path: &spec.path,
                 source: &source,
                 is_package: spec.is_package,
             });
+            drop(handled_guard);
             end_module_execution(name);
             let loaded = loaded?;
             if loaded.is_null() {
