@@ -12,14 +12,40 @@ pub type AttrName = u32;
 
 /// Loads an attribute by interned name, using generic descriptor semantics behind
 /// the receiver type's `tp_getattro` slot.
+///
+/// With a non-NULL `feedback` cell and a receiver whose `tp_getattro` is the
+/// stock [`descr::generic_get_attr`], this dispatches straight to the
+/// IC-aware core (J0.3 tier-0 consultation) — skipping the name-object
+/// round-trip the generic slot path pays.  Custom `tp_getattro` slots keep
+/// the plain dispatch and never see the cell.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_load_attr(
     object: *mut PyObject,
     name: AttrName,
     feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
-    unsafe { super::record_feedback_unary(feedback, object) };
-    super::catch_object_helper(|| unsafe { abstract_op::get_attr(object, name) })
+    super::catch_object_helper(|| unsafe { get_attr_dispatch(object, name, feedback) })
+}
+
+/// Shared IC-or-generic attribute dispatch for `pon_load_attr`/`pon_get_attr`.
+///
+/// # Safety
+///
+/// `object` must be NULL or a live boxed object pointer.
+pub(super) unsafe fn get_attr_dispatch(object: *mut PyObject, name: AttrName, feedback: *mut FeedbackCell) -> *mut PyObject {
+    if !feedback.is_null() && !object.is_null() {
+        let ty = unsafe { (*object).ob_type };
+        // fn_addr_eq: a false negative merely skips the IC (safe); types
+        // assign this slot from the same crate-local item, so the addresses
+        // agree in practice.
+        if !ty.is_null()
+            && unsafe { (*ty).tp_getattro }
+                .is_some_and(|slot| core::ptr::fn_addr_eq(slot, descr::generic_get_attr as unsafe extern "C" fn(_, _) -> _))
+        {
+            return unsafe { descr::generic_get_attr_cached(object, name, feedback) };
+        }
+    }
+    unsafe { abstract_op::get_attr(object, name) }
 }
 
 /// Stores an attribute by interned name and returns the stored value on success.

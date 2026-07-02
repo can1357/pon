@@ -441,6 +441,19 @@ impl AttrCacheKind {
         }
     }
 }
+/// [`AttrCacheKind::Descriptor`] `offset` value: replay is a blind
+/// `descriptor_get` — the recorded translation proved the descriptor takes
+/// precedence over instance state (data descriptor).
+pub const ATTR_DESCR_BLIND: u32 = 0;
+/// [`AttrCacheKind::Descriptor`] `offset` value: the recorded descriptor is
+/// non-data (or a plain class attribute), so instance-dict shadowing is legal
+/// and replay MUST probe the instance dict before using the descriptor.
+///
+/// Tier-0 refinement of the J0.3 pin (which fixed `offset = 0` for
+/// descriptors): the offset word doubles as the replay mode.  Tier-1 snapshot
+/// consumers (O4) must treat a non-zero descriptor offset as
+/// "probe-dict-first" when baking inline guards.
+pub const ATTR_DESCR_PROBE_DICT: u32 = 1;
 
 /// One attribute inline-cache record (J0.3 pin: `AttrIC { type_version, kind, offset }`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -5,7 +5,7 @@
 //! integration pass can wire the helper table without redesigning semantics.
 
 use crate::abi::{CodeInfo, ParamSpec};
-use crate::feedback::FeedbackCell;
+use crate::feedback::{CallIC, FeedbackCell};
 use crate::object::PyObject;
 use crate::types::{cell, function, method};
 
@@ -33,7 +33,16 @@ pub unsafe extern "C" fn pon_call_ex(
     dstar: *mut PyObject,
     feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
-    unsafe { super::record_feedback_unary(feedback, callee) };
+    // J0.3 CallIC: record the observed callee identity (first target wins;
+    // a second distinct target latches the cell megamorphic).  Tier-0 never
+    // consults this — it exists to feed O3's tier-1 call specialization.
+    if let Some(cell) = unsafe { feedback.as_ref() } {
+        if !callee.is_null() {
+            cell.record_call(CallIC {
+                callee_identity: callee as usize,
+            });
+        }
+    }
     catch_object_helper(|| {
         if let Err(message) = ensure_runtime_initialized() {
             return return_null_with_error(message);
@@ -76,7 +85,6 @@ pub unsafe extern "C" fn pon_call_method(
     argc: usize,
     feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
-    unsafe { super::record_feedback_unary(feedback, recv_pair) };
     catch_object_helper(|| {
         if let Err(message) = ensure_runtime_initialized() {
             return return_null_with_error(message);
@@ -85,6 +93,16 @@ pub unsafe extern "C" fn pon_call_method(
             Ok(pair) => pair,
             Err(message) => return return_null_with_error(message),
         };
+        // J0.3 CallIC: record the UNDERLYING function, not the bound-method
+        // pair — the pair is a fresh allocation per LoadMethod, so its
+        // address would immediately latch the cell megamorphic.
+        if let Some(cell) = unsafe { feedback.as_ref() } {
+            if !function.is_null() {
+                cell.record_call(CallIC {
+                    callee_identity: function as usize,
+                });
+            }
+        }
         let args = match unsafe { object_slice(argv, argc) } {
             Ok(values) => values,
             Err(message) => return return_null_with_error(message),

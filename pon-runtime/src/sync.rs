@@ -160,6 +160,70 @@ pub fn bump_type_version_epoch(ty: *const PyType) -> usize {
         .fetch_add(1, Ordering::AcqRel)
         + 1
 }
+// ─── J0.3 §6 note A: subclass registry for transitive IC invalidation ────────
+//
+// An `AttrIC` guards only the receiver type's version tag, but attribute
+// lookup traverses the MRO: mutating `Base.attr` changes lookups on `Derived`
+// instances whose caches guard `Derived.version_tag`.  Every published type
+// therefore registers with its direct bases at class-creation time, and
+// [`type_modified`] bumps the mutated type plus all transitive descendants.
+//
+// The table holds weak addresses.  Types are currently immortal (leaked
+// boxes/statics); if type reclamation ever lands, the collector must clear
+// dead entries (J0.3 §3.1 identity-lifetime contract).
+static TYPE_SUBCLASSES: LazyLock<Mutex<HashMap<usize, Vec<usize>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Records `derived` as a direct subclass of `base` for transitive
+/// version-tag invalidation.  Called by class creation once per direct base;
+/// self-registration is ignored.
+pub fn register_subclass(base: *const PyType, derived: *const PyType) {
+    if base.is_null() || derived.is_null() || core::ptr::eq(base, derived) {
+        return;
+    }
+    let mut table = TYPE_SUBCLASSES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let children = table.entry(base as usize).or_default();
+    if !children.contains(&(derived as usize)) {
+        children.push(derived as usize);
+    }
+}
+
+/// Post-publication type mutation hook (J0.3 §6): bumps the in-object
+/// `version_tag` of `ty` and every transitive subclass, plus each type's
+/// side-table `version_epoch` (the ordered FT counter, step 4 of the §7
+/// mutation discipline).
+///
+/// Callers own mutation atomicity: invoke this AFTER the type-dict/slot write,
+/// on the mutating thread (single-threaded today; under the type critical
+/// section in FT builds).
+pub fn type_modified(ty: *const PyType) {
+    if ty.is_null() {
+        return;
+    }
+    let mut pending = vec![ty as usize];
+    let mut seen: Vec<usize> = Vec::new();
+    let table = TYPE_SUBCLASSES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    while let Some(address) = pending.pop() {
+        if seen.contains(&address) {
+            continue;
+        }
+        seen.push(address);
+        if let Some(children) = table.get(&address) {
+            pending.extend(children.iter().copied());
+        }
+    }
+    drop(table);
+    for address in seen {
+        let ty = address as *const PyType;
+        // SAFETY: Registered types are immortal for the process lifetime; the
+        // registry only ever holds addresses of published `PyType` objects.
+        unsafe { (*ty).bump_version() };
+        bump_type_version_epoch(ty);
+    }
+}
 
 #[cfg(feature = "free-threading")]
 const GLOBAL_CRITICAL_SECTION_KEY: usize = 0;

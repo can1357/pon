@@ -238,6 +238,14 @@ pub unsafe fn build_class_from_namespace(
     if unsafe { mro::set_c3_mro(ty, &base_types) } < 0 {
         return ptr::null_mut();
     }
+    // J0.3 §6 note A: register the new type with every MRO ancestor so a
+    // later ancestor mutation transitively invalidates this type's AttrICs
+    // (lookup traverses the whole MRO, not just direct bases).
+    for ancestor in unsafe { mro::mro_entries(ty) } {
+        if !ancestor.is_null() && ancestor != ty {
+            crate::sync::register_subclass(ancestor, ty);
+        }
+    }
 
     install_slot_descriptors(ty, namespace, slot_names_from_namespace(unsafe { &*namespace }));
     for (name, value) in unsafe { (&*namespace).iter().collect::<Vec<_>>() } {

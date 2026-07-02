@@ -439,6 +439,9 @@ fn create_module(
     });
     let object = as_object_ptr(Box::into_raw(object));
     state.modules.insert(name_id, object);
+    // J0.3 GlobalIC site: a (re)installed module can replace the module whose
+    // attrs overlay `pon_load_global` currently consults.
+    crate::abi::bump_namespace_version();
     Ok(object)
 }
 
@@ -488,6 +491,8 @@ fn bind_child_to_parent(name: &str, module: *mut PyObject) {
     unsafe {
         (&mut *parent).attrs.insert(child_id, module);
     }
+    // J0.3 GlobalIC site: parent-module attr overlay insert.
+    crate::abi::bump_namespace_version();
 }
 
 pub fn begin_module_execution(name: &str) -> Result<(), String> {
@@ -497,6 +502,9 @@ pub fn begin_module_execution(name: &str) -> Result<(), String> {
         return Err(format!("cannot execute uncached module '{name}'"));
     }
     state.current_modules.push(name_id);
+    // J0.3 GlobalIC site: context switch changes which attr overlay
+    // `pon_load_global` consults.
+    crate::abi::bump_namespace_version();
     Ok(())
 }
 
@@ -505,6 +513,8 @@ pub fn end_module_execution(name: &str) {
     let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
     if state.current_modules.last().copied() == Some(name_id) {
         state.current_modules.pop();
+        // J0.3 GlobalIC site: context switch (see begin_module_execution).
+        crate::abi::bump_namespace_version();
     }
 }
 
@@ -542,6 +552,8 @@ pub fn store_active_module_attr(name: u32, value: *mut PyObject) -> bool {
     unsafe {
         (&mut *module).attrs.insert(name, value);
     }
+    // J0.3 GlobalIC site: active-module attr overlay insert/replace.
+    crate::abi::bump_namespace_version();
     true
 }
 

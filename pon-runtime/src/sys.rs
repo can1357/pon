@@ -63,6 +63,8 @@ fn install_sys_argv(argv_object: *mut PyObject) -> Result<(), String> {
     unsafe {
         (&mut *sys).attrs.insert(intern("argv"), argv_object);
     }
+    // J0.3 GlobalIC site: module attr overlay mutation.
+    crate::abi::bump_namespace_version();
     Ok(())
 }
 

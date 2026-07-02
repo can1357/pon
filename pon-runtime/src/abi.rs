@@ -45,7 +45,7 @@ use pon_gc::{GcTypeInfo, Heap, RootSource, TypeId};
 
 use crate::builtins as runtime_builtins;
 use crate::intern::resolve;
-use crate::feedback::{FeedbackCell, FeedbackVec, TypeTag};
+use crate::feedback::{FeedbackCell, FeedbackVec, GlobalIC, TypeTag};
 use crate::object::{
     PyCodeFn, PyFunction, PyLong, PyNone, PyObject, PyObjectHeader, PyType, PyUnicode, TIER_STATE_DEFERRED,
     TIER_STATE_QUEUED, TIER_STATE_TIER0, as_object_ptr, is_exact_type,
@@ -81,6 +81,53 @@ struct CurrentCall {
 
 thread_local! {
     static CURRENT_FUNCTION_STACK: RefCell<Vec<CurrentCall>> = RefCell::new(Vec::new());
+}
+// ─── J0.3 GlobalIC guard: process-wide namespace version ────────────────────
+//
+// `pon_load_global` resolves through TWO layered stores (the executing
+// module's `PyModuleObject.attrs`, then the flat `Runtime.globals` map that
+// also holds builtins), neither of which is a versioned dict object yet.
+// Until N4 lands the real module-dict representation (J0.3 §5), GlobalIC
+// guards on ONE process-wide counter that is bumped by
+//   1. every mutation of either store (insert/replace/delete), and
+//   2. every module-execution context switch (`begin/end_module_execution`),
+//      because the switch changes which overlay `pon_load_global` consults.
+// A guard match therefore proves a recorded resolution would replay
+// identically.  Coarse (any store invalidates every GlobalIC) but exactly
+// sound, and steady-state module code — the hot case — never bumps it.
+//
+// Seeded to 1: `FeedbackCell::record_global` refuses `dict_version == 0`
+// (the empty-cell sentinel).  The counter address doubles as the cell's
+// identity word so a cell can never be confused with a future per-dict
+// version word living at a real dict address.
+static NAMESPACE_VERSION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+/// Current global-namespace version (Relaxed; same soundness argument as
+/// `PyType::version` — the counter is a pure invalidation fact).
+#[inline]
+#[must_use]
+pub fn namespace_version() -> u32 {
+    NAMESPACE_VERSION.load(Ordering::Relaxed)
+}
+
+/// Records a mutation of the module-attr overlay or the flat globals map
+/// (or a module-context switch).  Every such site MUST call this AFTER the
+/// write, mirroring the J0.3 type-mutation discipline.
+#[inline]
+pub fn bump_namespace_version() {
+    NAMESPACE_VERSION.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Stable identity word for GlobalIC records guarded by [`namespace_version`].
+#[inline]
+fn namespace_identity() -> usize {
+    (&raw const NAMESPACE_VERSION) as usize
+}
+
+/// Crate-test accessor for the GlobalIC identity word.
+#[cfg(test)]
+pub(crate) fn namespace_identity_for_tests() -> usize {
+    namespace_identity()
 }
 const TYPE_ID_LONG: TypeId = TypeId(2);
 const TYPE_ID_UNICODE: TypeId = TypeId(3);
@@ -304,7 +351,8 @@ const PARAMS_OBJ_OBJ_FEEDBACK: &[AbiTy] = &[AbiTy::PyObjectPtr, AbiTy::PyObjectP
 const PARAMS_CALL: &[AbiTy] = &[AbiTy::PyObjectPtr, AbiTy::PyObjectPtrPtr, AbiTy::Usize];
 const PARAMS_LOAD_BUILD_CLASS: &[AbiTy] = &[];
 const PARAMS_BUILD_CLASS: &[AbiTy] = &[AbiTy::PyObjectPtr, AbiTy::U32, AbiTy::PyObjectPtrPtr, AbiTy::Usize];
-const PARAMS_LOAD_GLOBAL: &[AbiTy] = &[AbiTy::U32];
+const PARAMS_LOAD_GLOBAL: &[AbiTy] = &[AbiTy::U32, AbiTy::FeedbackCellPtr];
+const PARAMS_LOAD_BUILTIN: &[AbiTy] = &[AbiTy::U32];
 const PARAMS_LOAD_NAME: &[AbiTy] = &[AbiTy::U32];
 const PARAMS_PRINT: &[AbiTy] = &[AbiTy::PyObjectPtr];
 const PARAMS_MAKE_FUNCTION: &[AbiTy] = &[AbiTy::CodePtr, AbiTy::Usize, AbiTy::U32];
@@ -472,7 +520,7 @@ pub static HELPERS: &[HelperDecl] = &[
     HelperDecl {
         symbol: "pon_load_builtin",
         address: builtins::pon_load_builtin as *const (),
-        params: PARAMS_LOAD_GLOBAL,
+        params: PARAMS_LOAD_BUILTIN,
         ret: AbiTy::PyObjectPtr,
     },
     HelperDecl {
@@ -1330,6 +1378,10 @@ fn init_runtime() -> Result<(), String> {
             let mut type_type = Box::new(PyType::new(ptr::null(), "type", mem::size_of::<PyType>()));
             type_type.tp_call = Some(type_::type_call);
             type_type.tp_getattro = Some(crate::descr::generic_get_attr);
+            // J0.3 §6: class-attribute assignment (`SomeClass.attr = v`) must
+            // reach generic_set_attr's type branch so type-dict mutation bumps
+            // the version tag and invalidates recorded AttrICs.
+            type_type.tp_setattro = Some(crate::descr::generic_set_attr);
             let type_type = Box::into_raw(type_type);
             let long_type = Box::into_raw(Box::new(PyType::new(type_type, "int", mem::size_of::<PyLong>())));
             let unicode_type = Box::into_raw(Box::new(PyType::new(type_type, "str", mem::size_of::<PyUnicode>())));
@@ -2076,7 +2128,7 @@ unsafe fn object_type_name(object: *mut PyObject) -> Option<String> {
 /// Loads the builtin `__build_class__` callable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_load_build_class() -> *mut PyObject {
-    unsafe { pon_load_global(crate::intern::intern("__build_class__")) }
+    unsafe { pon_load_global(crate::intern::intern("__build_class__"), ptr::null_mut()) }
 }
 
 /// Builds a heap Python class from an already-emitted body function and bases.
@@ -2165,6 +2217,8 @@ pub unsafe extern "C" fn pon_setup_annotations() -> *mut PyObject {
             } else {
                 runtime.globals.insert(name, annotations);
                 crate::import::store_active_module_attr(name, annotations);
+                // J0.3 GlobalIC site: module-level __annotations__ insert.
+                bump_namespace_version();
                 ensure_module_annotate_function(runtime).map(|()| annotations)
             }
         }) {
@@ -2183,6 +2237,8 @@ fn ensure_module_annotate_function(runtime: &mut Runtime) -> Result<(), String> 
     let function = alloc_function(runtime, module_annotations_annotate as *const u8, 1, name)?;
     runtime.globals.insert(name, function);
     crate::import::store_active_module_attr(name, function);
+    // J0.3 GlobalIC site: module __annotate__ registration.
+    bump_namespace_version();
     Ok(())
 }
 
@@ -2197,18 +2253,52 @@ unsafe extern "C" fn module_annotations_annotate(_argv: *mut *mut PyObject, argc
 }
 
 /// Loads a module-global or builtin value by interned name.
+///
+/// With a non-NULL `feedback` cell this consults a [`GlobalIC`] guarded by
+/// the process-wide [`namespace_version`]: a hit returns the cached binding
+/// with no mutex, no hash lookup, and no import-state lock.  A miss runs the
+/// layered lookup (active module attrs, then flat globals incl. builtins)
+/// and publishes a fresh record.  `builtins_version` is recorded `0` because
+/// builtins live in the same flat map the counter already guards (J0.3 §5:
+/// per-dict versions arrive with N4's dict representation).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pon_load_global(name_interned: u32) -> *mut PyObject {
+pub unsafe extern "C" fn pon_load_global(name_interned: u32, feedback: *mut FeedbackCell) -> *mut PyObject {
+    if let Some(cell) = unsafe { feedback.as_ref() } {
+        if let Some(ic) = cell.global_hit(namespace_identity(), namespace_version(), 0) {
+            // A version+identity match proves no namespace store or module
+            // context switch happened since recording: replaying the slow
+            // lookup would produce this same binding.  The runtime-init
+            // check is subsumed — records only exist post-init.
+            return ic.value_ptr as *mut PyObject;
+        }
+    }
     catch_object_helper(|| {
         if let Err(message) = ensure_runtime_initialized() {
             return return_null_with_error(message);
         }
-        crate::import::active_module_attr(name_interned)
-            .or_else(|| with_runtime(|runtime| runtime.globals.get(&name_interned).copied()).flatten())
-            .unwrap_or_else(|| {
+        // J0.3 capture discipline: version BEFORE the lookup.
+        let version = namespace_version();
+        let resolved = crate::import::active_module_attr(name_interned)
+            .or_else(|| with_runtime(|runtime| runtime.globals.get(&name_interned).copied()).flatten());
+        match resolved {
+            Some(value) => {
+                if let Some(cell) = unsafe { feedback.as_ref() } {
+                    cell.record_global(
+                        namespace_identity(),
+                        GlobalIC {
+                            dict_version: version,
+                            builtins_version: 0,
+                            value_ptr: value as usize,
+                        },
+                    );
+                }
+                value
+            }
+            None => {
                 let name = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
                 return_null_with_error(format!("name '{name}' is not defined"))
-            })
+            }
+        }
     })
 }
 /// Loads from the active class-body namespace, falling back to globals/builtins.
@@ -2283,6 +2373,8 @@ pub unsafe extern "C" fn pon_store_global(name_interned: u32, value: *mut PyObje
         crate::import::store_active_module_attr(name_interned, value);
         match with_runtime(|runtime| {
             runtime.globals.insert(name_interned, value);
+            // J0.3 GlobalIC site: flat-map insert/replace.
+            bump_namespace_version();
             value
         }) {
             Some(stored) => stored,
@@ -2308,6 +2400,8 @@ pub unsafe extern "C" fn pon_store_name(name_interned: u32, value: *mut PyObject
                 }
             } else {
                 runtime.globals.insert(name_interned, value);
+                // J0.3 GlobalIC site: module-scope StoreName lands in the flat map.
+                bump_namespace_version();
             }
             value
         }) {
@@ -2516,7 +2610,42 @@ mod tests {
             let name = intern("answer");
             let value = pon_const_int(42);
             assert_eq!(pon_store_global(name, value), value);
-            assert_eq!(pon_load_global(name), value);
+            assert_eq!(pon_load_global(name, ptr::null_mut()), value);
+        }
+    }
+
+    #[test]
+    fn store_global_invalidates_recorded_global_ic() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+            let name = intern("ic_guarded");
+            let old_value = pon_const_int(1);
+            let new_value = pon_const_int(2);
+            assert_eq!(pon_store_global(name, old_value), old_value);
+
+            // Miss + record through the real helper path.
+            let cell = FeedbackCell::EMPTY;
+            assert_eq!(pon_load_global(name, (&raw const cell).cast_mut()), old_value);
+            let (identity, ic) = cell.global_snapshot().expect("load published a GlobalIC record");
+            assert_eq!(ic.value_ptr, old_value as usize);
+
+            // Hit replays the cached binding.
+            assert_eq!(pon_load_global(name, (&raw const cell).cast_mut()), old_value);
+
+            // J0.3 §6: the flat-map store bumps the namespace version, so the
+            // recorded version can never match again (bumps are monotonic).
+            assert_eq!(pon_store_global(name, new_value), new_value);
+            assert!(
+                cell.global_hit(identity, namespace_version(), 0).is_none(),
+                "store must invalidate the recorded GlobalIC"
+            );
+
+            // Slow path re-resolves the NEW binding and re-records it.
+            assert_eq!(pon_load_global(name, (&raw const cell).cast_mut()), new_value);
+            let (_, ic) = cell.global_snapshot().expect("reload re-published");
+            assert_eq!(ic.value_ptr, new_value as usize);
+            assert_eq!(pon_load_global(name, (&raw const cell).cast_mut()), new_value);
         }
     }
 

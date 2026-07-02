@@ -32,14 +32,16 @@ pub unsafe extern "C" fn pon_is_true(object: *mut PyObject) -> i32 {
 }
 
 /// Loads an interned-name attribute through the object's attribute slot.
+///
+/// A non-NULL `feedback` cell enables the J0.3 AttrIC fast path for stock
+/// `generic_get_attr` receivers (see `abi::attr::get_attr_dispatch`).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_get_attr(
     object: *mut PyObject,
     name: u32,
     feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
-    unsafe { super::record_feedback_unary(feedback, object) };
-    super::catch_object_helper(|| unsafe { abstract_op::get_attr(object, name) })
+    super::catch_object_helper(|| unsafe { super::attr::get_attr_dispatch(object, name, feedback) })
 }
 
 /// Stores an interned-name attribute through the object's attribute slot.

@@ -86,7 +86,7 @@ pub(crate) fn make_module() -> Result<*mut PyObject, String> {
     let mut attrs = Vec::new();
     for_each_builtin(|builtin_name, _arity, _code| {
         let name = crate::intern::intern(builtin_name);
-        let value = unsafe { abi::pon_load_global(name) };
+        let value = unsafe { abi::pon_load_global(name, core::ptr::null_mut()) };
         if !value.is_null() {
             attrs.push((name, value));
         }
@@ -108,7 +108,7 @@ pub(crate) fn make_module() -> Result<*mut PyObject, String> {
         "ExceptionGroup",
     ] {
         let name = crate::intern::intern(exception_name);
-        let value = unsafe { abi::pon_load_global(name) };
+        let value = unsafe { abi::pon_load_global(name, core::ptr::null_mut()) };
         if value.is_null() {
             return Err(format!("builtin exception '{exception_name}' is not registered"));
         }

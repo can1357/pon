@@ -622,6 +622,14 @@ pub enum SlotUpdateError {
 /// the real trampolines that know how to call Python descriptors.  Unknown
 /// dunder names are accepted and intentionally leave the type unchanged.
 ///
+/// # IC invalidation contract (J0.3 §6 site #3)
+///
+/// This function does NOT bump `version_tag`: post-publication callers
+/// (`descr::generic_set_attr` sites #1/#2) own the `sync::type_modified`
+/// call, and class creation (site #6) mutates a not-yet-published type where
+/// a bump would be noise.  Any future caller that rewrites dunders outside
+/// `generic_set_attr` on a PUBLISHED type owns its own bump.
+///
 /// # Errors
 ///
 /// Returns [`SlotUpdateError::NullType`] when `ty` is NULL.
