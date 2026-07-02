@@ -307,54 +307,6 @@ unsafe extern "C" fn fix_co_filename_entry(_argv: *mut *mut PyObject, _argc: usi
     none()
 }
 
-/// SipHash-1-3 exactly as CPython's `pyhash.c` `siphash13` (the `_Py_KeyedHash`
-/// used by `_imp.source_hash`): k0 = key, k1 = 0.
-fn siphash13(k0: u64, k1: u64, data: &[u8]) -> u64 {
-    #[inline]
-    fn single_round(v: &mut [u64; 4]) {
-        // HALF_ROUND(v0, v1, v2, v3, 13, 16)
-        v[0] = v[0].wrapping_add(v[1]);
-        v[2] = v[2].wrapping_add(v[3]);
-        v[1] = v[1].rotate_left(13) ^ v[0];
-        v[3] = v[3].rotate_left(16) ^ v[2];
-        v[0] = v[0].rotate_left(32);
-        // HALF_ROUND(v2, v1, v0, v3, 17, 21)
-        v[2] = v[2].wrapping_add(v[1]);
-        v[0] = v[0].wrapping_add(v[3]);
-        v[1] = v[1].rotate_left(17) ^ v[2];
-        v[3] = v[3].rotate_left(21) ^ v[0];
-        v[2] = v[2].rotate_left(32);
-    }
-
-    let mut v = [
-        k0 ^ 0x736f_6d65_7073_6575,
-        k1 ^ 0x646f_7261_6e64_6f6d,
-        k0 ^ 0x6c79_6765_6e65_7261,
-        k1 ^ 0x7465_6462_7974_6573,
-    ];
-    let mut b = (data.len() as u64) << 56;
-    let mut chunks = data.chunks_exact(8);
-    for chunk in &mut chunks {
-        let mi = u64::from_le_bytes(chunk.try_into().expect("8-byte chunk"));
-        v[3] ^= mi;
-        single_round(&mut v);
-        v[0] ^= mi;
-    }
-    let tail = chunks.remainder();
-    let mut t = [0u8; 8];
-    t[..tail.len()].copy_from_slice(tail);
-    b |= u64::from_le_bytes(t);
-
-    v[3] ^= b;
-    single_round(&mut v);
-    v[0] ^= b;
-    v[2] ^= 0xff;
-    single_round(&mut v);
-    single_round(&mut v);
-    single_round(&mut v);
-    (v[0] ^ v[1]) ^ (v[2] ^ v[3])
-}
-
 fn to_i64(object: *mut PyObject) -> Option<i64> {
     if object.is_null() {
         return None;
@@ -390,7 +342,7 @@ unsafe extern "C" fn source_hash_entry(argv: *mut *mut PyObject, argc: usize) ->
     let Some(source) = (unsafe { bytes_argument(untag(args[1])) }) else {
         return raise_type_error("source_hash() source must be bytes");
     };
-    let digest = siphash13(key as u64, 0, source).to_le_bytes();
+    let digest = crate::pyhash::siphash13(key as u64, 0, source).to_le_bytes();
     // SAFETY: `digest` is a live 8-byte buffer; the runtime copies it.
     unsafe { abi::str_::pon_const_bytes(digest.as_ptr(), digest.len()) }
 }

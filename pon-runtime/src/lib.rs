@@ -14,6 +14,7 @@ pub mod intern;
 pub mod mro;
 pub mod native;
 pub mod object;
+pub mod pyhash;
 pub mod sync;
 pub mod thread;
 pub mod thread_state;
