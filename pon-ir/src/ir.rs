@@ -264,6 +264,10 @@ pub enum InstKind {
     },
     /// Extend a list with values produced by an iterable.
     ListExtend { list: ValueId, iter: ValueId },
+    /// Convert a staging list into a tuple for `*` tuple-display unpacking.
+    ListToTuple { list: ValueId },
+    /// Update a set with values produced by an iterable for `*` set-display unpacking.
+    SetUpdate { set: ValueId, iter: ValueId },
     /// Merge another mapping into a dict for `**` display unpacking.
     DictMerge { map: ValueId, other: ValueId },
     /// Merge another mapping into a call-kwargs dict, rejecting duplicate keys.

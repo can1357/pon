@@ -452,10 +452,11 @@ fn push_inst_operands(kind: &InstKind, operands: &mut Vec<IrValue>) {
                 operands.push(*val);
             }
         }
-        InstKind::ListExtend { list, iter } => {
+        InstKind::ListExtend { list, iter } | InstKind::SetUpdate { set: list, iter } => {
             operands.push(*list);
             operands.push(*iter);
         }
+        InstKind::ListToTuple { list } => operands.push(*list),
         InstKind::StoreLocal(_, value)
         | InstKind::StoreGlobal(_, value)
         | InstKind::StoreName(_, value)

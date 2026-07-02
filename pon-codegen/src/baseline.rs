@@ -133,6 +133,7 @@ pub(crate) struct HelperFuncRefs {
     pub(crate) const_float: FuncRef,
     pub(crate) const_complex: FuncRef,
     pub(crate) const_bool: FuncRef,
+    pub(crate) const_bytes: FuncRef,
     pub(crate) rich_compare: FuncRef,
     pub(crate) number_unary: FuncRef,
     pub(crate) number_binary: FuncRef,
@@ -158,6 +159,8 @@ pub(crate) struct HelperFuncRefs {
     pub(crate) list_append: FuncRef,
     pub(crate) set_add: FuncRef,
     pub(crate) list_extend: FuncRef,
+    pub(crate) list_to_tuple: FuncRef,
+    pub(crate) set_update: FuncRef,
     pub(crate) unpack_seq: FuncRef,
     pub(crate) unpack_ex: FuncRef,
     pub(crate) get_len: FuncRef,
@@ -862,6 +865,7 @@ pub(crate) fn declare_helper_refs<M: Module>(module: &mut M, helpers: &HelperRef
         const_float: module.declare_func_in_func(helpers.const_float, func),
         const_complex: module.declare_func_in_func(helpers.const_complex, func),
         const_bool: module.declare_func_in_func(helpers.const_bool, func),
+        const_bytes: module.declare_func_in_func(helpers.const_bytes, func),
         rich_compare: module.declare_func_in_func(helpers.rich_compare, func),
         number_unary: module.declare_func_in_func(helpers.number_unary, func),
         number_binary: module.declare_func_in_func(helpers.number_binary, func),
@@ -887,6 +891,8 @@ pub(crate) fn declare_helper_refs<M: Module>(module: &mut M, helpers: &HelperRef
         list_append: module.declare_func_in_func(helpers.list_append, func),
         set_add: module.declare_func_in_func(helpers.set_add, func),
         list_extend: module.declare_func_in_func(helpers.list_extend, func),
+        list_to_tuple: module.declare_func_in_func(helpers.list_to_tuple, func),
+        set_update: module.declare_func_in_func(helpers.set_update, func),
         unpack_seq: module.declare_func_in_func(helpers.unpack_seq, func),
         unpack_ex: module.declare_func_in_func(helpers.unpack_ex, func),
         get_len: module.declare_func_in_func(helpers.get_len, func),
@@ -1052,6 +1058,9 @@ pub(crate) fn lower_inst<M: Module>(
         InstKind::Const(PyConst::Complex { real, imag }) => {
             number::lower_const_complex(builder, helpers, *real, *imag, ptr_ty, exception_exit)
         }
+        InstKind::Const(PyConst::Bytes(value)) => {
+            strings::lower_const_bytes(module, builder, helpers, value, ptr_ty, exception_exit)
+        }
         InstKind::Const(_) => control::lower_future_value("Const(non Phase-A literal)"),
         InstKind::ConstRef(_) => control::lower_future_value("ConstRef"),
         InstKind::BuildTuple { elts } => container::lower_build_tuple(
@@ -1128,6 +1137,12 @@ pub(crate) fn lower_inst<M: Module>(
         ),
         InstKind::ListExtend { list, iter } => {
             container::lower_list_extend(builder, helpers.list_extend, state, *list, *iter, ptr_ty, exception_exit)
+        }
+        InstKind::ListToTuple { list } => {
+            container::lower_list_to_tuple(builder, helpers.list_to_tuple, state, *list, ptr_ty, exception_exit)
+        }
+        InstKind::SetUpdate { set, iter } => {
+            container::lower_set_update(builder, helpers.set_update, state, *set, *iter, ptr_ty, exception_exit)
         }
         InstKind::DictMerge { map, other } => {
             mapping::lower_dict_merge_with_helper(builder, helpers.dict_merge, state, *map, *other, ptr_ty, exception_exit)
@@ -1556,13 +1571,22 @@ pub(crate) fn declare_string_data<M: Module>(
     value: &str,
     ptr_ty: ir::Type,
 ) -> Result<ir::Value, CodegenError> {
+    declare_bytes_data(module, builder, value.as_bytes(), ptr_ty)
+}
+
+pub(crate) fn declare_bytes_data<M: Module>(
+    module: &mut M,
+    builder: &mut FunctionBuilder<'_>,
+    value: &[u8],
+    ptr_ty: ir::Type,
+) -> Result<ir::Value, CodegenError> {
     let data_id = module.declare_anonymous_data(false, false)?;
     let mut data = DataDescription::new();
     data.set_align(1);
     if value.is_empty() {
         data.define(vec![0_u8].into_boxed_slice());
     } else {
-        data.define(value.as_bytes().to_vec().into_boxed_slice());
+        data.define(value.to_vec().into_boxed_slice());
     }
     module.define_data(data_id, &data)?;
     let global = module.declare_data_in_func(data_id, builder.func);

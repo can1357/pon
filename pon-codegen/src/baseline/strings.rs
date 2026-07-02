@@ -5,7 +5,9 @@ use cranelift_frontend::FunctionBuilder;
 use cranelift_module::Module;
 use pon_ir::ir::{FStrPart, TStrPart};
 
-use super::{CodegenError, HelperFuncRefs, LowerState, call_pyobject_helper, declare_string_data, offset_i32};
+use super::{
+    CodegenError, HelperFuncRefs, LowerState, call_pyobject_helper, declare_bytes_data, declare_string_data, offset_i32,
+};
 
 const RAW_PART_BYTES: usize = 40;
 const RAW_PART_ALIGN_SHIFT: u8 = 3;
@@ -36,6 +38,21 @@ pub(crate) fn lower_const_str<M: Module>(
     let parts_ptr = builder.ins().stack_addr(ptr_ty, slot, 0);
     let count = builder.ins().iconst(ptr_ty, 1);
     Ok(call_pyobject_helper(builder, helpers.build_string, &[parts_ptr, count], ptr_ty, exception_exit))
+}
+
+/// Lower a Phase-A bytes literal through `pon_const_bytes`, materializing the
+/// raw byte data in the module constant pool.
+pub(crate) fn lower_const_bytes<M: Module>(
+    module: &mut M,
+    builder: &mut FunctionBuilder<'_>,
+    helpers: &HelperFuncRefs,
+    value: &[u8],
+    ptr_ty: ir::Type,
+    exception_exit: ir::Block,
+) -> Result<ir::Value, CodegenError> {
+    let data_ptr = declare_bytes_data(module, builder, value, ptr_ty)?;
+    let len = builder.ins().iconst(ptr_ty, value.len() as i64);
+    Ok(call_pyobject_helper(builder, helpers.const_bytes, &[data_ptr, len], ptr_ty, exception_exit))
 }
 
 /// Lower f-string interpolation parts through `pon_build_string`.

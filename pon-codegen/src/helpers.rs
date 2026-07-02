@@ -28,6 +28,8 @@ pub struct HelperRefs {
     pub const_bool: FuncId,
     /// `pon_const_str(*const u8, usize) -> *mut PyObject`.
     pub const_str: FuncId,
+    /// `pon_const_bytes(*const u8, usize) -> *mut PyObject`.
+    pub const_bytes: FuncId,
     /// `pon_binary_add(*mut PyObject, *mut PyObject) -> *mut PyObject`.
     pub binary_add: FuncId,
     /// `pon_rich_compare(op, lhs, rhs, feedback) -> *mut PyObject`.
@@ -84,6 +86,10 @@ pub struct HelperRefs {
     pub set_add: FuncId,
     /// `pon_list_extend(list, iterable) -> *mut PyObject`.
     pub list_extend: FuncId,
+    /// `pon_list_to_tuple(list) -> *mut PyObject`.
+    pub list_to_tuple: FuncId,
+    /// `pon_set_update(set, iterable) -> *mut PyObject`.
+    pub set_update: FuncId,
     /// `pon_unpack_seq(value, n, feedback) -> *mut *mut PyObject`.
     pub unpack_seq: FuncId,
     /// `pon_unpack_ex(value, before, after) -> *mut *mut PyObject`.
@@ -304,6 +310,7 @@ pub enum HelperId {
     NumberInplace,
     Contains,
     ConstStr,
+    ConstBytes,
     BuildString,
     BuildTemplate,
     BuildTuple,
@@ -478,6 +485,7 @@ pub static PHASE_B_HELPERS: &[HelperSig] = &[
     HelperSig { id: HelperId::NumberInplace, family: HelperFamily::Number, symbol: "pon_number_inplace", params: P_OP_OBJ_OBJ, ret: AbiShape::PyObjectPtr, feedback_trailing: 1 },
     HelperSig { id: HelperId::Contains, family: HelperFamily::Seq, symbol: "pon_contains", params: P_OBJ_OBJ, ret: AbiShape::I32, feedback_trailing: 0 },
     HelperSig { id: HelperId::ConstStr, family: HelperFamily::Str, symbol: "pon_const_str", params: P_STR_BYTES, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
+    HelperSig { id: HelperId::ConstBytes, family: HelperFamily::Str, symbol: "pon_const_bytes", params: P_STR_BYTES, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::BuildString, family: HelperFamily::Str, symbol: "pon_build_string", params: P_STR_PARTS, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::BuildTemplate, family: HelperFamily::Str, symbol: "pon_build_template", params: P_TSTR_PARTS, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
     HelperSig { id: HelperId::BuildTuple, family: HelperFamily::Seq, symbol: "pon_build_tuple", params: P_OBJ_ARR, ret: AbiShape::PyObjectPtr, feedback_trailing: 0 },
@@ -570,6 +578,7 @@ pub fn declare_helpers<M: Module>(module: &mut M) -> ModuleResult<HelperRefs> {
         const_complex: declare_one(module, "pon_const_complex")?,
         const_bool: declare_one(module, "pon_const_bool")?,
         const_str: declare_one(module, "pon_const_str")?,
+        const_bytes: declare_one(module, "pon_const_bytes")?,
         binary_add: declare_one(module, "pon_binary_add")?,
         rich_compare: declare_one(module, "pon_rich_compare")?,
         number_unary: declare_one(module, "pon_number_unary")?,
@@ -598,6 +607,8 @@ pub fn declare_helpers<M: Module>(module: &mut M) -> ModuleResult<HelperRefs> {
         list_append: declare_one(module, "pon_list_append")?,
         set_add: declare_one(module, "pon_set_add")?,
         list_extend: declare_one(module, "pon_list_extend")?,
+        list_to_tuple: declare_one(module, "pon_list_to_tuple")?,
+        set_update: declare_one(module, "pon_set_update")?,
         unpack_seq: declare_one(module, "pon_unpack_seq")?,
         unpack_ex: declare_one(module, "pon_unpack_ex")?,
         get_len: declare_one(module, "pon_get_len")?,

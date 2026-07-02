@@ -731,10 +731,17 @@ impl LoweringDriver {
             );
         }
         if tuple.elts.iter().any(|elt| matches!(elt, Expr::Starred(_))) {
-            return unsupported_at(
-                "starred tuple literal",
-                span_bounds(tuple.range.start().to_u32(), tuple.range.end().to_u32()),
-            );
+            let list = scope.emit(InstKind::BuildList { elts: Vec::new() })?;
+            for elt in &tuple.elts {
+                if let Expr::Starred(starred) = elt {
+                    let iter = self.lower_expr(scope, &starred.value)?;
+                    scope.emit(InstKind::ListExtend { list, iter })?;
+                } else {
+                    let item = self.lower_expr(scope, elt)?;
+                    scope.emit(InstKind::ListAppend { list, item })?;
+                }
+            }
+            return scope.emit(InstKind::ListToTuple { list });
         }
         let mut elts = Vec::with_capacity(tuple.elts.len());
         for elt in &tuple.elts {
@@ -748,14 +755,21 @@ impl LoweringDriver {
         scope: &mut BodyScope,
         set: &ruff_python_ast::ExprSet,
     ) -> Result<Value, LowerError> {
+        if set.elts.iter().any(|elt| matches!(elt, Expr::Starred(_))) {
+            let value = scope.emit(InstKind::BuildSet { elts: Vec::new() })?;
+            for elt in &set.elts {
+                if let Expr::Starred(starred) = elt {
+                    let iter = self.lower_expr(scope, &starred.value)?;
+                    scope.emit(InstKind::SetUpdate { set: value, iter })?;
+                } else {
+                    let item = self.lower_expr(scope, elt)?;
+                    scope.emit(InstKind::SetAdd { set: value, item })?;
+                }
+            }
+            return Ok(value);
+        }
         let mut elts = Vec::with_capacity(set.elts.len());
         for elt in &set.elts {
-            if matches!(elt, Expr::Starred(_)) {
-                return unsupported_at(
-                    "starred set literal",
-                    span_bounds(set.range.start().to_u32(), set.range.end().to_u32()),
-                );
-            }
             elts.push(self.lower_expr(scope, elt)?);
         }
         scope.emit(InstKind::BuildSet { elts })

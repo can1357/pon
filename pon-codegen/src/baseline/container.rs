@@ -113,6 +113,34 @@ pub(crate) fn lower_list_extend(
     Ok(call_pyobject_helper(builder, helper, &[list, iter], ptr_ty, exception_exit))
 }
 
+/// Lower staging-list-to-tuple conversion through `pon_list_to_tuple(list)`.
+pub(crate) fn lower_list_to_tuple(
+    builder: &mut FunctionBuilder<'_>,
+    helper: ir::FuncRef,
+    state: &LowerState,
+    list: IrValue,
+    ptr_ty: ir::Type,
+    exception_exit: ir::Block,
+) -> Result<ir::Value, CodegenError> {
+    let list = state.value(list)?;
+    Ok(call_pyobject_helper(builder, helper, &[list], ptr_ty, exception_exit))
+}
+
+/// Lower set update through `pon_set_update(set, iterable)`.
+pub(crate) fn lower_set_update(
+    builder: &mut FunctionBuilder<'_>,
+    helper: ir::FuncRef,
+    state: &LowerState,
+    set: IrValue,
+    iter: IrValue,
+    ptr_ty: ir::Type,
+    exception_exit: ir::Block,
+) -> Result<ir::Value, CodegenError> {
+    let set = state.value(set)?;
+    let iter = state.value(iter)?;
+    Ok(call_pyobject_helper(builder, helper, &[set, iter], ptr_ty, exception_exit))
+}
+
 /// Lower exact sequence unpack through `pon_unpack_seq(value, n, feedback=NULL)`.
 pub(crate) fn lower_unpack_seq(
     builder: &mut FunctionBuilder<'_>,

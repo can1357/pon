@@ -533,10 +533,11 @@ fn rewrite_operands(kind: &mut InstKind, f: &mut impl FnMut(&mut Value)) {
             f(key);
             f(val);
         }
-        InstKind::ListExtend { list, iter } => {
+        InstKind::ListExtend { list, iter } | InstKind::SetUpdate { set: list, iter } => {
             f(list);
             f(iter);
         }
+        InstKind::ListToTuple { list } => f(list),
         InstKind::DictMerge { map, other } | InstKind::DictMergeUnique { map, other } => {
             f(map);
             f(other);
