@@ -2,13 +2,24 @@ pub mod build;
 
 use crate::env::EnvLayout;
 use crate::error::{Error, Result};
-use crate::install::{InstallReport, ResolvedRecord};
+use crate::index::PackageIndex;
+use crate::install::{InstallReport, PackageArtifact, ResolvedRecord};
 use crate::names;
 
-use self::build::{BuildRequest, CatalogSdistBuilder, SdistBuilder};
+use self::build::{BuildRequest, CatalogSdistBuilder, Pep517Builder, SdistBuilder};
 
 pub fn install_sdist(env: &EnvLayout, resolved_record: &ResolvedRecord, filename: &str) -> Result<InstallReport> {
     install_sdist_with_builder(env, resolved_record, filename, &CatalogSdistBuilder)
+}
+
+pub fn install_sdist_with_index(
+    env: &EnvLayout,
+    resolved_record: &ResolvedRecord,
+    filename: &str,
+    index: &impl PackageIndex,
+) -> Result<InstallReport> {
+    let builder = Pep517Builder::new(index);
+    install_sdist_with_builder(env, resolved_record, filename, &builder)
 }
 
 pub fn install_sdist_with_builder(
@@ -17,6 +28,29 @@ pub fn install_sdist_with_builder(
     filename: &str,
     builder: &impl SdistBuilder,
 ) -> Result<InstallReport> {
+    let wheel_record = build_sdist_with_builder(env, resolved_record, filename, builder)?;
+    let PackageArtifact::Wheel { path: wheel_path, .. } = &wheel_record.artifact else {
+        unreachable!("built sdist record is always a wheel");
+    };
+    crate::wheel::install_wheel(env, &wheel_record, wheel_path, None)
+}
+
+pub fn build_sdist_with_index(
+    env: &EnvLayout,
+    resolved_record: &ResolvedRecord,
+    filename: &str,
+    index: &impl PackageIndex,
+) -> Result<ResolvedRecord> {
+    let builder = Pep517Builder::new(index);
+    build_sdist_with_builder(env, resolved_record, filename, &builder)
+}
+
+pub fn build_sdist_with_builder(
+    env: &EnvLayout,
+    resolved_record: &ResolvedRecord,
+    filename: &str,
+    builder: &impl SdistBuilder,
+) -> Result<ResolvedRecord> {
     let normalized_name = normalized_name_from_sdist(filename)?;
     let resolved_name = resolved_record.normalized_name();
     if normalized_name != resolved_name {
@@ -31,8 +65,7 @@ pub fn install_sdist_with_builder(
         filename,
     })?;
     let wheel_path = std::path::PathBuf::from(&build_artifact.wheel_filename);
-    let wheel_record = ResolvedRecord::wheel(&resolved_record.name, &resolved_record.version, &wheel_path);
-    crate::wheel::install_wheel(env, &wheel_record, &wheel_path, None)
+    Ok(ResolvedRecord::wheel(&resolved_record.name, &resolved_record.version, &wheel_path))
 }
 
 fn normalized_name_from_sdist(filename: &str) -> Result<String> {

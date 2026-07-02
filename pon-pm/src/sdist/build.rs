@@ -37,12 +37,31 @@ pub trait SdistBuilder {
 }
 
 pub struct CatalogSdistBuilder;
+
+pub struct Pep517Builder<'a, I: PackageIndex + ?Sized> {
+    index: &'a I,
+}
+
+static CATALOG_SDIST_INDEX: CatalogIndex = CatalogIndex;
+
 const DEFAULT_BUILD_BACKEND: &str = "setuptools.build_meta:__legacy__";
 const DEFAULT_BUILD_REQUIRES: &[&str] = &["setuptools>=40.8.0"];
 const GET_REQUIRES_OUTPUT: &str = "__pon_pep517_requires.txt";
 
+impl<'a, I: PackageIndex + ?Sized> Pep517Builder<'a, I> {
+    #[must_use]
+    pub fn new(index: &'a I) -> Self {
+        Self { index }
+    }
+}
 
 impl SdistBuilder for CatalogSdistBuilder {
+    fn build(&self, request: &BuildRequest<'_>) -> Result<BuildArtifact> {
+        Pep517Builder::new(&CATALOG_SDIST_INDEX).build(request)
+    }
+}
+
+impl<I: PackageIndex + ?Sized> SdistBuilder for Pep517Builder<'_, I> {
     fn build(&self, request: &BuildRequest<'_>) -> Result<BuildArtifact> {
         let archive_path = sdist_source_path(request.filename)?;
         let archive_hash = sha256_file(&archive_path)?;
@@ -68,8 +87,7 @@ impl SdistBuilder for CatalogSdistBuilder {
         let can_use_fixture_bridge = can_use_flit_fixture_bridge(request, build_backend);
 
         let build_env = EnvLayout::new(temp_root.join("build-env"));
-        let index = CatalogIndex::new();
-        let static_requirements_result = install_build_requirements(&build_env, &index, &build_system.requires);
+        let static_requirements_result = install_build_requirements(&build_env, self.index, &build_system.requires);
         // If static requirements are unavailable, still try the hook once; a missing
         // backend should surface with the standard backend-import classification.
         let dynamic_requirements = match run_get_requires_for_build_wheel_hook(
@@ -86,7 +104,7 @@ impl SdistBuilder for CatalogSdistBuilder {
             Err(error) => return Err(error),
         };
         static_requirements_result.map_err(|error| classify_build_requirement_error(build_backend, error))?;
-        install_build_requirements(&build_env, &index, &dynamic_requirements)
+        install_build_requirements(&build_env, self.index, &dynamic_requirements)
             .map_err(|error| classify_build_requirement_error(build_backend, error))?;
 
         let hook_result = run_build_wheel_hook(
@@ -243,7 +261,7 @@ fn locate_project_root(unpack_root: &Path) -> Result<PathBuf> {
     }
 }
 
-fn install_build_requirements<I: PackageIndex>(build_env: &EnvLayout, index: &I, requirements: &[String]) -> Result<()> {
+fn install_build_requirements<I: PackageIndex + ?Sized>(build_env: &EnvLayout, index: &I, requirements: &[String]) -> Result<()> {
     if requirements.is_empty() {
         return Ok(());
     }
@@ -255,7 +273,7 @@ fn install_build_requirements<I: PackageIndex>(build_env: &EnvLayout, index: &I,
     Ok(())
 }
 
-fn build_requirement_record<I: PackageIndex>(
+fn build_requirement_record<I: PackageIndex + ?Sized>(
     index: &I,
     record: &crate::resolve::source::PackageRecord,
 ) -> Result<ResolvedRecord> {
@@ -276,7 +294,7 @@ fn build_requirement_record<I: PackageIndex>(
     }
 }
 
-fn package_filename<I: PackageIndex>(index: &I, name: &str, version: &str) -> Result<String> {
+fn package_filename<I: PackageIndex + ?Sized>(index: &I, name: &str, version: &str) -> Result<String> {
     let project = index
         .lookup(name)?
         .ok_or_else(|| Error::InvalidRequirement(format!("unknown build requirement `{name}`")))?;
