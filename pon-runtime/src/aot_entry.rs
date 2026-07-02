@@ -194,6 +194,10 @@ mod tests {
         let _: ModuleMain = super::pon_module_main;
 
         let _guard = test_state_lock();
+        // Parallel tests share one process-global error slot: drop any stale
+        // pending error another test left behind so the entry path's
+        // `pon_err_occurred()` gates see the fresh-process state they assume.
+        crate::thread_state::pon_err_clear();
         MODULE_MAIN_CALLS.store(0, Ordering::SeqCst);
 
         let exit_code = unsafe { pon_aot_entry_impl(0, ptr::null()) };

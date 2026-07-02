@@ -48,6 +48,7 @@ pub fn for_each_builtin(mut f: impl FnMut(&'static str, usize, *const u8)) {
     builtin!("str", VARIADIC_ARITY, builtin_str);
     builtin!("format", VARIADIC_ARITY, super::builtins_batch::builtin_format);
     builtin!("hash", 1, builtin_hash);
+    builtin!("id", 1, builtin_id);
     builtin!("sorted", VARIADIC_ARITY, super::builtins_batch::builtin_sorted);
     builtin!("enumerate", VARIADIC_ARITY, builtin_enumerate);
     builtin!("zip", VARIADIC_ARITY, super::builtins_batch::builtin_zip);
@@ -1189,6 +1190,17 @@ pub unsafe extern "C" fn builtin_hash(argv: *mut *mut PyObject, argc: usize) -> 
     }
 }
 
+/// `id(object)`: the object's address (CPython contract: an integer unique
+/// and constant for the object's lifetime).  Tagged small ints use their
+/// tagged bits directly — equal immediates share an id, mirroring CPython's
+/// small-int interning.
+pub unsafe extern "C" fn builtin_id(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { exact_args(argv, argc, 1, "id") }) else {
+        return ptr::null_mut();
+    };
+    unsafe { abi::pon_const_int(args[0] as i64) }
+}
+
 /// `hash()`-builtin value domain, shared by the boxed entry point and the
 /// weakref delegation (which must recurse on values to cache them).
 unsafe fn builtin_hash_value(object: *mut PyObject) -> Result<i64, String> {
@@ -1778,7 +1790,7 @@ pub unsafe extern "C" fn builtin_callable(argv: *mut *mut PyObject, argc: usize)
     let Some(args) = (unsafe { exact_args(argv, argc, 1, "callable") }) else {
         return ptr::null_mut();
     };
-    let result = unsafe { type_name(args[0]).is_some_and(|name| matches!(name, "function" | "method" | "type")) };
+    let result = unsafe { is_callable_object(args[0]) };
     unsafe { abi::number::pon_const_bool(i32::from(result)) }
 }
 
@@ -1844,7 +1856,7 @@ fn dispatch_str_dunder(object: *mut PyObject, name: &str, terminus: *mut PyObjec
         return None;
     }
     let ty = unsafe { (*object).ob_type.cast_mut() };
-    if ty.is_null() || unsafe { (*ty).gc_type_id } != crate::types::type_::TYPE_ID_HEAP_INSTANCE.0 as usize {
+    if !crate::types::type_::type_dispatches_python_dunders(ty.cast_const()) {
         return None;
     }
     let hook = unsafe { crate::descr::lookup_in_type(ty, intern(name)) };
@@ -2161,7 +2173,14 @@ unsafe fn exception_message_text(object: *mut PyObject, mut ty: *const PyType) -
     while !ty.is_null() {
         if unsafe { (*ty).name() == "BaseException" } {
             // SAFETY: Reaching BaseException in the type chain proves compatible layout.
-            let message = unsafe { (*object.cast::<PyBaseException>()).message };
+            let exception = unsafe { &*object.cast::<PyBaseException>() };
+            // CPython `BaseException.__str__`: `len(args) != 1` stringifies
+            // the whole args tuple; the stored tuple is non-NULL exactly for
+            // multi-argument constructors.
+            if !exception.args.is_null() {
+                return Some(repr_text(exception.args));
+            }
+            let message = exception.message;
             if message.is_null() {
                 return Some(String::new());
             }
@@ -2245,7 +2264,30 @@ unsafe fn type_object(object: *mut PyObject) -> Option<*mut PyType> {
     }
 }
 unsafe fn is_callable_object(object: *mut PyObject) -> bool {
-    unsafe { type_name(object).is_some_and(|name| matches!(name, "function" | "method" | "type")) }
+    // CPython `callable(o)` is `type(o)->tp_call != NULL`.  pon's function/
+    // method/type objects dispatch through dedicated `pon_call` fast paths
+    // without tp_call slots, so they are named explicitly; everything else is
+    // callable when its type carries tp_call or its MRO defines `__call__`
+    // (heap instances go through the DunderCall path).
+    // Tagged small ints are ints: never callable, and must not be
+    // dereferenced as heap pointers.
+    if crate::tag::is_small_int(object) {
+        return false;
+    }
+    if unsafe { type_name(object).is_some_and(|name| matches!(name, "function" | "method" | "type")) } {
+        return true;
+    }
+    if object.is_null() {
+        return false;
+    }
+    let ty = unsafe { (*object).ob_type.cast_mut() };
+    if ty.is_null() {
+        return false;
+    }
+    if unsafe { (*ty).tp_call.is_some() } {
+        return true;
+    }
+    !unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern(crate::intern::DUNDER_CALL)) }.is_null()
 }
 
 

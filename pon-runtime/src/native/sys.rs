@@ -1,5 +1,7 @@
 //! Native `sys` module seed for WS-IMPORT.
 
+use num_traits::ToPrimitive;
+
 use crate::abi::{pon_const_int, pon_const_str, pon_make_function, return_null_with_error};
 use crate::intern::intern;
 use crate::object::PyObject;
@@ -28,6 +30,8 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         function_attr("intern", sys_intern),
         function_attr("exception", sys_exception),
         function_attr("exc_info", sys_exc_info),
+        std_stream_attr("stdout", 1),
+        std_stream_attr("stderr", 2),
     ];
     install_module("sys", attrs.into_iter().collect::<Result<Vec<_>, _>>()?)
 }
@@ -35,6 +39,17 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 fn string_attr(name: &str, value: &str) -> Result<(u32, *mut PyObject), String> {
     // SAFETY: Runtime allocation helpers return NULL with a diagnostic on failure.
     let object = unsafe { pon_const_str(value.as_ptr(), value.len()) };
+    (!object.is_null())
+        .then_some((intern(name), object))
+        .ok_or_else(|| format!("failed to allocate sys.{name}"))
+}
+
+/// `sys.stdout`/`sys.stderr`: writable text streams over the process fds
+/// (see `io::std_stream_object`).  `print()` writes host stdout directly and
+/// does not consult `sys.stdout`; these objects serve explicit stream users
+/// (unittest's TextTestRunner writes to `sys.stderr`).
+fn std_stream_attr(name: &str, fd: i32) -> Result<(u32, *mut PyObject), String> {
+    let object = super::io::std_stream_object(fd, &format!("<{name}>"));
     (!object.is_null())
         .then_some((intern(name), object))
         .ok_or_else(|| format!("failed to allocate sys.{name}"))
@@ -116,31 +131,39 @@ fn function_attr(
 ///
 /// pon materializes Python frames only on generator resume and raise paths,
 /// so this synthesizes a fresh empty frame of the shared runtime `frame` type
-/// per call.  The optional `depth` argument is accepted and loosely honored:
-/// it must be an `int` (mirroring CPython's TypeError contract) but every
-/// depth observes the same synthesized current frame — no `f_back` chain
-/// exists to walk.  `_collections_abc`'s PEP 667 probe
-/// (`type(sys._getframe().f_locals)`) only needs the frame's `f_locals` type
-/// identity, served by `crate::types::frame::frame_getattro`.
+/// per call.  The `depth` argument must be an `int` (mirroring CPython's
+/// TypeError contract) and selects which compiled call-stack entry donates
+/// the frame's `f_globals` namespace: the defining module of the function
+/// `depth` levels above the `_getframe` call, the active module when the
+/// walk runs past the tracked stack (module-toplevel frames; also CPython's
+/// too-deep ValueError case, loosened here).  Negative depths clamp to the
+/// current frame like CPython.  No `f_back` chain exists to walk;
+/// `_collections_abc`'s PEP 667 probe (`type(sys._getframe().f_locals)`)
+/// only needs the frame's `f_locals` type identity, served by
+/// `crate::types::frame::frame_getattro`.
 unsafe extern "C" fn sys_getframe(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     if argc > 1 {
         return return_null_with_error(format!("_getframe() takes at most 1 argument ({argc} given)"));
     }
+    let mut depth = 0usize;
     if argc == 1 {
         if argv.is_null() {
             return return_null_with_error("argv pointer is null");
         }
         // SAFETY: `argv` carries `argc` argument slots per the call ABI.
-        let depth = crate::tag::untag_arg(unsafe { *argv });
-        if depth.is_null() {
+        let depth_object = crate::tag::untag_arg(unsafe { *argv });
+        if depth_object.is_null() {
             // Boxing a tagged immediate failed; the error is already recorded.
             return core::ptr::null_mut();
         }
-        if unsafe { crate::types::int::to_bigint_including_bool(depth) }.is_none() {
+        let Some(value) = (unsafe { crate::types::int::to_bigint_including_bool(depth_object) }) else {
             return return_null_with_error("_getframe() argument must be int");
-        }
+        };
+        depth = value.to_usize().unwrap_or(0);
     }
-    crate::types::frame::synthesize_frame_object()
+    let globals_module = crate::abi::frame_defining_module_for_depth(depth, sys_getframe as *const u8)
+        .or_else(crate::import::active_module_name_id);
+    crate::types::frame::synthesize_frame_object(globals_module)
 }
 
 /// `sys.intern(string)`.

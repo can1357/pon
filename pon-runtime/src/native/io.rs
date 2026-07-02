@@ -69,8 +69,10 @@ static TEXT_FILE_TYPE: LazyLock<usize> = LazyLock::new(|| {
         std::mem::size_of::<PyNativeFile>(),
     ));
     ty.tp_getattro = Some(file_getattro);
+    ty.tp_setattro = Some(file_setattro);
     ty.tp_iter = Some(file_iter_slot);
     ty.tp_iternext = Some(file_iternext_slot);
+    ty.tp_new = Some(text_file_new);
     Box::into_raw(ty) as usize
 });
 
@@ -81,10 +83,88 @@ static BINARY_FILE_TYPE: LazyLock<usize> = LazyLock::new(|| {
         std::mem::size_of::<PyNativeFile>(),
     ));
     ty.tp_getattro = Some(file_getattro);
+    ty.tp_setattro = Some(file_setattro);
     ty.tp_iter = Some(file_iter_slot);
     ty.tp_iternext = Some(file_iternext_slot);
     Box::into_raw(ty) as usize
 });
+
+/// `tp_new` for `_io.TextIOWrapper(buffer, encoding=None, ...)`: wraps an
+/// open native binary stream by duplicating its host handle (dup semantics:
+/// shared offset, exactly what `tokenize.open`'s `buffer.seek(0)` +
+/// wrap-then-readlines sequence expects).  Extra positional/keyword options
+/// beyond `encoding` are accepted and ignored: pon's native text stream is
+/// always line-translating UTF-8.
+unsafe extern "C" fn text_file_new(_cls: *mut PyType, args: *mut PyObject, _kwargs: *mut PyObject) -> *mut PyObject {
+    let positional = match unsafe { type_::positional_args_from_object(args) } {
+        Ok(args) => args,
+        Err(message) => {
+            pon_err_set(message);
+            return ptr::null_mut();
+        }
+    };
+    if positional.is_empty() {
+        return raise_type_error("TextIOWrapper() missing required argument 'buffer'");
+    }
+    if let Some(&encoding) = positional.get(1) {
+        if !is_none(encoding) {
+            let Some(text) = (unsafe { type_::unicode_text(encoding) }) else {
+                return raise_type_error("TextIOWrapper() encoding must be str or None");
+            };
+            if !text.eq_ignore_ascii_case("utf-8") && !text.eq_ignore_ascii_case("utf8") {
+                return raise_io_error(&format!("unsupported encoding: {text}"));
+            }
+        }
+    }
+    let Some(buffer) = (unsafe { as_file(positional[0]) }) else {
+        return raise_type_error("TextIOWrapper() buffer must be an open native file");
+    };
+    let Some(handle) = buffer.file.as_ref() else {
+        return raise_value_error("I/O operation on closed file.");
+    };
+    let Ok(clone) = handle.try_clone() else {
+        return raise_io_error("failed to duplicate stream handle");
+    };
+    Box::into_raw(Box::new(PyNativeFile {
+        ob_base: PyObjectHeader::new(text_file_type()),
+        file: Some(clone),
+        name: buffer.name.clone(),
+        mode: "r".to_owned(),
+        binary: false,
+        readable: buffer.readable,
+        writable: buffer.writable,
+        append: buffer.append,
+        encoding: Some("utf-8".to_owned()),
+        newline: NewlineMode::UniversalTranslate,
+    }))
+    .cast::<PyObject>()
+}
+
+/// `tp_setattro` for native files: only the Python-visible `mode` label is
+/// assignable (`tokenize.open` stamps `text.mode = 'r'`); everything else
+/// raises AttributeError to keep the frontier loud.
+unsafe extern "C" fn file_setattro(object: *mut PyObject, name: *mut PyObject, value: *mut PyObject) -> core::ffi::c_int {
+    let Some(attr) = (unsafe { type_::unicode_text(name) }) else {
+        pon_err_set("file attribute name must be str");
+        return -1;
+    };
+    let Some(file) = (unsafe { as_file(object) }) else {
+        pon_err_set("file attribute receiver is not a native file");
+        return -1;
+    };
+    if attr == "mode" {
+        let Some(text) = (unsafe { type_::unicode_text(crate::tag::untag_arg(value)) }) else {
+            pon_err_set("file mode must be str");
+            return -1;
+        };
+        file.mode = text.to_owned();
+        return 0;
+    }
+    let message = format!("'{}' object attribute '{attr}' is read-only", unsafe { (*(*object).ob_type).name() });
+    // SAFETY-free typed raise: catchable AttributeError with the CPython text.
+    let _ = crate::abi::exc::raise_attribute_error_text(&message);
+    -1
+}
 
 fn text_file_type() -> *mut PyType {
     *TEXT_FILE_TYPE as *mut PyType
@@ -514,6 +594,31 @@ fn alloc_file(file: File, name: String, mode: OpenMode, encoding: Option<String>
         append: mode.append,
         encoding,
         newline,
+    }))
+    .cast::<PyObject>()
+}
+
+/// Process-level std stream (`sys.stdout`/`sys.stderr`) as a text-mode
+/// native file over the raw fd.  The object lives in the `sys` module for
+/// the process lifetime, so the `File` never drops (the fd is never closed
+/// underneath libc); an explicit Python-level `close()` closes the real
+/// stream, exactly like CPython.
+pub(super) fn std_stream_object(fd: i32, name: &str) -> *mut PyObject {
+    use std::os::fd::FromRawFd;
+    // SAFETY: fds 1/2 are open for the process lifetime; ownership is parked
+    // in a static module attribute, never dropped.
+    let file = unsafe { File::from_raw_fd(fd) };
+    Box::into_raw(Box::new(PyNativeFile {
+        ob_base: PyObjectHeader::new(text_file_type()),
+        file: Some(file),
+        name: name.to_owned(),
+        mode: "w".to_owned(),
+        binary: false,
+        readable: false,
+        writable: true,
+        append: false,
+        encoding: Some("utf-8".to_owned()),
+        newline: NewlineMode::Preserve,
     }))
     .cast::<PyObject>()
 }
@@ -1263,6 +1368,9 @@ mod tests {
     fn x_mode_collision_reports_error() {
         let _guard = test_state_lock();
         init_runtime();
+        // Hermetic entry state: a stale pending error from a prior test would
+        // win over this test's raise (`pon_err_set` preserve discipline).
+        pon_err_clear();
         let path = tmp_path("x-collision.txt");
         std::fs::write(&path, b"already here").unwrap();
         let mut args = [str_obj(&path), str_obj("x")];
