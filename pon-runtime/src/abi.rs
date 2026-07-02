@@ -2794,12 +2794,14 @@ unsafe fn call_exception_type_with_keywords(
         let mut new_argv = Vec::with_capacity(args.len().saturating_add(1));
         new_argv.push(callee);
         new_argv.extend_from_slice(args);
-        let instance = if function::function_record(callable).is_some() {
-            unsafe { call_phase_b_function(callable, &new_argv, keywords, None, None) }
-        } else {
-            match unsafe { function::call_bound_function(callable, &new_argv, keywords, None, None) } {
-                Ok(result) => result,
-                Err(message) => return return_null_with_error(message),
+        // Both function flavors bind through `call_bound_function`; a
+        // binding failure inside type_call is a TypeError in CPython, so
+        // keep it typed — `except TypeError` must catch it and no raise
+        // site may morph it.
+        let instance = match unsafe { function::call_bound_function(callable, &new_argv, keywords, None, None) } {
+            Ok(result) => result,
+            Err(message) => {
+                return exc::raise_kind_error_text(crate::types::exc::ExceptionKind::TypeError, &message);
             }
         };
         if instance.is_null() {
@@ -2834,12 +2836,11 @@ unsafe fn call_exception_type_with_keywords(
         let mut positional = Vec::with_capacity(args.len().saturating_add(1));
         positional.push(instance);
         positional.extend_from_slice(args);
-        let result = if function::function_record(init).is_some() {
-            unsafe { call_phase_b_function(init, &positional, keywords, None, None) }
-        } else {
-            match unsafe { function::call_bound_function(init, &positional, keywords, None, None) } {
-                Ok(result) => result,
-                Err(message) => return return_null_with_error(message),
+        // Typed for the same reason as the `__new__` leg above.
+        let result = match unsafe { function::call_bound_function(init, &positional, keywords, None, None) } {
+            Ok(result) => result,
+            Err(message) => {
+                return exc::raise_kind_error_text(crate::types::exc::ExceptionKind::TypeError, &message);
             }
         };
         if result.is_null() {
