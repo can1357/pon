@@ -10,6 +10,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Expose python3.14 alias
+        run: |
+          if ! command -v python3.14 &> /dev/null; then
+            sudo ln -sf $(which python) /usr/local/bin/python3.14
+          fi
       - name: Phase A slice corpus
         run: cargo run -p pon-conformance -- --suite slice
       - name: Phase B CPython floor
