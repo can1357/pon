@@ -42,6 +42,7 @@ mod sre;
 mod string_mod;
 mod struct_;
 mod sys;
+mod sysconfigdata;
 pub(crate) mod thread;
 mod time;
 mod tokenize;
@@ -66,6 +67,9 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
     ("_sre", sre::make_module),
     ("_string", string_mod::make_module),
     ("_struct", struct_::make_module),
+    // Name is cfg-selected per target (`_sysconfigdata__darwin_` /
+    // `_sysconfigdata__linux_`); the row sorts identically either way.
+    (sysconfigdata::MODULE_NAME, sysconfigdata::make_module),
     ("_thread", thread::make_module),
     ("_tokenize", tokenize::make_module),
     ("_warnings", imp::make_warnings_module),
