@@ -250,12 +250,14 @@ pub unsafe extern "C" fn trace_payload_subclass_instance(object: *mut u8, visito
     }
 }
 
-/// Finalizes a payload-subclass instance: heap-instance semantics only (the
-/// payload is an independently managed object).
+/// Finalizes a payload-subclass instance: heap-instance semantics, plus
+/// detaching an embedded canonical weakref payload so referent death can
+/// never call back through the freed wrapper.
 pub unsafe extern "C" fn finalize_payload_subclass_instance(object: *mut u8) {
     if object.is_null() {
         return;
     }
+    unsafe { crate::types::weakref::detach_wrapper_payload(object.cast::<PyObject>()) };
     unsafe { crate::types::weakref::finalize_heap_instance(object) };
 }
 
@@ -1039,6 +1041,35 @@ unsafe fn wrap_dunder_new_as_staticmethod(namespace: *mut PyClassDict) {
     }
 }
 
+/// CPython `type_new_set_attrs` parity: a plain function `__init_subclass__`
+/// in the class namespace is implicitly wrapped in a `classmethod` carrier
+/// before the namespace becomes `tp_dict` (PEP 487).  Without the carrier a
+/// chained `super().__init_subclass__(**kwargs)` resolves the parent hook as
+/// an unbound plain function and loses the `cls` argument.  The
+/// `PyFunction_Check` gate matches `wrap_dunder_new_as_staticmethod`.
+unsafe fn wrap_init_subclass_as_classmethod(namespace: *mut PyClassDict) {
+    let init_id = intern::intern("__init_subclass__");
+    let Some(value) = (unsafe { (&*namespace).get(init_id) }) else {
+        return;
+    };
+    if unsafe { object_type_display(value) } != "function" {
+        return;
+    }
+    let Some(carrier_type) = abi::runtime_global(intern::intern("classmethod")) else {
+        return;
+    };
+    if unsafe { !is_type_object(carrier_type) } {
+        return;
+    }
+    // SAFETY: `carrier_type` is the builtin classmethod type object and
+    // `value` is a live function object owned by the namespace (the
+    // `wrap_dunder_new_as_staticmethod` contract).
+    let carrier = unsafe { crate::types::classmethod::new_classmethod(carrier_type.cast::<PyType>(), value) };
+    if !carrier.is_null() {
+        unsafe { (&mut *namespace).set(init_id, carrier) };
+    }
+}
+
 /// CPython `type_new` rule: a class whose namespace defines `__eq__` without
 /// defining `__hash__` gets `__hash__ = None` stamped into the namespace
 /// before it becomes `tp_dict` — instances then resolve the None marker
@@ -1072,6 +1103,7 @@ unsafe fn construct_class(
         return raise_object("class namespace is NULL");
     }
     unsafe { wrap_dunder_new_as_staticmethod(namespace) };
+    unsafe { wrap_init_subclass_as_classmethod(namespace) };
     unsafe { stamp_unhashable_for_eq_without_hash(namespace) };
     // CPython: `class C:` means `class C(object):` — the implicit terminus
     // applies to the CONSTRUCTED type (tp_base, MRO, registries) while the
@@ -1131,6 +1163,13 @@ unsafe fn construct_class(
         // the new class can resolve through it.
         crate::abi::seq::ensure_tuple_subclass_surface();
         mem::size_of::<crate::types::tuple::PyTupleSubclassInstance>()
+    } else if unsafe { crate::types::weakref::class_bases_embed_weakref(base_types) } {
+        // Classes linearizing over `weakref.ref` (importlib bootstrap's
+        // `KeyedRef`) reuse the payload layout with a canonical registered
+        // ref as the payload; the ref type's `__new__`/`__call__` surface
+        // must exist before MRO lookups on the new class resolve through it.
+        crate::types::weakref::ensure_weakref_subclass_surface();
+        mem::size_of::<PyPayloadSubclassInstance>()
     } else if unsafe { class_bases_embed_payload(base_types) } {
         // Classes linearizing over `str`/`int` embed a canonical payload
         // slot; the distinct basicsize is the layout marker

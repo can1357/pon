@@ -11,6 +11,7 @@
 use core::ffi::c_int;
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::Ordering;
 use std::mem;
 use std::ptr;
 use std::sync::{LazyLock, Mutex};
@@ -1309,21 +1310,26 @@ pub unsafe fn call_bound_function(
     star: Option<*mut PyObject>,
     dstar: Option<*mut PyObject>,
 ) -> Result<*mut PyObject, String> {
-    let record = function_record(function);
     let mut argv = bind_arguments(function, positional, keywords, star, dstar)?;
     // Generator/coroutine functions need no special casing here: the compiled
     // stub at the function's entry allocates the frame and returns the
     // generator object itself (pin J0.1 §4.0).
-    let code = if let Some(record) = record {
-        record.entry
-    } else {
-        // SAFETY: The caller has already established that this is a function.
-        unsafe { (*function.cast::<PyFunction>()).code }
-    };
+    //
+    // Tier-up parity with the record-less code-pointer path in `pon_call`:
+    // bump the call-hotness probe, then dispatch through the live `entry`
+    // cell so an installed tier-1 body is actually entered.  The record's
+    // `entry` is a creation-time tier-0 snapshot and must never pin dispatch
+    // to tier-0 (both tiers share the bound `(argv, argc)` ABI).
+    let function = function.cast::<PyFunction>();
+    // SAFETY: `bind_arguments` only succeeds for live function objects.
+    unsafe { crate::abi::pon_tierup_bump_call(function) };
+    // SAFETY: See above; `entry` is initialized to the tier-0 code pointer at
+    // allocation and only ever replaced by the tier-up install protocol.
+    let code = unsafe { (*function).entry.load(Ordering::Acquire) }.cast_const();
     if code.is_null() {
         return Err("function code pointer is null".to_owned());
     }
-    let _guard = crate::abi::push_current_call(function.cast::<PyFunction>(), argv.as_mut_ptr(), argv.len());
+    let _guard = crate::abi::push_current_call(function, argv.as_mut_ptr(), argv.len());
     let _handled_guard = crate::abi::HandledExcGuard::enter();
     pon_err_clear();
     // SAFETY: Function entrypoints are emitted with the compiled-code ABI.
