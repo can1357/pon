@@ -163,3 +163,7 @@ pon-conformance/corpus/cpython/time_utc.py
 pon-conformance/corpus/cpython/atexit_basic.py
 pon-conformance/corpus/cpython/weakref_dicts.py
 pon-conformance/corpus/cpython/type_dict_descriptors.py
+pon-conformance/corpus/cpython/seq_ordering.py
+pon-conformance/corpus/cpython/str_hash_parity.py
+
+pon-conformance/corpus/cpython/dict_union.py
