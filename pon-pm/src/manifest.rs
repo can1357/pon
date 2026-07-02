@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -7,7 +6,7 @@ use crate::names;
 
 #[path = "pyproject.rs"]
 pub mod pyproject;
-pub use pyproject::{BuildSystem, PonSource, PyProject};
+pub use self::pyproject::{BuildSystem, PonSource, PyProject};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Requirement {
@@ -161,6 +160,7 @@ pub fn remove_dependency(path: impl AsRef<Path>, name: impl AsRef<str>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn temp_path(name: &str) -> PathBuf {
         let unique = format!(

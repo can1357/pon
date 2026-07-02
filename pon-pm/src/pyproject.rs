@@ -82,7 +82,7 @@ impl PyProject {
                 .as_array()
                 .map(|array| string_array_values(array).collect::<Vec<_>>())
                 .unwrap_or_default();
-            optional.insert(key.get().to_owned(), deps);
+            optional.insert(key.to_owned(), deps);
         }
         optional
     }
@@ -156,7 +156,7 @@ impl PyProject {
 
     pub fn remove_source(&mut self, name: &str) -> bool {
         let normalized = names::normalize(name);
-        let Some(sources) = item_at_mut(self.doc.as_item_mut(), &["tool", "pon", "sources"])
+        let Some(sources) = item_at_mut_existing(self.doc.as_item_mut(), &["tool", "pon", "sources"])
             .and_then(Item::as_table_like_mut)
         else {
             return false;
@@ -217,11 +217,11 @@ impl PyProject {
             if item.is_none() {
                 continue;
             }
-            let source_name = names::normalize(key.get());
+            let source_name = names::normalize(key);
             let Some(entry) = item.as_table_like() else {
                 return Err(Error::manifest(
                     self.path.clone(),
-                    format!("[tool.pon.sources].{} must be a table", key.get()),
+                    format!("[tool.pon.sources].{} must be a table", key),
                 ));
             };
             let raw_path = entry.get("path").and_then(Item::as_str);
@@ -229,13 +229,13 @@ impl PyProject {
             if raw_path.is_some() == raw_git.is_some() {
                 return Err(Error::manifest(
                     self.path.clone(),
-                    format!("[tool.pon.sources].{} must specify exactly one of `path` or `git`", key.get()),
+                    format!("[tool.pon.sources].{} must specify exactly one of `path` or `git`", key),
                 ));
             }
             if raw_path.is_none() && entry.contains_key("editable") {
                 return Err(Error::manifest(
                     self.path.clone(),
-                    format!("[tool.pon.sources].{} sets `editable` without `path`", key.get()),
+                    format!("[tool.pon.sources].{} sets `editable` without `path`", key),
                 ));
             }
             let path = raw_path.map(|path| self.resolve_source_path(path));
@@ -292,8 +292,18 @@ impl PyProject {
     }
 
     fn source_path_for_write(&self, path: &Path) -> String {
+        if !path.is_absolute() {
+            return path.to_string_lossy().into_owned();
+        }
         let base = self.base_dir();
-        let relative = path.strip_prefix(&base).ok().filter(|relative| !relative.as_os_str().is_empty());
+        let absolute_base = if base.is_absolute() {
+            base
+        } else {
+            std::env::current_dir()
+                .map(|current| current.join(base))
+                .unwrap_or_else(|_| PathBuf::from("."))
+        };
+        let relative = path.strip_prefix(&absolute_base).ok().filter(|relative| !relative.as_os_str().is_empty());
         relative.unwrap_or(path).to_string_lossy().into_owned()
     }
 }
@@ -306,27 +316,29 @@ fn item_at<'a>(item: &'a Item, path: &[&str]) -> Option<&'a Item> {
     Some(current)
 }
 
-fn item_at_mut<'a>(item: &'a mut Item, path: &[&str]) -> Option<&'a mut Item> {
+fn item_at_mut_existing<'a>(item: &'a mut Item, path: &[&str]) -> Option<&'a mut Item> {
     let mut current = item;
     for key in path {
-        current = current.get_mut(*key)?;
+        current = current.as_table_like_mut()?.get_mut(key)?;
     }
     Some(current)
 }
 
 fn ensure_table_path<'a>(item: &'a mut Item, path: &[&str]) -> &'a mut Table {
+    let table = ensure_table_item(item);
     if path.is_empty() {
-        if !item.is_table() {
-            *item = Item::Table(Table::new());
-        }
-        return item.as_table_mut().expect("ensured table");
+        return table;
     }
-    if !item.is_table() {
-        *item = Item::Table(Table::new());
-    }
-    let table = item.as_table_mut().expect("ensured table");
     let child = table.entry(path[0]).or_insert(Item::Table(Table::new()));
     ensure_table_path(child, &path[1..])
+}
+
+fn ensure_table_item(item: &mut Item) -> &mut Table {
+    if !item.is_table() {
+        let previous = std::mem::take(item);
+        *item = previous.into_table().map(Item::Table).unwrap_or_else(|_| Item::Table(Table::new()));
+    }
+    item.as_table_mut().expect("ensured table")
 }
 
 fn string_array_values(array: &Array) -> impl Iterator<Item = String> + '_ {

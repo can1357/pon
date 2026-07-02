@@ -270,10 +270,14 @@ fn package_filename(index: &impl PackageIndex, name: &str, version: &str) -> Res
     let project = index
         .lookup(name)?
         .ok_or_else(|| Error::InvalidRequirement(format!("unknown package `{name}`")))?;
+    let parsed_version = version.parse::<pep440_rs::Version>().ok();
     project
         .files
         .into_iter()
-        .find(|file| file.version.raw() == version && matches!(file.kind, PackageKind::Pure))
+        .find(|file| {
+            parsed_version.as_ref().is_some_and(|version| &file.version == version)
+                && matches!(file.kind, PackageKind::Pure)
+        })
         .map(|file| file.filename)
         .ok_or_else(|| Error::UnsupportedArtifact(format!("no installable pure-Python artifact for `{name}` {version}")))
 }

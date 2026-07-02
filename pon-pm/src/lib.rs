@@ -11,6 +11,8 @@ pub mod install;
 pub mod native;
 pub mod names;
 pub mod lock;
+pub mod pyproject;
+pub mod requirement;
 pub mod resolve;
 pub mod sdist;
 pub mod wheel;
