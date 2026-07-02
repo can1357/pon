@@ -101,3 +101,12 @@ pon-conformance/corpus/cpython/delfin.py
 pon-conformance/corpus/cpython/except_star.py
 pon-conformance/corpus/cpython/object_generator_throw_close.py
 pon-conformance/corpus/cpython/union_types.py
+pon-conformance/corpus/cpython/starred_displays.py
+pon-conformance/corpus/cpython/const_kinds.py
+pon-conformance/corpus/cpython/type_name_attrs.py
+pon-conformance/corpus/cpython/set_eq_frozenset.py
+pon-conformance/corpus/cpython/bytes_protocol.py
+pon-conformance/corpus/cpython/dict_constructor.py
+pon-conformance/corpus/cpython/iterator_protocol.py
+pon-conformance/corpus/cpython/dict_views_unpack.py
+pon-conformance/corpus/cpython/sys_getframe.py
