@@ -2638,10 +2638,14 @@ mod tests {
 
         // Exactly one `pon_current_line` store per statement-line transition,
         // deduped across a statement's instruction run.  Boxed locals live in
-        // CLIF variables and globals go through helper calls, so these are the
-        // only plain stores in the lowered body.  Each store line's value
+        // CLIF variables (their shadow-slot writes are `stack_store`s, filtered
+        // here) and globals go through helper calls, so line-cell writes are
+        // the only plain `store`s in the lowered body.  Each store line's value
         // annotation names the recorded line (`store vN, vM  ; vN = <line>`).
-        let stores: Vec<&str> = clif.lines().filter(|line| line.contains("store v")).collect();
+        let stores: Vec<&str> = clif
+            .lines()
+            .filter(|line| line.contains("store v") && !line.contains("stack_store"))
+            .collect();
         assert_eq!(stores.len(), 2, "one line store per statement:\n{clif}");
         assert!(stores[0].ends_with("= 1"), "first store records line 1: {}", stores[0]);
         assert!(stores[1].ends_with("= 2"), "second store records line 2: {}", stores[1]);
@@ -2650,10 +2654,14 @@ mod tests {
     #[test]
     fn line_free_ir_emits_no_line_plumbing() {
         // Hand-built IR carries `line: 0` everywhere; its emitted code must
-        // stay byte-identical to pre-line-plumbing output (no imported cell,
-        // no stores).
+        // contain no line plumbing (no imported cell, no line-cell stores).
+        // Local shadow-slot writes are `stack_store`s and are expected.
         let ir = binary_ir(BinOp::Add);
         let clif = compiled_clif(&ir, 0);
-        assert_eq!(clif.matches("store v").count(), 0, "no line stores for line-free IR:\n{clif}");
+        let line_stores = clif
+            .lines()
+            .filter(|line| line.contains("store v") && !line.contains("stack_store"))
+            .count();
+        assert_eq!(line_stores, 0, "no line stores for line-free IR:\n{clif}");
     }
 }
