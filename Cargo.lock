@@ -1405,6 +1405,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "pon-gc",
+ "sha2",
 ]
 
 [[package]]
