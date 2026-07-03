@@ -753,6 +753,14 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
         let mut argv = [name_object];
         return unsafe { abi::pon_call(bound, argv.as_mut_ptr(), 1) };
     }
+    if name_id == intern::intern("__doc__") {
+        let doc = unsafe { generic_get_attr_cached(obj_ty.cast::<PyObject>(), name_id, ptr::null()) };
+        if !doc.is_null() {
+            return doc;
+        }
+        crate::thread_state::pon_err_clear();
+        return unsafe { abi::pon_none() };
+    }
     unsafe { abi::pon_raise_attribute_error(object, name_id) }
 }
 
@@ -1446,11 +1454,11 @@ unsafe extern "C" fn getset_descr_get(descr: *mut PyObject, obj: *mut PyObject, 
 }
 
 /// `descriptor.__set__(obj, value)` / `__delete__(obj)` slot.  Of the `type`
-/// getsets only `__annotations__` is writable; `__mro__`/`__dict__` raise the
-/// CPython read-only AttributeError.  `__bases__` is a deliberate divergence:
-/// CPython's getset supports live re-basing (`C.__bases__ = (B,)`), which pon
-/// does not implement — the write raises the same honest read-only
-/// AttributeError instead of silently storing to the dict.  Function slots
+/// getsets only `__annotations__` is writable unconditionally. `__bases__`
+/// has one narrow construction-time escape hatch for `typing.NamedTuple` /
+/// `TypedDict`: while a class is still being constructed, writes update only
+/// the Python-visible declared-bases record. Live rebasing of published types
+/// remains unsupported. `__mro__`/`__dict__` stay read-only. Function slots
 /// delegate to `function_setattro` — the same semantics as a plain attribute
 /// write.
 unsafe extern "C" fn getset_descr_set(descr: *mut PyObject, obj: *mut PyObject, value: *mut PyObject) -> c_int {
@@ -1460,12 +1468,15 @@ unsafe extern "C" fn getset_descr_set(descr: *mut PyObject, obj: *mut PyObject, 
             if obj.is_null() || unsafe { !is_type_object(obj) } {
                 return raise_type_status(unsafe { getset_receiver_mismatch(d, obj) });
             }
-            if kind != TypeGetSetKind::Annotations {
-                let message = format!("attribute '{}' of 'type' objects is not writable", kind.attr_name());
-                let _ = crate::abi::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::AttributeError, &message);
-                return -1;
+            if kind == TypeGetSetKind::Annotations {
+                return unsafe { type_annotations_set(obj.cast::<PyType>(), value) };
             }
-            unsafe { type_annotations_set(obj.cast::<PyType>(), value) }
+            if kind == TypeGetSetKind::Bases {
+                return unsafe { crate::types::type_::set_declared_bases_during_construction(obj.cast::<PyType>(), value) };
+            }
+            let message = format!("attribute '{}' of 'type' objects is not writable", kind.attr_name());
+            let _ = crate::abi::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::AttributeError, &message);
+            -1
         }
         GetSetPayload::FunctionAttr(name_id) => {
             if !crate::types::function::is_function_object(obj) {

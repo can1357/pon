@@ -1325,6 +1325,24 @@ fn set_is_superset(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
     }
 }
 
+fn set_is_disjoint(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    let result = unsafe {
+        set_::entries_snapshot(left).and_then(|left_entries| {
+            let right_entries = set_argument_entries(right)?;
+            for item in &right_entries {
+                if set_::find_element_index(&left_entries, *item)?.is_some() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })
+    };
+    match result {
+        Ok(value) => unsafe { super::number::pon_const_bool(c_int::from(value)) },
+        Err(message) => null_error(message),
+    }
+}
+
 unsafe extern "C" fn set_contains_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let args = match map_method_args(argv, argc, "set.__contains__") {
         Ok(args) => args,
@@ -1398,6 +1416,22 @@ unsafe extern "C" fn set_difference_method_trampoline(argv: *mut *mut PyObject, 
     unsafe { pon_set_difference(args[0], args[1]) }
 }
 
+unsafe extern "C" fn set_update_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match map_method_args(argv, argc, "set.update") {
+        Ok(args) => args,
+        Err(message) => return null_error(message),
+    };
+    if args.is_empty() {
+        return raise_map_type_error("set.update() expected at least 1 argument".to_owned());
+    }
+    for iterable in &args[1..] {
+        if unsafe { pon_set_update(args[0], *iterable) }.is_null() {
+            return ptr::null_mut();
+        }
+    }
+    map_none()
+}
+
 unsafe extern "C" fn set_issubset_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let args = match map_method_args(argv, argc, "set.issubset") {
         Ok(args) => args,
@@ -1421,6 +1455,20 @@ unsafe extern "C" fn set_issuperset_method_trampoline(argv: *mut *mut PyObject, 
         ));
     }
     set_is_superset(args[0], args[1])
+}
+
+unsafe extern "C" fn set_isdisjoint_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match map_method_args(argv, argc, "set.isdisjoint") {
+        Ok(args) => args,
+        Err(message) => return null_error(message),
+    };
+    if args.len() != 2 {
+        return raise_map_type_error(format!(
+            "set.isdisjoint() expected 1 argument, got {}",
+            args.len().saturating_sub(1)
+        ));
+    }
+    set_is_disjoint(args[0], args[1])
 }
 
 unsafe extern "C" fn set_copy_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -1506,8 +1554,10 @@ pub unsafe fn pon_set_bound_method(set: *mut PyObject, name: &str) -> *mut PyObj
         "union" => alloc_bound_native_method(set, name, set_union_method_trampoline),
         "intersection" => alloc_bound_native_method(set, name, set_intersection_method_trampoline),
         "difference" => alloc_bound_native_method(set, name, set_difference_method_trampoline),
+        "update" => alloc_bound_native_method(set, name, set_update_method_trampoline),
         "issubset" => alloc_bound_native_method(set, name, set_issubset_method_trampoline),
         "issuperset" => alloc_bound_native_method(set, name, set_issuperset_method_trampoline),
+        "isdisjoint" => alloc_bound_native_method(set, name, set_isdisjoint_method_trampoline),
         "__contains__" => alloc_bound_native_method(set, name, set_contains_method_trampoline),
         "copy" => alloc_bound_native_method(set, name, set_copy_method_trampoline),
         "remove" => alloc_bound_native_method(set, name, set_remove_method_trampoline),

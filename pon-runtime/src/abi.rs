@@ -1630,6 +1630,10 @@ pub(crate) fn runtime_type_type() -> *mut PyType {
     with_runtime(|runtime| runtime._type_type).unwrap_or(ptr::null_mut())
 }
 
+pub(crate) fn class_construction_active() -> bool {
+    with_runtime(|runtime| !runtime.class_namespace_stack.is_empty() || !runtime.class_construction_stack.is_empty()).unwrap_or(false)
+}
+
 /// Non-raising lookup of an installed runtime builtin global.
 pub(crate) fn runtime_global(name: u32) -> Option<*mut PyObject> {
     with_runtime(|runtime| runtime.globals.get(&name).copied()).flatten()
@@ -1751,6 +1755,9 @@ fn perform_runtime_init() -> Result<(), String> {
             type_type.tp_setattro = Some(crate::descr::generic_set_attr);
             let type_type = Box::into_raw(type_type);
             let long_type = Box::into_raw(Box::new(PyType::new(type_type, "int", mem::size_of::<PyLong>())));
+            unsafe {
+                (*long_type).tp_getattro = Some(int_getattro);
+            }
             let unicode_type = Box::into_raw(Box::new(PyType::new(type_type, "str", mem::size_of::<PyUnicode>())));
             let mut function_type = Box::new(PyType::new(type_type, "function", mem::size_of::<PyFunction>()));
             function_type.tp_descr_get = Some(function::function_descr_get);
@@ -2084,8 +2091,10 @@ fn register_builtin_type_globals(runtime: &mut Runtime) {
         // object)`, `issubclass(bool, int)` is True).  The static bool type
         // must re-point at THIS runtime's per-init `long_type` on every
         // registration, so the assignment is unconditional (a null-guarded
-        // write would keep a stale pointer across runtime re-inits).
+        // write would keep a stale pointer across runtime re-inits).  Bool
+        // instances also need scalar-type attribute lookup (`False.__doc__`).
         (*bool_type).tp_base = runtime.long_type;
+        (*bool_type).tp_getattro = Some(int_getattro);
         install_builtin_type(runtime, "bool", bool_type, Some(builtin_bool_new), object_type);
 
         let float_sample = float::from_f64(0.0);
@@ -2218,6 +2227,28 @@ fn install_type_dunder_prepare(runtime: &mut Runtime) {
     }
 }
 
+/// `tp_getattro` for int/bool: native numeric instance attrs first, then MRO
+/// lookup with descriptor binding. This keeps builtin scalar instances
+/// introspectable (`False.__doc__`, `1.__class__`, etc.) without pretending
+/// they carry instance dict storage.
+unsafe extern "C" fn int_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name_text) = (unsafe { type_::unicode_text(name) }) else {
+        return return_null_with_error("attribute name must be str");
+    };
+    let name_id = crate::intern::intern(name_text);
+    if let Some(result) = unsafe { crate::types::int::int_instance_attr(object, name_id) } {
+        return result;
+    }
+    let ty = unsafe { (*object).ob_type.cast_mut() };
+    let descr = unsafe { crate::descr::lookup_in_type(ty, name_id) };
+    if descr.is_null() {
+        if name_id == crate::intern::intern("__doc__") {
+            return unsafe { pon_none() };
+        }
+        return unsafe { pon_raise_attribute_error(object, name_id) };
+    }
+    unsafe { crate::descr::descriptor_get(descr, object, ty) }
+}
 /// `tp_getattro` for `None`: MRO-only lookup with descriptor binding.  No
 /// instance dict — `PyNone` is header-only, so the generic heap-instance
 /// resolver must not be installed here (its `PyHeapInstance` dict cast would
@@ -4233,7 +4264,11 @@ unsafe fn build_class_with_body(
         }
     }
     let class = if scope.mapping.is_null() {
-        unsafe { type_::build_class_from_namespace(name, &scope.bases, frame.namespace, keywords) }
+        if let Some(kind) = scope.typing_special {
+            unsafe { type_::build_typing_special_class(name, frame.namespace, keywords, kind) }
+        } else {
+            unsafe { type_::build_class_from_namespace(name, &scope.bases, frame.namespace, keywords) }
+        }
     } else {
         unsafe { type_::build_class_from_prepared_mapping(name, &scope.bases, scope.mapping, keywords) }
     };
@@ -5075,6 +5110,10 @@ fn collect_impl() -> Result<(), String> {
     // immortal leaked boxes marking cannot traverse) plus the `sys.modules`
     // dict: every module-scope binding in every module.
     for value in crate::import::gc_held_roots() {
+        push_namespace_value_roots(value, &mut roots);
+    }
+    // Objects held by recompiled C extensions through `Py_INCREF` pins.
+    for value in crate::capi::gc_held_roots() {
         push_namespace_value_roots(value, &mut roots);
     }
     // Source iterators, callables, and saved values held by leaked-box

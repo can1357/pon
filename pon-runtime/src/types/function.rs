@@ -708,14 +708,20 @@ fn function_attr_by_id(function: *mut PyObject, name_id: u32) -> Option<*mut PyO
         return Some(unsafe { crate::abi::pon_none() });
     }
     if name_id == intern("__module__") {
-        // Mirrors `__globals__` below: the runtime only tracks the actively
-        // executing module, so the definition module is approximated by the
-        // active module name (`__main__` outside source-module execution).
-        let module = crate::import::active_module_name_id().unwrap_or_else(|| intern("__main__"));
+        let module = function_module(function)
+            .or_else(crate::import::active_module_name_id)
+            .unwrap_or_else(|| intern("__main__"));
         return Some(const_name(module));
     }
     if name_id == intern("__code__") {
         return Some(alloc_code_object(function));
+    }
+    if name_id == intern("__builtins__") {
+        let builtins = crate::import::cached_module(intern("builtins"))?;
+        if let Some(namespace) = crate::import::module_namespace_for_object(builtins) {
+            return namespace.ok();
+        }
+        return Some(builtins);
     }
     if name_id == intern("__globals__") {
         return Some(unsafe { crate::dynexec::builtin_globals(ptr::null_mut(), 0) });

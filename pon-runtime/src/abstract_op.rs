@@ -615,6 +615,9 @@ pub unsafe fn get_attr(object: *mut PyObject, name: u32) -> *mut PyObject {
         if let Some(result) = unsafe { crate::types::int::int_instance_attr(object, name) } {
             return result;
         }
+        if name == crate::intern::intern("__doc__") {
+            return unsafe { crate::abi::pon_none() };
+        }
         let attr = crate::intern::resolve(name).unwrap_or_else(|| format!("<interned:{name}>"));
         return raise_type_error(&format!(
             "'{}' object does not support attribute lookup (attribute '{attr}')",
