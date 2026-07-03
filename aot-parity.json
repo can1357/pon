@@ -3,16 +3,14 @@
   "cpython_tag": "v3.14.0",
   "results_file": "aot-parity.json",
   "summary": {
-    "aot-pass": 4,
+    "aot-pass": 0,
     "aot-fail": 0,
     "aot-refused": 0,
-    "aot-error": 0
+    "aot-error": 2
   },
   "refusal_buckets": [  ],
   "records": [
-    { "module": "pon-conformance/corpus/cpython/delfin.py", "status": "aot-pass" },
-    { "module": "pon-conformance/corpus/cpython/weakref_basic.py", "status": "aot-pass" },
-    { "module": "pon-conformance/corpus/cpython/generators_plain_yield.py", "status": "aot-pass" },
-    { "module": "pon-conformance/corpus/cpython/metaclass_prepare.py", "status": "aot-pass" }
+    { "module": "pon-conformance/corpus/cpython/struct_time.py", "status": "aot-error", "detail": "pon build failed for output `/work/pon/target/pon-conformance-aot/70598/0-pon-conformance-corpus-cpython-struct-time-py`: exit=1 stdout=\"\" stderr=\"pon: could not locate libpon_runtime.a; tried:\\n  - /tmp/pon-target-OsEnvironMap/debug/../lib/libpon_runtime.a\\n  - /tmp/pon-target-OsEnvironMap/debug/libpon_runtime.a\\n  - /tmp/pon-target-OsEnvironMap/debug/libpon_runtime.a\\n  - /tmp/pon-target-OsEnvironMap/debug/libpon_runtime.a\\n  - /tmp/pon-target-OsEnvironMap/release/libpon_runtime.a\\n\"" },
+    { "module": "pon-conformance/corpus/cpython/os_environ.py", "status": "aot-error", "detail": "pon build failed for output `/work/pon/target/pon-conformance-aot/70598/1-pon-conformance-corpus-cpython-os-environ-py`: exit=1 stdout=\"\" stderr=\"pon: could not locate libpon_runtime.a; tried:\\n  - /tmp/pon-target-OsEnvironMap/debug/../lib/libpon_runtime.a\\n  - /tmp/pon-target-OsEnvironMap/debug/libpon_runtime.a\\n  - /tmp/pon-target-OsEnvironMap/debug/libpon_runtime.a\\n  - /tmp/pon-target-OsEnvironMap/debug/libpon_runtime.a\\n  - /tmp/pon-target-OsEnvironMap/release/libpon_runtime.a\\n\"" }
   ]
 }
