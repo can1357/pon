@@ -3780,33 +3780,16 @@ unsafe fn call_type_from_argv(callee: *mut PyObject, argv: *mut *mut PyObject, a
     })
     .unwrap_or(false);
     if is_exception_type {
-        return match with_runtime(|runtime| {
-            if unsafe { runtime.exception_types.is_exception_group_type(cls.cast_const()) } {
-                exc::build_exception_group_checked(runtime, cls, args)
-            } else {
-                let message = args.first().copied().unwrap_or(ptr::null_mut());
-                match exc::alloc_exception_object(runtime, cls, message, ptr::null_mut()) {
-                    Ok(exception) => {
-                        // Multi-argument constructors carry the full tuple:
-                        // `E('x', 'y').args == ('x', 'y')`.  Zero/one-argument
-                        // exceptions keep the allocation-free derived form.
-                        if args.len() >= 2 {
-                            match seq::alloc_tuple_from_slice(runtime, args) {
-                                Ok(tuple) => unsafe {
-                                    (*exception.cast::<PyBaseException>()).args = tuple;
-                                },
-                                Err(message) => return return_null_with_error(message),
-                            }
-                        }
-                        exception
-                    }
-                    Err(message) => return_null_with_error(message),
-                }
-            }
-        }) {
-            Some(exception) => exception,
-            None => return_null_with_error("runtime is not initialized"),
+        // Exception classes share the keyword sibling's dedicated leg: it
+        // runs user `__new__`/`__init__` overrides (pickle's `_Stop(value)`
+        // stores `self.value` in one) and falls back to the keyword-blind
+        // builtin construction — group check plus `alloc_exception_instance`,
+        // exactly what this branch previously inlined — otherwise.
+        let keywords = function::KeywordArgs {
+            names: &[],
+            values: &[],
         };
+        return unsafe { call_exception_type_with_keywords(callee, args, keywords) };
     }
 
     let user_new = unsafe { crate::descr::lookup_in_type(cls, crate::intern::intern("__new__")) };
