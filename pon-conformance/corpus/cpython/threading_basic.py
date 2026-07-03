@@ -58,9 +58,13 @@ print("locked held", plain.locked())
 plain.release()
 print("locked after", plain.locked())
 r = threading.RLock()
+print("rlock locked before", r.locked())
 print("rlock twice", r.acquire(), r.acquire())
+print("rlock locked held", r.locked())
 r.release()
+print("rlock locked once", r.locked())
 r.release()
+print("rlock locked after", r.locked())
 
 # Event protocol (no blocking waits: set first).
 event = threading.Event()

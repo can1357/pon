@@ -72,12 +72,20 @@ t("list-pop-empty", lambda: [].pop(), IndexError)
 t("list-index-missing", lambda: [].index(1), ValueError)
 t("list-remove-missing", lambda: [1].remove(2), ValueError)
 _xs = [1]
+
+def _call_int():
+    n = 0
+    return n()
+
+
+t("call-int", _call_int, TypeError)
 t("list-subscript-str", lambda: _xs["x"], TypeError)
 tm("list-slice-step0", lambda: [1, 2][::0], ValueError)
 t("tuple-concat-list", lambda: (1,) + [2], TypeError)
 t("list-mul-str", lambda: [1] * "x", TypeError)
 tm("range-str", lambda: range("a"), TypeError)
 t("sort-mixed", lambda: [1, "a"].sort(), TypeError)
+t("list-clear-arity", lambda: [1].clear(1), TypeError)
 t("list-attr-miss", lambda: [].nope, AttributeError)
 
 print("== dict/set ==")

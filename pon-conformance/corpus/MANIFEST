@@ -209,4 +209,9 @@ pon-conformance/corpus/cpython/sys_monitoring_surface.py
 pon-conformance/corpus/cpython/str_maketrans_dict.py
 pon-conformance/corpus/cpython/colorize_ansi_colors.py
 pon-conformance/corpus/cpython/importlib_source_finder.py
+pon-conformance/corpus/cpython/unbound_type_methods.py
+pon-conformance/corpus/cpython/int_from_bytes.py
 
+pon-conformance/corpus/cpython/sys_surface.py
+pon-conformance/corpus/cpython/os_seek.py
+pon-conformance/corpus/cpython/gc_expr_temps.py
