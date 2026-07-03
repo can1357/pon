@@ -119,14 +119,10 @@ pub(crate) fn synthesize_type_alias_thunk(
 }
 
 /// Collect module/class-level variable annotations from `body` and claim the
-/// deferred `__annotate__` child that scope analysis inserted at
-/// `children[0]` for them.
+/// deferred `__annotate__` child that scope analysis merged for them.
 ///
-/// MUST be called BEFORE lowering `body`'s statements: nested annotated
-/// `def`s claim their own `__annotate__` children by name, and claiming the
-/// namespace child first is what keeps the claim order aligned with scope
-/// analysis (which pushes the deferred namespace child ahead of every
-/// statement-discovered child).
+/// The merged namespace child is the only `__annotate__` scope with no
+/// defining source construct, so it is claimed with a `None` span key.
 ///
 /// Returns `None` when `body` carries no name-target `AnnAssign` (scope
 /// analysis created no child in that case).
@@ -139,7 +135,7 @@ pub(crate) fn claim_namespace_annotate<'a>(
     if entries.is_empty() {
         return Ok(None);
     }
-    let child_info = scope.next_child_scope(ScopeKind::Function, scope::ANNOTATE_SCOPE_NAME)?;
+    let child_info = scope.next_child_scope(ScopeKind::Function, scope::ANNOTATE_SCOPE_NAME, None)?;
     Ok(Some((child_info, entries)))
 }
 

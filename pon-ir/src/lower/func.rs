@@ -13,18 +13,21 @@ pub(super) fn lower_function_def_stmt(
         None
     };
 
-    // PEP 649: scope analysis pushes the `__annotate__` child immediately
-    // BEFORE the def's own Function child, so the claim order here is frozen:
-    // annotate first, def second.
+    // PEP 649: the def's `__annotate__` child is keyed to the def's own span;
+    // the reserved name disambiguates it from the def's Function child.
     let annotate = if scope::function_def_has_annotations(def) {
-        let annotate_info = scope.next_child_scope(ScopeKind::Function, scope::ANNOTATE_SCOPE_NAME)?;
+        let annotate_info = scope.next_child_scope(
+            ScopeKind::Function,
+            scope::ANNOTATE_SCOPE_NAME,
+            Some(scope::span_key(def.range)),
+        )?;
         let entries = annotation_entries(&def.parameters, def.returns.as_deref());
         Some(synth::synthesize_annotate_scope(driver, scope, annotate_info, &entries)?)
     } else {
         None
     };
 
-    let function_info = scope.next_child_scope(ScopeKind::Function, name)?;
+    let function_info = scope.next_child_scope(ScopeKind::Function, name, Some(scope::span_key(def.range)))?;
     let mut value = synth::synthesize_scope_function_with_annotate(
         driver,
         scope,
@@ -179,7 +182,7 @@ pub(super) fn lower_lambda(
 ) -> Result<Value, LowerError> {
     let parameters = lambda.parameters.as_deref().cloned().unwrap_or_default();
     reject_parameter_annotations(&parameters)?;
-    let lambda_info = scope.next_child_scope(ScopeKind::Function, "<lambda>")?;
+    let lambda_info = scope.next_child_scope(ScopeKind::Function, "<lambda>", Some(scope::span_key(lambda.range)))?;
     synth::synthesize_scope_function(driver, scope, lambda_info, &parameters, |driver, body| {
         let value = driver.lower_expr(body, &lambda.body)?;
         body.set_term(Terminator::Return(value))

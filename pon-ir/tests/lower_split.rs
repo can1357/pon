@@ -1,4 +1,7 @@
-use pon_ir::{BinOp, CellId, InstKind, LocalId, NameId, PyConst, Terminator, Value, lower_source};
+use pon_ir::{
+    BinOp, CellId, Function, InstKind, LocalId, Module, NameId, PyConst, Terminator, Value,
+    lower_source,
+};
 
 const PHASE_A_HELLO: &str = r#"
 def add(a, b):
@@ -299,5 +302,150 @@ def inner():
             .flat_map(|block| &block.insts)
             .any(|inst| matches!(inst.kind, InstKind::Yield { .. } | InstKind::YieldFrom { .. })),
         "the transform must consume every Yield/YieldFrom marker"
+    );
+}
+
+// --- span-keyed child-scope pairing regressions ------------------------------
+//
+// Lowering pairs each def/lambda/comprehension with its ScopeInfo child by
+// (kind, name, span).  The order-based first-unused pairing it replaced failed
+// in observable ways covered below:
+//   * `try` lowers `else` before its handlers, so same-named defs in the two
+//     suites swapped ScopeInfos: the `yield` body lowered as a plain function
+//     (raw Yield markers survived for codegen to reject) while the plain body
+//     was rewritten as a bogus state machine;
+//   * the `except*` lowering path failed the same way;
+//   * `finally` suites are inlined once per departing edge, so the second
+//     claim of the same def died with "scope metadata was not discovered".
+
+fn functions_named<'m>(module: &'m Module, name: &str) -> Vec<&'m Function> {
+    module
+        .functions
+        .iter()
+        .filter(|function| function.name == name)
+        .collect()
+}
+
+fn has_suspend(function: &Function) -> bool {
+    function
+        .blocks
+        .iter()
+        .any(|block| matches!(block.term, Terminator::Suspend { .. }))
+}
+
+fn has_str_const(function: &Function, wanted: &str) -> bool {
+    function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.insts)
+        .any(|inst| matches!(&inst.kind, InstKind::Const(PyConst::Str(s)) if s.as_str() == wanted))
+}
+
+fn raw_yield_marker_count(module: &Module) -> usize {
+    module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.insts)
+        .filter(|inst| matches!(inst.kind, InstKind::Yield { .. } | InstKind::YieldFrom { .. }))
+        .count()
+}
+
+/// Shared assertions for the try/except/else twin-`f` shapes: whichever suite
+/// holds the `yield p` body must come out as the generator state machine, and
+/// the `raise RuntimeError('x')` body must stay a plain function.
+fn assert_twin_f_pairing(source: &str) {
+    let module = lower_source(source).expect("twin-f try shape should lower");
+    let fs = functions_named(&module, "f");
+    assert_eq!(fs.len(), 2, "both defs of f lower to distinct functions");
+
+    let generators: Vec<&Function> = fs.iter().copied().filter(|f| f.is_generator).collect();
+    let plains: Vec<&Function> = fs.iter().copied().filter(|f| !f.is_generator).collect();
+    assert_eq!(generators.len(), 1, "exactly one lowered f is a generator");
+    assert_eq!(plains.len(), 1, "exactly one lowered f is a plain function");
+
+    let generator = generators[0];
+    let plain = plains[0];
+    assert!(
+        has_suspend(generator),
+        "the yield body must lower to a Suspend state machine"
+    );
+    assert!(
+        !has_str_const(generator, "x"),
+        "the generator ScopeInfo must pair with the yield body, not the raise body"
+    );
+    assert!(
+        has_str_const(plain, "x"),
+        "the raise body must stay the plain (non-generator) function"
+    );
+    assert!(
+        !has_suspend(plain),
+        "the raise body must not be rewritten as a state machine"
+    );
+
+    assert_eq!(
+        raw_yield_marker_count(&module),
+        0,
+        "the generator transform must consume every raw Yield/YieldFrom marker"
+    );
+}
+
+#[test]
+fn try_else_generator_span_pairing_survives_handler_first_scope_order() {
+    // `else` lowers before the handler suite; order-based pairing handed the
+    // else generator the handler's non-generator ScopeInfo.
+    assert_twin_f_pairing(
+        "try: pass\nexcept ImportError:\n    def f(p):\n        raise RuntimeError('x')\nelse:\n    def f(p):\n        yield p\n",
+    );
+}
+
+#[test]
+fn try_handler_generator_span_pairing_mirror() {
+    // Mirror orientation: the handler owns the generator body.
+    assert_twin_f_pairing(
+        "try: pass\nexcept ImportError:\n    def f(p):\n        yield p\nelse:\n    def f(p):\n        raise RuntimeError('x')\n",
+    );
+}
+
+#[test]
+fn try_star_generator_span_pairing_both_orientations() {
+    // The `except*` lowering path claims children the same way.
+    assert_twin_f_pairing(
+        "try: pass\nexcept* ValueError:\n    def f(p):\n        raise RuntimeError('x')\nelse:\n    def f(p):\n        yield p\n",
+    );
+    assert_twin_f_pairing(
+        "try: pass\nexcept* ValueError:\n    def f(p):\n        yield p\nelse:\n    def f(p):\n        raise RuntimeError('x')\n",
+    );
+}
+
+#[test]
+fn finally_inlined_def_span_pairing_lowers_every_clone() {
+    // `finally` suites are inlined once per departing edge, so the same def
+    // statement claims its ScopeInfo child several times.  Used-marking made
+    // the second claim fail with "scope metadata was not discovered for g".
+    let module = lower_source(
+        "def outer():\n    try:\n        return 1\n    finally:\n        def g():\n            yield 2\n",
+    )
+    .expect("def inside finally must lower even though the suite is inlined per edge");
+
+    assert_eq!(functions_named(&module, "outer").len(), 1);
+
+    let clones = functions_named(&module, "g");
+    assert!(
+        clones.len() >= 2,
+        "finally inlining lowers g once per departing edge, got {}",
+        clones.len()
+    );
+    for clone in &clones {
+        assert!(clone.is_generator, "every inlined g clone is a generator");
+        assert!(
+            has_suspend(clone),
+            "every inlined g clone must carry the Suspend state machine"
+        );
+    }
+    assert_eq!(
+        raw_yield_marker_count(&module),
+        0,
+        "no raw Yield/YieldFrom marker may survive in any clone"
     );
 }

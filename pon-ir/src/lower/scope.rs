@@ -129,6 +129,11 @@ pub struct ScopeInfo {
     pub kind: ScopeKind,
     /// Debug/source name.  The module scope is `__main__`.
     pub name: String,
+    /// Byte range `(start, end)` of the defining source construct, the
+    /// child-scope pairing key claimed by lowering.  `None` for scopes with
+    /// no single defining node: the module root and the merged namespace
+    /// `__annotate__` child.
+    pub span: Option<(u32, u32)>,
     /// Classified names by spelling.
     pub symbols: BTreeMap<String, SymbolInfo>,
     /// Local slots in numeric order.
@@ -205,10 +210,21 @@ pub const ANNOTATE_SCOPE_NAME: &str = "__annotate__";
 /// Reserved scope name for synthesized PEP 695 type-alias value thunks.
 pub const TYPE_ALIAS_SCOPE_NAME: &str = "<type_alias>";
 
+/// Child-scope pairing key: the byte range of the defining AST node.
+///
+/// Scope analysis records it at discovery and lowering presents it when
+/// claiming the child, so pairing stays exact even when lowering visits
+/// siblings out of source order (`try` lowers `else` before its handlers) or
+/// lowers one statement list several times (inlined `finally` copies).
+pub(crate) fn span_key(range: ruff_text_size::TextRange) -> (u32, u32) {
+    (range.start().to_u32(), range.end().to_u32())
+}
+
 #[derive(Clone, Debug)]
 struct ScopeBuilder {
     kind: ScopeKind,
     name: String,
+    span: Option<(u32, u32)>,
     params: Vec<String>,
     positional_only: usize,
     has_vararg: bool,
@@ -236,6 +252,7 @@ impl ScopeBuilder {
         Self {
             kind,
             name: name.to_owned(),
+            span: None,
             params: Vec::new(),
             positional_only: 0,
             has_vararg: false,
@@ -302,6 +319,7 @@ fn annotate_builder(name: &str, type_params: &[String]) -> ScopeBuilder {
 
 fn function_builder(def: &StmtFunctionDef) -> Result<ScopeBuilder, LowerError> {
     let mut builder = ScopeBuilder::new(ScopeKind::Function, def.name.as_str(), def.is_async);
+    builder.span = Some(span_key(def.range));
     fill_parameters(&def.parameters, &mut builder)?;
     Ok(builder)
 }
@@ -358,6 +376,7 @@ fn scan_stmt(stmt: &Stmt, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
 
             if function_def_has_annotations(def) {
                 let mut annotate = annotate_builder(ANNOTATE_SCOPE_NAME, &active);
+                annotate.span = Some(span_key(def.range));
                 if let Some(returns) = def.returns.as_deref() {
                     scan_expr(returns, &mut annotate)?;
                 }
@@ -389,6 +408,7 @@ fn scan_stmt(stmt: &Stmt, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
             active.extend(own_type_params.iter().cloned());
 
             let mut child = ScopeBuilder::new(ScopeKind::Class, def.name.as_str(), false);
+            child.span = Some(span_key(def.range));
             child.active_type_params = active;
             scan_body(&def.body, &mut child)?;
             scope.children.push(child);
@@ -408,6 +428,7 @@ fn scan_stmt(stmt: &Stmt, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
             let mut active = scope.active_type_params.clone();
             active.extend(type_param_names(alias.type_params.as_deref()));
             let mut thunk = annotate_builder(TYPE_ALIAS_SCOPE_NAME, &active);
+            thunk.span = Some(span_key(alias.range));
             scan_expr(&alias.value, &mut thunk)?;
             scope.children.push(thunk);
         }
@@ -625,6 +646,7 @@ fn scan_expr(expr: &Expr, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
         Expr::UnaryOp(expr) => scan_expr(&expr.operand, scope)?,
         Expr::Lambda(expr) => {
             let mut child = ScopeBuilder::new(ScopeKind::Function, "<lambda>", false);
+            child.span = Some(span_key(expr.range));
             if let Some(parameters) = expr.parameters.as_deref() {
                 scan_parameter_defaults(parameters, scope)?;
                 fill_parameters(parameters, &mut child)?;
@@ -651,13 +673,14 @@ fn scan_expr(expr: &Expr, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
             }
         }
         Expr::ListComp(expr) => {
-            scan_comprehension("<listcomp>", &expr.elt, &expr.generators, scope)?
+            scan_comprehension("<listcomp>", &expr.elt, &expr.generators, span_key(expr.range), scope)?
         }
         Expr::SetComp(expr) => {
-            scan_comprehension("<setcomp>", &expr.elt, &expr.generators, scope)?
+            scan_comprehension("<setcomp>", &expr.elt, &expr.generators, span_key(expr.range), scope)?
         }
         Expr::DictComp(expr) => {
             let mut child = ScopeBuilder::new(ScopeKind::Comprehension, "<dictcomp>", false);
+            child.span = Some(span_key(expr.range));
             scan_comprehension_generators(&expr.generators, scope, &mut child)?;
             scan_expr(&expr.key, &mut child)?;
             scan_expr(&expr.value, &mut child)?;
@@ -666,6 +689,7 @@ fn scan_expr(expr: &Expr, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
         }
         Expr::Generator(expr) => {
             let mut child = ScopeBuilder::new(ScopeKind::Comprehension, "<genexpr>", false);
+            child.span = Some(span_key(expr.range));
             child.is_generator = true;
             scan_comprehension_generators(&expr.generators, scope, &mut child)?;
             scan_expr(&expr.elt, &mut child)?;
@@ -774,9 +798,11 @@ fn scan_comprehension(
     name: &str,
     elt: &Expr,
     generators: &[Comprehension],
+    span: (u32, u32),
     scope: &mut ScopeBuilder,
 ) -> Result<(), LowerError> {
     let mut child = ScopeBuilder::new(ScopeKind::Comprehension, name, false);
+    child.span = Some(span);
     scan_comprehension_generators(generators, scope, &mut child)?;
     scan_expr(elt, &mut child)?;
     propagate_comprehension_asyncness(&child, scope);
@@ -1034,6 +1060,7 @@ fn finalize_scope(mut builder: ScopeBuilder, enclosing_locals: &BTreeSet<String>
     ScopeInfo {
         kind: builder.kind,
         name: builder.name,
+        span: builder.span,
         symbols,
         locals,
         free_vars,
@@ -1329,5 +1356,59 @@ def h(s):
         let symbol = class_scope.symbol("s").expect("s should be classified");
         assert!(matches!(symbol.class, NameClass::Free { slot: 0 }));
         assert!(symbol.is_nonlocal);
+    }
+
+    #[test]
+    fn records_child_scope_spans_for_span_pairing() {
+        let source = "def f(p):\n    return p\n\nclass C:\n    pass\n\nh = lambda x: x\n\ng = (n for n in [h])\n\nx: int = 0\n";
+        let analysis = analyze(source);
+        let root = &analysis.root;
+        assert_eq!(root.span, None, "the module root has no defining node");
+
+        let expect_span = |snippet: &str| {
+            let start = source.find(snippet).expect("snippet should appear in the fixture");
+            Some((start as u32, (start + snippet.len()) as u32))
+        };
+
+        let function = root
+            .child(ScopeKind::Function, "f")
+            .expect("function scope should be discovered");
+        assert_eq!(function.span, expect_span("def f(p):\n    return p"));
+
+        let class_scope = root
+            .child(ScopeKind::Class, "C")
+            .expect("class scope should be discovered");
+        assert_eq!(class_scope.span, expect_span("class C:\n    pass"));
+
+        let lambda = root
+            .child(ScopeKind::Function, "<lambda>")
+            .expect("lambda scope should be discovered");
+        assert_eq!(lambda.span, expect_span("lambda x: x"));
+
+        let genexpr = root
+            .child(ScopeKind::Comprehension, "<genexpr>")
+            .expect("genexpr scope should be discovered");
+        assert_eq!(genexpr.span, expect_span("(n for n in [h])"));
+
+        // The merged namespace `__annotate__` child aggregates every annotated
+        // statement in the scope, so it has no single defining node.
+        let annotate = root
+            .child(ScopeKind::Function, ANNOTATE_SCOPE_NAME)
+            .expect("module-level annotation should synthesize a merged __annotate__ child");
+        assert_eq!(annotate.span, None, "merged __annotate__ has no defining node");
+
+        // Spans are the pairing key lowering claims children by, so every
+        // other scope in the tree must record one.
+        fn assert_descendants_spanned(scope: &ScopeInfo) {
+            for child in &scope.children {
+                assert!(
+                    child.span.is_some() || child.name == ANNOTATE_SCOPE_NAME,
+                    "child scope {} must record its defining span",
+                    child.name
+                );
+                assert_descendants_spanned(child);
+            }
+        }
+        assert_descendants_spanned(root);
     }
 }

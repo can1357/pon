@@ -157,7 +157,8 @@ fn lower_comprehension_call(
         .ok_or_else(|| LowerError::internal("comprehension without generator clause"))?;
 
     let outer_iterable = driver.lower_expr(enclosing, &first_generator.iter)?;
-    let child_info = enclosing.next_child_scope(ScopeKind::Comprehension, child_name)?;
+    let child_info =
+        enclosing.next_child_scope(ScopeKind::Comprehension, child_name, Some((span.start, span.end)))?;
     let is_async_comp = child_info.is_async;
     if is_async_comp {
         if is_genexpr {

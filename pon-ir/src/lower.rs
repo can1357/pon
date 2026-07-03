@@ -1082,7 +1082,6 @@ impl LoweringDriver {
 
 pub(crate) struct BodyScope {
     info: ScopeInfo,
-    child_used: Vec<bool>,
     defined_locals: Vec<bool>,
     blocks: Vec<Block>,
     current_id: BlockId,
@@ -1107,11 +1106,9 @@ pub(crate) struct BodyScope {
 impl BodyScope {
     fn new(info: &ScopeInfo) -> Self {
         let info = info.clone();
-        let child_used = vec![false; info.children.len()];
         let defined_locals = info.locals.iter().map(|local| local.is_parameter).collect();
         let mut scope = Self {
             info,
-            child_used,
             defined_locals,
             blocks: Vec::new(),
             current_id: BlockId(0),
@@ -1303,21 +1300,30 @@ impl BodyScope {
         }
     }
 
-    fn next_child_scope(&mut self, kind: ScopeKind, name: &str) -> Result<ScopeInfo, LowerError> {
-        let index = self
-            .info
+    /// Claims the child scope discovered for the construct at `span`.
+    ///
+    /// Pairing is keyed on (kind, name, span) rather than discovery order:
+    /// lowering visits `try` clauses in control-flow order (`else` before the
+    /// handlers) and inlines `finally` bodies once per departing edge, so
+    /// positional claiming cross-pairs same-named siblings and fails outright
+    /// on re-lowered statements.  Span keys make claims order-independent and
+    /// idempotent.  Synthesized scopes with no defining source construct (the
+    /// merged namespace `__annotate__` child) carry — and are claimed with —
+    /// `None`.
+    fn next_child_scope(
+        &self,
+        kind: ScopeKind,
+        name: &str,
+        span: Option<(u32, u32)>,
+    ) -> Result<ScopeInfo, LowerError> {
+        self.info
             .children
             .iter()
-            .enumerate()
-            .find(|(index, child)| {
-                !self.child_used[*index] && child.kind == kind && child.name == name
-            })
-            .map(|(index, _)| index)
+            .find(|child| child.kind == kind && child.name == name && child.span == span)
+            .cloned()
             .ok_or_else(|| {
                 LowerError::internal(format!("scope metadata was not discovered for {name}"))
-            })?;
-        self.child_used[index] = true;
-        Ok(self.info.children[index].clone())
+            })
     }
 
     fn is_global_name(&self, name: &str) -> bool {

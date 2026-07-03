@@ -291,9 +291,13 @@ pub(super) fn lower_type_alias(
     stmt: &ruff_python_ast::StmtTypeAlias,
 ) -> Result<(), LowerError> {
     // PEP 695: `type X = expr` synthesizes a zero-argument value thunk (the
-    // `<type_alias>` child claimed by name in statement order) and wraps it
+    // `<type_alias>` child claimed by this statement's span) and wraps it
     // in a `TypeAliasType` that evaluates `expr` on first `__value__` access.
-    let thunk_info = scope.next_child_scope(ScopeKind::Function, scope::TYPE_ALIAS_SCOPE_NAME)?;
+    let thunk_info = scope.next_child_scope(
+        ScopeKind::Function,
+        scope::TYPE_ALIAS_SCOPE_NAME,
+        Some(scope::span_key(stmt.range)),
+    )?;
     let thunk = synth::synthesize_type_alias_thunk(driver, scope, thunk_info, &stmt.value)?;
 
     let Expr::Name(target) = stmt.name.as_ref() else {
