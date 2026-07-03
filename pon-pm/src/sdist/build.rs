@@ -423,11 +423,10 @@ fn build_import_path(build_env: &EnvLayout, source_root: &Path, backend_path: &[
 
 fn backend_object_script(backend: &str) -> String {
     let (module, object) = backend.split_once(':').unwrap_or((backend, ""));
-    let mut script = "_pon_sys = __import__('sys')\n_pon_re = __import__('re')\nif _pon_sys.implementation.name == 'pon':\n    try:\n        _pon_builtins = __import__('builtins')\n        _pon_builtins.pathlib = __import__('pathlib')\n    except Exception:\n        pass\n    try:\n        import packaging.version as _pon_packaging_version\n        _pon_packaging_version.VERSION_PATTERN = _pon_packaging_version._VERSION_PATTERN_OLD\n        _pon_packaging_version.Version._regex = _pon_re.compile(r'\\s*' + _pon_packaging_version.VERSION_PATTERN + r'\\s*', _pon_re.VERBOSE | _pon_re.IGNORECASE)\n    except Exception:\n        pass\n    try:\n        import annotationlib as _pon_annotationlib\n        _pon_real_call_annotate = _pon_annotationlib.call_annotate_function\n        def _pon_call_annotate_function(annotate, format, *, owner=None, _is_evaluate=False):\n            try:\n                return _pon_real_call_annotate(annotate, format, owner=owner, _is_evaluate=_is_evaluate)\n            except TypeError as _pon_exc:\n                if 'function() takes no keyword arguments' not in str(_pon_exc):\n                    raise\n                return annotate(_pon_annotationlib.Format.VALUE)\n        _pon_annotationlib.call_annotate_function = _pon_call_annotate_function\n    except Exception:\n        pass\n".to_owned();
-    script.push_str(&format!(
+    let mut script = format!(
         "_pon_backend_module = __import__({}, fromlist=['_pon_backend'])\n_pon_backend = _pon_backend_module\n",
         python_string_literal(module)
-    ));
+    );
     for attr in object.split('.').filter(|attr| !attr.is_empty()) {
         script.push_str(&format!(
             "_pon_backend = getattr(_pon_backend, {})\n",
