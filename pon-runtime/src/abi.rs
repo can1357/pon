@@ -3235,6 +3235,10 @@ pub fn return_null_with_error(message: impl Into<String>) -> *mut PyObject {
     pon_err_set(message);
     ptr::null_mut()
 }
+#[inline]
+pub fn return_null_with_type_error(message: impl AsRef<str>) -> *mut PyObject {
+    exc::raise_kind_error_text(crate::types::exc::ExceptionKind::TypeError, message.as_ref())
+}
 
 /// Records a thread-state error and returns the ABI `-1` sentinel.
 ///
@@ -3399,7 +3403,7 @@ pub unsafe extern "C" fn pon_call(callee: *mut PyObject, argv: *mut *mut PyObjec
             }
         }) {
             Some(Ok(target)) => target,
-            Some(Err(message)) => return return_null_with_error(message),
+            Some(Err(message)) => return return_null_with_type_error(message),
             None => return return_null_with_error("runtime is not initialized"),
         };
 
@@ -3428,7 +3432,7 @@ pub unsafe extern "C" fn pon_call(callee: *mut PyObject, argv: *mut *mut PyObjec
                 let ty = unsafe { (*callee).ob_type.cast_mut() };
                 let dunder = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern(crate::intern::DUNDER_CALL)) };
                 if dunder.is_null() {
-                    return return_null_with_error("callee is not callable");
+                    return return_null_with_type_error("callee is not callable");
                 }
                 let bound = unsafe { crate::descr::descriptor_get(dunder, callee, ty) };
                 if bound.is_null() {
@@ -3918,7 +3922,7 @@ unsafe fn call_type_from_argv(callee: *mut PyObject, argv: *mut *mut PyObject, a
     if !init.is_null() {
         let init_is_function = with_runtime(|runtime| unsafe { is_exact_type(init, runtime.function_type) }).unwrap_or(false);
         if !init_is_function {
-            return return_null_with_error("type __init__ is not callable");
+            return return_null_with_type_error("type __init__ is not callable");
         }
         let mut positional = Vec::with_capacity(argc.saturating_add(1));
         positional.push(instance);

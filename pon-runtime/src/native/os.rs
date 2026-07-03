@@ -831,22 +831,22 @@ fn optional_arg(args: &[*mut PyObject], index: usize) -> Option<*mut PyObject> {
 /// Raises the CPython OSError subclass for `errno` (PEP 3151) with the
 /// `[Errno N] strerror` message shape and optional filename context.
 fn raise_errno(errno: i32, path: Option<&str>) -> *mut PyObject {
-    let kind = match errno {
-        libc::EEXIST => ExceptionKind::FileExistsError,
-        libc::ENOENT => ExceptionKind::FileNotFoundError,
-        libc::EISDIR => ExceptionKind::IsADirectoryError,
-        libc::ENOTDIR => ExceptionKind::NotADirectoryError,
-        libc::EACCES | libc::EPERM => ExceptionKind::PermissionError,
-        libc::EINTR => ExceptionKind::InterruptedError,
-        libc::EPIPE => ExceptionKind::BrokenPipeError,
-        libc::ECHILD => ExceptionKind::ChildProcessError,
-        libc::ESRCH => ExceptionKind::ProcessLookupError,
-        libc::EAGAIN => ExceptionKind::BlockingIOError,
-        libc::ETIMEDOUT => ExceptionKind::TimeoutError,
-        libc::ECONNABORTED => ExceptionKind::ConnectionAbortedError,
-        libc::ECONNREFUSED => ExceptionKind::ConnectionRefusedError,
-        libc::ECONNRESET => ExceptionKind::ConnectionResetError,
-        _ => ExceptionKind::OSError,
+    let (kind, class_name) = match errno {
+        libc::EEXIST => (ExceptionKind::FileExistsError, "FileExistsError"),
+        libc::ENOENT => (ExceptionKind::FileNotFoundError, "FileNotFoundError"),
+        libc::EISDIR => (ExceptionKind::IsADirectoryError, "IsADirectoryError"),
+        libc::ENOTDIR => (ExceptionKind::NotADirectoryError, "NotADirectoryError"),
+        libc::EACCES | libc::EPERM => (ExceptionKind::PermissionError, "PermissionError"),
+        libc::EINTR => (ExceptionKind::InterruptedError, "InterruptedError"),
+        libc::EPIPE => (ExceptionKind::BrokenPipeError, "BrokenPipeError"),
+        libc::ECHILD => (ExceptionKind::ChildProcessError, "ChildProcessError"),
+        libc::ESRCH => (ExceptionKind::ProcessLookupError, "ProcessLookupError"),
+        libc::EAGAIN => (ExceptionKind::BlockingIOError, "BlockingIOError"),
+        libc::ETIMEDOUT => (ExceptionKind::TimeoutError, "TimeoutError"),
+        libc::ECONNABORTED => (ExceptionKind::ConnectionAbortedError, "ConnectionAbortedError"),
+        libc::ECONNREFUSED => (ExceptionKind::ConnectionRefusedError, "ConnectionRefusedError"),
+        libc::ECONNRESET => (ExceptionKind::ConnectionResetError, "ConnectionResetError"),
+        _ => (ExceptionKind::OSError, "OSError"),
     };
     // SAFETY: `strerror` returns a NUL-terminated entry of the static
     // message table; the text is copied before any other libc call.
@@ -857,7 +857,32 @@ fn raise_errno(errno: i32, path: Option<&str>) -> *mut PyObject {
         Some(path) => format!("[Errno {errno}] {detail}: '{path}'"),
         None => format!("[Errno {errno}] {detail}"),
     };
-    crate::abi::exc::raise_kind_error_text(kind, &message)
+    // Prefer a real errno-carrying exception instance so `.errno` /
+    // `.strerror` / `.filename` match CPython's fixed OSError members.
+    let errno_obj = unsafe { crate::abi::pon_const_int(i64::from(errno)) };
+    if errno_obj.is_null() {
+        return crate::abi::exc::raise_kind_error_text(kind, &message);
+    }
+    let detail_obj = unsafe { pon_const_str(detail.as_ptr(), detail.len()) };
+    if detail_obj.is_null() {
+        return crate::abi::exc::raise_kind_error_text(kind, &message);
+    }
+    let mut args = vec![errno_obj, detail_obj];
+    if let Some(path) = path {
+        let path_obj = unsafe { pon_const_str(path.as_ptr(), path.len()) };
+        if path_obj.is_null() {
+            return crate::abi::exc::raise_kind_error_text(kind, &message);
+        }
+        args.push(path_obj);
+    }
+    let Some(class) = crate::abi::runtime_global(intern(class_name)) else {
+        return crate::abi::exc::raise_kind_error_text(kind, &message);
+    };
+    let exception = crate::abi::exc::alloc_exception_instance(class.cast::<crate::object::PyType>(), &args);
+    if exception.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { crate::abi::exc::pon_raise(exception, std::ptr::null_mut()) }
 }
 
 fn last_errno() -> i32 {

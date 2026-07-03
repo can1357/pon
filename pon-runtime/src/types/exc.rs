@@ -684,6 +684,15 @@ unsafe fn exception_fixed_attr(object: *mut PyObject, name: &str) -> Option<*mut
             };
             Some(stored.unwrap_or_else(|| unsafe { crate::abi::pon_none() }))
         }
+        // CPython `OSError`'s fixed C members are projections of the
+        // positional args tuple (`errno`, `strerror`, `filename`,
+        // `filename2`). Single-argument `OSError("msg")` leaves them unset,
+        // so the fixed surface answers `None` instead of AttributeError.
+        "errno" | "strerror" | "filename" | "filename2"
+            if unsafe { exception_type_named((*object).ob_type, "OSError") } =>
+        {
+            Some(unsafe { os_error_fixed_attr(exception, name) })
+        }
         "__cause__" => Some(if exception.cause.is_null() {
             unsafe { crate::abi::pon_none() }
         } else {
@@ -708,6 +717,23 @@ unsafe fn exception_fixed_attr(object: *mut PyObject, name: &str) -> Option<*mut
         }
         _ => None,
     }
+}
+/// Serves CPython's fixed `OSError` members from the constructor args tuple.
+unsafe fn os_error_fixed_attr(exception: &PyBaseException, name: &str) -> *mut PyObject {
+    let none = unsafe { crate::abi::pon_none() };
+    let Some(items) = (!exception.args.is_null())
+        .then(|| unsafe { (*exception.args.cast::<crate::types::tuple::PyTuple>()).as_slice() })
+    else {
+        return none;
+    };
+    match name {
+        "errno" => items.first().copied(),
+        "strerror" => items.get(1).copied(),
+        "filename" => items.get(2).copied(),
+        "filename2" => items.get(4).copied(),
+        _ => None,
+    }
+    .unwrap_or(none)
 }
 
 /// Returns the instance dict, creating it on first use.
