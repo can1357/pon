@@ -20,7 +20,7 @@ use crate::abi::{CodeInfo, ParamSpec, return_null_with_error};
 use crate::intern::{self, intern, resolve};
 use crate::object::{PyCodeFn, PyFunction, PyObject, PyObjectHeader, PyType, PyUnicode};
 use crate::thread_state::{pon_err_occurred, pon_err_set};
-use crate::types::{dict, list::PyList, method, tuple::PyTuple, type_::{self, PyClassDict}};
+use crate::types::{classmethod, dict, list::PyList, method, tuple::PyTuple, type_::{self, PyClassDict}};
 
 static FUNCTION_RECORDS: LazyLock<Mutex<HashMap<usize, FunctionRecord>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -1409,6 +1409,22 @@ pub fn fill_positional_defaults(
     Some(filled)
 }
 
+/// Module-level `@staticmethod` functions (`_pyio.open`, implicit `__new__`
+/// carriers, etc.) can reach the call binder before the descriptor `tp_call`
+/// peels them.  Treat the carrier as its wrapped callable so keyword binding
+/// and direct call dispatch see the real function object.
+fn unwrap_staticmethod_callable(function: *mut PyObject) -> *mut PyObject {
+    if function.is_null() || !crate::tag::is_heap(function) {
+        return function;
+    }
+    let ty = unsafe { (*function).ob_type.cast_mut() };
+    if ty != crate::abi::staticmethod_builtin_type() {
+        return function;
+    }
+    // SAFETY: Exact builtin `staticmethod` carrier layout above.
+    let callable = unsafe { (*function.cast::<classmethod::PyStaticMethod>()).callable };
+    if callable.is_null() { function } else { callable }
+}
 /// Bind a call into the compiled function's argv/local-slot order.
 pub fn bind_arguments(
     function: *mut PyObject,
@@ -1417,6 +1433,7 @@ pub fn bind_arguments(
     star: Option<*mut PyObject>,
     dstar: Option<*mut PyObject>,
 ) -> Result<Vec<*mut PyObject>, String> {
+    let function = unwrap_staticmethod_callable(function);
     if keywords.names.len() != keywords.values.len() {
         return Err(format!(
             "keyword name/value length mismatch: {} names for {} values",
@@ -1555,6 +1572,7 @@ pub unsafe fn call_bound_function(
     star: Option<*mut PyObject>,
     dstar: Option<*mut PyObject>,
 ) -> Result<*mut PyObject, String> {
+    let function = unwrap_staticmethod_callable(function);
     let mut argv = bind_arguments(function, positional, keywords, star, dstar)?;
     // Generator/coroutine functions need no special casing here: the compiled
     // stub at the function's entry allocates the frame and returns the
@@ -1832,14 +1850,14 @@ pub(crate) fn bind_native_keywords_for_name(
         }
         // `str.split(sep=None, maxsplit=-1)` / `str.rsplit` (bytes/bytearray
         // share the row: same signature, dispatch is by function name): the
-        // bound receiver occupies the first slot (`to_bytes` precedent).
-        // Preserve an omitted trailing `maxsplit` so the entry can still
-        // distinguish omission from an explicit `None` (CPython rejects
-        // `split(None, None)`), while interior gaps still materialize as
-        // None for `split(maxsplit=1)`. `ipaddress.py` module exec runs
-        // `ip_str.split(':', maxsplit=_max_parts)`.
-        "split" => bind_optional_named_keywords_trimmed(positional, keywords, "split", &["self", "sep", "maxsplit"], 3),
-        "rsplit" => bind_optional_named_keywords_trimmed(positional, keywords, "rsplit", &["self", "sep", "maxsplit"], 3),
+        // bound receiver occupies the first slot (`to_bytes` precedent) and
+        // absent optionals arrive as None (`str_split_args` maps None to the
+        // whitespace-sep / unlimited-maxsplit defaults).  `ipaddress.py`
+        // module exec runs `ip_str.split(':', maxsplit=_max_parts)`.
+        "split" => bind_optional_named_keywords(positional, keywords, "split", &["self", "sep", "maxsplit"], 3),
+        "rsplit" => {
+            bind_optional_named_keywords(positional, keywords, "rsplit", &["self", "sep", "maxsplit"], 3)
+        }
         // `open(file, mode='r', buffering=-1, encoding=None, errors=None,
         // newline=None, closefd=True, opener=None)`: `_osx_support` and the
         // sysconfig/platform chain pass `encoding=` (and friends) as
@@ -1911,54 +1929,6 @@ fn bind_optional_named_keywords(
             *slot = none;
         }
     }
-    Ok(argv)
-}
-
-/// Like [`bind_optional_named_keywords`], but trims omitted trailing slots
-/// back off the argv tail after keyword placement. This lets entries
-/// distinguish "argument omitted" from an explicit trailing `None` while
-/// still materializing interior gaps as `None` for calls like
-/// `split(maxsplit=1)`.
-fn bind_optional_named_keywords_trimmed(
-    positional: &[*mut PyObject],
-    keywords: KeywordArgs<'_>,
-    function_name: &str,
-    names: &[&str],
-    max_positional: usize,
-) -> Result<Vec<*mut PyObject>, String> {
-    if positional.len() > max_positional {
-        return Err(format!(
-            "{function_name}() expected at most {max_positional} positional arguments, got {}",
-            positional.len()
-        ));
-    }
-    let mut argv = positional.to_vec();
-    let mut used = positional.len();
-    argv.resize(names.len(), ptr::null_mut());
-    for (name, value) in keywords.names.iter().copied().zip(keywords.values.iter().copied()) {
-        if value.is_null() {
-            return Err(format!("keyword argument {} is NULL", keyword_name(name)));
-        }
-        let actual = keyword_name(name);
-        let Some(index) = names.iter().position(|expected| *expected == actual) else {
-            return Err(format!("{function_name}() got an unexpected keyword argument '{actual}'"));
-        };
-        if index < positional.len() || !argv[index].is_null() {
-            return Err(format!("{function_name}() got multiple values for argument '{actual}'"));
-        }
-        argv[index] = value;
-        used = used.max(index + 1);
-    }
-    let none = unsafe { crate::abi::pon_none() };
-    if none.is_null() {
-        return Err(format!("failed to allocate None default for {function_name}()"));
-    }
-    for slot in &mut argv[..used] {
-        if slot.is_null() {
-            *slot = none;
-        }
-    }
-    argv.truncate(used);
     Ok(argv)
 }
 

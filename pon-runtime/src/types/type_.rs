@@ -826,9 +826,10 @@ pub unsafe fn build_class_from_namespace(
 /// CPython class bodies always see `__module__`: the compiler seeds
 /// `__module__ = __name__` before the body runs, and `type.__new__` falls
 /// back to the caller's globals when the namespace lacks it.  pon's lowering
-/// emits neither, so class construction seeds the active module's name
-/// (`__main__` outside module execution) into any namespace missing it —
-/// stdlib machinery (`enum._simple_enum`, pickling) reads `cls.__module__`.
+/// emits neither, so class construction first consults the active module
+/// object's live `__name__` attribute (important for modules that rebind it,
+/// e.g. `_pydecimal` sets `__name__ = 'decimal'` for pickling) and only then
+/// falls back to the cached import key / `__main__`.
 unsafe fn seed_namespace_module(namespace: *mut PyClassDict) {
     if namespace.is_null() {
         return;
@@ -837,8 +838,10 @@ unsafe fn seed_namespace_module(namespace: *mut PyClassDict) {
     if unsafe { (&*namespace).get(module_id) }.is_some() {
         return;
     }
-    let name = crate::import::active_module_name_id()
-        .and_then(intern::resolve)
+    let active_name = crate::import::active_module_attr(intern::intern("__name__"))
+        .and_then(|value| unsafe { unicode_text(value).map(str::to_owned) });
+    let name = active_name
+        .or_else(|| crate::import::active_module_name_id().and_then(intern::resolve))
         .unwrap_or_else(|| "__main__".to_owned());
     let value = unsafe { abi::pon_const_str(name.as_ptr(), name.len()) };
     if value.is_null() {
