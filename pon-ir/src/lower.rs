@@ -1194,15 +1194,30 @@ impl BodyScope {
 
     fn emit_cell_prologue(&mut self) {
         for index in 0..self.info.cell_vars.len() {
-            let name = &self.info.cell_vars[index];
-            let local_slot = match self.name_class(name) {
-                Some(NameClass::Cell { local_slot, .. }) => *local_slot,
-                _ => continue,
+            let known_local = match self.name_class(&self.info.cell_vars[index]) {
+                Some(NameClass::Cell { local_slot, .. }) => Some(*local_slot),
+                _ => None,
             };
-            let is_parameter = self
-                .info
-                .symbol(name)
-                .is_some_and(|symbol| symbol.is_parameter);
+            let (local_slot, is_parameter) = match known_local {
+                Some(local_slot) => {
+                    let is_parameter = self
+                        .info
+                        .symbol(&self.info.cell_vars[index])
+                        .is_some_and(|symbol| symbol.is_parameter);
+                    (local_slot, is_parameter)
+                }
+                // The implicit class `__class__` cell has no symbols entry:
+                // back it with a fresh None-initialized temp slot so
+                // `MakeCell` has a local to promote.  `__build_class__`
+                // fills the cell with the class object at construction via
+                // the `__classcell__` protocol (see `lower_class_def`).
+                None if self.info.needs_class_closure
+                    && self.info.cell_vars[index] == "__class__" =>
+                {
+                    (self.alloc_temp_local().0, false)
+                }
+                None => continue,
+            };
             if !is_parameter {
                 let none = Value(self.next_value);
                 self.next_value = self
@@ -1228,6 +1243,12 @@ impl BodyScope {
     }
 
     fn closure_slot(&self, name: &str) -> Option<CellId> {
+        // The implicit class cell is always the class body's first (and
+        // only) own cell; it deliberately has no symbols entry so class-body
+        // source accesses to `__class__` keep namespace semantics.
+        if self.info.needs_class_closure && name == "__class__" {
+            return Some(CellId(0));
+        }
         match self.name_class(name)? {
             NameClass::Cell { cell_slot, .. } => Some(CellId(*cell_slot)),
             NameClass::Free { slot } => Some(self.free_cell(*slot)),

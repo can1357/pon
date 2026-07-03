@@ -142,6 +142,15 @@ pub struct ScopeInfo {
     pub free_vars: Vec<String>,
     /// Cell variable names in cell order.
     pub cell_vars: Vec<String>,
+    /// True for a class scope that claims the implicit `__class__` cell:
+    /// some method (or a scope nested in one) references `__class__` —
+    /// directly, or via `nonlocal __class__` — so the class body owns a
+    /// compiler-synthesized cell (CPython `ste_needs_class_closure`).  The
+    /// cell is `cell_vars[0]` ("__class__") but has NO symbols entry: source
+    /// accesses to `__class__` inside the class body keep their namespace
+    /// semantics, exactly as in CPython, where the implicit cell and any
+    /// class-level `__class__` binding coexist.
+    pub needs_class_closure: bool,
     /// Parameter summary in `CodeInfo` order.
     pub parameters: ParameterSummary,
     /// Direct child scopes discovered in source order.
@@ -933,6 +942,13 @@ fn finalize_scope(mut builder: ScopeBuilder, enclosing_locals: &BTreeSet<String>
     if matches!(builder.kind, ScopeKind::Function | ScopeKind::Comprehension) {
         child_enclosing.extend(local_names.iter().cloned());
     }
+    if matches!(builder.kind, ScopeKind::Class) {
+        // CPython symtable "Special-case __class__": a class block
+        // unconditionally adds `__class__` to the bound set passed to child
+        // scopes, so methods may reference it (or declare it `nonlocal`) and
+        // resolve to the class scope's implicit cell.
+        child_enclosing.insert("__class__".to_owned());
+    }
 
     let mut children = Vec::with_capacity(builder.children.len());
     let mut names_needed_by_children = BTreeSet::new();
@@ -990,11 +1006,23 @@ fn finalize_scope(mut builder: ScopeBuilder, enclosing_locals: &BTreeSet<String>
         ScopeKind::Module => {}
     }
 
-    let cell_names: BTreeSet<_> = names_needed_by_children
+    // CPython `drop_class_free`: a class whose children close over
+    // `__class__` claims it as the implicit class cell instead of threading
+    // it outward like other captured names.
+    let needs_class_closure = matches!(builder.kind, ScopeKind::Class)
+        && names_needed_by_children.contains("__class__");
+    if needs_class_closure {
+        free_names.remove("__class__");
+    }
+
+    let mut cell_names: BTreeSet<_> = names_needed_by_children
         .iter()
         .filter(|name| local_names.contains(*name))
         .cloned()
         .collect();
+    if needs_class_closure {
+        cell_names.insert("__class__".to_owned());
+    }
 
     let locals = assign_local_slots(&builder, &local_names);
     let slot_by_name: BTreeMap<String, u32> = locals
@@ -1065,6 +1093,7 @@ fn finalize_scope(mut builder: ScopeBuilder, enclosing_locals: &BTreeSet<String>
         locals,
         free_vars,
         cell_vars,
+        needs_class_closure,
         parameters,
         children,
         is_generator: builder.is_generator,

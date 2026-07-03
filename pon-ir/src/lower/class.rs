@@ -10,7 +10,10 @@ pub(super) fn lower_class_def(
         stmt.name.as_str(),
         Some(scope::span_key(stmt.range)),
     )?;
-    if !class_info.cell_vars.is_empty() {
+    let implicit_cell_only = class_info.needs_class_closure
+        && class_info.cell_vars.len() == 1
+        && class_info.cell_vars[0] == "__class__";
+    if !class_info.cell_vars.is_empty() && !implicit_cell_only {
         return unsupported_at("class body cell variables", span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()));
     }
     // Free variables of the class scope are enclosing-function locals that
@@ -39,6 +42,16 @@ pub(super) fn lower_class_def(
             let annotate_name = driver.names.intern(scope::ANNOTATE_SCOPE_NAME)?;
             body.emit(InstKind::StoreName(annotate_name, annotate))?;
         }
+    }
+    if class_info.needs_class_closure && !body.is_terminated() {
+        // CPython `__classcell__` protocol: the class body ends by storing
+        // the implicit `__class__` cell OBJECT (its first own cell) into the
+        // namespace under `__classcell__`; `__build_class__` pops the entry
+        // and fills the cell with the constructed class, closing the loop
+        // for methods that captured it.
+        let cell = body.emit(InstKind::LoadClosure(CellId(0)))?;
+        let classcell_name = driver.names.intern("__classcell__")?;
+        body.emit(InstKind::StoreName(classcell_name, cell))?;
     }
     let body_fn = body.finish()?;
     driver.replace_reserved_function(body_id, body_fn)?;
