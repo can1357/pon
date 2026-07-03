@@ -208,3 +208,5 @@ pon-conformance/corpus/cpython/object_init_leniency.py
 pon-conformance/corpus/cpython/sys_monitoring_surface.py
 pon-conformance/corpus/cpython/str_maketrans_dict.py
 pon-conformance/corpus/cpython/colorize_ansi_colors.py
+pon-conformance/corpus/cpython/importlib_source_finder.py
+
