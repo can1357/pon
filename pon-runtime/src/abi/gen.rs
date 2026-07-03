@@ -623,8 +623,14 @@ pub unsafe extern "C" fn pon_gen_unwind(frame: *mut GenFrame, kind: u8) -> *mut 
         && !stop_iteration
         && pending_exception_matches(ExceptionKind::StopAsyncIteration);
     if stop_iteration || stop_async_iteration {
+        // Keep the original PENDING (and therefore GC-rooted via
+        // `current_exc`) while the replacement message and RuntimeError are
+        // allocated: a collection inside those allocations would otherwise
+        // free the original and leave `__cause__`/`__context__` dangling.
+        // The still-pending original also supplies `__context__` at
+        // allocation time — CPython sets both links on the PEP 479
+        // RuntimeError (`_PyGen_SetStopIterationValue` path).
         let original = thread_state_lock().current_exc;
-        pon_err_clear();
         let text: String = format!(
             "{} raised {}",
             kind_noun(kind),
@@ -638,7 +644,8 @@ pub unsafe extern "C" fn pon_gen_unwind(frame: *mut GenFrame, kind: u8) -> *mut 
             Some(Err(message)) => return super::return_null_with_error(message),
             None => return super::return_null_with_error("runtime is not initialized"),
         };
-        // SAFETY: `pon_raise` installs the instance and links __cause__.
+        // SAFETY: `pon_raise` links __cause__/__context__ from the
+        // still-pending original, then replaces it as the current exception.
         return unsafe { super::exc::pon_raise(runtime_error, original) };
     }
     ptr::null_mut()

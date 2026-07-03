@@ -933,6 +933,64 @@ pub unsafe extern "C" fn builtin_print(argv: *mut *mut PyObject, argc: usize) ->
     let Some(args) = (unsafe { argv_slice(argv, argc) }) else {
         return fail("print() received a null argv pointer");
     };
+    // `print(*objects, sep=' ', end='\n', file=None, flush=False)`: keywords
+    // ride a trailing marker appended by the keyword binder; plain positional
+    // calls arrive without one.
+    let (args, kw_pairs) = match args.split_last() {
+        Some((&last, rest)) => match unsafe { crate::types::lazy_iter::kw_marker_pairs(last) } {
+            Some(pairs) => (rest, pairs),
+            None => (args, &[][..]),
+        },
+        None => (args, &[][..]),
+    };
+    let mut sep: Option<String> = None;
+    let mut end: Option<String> = None;
+    let mut file: *mut PyObject = ptr::null_mut();
+    let mut flush = false;
+    for &(name, value) in kw_pairs {
+        let Some(keyword) = crate::intern::resolve(name) else {
+            return fail("print() keyword name is not interned");
+        };
+        match keyword.as_str() {
+            slot @ ("sep" | "end") => {
+                if !is_none(value) {
+                    let Some(text) = (unsafe { crate::types::type_::unicode_text(value) }) else {
+                        return abi::exc::raise_kind_error_text(
+                            crate::types::exc::ExceptionKind::TypeError,
+                            &format!(
+                                "{slot} must be None or a string, not {}",
+                                unsafe { type_name(value) }.unwrap_or("object")
+                            ),
+                        );
+                    };
+                    if slot == "sep" {
+                        sep = Some(text.to_owned());
+                    } else {
+                        end = Some(text.to_owned());
+                    }
+                }
+            }
+            "file" => {
+                if !is_none(value) {
+                    file = value;
+                }
+            }
+            "flush" => {
+                flush = match unsafe { truth(value) } {
+                    Ok(value) => value,
+                    Err(message) => return fail(message),
+                };
+            }
+            other => {
+                // The keyword binder already rejects unknown names; keep the
+                // typed rejection for direct native callers.
+                return abi::exc::raise_kind_error_text(
+                    crate::types::exc::ExceptionKind::TypeError,
+                    &format!("'{other}' is an invalid keyword argument for print()"),
+                );
+            }
+        }
+    }
     // Stringify before taking the stdout lock: `__str__` dispatch can run
     // arbitrary Python (including a nested `print`).
     let mut texts = Vec::with_capacity(args.len());
@@ -942,11 +1000,44 @@ pub unsafe extern "C" fn builtin_print(argv: *mut *mut PyObject, argc: usize) ->
             Err(()) => return ptr::null_mut(),
         }
     }
+    let mut payload = texts.join(sep.as_deref().unwrap_or(" "));
+    payload.push_str(end.as_deref().unwrap_or("\n"));
+    if !file.is_null() {
+        // Explicit `file=`: route through the object's own `write` (and
+        // `flush`) methods so swapped streams (io.StringIO capture shims)
+        // observe the output, matching CPython's `print`.
+        let payload_object = alloc_str(&payload);
+        if payload_object.is_null() {
+            return ptr::null_mut();
+        }
+        // SAFETY: Attribute dispatch tolerates a null feedback cell.
+        let write_method = unsafe { abi::pon_get_attr(file, crate::intern::intern("write"), ptr::null_mut()) };
+        if write_method.is_null() {
+            return ptr::null_mut();
+        }
+        let mut call_args = [payload_object];
+        // SAFETY: Call helper follows the NULL-sentinel error contract.
+        if unsafe { abi::pon_call(write_method, call_args.as_mut_ptr(), 1) }.is_null() {
+            return ptr::null_mut();
+        }
+        if flush {
+            // SAFETY: Attribute dispatch tolerates a null feedback cell.
+            let flush_method = unsafe { abi::pon_get_attr(file, crate::intern::intern("flush"), ptr::null_mut()) };
+            if flush_method.is_null() {
+                return ptr::null_mut();
+            }
+            // SAFETY: Call helper follows the NULL-sentinel error contract.
+            if unsafe { abi::pon_call(flush_method, ptr::null_mut(), 0) }.is_null() {
+                return ptr::null_mut();
+            }
+        }
+        return unsafe { abi::pon_none() };
+    }
     let mut stdout = io::stdout().lock();
-    if write!(stdout, "{}", texts.join(" ")).is_err() {
+    if write!(stdout, "{payload}").is_err() {
         return fail("failed to write stdout");
     }
-    if writeln!(stdout).and_then(|()| stdout.flush()).is_err() {
+    if stdout.flush().is_err() {
         return fail("failed to write stdout");
     }
     unsafe { abi::pon_none() }

@@ -43,35 +43,59 @@ pub unsafe extern "C" fn builtin_dir(argv: *mut *mut PyObject, argc: usize) -> *
         return raise_type_error(&format!("dir expected at most 1 argument, got {}", args.len()));
     }
 
+    // CPython `PyObject_Dir` sorts the `__dir__` result but does NOT dedup it;
+    // only the dict-merged producers (`type.__dir__`/`object.__dir__`, locals,
+    // module dicts) are unique by construction.  pon's fallback enumeration
+    // walks MRO dicts naively, so it dedups explicitly to match.
+    let mut dedup = true;
     let mut names = if args.is_empty() {
         match unsafe { names_from_mapping(crate::native::builtins_mod::builtin_locals(ptr::null_mut(), 0)) } {
             Ok(names) => names,
             Err(message) => return raise_type_error(&message),
         }
-    } else if let Some(dir_method) = unsafe { try_get_attr(args[0], "__dir__") } {
-        let result = unsafe { abi::pon_call(dir_method, ptr::null_mut(), 0) };
-        if result.is_null() {
+    } else {
+        // Tag discipline: box a tagged immediate once so every arm below may
+        // dereference (`names_for_object` walks `ob_type`).
+        let object = crate::tag::untag_arg(args[0]);
+        if object.is_null() {
             return ptr::null_mut();
         }
-        match collect_iterable(result) {
-            Ok(values) => values.into_iter().map(name_text).collect(),
-            Err(message) => return raise_type_error(&message),
+        // CPython: `dir(obj)` is special-method dispatch — `type(obj).__dir__(obj)`,
+        // looked up on the TYPE only (`_PyObject_LookupSpecial`), never on the
+        // instance.  A class defining `__dir__` for its instances therefore
+        // still enumerates normally when the class object itself is passed
+        // (mock.py does `dir(NonCallableMock)` at import); a METACLASS
+        // `__dir__` does fire for its classes.  No pon builtin type registers
+        // `__dir__`, so only a Python-level method can match here.
+        if let Some(dir_method) = unsafe { type_dunder(object, "__dir__") } {
+            let mut call_args = [object];
+            let result = unsafe { abi::pon_call(dir_method, call_args.as_mut_ptr(), 1) };
+            if result.is_null() {
+                return ptr::null_mut();
+            }
+            dedup = false;
+            match collect_iterable(result) {
+                Ok(values) => values.into_iter().map(name_text).collect(),
+                Err(message) => return raise_type_error(&message),
+            }
+        } else if let Some(namespace) = crate::import::module_namespace_for_object(object) {
+            // Module arm: CPython's `module.__dir__` returns `list(module.__dict__)`.
+            // Module attrs live on the module object (mirrored into the registered
+            // namespace dict), not in any class dict, so the fallback below would
+            // see nothing.
+            match namespace.and_then(|dict| unsafe { names_from_mapping(dict) }) {
+                Ok(names) => names,
+                Err(message) => return raise_type_error(&message),
+            }
+        } else {
+            names_for_object(object)
         }
-    } else if let Some(namespace) = crate::import::module_namespace_for_object(args[0]) {
-        // Module arm: CPython's `module.__dir__` returns `list(module.__dict__)`.
-        // Module attrs live on the module object (mirrored into the registered
-        // namespace dict), not in any class dict, so the fallback below would
-        // see nothing.
-        match namespace.and_then(|dict| unsafe { names_from_mapping(dict) }) {
-            Ok(names) => names,
-            Err(message) => return raise_type_error(&message),
-        }
-    } else {
-        names_for_object(args[0])
     };
 
     names.sort();
-    names.dedup();
+    if dedup {
+        names.dedup();
+    }
     build_str_list(names)
 }
 
@@ -887,10 +911,27 @@ fn class_dict_to_dict(class_dict: *mut PyClassDict) -> Result<*mut PyObject, Str
 
 pub(super) fn names_for_object(object: *mut PyObject) -> Vec<String> {
     let mut names = Vec::new();
+    if unsafe { type_::is_type_object(object) } {
+        // CPython `type.__dir__(cls)`: merge `cls.__dict__` with every base
+        // in `cls.__mro__` — deliberately NOT metaclass attributes (CPython
+        // excludes them so `'mro' not in dir(int)`).
+        for class in unsafe { crate::mro::mro_entries(object.cast::<PyType>()) } {
+            if class.is_null() {
+                continue;
+            }
+            let dict = unsafe { (*class).tp_dict.cast::<PyClassDict>() };
+            if !dict.is_null() {
+                names.extend(class_dict_names(dict));
+            }
+        }
+        return names;
+    }
+    // `object.__dir__(obj)`: instance `__dict__` plus every class dict on
+    // `type(obj).__mro__`.
     if let Some(class_dict) = unsafe { class_namespace(object) } {
         names.extend(class_dict_names(class_dict));
     }
-    if !object.is_null() {
+    if !object.is_null() && crate::tag::is_heap(object) {
         let ty = unsafe { (*object).ob_type.cast_mut() };
         for class in unsafe { crate::mro::mro_entries(ty) } {
             let dict = unsafe { (*class).tp_dict.cast::<PyClassDict>() };
@@ -998,4 +1039,33 @@ fn raise_value_error(message: &str) -> *mut PyObject {
 
 fn raise_zero_division_error(message: &str) -> *mut PyObject {
     unsafe { abi::exc::pon_raise_zero_division_error(message.as_ptr(), message.len()) }
+}
+
+/// Special-method lookup: find `name` on `type(object)`'s MRO only.
+///
+/// CPython's `_PyObject_LookupSpecial` — the instance (and, for a class
+/// object, the class itself) is never consulted, only its type/metaclass
+/// chain.  Returns the raw class-dict entry; callers pass `object` as the
+/// explicit first argument instead of descriptor-binding, which is
+/// equivalent for the plain Python functions this can match (no pon
+/// builtin type registers these dunders natively).
+pub(super) unsafe fn type_dunder(object: *mut PyObject, name: &str) -> Option<*mut PyObject> {
+    if object.is_null() || !crate::tag::is_heap(object) {
+        return None;
+    }
+    let ty = unsafe { (*object).ob_type.cast_mut() };
+    let name_id = intern(name);
+    for class in unsafe { crate::mro::mro_entries(ty) } {
+        if class.is_null() {
+            continue;
+        }
+        let dict = unsafe { (*class).tp_dict.cast::<PyClassDict>() };
+        if dict.is_null() {
+            continue;
+        }
+        if let Some(value) = unsafe { (&*dict).get(name_id) } {
+            return Some(value);
+        }
+    }
+    None
 }

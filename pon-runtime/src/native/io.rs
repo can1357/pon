@@ -972,6 +972,693 @@ unsafe extern "C" fn bytesio_next_method(argv: *mut *mut PyObject, argc: usize) 
     unsafe { bytesio_iternext_slot(args[0]) }
 }
 
+// ---------------------------------------------------------------------------
+// StringIO: real in-memory text stream (CPython `Modules/_io/stringio.c`
+// semantics).  The backing store is a growable code-point vector, so
+// `tell`/`seek` offsets count code points like CPython's UCS4 buffer; the
+// position may park beyond EOF (reads see empty, writes NUL-fill the gap).
+// Newline handling follows the constructor's `newline=` mode: `None` decodes
+// universal newlines on write, `'\r'`/`'\r\n'` translate `'\n'` on write, and
+// `''`/`'\n'` pass text through verbatim.
+
+/// Constructor `newline=` mode (CPython `stringio.c` write/readline pairing).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SioNewline {
+    /// `newline=None`: writes decode `\r\n`/`\r` to `\n`; lines end at `\n`.
+    Universal,
+    /// `newline=''`: verbatim writes; lines end at any of `\r\n`/`\r`/`\n`.
+    Verbatim,
+    /// `newline='\n'`: verbatim writes; lines end at `\n`.
+    Lf,
+    /// `newline='\r'`: writes translate `\n` to `\r`; lines end at `\r`.
+    Cr,
+    /// `newline='\r\n'`: writes translate `\n` to `\r\n`; lines end at `\r\n`.
+    CrLf,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+struct PyStringIO {
+    /// Common object header; this field must remain first.
+    ob_base: PyObjectHeader,
+    /// Backing code-point buffer. `None` is the closed state.
+    buffer: Option<Vec<char>>,
+    /// Absolute stream position; `seek` may park it beyond the buffer end.
+    pos: usize,
+    /// Newline translation mode fixed at construction.
+    newline: SioNewline,
+}
+
+unsafe impl Send for PyStringIO {}
+
+static STRING_IO_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let mut ty = Box::new(PyType::new(
+        abi::runtime_type_type().cast_const(),
+        // Dotted tp_name (the `pickle.PickleBuffer` discipline): `repr(type)`
+        // shows the CPython path while `__name__` exposes the tail component.
+        "_io.StringIO",
+        std::mem::size_of::<PyStringIO>(),
+    ));
+    ty.tp_new = Some(stringio_new);
+    ty.tp_getattro = Some(stringio_getattro);
+    ty.tp_setattro = Some(stringio_setattro);
+    ty.tp_iter = Some(stringio_iter_slot);
+    ty.tp_iternext = Some(stringio_iternext_slot);
+    // pon's `__module__` getter defaults static types to "builtins"; carry
+    // the CPython value (and the abstract-base `__doc__`) explicitly.
+    let namespace = type_::new_namespace();
+    if !namespace.is_null() {
+        let module = unsafe { pon_const_str("_io".as_ptr(), "_io".len()) };
+        let doc = "Text I/O implementation using an in-memory buffer.";
+        let doc_object = unsafe { pon_const_str(doc.as_ptr(), doc.len()) };
+        if !module.is_null() && !doc_object.is_null() {
+            // SAFETY: Freshly allocated namespace box; values are live objects.
+            unsafe {
+                (*namespace).set(intern("__module__"), module);
+                (*namespace).set(intern("__doc__"), doc_object);
+            }
+            ty.tp_dict = namespace.cast::<PyObject>();
+        }
+    }
+    Box::into_raw(ty) as usize
+});
+
+fn stringio_type() -> *mut PyType {
+    *STRING_IO_TYPE as *mut PyType
+}
+
+unsafe fn as_stringio<'a>(object: *mut PyObject) -> Option<&'a mut PyStringIO> {
+    let object = crate::tag::untag_arg(object);
+    if object.is_null() {
+        return None;
+    }
+    // Non-forcing type fetch: before the first `_io` import no instance can
+    // exist (the `as_bytesio` discipline).
+    let ty = LazyLock::get(&STRING_IO_TYPE).map_or(ptr::null(), |&ty| ty as *const PyType);
+    if ty.is_null() {
+        return None;
+    }
+    // SAFETY: NULL was rejected above; the type check gates the downcast.
+    (unsafe { (*object).ob_type } == ty).then(|| unsafe { &mut *object.cast::<PyStringIO>() })
+}
+
+impl PyStringIO {
+    /// Splits the open stream into `(buffer, position)` borrows, or the
+    /// closed-file ValueError.
+    fn open_parts(&mut self) -> Result<(&mut Vec<char>, &mut usize), BioError> {
+        let Self { buffer, pos, .. } = self;
+        buffer.as_mut().map(|buffer| (buffer, pos)).ok_or_else(closed_bio)
+    }
+
+    /// Applies the constructor's `newline=` mode to outgoing text.
+    fn translated(&self, text: &str) -> String {
+        match self.newline {
+            SioNewline::Universal => text.replace("\r\n", "\n").replace('\r', "\n"),
+            SioNewline::Verbatim | SioNewline::Lf => text.to_owned(),
+            SioNewline::Cr => text.replace('\n', "\r"),
+            SioNewline::CrLf => text.replace('\n', "\r\n"),
+        }
+    }
+
+    /// `write`: overwrite/extend at the current position, NUL-filling any
+    /// gap left by a past-EOF seek.  Returns the code-point length of the
+    /// ORIGINAL text (CPython returns `len(s)` before translation).
+    fn write_text(&mut self, text: &str) -> Result<usize, BioError> {
+        let written: Vec<char> = self.translated(text).chars().collect();
+        let (buffer, pos) = self.open_parts()?;
+        if !written.is_empty() {
+            if *pos > buffer.len() {
+                buffer.resize(*pos, '\0');
+            }
+            let end = *pos + written.len();
+            if end > buffer.len() {
+                buffer.resize(end, '\0');
+            }
+            buffer[*pos..end].copy_from_slice(&written);
+            *pos = end;
+        }
+        Ok(text.chars().count())
+    }
+
+    /// `read`: up to `size` code points from the current position
+    /// (`None`/negative reads to EOF); a position parked past EOF reads
+    /// empty without moving.
+    fn read_text(&mut self, size: Option<i64>) -> Result<String, BioError> {
+        let (buffer, pos) = self.open_parts()?;
+        let start = (*pos).min(buffer.len());
+        let available = buffer.len() - start;
+        let count = match size {
+            Some(size) if size >= 0 => (size as usize).min(available),
+            _ => available,
+        };
+        let out = buffer[start..start + count].iter().collect();
+        *pos += count;
+        Ok(out)
+    }
+
+    /// Length of the line starting `window[0]`, INCLUDING its line ending,
+    /// per the `newline=` mode; `window.len()` when no ending is found.
+    fn line_length(&self, window: &[char]) -> usize {
+        let limit = window.len();
+        match self.newline {
+            SioNewline::Universal | SioNewline::Lf => {
+                window.iter().position(|&ch| ch == '\n').map_or(limit, |at| at + 1)
+            }
+            SioNewline::Verbatim => {
+                for (index, &ch) in window.iter().enumerate() {
+                    if ch == '\n' {
+                        return index + 1;
+                    }
+                    if ch == '\r' {
+                        // `\r\n` counts as one ending; lone `\r` ends a line.
+                        return if window.get(index + 1) == Some(&'\n') { index + 2 } else { index + 1 };
+                    }
+                }
+                limit
+            }
+            SioNewline::Cr => window.iter().position(|&ch| ch == '\r').map_or(limit, |at| at + 1),
+            SioNewline::CrLf => window
+                .windows(2)
+                .position(|pair| pair == ['\r', '\n'])
+                .map_or(limit, |at| at + 2),
+        }
+    }
+
+    /// `readline`: code points through the next line ending (inclusive),
+    /// capped by `size`.
+    fn read_line(&mut self, size: Option<i64>) -> Result<String, BioError> {
+        let limit = {
+            let (buffer, pos) = self.open_parts()?;
+            let start = (*pos).min(buffer.len());
+            let available = buffer.len() - start;
+            match size {
+                Some(size) if size >= 0 => (size as usize).min(available),
+                _ => available,
+            }
+        };
+        let start = self.pos.min(self.buffer.as_ref().map_or(0, Vec::len));
+        let window: Vec<char> = {
+            let buffer = self.buffer.as_ref().ok_or_else(closed_bio)?;
+            buffer[start..start + limit].to_vec()
+        };
+        let count = self.line_length(&window);
+        self.pos = start + count;
+        Ok(window[..count].iter().collect())
+    }
+
+    /// `seek`: absolute negative positions raise; cur/end-relative seeks
+    /// accept only offset 0 (CPython `_io_StringIO_seek_impl`).
+    fn seek_to(&mut self, offset: i64, whence: i64) -> Result<usize, BioError> {
+        let (buffer, pos) = self.open_parts()?;
+        match whence {
+            0 => {
+                if offset < 0 {
+                    return Err(BioError::Value(format!("Negative seek position {offset}")));
+                }
+                *pos = offset as usize;
+            }
+            1 => {
+                if offset != 0 {
+                    return Err(BioError::Value("Can't do nonzero cur-relative seeks".to_owned()));
+                }
+            }
+            2 => {
+                if offset != 0 {
+                    return Err(BioError::Value("Can't do nonzero end-relative seeks".to_owned()));
+                }
+                *pos = buffer.len();
+            }
+            _ => {
+                return Err(BioError::Value(format!("Invalid whence ({whence}, should be 0, 1 or 2)")));
+            }
+        }
+        Ok(*pos)
+    }
+
+    /// `truncate`: shrink-only resize that returns the REQUESTED size and
+    /// never moves the position (CPython contract).
+    fn truncate_to(&mut self, size: Option<i64>) -> Result<i64, BioError> {
+        let (buffer, pos) = self.open_parts()?;
+        let size = size.unwrap_or(*pos as i64);
+        if size < 0 {
+            return Err(BioError::Value(format!("Negative size value {size}")));
+        }
+        if (size as usize) < buffer.len() {
+            buffer.truncate(size as usize);
+        }
+        Ok(size)
+    }
+}
+
+/// Parses the constructor/`__init__` `newline=` argument.
+fn stringio_newline_mode(object: Option<*mut PyObject>) -> Result<SioNewline, *mut PyObject> {
+    let Some(object) = object.map(crate::tag::untag_arg) else {
+        return Ok(SioNewline::Lf);
+    };
+    if is_none(object) {
+        return Ok(SioNewline::Universal);
+    }
+    let Some(text) = (unsafe { type_::unicode_text(object) }) else {
+        let type_name = unsafe { crate::types::dict::type_name(object) }.unwrap_or("object");
+        return Err(raise_type_error(&format!("newline must be str or None, not {type_name}")));
+    };
+    match text {
+        "" => Ok(SioNewline::Verbatim),
+        "\n" => Ok(SioNewline::Lf),
+        "\r" => Ok(SioNewline::Cr),
+        "\r\n" => Ok(SioNewline::CrLf),
+        other => Err(raise_value_error(&format!("illegal newline value: '{other}'"))),
+    }
+}
+
+/// `tp_new` for `_io.StringIO(initial_value='', newline='\n')`.
+unsafe extern "C" fn stringio_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    let positional = match unsafe { type_::positional_args_from_object(args) } {
+        Ok(args) => args,
+        Err(message) => {
+            pon_err_set(message);
+            return ptr::null_mut();
+        }
+    };
+    if positional.len() > 2 {
+        return raise_type_error(&format!("StringIO() takes at most 2 arguments ({} given)", positional.len()));
+    }
+    let mut initial = positional.first().copied();
+    let mut newline = positional.get(1).copied();
+    if !kwargs.is_null() {
+        let entries = match unsafe { crate::types::dict::dict_entries_snapshot(kwargs) } {
+            Ok(entries) => entries,
+            Err(message) => return raise_type_error(&message),
+        };
+        for entry in entries {
+            let Some(key) = (unsafe { type_::unicode_text(entry.key) }) else {
+                return raise_type_error("keywords must be strings");
+            };
+            let (slot, position) = match key {
+                "initial_value" => (&mut initial, 1),
+                "newline" => (&mut newline, 2),
+                other => {
+                    return raise_type_error(&format!("'{other}' is an invalid keyword argument for StringIO()"));
+                }
+            };
+            if slot.is_some() {
+                return raise_type_error(&format!(
+                    "argument for StringIO() given by name ('{key}') and position ({position})"
+                ));
+            }
+            *slot = Some(entry.value);
+        }
+    }
+    let newline = match stringio_newline_mode(newline) {
+        Ok(mode) => mode,
+        Err(raised) => return raised,
+    };
+    let mut sio = PyStringIO {
+        ob_base: PyObjectHeader::new(stringio_type()),
+        buffer: Some(Vec::new()),
+        pos: 0,
+        newline,
+    };
+    match initial.map(crate::tag::untag_arg) {
+        None => {}
+        Some(object) if is_none(object) => {}
+        Some(object) => {
+            let Some(text) = (unsafe { type_::unicode_text(object) }) else {
+                let type_name = unsafe { crate::types::dict::type_name(object) }.unwrap_or("object");
+                return raise_type_error(&format!("initial_value must be str or None, not {type_name}"));
+            };
+            // CPython seeds via `write(initial_value)` (translation applies)
+            // and rewinds to position 0.
+            if let Err(error) = sio.write_text(text) {
+                return raise_bio(error);
+            }
+            sio.pos = 0;
+        }
+    }
+    Box::into_raw(Box::new(sio)).cast::<PyObject>()
+}
+
+unsafe extern "C" fn stringio_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(attr) = (unsafe { type_::unicode_text(name) }) else {
+        return raise_type_error("StringIO attribute name must be str");
+    };
+    let Some(sio) = (unsafe { as_stringio(object) }) else {
+        return raise_type_error("StringIO method receiver is not a StringIO");
+    };
+    match attr {
+        "closed" => unsafe { abi::number::pon_const_bool(i32::from(sio.buffer.is_none())) },
+        // pon does not track the newline kinds seen; CPython starts at None.
+        "newlines" => unsafe { abi::pon_none() },
+        "line_buffering" => unsafe { abi::number::pon_const_bool(0) },
+        "read" => bound_file_method(object, attr, stringio_read_method),
+        "readline" => bound_file_method(object, attr, stringio_readline_method),
+        "readlines" => bound_file_method(object, attr, stringio_readlines_method),
+        "write" => bound_file_method(object, attr, stringio_write_method),
+        "writelines" => bound_file_method(object, attr, stringio_writelines_method),
+        "seek" => bound_file_method(object, attr, stringio_seek_method),
+        "tell" => bound_file_method(object, attr, stringio_tell_method),
+        "truncate" => bound_file_method(object, attr, stringio_truncate_method),
+        "flush" => bound_file_method(object, attr, stringio_flush_method),
+        "close" => bound_file_method(object, attr, stringio_close_method),
+        "getvalue" => bound_file_method(object, attr, stringio_getvalue_method),
+        "readable" | "writable" | "seekable" => bound_file_method(object, attr, stringio_true_flag_method),
+        "isatty" => bound_file_method(object, attr, stringio_isatty_method),
+        "fileno" => bound_file_method(object, attr, stringio_fileno_method),
+        "detach" => bound_file_method(object, attr, stringio_detach_method),
+        "__enter__" => bound_file_method(object, attr, stringio_enter_method),
+        "__exit__" => bound_file_method(object, attr, stringio_exit_method),
+        "__iter__" => bound_file_method(object, attr, stringio_iter_method),
+        "__next__" => bound_file_method(object, attr, stringio_next_method),
+        _ => raise_attribute_error(attr),
+    }
+}
+
+/// StringIO instances carry no writable attributes (CPython: no `__dict__`).
+unsafe extern "C" fn stringio_setattro(object: *mut PyObject, name: *mut PyObject, _value: *mut PyObject) -> core::ffi::c_int {
+    let attr = unsafe { type_::unicode_text(name) }.unwrap_or("?");
+    let type_name = unsafe { crate::types::dict::type_name(crate::tag::untag_arg(object)) }.unwrap_or("_io.StringIO");
+    let _ = crate::abi::exc::raise_attribute_error_text(&format!("'{type_name}' object has no attribute '{attr}'"));
+    -1
+}
+
+unsafe extern "C" fn stringio_iter_slot(object: *mut PyObject) -> *mut PyObject {
+    let Some(sio) = (unsafe { as_stringio(object) }) else {
+        return raise_type_error("StringIO iterator receiver is not a StringIO");
+    };
+    if sio.buffer.is_none() {
+        return raise_value_error("I/O operation on closed file.");
+    }
+    object
+}
+
+unsafe extern "C" fn stringio_iternext_slot(object: *mut PyObject) -> *mut PyObject {
+    let Some(sio) = (unsafe { as_stringio(object) }) else {
+        return raise_type_error("StringIO iterator receiver is not a StringIO");
+    };
+    match sio.read_line(None) {
+        Ok(text) if text.is_empty() => unsafe { abi::pon_raise_stop_iteration(ptr::null_mut()) },
+        Ok(text) => alloc_str(&text),
+        Err(error) => raise_bio(error),
+    }
+}
+
+/// Shared entry preamble: bounds-checks arity and downcasts the receiver.
+unsafe fn stringio_method_args<'a>(
+    argv: *mut *mut PyObject,
+    argc: usize,
+    name: &str,
+    max_extra: usize,
+) -> Result<(&'a mut PyStringIO, &'a [*mut PyObject]), *mut PyObject> {
+    let args = match unsafe { method_args(argv, argc, name) } {
+        Ok(args) => args,
+        Err(message) => return Err(raise_type_error(&message)),
+    };
+    if args.len() > 1 + max_extra {
+        return Err(raise_type_error(&format!(
+            "{name}() expected at most {max_extra} arguments, got {}",
+            args.len() - 1
+        )));
+    }
+    let Some(sio) = (unsafe { as_stringio(args[0]) }) else {
+        return Err(raise_type_error(&format!("{name}() receiver is not a StringIO")));
+    };
+    Ok((sio, &args[1..]))
+}
+
+unsafe extern "C" fn stringio_read_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (sio, args) = match unsafe { stringio_method_args(argv, argc, "read", 1) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    let size = match bio_optional_size(args.first().copied()) {
+        Ok(size) => size,
+        Err(error) => return raise_bio(error),
+    };
+    match sio.read_text(size) {
+        Ok(text) => alloc_str(&text),
+        Err(error) => raise_bio(error),
+    }
+}
+
+unsafe extern "C" fn stringio_readline_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (sio, args) = match unsafe { stringio_method_args(argv, argc, "readline", 1) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    let size = match bio_optional_size(args.first().copied()) {
+        Ok(size) => size,
+        Err(error) => return raise_bio(error),
+    };
+    match sio.read_line(size) {
+        Ok(text) => alloc_str(&text),
+        Err(error) => raise_bio(error),
+    }
+}
+
+unsafe extern "C" fn stringio_readlines_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (sio, args) = match unsafe { stringio_method_args(argv, argc, "readlines", 1) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    let hint = match bio_optional_size(args.first().copied()) {
+        Ok(size) => size,
+        Err(error) => return raise_bio(error),
+    };
+    let mut lines = Vec::new();
+    let mut total = 0i64;
+    loop {
+        let line = match sio.read_line(None) {
+            Ok(line) => line,
+            Err(error) => return raise_bio(error),
+        };
+        if line.is_empty() {
+            break;
+        }
+        total += line.chars().count() as i64;
+        let object = alloc_str(&line);
+        if object.is_null() {
+            return ptr::null_mut();
+        }
+        lines.push(object);
+        if matches!(hint, Some(hint) if hint > 0 && total >= hint) {
+            break;
+        }
+    }
+    unsafe { abi::seq::pon_build_list(lines.as_mut_ptr(), lines.len()) }
+}
+
+unsafe extern "C" fn stringio_write_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (sio, args) = match unsafe { stringio_method_args(argv, argc, "write", 1) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    let Some(&value) = args.first() else {
+        return raise_type_error("write() missing 1 required positional argument: 's'");
+    };
+    let value = crate::tag::untag_arg(value);
+    let Some(text) = (unsafe { type_::unicode_text(value) }) else {
+        let type_name = unsafe { crate::types::dict::type_name(value) }.unwrap_or("object");
+        return raise_type_error(&format!("string argument expected, got '{type_name}'"));
+    };
+    match sio.write_text(text) {
+        Ok(count) => unsafe { abi::pon_const_int(count as i64) },
+        Err(error) => raise_bio(error),
+    }
+}
+
+unsafe extern "C" fn stringio_writelines_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (sio, args) = match unsafe { stringio_method_args(argv, argc, "writelines", 1) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    if sio.buffer.is_none() {
+        return raise_bio(closed_bio());
+    }
+    let Some(&lines) = args.first() else {
+        return raise_type_error("writelines() missing 1 required positional argument: 'lines'");
+    };
+    let receiver = args[0];
+    // SAFETY: Iteration helpers follow the NULL-sentinel error contract.
+    let iterator = unsafe { crate::abstract_op::get_iter(lines) };
+    if iterator.is_null() {
+        return ptr::null_mut();
+    }
+    loop {
+        // SAFETY: `iterator` is live; NULL return distinguishes exhaustion via
+        // the pending-StopIteration check below.
+        let item = unsafe { crate::abstract_op::iter_next(iterator) };
+        if item.is_null() {
+            if stop_iteration_pending() || !pon_err_occurred() {
+                pon_err_clear();
+                break;
+            }
+            return ptr::null_mut();
+        }
+        let mut write_args = [receiver, item];
+        if unsafe { stringio_write_method(write_args.as_mut_ptr(), write_args.len()) }.is_null() {
+            return ptr::null_mut();
+        }
+    }
+    unsafe { abi::pon_none() }
+}
+
+unsafe extern "C" fn stringio_seek_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (sio, args) = match unsafe { stringio_method_args(argv, argc, "seek", 2) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    let Some(&target) = args.first() else {
+        return raise_type_error("seek() missing 1 required positional argument: 'pos'");
+    };
+    let offset = match bio_index_arg(target) {
+        Ok(offset) => offset,
+        Err(error) => return raise_bio(error),
+    };
+    let whence = match args.get(1).map(|&object| bio_index_arg(object)) {
+        None => 0,
+        Some(Ok(whence)) => whence,
+        Some(Err(error)) => return raise_bio(error),
+    };
+    match sio.seek_to(offset, whence) {
+        Ok(position) => unsafe { abi::pon_const_int(position as i64) },
+        Err(error) => raise_bio(error),
+    }
+}
+
+unsafe extern "C" fn stringio_tell_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (sio, _) = match unsafe { stringio_method_args(argv, argc, "tell", 0) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    if sio.buffer.is_none() {
+        return raise_bio(closed_bio());
+    }
+    unsafe { abi::pon_const_int(sio.pos as i64) }
+}
+
+unsafe extern "C" fn stringio_truncate_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (sio, args) = match unsafe { stringio_method_args(argv, argc, "truncate", 1) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    let size = match bio_optional_size(args.first().copied()) {
+        Ok(size) => size,
+        Err(error) => return raise_bio(error),
+    };
+    match sio.truncate_to(size) {
+        Ok(size) => unsafe { abi::pon_const_int(size) },
+        Err(error) => raise_bio(error),
+    }
+}
+
+unsafe extern "C" fn stringio_flush_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (sio, _) = match unsafe { stringio_method_args(argv, argc, "flush", 0) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    if sio.buffer.is_none() {
+        return raise_bio(closed_bio());
+    }
+    unsafe { abi::pon_none() }
+}
+
+unsafe extern "C" fn stringio_close_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (sio, _) = match unsafe { stringio_method_args(argv, argc, "close", 0) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    sio.buffer = None;
+    unsafe { abi::pon_none() }
+}
+
+unsafe extern "C" fn stringio_getvalue_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (sio, _) = match unsafe { stringio_method_args(argv, argc, "getvalue", 0) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    match &sio.buffer {
+        Some(buffer) => alloc_str(&buffer.iter().collect::<String>()),
+        None => raise_bio(closed_bio()),
+    }
+}
+
+/// `readable()`/`writable()`/`seekable()`: `True`, once open is proven.
+unsafe extern "C" fn stringio_true_flag_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (sio, _) = match unsafe { stringio_method_args(argv, argc, "readable", 0) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    if sio.buffer.is_none() {
+        return raise_bio(closed_bio());
+    }
+    unsafe { abi::number::pon_const_bool(1) }
+}
+
+unsafe extern "C" fn stringio_isatty_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (sio, _) = match unsafe { stringio_method_args(argv, argc, "isatty", 0) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    if sio.buffer.is_none() {
+        return raise_bio(closed_bio());
+    }
+    unsafe { abi::number::pon_const_bool(0) }
+}
+
+/// `fileno()`: no OS descriptor backs the buffer; CPython raises
+/// `io.UnsupportedOperation`, an OSError subclass — pon reuses the plain
+/// OSError leg with the same message text.
+unsafe extern "C" fn stringio_fileno_method(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+    unsafe { abi::exc::pon_raise_os_error("fileno".as_ptr(), "fileno".len()) }
+}
+
+/// `detach()`: same UnsupportedOperation contract as `fileno()`.
+unsafe extern "C" fn stringio_detach_method(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+    unsafe { abi::exc::pon_raise_os_error("detach".as_ptr(), "detach".len()) }
+}
+
+unsafe extern "C" fn stringio_enter_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { method_args(argv, argc, "__enter__") } {
+        Ok(args) => args,
+        Err(message) => return raise_type_error(&message),
+    };
+    let Some(sio) = (unsafe { as_stringio(args[0]) }) else {
+        return raise_type_error("__enter__() receiver is not a StringIO");
+    };
+    if sio.buffer.is_none() {
+        return raise_bio(closed_bio());
+    }
+    args[0]
+}
+
+unsafe extern "C" fn stringio_exit_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { method_args(argv, argc, "__exit__") } {
+        Ok(args) => args,
+        Err(message) => return raise_type_error(&message),
+    };
+    let Some(sio) = (unsafe { as_stringio(args[0]) }) else {
+        return raise_type_error("__exit__() receiver is not a StringIO");
+    };
+    sio.buffer = None;
+    unsafe { abi::number::pon_const_bool(0) }
+}
+
+unsafe extern "C" fn stringio_iter_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { method_args(argv, argc, "__iter__") } {
+        Ok(args) => args,
+        Err(message) => return raise_type_error(&message),
+    };
+    unsafe { stringio_iter_slot(args[0]) }
+}
+
+unsafe extern "C" fn stringio_next_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { method_args(argv, argc, "__next__") } {
+        Ok(args) => args,
+        Err(message) => return raise_type_error(&message),
+    };
+    unsafe { stringio_iternext_slot(args[0]) }
+}
+
 /// Stream methods stubbed on `_io._IOBase`: `import io` only needs the heap
 /// classes to exist for subclassing/ABC registration, so unimplemented
 /// operations raise an honest `NotImplementedError` when actually called.
@@ -1028,6 +1715,11 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
             (*bytes_io).tp_base = buffered_io_base.cast::<PyType>();
             (*bytes_io).bump_version();
         }
+        let string_io = stringio_type();
+        if (*string_io).tp_base.is_null() {
+            (*string_io).tp_base = text_io_base.cast::<PyType>();
+            (*string_io).bump_version();
+        }
     }
     let attrs = vec![
         string_attr("__name__", "_io")?,
@@ -1053,10 +1745,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         (intern("FileIO"), binary_file_type().cast::<PyObject>()),
         (intern("TextIOWrapper"), text_file_type().cast::<PyObject>()),
         (intern("BytesIO"), bytesio_type().cast::<PyObject>()),
-        (
-            intern("StringIO"),
-            heap_class("StringIO", &[text_io_base], "Text I/O implementation using an in-memory buffer.", &[])?,
-        ),
+        (intern("StringIO"), stringio_type().cast::<PyObject>()),
         (
             intern("BufferedReader"),
             heap_class(
@@ -1408,24 +2097,26 @@ fn alloc_file(file: File, name: String, mode: OpenMode, encoding: Option<String>
     .cast::<PyObject>()
 }
 
-/// Process-level std stream (`sys.stdout`/`sys.stderr`) as a text-mode
-/// native file over the raw fd.  The object lives in the `sys` module for
-/// the process lifetime, so the `File` never drops (the fd is never closed
-/// underneath libc); an explicit Python-level `close()` closes the real
-/// stream, exactly like CPython.
-pub(super) fn std_stream_object(fd: i32, name: &str) -> *mut PyObject {
+/// Process-level std stream (`sys.stdin`/`sys.stdout`/`sys.stderr`) as a
+/// text-mode native file over the raw fd.  The object lives in the `sys`
+/// module for the process lifetime, so the `File` never drops (the fd is
+/// never closed underneath libc); an explicit Python-level `close()` closes
+/// the real stream, exactly like CPython.  `readable` selects the fd-0
+/// shape (mode `"r"`, read side only); writers pass `false` and keep the
+/// write-only stdout/stderr contract.
+pub(super) fn std_stream_object(fd: i32, name: &str, readable: bool) -> *mut PyObject {
     use std::os::fd::FromRawFd;
-    // SAFETY: fds 1/2 are open for the process lifetime; ownership is parked
-    // in a static module attribute, never dropped.
+    // SAFETY: fds 0/1/2 are open for the process lifetime; ownership is
+    // parked in a static module attribute, never dropped.
     let file = unsafe { File::from_raw_fd(fd) };
     Box::into_raw(Box::new(PyNativeFile {
         ob_base: PyObjectHeader::new(text_file_type()),
         file: Some(file),
         name: name.to_owned(),
-        mode: "w".to_owned(),
+        mode: if readable { "r" } else { "w" }.to_owned(),
         binary: false,
-        readable: false,
-        writable: true,
+        readable,
+        writable: !readable,
         append: false,
         encoding: Some("utf-8".to_owned()),
         newline: NewlineMode::Preserve,
@@ -1596,7 +2287,13 @@ unsafe extern "C" fn file_read_method(argv: *mut *mut PyObject, argc: usize) -> 
     let Some(file) = (unsafe { as_file(args[0]) }) else {
         return raise_type_error("read() receiver is not a native file");
     };
-    match read_raw(file, size) {
+    // Text mode counts `size` in CHARACTERS (CPython `TextIOWrapper.read`);
+    // only binary mode and unsized reads take the raw byte path.
+    let result = match size {
+        Some(count) if !file.binary => read_chars_raw(file, count),
+        _ => read_raw(file, size),
+    };
+    match result {
         Ok(bytes) => bytes_to_python(file, bytes),
         Err(FileOpError::Value(message)) => raise_value_error(&message),
         Err(FileOpError::Io(message)) => raise_io_error(&message),
@@ -1902,6 +2599,65 @@ fn read_line_raw(file: &mut PyNativeFile, size: Option<usize>) -> Result<Vec<u8>
             }
             break;
         }
+    }
+    Ok(out)
+}
+
+/// Text-mode `read(size)`: `size` counts CHARACTERS, not bytes.  Reads one
+/// UTF-8 sequence at a time so a multibyte character is never split at the
+/// requested boundary (the old byte-counted slice ValueError'd mid-codepoint
+/// on e.g. `read(1)` over `'¡'`).  In universal-translate mode a `\r\n` pair
+/// counts as ONE character (it collapses to `\n` downstream) and a bare `\r`
+/// uses the same peek/seek-back idiom as `read_line_raw`.  Invalid leading
+/// bytes are passed through one byte at a time; `bytes_to_python`'s UTF-8
+/// validation stays the single point that rejects them.
+fn read_chars_raw(file: &mut PyNativeFile, count: usize) -> Result<Vec<u8>, FileOpError> {
+    ensure_readable(file)?;
+    let translate = file.newline == NewlineMode::UniversalTranslate;
+    let handle = file.file.as_mut().ok_or_else(closed_error)?;
+    let mut out = Vec::with_capacity(count);
+    let mut chars = 0_usize;
+    while chars < count {
+        let mut byte = [0_u8; 1];
+        if handle.read(&mut byte).map_err(io_op_error)? == 0 {
+            break;
+        }
+        out.push(byte[0]);
+        // Continuation bytes owed for this UTF-8 sequence (0 for ASCII and
+        // for invalid leading bytes, which count as one unit each).
+        let mut pending = match byte[0] {
+            0xC0..=0xDF => 1_usize,
+            0xE0..=0xEF => 2,
+            0xF0..=0xF7 => 3,
+            _ => 0,
+        };
+        while pending > 0 {
+            let mut cont = [0_u8; 1];
+            if handle.read(&mut cont).map_err(io_op_error)? == 0 {
+                // EOF mid-sequence: downstream validation reports it.
+                return Ok(out);
+            }
+            out.push(cont[0]);
+            if cont[0] & 0xC0 != 0x80 {
+                // Not a continuation byte: the sequence is broken; leave the
+                // byte in the buffer for downstream validation to reject.
+                break;
+            }
+            pending -= 1;
+        }
+        if translate && byte[0] == b'\r' {
+            // `\r\n` collapses to one `\n` downstream: consume the pair as a
+            // single character; a bare `\r` seeks back like `read_line_raw`.
+            let mut next = [0_u8; 1];
+            if handle.read(&mut next).map_err(io_op_error)? != 0 {
+                if next[0] == b'\n' {
+                    out.push(next[0]);
+                } else {
+                    handle.seek(SeekFrom::Current(-1)).map_err(io_op_error)?;
+                }
+            }
+        }
+        chars += 1;
     }
     Ok(out)
 }

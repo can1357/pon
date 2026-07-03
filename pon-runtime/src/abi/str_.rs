@@ -1673,12 +1673,71 @@ unsafe fn bytes_method_entry(method: BytesMethodId, argv: *mut *mut PyObject, ar
     unsafe { pon_bytes_method(method, receiver, explicit_argv, explicit_argc) }
 }
 
+/// Bare method name for a [`StrMethodId`], for the CPython
+/// method_descriptor error shapes (`unbound method str.upper() needs an
+/// argument`, `descriptor 'upper' for 'str' objects doesn't apply to ...`).
+fn str_method_name(method: StrMethodId) -> &'static str {
+    match method {
+        STR_METHOD_SPLIT => "split",
+        STR_METHOD_JOIN => "join",
+        STR_METHOD_REPLACE => "replace",
+        STR_METHOD_FIND => "find",
+        STR_METHOD_STARTSWITH => "startswith",
+        STR_METHOD_ENCODE => "encode",
+        STR_METHOD_STRIP => "strip",
+        STR_METHOD_LOWER => "lower",
+        STR_METHOD_UPPER => "upper",
+        STR_METHOD_ENDSWITH => "endswith",
+        STR_METHOD_TITLE => "title",
+        STR_METHOD_RSPLIT => "rsplit",
+        STR_METHOD_SPLITLINES => "splitlines",
+        STR_METHOD_LSTRIP => "lstrip",
+        STR_METHOD_RSTRIP => "rstrip",
+        STR_METHOD_RFIND => "rfind",
+        STR_METHOD_INDEX => "index",
+        STR_METHOD_RINDEX => "rindex",
+        STR_METHOD_COUNT => "count",
+        STR_METHOD_CAPITALIZE => "capitalize",
+        STR_METHOD_CASEFOLD => "casefold",
+        STR_METHOD_SWAPCASE => "swapcase",
+        STR_METHOD_CENTER => "center",
+        STR_METHOD_LJUST => "ljust",
+        STR_METHOD_RJUST => "rjust",
+        STR_METHOD_ZFILL => "zfill",
+        STR_METHOD_EXPANDTABS => "expandtabs",
+        STR_METHOD_PARTITION => "partition",
+        STR_METHOD_RPARTITION => "rpartition",
+        STR_METHOD_REMOVEPREFIX => "removeprefix",
+        STR_METHOD_REMOVESUFFIX => "removesuffix",
+        STR_METHOD_ISDECIMAL => "isdecimal",
+        STR_METHOD_ISDIGIT => "isdigit",
+        STR_METHOD_ISNUMERIC => "isnumeric",
+        STR_METHOD_ISALPHA => "isalpha",
+        STR_METHOD_ISALNUM => "isalnum",
+        STR_METHOD_ISSPACE => "isspace",
+        STR_METHOD_ISUPPER => "isupper",
+        STR_METHOD_ISLOWER => "islower",
+        STR_METHOD_ISTITLE => "istitle",
+        STR_METHOD_ISIDENTIFIER => "isidentifier",
+        STR_METHOD_ISPRINTABLE => "isprintable",
+        STR_METHOD_ISASCII => "isascii",
+        STR_METHOD_TRANSLATE => "translate",
+        STR_METHOD_MAKETRANS => "maketrans",
+        STR_METHOD_FORMAT_MAP => "format_map",
+        STR_METHOD_FORMAT => "format",
+        _ => "?",
+    }
+}
+
 unsafe fn str_method_entry(method: StrMethodId, argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc == 0 {
+        // CPython method_descriptor `descr_check`: `str.upper()` reached
+        // unbound off the type with no receiver.  Checked BEFORE the argv
+        // probe — zero-argument calls legitimately carry a NULL argv.
+        return raise_type_error(format!("unbound method str.{}() needs an argument", str_method_name(method)));
+    }
     if argv.is_null() {
         return super::return_null_with_error("str method argv pointer is null");
-    }
-    if argc == 0 {
-        return super::return_null_with_error("str method missing receiver");
     }
     let receiver = unsafe { *argv };
     let explicit_argc = argc - 1;
@@ -1849,8 +1908,20 @@ pub unsafe extern "C" fn pon_str_method(
 ) -> *mut PyObject {
     crate::untag_prelude!(receiver);
     super::catch_object_helper(|| {
-        let Ok(receiver) = expect_str(receiver) else {
-            return super::return_null_with_error("str method receiver must be str");
+        let receiver = match expect_str(receiver) {
+            Ok(receiver) => receiver,
+            // A non-str receiver is the CPython method_descriptor receiver
+            // check (`descr_check`): unbound `str.upper(1)` misuse.  Other
+            // failures (NULL receiver, invalid UTF-8, uninitialized
+            // runtime) keep the internal error path.
+            Err(message) if message == "expected str object" => {
+                let got = unsafe { crate::types::dict::type_name(receiver) }.unwrap_or("object");
+                return raise_type_error(format!(
+                    "descriptor '{}' for 'str' objects doesn't apply to a '{got}' object",
+                    str_method_name(method)
+                ));
+            }
+            Err(message) => return super::return_null_with_error(message),
         };
         let Some(args) = raw_args(argv, argc) else {
             return super::return_null_with_error("str method argv pointer is null");
@@ -2215,7 +2286,7 @@ fn str_swapcase_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject 
 
 fn str_unary_text_method(args: &[*mut PyObject], value: &str, name: &str) -> *mut PyObject {
     if !args.is_empty() {
-        return raise_type_error(format!("{name} expected no arguments"));
+        return raise_type_error(format!("{name}() takes no arguments ({} given)", args.len()));
     }
     alloc_str_object(value)
 }
@@ -2320,6 +2391,9 @@ fn str_translate_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject
 }
 
 fn str_maketrans_method(args: &[*mut PyObject]) -> *mut PyObject {
+    if args.len() == 1 {
+        return str_maketrans_dict_form(args[0]);
+    }
     if !(2..=3).contains(&args.len()) {
         return raise_type_error("str.maketrans expected two or three arguments");
     }
@@ -2328,6 +2402,53 @@ fn str_maketrans_method(args: &[*mut PyObject]) -> *mut PyObject {
     let delete = match args.get(2).copied().map(expect_str).transpose() { Ok(value) => value, Err(message) => return raise_type_error(message) };
     let table = match str_type::maketrans(&from, &to, delete.as_deref()) { Ok(table) => table, Err(message) => return raise_value_error(message) };
     as_object_ptr(Box::into_raw(Box::new(PyStrTranslateTable { ob_base: PyObjectHeader::new(str_translate_table_type()), table })))
+}
+
+/// CPython's one-argument `str.maketrans(dict)` form.
+///
+/// Keys must be ints (kept as-is, `bool <: int` included) or length-1
+/// strings (re-keyed to their ordinal); values pass through UNVALIDATED —
+/// CPython defers value checking to `str.translate`, and the dict leg of
+/// [`expect_translate_table`] applies the same deferred contract.  Returns a
+/// REAL dict exactly like CPython (the 2/3-argument form predates this leg
+/// and keeps the opaque representative table).  Error messages reproduce the
+/// CPython 3.14.6 oracle byte-for-byte, historical typos included
+/// ("mustbe", "translatetable").  Consumed at import by `_pyrepl.utils`
+/// (`ZERO_WIDTH_TRANS = str.maketrans({"\x01": "", "\x02": ""})`) on the
+/// `doctest -> pdb` chain.
+fn str_maketrans_dict_form(mapping: *mut PyObject) -> *mut PyObject {
+    let entries = {
+        let _guard = crate::sync::begin_critical_section(mapping);
+        match unsafe { crate::types::dict::dict_entries_snapshot(mapping) } {
+            Ok(entries) => entries,
+            Err(_) => return raise_type_error("if you give only one argument to maketrans it must be a dict"),
+        }
+    };
+    let mut flat: Vec<*mut PyObject> = Vec::with_capacity(entries.len() * 2);
+    for entry in &entries {
+        let key = if let Ok(text) = expect_str(entry.key) {
+            let mut chars = text.chars();
+            match (chars.next(), chars.next()) {
+                (Some(ch), None) => {
+                    // SAFETY: Integer boxing helper follows the NULL-sentinel contract.
+                    let key = unsafe { super::pon_const_int(i64::from(u32::from(ch))) };
+                    if key.is_null() {
+                        return ptr::null_mut();
+                    }
+                    key
+                }
+                _ => return raise_value_error("string keys in translatetable must be of length 1"),
+            }
+        } else if str_long_value(entry.key).is_ok() {
+            entry.key
+        } else {
+            return raise_type_error("keys in translate table mustbe strings or integers");
+        };
+        flat.push(key);
+        flat.push(entry.value);
+    }
+    // SAFETY: `flat` holds `entries.len()` live key/value pairs.
+    unsafe { super::map::pon_build_map(flat.as_mut_ptr(), entries.len()) }
 }
 
 fn str_format_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
@@ -2406,8 +2527,10 @@ fn str_split_args(args: &[*mut PyObject], name: &str) -> Result<(Option<String>,
         return Err("empty separator".to_owned());
     }
     let maxsplit = match args.get(1).copied() {
-        Some(value) => str_long_value(value)? as isize,
-        None => -1,
+        // Keyword binding fills absent slots with None (`split`/`rsplit`
+        // binder rows): None keeps the unlimited default like CPython.
+        Some(value) if !is_none(value) => str_long_value(value)? as isize,
+        _ => -1,
     };
     Ok((sep, maxsplit))
 }
@@ -2886,7 +3009,9 @@ fn bytearray_clear_method(receiver: *mut PyObject, args: &[*mut PyObject]) -> *m
     unsafe { super::pon_none() }
 }
 
-/// Collects an iterable of ints in `range(0, 256)` for the `bytes()` constructor.
+/// Collects an iterable of byte items for the `bytes()` constructor and
+/// `int.from_bytes`: each item goes through the `__index__` protocol and
+/// must land in `range(0, 256)`.
 fn bytes_items_from_iterable(iterable: *mut PyObject) -> Option<Vec<u8>> {
     let iter = unsafe { super::iter::pon_get_iter(iterable, ptr::null_mut()) };
     if iter.is_null() {
@@ -2909,7 +3034,7 @@ fn bytes_items_from_iterable(iterable: *mut PyObject) -> Option<Vec<u8>> {
             }
             return Some(out);
         }
-        let Some(value) = object_to_i64(item) else {
+        let Some(value) = byte_item_index(item) else {
             let type_name = unsafe { crate::types::dict::type_name(item) }.unwrap_or("object");
             let message = format!("'{type_name}' object cannot be interpreted as an integer");
             unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
@@ -2922,6 +3047,85 @@ fn bytes_items_from_iterable(iterable: *mut PyObject) -> Option<Vec<u8>> {
         }
         out.push(value as u8);
     }
+}
+
+/// Integer payload of one iterable byte item: bool/int payloads read
+/// directly, then the `__index__` protocol (nb_index slot, then the
+/// Python-level dunder) — CPython's `_PyBytes_FromIterator` accepts any
+/// index-carrying item, not just exact ints.
+fn byte_item_index(item: *mut PyObject) -> Option<i64> {
+    if let Some(value) = object_to_i64(item) {
+        return Some(value);
+    }
+    // SAFETY: A non-NULL heap object carries a live header.
+    let ty = unsafe { item.as_ref()?.ob_type.as_ref()? };
+    if let Some(slot) = unsafe { ty.tp_as_number.as_ref().and_then(|methods| methods.nb_index) } {
+        // SAFETY: Slot dispatch on the item's own type table.
+        let result = unsafe { slot(item) };
+        if result.is_null() {
+            if crate::thread_state::pon_err_occurred() {
+                crate::thread_state::pon_err_clear();
+            }
+            return None;
+        }
+        return object_to_i64(crate::tag::untag_arg(result));
+    }
+    // SAFETY: Generic attribute lookup tolerates any live object.
+    let index = unsafe { crate::abstract_op::get_attr(item, crate::intern::intern("__index__")) };
+    if index.is_null() {
+        if crate::thread_state::pon_err_occurred() {
+            crate::thread_state::pon_err_clear();
+        }
+        return None;
+    }
+    // SAFETY: Bound method invoked with zero arguments.
+    let result = unsafe { super::pon_call(index, ptr::null_mut(), 0) };
+    if result.is_null() {
+        if crate::thread_state::pon_err_occurred() {
+            crate::thread_state::pon_err_clear();
+        }
+        return None;
+    }
+    object_to_i64(crate::tag::untag_arg(result))
+}
+
+/// CPython `PyObject_Bytes` semantics for bytes-consuming APIs
+/// (`int.from_bytes`): bytes-like buffers (bytes/bytearray/memoryview/
+/// PickleBuffer) pass through, `__bytes__` results are honored, str is
+/// rejected up front, and anything else takes the iterable-of-ints path.
+/// `None` follows the NULL-sentinel contract (error already set).
+pub(crate) fn bytes_payload_from_object(object: *mut PyObject) -> Option<Vec<u8>> {
+    if let Ok(bytes) = expect_bytes_like(object) {
+        return Some(bytes);
+    }
+    // SAFETY: Generic attribute lookup tolerates any live object.
+    let dunder = unsafe { crate::abstract_op::get_attr(object, crate::intern::intern("__bytes__")) };
+    if !dunder.is_null() {
+        // SAFETY: Bound method invoked with zero arguments.
+        let result = unsafe { super::pon_call(dunder, ptr::null_mut(), 0) };
+        if result.is_null() {
+            return None; // propagate the `__bytes__` exception
+        }
+        let result = crate::tag::untag_arg(result);
+        // SAFETY: A non-NULL call result carries a live header.
+        if bytes_type::is_bytes_type(unsafe { (*result).ob_type }) {
+            let bytes = unsafe { &*result.cast::<bytes_type::PyBytes>() };
+            return Some(unsafe { bytes.as_slice() }.to_vec());
+        }
+        let type_name = unsafe { crate::types::dict::type_name(result) }.unwrap_or("object");
+        let message = format!("__bytes__ returned non-bytes (type {type_name})");
+        unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+        return None;
+    }
+    if crate::thread_state::pon_err_occurred() {
+        crate::thread_state::pon_err_clear();
+    }
+    if unsafe { crate::types::dict::type_name(object) } == Some("str") {
+        let message = "cannot convert 'str' object to bytes";
+        unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+        return None;
+    }
+    bytes_items_from_iterable(object)
 }
 
 /// Implements the CPython `bytes()` constructor forms: no args, int count,
@@ -3214,6 +3418,11 @@ fn expect_str(value: *mut PyObject) -> Result<String, String> {
 fn str_long_value(value: *mut PyObject) -> Result<i64, String> {
     if value.is_null() {
         return Err("integer operand is NULL".to_owned());
+    }
+    // `bool <: int`: string indexes, slice bounds, and count arguments
+    // accept True/False exactly like 1/0 (CPython shared long payload).
+    if let Some(value) = unsafe { crate::types::bool_::to_bool(value) } {
+        return Ok(i64::from(value));
     }
     if let Err(message) = super::ensure_runtime_initialized() {
         return Err(message);

@@ -14,13 +14,19 @@
 //!   vendored default-theme constants (empty strings in the no-color
 //!   variant);
 //! - `decolor(text)` — strips the vendored `ColorCodes` set;
+//! - `ANSIColors` — the vendored escape-code table as an opaque singleton
+//!   (`doctest` binds it at import and reads `.RED`/`.RESET` when rendering
+//!   colored failure reports);
+//! - `get_colors(colorize=False, *, file=None)` — the colored singleton or
+//!   the all-empty-strings no-color one (the vendored `NoColors` instance);
+//!   `doctest.DocTestRunner.summarize` calls it on every run;
 //! - `COLORIZE = True` module flag.
 //!
 //! Keyword-only signatures bind through
 //! `types::function::bind_native_keywords_for_name` rows.  Not served (out
-//! of the unittest chain, loud `AttributeError` when reached): `ANSIColors`,
-//! `NoColors`, `get_colors`, `set_theme`, `default_theme`, `ThemeSection`
-//! dataclasses.
+//! of the consumed chains, loud `AttributeError` when reached): `NoColors`
+//! as a module attribute, `get_colors`'s `ANSIColors()` construction
+//! surface, `set_theme`, `default_theme`, `ThemeSection` dataclasses.
 
 use std::mem;
 use std::ptr;
@@ -62,6 +68,55 @@ const COLOR_CODES: &[&str] = &[
     "\x1b[94m", "\x1b[96m", "\x1b[92m", "\x1b[95m", "\x1b[91m", "\x1b[97m", "\x1b[93m",
     "\x1b[40m", "\x1b[44m", "\x1b[46m", "\x1b[42m", "\x1b[45m", "\x1b[41m", "\x1b[47m", "\x1b[43m",
     "\x1b[100m", "\x1b[104m", "\x1b[106m", "\x1b[102m", "\x1b[105m", "\x1b[101m", "\x1b[107m", "\x1b[103m",
+];
+
+/// The complete vendored `ANSIColors` class table, verbatim (the named
+/// subset above stays as consts because the theme field tables reference
+/// them).  `GREY` and `INTENSE_BLACK` genuinely share `\x1b[90m` upstream.
+const ANSI_COLORS: &[(&str, &str)] = &[
+    ("RESET", RESET),
+    ("BLACK", "\x1b[30m"),
+    ("BLUE", BLUE),
+    ("CYAN", CYAN),
+    ("GREEN", GREEN),
+    ("GREY", "\x1b[90m"),
+    ("MAGENTA", MAGENTA),
+    ("RED", RED),
+    ("WHITE", "\x1b[37m"),
+    ("YELLOW", YELLOW),
+    ("BOLD", BOLD),
+    ("BOLD_BLACK", "\x1b[1;30m"),
+    ("BOLD_BLUE", BOLD_BLUE),
+    ("BOLD_CYAN", BOLD_CYAN),
+    ("BOLD_GREEN", BOLD_GREEN),
+    ("BOLD_MAGENTA", BOLD_MAGENTA),
+    ("BOLD_RED", BOLD_RED),
+    ("BOLD_WHITE", "\x1b[1;37m"),
+    ("BOLD_YELLOW", BOLD_YELLOW),
+    ("INTENSE_BLACK", "\x1b[90m"),
+    ("INTENSE_BLUE", "\x1b[94m"),
+    ("INTENSE_CYAN", "\x1b[96m"),
+    ("INTENSE_GREEN", "\x1b[92m"),
+    ("INTENSE_MAGENTA", "\x1b[95m"),
+    ("INTENSE_RED", "\x1b[91m"),
+    ("INTENSE_WHITE", "\x1b[97m"),
+    ("INTENSE_YELLOW", "\x1b[93m"),
+    ("BACKGROUND_BLACK", "\x1b[40m"),
+    ("BACKGROUND_BLUE", "\x1b[44m"),
+    ("BACKGROUND_CYAN", "\x1b[46m"),
+    ("BACKGROUND_GREEN", "\x1b[42m"),
+    ("BACKGROUND_MAGENTA", "\x1b[45m"),
+    ("BACKGROUND_RED", "\x1b[41m"),
+    ("BACKGROUND_WHITE", "\x1b[47m"),
+    ("BACKGROUND_YELLOW", "\x1b[43m"),
+    ("INTENSE_BACKGROUND_BLACK", "\x1b[100m"),
+    ("INTENSE_BACKGROUND_BLUE", "\x1b[104m"),
+    ("INTENSE_BACKGROUND_CYAN", "\x1b[106m"),
+    ("INTENSE_BACKGROUND_GREEN", "\x1b[102m"),
+    ("INTENSE_BACKGROUND_MAGENTA", "\x1b[105m"),
+    ("INTENSE_BACKGROUND_RED", "\x1b[101m"),
+    ("INTENSE_BACKGROUND_WHITE", "\x1b[107m"),
+    ("INTENSE_BACKGROUND_YELLOW", "\x1b[103m"),
 ];
 
 const ARGPARSE_FIELDS: &[(&str, &str)] = &[
@@ -239,6 +294,62 @@ unsafe extern "C" fn theme_getattro(object: *mut PyObject, name: *mut PyObject) 
 }
 
 // ---------------------------------------------------------------------------
+// ANSIColors (immortal leaked boxes, string-only payloads)
+//
+// CPython's `ANSIColors` is a plain class of str constants and `NoColors`
+// is an `ANSIColors()` instance with every field re-set to "".  pon serves
+// both through one payload shape — the Theme pattern: a `colored` flag
+// selecting the vendored code or the empty string.  The colored singleton
+// doubles as the module's `ANSIColors` binding (attribute reads are the
+// consumed surface; it is not callable) and as `get_colors`'s colored
+// result.
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+struct PyAnsiColors {
+    ob_base: PyObjectHeader,
+    colored: bool,
+}
+
+static ANSI_COLORS_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let mut ty = PyType::new(
+        abi::runtime_type_type().cast_const(),
+        "ANSIColors",
+        mem::size_of::<PyAnsiColors>(),
+    );
+    ty.tp_getattro = Some(ansi_colors_getattro);
+    Box::into_raw(Box::new(ty)) as usize
+});
+
+/// `[no_color, colored]` ANSIColors singletons.
+static ANSI_COLORS_OBJECTS: LazyLock<[usize; 2]> = LazyLock::new(|| {
+    core::array::from_fn(|colored| {
+        Box::into_raw(Box::new(PyAnsiColors {
+            ob_base: PyObjectHeader::new(*ANSI_COLORS_TYPE as *mut PyType),
+            colored: colored == 1,
+        })) as usize
+    })
+});
+
+fn ansi_colors_object(colored: bool) -> *mut PyObject {
+    ANSI_COLORS_OBJECTS[usize::from(colored)] as *mut PyObject
+}
+
+unsafe extern "C" fn ansi_colors_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name) = attr_name_text(name) else {
+        return abi::exc::raise_attribute_error_text("ANSIColors attribute name must be str");
+    };
+    // SAFETY: Receiver is one of the PyAnsiColors singletons.
+    let colors = unsafe { &*object.cast::<PyAnsiColors>() };
+    for &(field, code) in ANSI_COLORS {
+        if field == name {
+            return alloc_str_object(if colors.colored { code } else { "" });
+        }
+    }
+    abi::exc::raise_attribute_error_text(&format!("'ANSIColors' object has no attribute '{name}'"))
+}
+
+// ---------------------------------------------------------------------------
 // Module functions
 
 fn none() -> *mut PyObject {
@@ -359,6 +470,27 @@ unsafe extern "C" fn get_theme_entry(argv: *mut *mut PyObject, argc: usize) -> *
     theme_object(colored)
 }
 
+/// `get_colors(colorize=False, *, file=None)`; keyword binding delivers
+/// `[colorize, file]`.  The colored singleton when forced or the
+/// environment allows color, else the all-empty-strings no-color singleton
+/// (the vendored `NoColors` instance).
+unsafe extern "C" fn get_colors_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = if argc == 0 || argv.is_null() {
+        &[][..]
+    } else {
+        // SAFETY: The caller passed `argc` live argument slots.
+        unsafe { std::slice::from_raw_parts(argv, argc) }
+    };
+    if args.len() > 2 {
+        return abi::exc::raise_kind_error_text(
+            crate::types::exc::ExceptionKind::TypeError,
+            "get_colors() takes at most 1 positional argument",
+        );
+    }
+    let colored = truthy(args.first().copied()) || can_colorize_value(args.get(1).copied());
+    ansi_colors_object(colored)
+}
+
 /// `decolor(text)`: strips the vendored `ColorCodes` set.
 unsafe extern "C" fn decolor_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     if argc != 1 || argv.is_null() {
@@ -400,6 +532,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         ("can_colorize", can_colorize_entry as BuiltinFn),
         ("get_theme", get_theme_entry),
         ("decolor", decolor_entry),
+        ("get_colors", get_colors_entry),
     ] {
         // SAFETY: `entry` is a live builtin entry point.
         let function = unsafe { abi::pon_make_function(entry as *const u8, VARIADIC_ARITY, intern(fn_name)) };
@@ -414,5 +547,6 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         return Err("failed to allocate _colorize.COLORIZE".to_owned());
     }
     attrs.push((intern("COLORIZE"), colorize_flag));
+    attrs.push((intern("ANSIColors"), ansi_colors_object(true)));
     install_module(name, attrs)
 }

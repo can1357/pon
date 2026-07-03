@@ -24,7 +24,12 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         function_attr("monotonic", time_monotonic),
         function_attr("monotonic_ns", time_monotonic_ns),
     ];
-    install_module("time", attrs.into_iter().collect::<Result<Vec<_>, _>>()?)
+    let mut attrs = attrs.into_iter().collect::<Result<Vec<_>, _>>()?;
+    // `gmtime`/`localtime` construct instances of this class, so a failure
+    // here is a loud init error rather than a broken first call (see the
+    // `time.struct_time` section comment at the end of this file).
+    attrs.push((intern("struct_time"), struct_time_class()?));
+    install_module("time", attrs)
 }
 
 /// Process-start epoch shared by the monotonic clock family: CPython's
@@ -198,8 +203,9 @@ fn utc_fields(seconds: f64) -> [i64; 9] {
 }
 
 /// `time.gmtime([secs])` / `time.localtime([secs])` under the pinned UTC
-/// environment: the nine `struct_time` fields as a plain tuple
-/// (`tm_year..tm_isdst`; `tm_wday` is Monday=0, `tm_isdst` 0 for UTC).
+/// environment: the nine `struct_time` fields (`tm_year..tm_isdst`;
+/// `tm_wday` is Monday=0, `tm_isdst` 0 for UTC) as a `time.struct_time`
+/// instance.
 unsafe fn utc_tuple_entry(name: &str, argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     if argc > 1 {
         return return_null_with_error(format!("{name}() takes at most 1 argument ({argc} given)"));
@@ -236,7 +242,18 @@ unsafe fn utc_tuple_entry(name: &str, argv: *mut *mut PyObject, argc: usize) -> 
         items.push(object);
     }
     // SAFETY: `items` is a live window for the duration of the call.
-    unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) }
+    let values = unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) };
+    if values.is_null() {
+        return core::ptr::null_mut();
+    }
+    let class = match struct_time_class() {
+        Ok(class) => class,
+        Err(message) => return return_null_with_error(message),
+    };
+    let mut call_argv = [values];
+    // SAFETY: The class is a live tuple-derived heap class; calling it
+    // routes through `tuple.__new__` construction over the value tuple.
+    unsafe { crate::abi::pon_call(class, call_argv.as_mut_ptr(), call_argv.len()) }
 }
 
 unsafe extern "C" fn time_gmtime(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -672,6 +689,271 @@ unsafe extern "C" fn time_strftime(argv: *mut *mut PyObject, argc: usize) -> *mu
     };
     let mut text = String::with_capacity(format.len() * 2);
     render(&format, &tm, &mut text);
+    // SAFETY: String allocation helper follows the NULL-sentinel contract.
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+// ---------------------------------------------------------------------------
+// time.struct_time
+//
+// CPython's `time.struct_time` is a structseq (a tuple subclass with named
+// read-only fields) defined by the C `time` module; `gmtime`/`localtime`
+// construct it and `strftime` accepts it (`test_strftime` reads `tm_year`
+// off `localtime()`'s result, and `logging.Formatter.formatTime` feeds the
+// value back into `strftime`).  pon builds the same shape through the
+// tuple-embedding heap-class machinery — mirroring `os.terminal_size` and
+// `sys.version_info` — with `tm_year = property(self[0])`-style getters and
+// the CPython structseq repr.
+//
+// Deliberate divergences from the C structseq, pinned by consumers: the
+// constructor is inherited `tuple.__new__` (any iterable of any length is
+// accepted; CPython requires a 9..=11-item sequence), and the extended
+// non-sequence fields `tm_zone`/`tm_gmtoff` — plus the `n_fields`/
+// `n_sequence_fields`/`n_unnamed_fields` class ints that would promise
+// them — are absent: a tuple-embedding instance cannot hold 11 slots while
+// reporting `len() == 9`, and under the pinned `TZ=UTC` environment no
+// vendored consumer reads them.
+
+type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
+
+/// The nine named sequence fields, in tuple order.
+const STRUCT_TIME_FIELDS: [&str; 9] =
+    ["tm_year", "tm_mon", "tm_mday", "tm_hour", "tm_min", "tm_sec", "tm_wday", "tm_yday", "tm_isdst"];
+
+/// Getter entry points aligned with [`STRUCT_TIME_FIELDS`].
+const STRUCT_TIME_GETTERS: [BuiltinFn; 9] = [
+    struct_time_tm_year,
+    struct_time_tm_mon,
+    struct_time_tm_mday,
+    struct_time_tm_hour,
+    struct_time_tm_min,
+    struct_time_tm_sec,
+    struct_time_tm_wday,
+    struct_time_tm_yday,
+    struct_time_tm_isdst,
+];
+
+/// CPython's `time.struct_time.__doc__`, verbatim (the oracle prints it).
+const STRUCT_TIME_DOC: &str = "The time value as returned by gmtime(), localtime(), and strptime(), and\n accepted by asctime(), mktime() and strftime().  May be considered as a\n sequence of 9 integers.\n\n Note that several fields' values are not the same as those defined by\n the C language standard for struct tm.  For example, the value of the\n field tm_year is the actual year, not year - 1900.  See individual\n fields' descriptions for details.";
+
+/// The `time.struct_time` class, built once and reused across import
+/// re-registration (a CPython static type has the same lifetime).
+fn struct_time_class() -> Result<*mut PyObject, String> {
+    static CLASS: std::sync::LazyLock<Result<usize, String>> =
+        std::sync::LazyLock::new(|| build_struct_time_class().map(|class| class as usize));
+    CLASS.clone().map(|class| class as *mut PyObject)
+}
+
+/// `class struct_time(tuple)` with the CPython structseq surface: field
+/// properties reading `self[i]` and the `time.struct_time(...)` repr.
+fn build_struct_time_class() -> Result<*mut PyObject, String> {
+    // SAFETY: `pon_load_global` returns NULL with a raised NameError on miss.
+    let tuple_class = unsafe { crate::abi::pon_load_global(intern("tuple"), std::ptr::null_mut()) };
+    if tuple_class.is_null() {
+        crate::thread_state::pon_err_clear();
+        return Err("builtin 'tuple' is not registered for time.struct_time".to_owned());
+    }
+    // SAFETY: Same contract for the builtin `property` constructor.
+    let property_class = unsafe { crate::abi::pon_load_global(intern("property"), std::ptr::null_mut()) };
+    if property_class.is_null() {
+        crate::thread_state::pon_err_clear();
+        return Err("builtin 'property' is not registered for time.struct_time".to_owned());
+    }
+    let namespace = crate::types::type_::new_namespace();
+    if namespace.is_null() {
+        return Err("failed to allocate the time.struct_time namespace".to_owned());
+    }
+    class_str_attr(namespace, "__module__", "time")?;
+    class_str_attr(namespace, "__doc__", STRUCT_TIME_DOC)?;
+    class_function_attr(namespace, "__repr__", struct_time_repr)?;
+    for (index, name) in STRUCT_TIME_FIELDS.iter().enumerate() {
+        // SAFETY: Live builtin entry point with the runtime calling convention.
+        let fget = unsafe { pon_make_function(STRUCT_TIME_GETTERS[index] as *const u8, 1, intern(name)) };
+        if fget.is_null() {
+            return Err(format!("failed to allocate time.struct_time.{name} getter"));
+        }
+        let mut argv = [fget];
+        // SAFETY: The builtin `property` class is callable with one fget slot.
+        let descriptor = unsafe { crate::abi::pon_call(property_class, argv.as_mut_ptr(), argv.len()) };
+        if descriptor.is_null() {
+            let detail = crate::thread_state::pon_err_message().unwrap_or_else(|| "unknown error".to_owned());
+            crate::thread_state::pon_err_clear();
+            return Err(format!("failed to build time.struct_time.{name} property: {detail}"));
+        }
+        // SAFETY: `new_namespace` returned a live namespace box.
+        unsafe { (&mut *namespace).set(intern(name), descriptor) };
+    }
+    // SAFETY: The base is the live builtin `tuple` class object.
+    let class = unsafe {
+        crate::types::type_::build_class_from_namespace("struct_time", &[tuple_class], namespace, &[])
+    };
+    if class.is_null() {
+        let detail = crate::thread_state::pon_err_message().unwrap_or_else(|| "unknown error".to_owned());
+        crate::thread_state::pon_err_clear();
+        return Err(format!("failed to create time.struct_time: {detail}"));
+    }
+    // SAFETY: Freshly built class object owned by this module build; mirror
+    // `pon_build_class`'s ob_type fix-up for a metaclass-less construction.
+    unsafe {
+        if (*class).ob_type.is_null() {
+            (*class).ob_type = crate::abi::runtime_type_type().cast_const();
+        }
+    }
+    Ok(class)
+}
+
+/// Seeds a str-valued class attribute into a class namespace under build.
+fn class_str_attr(
+    namespace: *mut crate::types::type_::PyClassDict,
+    name: &str,
+    value: &str,
+) -> Result<(), String> {
+    // SAFETY: String allocation helper; NULL is checked below.
+    let object = unsafe { pon_const_str(value.as_ptr(), value.len()) };
+    if object.is_null() {
+        return Err(format!("failed to allocate time.struct_time attribute '{name}'"));
+    }
+    // SAFETY: The caller passes a live namespace box.
+    unsafe { (&mut *namespace).set(intern(name), object) };
+    Ok(())
+}
+
+/// Seeds a native-function class attribute into a class namespace under build.
+fn class_function_attr(
+    namespace: *mut crate::types::type_::PyClassDict,
+    name: &str,
+    entry: BuiltinFn,
+) -> Result<(), String> {
+    // SAFETY: Live builtin entry point with the runtime calling convention.
+    let function =
+        unsafe { pon_make_function(entry as *const u8, crate::builtins::variadic_arity(), intern(name)) };
+    if function.is_null() {
+        return Err(format!("failed to allocate time.struct_time method '{name}'"));
+    }
+    // SAFETY: The caller passes a live namespace box.
+    unsafe { (&mut *namespace).set(intern(name), function) };
+    Ok(())
+}
+
+/// Borrows the argv slots as a slice; NULL argv reads as empty.
+unsafe fn call_args<'a>(argv: *mut *mut PyObject, argc: usize) -> &'a [*mut PyObject] {
+    if argv.is_null() || argc == 0 {
+        &[]
+    } else {
+        // SAFETY: The caller passed `argc` live argument slots.
+        unsafe { std::slice::from_raw_parts(argv, argc) }
+    }
+}
+
+/// Element `index` of a struct_time receiver, as stored (heap-or-NULL after
+/// untagging).  CPython's structseq getters return the stored object, so a
+/// user-constructed `struct_time(('a', ...))` reads back `'a'` — no int
+/// coercion here.
+fn struct_time_element(
+    args: &[*mut PyObject],
+    index: usize,
+    what: &str,
+) -> Result<*mut PyObject, *mut PyObject> {
+    if args.len() != 1 {
+        return Err(return_null_with_error(format!("{what} expected only a receiver")));
+    }
+    // SAFETY: Integer boxing helper follows the NULL-sentinel error contract.
+    let key = unsafe { pon_const_int(index as i64) };
+    if key.is_null() {
+        return Err(std::ptr::null_mut());
+    }
+    // SAFETY: Subscript dispatch resolves the tuple-embedded layout.
+    let element = unsafe { crate::abstract_op::subscript_get(args[0], key) };
+    if element.is_null() {
+        return Err(std::ptr::null_mut());
+    }
+    let element = crate::tag::untag_arg(element);
+    if element.is_null() {
+        return Err(std::ptr::null_mut());
+    }
+    Ok(element)
+}
+
+/// Shared property-getter core: `self[index]`.
+unsafe fn struct_time_field(
+    argv: *mut *mut PyObject,
+    argc: usize,
+    index: usize,
+    what: &str,
+) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    match struct_time_element(args, index, what) {
+        Ok(element) => element,
+        Err(error) => error,
+    }
+}
+
+unsafe extern "C" fn struct_time_tm_year(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded slots per the runtime calling convention.
+    unsafe { struct_time_field(argv, argc, 0, "struct_time.tm_year") }
+}
+
+unsafe extern "C" fn struct_time_tm_mon(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded slots per the runtime calling convention.
+    unsafe { struct_time_field(argv, argc, 1, "struct_time.tm_mon") }
+}
+
+unsafe extern "C" fn struct_time_tm_mday(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded slots per the runtime calling convention.
+    unsafe { struct_time_field(argv, argc, 2, "struct_time.tm_mday") }
+}
+
+unsafe extern "C" fn struct_time_tm_hour(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded slots per the runtime calling convention.
+    unsafe { struct_time_field(argv, argc, 3, "struct_time.tm_hour") }
+}
+
+unsafe extern "C" fn struct_time_tm_min(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded slots per the runtime calling convention.
+    unsafe { struct_time_field(argv, argc, 4, "struct_time.tm_min") }
+}
+
+unsafe extern "C" fn struct_time_tm_sec(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded slots per the runtime calling convention.
+    unsafe { struct_time_field(argv, argc, 5, "struct_time.tm_sec") }
+}
+
+unsafe extern "C" fn struct_time_tm_wday(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded slots per the runtime calling convention.
+    unsafe { struct_time_field(argv, argc, 6, "struct_time.tm_wday") }
+}
+
+unsafe extern "C" fn struct_time_tm_yday(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded slots per the runtime calling convention.
+    unsafe { struct_time_field(argv, argc, 7, "struct_time.tm_yday") }
+}
+
+unsafe extern "C" fn struct_time_tm_isdst(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded slots per the runtime calling convention.
+    unsafe { struct_time_field(argv, argc, 8, "struct_time.tm_isdst") }
+}
+
+/// CPython's structseq repr:
+/// `time.struct_time(tm_year=1970, tm_mon=1, ..., tm_isdst=0)`, with
+/// element reprs (user-constructed instances may hold non-ints).
+unsafe extern "C" fn struct_time_repr(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    let mut text = String::from("time.struct_time(");
+    for (index, name) in STRUCT_TIME_FIELDS.iter().enumerate() {
+        let element = match struct_time_element(args, index, "struct_time.__repr__") {
+            Ok(element) => element,
+            Err(error) => return error,
+        };
+        if index > 0 {
+            text.push_str(", ");
+        }
+        text.push_str(name);
+        text.push('=');
+        text.push_str(&super::builtins_mod::repr_text(element));
+    }
+    text.push(')');
     // SAFETY: String allocation helper follows the NULL-sentinel contract.
     unsafe { pon_const_str(text.as_ptr(), text.len()) }
 }

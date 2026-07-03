@@ -1089,6 +1089,22 @@ pub unsafe extern "C" fn pon_contains(container: *mut PyObject, item: *mut PyObj
                 }
             }
         }
+        // CPython `slot_sq_contains`: `__contains__ = None` BLOCKS the
+        // protocol (no iteration fallback) — `0 in obj` raises TypeError,
+        // exactly the no-container message. Guarded before `descriptor_get`
+        // so the None never reaches a call site ("callee is not callable").
+        let hook_value = crate::tag::untag_arg(hook);
+        let hook_is_none = !hook_value.is_null() && {
+            let hook_type = unsafe { (*hook_value).ob_type };
+            !hook_type.is_null() && unsafe { (*hook_type).name() == "NoneType" }
+        };
+        if hook_is_none {
+            let message = format!("argument of type '{}' is not a container or iterable", unsafe {
+                (*container_type).name()
+            });
+            unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+            return -1;
+        }
         let bound = unsafe { crate::descr::descriptor_get(hook, container, container_type) };
         if bound.is_null() {
             return -1;

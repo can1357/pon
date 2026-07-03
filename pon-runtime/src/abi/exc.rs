@@ -366,10 +366,15 @@ fn raise_type_error_text(text: &str) -> *mut PyObject {
 /// Raises the typed import failure for `text`: a missing-module diagnostic
 /// (`No module named '...'`, the exact text `resolve_module_by_name` emits)
 /// raises `ModuleNotFoundError` like CPython — `subprocess` gates its whole
-/// Windows surface on `except ModuleNotFoundError: import msvcrt` — and
-/// every other import failure stays a plain `ImportError`.
+/// Windows surface on `except ModuleNotFoundError: import msvcrt` — as does
+/// the blocked-import halt (`import of X halted; None in sys.modules`, the
+/// `sys.modules[name] = None` sentinel `test.support.import_helper` plants;
+/// stdlib accelerator fallbacks catch it as ImportError) — and every other
+/// import failure stays a plain `ImportError`.
 pub fn raise_import_error_text(text: &str) -> *mut PyObject {
-    let kind = if text.starts_with("No module named ") {
+    let kind = if text.starts_with("No module named ")
+        || (text.starts_with("import of ") && text.ends_with(" halted; None in sys.modules"))
+    {
         ExceptionKind::ModuleNotFoundError
     } else {
         ExceptionKind::ImportError

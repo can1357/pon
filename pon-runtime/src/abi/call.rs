@@ -133,6 +133,38 @@ pub unsafe extern "C" fn pon_call_ex(
         if unsafe { crate::types::type_::is_type_object(callee) } {
             return unsafe { super::call_type_with_keywords(callee, &flat_positional, keywords) };
         }
+        // Instance of a class with no `tp_call`, reached with keyword
+        // arguments (`Mock(return_value=…)`, `m.foo(1, key="v")` — mock's
+        // `CallableMixin.__call__(self, /, *args, **kwargs)`): dispatch
+        // through the type's `__call__` descriptor, mirroring `pon_call`'s
+        // DunderCall target on the no-keyword path.  The bound result
+        // re-enters this helper once: the method pair is pierced at entry
+        // and the underlying Python function binds the keywords.
+        if !callee.is_null() {
+            let ty = unsafe { (*callee).ob_type.cast_mut() };
+            if !ty.is_null() && unsafe { (*ty).tp_call.is_none() } {
+                let dunder = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern(crate::intern::DUNDER_CALL)) };
+                if !dunder.is_null() {
+                    let bound = unsafe { crate::descr::descriptor_get(dunder, callee, ty) };
+                    if bound.is_null() {
+                        return core::ptr::null_mut();
+                    }
+                    return unsafe {
+                        pon_call_ex(
+                            bound,
+                            flat_positional.as_mut_ptr(),
+                            flat_positional.len(),
+                            core::ptr::null_mut(),
+                            flat_names.as_ptr(),
+                            flat_values.as_mut_ptr(),
+                            flat_names.len(),
+                            core::ptr::null_mut(),
+                            core::ptr::null_mut(),
+                        )
+                    };
+                }
+            }
+        }
         match unsafe { function::call_bound_function(callee, &flat_positional, keywords, None, None) } {
             Ok(result) => result,
             Err(message) => return_null_with_error(message),

@@ -356,7 +356,12 @@ unsafe fn object_type_display(object: *mut PyObject) -> String {
     }
 }
 
-unsafe fn normalize_bases(bases: &[*mut PyObject]) -> Option<Vec<*mut PyType>> {
+/// Resolves PEP 560 `__mro_entries__` bases.  Returns the resolved base
+/// types plus the ORIGINAL bases tuple (a GC allocation) when any base
+/// needed resolution, NULL otherwise — callers publishing
+/// `__orig_bases__` (CPython `__build_class__`) consume the tuple; other
+/// callers discard it.
+unsafe fn normalize_bases(bases: &[*mut PyObject]) -> Option<(Vec<*mut PyType>, *mut PyObject)> {
     let needs_mro_entries = bases.iter().copied().any(|base| unsafe { !is_type_object(base) });
     let mut original_bases = bases.to_vec();
     let original_tuple = if needs_mro_entries {
@@ -402,7 +407,7 @@ unsafe fn normalize_bases(bases: &[*mut PyObject]) -> Option<Vec<*mut PyType>> {
             out.push(replacement.cast::<PyType>());
         }
     }
-    Some(out)
+    Some((out, original_tuple))
 }
 
 unsafe fn resolve_mro_entries(base: *mut PyObject, original_bases: *mut PyObject) -> Result<Vec<*mut PyObject>, String> {
@@ -776,7 +781,7 @@ pub unsafe extern "C" fn type_dunder_new(argv: *mut *mut PyObject, argc: usize) 
                 Ok(namespace) => namespace,
                 Err(message) => return raise_object(message),
             };
-            let Some(base_types) = (unsafe { normalize_bases(&bases) }) else {
+            let Some((base_types, _)) = (unsafe { normalize_bases(&bases) }) else {
                 return ptr::null_mut();
             };
             let Some(winner) = (unsafe { select_metaclass(&base_types, mcls) }) else {
@@ -800,7 +805,7 @@ pub unsafe fn build_class_from_namespace(
         return raise_object("class namespace is NULL");
     }
     unsafe { seed_namespace_module(namespace) };
-    let Some(base_types) = (unsafe { normalize_bases(bases) }) else {
+    let Some((base_types, _)) = (unsafe { normalize_bases(bases) }) else {
         return ptr::null_mut();
     };
     let explicit_meta = keywords
@@ -878,6 +883,11 @@ pub struct PreparedClassScope {
     /// Bases with `__mro_entries__` already resolved (CPython `update_bases`
     /// runs once, before `__prepare__` and the body).
     pub bases: Vec<*mut PyObject>,
+    /// Original bases tuple when `__mro_entries__` resolution fired (the
+    /// class body publishes it as `__orig_bases__`), NULL when bases were
+    /// used as written.  Rooted by the caller's `ClassBodyFrame` across the
+    /// body-execution and construction windows.
+    pub orig_bases: *mut PyObject,
 }
 
 /// CPython `__build_class__` prepare step: resolve the winning metaclass and
@@ -890,7 +900,7 @@ pub unsafe fn prepare_class_scope(
     bases: &[*mut PyObject],
     keywords: &[ClassKeyword],
 ) -> Result<PreparedClassScope, ()> {
-    let Some(base_types) = (unsafe { normalize_bases(bases) }) else {
+    let Some((base_types, orig_bases)) = (unsafe { normalize_bases(bases) }) else {
         return Err(());
     };
     let resolved_bases = base_types.iter().map(|base| base.cast::<PyObject>()).collect::<Vec<_>>();
@@ -907,6 +917,7 @@ pub unsafe fn prepare_class_scope(
         return Ok(PreparedClassScope {
             mapping: ptr::null_mut(),
             bases: resolved_bases,
+            orig_bases,
         });
     }
     let name_object = unsafe { abi::pon_const_str(name.as_ptr(), name.len()) };
@@ -957,6 +968,7 @@ pub unsafe fn prepare_class_scope(
     Ok(PreparedClassScope {
         mapping,
         bases: resolved_bases,
+        orig_bases,
     })
 }
 
@@ -971,7 +983,7 @@ pub unsafe fn build_class_from_prepared_mapping(
     mapping: *mut PyObject,
     keywords: &[ClassKeyword],
 ) -> *mut PyObject {
-    let Some(base_types) = (unsafe { normalize_bases(bases) }) else {
+    let Some((base_types, _)) = (unsafe { normalize_bases(bases) }) else {
         return ptr::null_mut();
     };
     let explicit_meta = keywords
@@ -1344,12 +1356,11 @@ unsafe extern "C" fn member_descriptor_get(descr: *mut PyObject, obj: *mut PyObj
             value
         }
         PyMemberKind::Dict => {
-            let dict = unsafe { (*instance).dict };
-            if dict.is_null() {
-                unsafe { abi::pon_none() }
-            } else {
-                dict.cast::<PyObject>()
-            }
+            // Live view, never the raw internal `PyClassDict` (typeless) —
+            // and never a snapshot: mock-style `self.__dict__[k] = v` must
+            // land in attribute storage.  Materializes an empty namespace
+            // for fresh instances (CPython parity).
+            unsafe { crate::types::instance_dict::new_view(instance) }
         }
     }
 }

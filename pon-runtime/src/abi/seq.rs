@@ -694,6 +694,16 @@ unsafe fn sequence_richcmp(left: *mut PyObject, right: *mut PyObject, op: c_int,
     };
 
     for index in 0..left_items.len().min(right_items.len()) {
+        // CPython `PyObject_RichCompareBool` identity fast path, scoped to
+        // the EQ probe only: an element identical to its counterpart counts
+        // as equal without calling `__eq__` (NaN parity — `[x] == [x]` is
+        // True even though `x == x` is False; side-effecting `__eq__` is
+        // skipped for identical objects). Small-int immediates compare
+        // bitwise, matching CPython's small-int singletons. The ordering
+        // fallback below still runs a real compare.
+        if left_items[index] == right_items[index] {
+            continue;
+        }
         let equal = unsafe { abstract_op::rich_compare(RICH_EQ, left_items[index], right_items[index]) };
         if equal.is_null() {
             return ptr::null_mut();
@@ -728,6 +738,12 @@ unsafe fn sequence_richcmp(left: *mut PyObject, right: *mut PyObject, op: c_int,
 fn long_value(object: *mut PyObject) -> Result<i64, String> {
     if object.is_null() {
         return Err("integer operand is NULL".to_owned());
+    }
+    // `bool <: int`: True/False are valid everywhere an int operand is
+    // (sequence indexes, slice bounds, repeat counts — CPython reads them
+    // through the shared long payload).
+    if let Some(value) = unsafe { crate::types::bool_::to_bool(object) } {
+        return Ok(i64::from(value));
     }
     let Some(result) = with_runtime(|runtime| unsafe {
         if is_exact_type(object, runtime.long_type) {

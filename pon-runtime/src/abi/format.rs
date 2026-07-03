@@ -1189,6 +1189,12 @@ fn percent_args_is_mapping(args: *mut PyObject) -> bool {
     if ty.is_null() {
         return false;
     }
+    // CPython `PyMapping_Check` is a slot probe: a non-NULL `mp_subscript`
+    // makes a mapping (instance-`__dict__` views, the PEP 667 frame-locals
+    // proxy).  Heap classes carry `__getitem__` in the type dict instead.
+    if unsafe { (*ty).tp_as_mapping.as_ref() }.is_some_and(|methods| methods.mp_subscript.is_some()) {
+        return true;
+    }
     unsafe { !crate::descr::lookup_in_type(ty, intern("__getitem__")).is_null() }
 }
 

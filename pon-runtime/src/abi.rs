@@ -2076,6 +2076,12 @@ fn register_builtin_type_globals(runtime: &mut Runtime) {
         install_builtin_type(runtime, "str", runtime.unicode_type, Some(builtin_str_new), object_type);
 
         let bool_type = (*bool_::from_bool(false)).ob_type.cast_mut();
+        // CPython: `bool` subclasses `int` (`bool.__mro__ == (bool, int,
+        // object)`, `issubclass(bool, int)` is True).  The static bool type
+        // must re-point at THIS runtime's per-init `long_type` on every
+        // registration, so the assignment is unconditional (a null-guarded
+        // write would keep a stale pointer across runtime re-inits).
+        (*bool_type).tp_base = runtime.long_type;
         install_builtin_type(runtime, "bool", bool_type, Some(builtin_bool_new), object_type);
 
         let float_sample = float::from_f64(0.0);
@@ -2585,19 +2591,62 @@ unsafe extern "C" fn object_dunder_init_native(argv: *mut *mut PyObject, argc: u
     unsafe { pon_none() }
 }
 
-/// Whether `ty` overrides `__new__` past object's generic allocator: either a
+/// Whether `ty` overrides `__new__` past object's generic allocator: a
 /// Python-level/`install_*` dict entry other than object's carrier, or a
-/// builtin constructor in the `tp_new` slot (property, list, ... override via
-/// slot only).
+/// native constructor in the `tp_new` slot of `ty` or any MRO ancestor.
+/// The ancestor walk mirrors CPython's type-ready slot inheritance: a
+/// bytes/tuple subclass inherits the builtin base's `tp_new`, so CPython
+/// sees `tp_new != object_new` and `object.__init__` stays permissive
+/// about excess arguments (multiprocessing's `AuthenticationString(bytes)`
+/// built from `os.urandom(32)`).  Exactly two slots do NOT override:
+/// `type_new` (the generic heap allocator every constructed class carries)
+/// and `builtin_object_new` (object's own slot — counting it would mark
+/// every class overridden, object being every MRO's terminus).
 unsafe fn type_new_is_overridden(ty: *mut PyType) -> bool {
-    if let Some(slot) = unsafe { (*ty).tp_new } {
-        if slot as usize != type_::type_new as *const () as usize {
-            return true;
+    let generic_new = type_::type_new as *const () as usize;
+    let object_slot_new = builtin_object_new as *const () as usize;
+    for entry in unsafe { crate::mro::mro_entries(ty) } {
+        if entry.is_null() {
+            continue;
+        }
+        if let Some(slot) = unsafe { (*entry).tp_new } {
+            let slot = slot as usize;
+            if slot != generic_new && slot != object_slot_new {
+                return true;
+            }
         }
     }
     let ty_new = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern("__new__")) };
     let object_new = OBJECT_DUNDER_NEW_DESCRIPTOR.load(Ordering::Acquire);
     !ty_new.is_null() && ty_new != object_new
+}
+
+/// `__new__` for class-call dispatch, honoring CPython slot precedence: a
+/// type carrying its OWN complete native `tp_new` slot (bool, list, range,
+/// ...) is never shadowed by an ANCESTOR dict's `__new__` — CPython copies
+/// slots at type-ready time, so `bool(x)` runs bool's constructor, not
+/// `int.__dict__['__new__']`, even though bool linearizes over int.  A
+/// `__new__` in the type's OWN dict still wins (the int/str data-type
+/// carriers front their own constructors).  Constructed heap classes always
+/// carry `tp_new == type_new` (types/type_.rs), so payload/dict-subclass
+/// construction through an inherited data-type `__new__` is unaffected.
+/// Returns NULL when the `tp_new` slot should drive construction.
+unsafe fn mro_new_override(cls: *mut PyType) -> *mut PyObject {
+    let name = crate::intern::intern("__new__");
+    let user_new = unsafe { crate::descr::lookup_in_type(cls, name) };
+    if user_new.is_null() {
+        return ptr::null_mut();
+    }
+    let own_slot_is_native = unsafe { (*cls).tp_new }
+        .is_some_and(|slot| slot as usize != type_::type_new as *const () as usize);
+    if own_slot_is_native {
+        let own_dict = unsafe { (*cls).tp_dict.cast::<type_::PyClassDict>() };
+        let owned = !own_dict.is_null() && unsafe { (&*own_dict).get(name) }.is_some();
+        if !owned {
+            return ptr::null_mut();
+        }
+    }
+    user_new
 }
 
 /// `object.__new__(cls, *args)` — the generic instance allocator, exposed as
@@ -2734,7 +2783,7 @@ pub(super) unsafe fn call_type_with_keywords(
     if is_exception_type {
         return unsafe { call_exception_type_with_keywords(callee, args, keywords) };
     }
-    let user_new = unsafe { crate::descr::lookup_in_type(cls, crate::intern::intern("__new__")) };
+    let user_new = unsafe { mro_new_override(cls) };
     let object_new = OBJECT_DUNDER_NEW_DESCRIPTOR.load(Ordering::Acquire);
     let instance = if user_new.is_null() || user_new == object_new {
         let new = unsafe { (*cls).tp_new.unwrap_or(type_::type_new) };
@@ -3809,7 +3858,7 @@ unsafe fn call_type_from_argv(callee: *mut PyObject, argv: *mut *mut PyObject, a
         return unsafe { call_exception_type_with_keywords(callee, args, keywords) };
     }
 
-    let user_new = unsafe { crate::descr::lookup_in_type(cls, crate::intern::intern("__new__")) };
+    let user_new = unsafe { mro_new_override(cls) };
     // Object's generic `__new__` carrier is not a user override: keep the
     // default `tp_new` slot path (builtin containers and exception layouts
     // depend on their slot allocators, not the heap-instance fallback).
@@ -5022,6 +5071,11 @@ fn collect_impl() -> Result<(), String> {
     for value in format::gc_held_roots() {
         push_namespace_value_roots(value, &mut roots);
     }
+    // Audit hooks registered through `sys.addaudithook`, mirroring
+    // `_contextvars`.
+    for value in crate::native::sys::gc_held_roots() {
+        push_namespace_value_roots(value, &mut roots);
+    }
     extend_tierup_roots(&mut roots);
 
     let mut roots = LocalRoots { roots };
@@ -5095,20 +5149,29 @@ fn defining_module_attr(name: u32) -> Option<*mut PyObject> {
     crate::import::module_attr(module, name)
 }
 
-/// Defining module of the compiled call-stack frame `depth` levels above the
-/// caller of a native builtin, for `sys._getframe(depth).f_globals`.
+/// Call chain captured for `sys._getframe(depth)`: `chain[0]` describes the
+/// compiled call-stack frame `depth` levels above the caller of a native
+/// builtin, later links its callers outward, and the final link is always
+/// the active module's toplevel frame — the `f_back` chain terminator.
 ///
 /// `native_entry` is the builtin's own code pointer (`sys._getframe`): when
 /// the innermost stack entry is that very call it is skipped, so `depth`
 /// counts from the builtin's caller — CPython counts Python frames only, a
 /// C call pushes none.  Entries below the active module's call floor are
 /// suspended behind the import and stay invisible, mirroring
-/// `current_defining_module`.  `None` when the walk runs past the tracked
-/// compiled stack (a module-toplevel frame — callers approximate with the
-/// active module's namespace) or the entry at `depth` carries no
-/// defining-module record (native wrappers).
-pub(crate) fn frame_defining_module_for_depth(depth: usize, native_entry: *const u8) -> Option<u32> {
+/// `current_defining_module`.  A `depth` past the tracked compiled stack
+/// clamps to the bare toplevel link (CPython raises ValueError; loosened
+/// here, preserving `sys_getframe`'s active-module fallback).
+///
+/// Per-link lines follow the traceback rule (`abi::exc`): a frame's current
+/// line is the line recorded when its innermost callee was pushed — the
+/// skipped native entry's push line (else the live line cell) for the
+/// innermost frame, and each caller's line is the push line of the call it
+/// is executing.
+pub(crate) fn frame_chain_for_depth(depth: usize, native_entry: *const u8) -> Box<[crate::types::frame::FrameLink]> {
+    use crate::types::frame::FrameLink;
     let floor = crate::import::active_module_call_floor();
+    let toplevel_module = crate::import::active_module_name_id();
     CURRENT_FUNCTION_STACK.with(|stack| {
         let stack = stack.borrow();
         let floor = floor.min(stack.len());
@@ -5118,8 +5181,30 @@ pub(crate) fn frame_defining_module_for_depth(depth: usize, native_entry: *const
             let entry = unsafe { (*call.function).entry.load(Ordering::Acquire) };
             ptr::eq(entry.cast_const(), native_entry)
         }));
-        let index = visible.len().checked_sub(1 + skip + depth)?;
-        crate::types::function::function_module(visible[index].function.cast::<PyObject>())
+        let funcs = &visible[..visible.len() - skip];
+        let innermost_line = if skip == 1 { visible[funcs.len()].caller_line } else { current_line() };
+        // Conceptual frame list, innermost-first: tracked function frames,
+        // then the module-toplevel frame.
+        let start = depth.min(funcs.len());
+        let mut chain = Vec::with_capacity(funcs.len() - start + 1);
+        for position in start..funcs.len() {
+            let index = funcs.len() - 1 - position;
+            let call = &funcs[index];
+            let line = if position == 0 { innermost_line } else { funcs[index + 1].caller_line };
+            // SAFETY: Stack entries hold live function objects for the call's duration.
+            let name = unsafe { (*call.function).name_interned };
+            chain.push(FrameLink {
+                module: crate::types::function::function_module(call.function.cast::<PyObject>()),
+                name: Some(name),
+                line,
+            });
+        }
+        chain.push(FrameLink {
+            module: toplevel_module,
+            name: None,
+            line: if funcs.is_empty() { innermost_line } else { funcs[0].caller_line },
+        });
+        chain.into_boxed_slice()
     })
 }
 
@@ -5150,7 +5235,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_defining_module_for_depth_walks_caller_stack() {
+    fn frame_chain_for_depth_walks_caller_stack() {
         let _guard = test_state_lock();
         unsafe {
             assert_eq!(pon_runtime_init(), 0);
@@ -5168,22 +5253,47 @@ mod tests {
             let native = pon_make_function(getframe_probe as *const u8, 0, intern("fg_getframe"));
             assert!(!fa.is_null() && !fb.is_null() && !native.is_null());
 
+            // Deterministic per-frame lines: toplevel calls fa at 10, fa
+            // calls fb at 20, fb calls the probing builtin at 30.
+            set_current_line(10);
             let _call_a = push_current_call(fa.cast::<PyFunction>(), ptr::null_mut(), 0);
+            set_current_line(20);
             let _call_b = push_current_call(fb.cast::<PyFunction>(), ptr::null_mut(), 0);
+            set_current_line(30);
             let _call_n = push_current_call(native.cast::<PyFunction>(), ptr::null_mut(), 0);
 
             // Innermost entry IS the probing builtin: skipped, so depth 0 is
-            // its caller and each further depth walks one caller outward.
+            // its caller and each further depth walks one caller outward,
+            // ending at the module-toplevel link (no active module here).
             let entry = getframe_probe as *const u8;
-            assert_eq!(frame_defining_module_for_depth(0, entry), Some(intern("fg_mod_b")));
-            assert_eq!(frame_defining_module_for_depth(1, entry), Some(intern("fg_mod_a")));
-            // Past the tracked stack: a module-toplevel frame, no record.
-            assert_eq!(frame_defining_module_for_depth(2, entry), None);
+            let chain = frame_chain_for_depth(0, entry);
+            assert_eq!(chain.len(), 3);
+            assert_eq!(chain[0].module, Some(intern("fg_mod_b")));
+            assert_eq!(chain[0].name, Some(intern("fg_fn_b")));
+            assert_eq!(chain[0].line, 30);
+            assert_eq!(chain[1].module, Some(intern("fg_mod_a")));
+            assert_eq!(chain[1].name, Some(intern("fg_fn_a")));
+            assert_eq!(chain[1].line, 20);
+            assert_eq!((chain[2].module, chain[2].name, chain[2].line), (None, None, 10));
+
+            // Deeper starts drop inner links; past the tracked stack only the
+            // toplevel link remains (CPython's ValueError case, loosened).
+            let chain = frame_chain_for_depth(1, entry);
+            assert_eq!(chain.len(), 2);
+            assert_eq!(chain[0].module, Some(intern("fg_mod_a")));
+            let chain = frame_chain_for_depth(2, entry);
+            assert_eq!(chain.len(), 1);
+            assert_eq!((chain[0].module, chain[0].name), (None, None));
+            assert_eq!(frame_chain_for_depth(9, entry).len(), 1);
 
             // No skip when the innermost entry is not the probing builtin —
-            // and an entry without a defining-module record resolves to None.
-            assert_eq!(frame_defining_module_for_depth(0, return_none as *const u8), None);
-            assert_eq!(frame_defining_module_for_depth(1, return_none as *const u8), Some(intern("fg_mod_b")));
+            // an entry without a defining-module record links module None
+            // but still carries its function name.
+            let chain = frame_chain_for_depth(0, return_none as *const u8);
+            assert_eq!(chain.len(), 4);
+            assert_eq!(chain[0].module, None);
+            assert_eq!(chain[0].name, Some(intern("fg_getframe")));
+            assert_eq!(chain[1].module, Some(intern("fg_mod_b")));
         }
     }
 

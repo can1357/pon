@@ -702,7 +702,21 @@ pub unsafe fn iter_next(iterator: *mut PyObject) -> *mut PyObject {
     match unsafe { call_unary_slot(slot, iterator) } {
         SlotOutcome::Value(value) => value,
         SlotOutcome::Error => ptr::null_mut(),
-        SlotOutcome::Missing | SlotOutcome::NotImplemented => raise_type_error("object is not an iterator"),
+        SlotOutcome::Missing | SlotOutcome::NotImplemented => {
+            // Python-level `__next__` (heap instances, e.g. tempfile's
+            // `_RandomNameSequence`): heap classes carry the dunder in their
+            // namespace rather than tp_iternext, mirroring `get_iter`'s
+            // `__iter__` fallback above.
+            let hook = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern("__next__")) };
+            if hook.is_null() {
+                return raise_type_error(&format!("'{}' object is not an iterator", unsafe { (*ty).name() }));
+            }
+            let bound = unsafe { crate::descr::descriptor_get(hook, iterator, ty) };
+            if bound.is_null() {
+                return ptr::null_mut();
+            }
+            unsafe { abi::pon_call(bound, ptr::null_mut(), 0) }
+        }
     }
 }
 
@@ -807,6 +821,25 @@ pub unsafe fn subscript_get(object: *mut PyObject, key: *mut PyObject) -> *mut P
         }
         let mut argv = [key];
         return unsafe { abi::pon_call(callable, argv.as_mut_ptr(), argv.len()) };
+    }
+
+    // PEP 560: subscription of a class object dispatches to its
+    // `__class_getitem__` (CPython `PyObject_GetItem`'s type-receiver
+    // fallback, after every mapping/sequence/metatype-`__getitem__` leg
+    // missed).  The hook is looked up on the class's own MRO and bound as
+    // `__get__(NULL, cls)`, so classmethod descriptors receive the
+    // *subscripted* class: `IO[bytes]` passes `cls=IO` even though the hook
+    // lives on `Generic`.
+    if unsafe { crate::types::type_::is_type_object(object) } {
+        let hook = unsafe { crate::descr::lookup_in_type(object.cast::<PyType>(), crate::intern::intern("__class_getitem__")) };
+        if !hook.is_null() {
+            let bound = unsafe { crate::descr::descriptor_get(hook, ptr::null_mut(), object.cast::<PyType>()) };
+            if bound.is_null() {
+                return ptr::null_mut();
+            }
+            let mut argv = [key];
+            return unsafe { abi::pon_call(bound, argv.as_mut_ptr(), argv.len()) };
+        }
     }
 
     raise_type_error(&format!("'{}' object is not subscriptable", unsafe { (*ty).name() }))

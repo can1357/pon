@@ -9,7 +9,7 @@ use num_bigint::{BigInt, Sign};
 use num_traits::{One, Signed, ToPrimitive, Zero};
 
 use crate::abi;
-use crate::object::{PyLong, PyNumberMethods, PyObject, PyObjectHeader};
+use crate::object::{PyLong, PyNumberMethods, PyObject, PyObjectHeader, PyType};
 
 static BIG_INTS: LazyLock<Mutex<HashMap<usize, BigInt>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static INT_NUMBER_METHODS: LazyLock<usize> =
@@ -186,7 +186,35 @@ unsafe fn construct_one(object: *mut PyObject) -> *mut PyObject {
             Err(message) => raise_value_error(&message),
         };
     }
-    raise_type_error("int() argument must be a string, a bytes-like object or a real number, not object")
+    // User-defined `__int__`/`__index__` (CPython `PyNumber_Long` nb_int /
+    // nb_index legs): `ipaddress.py` module exec runs
+    // `packed = int(self.network_address)` over IPv4Address instances.
+    for dunder in ["__int__", "__index__"] {
+        // SAFETY: Generic attribute lookup tolerates any live object.
+        let method = unsafe { crate::abstract_op::get_attr(object, crate::intern::intern(dunder)) };
+        if method.is_null() {
+            if crate::thread_state::pon_err_occurred() {
+                crate::thread_state::pon_err_clear();
+            }
+            continue;
+        }
+        // SAFETY: Bound method invoked with zero arguments.
+        let result = unsafe { abi::pon_call(method, ptr::null_mut(), 0) };
+        if result.is_null() {
+            return ptr::null_mut(); // propagate the dunder's exception
+        }
+        let result = crate::tag::untag_arg(result);
+        // Int-subclass results (IntEnum members, ...) read their canonical
+        // payload exactly like the receiver pierce above.
+        let result = unsafe { crate::types::type_::payload_subclass_value(result) }.unwrap_or(result);
+        if let Some(value) = unsafe { to_bigint_including_bool(result) } {
+            return from_bigint(value);
+        }
+        let type_name = unsafe { crate::types::dict::type_name(result) }.unwrap_or("object");
+        return raise_type_error(&format!("{dunder} returned non-int (type {type_name})"));
+    }
+    let type_name = unsafe { crate::types::dict::type_name(object) }.unwrap_or("object");
+    raise_type_error(&format!("int() argument must be a string, a bytes-like object or a real number, not '{type_name}'"))
 }
 
 unsafe fn construct_with_base(object: *mut PyObject, base_object: *mut PyObject) -> *mut PyObject {
@@ -405,6 +433,76 @@ fn bound_int_method(
         Err(message) => Some(raise_type_error(&message)),
     }
 }
+
+/// One-shot installer for the builtin `int` type object's `tp_dict` method
+/// surface, so type-level access resolves through the regular MRO lookup:
+/// the unbound `int.bit_length(n)` / `_nbits = int.bit_length` patterns
+/// (vendored `_pydecimal` module scope) and `member_type.__format__` (enum).
+/// The entries are the bound-path trampolines, which already peel `argv[0]`
+/// as the receiver and validate it ([`int_method_receiver`] descriptor
+/// shapes), so `descriptor_get` with a NULL instance hands them back
+/// unbound while heap int-subclass instances bind them through the MRO.
+/// `bool` inherits the surface through its `int` MRO rung (no copies into
+/// bool's tp_dict: `bool.bit_length is int.bit_length` in CPython).
+/// Existing `tp_dict` entries are kept: only missing names are added.
+pub(crate) fn ensure_int_type_methods_installed(ty: *mut PyType) {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if ty.is_null() || INSTALLED.load(AtomicOrdering::SeqCst) {
+        return;
+    }
+    // Pre-runtime call sites must not latch a no-op install: the function
+    // allocations below need a live runtime.
+    if crate::abi::runtime_type_type().is_null() {
+        return;
+    }
+    if INSTALLED.swap(true, AtomicOrdering::SeqCst) {
+        return;
+    }
+    let namespace = unsafe { (*ty).tp_dict.cast::<crate::types::type_::PyClassDict>() };
+    let namespace = if namespace.is_null() { crate::types::type_::new_namespace() } else { namespace };
+    type Entry = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
+    let natives: &[(&str, Entry)] = &[
+        ("bit_length", int_bit_length_method),
+        ("bit_count", int_bit_count_method),
+        ("to_bytes", int_to_bytes_method),
+        ("__index__", int_identity_method),
+        ("__int__", int_identity_method),
+        ("__trunc__", int_identity_method),
+        ("__floor__", int_identity_method),
+        ("__ceil__", int_identity_method),
+        ("__format__", int_dunder_format_entry),
+    ];
+    for (name, entry) in natives {
+        let interned = crate::intern::intern(name);
+        if unsafe { (&*namespace).get(interned) }.is_some() {
+            continue;
+        }
+        // SAFETY: Live builtin entry points with the runtime calling convention.
+        let function =
+            unsafe { crate::abi::pon_make_function(*entry as *const u8, crate::builtins::variadic_arity(), interned) };
+        if !function.is_null() {
+            unsafe { (&mut *namespace).set(interned, function) };
+        }
+    }
+    unsafe {
+        (*ty).tp_dict = namespace.cast::<PyObject>();
+    }
+    // GC rooting for the namespace values plus IC invalidation for any
+    // AttrIC guarding the type object.
+    crate::sync::register_namespaced_type(ty);
+    crate::sync::type_modified(ty);
+}
+
+/// Ensures the GLOBAL `int` type object carries the type-level method
+/// surface.  Trigger for receivers that only reach `int` through their MRO
+/// (`bool.bit_length` after the bool→int base wiring); mirrors
+/// `abi::seq::ensure_list_subclass_surface`.
+pub(crate) fn ensure_int_surface_on_global() {
+    if let Some(ty) = crate::native::builtins_mod::builtin_native_type("int") {
+        ensure_int_type_methods_installed(ty);
+    }
+}
 /// `int.__index__`/`__int__`/`__trunc__`/`__floor__`/`__ceil__`: identity on
 /// exact ints (CPython returns self; the runtime's canonical boxing keeps
 /// value identity).
@@ -415,15 +513,28 @@ unsafe extern "C" fn int_identity_method(argv: *mut *mut PyObject, argc: usize) 
     }
 }
 
+/// Receiver/arity validation for the zero-argument int instance methods,
+/// shared by the bound path (`(7).bit_length()`) and the unbound
+/// type-access path (`int.bit_length(7)` / `_nbits = int.bit_length` in
+/// vendored `_pydecimal`).  Error shapes mirror the CPython 3.14
+/// method_descriptor oracle byte-for-byte, in CPython's check order:
+/// missing receiver, then receiver type (bool and payload int subclasses
+/// pass through `to_bigint_including_bool`), then arity.
 unsafe fn int_method_receiver(argv: *mut *mut PyObject, argc: usize, name: &str) -> Result<BigInt, *mut PyObject> {
-    if argc != 1 || argv.is_null() {
-        return Err(raise_type_error(&format!("int.{name}() takes no arguments")));
+    if argv.is_null() || argc == 0 {
+        return Err(raise_type_error(&format!("unbound method int.{name}() needs an argument")));
     }
     let receiver = unsafe { crate::tag::untag_arg(*argv) };
-    match unsafe { to_bigint_including_bool(receiver) } {
-        Some(value) => Ok(value),
-        None => Err(raise_type_error(&format!("int.{name}() receiver must be int"))),
+    let Some(value) = (unsafe { to_bigint_including_bool(receiver) }) else {
+        let got = unsafe { crate::types::dict::type_name(receiver) }.unwrap_or("object");
+        return Err(raise_type_error(&format!(
+            "descriptor '{name}' for 'int' objects doesn't apply to a '{got}' object"
+        )));
+    };
+    if argc != 1 {
+        return Err(raise_type_error(&format!("int.{name}() takes no arguments ({} given)", argc - 1)));
     }
+    Ok(value)
 }
 
 /// `int.__format__(self, format_spec)` — the real formatting method CPython
@@ -523,14 +634,18 @@ unsafe extern "C" fn int_bit_count_method(argv: *mut *mut PyObject, argc: usize)
 /// arm).  `importlib._bootstrap_external` calls it at module scope
 /// (`MAGIC_NUMBER = (3610).to_bytes(2, 'little')`, pyc header tokens).
 unsafe extern "C" fn int_to_bytes_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    if argv.is_null() || argc == 0 || argc > 4 {
+    if argv.is_null() || argc == 0 {
+        return raise_type_error("unbound method int.to_bytes() needs an argument");
+    }
+    if argc > 4 {
         return raise_type_error(&format!("to_bytes() takes 0 to 3 arguments ({} given)", argc.saturating_sub(1)));
     }
     // SAFETY: The caller passes a live argv window of length argc.
     let args: Vec<*mut PyObject> =
         unsafe { core::slice::from_raw_parts(argv, argc) }.iter().map(|&arg| crate::tag::untag_arg(arg)).collect();
     let Some(value) = (unsafe { to_bigint_including_bool(args[0]) }) else {
-        return raise_type_error("to_bytes() receiver must be an integer");
+        let got = unsafe { crate::types::dict::type_name(args[0]) }.unwrap_or("object");
+        return raise_type_error(&format!("descriptor 'to_bytes' for 'int' objects doesn't apply to a '{got}' object"));
     };
     let is_none = |object: *mut PyObject| {
         // SAFETY: Type probe tolerates any live object.
@@ -614,6 +729,9 @@ pub fn from_bytes_function() -> *mut PyObject {
 /// `int.from_bytes(bytes, byteorder='big', *, signed=False)`; keyword slots
 /// arrive positionally with None filling absent values (`types::function`
 /// binder arm), and the `random.py` str-seed path calls it one-argument.
+/// The payload accepts CPython's `PyObject_Bytes` universe (bytes-like
+/// buffers, `__bytes__` carriers, iterables of ints): `ipaddress.py` feeds
+/// `map(cls._parse_octet, octets)` at module exec.
 unsafe extern "C" fn int_from_bytes_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     if argv.is_null() || argc == 0 || argc > 3 {
         return raise_type_error(&format!("from_bytes() takes 1 to 3 arguments ({argc} given)"));
@@ -621,20 +739,6 @@ unsafe extern "C" fn int_from_bytes_entry(argv: *mut *mut PyObject, argc: usize)
     // SAFETY: The caller passes a live argv window of length argc.
     let args: Vec<*mut PyObject> =
         unsafe { core::slice::from_raw_parts(argv, argc) }.iter().map(|&arg| crate::tag::untag_arg(arg)).collect();
-    let payload: Vec<u8> = {
-        let data = args[0];
-        // SAFETY: A non-NULL heap object carries a live header.
-        let ty = unsafe { data.as_ref().map_or(ptr::null(), |object| object.ob_type) };
-        if crate::types::bytes_::is_bytes_type(ty) {
-            // SAFETY: Type check above proved the layout.
-            unsafe { (*data.cast::<crate::types::bytes_::PyBytes>()).as_slice().to_vec() }
-        } else if crate::types::bytearray_::is_bytearray_type(ty) {
-            // SAFETY: Type check above proved the layout.
-            unsafe { (*data.cast::<crate::types::bytearray_::PyByteArray>()).as_slice().to_vec() }
-        } else {
-            return raise_type_error("cannot convert non-bytes object to int");
-        }
-    };
     let is_none = |object: *mut PyObject| {
         // SAFETY: Type probe tolerates any live object.
         let name = unsafe { crate::types::dict::type_name(object) };
@@ -658,6 +762,12 @@ unsafe extern "C" fn int_from_bytes_entry(argv: *mut *mut PyObject, argc: usize)
             negative if negative < 0 => return ptr::null_mut(),
             truth => truth != 0,
         },
+    };
+    // Byteorder/signed parse first (CPython argument-clinic order), then
+    // the payload conversion with its own diagnostics.
+    let payload: Vec<u8> = match crate::abi::str_::bytes_payload_from_object(args[0]) {
+        Some(payload) => payload,
+        None => return ptr::null_mut(),
     };
     let value = match (little, signed) {
         (false, false) => BigInt::from_bytes_be(Sign::Plus, &payload),
