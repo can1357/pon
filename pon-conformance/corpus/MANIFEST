@@ -215,3 +215,7 @@ pon-conformance/corpus/cpython/int_from_bytes.py
 pon-conformance/corpus/cpython/sys_surface.py
 pon-conformance/corpus/cpython/os_seek.py
 pon-conformance/corpus/cpython/gc_expr_temps.py
+pon-conformance/corpus/cpython/hashlib_sha2.py
+pon-conformance/corpus/cpython/import_blocked_none.py
+pon-conformance/corpus/cpython/namespace_pkg.py
+pon-conformance/corpus/cpython/decimal_reexport.py

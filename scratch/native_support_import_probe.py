@@ -1,0 +1,2 @@
+import native_support_probe_mod
+print(native_support_probe_mod.VALUE)
