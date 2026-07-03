@@ -13,11 +13,12 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::abi::{
     pon_const_int, pon_const_str, pon_none, pon_store_global, raise_import_error_text, return_minus_one_with_error, return_null_with_error,
 };
-use crate::abi::exc::raise_attribute_error_text;
+use crate::abi::exc::{pon_raise_type_error, raise_attribute_error_text};
 use crate::intern::{intern, resolve};
 use crate::object::{PyObject, PyObjectHeader, PyType, PyUnicode, as_object_ptr};
 use crate::thread_state::{pon_err_clear, pon_err_occurred};
@@ -44,6 +45,13 @@ pub struct PyModuleObject {
     pub ob_base: PyObjectHeader,
     /// Interned module name.
     pub name: u32,
+    /// Interned registry identity keying the dynexec globals registry
+    /// (`module.__dict__` / `dir` / attr-store mirroring) and attr-snapshot
+    /// lookups.  Equal to `name` for imported/installed modules; unique per
+    /// instance for synthetic `types.ModuleType(...)` modules so a synthetic
+    /// module named like a real one never aliases the real module's
+    /// namespace dict.
+    pub registry_key: u32,
     /// Attribute table keyed by runtime interned name ids.
     pub attrs: HashMap<u32, *mut PyObject>,
 }
@@ -72,6 +80,12 @@ impl ImportState {
         let mut ty = Box::new(PyType::new(ptr::null(), "module", mem::size_of::<PyModuleObject>()));
         ty.tp_getattro = Some(module_getattro);
         ty.tp_setattro = Some(module_setattro);
+        // Direct calls on the module type (`types.ModuleType(name, doc)`)
+        // MUST NOT fall back to the generic `type_new` heap-instance
+        // allocator: the attr hooks above reinterpret the instance as
+        // `PyModuleObject`, and a `PyHeapInstance`'s bytes read as a garbage
+        // attrs `HashMap` (UB on first insert).
+        ty.tp_new = Some(module_tp_new);
         Self {
             modules: HashMap::new(),
             source_loader: None,
@@ -115,6 +129,26 @@ pub fn reset_import_state_for_tests() {
 /// Installs the curated native modules into the import cache after core runtime
 /// allocation is available.
 pub fn register_native_modules() -> Result<(), String> {
+    // Late-bind the module type's base: `object` exists only once core
+    // runtime globals are installed, while the module type is created with
+    // the import state (possibly earlier).  The base wires the generic
+    // keyword-call path (`types.ModuleType(name, doc=...)`): with a custom
+    // `tp_new`, `call_type_with_keywords` must resolve `__init__` to the
+    // inherited `object.__init__` carrier (the `_contextvars` pattern).
+    // Safe to bind late: the module type never owns a `tp_mro` carrier, so
+    // every MRO walk reads the live `tp_base` chain.
+    let module_type = {
+        let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        state.module_type
+    };
+    // SAFETY: The module type is an immortal leaked box created by
+    // `ImportState::new`; no Python executes concurrently with runtime init.
+    unsafe {
+        if (*module_type).tp_base.is_null() {
+            (*module_type).tp_base = crate::abi::runtime_global(intern("object"))
+                .map_or(ptr::null_mut(), |object| object.cast::<PyType>());
+        }
+    }
     crate::native::register_modules()
 }
 
@@ -498,12 +532,16 @@ fn import_module_by_name(name: &str) -> Result<*mut PyObject, String> {
 /// `meta_path`, so running before it (pon) vs after it (CPython) is not
 /// observable.
 ///
-/// `PathFinder` (CPython's third finder, appended by the separate
-/// `_install_external_importers` init step from `_bootstrap_external`) is
-/// deliberately not seeded: it would route `importlib.import_module` through
-/// vendored file-system loaders pon does not run.  Documented divergence:
-/// `sys.meta_path` is `[BuiltinImporter, FrozenImporter]` and the classes'
-/// `__module__` is `'importlib._bootstrap'`, not `'_frozen_importlib'`.
+/// The third slot — CPython's `PathFinder`, appended by the separate
+/// `_install_external_importers` init step from `_bootstrap_external` — is
+/// filled by pon's own `_pon_source_importer` module
+/// (`crate::native::imp::make_source_importer_module`) instead: `PathFinder`
+/// itself would route `importlib.import_module` through vendored
+/// file-system loaders pon does not run, while the stand-in claims exactly
+/// the names pon's embedded/source machinery serves and delegates loading to
+/// it.  Documented divergence: `sys.meta_path[2]` is that module object, not
+/// the `PathFinder` class, and the bootstrap classes' `__module__` is
+/// `'importlib._bootstrap'`, not `'_frozen_importlib'`.
 ///
 /// The append only fires while the list is still empty: CPython never
 /// re-runs `_install` either, so a re-import after a user cleared
@@ -529,7 +567,16 @@ fn seed_meta_path_finders() {
     let Some(frozen_importer) = module_attr(bootstrap, intern("FrozenImporter")) else {
         return;
     };
-    for finder in [builtin_importer, frozen_importer] {
+    let finders = match crate::native::imp::make_source_importer_module() {
+        Ok(source_importer) => [builtin_importer, frozen_importer, source_importer],
+        // Allocation failure: seed the two bootstrap classes and stay quiet
+        // (failure policy above); statement imports are unaffected.
+        Err(_) => [builtin_importer, frozen_importer, ptr::null_mut()],
+    };
+    for finder in finders {
+        if finder.is_null() {
+            continue;
+        }
         if crate::abi::seq::list_append_raw(meta_path, finder).is_err() {
             break;
         }
@@ -576,6 +623,15 @@ fn ensure_os_path_alias() {
     }
 }
 
+/// True when a `sys.modules` binding is the `None` singleton — the deliberate
+/// import block `test.support.import_helper.import_fresh_module` plants for
+/// each blocked name (tag-tolerant, like any generated-code dict value).
+fn is_none_binding(binding: *mut PyObject) -> bool {
+    // SAFETY: Singleton accessor; a NULL from pre-init failure never equals
+    // a live dict binding.
+    crate::tag::untag_arg(binding) == unsafe { pon_none() }
+}
+
 fn resolve_module_by_name(name: &str) -> Result<*mut PyObject, String> {
     if name.is_empty() {
         return Err("No module named ''".to_owned());
@@ -586,7 +642,17 @@ fn resolve_module_by_name(name: &str) -> Result<*mut PyObject, String> {
         let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
         state.modules.get(&name_id).copied()
     };
-    match (cached, sys_modules_entry(name)?) {
+    let entry = sys_modules_entry(name)?;
+    // CPython `_find_and_load`: a `None` binding in `sys.modules` is a
+    // deliberate import block — halt with the bootstrap's exact diagnostic
+    // (typed `ModuleNotFoundError` by `raise_import_error_text`) before any
+    // parent import or resolution side effect, so the `except ImportError:`
+    // accelerator fallbacks (bisect/queue/stat/collections/decimal) take
+    // their pure-Python arm instead of receiving `None` as a module.
+    if entry.is_some_and(is_none_binding) {
+        return Err(format!("import of {name} halted; None in sys.modules"));
+    }
+    match (cached, entry) {
         // Steady state: the cache and `sys.modules` agree.
         (Some(module), Some(entry)) if module == entry => return Ok(module),
         // A binding the user inserted or replaced through `sys.modules` wins.
@@ -616,7 +682,11 @@ fn resolve_module_by_name(name: &str) -> Result<*mut PyObject, String> {
         // (e.g. `collections/__init__.py` registers `collections.abc` as an
         // alias of `_collections_abc`). Adopt that binding instead of
         // resolving the child from disk.
-        if let Some(entry) = sys_modules_entry(name)? {
+        // A `None` block planted mid-flight by the parent's own body is
+        // "keep loading" in the bootstrap's crazy-side-effects recheck
+        // (`sys.modules.get(name) is not None`) — never an adoptable
+        // binding, and not a halt either.
+        if let Some(entry) = sys_modules_entry(name)?.filter(|&entry| !is_none_binding(entry)) {
             let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
             state.modules.insert(name_id, entry);
             drop(state);
@@ -848,6 +918,37 @@ pub fn import_shadowed_from_source(name: &str) -> bool {
     crate::native::is_native_module(name) || is_unsupported_c_accelerated(name)
 }
 
+/// Package flag for a name pon's post-registry machinery would import:
+/// embedded AoT bodies first, then on-disk source roots — exactly
+/// `resolve_module_by_name`'s order past the curated registry. `None` means
+/// "not servable": curated-native and refused C-accelerated names are
+/// excluded (`BuiltinImporter` already claims the former through
+/// `_imp.is_builtin`; the latter must keep raising CPython's
+/// `ModuleNotFoundError` when routed through `importlib`). Claim predicate of
+/// the `_pon_source_importer` meta-path finder (`crate::native::imp`).
+pub(crate) fn source_module_package_flag(name: &str) -> Option<bool> {
+    if crate::native::is_native_module(name) || is_unsupported_c_accelerated(name) {
+        return None;
+    }
+    if let Some((is_package, _)) = embedded_module(name) {
+        return Some(is_package);
+    }
+    find_source_module(name).map(|spec| spec.is_package)
+}
+
+/// Imports `name` and returns exactly that module — never the root-package
+/// remap `pon_import_name` applies for empty fromlists — raising the same
+/// typed import failure on error. Serves loader entry points
+/// (`_pon_source_importer.create_module`) that must hand
+/// `importlib._bootstrap._load` the named module itself, not its package
+/// root.
+pub(crate) fn import_named_module_raw(name: &str) -> *mut PyObject {
+    match import_module_by_name(name) {
+        Ok(module) => module,
+        Err(message) => raise_import_error_text(&message),
+    }
+}
+
 fn load_curated_assignment_module(name: &str, source: &str, is_package: bool) -> Result<*mut PyObject, String> {
     let mut attrs = Vec::new();
     for line in source.lines() {
@@ -896,11 +997,19 @@ fn create_module(
     let package_object = runtime_string(&package)?;
     attr_map.insert(intern("__name__"), name_object);
     attr_map.insert(intern("__package__"), package_object);
+    // CPython binds `__doc__ = None` at module birth; the compiled body
+    // rebinds it when a docstring executes.  pon codegen does not thread
+    // docstrings, so the value stays None (accepted divergence) — but the
+    // BINDING must exist: module-level `if __doc__ is not None:` (pdb.py)
+    // is a NameError without it.  Native modules that pass an explicit
+    // `__doc__` keep theirs.
+    attr_map.entry(intern("__doc__")).or_insert_with(|| unsafe { pon_none() });
 
     let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
     let object = Box::new(PyModuleObject {
         ob_base: PyObjectHeader::new(state.module_type),
         name: name_id,
+        registry_key: name_id,
         attrs: attr_map,
     });
     let object = as_object_ptr(Box::into_raw(object));
@@ -911,6 +1020,115 @@ fn create_module(
     // attrs overlay `pon_load_global` currently consults.
     crate::abi::bump_namespace_version();
     Ok(object)
+}
+
+/// Sequence source for unique synthetic-module registry identities.
+static SYNTHETIC_MODULE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Synthetic modules created by calling the module type directly
+/// (`types.ModuleType(name, doc=None)`), keyed by their unique
+/// [`PyModuleObject::registry_key`].
+///
+/// These are NOT import-system modules: they never enter the import cache or
+/// `sys.modules`, so `import name` never observes them and two same-named
+/// instances stay distinct.  The unique key keeps the dynexec globals
+/// registry (`module.__dict__` / `dir(module)` / attr-store mirroring) and
+/// the GC root walk per-INSTANCE: a synthetic module named like a real one
+/// (`types.ModuleType('os')`) must never read or pollute the real module's
+/// namespace dict.  Objects are immortal leaked boxes exactly like
+/// [`create_module`] products, stored as raw addresses (`usize`) so the
+/// static is `Sync`, matching the dynexec `GLOBALS_REGISTRY` convention.
+/// The mutex is held only for short non-reentrant sections while no Python
+/// executes, and never while `IMPORT_STATE`'s lock is held
+/// (deadlock-freedom mirrors the [`gc_held_roots`] contract).
+static SYNTHETIC_MODULES: LazyLock<Mutex<HashMap<u32, usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// `type(sys)(name, doc=None)`: CPython `module.__new__` + `module.__init__`
+/// fused into one construction pass, per this runtime's builtin-constructor
+/// convention (`type_call` skips the `__init__` leg when `tp_new` is not
+/// `type_new`).
+///
+/// Builds the real `PyModuleObject` layout with a live attrs map seeded like
+/// CPython `module.__init__`: `__name__`, `__doc__`, and
+/// `__package__`/`__loader__`/`__spec__` all `None`.
+///
+/// `cls` is honored in the object header so `type(m)` answers correctly, but
+/// attr dispatch (`as_module`) recognizes only the exact module type:
+/// `ModuleType` subclasses construct safely and raise on attr access instead
+/// of hitting UB (subclass attr support is out of scope).
+unsafe extern "C" fn module_tp_new(cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    if cls.is_null() {
+        return return_null_with_error("cannot instantiate NULL module type");
+    }
+    let positional = match unsafe { crate::types::type_::positional_args_from_object(args) } {
+        Ok(positional) => positional,
+        Err(message) => return return_null_with_error(message),
+    };
+    if positional.len() > 2 {
+        let message = format!("module() takes at most 2 arguments ({} given)", positional.len());
+        return unsafe { pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    let mut name_value = positional.first().copied().unwrap_or(ptr::null_mut());
+    let mut doc_value = positional.get(1).copied().unwrap_or(ptr::null_mut());
+    if !kwargs.is_null() {
+        // `call_type_with_keywords` materializes keywords as a real dict.
+        let entries = match unsafe { crate::types::dict::dict_entries_snapshot(kwargs) } {
+            Ok(entries) => entries,
+            Err(message) => return return_null_with_error(message),
+        };
+        for entry in entries {
+            let (slot, position) = match unicode_text(crate::tag::untag_arg(entry.key)) {
+                Some("name") => (&mut name_value, 1usize),
+                Some("doc") => (&mut doc_value, 2usize),
+                Some(other) => {
+                    let message = format!("module() got an unexpected keyword argument '{other}'");
+                    return unsafe { pon_raise_type_error(message.as_ptr(), message.len()) };
+                }
+                None => return return_null_with_error("module() keywords must be strings"),
+            };
+            if !slot.is_null() {
+                let keyword = if position == 1 { "name" } else { "doc" };
+                let message = format!("argument for module() given by name ('{keyword}') and position ({position})");
+                return unsafe { pon_raise_type_error(message.as_ptr(), message.len()) };
+            }
+            *slot = entry.value;
+        }
+    }
+    if name_value.is_null() {
+        const MESSAGE: &str = "module() missing required argument 'name' (pos 1)";
+        return unsafe { pon_raise_type_error(MESSAGE.as_ptr(), MESSAGE.len()) };
+    }
+    let name_object = crate::tag::untag_arg(name_value);
+    let Some(name_text) = unicode_text(name_object) else {
+        let kind = unsafe { crate::types::dict::type_name(name_object) }.unwrap_or("object");
+        let message = format!("module() argument 'name' must be str, not {kind}");
+        return unsafe { pon_raise_type_error(message.as_ptr(), message.len()) };
+    };
+
+    // CPython `module.__init__` namespace seed.
+    let none = unsafe { pon_none() };
+    let doc = if doc_value.is_null() { none } else { doc_value };
+    let mut attrs = HashMap::new();
+    attrs.insert(intern("__name__"), name_object);
+    attrs.insert(intern("__doc__"), doc);
+    attrs.insert(intern("__package__"), none);
+    attrs.insert(intern("__loader__"), none);
+    attrs.insert(intern("__spec__"), none);
+
+    let sequence = SYNTHETIC_MODULE_SEQ.fetch_add(1, Ordering::Relaxed);
+    // NUL prefix: importable module names cannot contain NUL, so the key
+    // never collides with a real module's registry identity.
+    let registry_key = intern(&format!("\0module-instance:{sequence}:{name_text}"));
+    let object = Box::new(PyModuleObject {
+        ob_base: PyObjectHeader::new(cls),
+        name: intern(name_text),
+        registry_key,
+        attrs,
+    });
+    let object = as_object_ptr(Box::into_raw(object));
+    let mut synthetic = SYNTHETIC_MODULES.lock().unwrap_or_else(|poison| poison.into_inner());
+    synthetic.insert(registry_key, object as usize);
+    object
 }
 
 fn runtime_string(value: &str) -> Result<*mut PyObject, String> {
@@ -1063,11 +1281,26 @@ pub fn active_module_name_id() -> Option<u32> {
 }
 
 pub fn module_attrs_snapshot(module_name: u32) -> Option<Vec<(u32, *mut PyObject)>> {
-    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
-    let module = state.modules.get(&module_name).copied()?;
-    let module = module_from_object_locked(&state, module)?;
-    // SAFETY: The import state proved the object uses `PyModuleObject` layout.
-    let module = unsafe { &*module };
+    {
+        let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(module) = state.modules.get(&module_name).copied() {
+            let module = module_from_object_locked(&state, module)?;
+            // SAFETY: The import state proved the object uses `PyModuleObject` layout.
+            let module = unsafe { &*module };
+            return Some(module.attrs.iter().map(|(name, value)| (*name, *value)).collect());
+        }
+    }
+    // Synthetic `types.ModuleType(...)` instances live outside the import
+    // cache; resolve them by their unique registry key so namespace-dict
+    // materialization (`__dict__`, `dir`) sees their attrs.
+    let object = {
+        let synthetic = SYNTHETIC_MODULES.lock().unwrap_or_else(|poison| poison.into_inner());
+        synthetic.get(&module_name).copied()? as *mut PyObject
+    };
+    // SAFETY: Every synthetic-table entry was built by `module_tp_new` with
+    // the `PyModuleObject` layout; attrs are read outside any lock exactly
+    // like `module_getattro` reads them (Python execution is serialized).
+    let module = unsafe { &*object.cast::<PyModuleObject>() };
     Some(module.attrs.iter().map(|(name, value)| (*name, *value)).collect())
 }
 
@@ -1085,26 +1318,43 @@ pub fn module_attrs_snapshot(module_name: u32) -> Option<Vec<(u32, *mut PyObject
 /// runs solely from explicit `gc.collect()` calls, and Python code never
 /// executes while `IMPORT_STATE` is locked, so the mutex is always free here.
 pub fn gc_held_roots() -> Vec<*mut PyObject> {
-    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
     let mut roots = Vec::new();
-    if !state.modules_dict.is_null() {
-        roots.push(state.modules_dict);
-    }
-    for &object in state.modules.values() {
-        match module_from_object_locked(&state, object) {
-            Some(module) => {
-                // SAFETY: The layout check proved `PyModuleObject`; attrs are
-                // enumerated under the import-state lock.
-                for (_, &value) in unsafe { (*module).attrs.iter() } {
-                    if !value.is_null() && crate::tag::is_heap(value) {
-                        roots.push(value);
+    {
+        let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        if !state.modules_dict.is_null() {
+            roots.push(state.modules_dict);
+        }
+        for &object in state.modules.values() {
+            match module_from_object_locked(&state, object) {
+                Some(module) => {
+                    // SAFETY: The layout check proved `PyModuleObject`; attrs are
+                    // enumerated under the import-state lock.
+                    for (_, &value) in unsafe { (*module).attrs.iter() } {
+                        if !value.is_null() && crate::tag::is_heap(value) {
+                            roots.push(value);
+                        }
+                    }
+                }
+                None => {
+                    if !object.is_null() && crate::tag::is_heap(object) {
+                        roots.push(object);
                     }
                 }
             }
-            None => {
-                if !object.is_null() && crate::tag::is_heap(object) {
-                    roots.push(object);
-                }
+        }
+    }
+    // Synthetic `types.ModuleType(...)` modules: same immortal-box rationale —
+    // marking cannot reach their attr values either.  Walked under the side
+    // table's own lock AFTER the import-state section ends so the two
+    // mutexes never nest.
+    let synthetic = SYNTHETIC_MODULES.lock().unwrap_or_else(|poison| poison.into_inner());
+    for &object in synthetic.values() {
+        let object = object as *mut PyObject;
+        // SAFETY: Every synthetic-table entry was built by `module_tp_new`
+        // with the `PyModuleObject` layout.
+        for (_, &value) in unsafe { (*object.cast::<PyModuleObject>()).attrs.iter() } {
+            if !value.is_null() && crate::tag::is_heap(value) {
+                roots.push(value);
             }
         }
     }
@@ -1233,7 +1483,11 @@ mod tests {
     use std::ptr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{STDLIB_PATH_ENV_VAR, pon_import_from, pon_import_name, reset_import_state_for_tests, resolve_import_name};
+    use super::{
+        STDLIB_PATH_ENV_VAR, pon_import_from, pon_import_name, reset_import_state_for_tests, resolve_import_name,
+        runtime_string, sys_modules_dict,
+    };
+    use crate::abi::pon_none;
     use crate::abi::{format_object_for_print, pon_runtime_init};
     use crate::intern::intern;
     use crate::thread_state::{pon_err_clear, pon_err_message, test_state_lock};
@@ -1433,6 +1687,47 @@ mod tests {
         );
         pon_err_clear();
     }
+
+    #[test]
+    fn none_sys_modules_binding_halts_import() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+        pon_err_clear();
+        reset_import_state_for_tests();
+
+        // Plant the block `import_fresh_module(blocked=[...])` plants.
+        let dict = sys_modules_dict().unwrap();
+        let key = runtime_string("pon_tiny").unwrap();
+        let none = unsafe { pon_none() };
+        {
+            let _guard = crate::sync::begin_critical_section(dict);
+            unsafe { crate::types::dict::dict_insert(dict, key, none).unwrap() };
+        }
+
+        let blocked = unsafe { pon_import_name(intern("pon_tiny"), ptr::null(), 0, 0) };
+        assert!(blocked.is_null(), "a None sys.modules binding must halt the import");
+        let message = pon_err_message();
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|text| text.contains("import of pon_tiny halted; None in sys.modules")),
+            "unexpected halt diagnostic: {message:?}"
+        );
+        pon_err_clear();
+
+        // Deleting the block restores importability (fresh vendored load).
+        {
+            let _guard = crate::sync::begin_critical_section(dict);
+            unsafe { crate::types::dict::dict_remove(dict, key).unwrap() };
+        }
+        let module = unsafe { pon_import_name(intern("pon_tiny"), ptr::null(), 0, 0) };
+        assert!(!module.is_null(), "unblocked import failed: {:?}", pon_err_message());
+        let name = unsafe { pon_import_from(module, intern("name")) };
+        assert_eq!(format_object_for_print(name).as_deref(), Ok("tiny"));
+    }
 }
 
 fn parse_curated_literal(text: &str) -> Result<*mut PyObject, String> {
@@ -1491,7 +1786,7 @@ fn as_module(object: *mut PyObject) -> Option<*mut PyModuleObject> {
 pub(crate) fn module_namespace_for_object(object: *mut PyObject) -> Option<Result<*mut PyObject, String>> {
     let module = as_module(object)?;
     // SAFETY: `as_module` proved the `PyModuleObject` layout.
-    Some(crate::dynexec::module_namespace_dict(unsafe { (*module).name }))
+    Some(crate::dynexec::module_namespace_dict(unsafe { (*module).registry_key }))
 }
 
 unsafe extern "C" fn module_getattro(module: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
@@ -1510,7 +1805,7 @@ unsafe extern "C" fn module_getattro(module: *mut PyObject, name: *mut PyObject)
         // The live namespace view: mutations through it sync back into the
         // module attrs via the dynexec globals-registry hooks (CPython's
         // module `__dict__` IS the module namespace).
-        return match crate::dynexec::module_namespace_dict(unsafe { (*module).name }) {
+        return match crate::dynexec::module_namespace_dict(unsafe { (*module).registry_key }) {
             Ok(dict) => dict,
             Err(message) => return_null_with_error(message),
         };
@@ -1524,7 +1819,7 @@ unsafe extern "C" fn module_getattro(module: *mut PyObject, name: *mut PyObject)
     // Attrs miss: consult the registered namespace dict. CPython module
     // attribute lookup IS a `__dict__` lookup, so bindings created only
     // through the dict view (`vars(mod)["k"] = v`) must resolve here too.
-    if let Some(value) = crate::dynexec::peek_module_namespace_value(module_ref.name, name_text) {
+    if let Some(value) = crate::dynexec::peek_module_namespace_value(module_ref.registry_key, name_text) {
         return value;
     }
     let module_name = resolve(module_ref.name).unwrap_or_else(|| format!("<module:{}>", module_ref.name));
@@ -1551,8 +1846,9 @@ unsafe extern "C" fn module_setattro(module: *mut PyObject, name: *mut PyObject,
         return -1;
     };
     let name_id = intern(name_text);
-    // SAFETY: `as_module` proved the layout.
-    let module_name_id = unsafe { (&*module).name };
+    // SAFETY: `as_module` proved the layout.  The registry key routes the
+    // namespace-dict mirror; the interned name serves error messages.
+    let (module_name_id, module_registry_key) = unsafe { ((&*module).name, (&*module).registry_key) };
     if value.is_null() {
         // SAFETY: `as_module` proved the layout.
         let removed = unsafe { (&mut *module).attrs.remove(&name_id).is_some() };
@@ -1563,13 +1859,13 @@ unsafe extern "C" fn module_setattro(module: *mut PyObject, name: *mut PyObject,
         }
         // Keep the registered namespace dict (`module.__dict__`) coherent:
         // `dir(module)` and the getattro fallback read it.
-        crate::dynexec::sync_global_delete_for_module(module_name_id, name_id);
+        crate::dynexec::sync_global_delete_for_module(module_registry_key, name_id);
     } else {
         // SAFETY: `as_module` proved the layout.
         unsafe {
             (&mut *module).attrs.insert(name_id, value);
         }
-        crate::dynexec::sync_global_store_for_module(module_name_id, name_id, value);
+        crate::dynexec::sync_global_store_for_module(module_registry_key, name_id, value);
     }
     // J0.3 GlobalIC site: module attr overlay insert/replace/removal.
     crate::abi::bump_namespace_version();

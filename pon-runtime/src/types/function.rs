@@ -1517,7 +1517,11 @@ pub fn bind_arguments(
             }
             if bound[index].is_null() {
                 let name = params.names.get(index).copied().unwrap_or(0);
-                return Err(format!("missing required positional argument {name}"));
+                return Err(format!(
+                    "{} missing required positional argument: '{}'",
+                    function_call_name(function),
+                    keyword_name(name)
+                ));
             }
         }
     }
@@ -1695,6 +1699,12 @@ pub(crate) fn bind_native_keywords_for_name(
             bind_trailing_marker_keywords(positional, keywords, "replace", CODE_REPLACE_KEYWORDS)
                 .map_err(raise_boxed_type_error)
         }
+        // `print(*objects, sep=' ', end='\n', file=None, flush=False)`: the
+        // keyword-only quartet rides a trailing marker that `builtin_print`
+        // peels (test.support.captured_output passes `file=`).  Binder
+        // failures are boxed as real TypeErrors like every clinic rejection.
+        "print" => bind_trailing_marker_keywords(positional, keywords, "print", &["sep", "end", "file", "flush"])
+            .map_err(raise_boxed_type_error),
         // `__import__(name, globals=None, locals=None, fromlist=(), level=0)`:
         // the vendored `encodings` package search function calls it with
         // `fromlist=`/`level=` keywords; absent optionals arrive as None and
@@ -1716,6 +1726,11 @@ pub(crate) fn bind_native_keywords_for_name(
             &["tty_file", "force_color", "force_no_color"],
             0,
         ),
+        // `get_colors(colorize=False, *, file=None)`: `doctest` calls it
+        // bare and with `file=` when summarizing runs.
+        "get_colors" => {
+            bind_optional_named_keywords(positional, keywords, "get_colors", &["colorize", "file"], 1)
+        }
         // Native `itertools` constructors (J0.4 lazy module): fixed-shape
         // signatures flatten keywords into their positional slots with None
         // filling absent optionals; the variadic constructors carry keywords
@@ -1814,6 +1829,16 @@ pub(crate) fn bind_native_keywords_for_name(
         // absent optionals arrive as None and the entry applies the defaults.
         "to_bytes" => {
             bind_optional_named_keywords(positional, keywords, "to_bytes", &["self", "length", "byteorder", "signed"], 3)
+        }
+        // `str.split(sep=None, maxsplit=-1)` / `str.rsplit` (bytes/bytearray
+        // share the row: same signature, dispatch is by function name): the
+        // bound receiver occupies the first slot (`to_bytes` precedent) and
+        // absent optionals arrive as None (`str_split_args` maps None to the
+        // whitespace-sep / unlimited-maxsplit defaults).  `ipaddress.py`
+        // module exec runs `ip_str.split(':', maxsplit=_max_parts)`.
+        "split" => bind_optional_named_keywords(positional, keywords, "split", &["self", "sep", "maxsplit"], 3),
+        "rsplit" => {
+            bind_optional_named_keywords(positional, keywords, "rsplit", &["self", "sep", "maxsplit"], 3)
         }
         // `open(file, mode='r', buffering=-1, encoding=None, errors=None,
         // newline=None, closefd=True, opener=None)`: `_osx_support` and the

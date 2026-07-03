@@ -31,7 +31,7 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
         string_attr(module, "pardir", ".."),
     ];
     let mut attrs = attrs.into_iter().collect::<Result<Vec<_>, _>>()?;
-    for &(name, value) in [OPEN_FLAGS, ACCESS_FLAGS, WAIT_OPTIONS].into_iter().flatten() {
+    for &(name, value) in [OPEN_FLAGS, ACCESS_FLAGS, WAIT_OPTIONS, SEEK_MODES].into_iter().flatten() {
         // SAFETY: Integer boxing helper; NULL is checked below.
         let boxed = unsafe { crate::abi::pon_const_int(i64::from(value)) };
         if boxed.is_null() {
@@ -118,6 +118,34 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
             }
             attrs.push((intern(name), function));
         }
+        // `os.py`'s `getenv` (never re-exported into `posix`, exactly like
+        // the fs-codec pair): `environ.get(key, default)` over the LIVE
+        // `os.environ` binding — see `os_getenv` for the read-through
+        // contract.
+        let getenv = unsafe {
+            crate::abi::pon_make_function(
+                os_getenv as *const u8,
+                crate::native::builtins_mod::VARIADIC_ARITY,
+                intern("getenv"),
+            )
+        };
+        if getenv.is_null() {
+            return Err(format!("failed to allocate {module}.getenv"));
+        }
+        attrs.push((intern("getenv"), getenv));
+        // `os.py`-level names never re-exported into `posix`: the portable
+        // seek trio (see [`SEEK_MODES`]) and the null-device path (os.py
+        // takes it from `posixpath.devnull`; `test.test_py_compile` probes
+        // `os.path.exists(os.devnull)` at class-body time).
+        for &(name, value) in SEEK_POSITIONS {
+            // SAFETY: Integer boxing helper; NULL is checked below.
+            let boxed = unsafe { crate::abi::pon_const_int(i64::from(value)) };
+            if boxed.is_null() {
+                return Err(format!("failed to allocate {module}.{name}"));
+            }
+            attrs.push((intern(name), boxed));
+        }
+        attrs.push(string_attr(module, "devnull", if cfg!(windows) { "nul" } else { "/dev/null" })?);
         attrs.push((intern("PathLike"), pathlike_class()?));
     }
     Ok(attrs)
@@ -316,14 +344,17 @@ unsafe extern "C" fn os_urandom(argv: *mut *mut PyObject, argc: usize) -> *mut P
 }
 
 /// `os.stat_result` shape: only the fields the vendored stdlib consumes are
-/// served (`linecache` reads `st_size`/`st_mtime`); unknown attributes raise
-/// AttributeError so the next frontier is loud, not silently wrong.
+/// served (`linecache` reads `st_size`/`st_mtime`; `netrc`'s security check
+/// reads `st_mode`/`st_uid`); unknown attributes raise AttributeError so the
+/// next frontier is loud, not silently wrong (`_pyio` reads `st_blksize`
+/// through `getattr(..., 0)`, which that AttributeError serves correctly).
 #[repr(C)]
 struct PyStatResult {
     ob_base: crate::object::PyObjectHeader,
     st_size: i64,
     st_mtime: f64,
     st_mode: u32,
+    st_uid: u32,
 }
 
 fn stat_result_type() -> *mut crate::object::PyType {
@@ -351,6 +382,7 @@ unsafe extern "C" fn stat_result_getattro(object: *mut PyObject, name: *mut PyOb
         "st_size" => unsafe { crate::abi::pon_const_int((*stat).st_size) },
         "st_mtime" => unsafe { crate::abi::number::pon_const_float((*stat).st_mtime) },
         "st_mode" => unsafe { crate::abi::pon_const_int(i64::from((*stat).st_mode)) },
+        "st_uid" => unsafe { crate::abi::pon_const_int(i64::from((*stat).st_uid)) },
         _ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
     }
 }
@@ -383,19 +415,86 @@ fn stat_result_object(metadata: &std::fs::Metadata) -> *mut PyObject {
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0.0, |duration| duration.as_secs_f64());
     #[cfg(unix)]
-    let mode = {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode()
+    let (mode, uid) = {
+        use std::os::unix::fs::MetadataExt;
+        (metadata.mode(), metadata.uid())
     };
     #[cfg(not(unix))]
-    let mode = 0u32;
+    let (mode, uid) = (0u32, 0u32);
+    stat_result_from_fields(i64::try_from(metadata.len()).unwrap_or(i64::MAX), mtime, mode, uid)
+}
+
+/// Boxes explicit field values as an `os.stat_result`; shared by the
+/// metadata path above and the raw `fstat(2)` path below.
+fn stat_result_from_fields(st_size: i64, st_mtime: f64, st_mode: u32, st_uid: u32) -> *mut PyObject {
     Box::into_raw(Box::new(PyStatResult {
         ob_base: crate::object::PyObjectHeader::new(stat_result_type()),
-        st_size: i64::try_from(metadata.len()).unwrap_or(i64::MAX),
-        st_mtime: mtime,
-        st_mode: mode,
+        st_size,
+        st_mtime,
+        st_mode,
+        st_uid,
     }))
     .cast::<PyObject>()
+}
+
+/// `os.fstat(fd)` over `fstat(2)`: the stat_result for an open descriptor
+/// (`_pyio.FileIO.__init__` probes `S_ISDIR(st_mode)`; `netrc`'s security
+/// check compares `st_uid` against `os.getuid()`).
+unsafe extern "C" fn os_fstat(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return crate::abi::return_null_with_error("os.fstat expected one argument");
+    }
+    let fd = match int_arg(args[0], "fstat fd") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    let mut raw = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `raw` is a live out-buffer; failure reports through errno below.
+    if unsafe { libc::fstat(fd as libc::c_int, raw.as_mut_ptr()) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    // SAFETY: fstat(2) success fills the whole struct.
+    let raw = unsafe { raw.assume_init() };
+    #[allow(clippy::cast_precision_loss)]
+    let mtime = raw.st_mtime as f64 + raw.st_mtime_nsec as f64 * 1e-9;
+    stat_result_from_fields(raw.st_size, mtime, u32::from(raw.st_mode), raw.st_uid)
+}
+
+/// `os.chmod(path, mode)` over `chmod(2)` (`test.support.os_helper.can_chmod`
+/// round-trips it against `os.stat().st_mode`).
+unsafe extern "C" fn os_chmod(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.chmod expected two arguments (path, mode)");
+    }
+    let path = match path_arg(args[0], "chmod") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let mode = match int_arg(args[1], "chmod mode") {
+        Ok(mode) => mode,
+        Err(error) => return error,
+    };
+    let c_path = match c_path(&path) {
+        Ok(c_path) => c_path,
+        Err(error) => return error,
+    };
+    // SAFETY: `c_path` is NUL-terminated.
+    if unsafe { libc::chmod(c_path.as_ptr(), mode as libc::mode_t) } < 0 {
+        return raise_errno(last_errno(), Some(&path));
+    }
+    // SAFETY: Singleton accessor.
+    unsafe { crate::abi::pon_none() }
+}
+
+/// `os.getuid()` over `getuid(2)` (`netrc._can_security_check` gates on its
+/// presence; the check itself compares it to the file owner).
+unsafe extern "C" fn os_getuid(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+    // SAFETY: getuid(2) cannot fail; integer boxing follows the NULL-sentinel contract.
+    unsafe { crate::abi::pon_const_int(i64::from(libc::getuid())) }
 }
 
 /// `os.path`: CPython's `os.py` publishes `sys.modules['os.path'] =
@@ -466,13 +565,51 @@ const ACCESS_FLAGS: &[(&str, i32)] = &[
 /// watchers pass it on every poll.
 const WAIT_OPTIONS: &[(&str, i32)] = &[("WNOHANG", libc::WNOHANG)];
 
+/// `lseek(2)` whence constants served by the C `posix` module on the host
+/// oracle: `SEEK_HOLE`/`SEEK_DATA` (sparse-file navigation) live on BOTH
+/// `os` and `posix`, while the portable trio `SEEK_SET`/`SEEK_CUR`/
+/// `SEEK_END` is defined by `os.py` itself and never re-exported into
+/// `posix` — [`build_attrs`] adds the trio under its `module == "os"`
+/// branch.  `zipfile` consumes `os.SEEK_SET`/`os.SEEK_CUR` at import time
+/// (module-level `_EndRecData` helpers seed `whence` defaults), and
+/// `importlib.metadata`/`pkgutil`/`zipimport` reach it through the zipfile
+/// chain.  Values come from libc, so they always match the host CPython's
+/// (darwin: HOLE=3/DATA=4; linux swaps them).
+const SEEK_MODES: &[(&str, i32)] = &[("SEEK_DATA", libc::SEEK_DATA), ("SEEK_HOLE", libc::SEEK_HOLE)];
+
+/// `os.py`-level `SEEK_SET`/`SEEK_CUR`/`SEEK_END` (see [`SEEK_MODES`]).
+const SEEK_POSITIONS: &[(&str, i32)] = &[
+    ("SEEK_SET", libc::SEEK_SET),
+    ("SEEK_CUR", libc::SEEK_CUR),
+    ("SEEK_END", libc::SEEK_END),
+];
+
 /// Snapshot of the process environment as a plain str->str dict.
 ///
-/// CPython's `os.environ` is a live `os._Environ` mapping whose writes call
-/// `putenv`/`unsetenv`; this seed is read-focused — mutating the dict never
-/// writes back to the process environment, and the snapshot is taken when the
-/// module is created. Non-UTF-8 entries are decoded lossily rather than with
-/// CPython's `surrogateescape`.
+/// DECISION (deferred surface, resolved by consumer evidence): the dict
+/// stays; `os._Environ` is not modelled.  CPython's `os.environ` is a live
+/// `MutableMapping` whose `__setitem__`/`__delitem__` write through to
+/// `putenv`/`unsetenv`, but the only observer that could distinguish pon's
+/// plain dict is a spawned child inheriting the mutated real environment,
+/// and pon does not wire process spawning yet (`_posixsubprocess.fork_exec`
+/// raises NotImplementedError).  Every in-cohort consumer works over dict
+/// semantics: `tempfile` reads through `os.getenv`, `subprocess` only calls
+/// `os.environ.get`, and `test.support.os_helper.EnvironmentVarGuard` uses
+/// plain mapping ops (`[]=`, `del`, `keys`, iteration — all served by dict,
+/// `setdefault` included) plus an `os.environ = ...` rebinding that the
+/// live module-attr read in [`os_getenv`] honors.  The observable
+/// `putenv`/`getenv` contract matches CPython exactly BECAUSE the dict is
+/// not written back: CPython's `putenv` bypasses `os.environ` too, so
+/// `putenv(k, v); getenv(k)` returns None on both.
+///
+/// Remaining documented divergences: mutating `os.environ` never reaches
+/// the real process environment (visible only to native env readers);
+/// `repr(os.environ)` is a dict repr, not `environ({...})`; `os.environb`,
+/// the `_Environ.encodekey` family, and non-str-key TypeErrors on item ops
+/// are absent; `posix.environ` is a second str->str snapshot rather than
+/// CPython's bytes-keyed raw dict; non-UTF-8 entries are decoded lossily
+/// rather than with CPython's `surrogateescape`; and the snapshot is taken
+/// when the module is created.
 fn environ_snapshot(module: &str) -> Result<*mut PyObject, String> {
     let mut pairs: Vec<*mut PyObject> = Vec::new();
     for (key, value) in std::env::vars_os() {
@@ -512,16 +649,23 @@ type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObjec
 const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("WIFSTOPPED", os_wifstopped, 1),
     ("WSTOPSIG", os_wstopsig, 1),
+    ("chmod", os_chmod, 2),
     ("close", os_close, 1),
+    ("fstat", os_fstat, 1),
     ("getcwd", os_getcwd, 0),
     ("getpid", os_getpid, 0),
+    ("getuid", os_getuid, 0),
+    ("lseek", os_lseek, 3),
     ("lstat", os_lstat, crate::native::builtins_mod::VARIADIC_ARITY),
+    ("mkdir", os_mkdir, crate::native::builtins_mod::VARIADIC_ARITY),
     ("open", os_open, crate::native::builtins_mod::VARIADIC_ARITY),
+    ("putenv", os_putenv, 2),
     ("read", os_read, 2),
     ("readlink", os_readlink, 1),
     ("rmdir", os_rmdir, 1),
     ("scandir", os_scandir, 1),
     ("unlink", os_unlink, 1),
+    ("unsetenv", os_unsetenv, 1),
     ("waitpid", os_waitpid, 2),
     ("waitstatus_to_exitcode", os_waitstatus_to_exitcode, 1),
     ("write", os_write, 2),
@@ -827,6 +971,37 @@ unsafe extern "C" fn os_write(argv: *mut *mut PyObject, argc: usize) -> *mut PyO
     unsafe { crate::abi::pon_const_int(count as i64) }
 }
 
+/// `os.lseek(fd, position, whence)` over `lseek(2)`: returns the resulting
+/// offset.  The whence argument takes the `SEEK_*` constants above;
+/// validation is the host's (EINVAL for junk whence/offset combinations),
+/// exactly like CPython's thin wrapper.
+unsafe extern "C" fn os_lseek(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 3 {
+        return crate::abi::return_null_with_error("os.lseek expected three arguments");
+    }
+    let fd = match int_arg(args[0], "lseek fd") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    let position = match int_arg(args[1], "lseek position") {
+        Ok(position) => position,
+        Err(error) => return error,
+    };
+    let whence = match int_arg(args[2], "lseek whence") {
+        Ok(whence) => whence,
+        Err(error) => return error,
+    };
+    // SAFETY: Plain fd syscall; failure reports through errno below.
+    let offset = unsafe { libc::lseek(fd as libc::c_int, position, whence as libc::c_int) };
+    if offset < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    // SAFETY: Integer boxing helper follows the NULL-sentinel error contract.
+    unsafe { crate::abi::pon_const_int(offset) }
+}
+
 /// Borrows a bytes/bytearray payload; `None` for other types.
 fn bytes_payload<'a>(object: *mut PyObject) -> Option<&'a [u8]> {
     if object.is_null() || crate::tag::is_small_int(object) {
@@ -862,6 +1037,39 @@ unsafe extern "C" fn os_unlink(argv: *mut *mut PyObject, argc: usize) -> *mut Py
     };
     // SAFETY: `c_path` is NUL-terminated.
     if unsafe { libc::unlink(c_path.as_ptr()) } < 0 {
+        return raise_errno(last_errno(), Some(&path));
+    }
+    // SAFETY: Singleton accessor.
+    unsafe { crate::abi::pon_none() }
+}
+
+/// `os.mkdir(path, mode=0o777, *, dir_fd=None)` over `mkdir(2)`; the mode is
+/// masked by the process umask exactly like the syscall.
+unsafe extern "C" fn os_mkdir(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if !(1..=3).contains(&args.len()) {
+        let message = "os.mkdir expected 1 to 2 arguments (path, mode=0o777)";
+        return crate::abi::return_null_with_error(message);
+    }
+    let path = match path_arg(args[0], "mkdir") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let mode = match optional_arg(args, 1).map(|object| int_arg(object, "mkdir mode")) {
+        None => 0o777,
+        Some(Ok(mode)) => mode,
+        Some(Err(error)) => return error,
+    };
+    if let Err(error) = reject_dir_fd(args, 2, "mkdir") {
+        return error;
+    }
+    let c_path = match c_path(&path) {
+        Ok(c_path) => c_path,
+        Err(error) => return error,
+    };
+    // SAFETY: `c_path` is NUL-terminated.
+    if unsafe { libc::mkdir(c_path.as_ptr(), mode as libc::mode_t) } < 0 {
         return raise_errno(last_errno(), Some(&path));
     }
     // SAFETY: Singleton accessor.
@@ -1413,4 +1621,176 @@ unsafe extern "C" fn terminal_size_repr(argv: *mut *mut PyObject, argc: usize) -
     let text = format!("os.terminal_size(columns={columns}, lines={lines})");
     // SAFETY: String allocation helper follows the NULL-sentinel contract.
     unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+// ---------------------------------------------------------------------------
+// Environment write-through: `putenv`/`unsetenv` (C `posix` pair, shared
+// with the `posix` module like the rest of the syscall table) and the
+// `os.py`-level `getenv`.  See [`environ_snapshot`] for the decision record
+// on why `os.environ` itself stays a plain dict.
+
+/// str/bytes/PathLike argument for the environment write-through pair:
+/// `os.fspath` coercion first (with its exact CPython TypeError), then the
+/// byte payload (str as UTF-8, bytes raw).
+unsafe fn env_bytes_arg(slot: *mut PyObject, what: &str) -> Result<Vec<u8>, *mut PyObject> {
+    let mut argv = [slot];
+    // SAFETY: One live argument slot built above.
+    let coerced = unsafe { os_fspath(argv.as_mut_ptr(), 1) };
+    if coerced.is_null() {
+        return Err(std::ptr::null_mut());
+    }
+    let raw = crate::tag::untag_arg(coerced);
+    if !raw.is_null() && !crate::tag::is_small_int(raw) {
+        // SAFETY: Heap pointer with a live header after the tag checks.
+        if let Some(text) = unsafe { crate::types::type_::unicode_text(raw) } {
+            return Ok(text.as_bytes().to_vec());
+        }
+        // SAFETY: Live header per the checks above.
+        if crate::types::bytes_::is_bytes_type(unsafe { (*raw).ob_type }) {
+            // SAFETY: The type check proved PyBytes layout.
+            return Ok(unsafe { (*raw.cast::<crate::types::bytes_::PyBytes>()).as_slice() }.to_vec());
+        }
+    }
+    Err(fs_codec_hook_type_error(what, raw))
+}
+
+/// `os.putenv(name, value)` / `posix.putenv`: writes through to the REAL
+/// process environment (`setenv(3)` shape).  Exactly like CPython, the call
+/// does NOT touch the `os.environ` dict — CPython documents that direct
+/// `putenv` calls "don't update os.environ" — so `putenv(k, v); getenv(k)`
+/// returns None on both engines (see [`environ_snapshot`]).
+unsafe extern "C" fn os_putenv(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 2 || argv.is_null() {
+        return crate::abi::return_null_with_error(format!("putenv expected 2 arguments, got {argc}"));
+    }
+    // SAFETY: Two live argument slots per the check above.
+    let name = match unsafe { env_bytes_arg(*argv, "putenv") } {
+        Ok(bytes) => bytes,
+        Err(raised) => return raised,
+    };
+    // SAFETY: As above.
+    let value = match unsafe { env_bytes_arg(*argv.add(1), "putenv") } {
+        Ok(bytes) => bytes,
+        Err(raised) => return raised,
+    };
+    if name.contains(&0) || value.contains(&0) {
+        let message = "embedded null byte";
+        // SAFETY: Typed raise helper.
+        return unsafe { crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) };
+    }
+    if name.contains(&b'=') {
+        let message = "illegal environment variable name";
+        // SAFETY: Typed raise helper.
+        return unsafe { crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) };
+    }
+    if name.is_empty() {
+        // macOS setenv(3) rejects an empty name; CPython surfaces the errno.
+        return raise_errno(libc::EINVAL, None);
+    }
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: The `set_var` panic preconditions (empty name, '=', NUL) are
+    // pre-checked above and raise Python errors instead; the remaining
+    // concurrent-getenv data-race contract is setenv(3)'s own, which
+    // CPython's putenv shares.
+    unsafe {
+        std::env::set_var(
+            std::ffi::OsStr::from_bytes(&name),
+            std::ffi::OsStr::from_bytes(&value),
+        );
+    }
+    // SAFETY: Singleton accessor.
+    unsafe { crate::abi::pon_none() }
+}
+
+/// `os.unsetenv(name)` / `posix.unsetenv`: removes `name` from the REAL
+/// process environment (`unsetenv(3)` shape); the `os.environ` dict is —
+/// like CPython — left untouched.
+unsafe extern "C" fn os_unsetenv(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 1 || argv.is_null() {
+        return crate::abi::return_null_with_error(format!("unsetenv expected 1 argument, got {argc}"));
+    }
+    // SAFETY: One live argument slot per the check above.
+    let name = match unsafe { env_bytes_arg(*argv, "unsetenv") } {
+        Ok(bytes) => bytes,
+        Err(raised) => return raised,
+    };
+    if name.contains(&0) {
+        let message = "embedded null byte";
+        // SAFETY: Typed raise helper.
+        return unsafe { crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) };
+    }
+    if name.is_empty() || name.contains(&b'=') {
+        // macOS unsetenv(3) rejects empty names and embedded '='; CPython
+        // surfaces the errno.
+        return raise_errno(libc::EINVAL, None);
+    }
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: The `remove_var` panic preconditions (empty name, '=', NUL)
+    // are pre-checked above; the concurrent-getenv data-race contract is
+    // unsetenv(3)'s own, which CPython shares.
+    unsafe { std::env::remove_var(std::ffi::OsStr::from_bytes(&name)) };
+    // SAFETY: Singleton accessor.
+    unsafe { crate::abi::pon_none() }
+}
+
+/// `os.getenv(key, default=None)`: `os.py`'s Python-level helper, served
+/// natively.  Reads the LIVE `os.environ` module binding — rebinding
+/// `os.environ`, as `test.support.os_helper.EnvironmentVarGuard.__exit__`
+/// does, changes what getenv consults, exactly like the os.py module-global
+/// read — then defers to `environ.get(key, default)` through attribute
+/// dispatch so any mapping works.  The key must be str, matching
+/// `_Environ.encodekey`'s check (a plain dict `.get` would silently return
+/// the default).
+unsafe extern "C" fn os_getenv(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc == 0 || argv.is_null() {
+        let message = "getenv() missing 1 required positional argument: 'key'";
+        // SAFETY: Typed raise helper.
+        return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    if argc > 2 {
+        let message = format!("getenv() takes from 1 to 2 positional arguments but {argc} were given");
+        // SAFETY: Typed raise helper.
+        return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    // SAFETY: `argc` live argument slots per the checks above.
+    let key = unsafe { *argv };
+    let raw_key = crate::tag::untag_arg(key);
+    if raw_key.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: Heap-or-NULL after `untag_arg`; NULL was handled above.
+    if crate::tag::is_small_int(raw_key) || unsafe { crate::types::type_::unicode_text(raw_key) }.is_none() {
+        let display = if crate::tag::is_small_int(raw_key) {
+            "int"
+        } else {
+            // SAFETY: Heap pointer with a live header after the tag checks.
+            unsafe { crate::types::dict::type_name(raw_key) }.unwrap_or("object")
+        };
+        let message = format!("str expected, not {display}");
+        // SAFETY: Typed raise helper.
+        return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    let default = if argc == 2 {
+        // SAFETY: Two live argument slots per the argc check.
+        unsafe { *argv.add(1) }
+    } else {
+        // SAFETY: Singleton accessor.
+        unsafe { crate::abi::pon_none() }
+    };
+    let Some(environ) = crate::import::module_attr(intern("os"), intern("environ")) else {
+        // `del os.environ` leaves getenv reading a missing global — the
+        // exact failure os.py's `environ.get` produces.
+        let message = "name 'environ' is not defined";
+        return crate::abi::exc::raise_kind_error_text(ExceptionKind::NameError, message);
+    };
+    // SAFETY: Live environ binding; a missing or failing `get` attribute
+    // propagates its own AttributeError, exactly like os.py's
+    // `environ.get(key, default)` expression.
+    let get = unsafe { crate::abi::pon_get_attr(environ, intern("get"), std::ptr::null_mut()) };
+    if get.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut call_argv = [key, default];
+    // SAFETY: Live bound method and two live argument slots.
+    unsafe { crate::abi::pon_call(get, call_argv.as_mut_ptr(), call_argv.len()) }
 }

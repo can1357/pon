@@ -4,7 +4,11 @@
 //! `Lib/importlib/__init__.py` cannot import without three C-only modules pon
 //! never had: `_imp` itself (`_bootstrap._setup`), and `_warnings` + `marshal`
 //! (module-top imports of `_bootstrap_external`).  All three factories live
-//! here because they exist for exactly that bootstrap chain.
+//! here because they exist for exactly that bootstrap chain, as does the
+//! fourth companion `_pon_source_importer` — pon's `PathFinder` stand-in that
+//! `crate::import::seed_meta_path_finders` appends to `sys.meta_path` so
+//! `importlib.import_module` can reach the embedded/source modules the
+//! `import` statement already serves.
 //!
 //! `_imp` is an honest projection of pon's import machinery, not an emulation
 //! of CPython's interpreter internals:
@@ -480,4 +484,124 @@ pub(super) fn make_marshal_module() -> Result<*mut PyObject, String> {
         attrs.push((intern(function_name), function));
     }
     install_module(name, attrs)
+}
+
+// ---------------------------------------------------------------------------
+// `_pon_source_importer`: pon's PathFinder stand-in (meta_path slot three)
+
+/// `sys.modules` name of pon's source-root finder/loader companion.
+const SOURCE_IMPORTER_NAME: &str = "_pon_source_importer";
+
+fn source_importer_module() -> Option<*mut PyObject> {
+    crate::import::cached_module(intern(SOURCE_IMPORTER_NAME))
+}
+
+/// `find_spec(fullname, path=None, target=None)`: claims exactly the names
+/// pon's post-registry machinery (embedded AoT bodies, then source roots)
+/// would serve, building the spec through the vendored
+/// `importlib._bootstrap.spec_from_loader` so `ModuleSpec` semantics
+/// (`is_package` via `loader.is_package`, `parent`, `_initializing`) are the
+/// bootstrap's own.  `path` and `target` are accepted and ignored: pon
+/// resolves by full dotted name, not per-package search locations.
+unsafe extern "C" fn source_find_spec_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { arg_window(argv, argc) };
+    if args.is_empty() {
+        return raise_type_error("find_spec() takes at least 1 argument (0 given)");
+    }
+    let name_object = untag(args[0]);
+    let Some(name) = (unsafe { text_argument(name_object) }) else {
+        return raise_type_error("find_spec() argument 'fullname' must be str");
+    };
+    if crate::import::source_module_package_flag(&name).is_none() {
+        return none();
+    }
+    // A missing loader module or bootstrap binding declines the claim rather
+    // than failing the import: the caller then raises its own
+    // ModuleNotFoundError, matching the pre-finder surface.
+    let Some(loader) = source_importer_module() else {
+        return none();
+    };
+    let Some(spec_from_loader) =
+        crate::import::module_attr(intern("importlib._bootstrap"), intern("spec_from_loader"))
+    else {
+        return none();
+    };
+    let mut call_args = [name_object, loader];
+    // SAFETY: `spec_from_loader` is a live callable; argv holds two live slots.
+    untag(unsafe { abi::pon_call(spec_from_loader, call_args.as_mut_ptr(), call_args.len()) })
+}
+
+/// `is_package(fullname)`: consulted by `spec_from_loader` while `find_spec`
+/// builds a claimed spec; ImportError for unclaimed names mirrors the
+/// `_requires_builtin` protocol (`spec_from_loader` catches it as
+/// "undefined").
+unsafe extern "C" fn source_is_package_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let name = match unsafe { single_name_argument(argv, argc, "is_package") } {
+        Ok(name) => name,
+        Err(error) => return error,
+    };
+    match crate::import::source_module_package_flag(&name) {
+        Some(flag) => bool_object(flag),
+        None => raise_kind_error_text(
+            ExceptionKind::ImportError,
+            &format!("{name} is not a pon source module"),
+        ),
+    }
+}
+
+/// `create_module(spec)`: loads `spec.name` through pon's import machinery
+/// and returns exactly the named module (never the root-package remap), fully
+/// executed — mirroring `create_builtin`, whose native factories also run
+/// eagerly at creation time.
+unsafe extern "C" fn source_create_module_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { arg_window(argv, argc) };
+    if args.is_empty() {
+        return raise_type_error("create_module() takes exactly one argument (0 given)");
+    }
+    let spec = untag(args[0]);
+    // SAFETY: Generic attribute read on a live object; NULL propagates below.
+    let name_object = unsafe { abi::object::pon_get_attr(spec, intern("name"), ptr::null_mut()) };
+    if name_object.is_null() {
+        return ptr::null_mut();
+    }
+    let Some(name) = (unsafe { text_argument(untag(name_object)) }) else {
+        return raise_type_error("spec.name must be a str");
+    };
+    crate::import::import_named_module_raw(&name)
+}
+
+/// `exec_module(module)`: no-op — `create_module` already executed the body
+/// (the `exec_builtin` shape, returning None per the loader protocol).
+unsafe extern "C" fn source_exec_module_entry(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+    none()
+}
+
+/// Builds and registers the `_pon_source_importer` module: pon's stand-in for
+/// CPython's `PathFinder` meta-path slot (`crate::import`'s
+/// `seed_meta_path_finders` appends it third).  The module object doubles as
+/// finder and loader — module-attr lookup returns unbound native functions,
+/// so `finder.find_spec(...)` and `spec.loader.create_module(...)` call
+/// cleanly — and registration roots it (and its function attrs) for GC like
+/// any other native module.
+pub(crate) fn make_source_importer_module() -> Result<*mut PyObject, String> {
+    if let Some(existing) = source_importer_module() {
+        return Ok(existing);
+    }
+    let mut attrs = Vec::new();
+    let functions: [(&str, BuiltinFn); 4] = [
+        ("create_module", source_create_module_entry),
+        ("exec_module", source_exec_module_entry),
+        ("find_spec", source_find_spec_entry),
+        ("is_package", source_is_package_entry),
+    ];
+    for (function_name, entry) in functions {
+        // SAFETY: `entry` is a live builtin entry point.
+        let function =
+            unsafe { abi::pon_make_function(entry as *const u8, VARIADIC_ARITY, intern(function_name)) };
+        if function.is_null() {
+            return Err(format!("failed to allocate {SOURCE_IMPORTER_NAME}.{function_name}"));
+        }
+        attrs.push((intern(function_name), function));
+    }
+    install_module(SOURCE_IMPORTER_NAME, attrs)
 }

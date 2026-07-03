@@ -85,9 +85,19 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         string_attr("platlibdir", "lib"),
         flags_attr(),
         hash_info_attr(),
+        float_info_attr(),
+        int_info_attr(),
+        thread_info_attr(),
+        // `repr(float)` uses the shortest round-tripping form — CPython's
+        // only style since 3.1 on every platform pon builds for (the
+        // 'legacy' style needs a pre-C99 double parser).  `test.test_float`
+        // gates its short-repr tests on this at import time.
+        string_attr("float_repr_style", "short"),
         jit_attr(),
+        monitoring_attr(),
         warnoptions_attr(),
         meta_path_attr(),
+        path_attr(),
         modules_attr(),
         builtin_module_names_attr(),
         function_attr("_getframe", sys_getframe),
@@ -99,6 +109,10 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         function_attr("setrecursionlimit", sys_setrecursionlimit),
         function_attr("getfilesystemencoding", sys_getfilesystemencoding),
         function_attr("getfilesystemencodeerrors", sys_getfilesystemencodeerrors),
+        function_attr("audit", sys_audit),
+        function_attr("addaudithook", sys_addaudithook),
+        function_attr("getsizeof", sys_getsizeof),
+        std_stream_attr("stdin", 0),
         std_stream_attr("stdout", 1),
         std_stream_attr("stderr", 2),
     ];
@@ -121,12 +135,14 @@ fn string_attr(name: &str, value: &str) -> Result<(u32, *mut PyObject), String> 
         .ok_or_else(|| format!("failed to allocate sys.{name}"))
 }
 
-/// `sys.stdout`/`sys.stderr`: writable text streams over the process fds
-/// (see `io::std_stream_object`).  `print()` writes host stdout directly and
-/// does not consult `sys.stdout`; these objects serve explicit stream users
-/// (unittest's TextTestRunner writes to `sys.stderr`).
+/// `sys.stdin`/`sys.stdout`/`sys.stderr`: text streams over the process
+/// fds (see `io::std_stream_object`).  `print()` writes host stdout
+/// directly and does not consult `sys.stdout`; these objects serve
+/// explicit stream users (unittest's TextTestRunner writes to
+/// `sys.stderr`, `test.test_univnewlines` probes `sys.stdin.newlines` at
+/// import).  fd 0 is the read side; 1/2 stay write-only.
 fn std_stream_attr(name: &str, fd: i32) -> Result<(u32, *mut PyObject), String> {
-    let object = super::io::std_stream_object(fd, &format!("<{name}>"));
+    let object = super::io::std_stream_object(fd, &format!("<{name}>"), fd == 0);
     (!object.is_null())
         .then_some((intern(name), object))
         .ok_or_else(|| format!("failed to allocate sys.{name}"))
@@ -226,11 +242,37 @@ unsafe extern "C" fn flags_getattro(object: *mut PyObject, name: *mut PyObject) 
         return std::ptr::null_mut();
     };
     match name_text {
-        // Plain `python3` invocation values (no -X/-O/-W switches reach pon).
-        // `thread_inherit_context` is 0 to match the reference CPython
-        // default (GIL) build: threads start with an empty context.
-        "context_aware_warnings" | "debug" | "optimize" | "verbose" | "dev_mode" | "ignore_environment"
-        | "thread_inherit_context" => unsafe { pon_const_int(0) },
+        // Plain `python3` invocation values (no -X/-O/-W switches reach
+        // pon).  `thread_inherit_context` is 0 to match the reference
+        // CPython default (GIL) build: threads start with an empty context.
+        "context_aware_warnings" | "debug" | "optimize" | "verbose" | "ignore_environment"
+        | "thread_inherit_context" | "inspect" | "interactive" | "no_user_site" | "no_site"
+        | "bytes_warning" | "quiet" | "isolated" | "utf8_mode" | "warn_default_encoding" => unsafe {
+            pon_const_int(0)
+        },
+        // CPython types these two as bool (`sys.flags(... dev_mode=False,
+        // safe_path=False ...)`); printed fields must match the oracle's
+        // False, not 0.
+        "dev_mode" | "safe_path" => unsafe { pon_const_bool(0) },
+        // The int->str conversion guard default, matching the host oracle;
+        // pon does not enforce the limit (see the int_info section note).
+        "int_max_str_digits" => unsafe { pon_const_int(4300) },
+        // Env-derived flags: the CT driver exports PYTHONDONTWRITEBYTECODE=1
+        // and PYTHONHASHSEED=0 to BOTH engines, so oracle parity requires
+        // reading the live environment rather than pinning either value.
+        "dont_write_bytecode" => {
+            let set = std::env::var("PYTHONDONTWRITEBYTECODE").is_ok_and(|value| !value.is_empty());
+            // SAFETY: Integer boxing helper follows the NULL-sentinel contract.
+            unsafe { pon_const_int(i64::from(set)) }
+        }
+        // CPython: randomization is OFF exactly when PYTHONHASHSEED names
+        // the fixed seed 0 (`use_hash_seed && hash_seed == 0`); any other
+        // state — unset, empty, "random", a nonzero seed — reports 1.
+        "hash_randomization" => {
+            let disabled = std::env::var("PYTHONHASHSEED").is_ok_and(|value| value.trim() == "0");
+            // SAFETY: Integer boxing helper follows the NULL-sentinel contract.
+            unsafe { pon_const_int(i64::from(!disabled)) }
+        }
         // SAFETY: Raise helper with the interned attribute name.
         _ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
     }
@@ -349,6 +391,124 @@ unsafe extern "C" fn jit_is_enabled(argv: *mut *mut PyObject, argc: usize) -> *m
     }
     // SAFETY: Boolean constant helper follows the NULL-sentinel contract.
     unsafe { pon_const_bool(0) }
+}
+
+// ---------------------------------------------------------------------------
+// sys.monitoring (PEP 669)
+//
+// CPython 3.12+ ships `sys.monitoring` as a real module wired into the
+// bytecode instrumentation machinery.  pon compiles calls natively and has
+// no instrumentation hooks, so only the CONSTANT surface is served: `bdb`
+// reads `sys.monitoring.events` at import time (module-level `E =
+// sys.monitoring.events`, then class-body dict keys / bitwise-ORs over the
+// event flags) on the `doctest -> pdb -> bdb` chain, and
+// `bdb._MonitoringTracer.__init__` reads the tool-id constants at
+// instantiation.  Values are the CPython 3.14.6 oracle table
+// (Include/cpython/monitoring.h: each event flag is `1 << event_id`).  The
+// callable surface (`use_tool_id`, `register_callback`, `set_events`, ...)
+// is deliberately unserved until a walk consumes it: pon never fires
+// monitoring events, so a no-op tool registry would be a silently wrong
+// default — unknown attributes raise so that frontier is loud.
+// ---------------------------------------------------------------------------
+
+/// `sys.monitoring` singleton (the flags/hash_info pattern: an opaque leaked
+/// object whose getattro serves the consumed constant set).
+fn monitoring_attr() -> Result<(u32, *mut PyObject), String> {
+    static MONITORING_TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let mut ty = crate::object::PyType::new(
+            std::ptr::null(),
+            "sys.monitoring",
+            std::mem::size_of::<crate::object::PyObjectHeader>(),
+        );
+        ty.tp_getattro = Some(monitoring_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    static MONITORING: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        Box::into_raw(Box::new(crate::object::PyObjectHeader::new(
+            *MONITORING_TYPE as *mut crate::object::PyType,
+        ))) as usize
+    });
+    Ok((intern("monitoring"), *MONITORING as *mut PyObject))
+}
+
+unsafe extern "C" fn monitoring_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let name = crate::tag::untag_arg(name);
+    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        crate::thread_state::pon_err_set("attribute name must be str");
+        return std::ptr::null_mut();
+    };
+    match name_text {
+        "events" => monitoring_events_object(),
+        // CPython tool-id slots (PY_MONITORING_*_ID); 3 and 4 are unnamed.
+        "DEBUGGER_ID" => unsafe { pon_const_int(0) },
+        "COVERAGE_ID" => unsafe { pon_const_int(1) },
+        "PROFILER_ID" => unsafe { pon_const_int(2) },
+        "OPTIMIZER_ID" => unsafe { pon_const_int(5) },
+        // SAFETY: Raise helper with the interned attribute name.
+        _ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
+    }
+}
+
+/// CPython 3.14.6 `sys.monitoring.events` flag table (each event `1 << id`),
+/// verified against the host oracle.  `NO_EVENTS` is the zero sentinel;
+/// `BRANCH` is 3.14's deprecated alias event with its own bit.
+const MONITORING_EVENTS: &[(&str, i64)] = &[
+    ("NO_EVENTS", 0),
+    ("PY_START", 1),
+    ("PY_RESUME", 2),
+    ("PY_RETURN", 4),
+    ("PY_YIELD", 8),
+    ("CALL", 16),
+    ("LINE", 32),
+    ("INSTRUCTION", 64),
+    ("JUMP", 128),
+    ("BRANCH_LEFT", 256),
+    ("BRANCH_RIGHT", 512),
+    ("STOP_ITERATION", 1024),
+    ("RAISE", 2048),
+    ("EXCEPTION_HANDLED", 4096),
+    ("PY_UNWIND", 8192),
+    ("PY_THROW", 16384),
+    ("RERAISE", 32768),
+    ("C_RETURN", 65536),
+    ("C_RAISE", 131072),
+    ("BRANCH", 262144),
+];
+
+/// The `sys.monitoring.events` singleton.  CPython types it
+/// `types.SimpleNamespace` (the `sys.implementation` precedent); consumers
+/// only read the flag constants, which must be real ints — `bdb` uses them
+/// as dict keys and ORs them into event masks.
+fn monitoring_events_object() -> *mut PyObject {
+    static EVENTS_TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let mut ty = crate::object::PyType::new(
+            std::ptr::null(),
+            "types.SimpleNamespace",
+            std::mem::size_of::<crate::object::PyObjectHeader>(),
+        );
+        ty.tp_getattro = Some(monitoring_events_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    static EVENTS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        Box::into_raw(Box::new(crate::object::PyObjectHeader::new(
+            *EVENTS_TYPE as *mut crate::object::PyType,
+        ))) as usize
+    });
+    *EVENTS as *mut PyObject
+}
+
+unsafe extern "C" fn monitoring_events_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let name = crate::tag::untag_arg(name);
+    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        crate::thread_state::pon_err_set("attribute name must be str");
+        return std::ptr::null_mut();
+    };
+    match MONITORING_EVENTS.iter().find(|(event, _)| *event == name_text) {
+        // SAFETY: Integer boxing helper follows the NULL-sentinel contract.
+        Some((_, value)) => unsafe { pon_const_int(*value) },
+        // SAFETY: Raise helper with the interned attribute name.
+        None => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -630,6 +790,326 @@ unsafe extern "C" fn version_info_repr(argv: *mut *mut PyObject, argc: usize) ->
 }
 
 // ---------------------------------------------------------------------------
+// sys.float_info / sys.int_info / sys.thread_info
+//
+// The remaining `sys` structseqs, built through the same tuple-embedding
+// heap-class machinery as `sys.version_info` above but generalized over a
+// field table: per-index property getters shared across the classes, and
+// the CPython structseq repr (`sys.float_info(max=1.797...e+308, ...)`)
+// rendered through the runtime's own repr dispatch so element formatting
+// (float shortest-repr, str quoting, None) matches `builtins.repr` exactly.
+//
+// Values, verified against the host CPython 3.14.6 oracle:
+// - `float_info`: IEEE-754 binary64 constants, honestly pon's own float
+//   type (Rust `f64` is the C `double` on every pon target), taken from
+//   `f64::` consts so they can never drift from the implementation.
+//   `test.test_long`/`test_complex`/`test_ast` read fields at import.
+// - `int_info`: the CPython oracle row (30-bit digits, 4-byte digit,
+//   4300/640 str-conversion guards).  DOCUMENTED DIVERGENCE: the digit
+//   fields describe CPython's bignum limb layout, not pon's (i64 fast
+//   path + heap bigint); in-cohort consumers only use them to SIZE test
+//   values (`test_long`'s `SHIFT`/`BASE`), and pon does not enforce the
+//   str-digit guards (`sys.set_int_max_str_digits` is unserved).
+// - `thread_info`: `name='pthread'` honestly describes pon threads
+//   (std::thread over pthreads on every POSIX pon target);
+//   `lock='mutex+cond'` is the host oracle's value and describes
+//   CPython's lock implementation, not pon's (documented divergence —
+//   `test.test_threadsignals` branches on exactly this pair at import);
+//   `version=None` matches the macOS oracle (no pthread version string).
+// ---------------------------------------------------------------------------
+
+/// One structseq family: class identity plus its named-field table.
+struct StructSeqSpec {
+    /// Class `__name__`, also the `sys` attribute name (`"float_info"`).
+    name: &'static str,
+    /// Repr prefix and `__doc__` headline (`"sys.float_info"`).
+    qualname: &'static str,
+    /// Named fields in tuple order; length picks the getter per index.
+    fields: &'static [&'static str],
+    /// Class-specific `__repr__` entry (a thin shim over
+    /// [`structseq_repr_body`] monomorphized by spec).
+    repr: BuiltinFn,
+}
+
+/// Element values a structseq seed can carry; allocated on construction.
+enum SeqValue {
+    Int(i64),
+    Float(f64),
+    Str(&'static str),
+    None,
+}
+
+impl SeqValue {
+    /// Boxes the value through the matching runtime allocation helper.
+    fn allocate(&self, what: &str) -> Result<*mut PyObject, String> {
+        // SAFETY: Allocation helpers follow the NULL-sentinel error contract.
+        let object = match *self {
+            Self::Int(value) => unsafe { pon_const_int(value) },
+            Self::Float(value) => unsafe { crate::abi::number::pon_const_float(value) },
+            Self::Str(value) => unsafe { pon_const_str(value.as_ptr(), value.len()) },
+            Self::None => unsafe { crate::abi::pon_none() },
+        };
+        (!object.is_null()).then_some(object).ok_or_else(|| format!("failed to allocate {what}"))
+    }
+}
+
+/// Shared per-index structseq property getters: `self[N]` through the same
+/// subscript dispatch as the version_info getters.  The receiver's class
+/// binds the field NAME to an index, so one getter set serves every
+/// structseq family; `STRUCTSEQ_GETTERS[i]` is the fget for element `i`.
+macro_rules! structseq_getters {
+    ($($getter:ident => $index:literal),* $(,)?) => {
+        $(
+            unsafe extern "C" fn $getter(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+                // SAFETY: Forwarded argument slots per the runtime calling
+                // convention.
+                unsafe { version_info_field(argv, argc, $index, "structseq field") }
+            }
+        )*
+        const STRUCTSEQ_GETTERS: &[BuiltinFn] = &[$($getter),*];
+    };
+}
+
+structseq_getters!(
+    structseq_get_0 => 0,
+    structseq_get_1 => 1,
+    structseq_get_2 => 2,
+    structseq_get_3 => 3,
+    structseq_get_4 => 4,
+    structseq_get_5 => 5,
+    structseq_get_6 => 6,
+    structseq_get_7 => 7,
+    structseq_get_8 => 8,
+    structseq_get_9 => 9,
+    structseq_get_10 => 10,
+);
+
+/// `class <name>(tuple)` with the CPython structseq surface over `spec`:
+/// field properties reading `self[i]` and the `sys.<name>(...)` repr —
+/// the version_info class builder generalized over the field table.
+fn build_structseq_class(spec: &StructSeqSpec) -> Result<*mut PyObject, String> {
+    debug_assert!(spec.fields.len() <= STRUCTSEQ_GETTERS.len());
+    // SAFETY: `pon_load_global` returns NULL with a raised NameError on miss.
+    let tuple_class = unsafe { crate::abi::pon_load_global(intern("tuple"), std::ptr::null_mut()) };
+    if tuple_class.is_null() {
+        crate::thread_state::pon_err_clear();
+        return Err(format!("builtin 'tuple' is not registered for sys.{}", spec.name));
+    }
+    // SAFETY: Same contract for the builtin `property` constructor.
+    let property_class = unsafe { crate::abi::pon_load_global(intern("property"), std::ptr::null_mut()) };
+    if property_class.is_null() {
+        crate::thread_state::pon_err_clear();
+        return Err(format!("builtin 'property' is not registered for sys.{}", spec.name));
+    }
+    let namespace = crate::types::type_::new_namespace();
+    if namespace.is_null() {
+        return Err(format!("failed to allocate the sys.{} namespace", spec.name));
+    }
+    class_str_attr(namespace, "__module__", "sys")?;
+    class_str_attr(namespace, "__doc__", &format!("{}\n\nA named tuple.", spec.qualname))?;
+    class_function_attr(namespace, "__repr__", spec.repr)?;
+    for (index, name) in spec.fields.iter().enumerate() {
+        // SAFETY: Live builtin entry point with the runtime calling convention.
+        let fget = unsafe { pon_make_function(STRUCTSEQ_GETTERS[index] as *const u8, 1, intern(name)) };
+        if fget.is_null() {
+            return Err(format!("failed to allocate sys.{}.{name} getter", spec.name));
+        }
+        let mut argv = [fget];
+        // SAFETY: The builtin `property` class is callable with one fget slot.
+        let descriptor = unsafe { crate::abi::pon_call(property_class, argv.as_mut_ptr(), argv.len()) };
+        if descriptor.is_null() {
+            let detail = crate::thread_state::pon_err_message().unwrap_or_else(|| "unknown error".to_owned());
+            crate::thread_state::pon_err_clear();
+            return Err(format!("failed to build sys.{}.{name} property: {detail}", spec.name));
+        }
+        // SAFETY: `new_namespace` returned a live namespace box.
+        unsafe { (&mut *namespace).set(intern(name), descriptor) };
+    }
+    // SAFETY: The base is the live builtin `tuple` class object.
+    let class = unsafe {
+        crate::types::type_::build_class_from_namespace(spec.name, &[tuple_class], namespace, &[])
+    };
+    if class.is_null() {
+        let detail = crate::thread_state::pon_err_message().unwrap_or_else(|| "unknown error".to_owned());
+        crate::thread_state::pon_err_clear();
+        return Err(format!("failed to create sys.{}: {detail}", spec.name));
+    }
+    // SAFETY: Freshly built class object owned by this module build; mirror
+    // `pon_build_class`'s ob_type fix-up for a metaclass-less construction.
+    unsafe {
+        if (*class).ob_type.is_null() {
+            (*class).ob_type = crate::abi::runtime_type_type().cast_const();
+        }
+    }
+    Ok(class)
+}
+
+/// Allocates a structseq singleton: builds the class, boxes the seed
+/// values, and calls the class with the value tuple exactly like
+/// `tuple.__new__` construction (the build_version_info shape).
+fn build_structseq(spec: &StructSeqSpec, values: &[SeqValue]) -> Result<*mut PyObject, String> {
+    debug_assert_eq!(spec.fields.len(), values.len());
+    let class = build_structseq_class(spec)?;
+    let mut items = Vec::with_capacity(values.len());
+    for (value, field) in values.iter().zip(spec.fields) {
+        items.push(value.allocate(&format!("sys.{}.{field}", spec.name))?);
+    }
+    // SAFETY: The slots above are live objects per the call ABI.
+    let tuple = unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) };
+    if tuple.is_null() {
+        return Err(format!("failed to allocate the sys.{} value tuple", spec.name));
+    }
+    let mut argv = [tuple];
+    // SAFETY: The class is a live tuple-derived heap class; calling it routes
+    // through `tuple.__new__` construction over the iterable argument.
+    let instance = unsafe { crate::abi::pon_call(class, argv.as_mut_ptr(), argv.len()) };
+    if instance.is_null() {
+        let detail = crate::thread_state::pon_err_message().unwrap_or_else(|| "unknown error".to_owned());
+        crate::thread_state::pon_err_clear();
+        return Err(format!("failed to construct sys.{}: {detail}", spec.name));
+    }
+    Ok(instance)
+}
+
+/// Shared repr body: `sys.<name>(field=repr(self[i]), ...)` with element
+/// text from the runtime's `builtins.repr` dispatch, so formatting matches
+/// what printing the elements individually would produce.
+unsafe fn structseq_repr_body(argv: *mut *mut PyObject, argc: usize, spec: &StructSeqSpec) -> *mut PyObject {
+    use std::fmt::Write as _;
+    let mut text = format!("{}(", spec.qualname);
+    for (index, field) in spec.fields.iter().enumerate() {
+        // SAFETY: Forwarded argument slots per the runtime calling convention.
+        let element = unsafe { version_info_field(argv, argc, index as i64, field) };
+        if element.is_null() {
+            return core::ptr::null_mut();
+        }
+        let mut slot = [element];
+        // SAFETY: One live argument slot; `builtin_repr` follows the
+        // NULL-sentinel error contract.
+        let repr_object = unsafe { super::builtins_mod::builtin_repr(slot.as_mut_ptr(), slot.len()) };
+        if repr_object.is_null() {
+            return core::ptr::null_mut();
+        }
+        let repr_object = crate::tag::untag_arg(repr_object);
+        // SAFETY: `builtin_repr` returns a str object on success.
+        let Some(repr_text) = (unsafe { crate::types::type_::unicode_text(repr_object) }) else {
+            return return_null_with_error(format!("repr of sys.{}.{field} is not a str", spec.name));
+        };
+        let separator = if index == 0 { "" } else { ", " };
+        let _ = write!(text, "{separator}{field}={repr_text}");
+    }
+    text.push(')');
+    // SAFETY: String allocation helper follows the NULL-sentinel contract.
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+/// `sys.float_info` spec: IEEE-754 binary64, CPython field order.
+static FLOAT_INFO_SPEC: StructSeqSpec = StructSeqSpec {
+    name: "float_info",
+    qualname: "sys.float_info",
+    fields: &[
+        "max",
+        "max_exp",
+        "max_10_exp",
+        "min",
+        "min_exp",
+        "min_10_exp",
+        "dig",
+        "mant_dig",
+        "epsilon",
+        "radix",
+        "rounds",
+    ],
+    repr: float_info_repr,
+};
+
+/// `sys.float_info.__repr__` entry: [`structseq_repr_body`] over the spec.
+unsafe extern "C" fn float_info_repr(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded argument slots per the runtime calling convention.
+    unsafe { structseq_repr_body(argv, argc, &FLOAT_INFO_SPEC) }
+}
+
+/// The `sys.float_info` singleton, built once and reused across import
+/// re-registration (the version_info lifetime pattern).
+fn float_info_attr() -> Result<(u32, *mut PyObject), String> {
+    static FLOAT_INFO: std::sync::LazyLock<Result<usize, String>> = std::sync::LazyLock::new(|| {
+        build_structseq(
+            &FLOAT_INFO_SPEC,
+            &[
+                SeqValue::Float(f64::MAX),
+                SeqValue::Int(f64::MAX_EXP.into()),
+                SeqValue::Int(f64::MAX_10_EXP.into()),
+                SeqValue::Float(f64::MIN_POSITIVE),
+                SeqValue::Int(f64::MIN_EXP.into()),
+                SeqValue::Int(f64::MIN_10_EXP.into()),
+                SeqValue::Int(f64::DIGITS.into()),
+                SeqValue::Int(f64::MANTISSA_DIGITS.into()),
+                SeqValue::Float(f64::EPSILON),
+                SeqValue::Int(f64::RADIX.into()),
+                // FLT_ROUNDS: round-to-nearest, the only mode pon runs in.
+                SeqValue::Int(1),
+            ],
+        )
+        .map(|object| object as usize)
+    });
+    FLOAT_INFO.clone().map(|object| (intern("float_info"), object as *mut PyObject))
+}
+
+/// `sys.int_info` spec: CPython field order.
+static INT_INFO_SPEC: StructSeqSpec = StructSeqSpec {
+    name: "int_info",
+    qualname: "sys.int_info",
+    fields: &["bits_per_digit", "sizeof_digit", "default_max_str_digits", "str_digits_check_threshold"],
+    repr: int_info_repr,
+};
+
+/// `sys.int_info.__repr__` entry: [`structseq_repr_body`] over the spec.
+unsafe extern "C" fn int_info_repr(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded argument slots per the runtime calling convention.
+    unsafe { structseq_repr_body(argv, argc, &INT_INFO_SPEC) }
+}
+
+/// The `sys.int_info` singleton (see the section comment for the digit-
+/// layout divergence record).
+fn int_info_attr() -> Result<(u32, *mut PyObject), String> {
+    static INT_INFO: std::sync::LazyLock<Result<usize, String>> = std::sync::LazyLock::new(|| {
+        build_structseq(
+            &INT_INFO_SPEC,
+            &[SeqValue::Int(30), SeqValue::Int(4), SeqValue::Int(4300), SeqValue::Int(640)],
+        )
+        .map(|object| object as usize)
+    });
+    INT_INFO.clone().map(|object| (intern("int_info"), object as *mut PyObject))
+}
+
+/// `sys.thread_info` spec: CPython field order.
+static THREAD_INFO_SPEC: StructSeqSpec = StructSeqSpec {
+    name: "thread_info",
+    qualname: "sys.thread_info",
+    fields: &["name", "lock", "version"],
+    repr: thread_info_repr,
+};
+
+/// `sys.thread_info.__repr__` entry: [`structseq_repr_body`] over the spec.
+unsafe extern "C" fn thread_info_repr(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded argument slots per the runtime calling convention.
+    unsafe { structseq_repr_body(argv, argc, &THREAD_INFO_SPEC) }
+}
+
+/// The `sys.thread_info` singleton (see the section comment for the lock-
+/// name divergence record).
+fn thread_info_attr() -> Result<(u32, *mut PyObject), String> {
+    static THREAD_INFO: std::sync::LazyLock<Result<usize, String>> = std::sync::LazyLock::new(|| {
+        build_structseq(
+            &THREAD_INFO_SPEC,
+            &[SeqValue::Str("pthread"), SeqValue::Str("mutex+cond"), SeqValue::None],
+        )
+        .map(|object| object as usize)
+    });
+    THREAD_INFO.clone().map(|object| (intern("thread_info"), object as *mut PyObject))
+}
+
+// ---------------------------------------------------------------------------
 // sys.implementation
 //
 // CPython builds this as a `types.SimpleNamespace` in `_PySys_InitCore`, and
@@ -765,15 +1245,13 @@ fn function_attr(
 /// pon materializes Python frames only on generator resume and raise paths,
 /// so this synthesizes a fresh empty frame of the shared runtime `frame` type
 /// per call.  The `depth` argument must be an `int` (mirroring CPython's
-/// TypeError contract) and selects which compiled call-stack entry donates
-/// the frame's `f_globals` namespace: the defining module of the function
-/// `depth` levels above the `_getframe` call, the active module when the
-/// walk runs past the tracked stack (module-toplevel frames; also CPython's
-/// too-deep ValueError case, loosened here).  Negative depths clamp to the
-/// current frame like CPython.  No `f_back` chain exists to walk;
-/// `_collections_abc`'s PEP 667 probe (`type(sys._getframe().f_locals)`)
-/// only needs the frame's `f_locals` type identity, served by
-/// `crate::types::frame::frame_getattro`.
+/// TypeError contract) and selects which compiled call-stack entry the frame
+/// describes; the frame carries the whole captured call chain
+/// (`abi::frame_chain_for_depth`), so `f_globals`/`f_lineno`/`f_code.co_name`
+/// read the entry `depth` levels above the `_getframe` call and `f_back`
+/// walks caller by caller to the module toplevel, then `None`.  A too-deep
+/// `depth` clamps to the toplevel frame (CPython raises ValueError; loosened
+/// here) and negative depths clamp to the current frame like CPython.
 unsafe extern "C" fn sys_getframe(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     if argc > 1 {
         return return_null_with_error(format!("_getframe() takes at most 1 argument ({argc} given)"));
@@ -794,9 +1272,7 @@ unsafe extern "C" fn sys_getframe(argv: *mut *mut PyObject, argc: usize) -> *mut
         };
         depth = value.to_usize().unwrap_or(0);
     }
-    let globals_module = crate::abi::frame_defining_module_for_depth(depth, sys_getframe as *const u8)
-        .or_else(crate::import::active_module_name_id);
-    crate::types::frame::synthesize_frame_object(globals_module)
+    crate::types::frame::synthesize_frame_object(crate::abi::frame_chain_for_depth(depth, sys_getframe as *const u8))
 }
 
 /// `sys.intern(string)`.
@@ -1037,6 +1513,190 @@ unsafe extern "C" fn sys_setrecursionlimit(argv: *mut *mut PyObject, argc: usize
     RECURSION_LIMIT.store(limit, Ordering::Relaxed);
     // SAFETY: Singleton accessor.
     unsafe { crate::abi::pon_none() }
+}
+
+// ---------------------------------------------------------------------------
+// sys.audit / sys.addaudithook (PEP 578)
+//
+// CPython's runtime audit system: hooks registered via `addaudithook`
+// receive every audit event, and `sys.audit(event, *args)` raises events
+// from Python code.  pon's compiled runtime FIRES NO BUILT-IN EVENTS
+// (documented divergence: there are no import/open/compile/exec hook
+// points to raise from, and `addaudithook` itself does not raise the
+// `sys.addaudithook` event to existing hooks), so the served contract is
+// exactly the user-visible half: `addaudithook` stores the callable,
+// `audit` validates the event name, calls every stored hook with
+// `(event, args_tuple)` — CPython's hook signature — and propagates the
+// first hook exception.  With no hooks registered, `audit` is a no-op
+// returning None; `test.test_cmd_line` reads `sys.audit` at import and
+// `test.test_audit`'s hasattr gate expects both names.  Hooks are
+// process-lifetime (CPython cannot remove them either); the raw pointers
+// are rooted through [`gc_held_roots`] (the `_contextvars` pattern) so a
+// stored hook is never swept.
+// ---------------------------------------------------------------------------
+
+/// Registered audit hooks in registration order (raw addresses; immortal,
+/// rooted via [`gc_held_roots`]).
+static AUDIT_HOOKS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// GC roots held by native `sys` state: the registered audit hooks.
+/// Consumed by `crate::abi::collect` (the `_contextvars` pattern).
+pub(crate) fn gc_held_roots() -> Vec<*mut PyObject> {
+    AUDIT_HOOKS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .iter()
+        .map(|&address| address as *mut PyObject)
+        .collect()
+}
+
+/// `sys.addaudithook(hook)`: stores the hook.  CPython performs no
+/// callability check at registration (a non-callable fails at event time),
+/// and neither does pon.
+unsafe extern "C" fn sys_addaudithook(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.is_empty() {
+        return raise_type_error("addaudithook() missing required argument 'hook' (pos 1)");
+    }
+    if args.len() > 1 {
+        return raise_type_error(&format!("addaudithook() takes at most 1 argument ({} given)", args.len()));
+    }
+    AUDIT_HOOKS.lock().unwrap_or_else(|poison| poison.into_inner()).push(args[0] as usize);
+    // SAFETY: Singleton fetch follows the NULL-sentinel contract.
+    unsafe { crate::abi::pon_none() }
+}
+
+/// `sys.audit(event, *args)`: validates the str event name, then calls
+/// every registered hook with `(event, args_tuple)`; the first hook
+/// exception propagates, exactly CPython's dispatch.  No hooks: None.
+unsafe extern "C" fn sys_audit(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    let Some(&event) = args.first() else {
+        return raise_type_error("audit expected at least 1 argument, got 0");
+    };
+    let event_object = crate::tag::untag_arg(event);
+    // SAFETY: Type probe on a live object (tagged immediates untagged above).
+    if unsafe { crate::types::type_::unicode_text(event_object) }.is_none() {
+        let type_name = if crate::tag::is_heap(event) {
+            // SAFETY: Heap pointer with a live header after the tag check.
+            unsafe { crate::types::dict::type_name(event) }.unwrap_or("object")
+        } else {
+            "int"
+        };
+        return raise_type_error(&format!("audit() argument 1 must be str, not {type_name}"));
+    }
+    let hooks: Vec<usize> = {
+        let held = AUDIT_HOOKS.lock().unwrap_or_else(|poison| poison.into_inner());
+        held.clone()
+    };
+    if hooks.is_empty() {
+        // SAFETY: Singleton fetch follows the NULL-sentinel contract.
+        return unsafe { crate::abi::pon_none() };
+    }
+    let mut rest: Vec<*mut PyObject> = args[1..].to_vec();
+    // SAFETY: The slots are live objects per the call ABI (empty reads none).
+    let args_tuple = unsafe { crate::abi::seq::pon_build_tuple(rest.as_mut_ptr(), rest.len()) };
+    if args_tuple.is_null() {
+        return core::ptr::null_mut();
+    }
+    for hook in hooks {
+        let mut hook_argv = [event, args_tuple];
+        // SAFETY: Call dispatch over a live callee and two live slots; a
+        // NULL result carries the hook's raised exception.
+        let result = unsafe { crate::abi::pon_call(hook as *mut PyObject, hook_argv.as_mut_ptr(), 2) };
+        if result.is_null() {
+            return core::ptr::null_mut();
+        }
+    }
+    // SAFETY: Singleton fetch follows the NULL-sentinel contract.
+    unsafe { crate::abi::pon_none() }
+}
+
+// ---------------------------------------------------------------------------
+// sys.getsizeof
+//
+// IMPLEMENTATION-DEFINED SIZES (documented divergence): CPython returns
+// its own object-layout byte counts (28 for a small int, 49 + length for
+// a str, ...); pon returns ITS real fixed allocation — the tagged machine
+// word for immediates (8), the type's `tp_basicsize` for heap objects.
+// Out-of-line payloads (str/bytes buffers, list/dict tables, bigint
+// limbs) are NOT accounted.  In-cohort consumers only need an int
+// (`test.test_marshal` computes a `@support.bigmemtest(memuse=...)`
+// decorator argument at class-body time); CPython-layout equality tests
+// fail honestly, and corpus modules must never pin numeric sizes — only
+// int-ness/positivity, which hold on both engines.  The optional
+// `default` is CPython's fallback for objects that cannot report a size;
+// every pon value has a sized type, so it is accepted and never engaged.
+// ---------------------------------------------------------------------------
+
+/// `sys.getsizeof(object, default=...)`: see the section comment.
+unsafe extern "C" fn sys_getsizeof(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    let Some(&object) = args.first() else {
+        return raise_type_error("getsizeof() missing required argument 'object' (pos 1)");
+    };
+    if args.len() > 2 {
+        return raise_type_error(&format!("getsizeof expected at most 2 arguments, got {}", args.len()));
+    }
+    if !crate::tag::is_heap(object) {
+        // A tagged immediate occupies exactly its machine word.
+        return unsafe { pon_const_int(std::mem::size_of::<usize>() as i64) };
+    }
+    // SAFETY: Heap pointer with a live header per the tag check above.
+    let ty = unsafe { (*object).ob_type };
+    let size = if ty.is_null() {
+        std::mem::size_of::<crate::object::PyObjectHeader>()
+    } else {
+        // SAFETY: Type pointers are live for the process lifetime.
+        unsafe { (*ty).tp_basicsize }
+    };
+    // SAFETY: Integer boxing helper follows the NULL-sentinel contract.
+    unsafe { pon_const_int(size as i64) }
+}
+
+// ---------------------------------------------------------------------------
+// sys.path
+//
+// A REAL mutable list (stdlib mutates it: test modules append fixture
+// directories, `pkgutil`/`zipimport` walk it), seeded once per process
+// with the runtime's actual source-import search order —
+// `crate::import::source_search_roots()`: cwd, installed packages, the
+// conformance corpus, `PONPATH`/`PON_IMPORT_PATH` entries, the vendored
+// stdlib — the honest answer to "where does pon import from".
+// DOCUMENTED DIVERGENCE: pon's importer derives its roots from the
+// process environment on each import and never re-reads this list, so
+// mutations are visible to every Python reader but do NOT steer pon's
+// import resolution.  CPython seeds `path[0]` with the script directory;
+// pon's leading cwd entry plays that role.  The singleton list lives for
+// the process (identity stable across `import sys` re-registration),
+// exactly like the version_info instance above.
+// ---------------------------------------------------------------------------
+
+/// The `sys.path` singleton list over the runtime's search roots.
+fn path_attr() -> Result<(u32, *mut PyObject), String> {
+    static PATH: std::sync::LazyLock<Result<usize, String>> = std::sync::LazyLock::new(|| {
+        let roots = crate::import::source_search_roots();
+        let mut items: Vec<*mut PyObject> = Vec::with_capacity(roots.len());
+        for root in &roots {
+            let text = root.to_string_lossy();
+            // SAFETY: String allocation helper follows the NULL-sentinel contract.
+            let object = unsafe { pon_const_str(text.as_ptr(), text.len()) };
+            if object.is_null() {
+                return Err("failed to allocate a sys.path entry".to_owned());
+            }
+            items.push(object);
+        }
+        // SAFETY: List builder reads exactly `len` live slots.
+        let list = unsafe { crate::abi::seq::pon_build_list(items.as_mut_ptr(), items.len()) };
+        if list.is_null() {
+            return Err("failed to allocate sys.path".to_owned());
+        }
+        Ok(list as usize)
+    });
+    PATH.clone().map(|object| (intern("path"), object as *mut PyObject))
 }
 
 fn raise_type_error(message: &str) -> *mut PyObject {
