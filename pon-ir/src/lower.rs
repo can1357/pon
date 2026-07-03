@@ -1344,11 +1344,18 @@ impl BodyScope {
         Ok(id)
     }
 
+    #[track_caller]
     fn switch_to(&mut self, id: BlockId) -> Result<(), LowerError> {
-        let term = self
-            .term
-            .take()
-            .ok_or_else(|| LowerError::internal("switching away from unterminated block"))?;
+        let caller = std::panic::Location::caller();
+        let term = self.term.take().ok_or_else(|| {
+            LowerError::internal(format!(
+                "switching away from unterminated block (block {} -> {} at {}:{})",
+                self.current_id.0,
+                id.0,
+                caller.file(),
+                caller.line()
+            ))
+        })?;
         let insts = std::mem::take(&mut self.insts);
         self.blocks.push(Block {
             id: self.current_id,

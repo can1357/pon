@@ -413,7 +413,13 @@ fn lower_exc_star_clause(
     scope.reraise_exc = previous_reraise;
 
     match scope.term.take() {
-        Some(Terminator::Jump(target)) if target == raised_block => {}
+        // A lexical `raise` ended the body: `redirect_raise_terms` already
+        // points the open block at `raised_block`.  Keep that edge as the
+        // block's terminator (the raised path pops the handler record and
+        // records the body exception) so `switch_to` below can close it.
+        Some(term @ Terminator::Jump(target)) if target == raised_block => {
+            scope.set_term(term)?;
+        }
         Some(term) => {
             scope.emit(InstKind::PopExcInfo)?;
             clear_handler_name(driver, scope, handler.name.as_ref())?;

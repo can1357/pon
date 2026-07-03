@@ -449,3 +449,22 @@ fn finally_inlined_def_span_pairing_lowers_every_clone() {
         "no raw Yield/YieldFrom marker may survive in any clone"
     );
 }
+
+#[test]
+fn except_star_bare_raise_lowers() {
+    // A lexical `raise` ending an `except*` handler body left the body block
+    // unterminated: `redirect_raise_terms` rewrote the open block's RaiseTerm
+    // into the raised-path jump, but the clause epilogue dropped that term
+    // instead of restoring it before switching blocks.
+    for source in [
+        "try:\n    raise ExceptionGroup('eg', [TypeError(1)])\nexcept* TypeError:\n    raise\n",
+        "try:\n    raise ExceptionGroup('eg', [TypeError(1)])\nexcept* TypeError as e:\n    raise\n",
+        "try:\n    raise ExceptionGroup('eg', [TypeError(1), ValueError(2)])\nexcept* TypeError as e:\n    raise\nexcept* ValueError as e:\n    raise\n",
+        "try:\n    raise ExceptionGroup('eg', [TypeError(1)])\nexcept* TypeError:\n    raise ValueError('x')\n",
+        "def f():\n    try:\n        raise ExceptionGroup('eg', [TypeError(1)])\n    except* TypeError:\n        raise\n    finally:\n        pass\n",
+    ] {
+        lower_source(source).unwrap_or_else(|error| {
+            panic!("except* body ending in raise must lower: {error}\nsource:\n{source}")
+        });
+    }
+}
