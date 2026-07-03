@@ -1,12 +1,12 @@
-//! Native `_sha2` module: SHA-512 (HANDOFF Track L).
+//! Native `_sha2` module: SHA-2 family constructors for hashlib/random.
 //!
-//! `random.py` imports `sha512` at module top (`from _sha2 import sha512`)
-//! and feeds `_sha512(a).digest()` into `Random.seed` for str/bytes seeds,
-//! so the digest must be the real FIPS 180-4 SHA-512 for seeded sequences to
-//! match CPython. The hash object buffers its input and computes on demand;
-//! the surface is the digest-object subset the stdlib chain consumes
+//! `random.py` imports `sha512` at module top (`from _sha2 import sha512`) and
+//! `hashlib.py` expects `_sha2` to expose `sha224`, `sha256`, `sha384`, and
+//! `sha512` during module init. The hash objects buffer their input and compute
+//! on demand; the surface is the digest-object subset the stdlib chain consumes
 //! (`update`/`digest`/`hexdigest`/`copy` plus the standard metadata attrs).
 
+use ::sha2::Digest as _;
 use std::ptr;
 use std::sync::LazyLock;
 
@@ -19,115 +19,96 @@ use crate::types::{bytearray_ as bytearray_type, bytes_ as bytes_type};
 use super::builtins_mod::VARIADIC_ARITY;
 use super::install_module;
 
-// FIPS 180-4 SHA-512 initial hash value.
-const H512: [u64; 8] = [
-    0x6a09e667f3bcc908,
-    0xbb67ae8584caa73b,
-    0x3c6ef372fe94f82b,
-    0xa54ff53a5f1d36f1,
-    0x510e527fade682d1,
-    0x9b05688c2b3e6c1f,
-    0x1f83d9abfb41bd6b,
-    0x5be0cd19137e2179,
-];
+fn sha224_digest(message: &[u8]) -> [u8; 28] {
+    ::sha2::Sha224::digest(message).into()
+}
 
-// FIPS 180-4 SHA-512 round constants.
-#[rustfmt::skip]
-const K512: [u64; 80] = [
-    0x428a2f98d728ae22, 0x7137449123ef65cd, 0xb5c0fbcfec4d3b2f, 0xe9b5dba58189dbbc,
-    0x3956c25bf348b538, 0x59f111f1b605d019, 0x923f82a4af194f9b, 0xab1c5ed5da6d8118,
-    0xd807aa98a3030242, 0x12835b0145706fbe, 0x243185be4ee4b28c, 0x550c7dc3d5ffb4e2,
-    0x72be5d74f27b896f, 0x80deb1fe3b1696b1, 0x9bdc06a725c71235, 0xc19bf174cf692694,
-    0xe49b69c19ef14ad2, 0xefbe4786384f25e3, 0x0fc19dc68b8cd5b5, 0x240ca1cc77ac9c65,
-    0x2de92c6f592b0275, 0x4a7484aa6ea6e483, 0x5cb0a9dcbd41fbd4, 0x76f988da831153b5,
-    0x983e5152ee66dfab, 0xa831c66d2db43210, 0xb00327c898fb213f, 0xbf597fc7beef0ee4,
-    0xc6e00bf33da88fc2, 0xd5a79147930aa725, 0x06ca6351e003826f, 0x142929670a0e6e70,
-    0x27b70a8546d22ffc, 0x2e1b21385c26c926, 0x4d2c6dfc5ac42aed, 0x53380d139d95b3df,
-    0x650a73548baf63de, 0x766a0abb3c77b2a8, 0x81c2c92e47edaee6, 0x92722c851482353b,
-    0xa2bfe8a14cf10364, 0xa81a664bbc423001, 0xc24b8b70d0f89791, 0xc76c51a30654be30,
-    0xd192e819d6ef5218, 0xd69906245565a910, 0xf40e35855771202a, 0x106aa07032bbd1b8,
-    0x19a4c116b8d2d0c8, 0x1e376c085141ab53, 0x2748774cdf8eeb99, 0x34b0bcb5e19b48a8,
-    0x391c0cb3c5c95a63, 0x4ed8aa4ae3418acb, 0x5b9cca4f7763e373, 0x682e6ff3d6b2b8a3,
-    0x748f82ee5defb2fc, 0x78a5636f43172f60, 0x84c87814a1f0ab72, 0x8cc702081a6439ec,
-    0x90befffa23631e28, 0xa4506cebde82bde9, 0xbef9a3f7b2c67915, 0xc67178f2e372532b,
-    0xca273eceea26619c, 0xd186b8c721c0c207, 0xeada7dd6cde0eb1e, 0xf57d4f7fee6ed178,
-    0x06f067aa72176fba, 0x0a637dc5a2c898a6, 0x113f9804bef90dae, 0x1b710b35131c471b,
-    0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c,
-    0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817,
-];
+fn sha256_digest(message: &[u8]) -> [u8; 32] {
+    ::sha2::Sha256::digest(message).into()
+}
+
+fn sha384_digest(message: &[u8]) -> [u8; 48] {
+    ::sha2::Sha384::digest(message).into()
+}
 
 /// FIPS 180-4 SHA-512 over the full message (single-shot; callers buffer).
 fn sha512_digest(message: &[u8]) -> [u8; 64] {
-    let mut h = H512;
-    // Padding: 0x80, zeros, 128-bit big-endian bit length.
-    let mut padded = message.to_vec();
-    padded.push(0x80);
-    while padded.len() % 128 != 112 {
-        padded.push(0);
-    }
-    let bit_len = (message.len() as u128) * 8;
-    padded.extend_from_slice(&bit_len.to_be_bytes());
-
-    let mut w = [0u64; 80];
-    for block in padded.chunks_exact(128) {
-        for (t, chunk) in block.chunks_exact(8).enumerate() {
-            w[t] = u64::from_be_bytes(chunk.try_into().expect("8-byte chunk"));
-        }
-        for t in 16..80 {
-            let s0 = w[t - 15].rotate_right(1) ^ w[t - 15].rotate_right(8) ^ (w[t - 15] >> 7);
-            let s1 = w[t - 2].rotate_right(19) ^ w[t - 2].rotate_right(61) ^ (w[t - 2] >> 6);
-            w[t] = w[t - 16].wrapping_add(s0).wrapping_add(w[t - 7]).wrapping_add(s1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
-        for t in 0..80 {
-            let big_s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
-            let ch = (e & f) ^ (!e & g);
-            let t1 = hh
-                .wrapping_add(big_s1)
-                .wrapping_add(ch)
-                .wrapping_add(K512[t])
-                .wrapping_add(w[t]);
-            let big_s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let t2 = big_s0.wrapping_add(maj);
-            hh = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(t1);
-            d = c;
-            c = b;
-            b = a;
-            a = t1.wrapping_add(t2);
-        }
-        for (slot, value) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
-            *slot = slot.wrapping_add(value);
-        }
-    }
-    let mut out = [0u8; 64];
-    for (chunk, value) in out.chunks_exact_mut(8).zip(h) {
-        chunk.copy_from_slice(&value.to_be_bytes());
-    }
-    out
+    ::sha2::Sha512::digest(message).into()
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Sha2Kind {
+    Sha224,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl Sha2Kind {
+    const ALL: [Self; 4] = [Self::Sha224, Self::Sha256, Self::Sha384, Self::Sha512];
+
+    const fn constructor_name(self) -> &'static str {
+        match self {
+            Self::Sha224 => "sha224",
+            Self::Sha256 => "sha256",
+            Self::Sha384 => "sha384",
+            Self::Sha512 => "sha512",
+        }
+    }
+
+    const fn digest_size(self) -> i64 {
+        match self {
+            Self::Sha224 => 28,
+            Self::Sha256 => 32,
+            Self::Sha384 => 48,
+            Self::Sha512 => 64,
+        }
+    }
+
+    const fn block_size(self) -> i64 {
+        match self {
+            Self::Sha224 | Self::Sha256 => 64,
+            Self::Sha384 | Self::Sha512 => 128,
+        }
+    }
+}
+
+fn sha2_type_slot(name: &'static str) -> usize {
+    let mut ty = PyType::new(abi::runtime_type_type().cast_const(), name, core::mem::size_of::<PySha2>());
+    ty.tp_getattro = Some(sha2_getattro);
+    Box::into_raw(Box::new(ty)) as usize
+}
+
+fn sha2_type(kind: Sha2Kind) -> *mut PyType {
+    match kind {
+        Sha2Kind::Sha224 => *SHA224_TYPE as *mut PyType,
+        Sha2Kind::Sha256 => *SHA256_TYPE as *mut PyType,
+        Sha2Kind::Sha384 => *SHA384_TYPE as *mut PyType,
+        Sha2Kind::Sha512 => *SHA512_TYPE as *mut PyType,
+    }
+}
+
+fn is_sha2_type(ty: *const PyType) -> bool {
+    ty == sha2_type(Sha2Kind::Sha224).cast_const()
+        || ty == sha2_type(Sha2Kind::Sha256).cast_const()
+        || ty == sha2_type(Sha2Kind::Sha384).cast_const()
+        || ty == sha2_type(Sha2Kind::Sha512).cast_const()
+}
+
+static SHA224_TYPE: LazyLock<usize> = LazyLock::new(|| sha2_type_slot(Sha2Kind::Sha224.constructor_name()));
+static SHA256_TYPE: LazyLock<usize> = LazyLock::new(|| sha2_type_slot(Sha2Kind::Sha256.constructor_name()));
+static SHA384_TYPE: LazyLock<usize> = LazyLock::new(|| sha2_type_slot(Sha2Kind::Sha384.constructor_name()));
+static SHA512_TYPE: LazyLock<usize> = LazyLock::new(|| sha2_type_slot(Sha2Kind::Sha512.constructor_name()));
 
 // ---------------------------------------------------------------------------
 // Hash object
 
 #[repr(C)]
-struct PySha512 {
+struct PySha2 {
     ob_base: PyObjectHeader,
+    kind: Sha2Kind,
     /// Buffered message; the digest is computed on demand.
     data: Vec<u8>,
-}
-
-static SHA512_TYPE: LazyLock<usize> = LazyLock::new(|| {
-    let mut ty = PyType::new(abi::runtime_type_type().cast_const(), "sha512", core::mem::size_of::<PySha512>());
-    ty.tp_getattro = Some(sha512_getattro);
-    Box::into_raw(Box::new(ty)) as usize
-});
-
-fn sha512_type() -> *mut PyType {
-    *SHA512_TYPE as *mut PyType
 }
 
 fn untag(object: *mut PyObject) -> *mut PyObject {
@@ -156,31 +137,42 @@ fn bytes_like<'a>(object: *mut PyObject) -> Option<&'a [u8]> {
     None
 }
 
-fn alloc_sha512(data: Vec<u8>) -> *mut PyObject {
-    let object = Box::new(PySha512 { ob_base: PyObjectHeader::new(sha512_type()), data });
+fn alloc_sha2(kind: Sha2Kind, data: Vec<u8>) -> *mut PyObject {
+    let object = Box::new(PySha2 {
+        ob_base: PyObjectHeader::new(sha2_type(kind)),
+        kind,
+        data,
+    });
     Box::into_raw(object).cast::<PyObject>()
 }
 
-unsafe fn receiver<'a>(object: *mut PyObject) -> Option<&'a mut PySha512> {
+unsafe fn receiver<'a>(object: *mut PyObject) -> Option<&'a mut PySha2> {
     let object = untag(object);
     if object.is_null() {
         return None;
     }
     // SAFETY: A non-NULL heap object carries a live header.
-    if unsafe { (*object).ob_type } != sha512_type().cast_const() {
+    if !is_sha2_type(unsafe { (*object).ob_type }) {
         return None;
     }
     // SAFETY: Type check above proved the layout.
-    Some(unsafe { &mut *object.cast::<PySha512>() })
+    Some(unsafe { &mut *object.cast::<PySha2>() })
 }
 
-/// `sha512(data=b'', *, usedforsecurity=True)` module constructor.
-unsafe extern "C" fn sha512_new(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+unsafe fn receiver_kind(object: *mut PyObject) -> Option<Sha2Kind> {
+    unsafe { receiver(object) }.map(|this| this.kind)
+}
+
+fn constructor_error(kind: Sha2Kind, argc: usize) -> *mut PyObject {
+    raise(
+        ExceptionKind::TypeError,
+        &format!("{}() takes at most 2 arguments ({argc} given)", kind.constructor_name()),
+    )
+}
+
+fn sha2_new(kind: Sha2Kind, argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     if argc > 2 {
-        return raise(
-            ExceptionKind::TypeError,
-            &format!("sha512() takes at most 2 arguments ({argc} given)"),
-        );
+        return constructor_error(kind, argc);
     }
     let mut data = Vec::new();
     if argc >= 1 && !argv.is_null() {
@@ -202,8 +194,21 @@ unsafe extern "C" fn sha512_new(argv: *mut *mut PyObject, argc: usize) -> *mut P
             data = payload.to_vec();
         }
     }
-    alloc_sha512(data)
+    alloc_sha2(kind, data)
 }
+
+macro_rules! sha_constructor {
+    ($entry:ident, $kind:expr) => {
+        unsafe extern "C" fn $entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+            sha2_new($kind, argv, argc)
+        }
+    };
+}
+
+sha_constructor!(sha224_new, Sha2Kind::Sha224);
+sha_constructor!(sha256_new, Sha2Kind::Sha256);
+sha_constructor!(sha384_new, Sha2Kind::Sha384);
+sha_constructor!(sha512_new, Sha2Kind::Sha512);
 
 macro_rules! sha_method {
     ($entry:ident, $name:literal, $body:expr) => {
@@ -215,7 +220,7 @@ macro_rules! sha_method {
             let raw = unsafe { core::slice::from_raw_parts(argv, argc) };
             // SAFETY: Bound receiver from this type's getattro.
             let Some(this) = (unsafe { receiver(raw[0]) }) else {
-                return raise(ExceptionKind::TypeError, concat!($name, "() receiver must be a sha512 object"));
+                return raise(ExceptionKind::TypeError, concat!($name, "() receiver must be a sha2 object"));
             };
             let args: Vec<*mut PyObject> = raw[1..].iter().copied().map(untag).collect();
             #[allow(clippy::redundant_closure_call)]
@@ -224,7 +229,20 @@ macro_rules! sha_method {
     };
 }
 
-sha_method!(sha512_update, "update", |this: &mut PySha512, args: &[*mut PyObject]| {
+fn pon_bytes_from_digest(digest: &[u8]) -> *mut PyObject {
+    // SAFETY: Runtime allocation helper; NULL on failure with the error set.
+    unsafe { abi::str_::pon_const_bytes(digest.as_ptr(), digest.len()) }
+}
+
+fn hex_digest(digest: &[u8]) -> String {
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
+sha_method!(sha2_update, "update", |this: &mut PySha2, args: &[*mut PyObject]| {
     if args.len() != 1 {
         return raise(ExceptionKind::TypeError, "update() takes exactly 1 argument");
     }
@@ -236,53 +254,63 @@ sha_method!(sha512_update, "update", |this: &mut PySha512, args: &[*mut PyObject
     unsafe { abi::pon_none() }
 });
 
-sha_method!(sha512_digest_method, "digest", |this: &mut PySha512, args: &[*mut PyObject]| {
+sha_method!(sha2_digest_method, "digest", |this: &mut PySha2, args: &[*mut PyObject]| {
     if !args.is_empty() {
         return raise(ExceptionKind::TypeError, "digest() takes no arguments");
     }
-    let digest = sha512_digest(&this.data);
-    // SAFETY: Runtime allocation helper; NULL on failure with the error set.
-    unsafe { abi::str_::pon_const_bytes(digest.as_ptr(), digest.len()) }
+    match this.kind {
+        Sha2Kind::Sha224 => pon_bytes_from_digest(&sha224_digest(&this.data)),
+        Sha2Kind::Sha256 => pon_bytes_from_digest(&sha256_digest(&this.data)),
+        Sha2Kind::Sha384 => pon_bytes_from_digest(&sha384_digest(&this.data)),
+        Sha2Kind::Sha512 => pon_bytes_from_digest(&sha512_digest(&this.data)),
+    }
 });
 
-sha_method!(sha512_hexdigest, "hexdigest", |this: &mut PySha512, args: &[*mut PyObject]| {
+sha_method!(sha2_hexdigest, "hexdigest", |this: &mut PySha2, args: &[*mut PyObject]| {
     if !args.is_empty() {
         return raise(ExceptionKind::TypeError, "hexdigest() takes no arguments");
     }
-    let digest = sha512_digest(&this.data);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        hex.push_str(&format!("{byte:02x}"));
-    }
+    let hex = match this.kind {
+        Sha2Kind::Sha224 => hex_digest(&sha224_digest(&this.data)),
+        Sha2Kind::Sha256 => hex_digest(&sha256_digest(&this.data)),
+        Sha2Kind::Sha384 => hex_digest(&sha384_digest(&this.data)),
+        Sha2Kind::Sha512 => hex_digest(&sha512_digest(&this.data)),
+    };
     // SAFETY: Runtime allocation helper; NULL on failure with the error set.
     unsafe { abi::pon_const_str(hex.as_ptr(), hex.len()) }
 });
 
-sha_method!(sha512_copy, "copy", |this: &mut PySha512, args: &[*mut PyObject]| {
+sha_method!(sha2_copy, "copy", |this: &mut PySha2, args: &[*mut PyObject]| {
     if !args.is_empty() {
         return raise(ExceptionKind::TypeError, "copy() takes no arguments");
     }
-    alloc_sha512(this.data.clone())
+    alloc_sha2(this.kind, this.data.clone())
 });
 
-unsafe extern "C" fn sha512_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn sha2_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
     let name = untag(name);
     // SAFETY: `unicode_text` type-checks its argument.
     let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
         crate::thread_state::pon_err_set("attribute name must be str");
         return ptr::null_mut();
     };
+    let Some(kind) = (unsafe { receiver_kind(object) }) else {
+        return raise(ExceptionKind::TypeError, "sha2 getattro on non-sha2 receiver");
+    };
     let entry: unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject = match name_text {
         // SAFETY: Runtime allocation helpers follow the NULL-sentinel contract.
-        "name" => return unsafe { abi::pon_const_str("sha512".as_ptr(), "sha512".len()) },
+        "name" => {
+            let constructor_name = kind.constructor_name();
+            return unsafe { abi::pon_const_str(constructor_name.as_ptr(), constructor_name.len()) };
+        }
         // SAFETY: Same contract as above.
-        "digest_size" => return unsafe { abi::pon_const_int(64) },
+        "digest_size" => return unsafe { abi::pon_const_int(kind.digest_size()) },
         // SAFETY: Same contract as above.
-        "block_size" => return unsafe { abi::pon_const_int(128) },
-        "update" => sha512_update,
-        "digest" => sha512_digest_method,
-        "hexdigest" => sha512_hexdigest,
-        "copy" => sha512_copy,
+        "block_size" => return unsafe { abi::pon_const_int(kind.block_size()) },
+        "update" => sha2_update,
+        "digest" => sha2_digest_method,
+        "hexdigest" => sha2_hexdigest,
+        "copy" => sha2_copy,
         // SAFETY: Typed raise helper.
         _ => return unsafe { abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
     };
@@ -301,6 +329,25 @@ unsafe extern "C" fn sha512_getattro(object: *mut PyObject, name: *mut PyObject)
 // ---------------------------------------------------------------------------
 // Module factory
 
+fn constructor_entry(kind: Sha2Kind) -> unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject {
+    match kind {
+        Sha2Kind::Sha224 => sha224_new,
+        Sha2Kind::Sha256 => sha256_new,
+        Sha2Kind::Sha384 => sha384_new,
+        Sha2Kind::Sha512 => sha512_new,
+    }
+}
+
+fn module_constructor(kind: Sha2Kind) -> Result<*mut PyObject, String> {
+    let name = kind.constructor_name();
+    // SAFETY: Live builtin entry point with the runtime calling convention.
+    let constructor = unsafe { abi::pon_make_function(constructor_entry(kind) as *const u8, VARIADIC_ARITY, intern(name)) };
+    if constructor.is_null() {
+        return Err(format!("failed to allocate _sha2.{name}"));
+    }
+    Ok(constructor)
+}
+
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
     let name = "_sha2";
     // SAFETY: Runtime allocation helpers return NULL with a diagnostic on failure.
@@ -308,14 +355,13 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
     if name_object.is_null() {
         return Err("failed to allocate _sha2.__name__".to_owned());
     }
-    // SAFETY: Live builtin entry point with the runtime calling convention.
-    let constructor = unsafe { abi::pon_make_function(sha512_new as *const u8, VARIADIC_ARITY, intern("sha512")) };
-    if constructor.is_null() {
-        return Err("failed to allocate _sha2.sha512".to_owned());
+    let mut attrs = vec![(intern("__name__"), name_object)];
+    for kind in Sha2Kind::ALL {
+        attrs.push((intern(kind.constructor_name()), module_constructor(kind)?));
     }
-    let attrs = vec![(intern("__name__"), name_object), (intern("sha512"), constructor)];
     install_module(name, attrs)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
