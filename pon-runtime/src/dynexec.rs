@@ -384,21 +384,185 @@ pub(crate) fn sync_globals_dict_bulk(dict_object: *mut PyObject) {
     let _ = copy_dict_to_active_module(dict_object);
 }
 
-fn compile_source(source: String, filename: String, mode: DynCodeMode) -> Result<*mut PyObject, String> {
+/// Dynamic-compile failure split by Python-visible type: `Syntax` raises a
+/// catchable `SyntaxError` (the parse/lower pipeline rejected the source);
+/// `Unavailable` stays on the untyped diagnostic path (no compile hook is
+/// installed in this embedding, an embedder defect rather than user code).
+enum CompileError {
+    Syntax(String),
+    Unavailable(String),
+}
+
+fn raise_compile_error(error: CompileError) -> *mut PyObject {
+    match error {
+        CompileError::Syntax(message) => raise_dyn_syntax_error(&message),
+        CompileError::Unavailable(message) => return_null_with_error(message),
+    }
+}
+
+fn raise_dyn_type_error(message: &str) -> *mut PyObject {
+    abi::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::TypeError, message)
+}
+
+fn raise_dyn_value_error(message: &str) -> *mut PyObject {
+    abi::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::ValueError, message)
+}
+
+fn raise_dyn_syntax_error(message: &str) -> *mut PyObject {
+    abi::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::SyntaxError, message)
+}
+
+fn compile_source(source: String, filename: String, mode: DynCodeMode) -> Result<*mut PyObject, CompileError> {
     let hook = DYN_HOOKS
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .compile;
     let Some(hook) = hook else {
-        return Err("dynamic code compilation is not available in this runtime".to_owned());
+        return Err(CompileError::Unavailable(
+            "dynamic code compilation is not available in this runtime".to_owned(),
+        ));
     };
     hook(DynCompileRequest {
         source: &source,
         filename: &filename,
         mode,
     })
-    .map_err(|message| format!("SyntaxError in {filename}: {message}"))?;
+    .map_err(CompileError::Syntax)?;
     Ok(alloc_code_object(source, filename, mode))
+}
+
+/// Source-encoding classes the PEP 263 decoder understands.  CPython accepts
+/// any registered codec; pon supports the encodings that appear in practice
+/// (UTF-8 default, the Latin-1 family, ASCII) and reports the rest as
+/// `SyntaxError: unknown encoding`.
+enum SourceEncoding {
+    Utf8,
+    Latin1,
+    Ascii,
+    Unknown,
+}
+
+fn normalize_source_encoding(cookie: &str) -> SourceEncoding {
+    let normalized = cookie.to_ascii_lowercase().replace('_', "-");
+    match normalized.as_str() {
+        "utf-8" | "utf8" => SourceEncoding::Utf8,
+        "latin-1" | "latin1" | "latin" | "l1" | "iso-8859-1" | "iso8859-1" | "iso-latin-1" | "8859" | "cp819" => {
+            SourceEncoding::Latin1
+        }
+        "ascii" | "us-ascii" | "646" => SourceEncoding::Ascii,
+        _ => SourceEncoding::Unknown,
+    }
+}
+
+/// PEP 263 cookie scan: a comment on line 1 (or line 2 when line 1 is blank
+/// or comment-only) matching `coding[:=][ \t]*([-_.a-zA-Z0-9]+)`.
+fn source_coding_cookie(bytes: &[u8]) -> Option<String> {
+    let mut lines = bytes.split(|&b| b == b'\n');
+    for _ in 0..2 {
+        let line = lines.next()?;
+        if let Some(cookie) = line_coding_cookie(line) {
+            return Some(cookie);
+        }
+        match line.iter().position(|&b| !matches!(b, b' ' | b'\t' | b'\x0c' | b'\r')) {
+            // Blank line or bare comment: the cookie may still be on line 2.
+            None => {}
+            Some(index) if line[index] == b'#' => {}
+            // Real code before any cookie: no declaration possible.
+            Some(_) => return None,
+        }
+    }
+    None
+}
+
+fn line_coding_cookie(line: &[u8]) -> Option<String> {
+    let start = line.iter().position(|&b| !matches!(b, b' ' | b'\t' | b'\x0c'))?;
+    if line[start] != b'#' {
+        return None;
+    }
+    let comment = &line[start..];
+    let mut index = 0;
+    while index + 7 <= comment.len() {
+        if &comment[index..index + 6] == b"coding" && matches!(comment[index + 6], b':' | b'=') {
+            let mut cursor = index + 7;
+            while cursor < comment.len() && matches!(comment[cursor], b' ' | b'\t') {
+                cursor += 1;
+            }
+            let name_start = cursor;
+            while cursor < comment.len()
+                && (comment[cursor].is_ascii_alphanumeric() || matches!(comment[cursor], b'-' | b'_' | b'.'))
+            {
+                cursor += 1;
+            }
+            if cursor > name_start {
+                // The character class above is pure ASCII; from_utf8 cannot fail.
+                return core::str::from_utf8(&comment[name_start..cursor]).ok().map(str::to_owned);
+            }
+            return None;
+        }
+        index += 1;
+    }
+    None
+}
+
+/// PEP 263 source-bytes decoding for `compile`/`eval`/`exec` and source
+/// module loading: honors a UTF-8 BOM and a coding cookie on the first two
+/// lines, defaulting to UTF-8.  `Err` carries CPython's SyntaxError message
+/// shapes (`Non-UTF-8 code starting with ...` for undeclared non-UTF-8
+/// bytes, `unknown encoding: ...` for unsupported cookies).
+pub(crate) fn decode_python_source(bytes: &[u8], filename: &str) -> Result<String, String> {
+    let (bytes, bom) = match bytes {
+        [0xef, 0xbb, 0xbf, rest @ ..] => (rest, true),
+        _ => (bytes, false),
+    };
+    let declared = source_coding_cookie(bytes);
+    let encoding = match &declared {
+        Some(cookie) => normalize_source_encoding(cookie),
+        None => SourceEncoding::Utf8,
+    };
+    match encoding {
+        SourceEncoding::Unknown => Err(format!("unknown encoding: {}", declared.unwrap_or_default())),
+        SourceEncoding::Latin1 | SourceEncoding::Ascii if bom => Err(format!(
+            "encoding problem: {} with BOM",
+            declared.unwrap_or_default()
+        )),
+        SourceEncoding::Latin1 => Ok(bytes.iter().map(|&b| char::from(b)).collect()),
+        SourceEncoding::Ascii => match bytes.iter().position(|&b| b >= 0x80) {
+            None => {
+                // All-ASCII bytes are valid UTF-8 by construction.
+                Ok(core::str::from_utf8(bytes).unwrap_or_default().to_owned())
+            }
+            Some(index) => Err(format!(
+                "(unicode error) 'ascii' codec can't decode byte 0x{:02x} in position {index}: ordinal not in range(128)",
+                bytes[index]
+            )),
+        },
+        SourceEncoding::Utf8 => core::str::from_utf8(bytes).map(str::to_owned).map_err(|error| {
+            let index = error.valid_up_to();
+            let byte = bytes[index];
+            if declared.is_some() {
+                format!("(unicode error) 'utf-8' codec can't decode byte 0x{byte:02x} in position {index}: invalid start byte")
+            } else {
+                let line = bytes[..index].iter().filter(|&&b| b == b'\n').count() + 1;
+                format!(
+                    "Non-UTF-8 code starting with '\\x{byte:02x}' in file {filename} on line {line}, but no encoding declared; see https://peps.python.org/pep-0263/ for details"
+                )
+            }
+        }),
+    }
+}
+
+/// Extracts dynamic source text from a `str` or bytes-like argument.
+/// `Ok(None)`: the argument is neither (the caller raises its own
+/// TypeError).  `Err`: a PEP 263 decode failure, already CPython-shaped for
+/// `SyntaxError`.
+unsafe fn source_text_arg(object: *mut PyObject, filename: &str) -> Result<Option<String>, String> {
+    if let Some(text) = unsafe { str_text(object) } {
+        return Ok(Some(text));
+    }
+    match crate::abi::str_::expect_bytes_like(object) {
+        Ok(bytes) => decode_python_source(&bytes, filename).map(Some),
+        Err(_) => Ok(None),
+    }
 }
 
 fn execute_code(code: &PyCodeObject, globals: *mut PyObject, locals: *mut PyObject) -> Result<*mut PyObject, String> {
@@ -505,30 +669,32 @@ pub unsafe extern "C" fn builtin_compile(argv: *mut *mut PyObject, argc: usize) 
     // `PyCF_ONLY_AST` is honored; `PyCF_TYPE_COMMENTS`/`ALLOW_TOP_LEVEL_AWAIT`
     // /`OPTIMIZED_AST` are accepted unread.
     if args.len() < 3 || args.len() > 7 {
-        return return_null_with_error(format!("compile() expected 3 to 6 arguments, got {}", args.len()));
+        return raise_dyn_type_error(&format!("compile() expected 3 to 6 arguments, got {}", args.len()));
     }
-    let Some(source) = (unsafe { str_text(args[0]) }) else {
-        return return_null_with_error("compile() arg 1 must be a string");
-    };
     let Some(filename) = (unsafe { str_text(args[1]) }) else {
-        return return_null_with_error("compile() arg 2 must be a string");
+        return raise_dyn_type_error("compile() arg 2 must be a string");
     };
     let Some(mode_text) = (unsafe { str_text(args[2]) }) else {
-        return return_null_with_error("compile() arg 3 must be a string");
+        return raise_dyn_type_error("compile() arg 3 must be a string");
+    };
+    let source = match unsafe { source_text_arg(args[0], &filename) } {
+        Ok(Some(source)) => source,
+        Ok(None) => return raise_dyn_type_error("compile() arg 1 must be a string, bytes or AST object"),
+        Err(message) => return raise_dyn_syntax_error(&message),
     };
     let flags = match optional_int_arg(args, 3, "flags") {
         Ok(flags) => flags,
-        Err(message) => return return_null_with_error(message),
+        Err(message) => return raise_dyn_type_error(&message),
     };
     let Some(mode) = DynCodeMode::from_str(&mode_text) else {
-        return return_null_with_error("compile() mode must be 'exec', 'eval', or 'single'");
+        return raise_dyn_value_error("compile() mode must be 'exec', 'eval' or 'single'");
     };
     if flags & PYCF_ONLY_AST != 0 {
         return compile_only_ast(&source, &filename, mode);
     }
     match compile_source(source, filename, mode) {
         Ok(code) => code,
-        Err(message) => return_null_with_error(message),
+        Err(error) => raise_compile_error(error),
     }
 }
 
@@ -593,21 +759,23 @@ pub unsafe extern "C" fn builtin_eval(argv: *mut *mut PyObject, argc: usize) -> 
         Err(message) => return return_null_with_error(message),
     };
     if args.is_empty() {
-        return return_null_with_error("eval() expected at least 1 argument, got 0");
+        return raise_dyn_type_error("eval() expected at least 1 argument, got 0");
     }
     let (globals, locals) = match namespace_args(args, "eval") {
         Ok(namespaces) => namespaces,
-        Err(message) => return return_null_with_error(message),
+        Err(message) => return raise_dyn_type_error(&message),
     };
     let code_object = if let Some(code) = unsafe { as_code_object(args[0]) } {
         code
     } else {
-        let Some(source) = (unsafe { str_text(args[0]) }) else {
-            return return_null_with_error("eval() arg 1 must be a string or code object");
+        let source = match unsafe { source_text_arg(args[0], "<string>") } {
+            Ok(Some(source)) => source,
+            Ok(None) => return raise_dyn_type_error("eval() arg 1 must be a string, bytes or code object"),
+            Err(message) => return raise_dyn_syntax_error(&message),
         };
         let code = match compile_source(source, "<string>".to_owned(), DynCodeMode::Eval) {
             Ok(code) => code,
-            Err(message) => return return_null_with_error(message),
+            Err(error) => return raise_compile_error(error),
         };
         unsafe { &*code.cast::<PyCodeObject>() }
     };
@@ -624,21 +792,23 @@ pub unsafe extern "C" fn builtin_exec(argv: *mut *mut PyObject, argc: usize) -> 
         Err(message) => return return_null_with_error(message),
     };
     if args.is_empty() {
-        return return_null_with_error("exec() expected at least 1 argument, got 0");
+        return raise_dyn_type_error("exec() expected at least 1 argument, got 0");
     }
     let (globals, locals) = match namespace_args(args, "exec") {
         Ok(namespaces) => namespaces,
-        Err(message) => return return_null_with_error(message),
+        Err(message) => return raise_dyn_type_error(&message),
     };
     let code_object = if let Some(code) = unsafe { as_code_object(args[0]) } {
         code
     } else {
-        let Some(source) = (unsafe { str_text(args[0]) }) else {
-            return return_null_with_error("exec() arg 1 must be a string or code object");
+        let source = match unsafe { source_text_arg(args[0], "<string>") } {
+            Ok(Some(source)) => source,
+            Ok(None) => return raise_dyn_type_error("exec() arg 1 must be a string, bytes or code object"),
+            Err(message) => return raise_dyn_syntax_error(&message),
         };
         let code = match compile_source(source, "<string>".to_owned(), DynCodeMode::Exec) {
             Ok(code) => code,
-            Err(message) => return return_null_with_error(message),
+            Err(error) => return raise_compile_error(error),
         };
         unsafe { &*code.cast::<PyCodeObject>() }
     };
