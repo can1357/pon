@@ -4,3 +4,10 @@
 !cpython-3.14/
 cpython-3.14/*
 !cpython-3.14/REVISION
+!cpython-3.14/Lib/
+!cpython-3.14/Lib/**/
+!cpython-3.14/Lib/*.py
+!cpython-3.14/Lib/**/*.py
+cpython-3.14/Lib/**/__pycache__/
+cpython-3.14/Lib/**/*.pyc
+cpython-3.14/Lib/ensurepip/_bundled/
