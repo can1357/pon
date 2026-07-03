@@ -363,14 +363,25 @@ fn raise_type_error_text(text: &str) -> *mut PyObject {
     }
 }
 
+fn import_error_name(text: &str) -> Option<&str> {
+    text.strip_prefix("No module named '")
+        .and_then(|suffix| suffix.strip_suffix('\''))
+        .or_else(|| {
+            text.strip_prefix("import of ")
+                .and_then(|suffix| suffix.strip_suffix(" halted; None in sys.modules"))
+        })
+}
+
 /// Raises the typed import failure for `text`: a missing-module diagnostic
 /// (`No module named '...'`, the exact text `resolve_module_by_name` emits)
 /// raises `ModuleNotFoundError` like CPython — `subprocess` gates its whole
 /// Windows surface on `except ModuleNotFoundError: import msvcrt` — as does
 /// the blocked-import halt (`import of X halted; None in sys.modules`, the
 /// `sys.modules[name] = None` sentinel `test.support.import_helper` plants;
-/// stdlib accelerator fallbacks catch it as ImportError) — and every other
-/// import failure stays a plain `ImportError`.
+/// stdlib accelerator fallbacks catch it as ImportError).  For those
+/// `ModuleNotFoundError` cases, mirror CPython's `exc.name` payload too so
+/// guards like `importlib.abc`'s `if exc.name != '_frozen_importlib': raise`
+/// can distinguish their own optional import from a deeper failure.
 pub fn raise_import_error_text(text: &str) -> *mut PyObject {
     let kind = if text.starts_with("No module named ")
         || (text.starts_with("import of ") && text.ends_with(" halted; None in sys.modules"))
@@ -380,7 +391,19 @@ pub fn raise_import_error_text(text: &str) -> *mut PyObject {
         ExceptionKind::ImportError
     };
     match ensure_runtime_for_exc() {
-        Ok(()) => match super::with_runtime(|runtime| raise_builtin_text(runtime, kind, text)) {
+        Ok(()) => match super::with_runtime(|runtime| {
+            let result = raise_builtin_text(runtime, kind, text);
+            if matches!(kind, ExceptionKind::ModuleNotFoundError)
+                && let Some(name) = import_error_name(text)
+                && let Some(exception) = pending_exception_object()
+                && let Ok(name_object) = super::alloc_unicode(runtime, name.as_bytes())
+            {
+                unsafe {
+                    crate::types::exc::set_exception_instance_attr(exception, intern::intern("name"), name_object);
+                }
+            }
+            result
+        }) {
             Some(result) => result,
             None => super::return_null_with_error("runtime is not initialized"),
         },
