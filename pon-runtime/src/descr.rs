@@ -880,6 +880,32 @@ pub unsafe fn super_lookup(start: *mut PyType, obj: *mut PyObject, owner: *mut P
             return function;
         }
     }
+    // Builtin exception types are carrier-less (no tp_dict `__init__`), so a
+    // cooperative `super().__init__(*args)` inside an exception subclass
+    // (pickle's `_Stop`) exhausts the walk.  Serve `BaseException.__init__`
+    // semantics for instance-bound exception receivers.  The unbound
+    // `ValueError.__init__(self, ...)` spelling resolves through type
+    // getattro, not this walk, and stays an honest miss.
+    if intern::resolve(name).as_deref() == Some("__init__")
+        && !obj.is_null()
+        && obj != owner.cast::<PyObject>()
+        && unsafe { abi::exc::type_derives_base_exception((*obj).ob_type) }
+    {
+        // SAFETY: Live builtin entry point with the runtime calling convention.
+        let function = unsafe {
+            abi::pon_make_function(
+                exception_super_init as *const u8,
+                crate::builtins::variadic_arity(),
+                name,
+            )
+        };
+        if !function.is_null() {
+            return match crate::types::method::new_bound_method(function, obj) {
+                Ok(method) => method.cast::<PyObject>(),
+                Err(message) => abi::return_null_with_error(message),
+            };
+        }
+    }
     // CPython super_getattro falls back to generic lookup on the proxy
     // itself; a miss there raises a REAL AttributeError.  A message-only
     // sentinel would be uncatchable (`except AttributeError` never matches),
@@ -890,6 +916,49 @@ pub unsafe fn super_lookup(start: *mut PyType, obj: *mut PyObject, owner: *mut P
 
 /// `object.__init_subclass__` surrogate: accepts anything, does nothing.
 unsafe extern "C" fn object_init_subclass_noop(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+    // SAFETY: Singleton accessor.
+    unsafe { abi::pon_none() }
+}
+
+/// `BaseException.__init__` surrogate for `super().__init__(*args)` chains:
+/// re-seats the receiver's `message`/`args` payload with the builtin
+/// constructor's argument semantics (`alloc_exception_instance`): two or more
+/// arguments carry the full tuple in `args` with `message = args[0]`; zero or
+/// one keep the allocation-free derived form (`args` NULL).
+unsafe extern "C" fn exception_super_init(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc == 0 {
+        return abi::exc::raise_kind_error_text(
+            crate::types::exc::ExceptionKind::TypeError,
+            "__init__() missing receiver",
+        );
+    }
+    // SAFETY: The runtime call convention guarantees `argc` live slots.
+    let args = unsafe { core::slice::from_raw_parts(argv.cast_const(), argc) };
+    let receiver = crate::tag::untag_arg(args[0]);
+    if receiver.is_null() || !unsafe { abi::exc::type_derives_base_exception((*receiver).ob_type) } {
+        return abi::exc::raise_kind_error_text(
+            crate::types::exc::ExceptionKind::TypeError,
+            "__init__() requires an exception receiver",
+        );
+    }
+    let ctor_args = &args[1..];
+    let exception = receiver.cast::<crate::types::exc::PyBaseException>();
+    let args_tuple = if ctor_args.len() >= 2 {
+        let mut items = ctor_args.to_vec();
+        // SAFETY: `items` holds live argument slots for the duration of the call.
+        let tuple = unsafe { abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) };
+        if tuple.is_null() {
+            return ptr::null_mut();
+        }
+        tuple
+    } else {
+        ptr::null_mut()
+    };
+    // SAFETY: The receiver derives BaseException, so the boxed layout holds.
+    unsafe {
+        (*exception).message = ctor_args.first().copied().unwrap_or(ptr::null_mut());
+        (*exception).args = args_tuple;
+    }
     // SAFETY: Singleton accessor.
     unsafe { abi::pon_none() }
 }
