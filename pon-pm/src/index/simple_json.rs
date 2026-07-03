@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::str::FromStr;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 use crate::names;
@@ -305,7 +306,7 @@ struct SimpleProjectResponse {
 
 #[derive(Deserialize)]
 struct SimpleMeta {
-    #[serde(rename = "_api-version")]
+    #[serde(rename = "api-version", alias = "_api-version")]
     api_version: String,
 }
 
@@ -581,8 +582,9 @@ fn unix_now_secs() -> Result<u64> {
 
 fn hex_key(url: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut key = String::with_capacity(url.len() * 2);
-    for byte in url.bytes() {
+    let digest = Sha256::digest(url.as_bytes());
+    let mut key = String::with_capacity(digest.len() * 2);
+    for byte in digest {
         key.push(HEX[(byte >> 4) as usize] as char);
         key.push(HEX[(byte & 0x0f) as usize] as char);
     }
@@ -619,6 +621,21 @@ mod tests {
     }
 
     #[test]
+    fn accepts_legacy_underscore_api_version_key() {
+        let project = parse_project_json(
+            r#"{
+                "meta": {"_api-version": "1.0"},
+                "name": "demo-pkg",
+                "files": []
+            }"#,
+        )
+        .expect("parse")
+        .expect("project");
+
+        assert_eq!(project.meta_api_version, "1.0");
+    }
+
+    #[test]
     fn lookup_uses_fresh_cache_without_network() {
         let temp = std::env::temp_dir().join(format!(
             "pon-pm-simple-json-cache-{}",
@@ -652,6 +669,6 @@ mod tests {
         let index = SimpleJsonIndex::with_cache_dir("https://pypi.example/simple/", "/tmp/pon-cache");
         let path = index.cache_path_for_url("https://pypi.example/simple/demo-pkg/");
 
-        assert_eq!(path, PathBuf::from("/tmp/pon-cache/68747470733a2f2f707970692e6578616d706c652f73696d706c652f64656d6f2d706b672f.json"));
+        assert_eq!(path, PathBuf::from("/tmp/pon-cache/076d218a1c917b1bbd6081d99e9ab17dffae1a1a754da32cb695038783ec7186.json"));
     }
 }

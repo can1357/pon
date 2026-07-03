@@ -1,6 +1,6 @@
 {
   "meta": {
-    "_api-version": "1.0"
+    "api-version": "1.0"
   },
   "name": "Demo_Pkg",
   "files": [
