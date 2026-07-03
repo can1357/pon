@@ -9,8 +9,8 @@ use super::install_module;
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
     let attrs = [
         string_attr("__name__", "time"),
-        string_attr("timezone", "0"),
-        string_attr("tzname", "('UTC', 'UTC')"),
+        int_attr("timezone", 0),
+        tzname_attr(),
         int_attr("daylight", 0),
         int_attr("altzone", 0),
         function_attr("time", time_time),
@@ -18,6 +18,8 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         function_attr("sleep", time_sleep),
         function_attr("gmtime", time_gmtime),
         function_attr("localtime", time_localtime),
+        function_attr("asctime", time_asctime),
+        function_attr("mktime", time_mktime),
         function_attr("strftime", time_strftime),
         function_attr("perf_counter", time_perf_counter),
         function_attr("perf_counter_ns", time_perf_counter_ns),
@@ -153,6 +155,20 @@ fn int_attr(name: &str, value: i64) -> Result<(u32, *mut PyObject), String> {
         .ok_or_else(|| format!("failed to allocate time.{name}"))
 }
 
+fn tzname_attr() -> Result<(u32, *mut PyObject), String> {
+    // SAFETY: Runtime allocation helpers return NULL with a diagnostic on failure.
+    let utc = unsafe { pon_const_str("UTC".as_ptr(), 3) };
+    if utc.is_null() {
+        return Err("failed to allocate time.tzname element".to_owned());
+    }
+    let mut items = [utc, utc];
+    // SAFETY: `items` is a live window for the duration of the call.
+    let tuple = unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) };
+    (!tuple.is_null())
+        .then_some((intern("tzname"), tuple))
+        .ok_or_else(|| "failed to allocate time.tzname".to_owned())
+}
+
 /// Civil date from days since the Unix epoch (Howard Hinnant's
 /// `civil_from_days`).
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
@@ -265,6 +281,68 @@ unsafe extern "C" fn time_localtime(argv: *mut *mut PyObject, argc: usize) -> *m
     unsafe { utc_tuple_entry("localtime", argv, argc) }
 }
 
+/// `time.asctime([t])`: the classic C `ctime` text over a nine-field time
+/// tuple, defaulting to the current local time (which is UTC here).
+unsafe extern "C" fn time_asctime(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc > 1 {
+        return raise_type_error(&format!("asctime expected at most 1 argument, got {argc}"));
+    }
+    let fields = if argc == 0 {
+        utc_fields(since_epoch().as_secs_f64())
+    } else {
+        let tuple = crate::tag::untag_arg(unsafe { *argv });
+        if tuple.is_null() {
+            return core::ptr::null_mut();
+        }
+        match time_tuple_fields(
+            tuple,
+            "Tuple or struct_time argument required",
+            "asctime(): illegal time tuple argument",
+        ) {
+            Ok(fields) => fields,
+            Err(error) => return error,
+        }
+    };
+    if let Err(error) = check_year_range(fields[0]) {
+        return error;
+    }
+    let tm = match tm_from_fields(fields) {
+        Ok(tm) => tm,
+        Err(error) => return error,
+    };
+    let mut text = String::with_capacity(24);
+    render("%a %b %e %H:%M:%S %Y", &tm, &mut text);
+    // SAFETY: String allocation helper follows the NULL-sentinel contract.
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+/// `time.mktime(t)`: seconds since the Unix epoch for a local-time tuple.
+/// With `TZ=UTC` pinned for the conformance runs, this reduces to UTC civil
+/// arithmetic plus CPython's forward-only overflow normalization.
+unsafe extern "C" fn time_mktime(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 1 {
+        return raise_type_error(&format!("time.mktime() takes exactly one argument ({argc} given)"));
+    }
+    let tuple = crate::tag::untag_arg(unsafe { *argv });
+    if tuple.is_null() {
+        return core::ptr::null_mut();
+    }
+    let fields = match time_tuple_fields(
+        tuple,
+        "Tuple or struct_time argument required",
+        "mktime(): illegal time tuple argument",
+    ) {
+        Ok(fields) => fields,
+        Err(error) => return error,
+    };
+    let seconds = match mktime_seconds(fields) {
+        Ok(seconds) => seconds,
+        Err(error) => return error,
+    };
+    // SAFETY: Float boxing helper follows the NULL-sentinel contract.
+    unsafe { crate::abi::number::pon_const_float(seconds as f64) }
+}
+
 // ---------------------------------------------------------------------------
 // time.strftime
 //
@@ -353,6 +431,11 @@ fn raise_value_error(message: &str) -> *mut PyObject {
     unsafe { crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) }
 }
 
+/// Raises `OverflowError` with `message`; always returns NULL.
+fn raise_overflow_error(message: &str) -> *mut PyObject {
+    crate::abi::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::OverflowError, message)
+}
+
 /// Type name for error messages (callers pass heap-or-NULL post-`untag_arg`;
 /// the small-int guard keeps a stray tagged value from being dereferenced).
 unsafe fn error_type_name(object: *mut PyObject) -> &'static str {
@@ -383,6 +466,57 @@ unsafe fn text_argument(object: *mut PyObject) -> Option<String> {
         ty = unsafe { (*ty).tp_base };
     }
     None
+}
+
+/// Parses a `tuple`/`struct_time` argument into the canonical nine integer
+/// fields used by `strftime`/`asctime`/`mktime`.
+fn time_tuple_fields(
+    tuple: *mut PyObject,
+    type_error: &str,
+    illegal_error: &str,
+) -> Result<[i64; 9], *mut PyObject> {
+    // SAFETY: Heap-or-NULL after caller-side `untag_arg`; the storage resolver
+    // accepts exact tuples and tuple-subclass instances (struct_time shape) and
+    // returns `None` for everything else.
+    let Some(items) = (unsafe { crate::abi::seq::tuple_storage_slice(tuple) }) else {
+        return Err(raise_type_error(type_error));
+    };
+    if items.len() != 9 {
+        return Err(raise_type_error(illegal_error));
+    }
+    let mut fields = [0i64; 9];
+    for (slot, &item) in fields.iter_mut().zip(items) {
+        let item = crate::tag::untag_arg(item);
+        if item.is_null() {
+            return Err(core::ptr::null_mut());
+        }
+        // SAFETY: Heap-or-NULL after `untag_arg`.
+        let parsed = unsafe { crate::types::int::to_bigint_including_bool(item) };
+        let Some(parsed) = parsed else {
+            return Err(raise_type_error(&format!(
+                "'{}' object cannot be interpreted as an integer",
+                // SAFETY: As above.
+                unsafe { error_type_name(item) }
+            )));
+        };
+        let Some(value) = num_traits::ToPrimitive::to_i64(&parsed) else {
+            return Err(raise_overflow_error("Python int too large to convert to C int"));
+        };
+        *slot = value;
+    }
+    Ok(fields)
+}
+
+/// CPython's year bounds for tuple-based `time` APIs: the tuple carries the
+/// actual year, but the C runtime stores it in `struct tm.tm_year`.
+fn check_year_range(year: i64) -> Result<(), *mut PyObject> {
+    if year > i32::MAX as i64 {
+        return Err(raise_overflow_error("signed integer is greater than maximum"));
+    }
+    if year < i32::MIN as i64 + 1900 {
+        return Err(raise_overflow_error("year out of range"));
+    }
+    Ok(())
 }
 
 /// CPython's `gettmarg` field shifts plus `time_strftime`'s normalization
@@ -424,6 +558,40 @@ fn tm_from_fields(fields: [i64; 9]) -> Result<Tm, *mut PyObject> {
         return Err(raise_value_error("day of year out of range"));
     }
     Ok(Tm { year, mon0, mday, hour, min, sec, c_wday, yday0 })
+}
+
+/// `mktime()`'s UTC-pinned civil arithmetic.  CPython/libc normalize positive
+/// month/day/time overflow forward (month 13 -> next January, hour 24 -> next
+/// day) but reject underflow legs such as month 0 or hour -1 with the shared
+/// `mktime argument out of range` wording.
+fn mktime_seconds(fields: [i64; 9]) -> Result<i64, *mut PyObject> {
+    let month = i128::from(fields[1]);
+    let mday = i128::from(fields[2]);
+    let hour = i128::from(fields[3]);
+    let min = i128::from(fields[4]);
+    let sec = i128::from(fields[5]);
+    if month <= 0 || mday <= 0 || hour < 0 || min < 0 || sec < 0 {
+        return Err(raise_overflow_error("mktime argument out of range"));
+    }
+
+    let month0 = month - 1;
+    let year = i128::from(fields[0]) + month0 / 12;
+    let year = i64::try_from(year).map_err(|_| {
+        if year.is_negative() {
+            raise_overflow_error("year out of range")
+        } else {
+            raise_overflow_error("signed integer is greater than maximum")
+        }
+    })?;
+    check_year_range(year)?;
+
+    let mon0 = (month0 % 12) as u32;
+    let total_seconds = hour * 3_600 + min * 60 + sec;
+    let day_offset = (mday - 1) + total_seconds / 86_400;
+    let second_of_day = total_seconds % 86_400;
+    let base_days = i128::from(days_from_civil(year, mon0 + 1, 1));
+    let epoch_seconds = (base_days + day_offset) * 86_400 + second_of_day;
+    i64::try_from(epoch_seconds).map_err(|_| raise_overflow_error("mktime argument out of range"))
 }
 
 /// Padding override parsed from a `-`/`_`/`0` conversion flag.
@@ -642,44 +810,18 @@ unsafe extern "C" fn time_strftime(argv: *mut *mut PyObject, argc: usize) -> *mu
         ));
     };
     let fields = if argc == 2 {
-        // SAFETY: Two live argument slots per the argc check.
         let tuple = crate::tag::untag_arg(unsafe { *argv.add(1) });
         if tuple.is_null() {
             return core::ptr::null_mut();
         }
-        // SAFETY: Heap-or-NULL after `untag_arg`; the storage resolver
-        // accepts exact tuples and tuple-subclass instances (struct_time
-        // shape) and returns `None` for everything else.
-        let Some(items) = (unsafe { crate::abi::seq::tuple_storage_slice(tuple) }) else {
-            return raise_type_error("Tuple or struct_time argument required");
-        };
-        if items.len() != 9 {
-            return raise_type_error("strftime(): illegal time tuple argument");
+        match time_tuple_fields(
+            tuple,
+            "Tuple or struct_time argument required",
+            "strftime(): illegal time tuple argument",
+        ) {
+            Ok(fields) => fields,
+            Err(error) => return error,
         }
-        let mut fields = [0i64; 9];
-        for (slot, &item) in fields.iter_mut().zip(items) {
-            let item = crate::tag::untag_arg(item);
-            if item.is_null() {
-                return core::ptr::null_mut();
-            }
-            // SAFETY: Heap-or-NULL after `untag_arg`.
-            let parsed = unsafe { crate::types::int::to_bigint_including_bool(item) };
-            let Some(parsed) = parsed else {
-                return raise_type_error(&format!(
-                    "'{}' object cannot be interpreted as an integer",
-                    // SAFETY: As above.
-                    unsafe { error_type_name(item) }
-                ));
-            };
-            let Some(value) = num_traits::ToPrimitive::to_i64(&parsed) else {
-                return crate::abi::exc::raise_kind_error_text(
-                    crate::types::exc::ExceptionKind::OverflowError,
-                    "Python int too large to convert to C int",
-                );
-            };
-            *slot = value;
-        }
-        fields
     } else {
         utc_fields(since_epoch().as_secs_f64())
     };
