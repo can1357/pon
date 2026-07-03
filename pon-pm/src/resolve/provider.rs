@@ -667,7 +667,7 @@ impl<'a, S: CandidateSource> PonProvider<'a, S> {
 
         let artifacts = self.source.artifacts(name, version)?;
         let has_installable_sdist = source_distribution_allowed(&artifacts);
-        if let Some(file) = artifacts.wheels.into_iter().find(|file| !file.kind.is_refused()) {
+        if let Some(file) = artifacts.wheels.into_iter().find(wheel_installable_by_pon) {
             let kind = file.kind.clone();
             return Ok((ResolvedArtifact::Wheel(file), kind));
         }
@@ -736,8 +736,12 @@ impl<'a, S: CandidateSource> PonProvider<'a, S> {
     }
 }
 
+
+fn wheel_installable_by_pon(file: &ProjectFile) -> bool {
+    matches!(file.kind, PackageKind::Pure)
+}
 fn source_distribution_allowed(artifacts: &ArtifactSet) -> bool {
-    artifacts.sdist.is_some() && artifacts.wheels.iter().all(|file| matches!(file.kind, PackageKind::Pure))
+    artifacts.sdist.is_some()
 }
 
 fn cabi_refusal_for_roots<S: CandidateSource>(provider: &PonProvider<'_, S>, roots: &BTreeSet<String>) -> Option<Error> {
@@ -801,7 +805,7 @@ impl<'a, S: CandidateSource> DependencyProvider for PonProvider<'a, S> {
                 return Ok(Some(version));
             }
             let artifacts = self.source.artifacts(name, &version)?;
-            let has_installable_wheel = artifacts.wheels.iter().any(|file| !file.kind.is_refused());
+            let has_installable_wheel = artifacts.wheels.iter().any(wheel_installable_by_pon);
             let has_installable_sdist = source_distribution_allowed(&artifacts);
             if has_installable_wheel || has_installable_sdist {
                 return Ok(Some(version));

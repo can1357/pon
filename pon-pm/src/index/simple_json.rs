@@ -81,10 +81,9 @@ impl SimpleJsonIndex {
         let normalized_name = validate_normalized_name(name.as_ref())?;
         let url = self.project_url(&normalized_name);
         let path = self.cache_path_for_url(&url);
-        if !path.is_file() {
+        let Some(body) = read_cache_text(&path)? else {
             return Ok(None);
-        }
-        let body = fs::read_to_string(&path)?;
+        };
         parse_project_response(&url, &body, None)
     }
 
@@ -94,8 +93,10 @@ impl SimpleJsonIndex {
         let metadata_path = metadata_path_for(&cache_path);
 
         if cache_is_fresh(&cache_path, &metadata_path)? {
-            let body = fs::read_to_string(&cache_path)?;
-            return parse_project_response(&url, &body, None);
+            if let Some(body) = read_cache_text(&cache_path)? {
+                return parse_project_response(&url, &body, None);
+            }
+            let _ = fs::remove_file(&cache_path);
         }
 
         let etag = cached_etag(&cache_path, &metadata_path)?;
@@ -111,12 +112,18 @@ impl SimpleJsonIndex {
             }
             Ok(FetchOutcome::NotModified) => {
                 refresh_cache_metadata(&metadata_path)?;
-                let body = fs::read_to_string(&cache_path)?;
-                parse_project_response(&url, &body, None)
+                if let Some(body) = read_cache_text(&cache_path)? {
+                    parse_project_response(&url, &body, None)
+                } else {
+                    let _ = fs::remove_file(&cache_path);
+                    self.fetch_project(normalized_name)
+                }
             }
             Ok(FetchOutcome::NotFound) => Ok(None),
             Err(error) if cache_path.is_file() => {
-                let body = fs::read_to_string(cache_path)?;
+                let Some(body) = read_cache_text(&cache_path)? else {
+                    return Err(error);
+                };
                 parse_project_response(&url, &body, None).map_err(|parse_error| {
                     Error::Index(format!(
                         "failed to fetch `{url}` ({error}) and cached response could not be parsed: {parse_error}"
@@ -136,7 +143,10 @@ impl SimpleJsonIndex {
         let metadata_path = metadata_path_for(&cache_path);
 
         if cache_is_fresh(&cache_path, &metadata_path)? {
-            return fs::read_to_string(&cache_path).map(Some).map_err(Error::from);
+            if let Some(body) = read_cache_text(&cache_path)? {
+                return Ok(Some(body));
+            }
+            let _ = fs::remove_file(&cache_path);
         }
 
         let etag = cached_etag(&cache_path, &metadata_path)?;
@@ -147,10 +157,20 @@ impl SimpleJsonIndex {
             }
             Ok(FetchOutcome::NotModified) => {
                 refresh_cache_metadata(&metadata_path)?;
-                fs::read_to_string(&cache_path).map(Some).map_err(Error::from)
+                if let Some(body) = read_cache_text(&cache_path)? {
+                    Ok(Some(body))
+                } else {
+                    let _ = fs::remove_file(&cache_path);
+                    self.fetch_distribution_metadata(file)
+                }
             }
             Ok(FetchOutcome::NotFound) => Ok(None),
-            Err(_error) if cache_path.is_file() => fs::read_to_string(cache_path).map(Some).map_err(Error::from),
+            Err(error) if cache_path.is_file() => {
+                let Some(body) = read_cache_text(&cache_path)? else {
+                    return Err(error);
+                };
+                Ok(Some(body))
+            }
             Err(error) => Err(error),
         }
     }
@@ -513,6 +533,14 @@ fn write_cache_entry(
     let etag = etag.unwrap_or_default();
     fs::write(metadata_path, format!("fetched_at={fetched_at}\nmax_age={max_age_secs}\netag={etag}\n"))?;
     Ok(())
+}
+
+fn read_cache_text(cache_path: &Path) -> Result<Option<String>> {
+    if !cache_path.is_file() {
+        return Ok(None);
+    }
+    let body = fs::read_to_string(cache_path)?;
+    Ok((!body.trim().is_empty()).then_some(body))
 }
 
 fn cached_etag(cache_path: &Path, metadata_path: &Path) -> Result<Option<String>> {
