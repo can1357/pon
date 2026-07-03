@@ -219,3 +219,5 @@ pon-conformance/corpus/cpython/hashlib_sha2.py
 pon-conformance/corpus/cpython/import_blocked_none.py
 pon-conformance/corpus/cpython/namespace_pkg.py
 pon-conformance/corpus/cpython/decimal_reexport.py
+pon-conformance/corpus/cpython/time_asctime_mktime.py
+pon-conformance/corpus/cpython/pyio_open.py
