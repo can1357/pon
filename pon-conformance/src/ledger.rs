@@ -475,8 +475,14 @@ approved_by = "orchestrator"
         let ledger = load_ledger(&root).expect("checked-in ledgers load");
         assert!(ledger.divergences.is_empty(), "J0 divergence ledger starts empty");
         let patterns = ledger.exclusions.iter().map(|entry| entry.pattern.as_str()).collect::<Vec<_>>();
-        assert_eq!(patterns, ["test_ctypes*", "test_capi*", "test_dis", "test_sys_settrace"]);
+        // The four J0-pin seed entries stay first, in file order; wave entries append after them.
+        assert!(
+            patterns.starts_with(&["test_ctypes*", "test_capi*", "test_dis", "test_sys_settrace"]),
+            "J0-pin seed exclusions must stay at the head of exclusions.toml, got {patterns:?}"
+        );
         assert!(ledger.exclusion_for("test_capi.test_abstract", "test_abstract").is_some());
+        // Wave-6 (owner-approved 2026-07-03) rows are carried too.
+        assert!(ledger.exclusion_for("test_xxlimited", "test_xxlimited").is_some());
         assert!(ledger.exclusion_for("test_grammar", "test_grammar").is_none());
     }
 }

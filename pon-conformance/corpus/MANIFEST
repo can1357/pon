@@ -200,3 +200,11 @@ pon-conformance/corpus/cpython/async_genexpr.py
 pon-conformance/corpus/cpython/gc_iterator_safety.py
 pon-conformance/corpus/cpython/ast_parse.py
 pon-conformance/corpus/cpython/gc_frame_window.py
+pon-conformance/corpus/cpython/bool_int_base.py
+pon-conformance/corpus/cpython/module_type_ctor.py
+pon-conformance/corpus/cpython/struct_time.py
+pon-conformance/corpus/cpython/os_environ.py
+pon-conformance/corpus/cpython/object_init_leniency.py
+pon-conformance/corpus/cpython/sys_monitoring_surface.py
+pon-conformance/corpus/cpython/str_maketrans_dict.py
+pon-conformance/corpus/cpython/colorize_ansi_colors.py

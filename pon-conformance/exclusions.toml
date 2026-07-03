@@ -55,3 +55,121 @@ pattern     = "test_sys_settrace"
 reason      = "interpreter-internals"
 note        = "asserts per-opcode/per-line settrace event sequences of the CPython eval loop; pon's compiled tiers have no equivalent opcode-event stream."
 approved_by = "J0-pin"
+
+# --- CT wave 6, ledger-triage lane (owner-approved 2026-07-03; proposal in ---
+# --- local://exclusion-proposal.md: roots source-verified, patterns        ---
+# --- audited against the 749-unit universe for zero unintended over-match) ---
+
+[[exclude]]
+pattern     = "test_importlib.extension*"
+reason      = "c-abi-boundary"
+note        = "test.test_importlib.extension.* exercises ExtensionFileLoader over real C extension .so files (_testsinglephase/_testmultiphase); pon has no C extension loading."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test_xxlimited"
+reason      = "c-abi-boundary"
+note        = "imports the xxlimited/xxlimited_35 limited-API demo C extensions (test_xxlimited.py:5-6); pure Python/C API surface pon does not present."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test_stable_abi_ctypes"
+reason      = "c-abi-boundary"
+note        = "audits the exported symbol table of CPython's stable C ABI via ctypes and _testcapi.get_feature_macros (test_stable_abi_ctypes.py:9-12); pon ships no C ABI."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test_bigmem"
+reason      = "c-abi-boundary"
+note        = "module-scope hard gate on the _testcapi C extension (test_bigmem.py:13); asserts CPython object-immortality via _testcapi.is_immortal."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test_importlib.frozen*"
+reason      = "interpreter-internals"
+note        = "tests FrozenImporter over the frozen-module table marshaled into the CPython binary; pon has no frozen-bytecode catalogue."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test_interpreters*"
+reason      = "interpreter-internals"
+note        = "PEP 734 subinterpreters over the private _interpreters/_interpchannels/_interpqueues C runtime modules (test_interpreters/utils.py:19-24); per-interpreter isolation is CPython C-runtime machinery with no pon analogue."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test__interpchannels"
+reason      = "interpreter-internals"
+note        = "directly tests the private _interpchannels C module (test__interpchannels.py:11)."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test_concurrent_futures.test_interpreter_pool"
+reason      = "interpreter-internals"
+note        = "InterpreterPoolExecutor requires the _interpreters C module via concurrent.interpreters; subinterpreter machinery has no pon analogue."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test_crossinterp"
+reason      = "interpreter-internals"
+note        = "cross-interpreter data marshalling via _testinternalcapi.get_crossinterp_data and _interpreters (test_crossinterp.py:12-13)."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test_opcache"
+reason      = "interpreter-internals"
+note        = "self-gates `check_impl_detail(cpython=False) -> SkipTest` (test_opcache.py:13-14) and drives the specializer via _testinternalcapi; adaptive-opcode caches are CPython eval-loop internals."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test_optimizer"
+reason      = "interpreter-internals"
+note        = "tier-2 uop optimizer rare-event counters via _testinternalcapi (test_optimizer.py:6); no pon analogue."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test_type_cache"
+reason      = "interpreter-internals"
+note        = "type-version-tag cache and specialization thresholds via _testcapi/_testinternalcapi (test_type_cache.py:13-18); CPython attribute-cache internals."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test_thread_local_bytecode"
+reason      = "interpreter-internals"
+note        = "free-threaded per-thread bytecode copies via _testinternalcapi.get_tlbc (test_thread_local_bytecode.py:11); CPython free-threading internals."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test_monitoring"
+reason      = "interpreter-internals"
+note        = "PEP 669 eval-loop event machinery driven through _testcapi (CodeLike, fire_event_*) and _testinternalcapi thresholds (test_monitoring.py:17-18); same class as the test_sys_settrace row. Stem rule also sweeps test.test_free_threading.test_monitoring (same internals under the GIL-less build; was `unsupported`, floor-neutral)."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test_fileutils"
+reason      = "interpreter-internals"
+note        = "exercises CPython's internal Python/fileutils.c helpers (normalize_path) via _testinternalcapi (test_fileutils.py:9)."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test_compileall"
+reason      = "interpreter-internals"
+note        = "asserts CPython .pyc bytecode-cache artifacts (magic numbers, PEP 552 invalidation); additionally hard-gated at import on _testsinglephase via test.test_importlib.util:18 (test_compileall.py:12)."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test_compiler_assemble"
+reason      = "interpreter-internals"
+note        = "drives CPython's internal assembler and executes raw 3.14 bytecode via test.support.bytecode_helper (_testinternalcapi); all 3 test ids are so gated."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test_tools.test_makefile"
+reason      = "platform-inapplicable"
+note        = "validates the CPython source-tree Makefile; self-gates check_impl_detail(cpython=True) plus Makefile existence (test_tools/test_makefile.py:12-15); pon never ships a CPython source build."
+approved_by = "owner 2026-07-03"
+
+[[exclude]]
+pattern     = "test_kqueue"
+reason      = "platform-inapplicable"
+note        = "select.kqueue is deliberately absent from pon's select module (native/select.rs:7-10) so selectors and test_kqueue take their documented fallback paths; a kqueue-enabled select is a build configuration pon never ships."
+approved_by = "owner 2026-07-03"

@@ -2,10 +2,11 @@
 # kind — plus `__mro__` ATTRIBUTE reads (not just `type.__dict__['__mro__']`).
 #
 # Deliberately absent (pon divergences documented at the descriptor in
-# descr.rs): `bool.__bases__` (pon's bool does not linearize through int),
-# `C.__bases__ = ...` assignment / deletion (CPython supports live re-basing;
-# pon raises the read-only getset AttributeError), and deep exception-MRO
-# chains (exception linearization is its own surface).
+# descr.rs): `C.__bases__ = ...` assignment / deletion (CPython supports live
+# re-basing; pon raises the read-only getset AttributeError), and deep
+# exception-MRO chains (exception linearization is its own surface).
+# `bool` linearizes through `int` like CPython; bool_int_base.py owns that
+# matrix.
 
 # --- builtin/static types; object is the empty-bases terminus. --------------
 print(int.__bases__)
