@@ -349,3 +349,78 @@ fn inst_spill_point(kind: &InstKind) -> bool {
 fn term_spill_point(term: &Terminator) -> bool {
     matches!(term, Terminator::Branch { .. } | Terminator::CondBranch { .. })
 }
+
+#[cfg(test)]
+mod tests {
+    use cranelift_codegen::ir::{self, AbiParam, types};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+    use pon_ir::ir::{BinOp, Block, BlockId, Function, Inst, InstKind, LocalId, PyConst, Terminator, Value};
+
+    use super::*;
+
+    fn compute_plan(function: &Function) -> Option<TempSpillPlan> {
+        let mut func = ir::Function::new();
+        func.signature.returns.push(AbiParam::new(types::I64));
+        let mut fctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut fctx);
+        let entry = builder.create_block();
+        builder.switch_to_block(entry);
+        let plan = TempSpillPlan::compute(&mut builder, function, types::I64)
+            .expect("fixture should build a spill plan");
+        builder.seal_all_blocks();
+        builder.finalize();
+        plan
+    }
+
+    #[test]
+    fn tracks_expression_temp_live_across_call() {
+        let function = Function {
+            name: "spill".to_owned(),
+            arity: 1,
+            is_coroutine: false,
+            is_generator: false,
+            is_async_generator: false,
+            params: Default::default(),
+            n_locals: 1,
+            blocks: vec![Block {
+                id: BlockId(0),
+                insts: vec![
+                    Inst::new(Value(0), InstKind::LoadLocal(LocalId(0))),
+                    Inst::new(Value(1), InstKind::Const(PyConst::Int(1))),
+                    Inst::new(Value(2), InstKind::Const(PyConst::Int(2))),
+                    Inst::new(
+                        Value(3),
+                        InstKind::BinaryOp {
+                            op: BinOp::Add,
+                            lhs: Value(1),
+                            rhs: Value(2),
+                        },
+                    ),
+                    Inst::new(
+                        Value(4),
+                        InstKind::Call {
+                            callee: Value(0),
+                            args: Vec::new(),
+                        },
+                    ),
+                    Inst::new(
+                        Value(5),
+                        InstKind::BuildTuple {
+                            elts: vec![Value(3), Value(4)],
+                        },
+                    ),
+                ],
+                term: Terminator::Return(Value(5)),
+            }],
+        };
+
+        let plan = compute_plan(&function).expect("call-crossing temp should allocate a spill pool");
+        assert_eq!(
+            plan.inst_spills.get(&(BlockId(0), 4)),
+            Some(&vec![Value(3)]),
+            "the binary-op temp must stay rooted across the call window"
+        );
+        assert_eq!(plan.pool.len(), 1, "one live-across temp needs one spill slot");
+        assert!(plan.term_spills.is_empty(), "this fixture has no truth-test spill sites");
+    }
+}

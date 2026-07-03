@@ -104,15 +104,6 @@ pub(crate) unsafe fn binary_op_with_flavor(
                     result
                 }
             }
-            (Some(_), None) | (None, Some(_))
-                if (op == BINARY_MATMUL || op == BINARY_POW)
-                    && !unsafe {
-                        crate::types::type_::is_payload_subclass_instance(a)
-                            || crate::types::type_::is_payload_subclass_instance(b)
-                    } =>
-            {
-                unsafe { abstract_op::raise_binary_unsupported(op, a, b, inplace) }
-            }
             _ => unsafe { abstract_op::binary_op_flavored(op, a, b, inplace) },
         }
     })
