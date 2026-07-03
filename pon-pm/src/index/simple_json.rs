@@ -308,6 +308,9 @@ fn fetch_simple_json(url: &str, etag: Option<&str>) -> Result<FetchOutcome> {
         .body_mut()
         .read_to_string()
         .map_err(|error| Error::Index(format!("failed to read simple index response `{url}`: {error}")))?;
+    if body.trim().is_empty() {
+        return Err(Error::Index(format!("simple index `{url}` returned an empty body")));
+    }
     Ok(FetchOutcome::Found {
         body,
         etag,
