@@ -10,7 +10,7 @@
 
 use core::ffi::c_int;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::mem;
 use std::ptr;
@@ -20,7 +20,7 @@ use crate::abi::{CodeInfo, ParamSpec, return_null_with_error};
 use crate::intern::{self, intern, resolve};
 use crate::object::{PyCodeFn, PyFunction, PyObject, PyObjectHeader, PyType, PyUnicode};
 use crate::thread_state::{pon_err_occurred, pon_err_set};
-use crate::types::{dict, list::PyList, tuple::PyTuple, type_::{self, PyClassDict}};
+use crate::types::{dict, list::PyList, method, tuple::PyTuple, type_::{self, PyClassDict}};
 
 static FUNCTION_RECORDS: LazyLock<Mutex<HashMap<usize, FunctionRecord>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -197,6 +197,17 @@ struct FunctionCodeMetadata {
 struct PyFunctionCodeObject {
     ob_base: PyObjectHeader,
     metadata: FunctionCodeMetadata,
+    /// co_* attribute replacements installed by `code.replace(**kwargs)`:
+    /// `(interned co_* name, replacement object)` pairs, last write wins.
+    /// Values are raw unrooted addresses — the accepted `FUNCTION_RECORDS`
+    /// defaults/closures pattern (code shells are Box-allocated and never
+    /// GC-traced).  `function_code_getattro` consults these before the
+    /// derived metadata views, so a replaced field reads back exactly the
+    /// object that was passed (CPython `code.replace` returns a new code
+    /// object with the named fields swapped; pon's shells carry no
+    /// executable payload, so swapping the visible metadata IS the whole
+    /// CPython-observable effect here).
+    overrides: Vec<(u32, *mut PyObject)>,
 }
 
 fn function_code_type() -> *mut PyType {
@@ -351,8 +362,151 @@ fn alloc_code_object(function: *mut PyObject) -> *mut PyObject {
     Box::into_raw(Box::new(PyFunctionCodeObject {
         ob_base: PyObjectHeader::new(function_code_type()),
         metadata: code_metadata_for_function(function),
+        overrides: Vec::new(),
     }))
     .cast::<PyObject>()
+}
+
+/// True when `object` is a function-code shell (`f.__code__`'s type).  The
+/// keyword binder uses this to tell `code.replace(co_flags=...)` apart from
+/// other natives named `replace` (`str.replace`).
+pub(crate) fn is_function_code_object(object: *mut PyObject) -> bool {
+    let object = crate::tag::untag_arg(object);
+    !object.is_null()
+        && crate::tag::is_heap(object)
+        && unsafe { (*object).ob_type } == function_code_type().cast_const()
+}
+
+/// co_* keyword names accepted by `code.replace(**kwargs)` — the CPython
+/// 3.14 signature.  Names without a derived view in
+/// `function_code_getattro` (`co_linetable`, `co_exceptiontable`) are still
+/// accepted and become readable through the override table, mirroring how a
+/// real replace round-trips every field.
+const CODE_REPLACE_KEYWORDS: &[&str] = &[
+    "co_argcount",
+    "co_posonlyargcount",
+    "co_kwonlyargcount",
+    "co_nlocals",
+    "co_stacksize",
+    "co_flags",
+    "co_firstlineno",
+    "co_code",
+    "co_consts",
+    "co_names",
+    "co_varnames",
+    "co_freevars",
+    "co_cellvars",
+    "co_filename",
+    "co_name",
+    "co_qualname",
+    "co_linetable",
+    "co_exceptiontable",
+];
+
+/// Validates one `code.replace` keyword value against the co_* field's
+/// CPython type contract (argument-clinic shape: ints for counts/flags,
+/// str for names, tuple for name/const tuples, bytes for code/tables).
+fn validate_code_replace_value(name_text: &str, value: *mut PyObject) -> Result<(), String> {
+    let probe = crate::tag::untag_arg(value);
+    let ok = match name_text {
+        "co_argcount" | "co_posonlyargcount" | "co_kwonlyargcount" | "co_nlocals" | "co_stacksize" | "co_flags"
+        | "co_firstlineno" => unsafe { crate::types::int::to_bigint_including_bool(probe) }.is_some(),
+        "co_filename" | "co_name" | "co_qualname" => unsafe { type_::unicode_text(probe) }.is_some(),
+        "co_consts" | "co_names" | "co_varnames" | "co_freevars" | "co_cellvars" => {
+            crate::abi::seq::has_tuple_storage(probe)
+        }
+        "co_code" | "co_linetable" | "co_exceptiontable" => unsafe { crate::types::int::type_name_is(probe, "bytes") },
+        _ => return Err(format!("replace() got an unexpected keyword argument '{name_text}'")),
+    };
+    if ok {
+        Ok(())
+    } else {
+        let expected = match name_text {
+            "co_filename" | "co_name" | "co_qualname" => "str",
+            "co_consts" | "co_names" | "co_varnames" | "co_freevars" | "co_cellvars" => "tuple",
+            "co_code" | "co_linetable" | "co_exceptiontable" => "bytes",
+            _ => "int",
+        };
+        Err(format!(
+            "replace() argument '{name_text}' must be {expected}, not {}",
+            unsafe { crate::types::dict::type_name(probe) }.unwrap_or("object")
+        ))
+    }
+}
+
+/// `code.replace(**kwargs)` — returns a NEW code shell with the named co_*
+/// fields swapped (CPython semantics on the metadata surface pon serves).
+/// Reached as a bound method: `argv[0]` is the receiver; keyword pairs ride
+/// a trailing `lazy_iter::PyKwMarker` appended by the binder arm, and the
+/// no-keyword spelling (`test.support.reset_code`'s `f.__code__.replace()`)
+/// arrives as the bare receiver.  Positional arguments are rejected like
+/// CPython's keyword-only signature.
+unsafe extern "C" fn function_code_replace_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc == 0 {
+        return return_null_with_error("code.replace() received a NULL argv");
+    }
+    // SAFETY: The caller passes a live argv window of length argc.
+    let args = unsafe { core::slice::from_raw_parts(argv, argc) };
+    let receiver = crate::tag::untag_arg(args[0]);
+    if !is_function_code_object(receiver) {
+        let message = "descriptor 'replace' for 'code' objects doesn't apply to another object";
+        let _ = unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+        return ptr::null_mut();
+    }
+    let mut pairs: &[(u32, *mut PyObject)] = &[];
+    let mut extra = &args[1..];
+    if let Some((&last, rest)) = extra.split_last() {
+        if let Some(marker_pairs) = unsafe { crate::types::lazy_iter::kw_marker_pairs(last) } {
+            pairs = marker_pairs;
+            extra = rest;
+        }
+    }
+    if !extra.is_empty() {
+        let message = "replace() takes no positional arguments";
+        let _ = unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+        return ptr::null_mut();
+    }
+    let code = unsafe { &*receiver.cast::<PyFunctionCodeObject>() };
+    let mut overrides = code.overrides.clone();
+    for &(name, value) in pairs {
+        let Some(name_text) = resolve(name) else {
+            return return_null_with_error("replace() keyword name is not interned");
+        };
+        if let Err(message) = validate_code_replace_value(&name_text, value) {
+            let _ = unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+            return ptr::null_mut();
+        }
+        match overrides.iter_mut().find(|(existing, _)| *existing == name) {
+            Some(slot) => slot.1 = value,
+            None => overrides.push((name, value)),
+        }
+    }
+    Box::into_raw(Box::new(PyFunctionCodeObject {
+        ob_base: PyObjectHeader::new(function_code_type()),
+        metadata: code.metadata.clone(),
+        overrides,
+    }))
+    .cast::<PyObject>()
+}
+
+/// Allocates the bound `code.replace` method for `function_code_getattro`
+/// (the map.rs `alloc_bound_native_method` shape).
+fn alloc_code_replace_method(receiver: *mut PyObject) -> *mut PyObject {
+    let name = intern("replace");
+    let function = unsafe {
+        crate::abi::pon_make_function(
+            function_code_replace_trampoline as *const u8,
+            crate::builtins::variadic_arity(),
+            name,
+        )
+    };
+    if function.is_null() {
+        return return_null_with_error("failed to allocate code.replace method");
+    }
+    match method::new_bound_method(function, receiver) {
+        Ok(bound) => bound.cast::<PyObject>(),
+        Err(message) => return_null_with_error(message),
+    }
 }
 
 fn cpython_code_flags(metadata: &FunctionCodeMetadata) -> u32 {
@@ -393,9 +547,18 @@ unsafe extern "C" fn function_code_getattro(code: *mut PyObject, name: *mut PyOb
         return return_null_with_error("code attribute name is not valid UTF-8");
     };
     let name_id = intern(name_text);
-    let metadata = unsafe { &(*code.cast::<PyFunctionCodeObject>()).metadata };
+    let code_ref = unsafe { &*code.cast::<PyFunctionCodeObject>() };
+    let metadata = &code_ref.metadata;
     if name_id == intern("__class__") {
         return function_code_type().cast::<PyObject>();
+    }
+    if name_id == intern("replace") {
+        return alloc_code_replace_method(code);
+    }
+    // `code.replace(**kwargs)` swaps win over every derived view below, so a
+    // replaced field reads back exactly the object that was installed.
+    if let Some(&(_, value)) = code_ref.overrides.iter().find(|&&(id, _)| id == name_id) {
+        return value;
     }
     if name_id == intern("co_flags") {
         return unsafe { crate::abi::pon_const_int(i64::from(cpython_code_flags(metadata))) };
@@ -606,9 +769,17 @@ fn function_attr_by_id(function: *mut PyObject, name_id: u32) -> Option<*mut PyO
         return Some(function_annotate(function).unwrap_or_else(|| unsafe { crate::abi::pon_none() }));
     }
     if name_id == intern("__get__") {
+        // CPython parity: builtin functions (`builtin_function_or_method`)
+        // implement no descriptor protocol, so a native function has no
+        // `__get__` at all (enum's `_is_descriptor` classifies them as plain
+        // members).  Falling through raises AttributeError in
+        // `function_getattro`.
+        if is_native_function(function) {
+            return None;
+        }
         // Python-visible descriptor protocol: `_is_descriptor`-style probes
         // (`hasattr(f, '__get__')`, enum's member classification) must see
-        // functions as descriptors.  Served as a bound native so
+        // USER functions as descriptors.  Served as a bound native so
         // `f.__get__(obj)` binds exactly like implicit method lookup.
         let carrier = unsafe {
             crate::abi::pon_make_function(
@@ -748,6 +919,19 @@ pub unsafe extern "C" fn function_setattro(function: *mut PyObject, name: *mut P
         pon_err_set("function attribute name is not valid UTF-8");
         return -1;
     };
+    if name_text == "__code__" {
+        // CPython `func_set_code`: assignment (and deletion) requires a code
+        // object; the accepted value lands in the attr dict below, which
+        // `function_getattro` consults before the derived `__code__` view, so
+        // `f.__code__ = f.__code__.replace(...)` (types.coroutine, reached at
+        // test.support import time) round-trips the stored object.  All three
+        // runtime code shells spell their type name `code`.
+        if value.is_null() || !unsafe { crate::types::int::type_name_is(crate::tag::untag_arg(value), "code") } {
+            let message = "__code__ must be set to a code object";
+            let _ = unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+            return -1;
+        }
+    }
     if name_text == "__defaults__" {
         return unsafe { store_defaults_override(function, value) };
     }
@@ -909,6 +1093,52 @@ pub fn clear_function_module(function: *mut PyObject) {
     }
 }
 
+/// Native (builtin) function side table: addresses of `PyFunction` objects
+/// that model CPython `builtin_function_or_method` values — module-level
+/// native functions (`time.localtime`, `math.log`) and the flat-pool
+/// builtins (`len`, `print`), recorded when a native module's attrs are
+/// installed (`import::create_module`).  CPython builtins are NOT
+/// descriptors: stored as a class attribute and read off an instance they
+/// come back bare (no bound `self`), and they expose no `__get__` — the
+/// `self.converter(...)` pattern in `logging.Formatter.formatTime` depends
+/// on exactly this.  Entries are raw unrooted addresses, the same accepted
+/// pattern as [`FUNCTION_RECORDS`]/[`FUNCTION_MODULES`]; the GC dealloc
+/// hook clears entries so a reused allocation address can never resurrect
+/// a stale native marking.
+static NATIVE_FUNCTIONS: LazyLock<Mutex<HashSet<usize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Record `function` as a native (builtin) function — a non-descriptor.
+/// Values that are not function objects are ignored, so module-attr walks
+/// can pass every installed value unfiltered.
+pub(crate) fn mark_native_function(function: *mut PyObject) {
+    if !is_function_object(function) {
+        return;
+    }
+    if let Ok(mut table) = NATIVE_FUNCTIONS.lock() {
+        table.insert(function as usize);
+    }
+}
+
+/// True when `function` was recorded as a native (builtin) function.
+#[must_use]
+pub(crate) fn is_native_function(function: *mut PyObject) -> bool {
+    if function.is_null() {
+        return false;
+    }
+    NATIVE_FUNCTIONS
+        .lock()
+        .map(|table| table.contains(&(function as usize)))
+        .unwrap_or(false)
+}
+
+/// Drop the native marking for a freed `function` allocation.
+pub fn clear_native_function(function: *mut PyObject) {
+    if let Ok(mut table) = NATIVE_FUNCTIONS.lock() {
+        table.remove(&(function as usize));
+    }
+}
+
 /// Lazy PEP 649 `__annotations__`: return the cached dict, or call
 /// `__annotate__(1)` (VALUE format) once and cache the result.  Functions
 /// without an annotate function cache an empty dict (CPython identity
@@ -972,9 +1202,16 @@ unsafe fn build_annotations_dict(names: &[u32], values: &[*mut PyObject]) -> Res
 }
 
 /// Descriptor binding for function attributes stored on Python classes.
+///
+/// Native (builtin) functions are exempt: CPython's
+/// `builtin_function_or_method` has a NULL `tp_descr_get`, so
+/// `class A: conv = time.localtime; A().conv` reads back the BARE function
+/// with no `self` prepended (`logging.Formatter.formatTime`'s
+/// `self.converter(record.created)` depends on this).  User functions keep
+/// full descriptor binding.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn function_descr_get(descr: *mut PyObject, obj: *mut PyObject, _owner: *mut PyObject) -> *mut PyObject {
-    if descr.is_null() || obj.is_null() {
+    if descr.is_null() || obj.is_null() || is_native_function(descr) {
         return descr;
     }
     match crate::types::method::new_bound_method(descr, obj) {
@@ -1443,6 +1680,17 @@ pub(crate) fn bind_native_keywords_for_name(
         // absent-vs-explicit-None distinction (base64.b16decode passes
         // `delete=` with a None table).
         "translate" => bind_trailing_marker_keywords(positional, keywords, "translate", &["delete"]),
+        // `code.replace(*, co_flags=..., co_filename=..., ...)`: the CPython
+        // 3.14 keyword-only signature, dispatched on the bound receiver so
+        // other natives named `replace` (`str.replace`) keep their current
+        // no-keyword path.  Keywords ride a trailing marker that
+        // `function_code_replace_trampoline` peels; binder failures are boxed
+        // as real TypeErrors (`replace() got an unexpected keyword argument`
+        // must match `except TypeError:` legs like every clinic rejection).
+        "replace" if positional.first().copied().is_some_and(is_function_code_object) => {
+            bind_trailing_marker_keywords(positional, keywords, "replace", CODE_REPLACE_KEYWORDS)
+                .map_err(raise_boxed_type_error)
+        }
         // `__import__(name, globals=None, locals=None, fromlist=(), level=0)`:
         // the vendored `encodings` package search function calls it with
         // `fromlist=`/`level=` keywords; absent optionals arrive as None and

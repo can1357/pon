@@ -224,7 +224,7 @@ fn format_str(value: &str, spec: &str) -> Result<String, String> {
     apply_text_width(&text, &parsed)
 }
 
-fn format_int(value: &BigInt, spec: &str) -> Result<String, String> {
+pub(crate) fn format_int(value: &BigInt, spec: &str) -> Result<String, String> {
     let parsed = ParsedFormatSpec::parse(spec)?;
     let ty = parsed.ty.unwrap_or('d');
     if parsed.z {

@@ -1966,6 +1966,7 @@ unsafe extern "C" fn finalize_function(object: *mut u8) {
     let function = object.cast::<PyFunction>();
     function::unregister_function_record(function.cast::<PyObject>());
     function::clear_function_module(function.cast::<PyObject>());
+    function::clear_native_function(function.cast::<PyObject>());
     // SAFETY: The GC calls this only for unreachable PyFunction allocations, so
     // no compiled code can concurrently read these interior-mutable owners.
     unsafe {
@@ -2048,6 +2049,13 @@ fn register_builtin_type_globals(runtime: &mut Runtime) {
         // identity checks in enum's `_find_new_` hold.
         install_none_attribute_support(runtime, object_type);
         install_builtin_type(runtime, "int", runtime.long_type, Some(builtin_int_new), object_type);
+        // `int.__format__` as a real int-formatting method: int SUBCLASS
+        // instances (IntEnum/IntFlag members, plain `class C(int)`) resolve
+        // it through the MRO ahead of `object.__format__`'s non-empty-spec
+        // TypeError, and enum's `member_type.__format__` class-dict copy
+        // picks up the genuine formatter.  Eager because instance lookups
+        // never pass `descr::synthetic_type_attr`'s lazy type-level trigger.
+        install_int_dunder_format(runtime, runtime.long_type);
         install_builtin_type(runtime, "str", runtime.unicode_type, Some(builtin_str_new), object_type);
 
         let bool_type = (*bool_::from_bool(false)).ob_type.cast_mut();
@@ -2490,6 +2498,41 @@ fn install_object_dunders(runtime: &mut Runtime, object_type: *mut PyType) {
         }
     }
     crate::sync::register_namespaced_type(object_type);
+}
+
+/// `int.__format__` on the builtin `int` type's dict: a plain function
+/// (unbound on class access, bound on instance access — the
+/// [`install_object_dunders`] carrier shape), so int-subclass instance
+/// lookups resolve the genuine int formatter ahead of `object.__format__`
+/// and enum's `member_type.__format__` class-dict copy (vendored
+/// enum.py:573-575) picks it up for IntEnum/IntFlag.  Lives here beside its
+/// sibling installers because allocation must go through the lock-free
+/// [`alloc_function`] — `register_builtin_type_globals` already holds the
+/// runtime, so `pon_make_function`'s `with_runtime` would deadlock.
+fn install_int_dunder_format(runtime: &Runtime, long_type: *mut PyType) {
+    if long_type.is_null() {
+        return;
+    }
+    let name = crate::intern::intern("__format__");
+    let Ok(function) = alloc_function(
+        runtime,
+        crate::types::int::int_dunder_format_entry as *const u8,
+        crate::builtins::variadic_arity(),
+        name,
+    ) else {
+        return;
+    };
+    unsafe {
+        let mut dict = (*long_type).tp_dict.cast::<type_::PyClassDict>();
+        if dict.is_null() {
+            dict = type_::new_namespace();
+            (*long_type).tp_dict = dict.cast::<PyObject>();
+        }
+        (&mut *dict).set(name, function.cast::<PyObject>());
+    }
+    // GC rooting for the namespace value; init-time, so no live AttrIC needs
+    // invalidation.
+    crate::sync::register_namespaced_type(long_type);
 }
 
 /// `object.__init__(self, *args)` — the MRO terminus.  Excess arguments are

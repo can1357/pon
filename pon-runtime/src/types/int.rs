@@ -383,6 +383,7 @@ pub unsafe fn int_instance_attr(object: *mut PyObject, name: u32) -> Option<*mut
         "__index__" | "__int__" | "__trunc__" | "__floor__" | "__ceil__" => {
             bound_int_method(object, name, int_identity_method)
         }
+        "__format__" => bound_int_method(object, name, int_dunder_format_entry),
         "numerator" | "real" => Some(from_bigint(value)),
         "denominator" => Some(from_bigint(BigInt::from(1))),
         "imag" => Some(from_bigint(BigInt::from(0))),
@@ -424,6 +425,83 @@ unsafe fn int_method_receiver(argv: *mut *mut PyObject, argc: usize, name: &str)
         None => Err(raise_type_error(&format!("int.{name}() receiver must be int"))),
     }
 }
+
+/// `int.__format__(self, format_spec)` — the real formatting method CPython
+/// exposes on `int`, so int SUBCLASS instances format through the int path:
+/// enum's `EnumType.__new__` copies `member_type.__format__` into every
+/// `IntEnum`/`IntFlag` class dict (vendored enum.py:573-575), and plain
+/// `class MyInt(int)` instances resolve it through the MRO ahead of
+/// `object.__format__` (whose non-empty-spec TypeError was the pre-fix
+/// failure).  The receiver reads through the payload-subclass pierce in
+/// `to_bigint_including_bool`, with an `__index__`-protocol fallback for
+/// subclass shapes whose canonical payload is not directly readable.
+pub(crate) unsafe extern "C" fn int_dunder_format_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 2 {
+        return raise_type_error(&format!(
+            "int.__format__() takes exactly one argument ({} given)",
+            argc.saturating_sub(1)
+        ));
+    }
+    // SAFETY: The caller passes a live argv window of length argc.
+    let args = unsafe { core::slice::from_raw_parts(argv, argc) };
+    let receiver = crate::tag::untag_arg(args[0]);
+    let spec_object = crate::tag::untag_arg(args[1]);
+    let Some(spec) = (unsafe { crate::types::type_::unicode_text(spec_object) }) else {
+        let got = unsafe { crate::types::dict::type_name(spec_object) }.unwrap_or("object");
+        return raise_type_error(&format!("__format__() argument must be str, not {got}"));
+    };
+    let Some(value) = (unsafe { format_receiver_bigint(receiver) }) else {
+        let got = unsafe { crate::types::dict::type_name(receiver) }.unwrap_or("object");
+        return raise_type_error(&format!(
+            "descriptor '__format__' requires a 'int' object but received a '{got}'"
+        ));
+    };
+    if spec.is_empty() {
+        // CPython `_PyLong_FormatAdvancedWriter`: an empty spec is `str(self)`
+        // WITH subclass `__str__` dispatch (`format(True)` is 'True').
+        let Ok(text) = crate::native::builtins_mod::try_str_text(receiver) else {
+            return ptr::null_mut();
+        };
+        // SAFETY: Runtime string allocation helper.
+        return unsafe { abi::pon_const_str(text.as_ptr(), text.len()) };
+    }
+    match crate::abi::format::format_int(&value, spec) {
+        // SAFETY: Runtime string allocation helper.
+        Ok(text) => unsafe { abi::pon_const_str(text.as_ptr(), text.len()) },
+        Err(message) => raise_value_error(&message),
+    }
+}
+
+/// Integer payload of an `int.__format__` receiver: exact `int`/`bool` and
+/// payload-embedding subclasses read directly; anything else falls back to
+/// the `__index__` protocol (nb_index slot, then the Python-level dunder) so
+/// int-subclass shapes without a readable canonical payload still format.
+unsafe fn format_receiver_bigint(receiver: *mut PyObject) -> Option<BigInt> {
+    if let Some(value) = unsafe { to_bigint_including_bool(receiver) } {
+        return Some(value);
+    }
+    let ty = unsafe { receiver.as_ref()?.ob_type.as_ref()? };
+    if let Some(slot) = unsafe { ty.tp_as_number.as_ref().and_then(|methods| methods.nb_index) } {
+        let result = unsafe { slot(receiver) };
+        if result.is_null() {
+            crate::thread_state::pon_err_clear();
+            return None;
+        }
+        return unsafe { to_bigint_including_bool(crate::tag::untag_arg(result)) };
+    }
+    let index = unsafe { crate::abstract_op::get_attr(receiver, crate::intern::intern("__index__")) };
+    if index.is_null() {
+        crate::thread_state::pon_err_clear();
+        return None;
+    }
+    let result = unsafe { abi::pon_call(index, ptr::null_mut(), 0) };
+    if result.is_null() {
+        crate::thread_state::pon_err_clear();
+        return None;
+    }
+    unsafe { to_bigint_including_bool(crate::tag::untag_arg(result)) }
+}
+
 
 unsafe extern "C" fn int_bit_length_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     match unsafe { int_method_receiver(argv, argc, "bit_length") } {

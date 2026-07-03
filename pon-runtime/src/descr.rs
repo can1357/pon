@@ -189,17 +189,50 @@ unsafe fn object_dunder_cmp_args<'a>(
     Err(unsafe { abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) })
 }
 
+/// `object.__hash__(self)` default: the runtime hash protocol (identity-based
+/// for plain heap instances, value hashes for builtins), `TypeError` for
+/// unhashable receivers — CPython `hash()` parity.
+unsafe extern "C" fn object_dunder_hash_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let message = if argv.is_null() && argc != 0 {
+        "object.__hash__ received a null argv pointer".to_owned()
+    } else if argc == 0 {
+        "descriptor '__hash__' of 'object' object needs an argument".to_owned()
+    } else if argc != 1 {
+        format!("expected 0 arguments, got {}", argc - 1)
+    } else {
+        let receiver = crate::tag::untag_arg(unsafe { *argv });
+        if receiver.is_null() {
+            return ptr::null_mut();
+        }
+        match unsafe { crate::types::dict::hash_object(receiver) } {
+            Ok(hash) => return unsafe { abi::pon_const_int(hash as i64) },
+            Err(message) => message,
+        }
+    };
+    unsafe { abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) }
+}
+
 /// Last-resort type-level fallback for `object`'s slot methods: a full-MRO
-/// miss on a TYPE receiver resolves `__eq__`/`__ne__` to fresh unbound
-/// natives implementing object's defaults, mirroring CPython where these
-/// wrappers live in `object`'s tp_dict at the end of every MRO
-/// (`MutableMapping.__ne__` in collections resolves there).  Kept out of any
-/// real tp_dict so instance-side rich-compare dispatch is untouched.
-unsafe fn object_slot_method_fallback(name_id: u32) -> *mut PyObject {
+/// miss on a TYPE receiver resolves `__eq__`/`__ne__`/`__hash__` to object's
+/// defaults, mirroring CPython where these wrappers live in `object`'s
+/// tp_dict at the end of every MRO (`MutableMapping.__ne__` in collections,
+/// `cls.__hash__ is None` in dataclasses).  Unhashable builtin layouts
+/// resolve `__hash__` to `None` itself — CPython stamps the marker on the
+/// type — so hashability probes stay truthful.  Kept out of any real tp_dict
+/// so instance-side dispatch (rich compare, `hash()`) is untouched.
+unsafe fn object_slot_method_fallback(ty: *mut PyType, name_id: u32) -> *mut PyObject {
     let entry = if name_id == intern::intern("__eq__") {
         object_dunder_eq_native as *const u8
     } else if name_id == intern::intern("__ne__") {
         object_dunder_ne_native as *const u8
+    } else if name_id == intern::intern("__hash__") {
+        let type_name = unsafe { (*ty).name() };
+        let unhashable = matches!(type_name, "dict" | "list" | "set" | "bytearray")
+            || unsafe { dict::type_is_dict_subclass(ty) };
+        if unhashable {
+            return unsafe { abi::pon_none() };
+        }
+        object_dunder_hash_native as *const u8
     } else {
         return ptr::null_mut();
     };
@@ -659,7 +692,7 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
         if !meta_descr.is_null() {
             return unsafe { descriptor_get(meta_descr, object, obj_ty) };
         }
-        let fallback = unsafe { object_slot_method_fallback(name_id) };
+        let fallback = unsafe { object_slot_method_fallback(object.cast::<PyType>(), name_id) };
         if !fallback.is_null() {
             return fallback;
         }
