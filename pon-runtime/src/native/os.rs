@@ -133,6 +133,14 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
             return Err(format!("failed to allocate {module}.getenv"));
         }
         attrs.push((intern("getenv"), getenv));
+        // `importlib.resources._common` keeps a direct `_os_remove=os.remove`
+        // reference for late finalization cleanup, so publish the CPython
+        // alias alongside the underlying `unlink` syscall wrapper.
+        let remove = unsafe { crate::abi::pon_make_function(os_unlink as *const u8, 1, intern("remove")) };
+        if remove.is_null() {
+            return Err(format!("failed to allocate {module}.remove"));
+        }
+        attrs.push((intern("remove"), remove));
         // `os.py`-level names never re-exported into `posix`: the portable
         // seek trio (see [`SEEK_MODES`]) and the null-device path (os.py
         // takes it from `posixpath.devnull`; `test.test_py_compile` probes

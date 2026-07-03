@@ -23,9 +23,9 @@
 //! - pon freezes nothing: `is_frozen` is always False, `_frozen_module_names`
 //!   is empty, and the frozen-object accessors raise CPython's exact
 //!   `No such frozen object named '...'` ImportError;
-//! - pon loads no extension modules: `extension_suffixes()` is empty (which
-//!   keeps `ExtensionFileLoader` inert in `_bootstrap_external`) and
-//!   `create_dynamic` raises a loud ImportError;
+//! - extension modules compiled against Pon's source C-API shim are loadable:
+//!   `extension_suffixes()` advertises Pon-compatible suffixes and
+//!   `create_dynamic` injects the C-API table before calling `PyInit_*`;
 //! - `source_hash` is the real keyed SipHash-1-3 from CPython's
 //!   `_Py_KeyedHash` (k0 = key, k1 = 0), byte-for-byte comparable with
 //!   CPython pycs; `pyc_magic_number_token` carries the CPython 3.14 value;
@@ -45,6 +45,7 @@
 //! `NotImplementedError` naming the gap.  Import always succeeds; only actual
 //! (de)serialization is refused, loudly.
 
+use std::path::PathBuf;
 use std::ptr;
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -98,6 +99,21 @@ fn str_object(text: &str) -> *mut PyObject {
 fn empty_list() -> *mut PyObject {
     // SAFETY: A zero-length window is valid for the list builder.
     unsafe { abi::seq::pon_build_list(ptr::null_mut(), 0) }
+}
+
+fn list_from_strings(values: &[&str]) -> *mut PyObject {
+    let mut items = Vec::with_capacity(values.len());
+    for value in values {
+        let object = str_object(value);
+        if object.is_null() {
+            return ptr::null_mut();
+        }
+        items.push(object);
+    }
+    let ptr = if items.is_empty() { ptr::null_mut() } else { items.as_mut_ptr() };
+    // SAFETY: `items` is live for the duration of the call; the runtime copies
+    // the pointer slice into list storage.
+    unsafe { abi::seq::pon_build_list(ptr, items.len()) }
 }
 
 fn raise_type_error(message: &str) -> *mut PyObject {
@@ -272,30 +288,36 @@ unsafe extern "C" fn override_multi_interp_check_entry(_argv: *mut *mut PyObject
 }
 
 // ---------------------------------------------------------------------------
-// Extension-module surface (pon loads no extension modules)
+// Extension-module surface for source-recompiled Pon C-API modules.
 
 unsafe extern "C" fn extension_suffixes_entry(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
-    empty_list()
+    list_from_strings(crate::capi::extension_suffixes())
 }
 
 unsafe extern "C" fn create_dynamic_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let args = unsafe { arg_window(argv, argc) };
-    let name = args
-        .first()
-        .map(|&spec| {
-            // SAFETY: Best-effort diagnostic read; errors are cleared below.
-            let name_object = unsafe { abi::object::pon_get_attr(untag(spec), intern("name"), ptr::null_mut()) };
-            if name_object.is_null() {
-                pon_err_clear();
-                return "<unknown>".to_owned();
-            }
-            unsafe { text_argument(untag(name_object)) }.unwrap_or_else(|| "<unknown>".to_owned())
-        })
-        .unwrap_or_else(|| "<unknown>".to_owned());
-    raise_kind_error_text(
-        ExceptionKind::ImportError,
-        &format!("pon cannot load extension module '{name}': dynamic loading is not supported"),
-    )
+    let Some(&spec) = args.first() else {
+        return raise_type_error("create_dynamic() takes exactly one argument (0 given)");
+    };
+    let spec = untag(spec);
+    let name_object = unsafe { abi::object::pon_get_attr(spec, intern("name"), ptr::null_mut()) };
+    if name_object.is_null() {
+        return ptr::null_mut();
+    }
+    let Some(name) = (unsafe { text_argument(untag(name_object)) }) else {
+        return raise_type_error("spec.name must be a str");
+    };
+    let origin_object = unsafe { abi::object::pon_get_attr(spec, intern("origin"), ptr::null_mut()) };
+    if origin_object.is_null() {
+        return ptr::null_mut();
+    }
+    let Some(origin) = (unsafe { text_argument(untag(origin_object)) }) else {
+        return raise_type_error("spec.origin must be a str");
+    };
+    match crate::capi::load_extension_module(&name, &PathBuf::from(origin)) {
+        Ok(module) => module,
+        Err(message) => raise_kind_error_text(ExceptionKind::ImportError, &message),
+    }
 }
 
 unsafe extern "C" fn exec_dynamic_entry(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {

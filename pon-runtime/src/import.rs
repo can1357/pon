@@ -723,6 +723,12 @@ fn resolve_module_by_name(name: &str) -> Result<*mut PyObject, String> {
         return Ok(module);
     }
 
+    if let Some(path) = find_extension_module(name) {
+        let module = crate::capi::load_extension_module(name, &path)?;
+        bind_child_to_parent(name, module);
+        return Ok(module);
+    }
+
     if is_unsupported_c_accelerated(name) {
         return Err(format!("module '{name}' is C-accelerated and unsupported"));
     }
@@ -888,6 +894,27 @@ fn find_source_module(name: &str) -> Option<SourceSpec> {
     (!namespace_portions.is_empty()).then(|| SourceSpec::namespace(namespace_portions))
 }
 
+fn find_extension_module(name: &str) -> Option<PathBuf> {
+    if name.is_empty() {
+        return None;
+    }
+    let mut relative = PathBuf::new();
+    for part in name.split('.') {
+        relative.push(part);
+    }
+    for root in search_roots() {
+        for suffix in crate::capi::extension_suffixes() {
+            let mut path = root.join(&relative).into_os_string();
+            path.push(suffix);
+            let path = PathBuf::from(path);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 /// Environment override for the vendored-stdlib search root (HANDOFF J0.4).
 /// When set it is authoritative: the value is used as the stdlib root if that
 /// directory exists, and the built-in locations are not consulted.
@@ -972,15 +999,21 @@ pub fn import_shadowed_from_source(name: &str) -> bool {
 }
 
 /// Package flag for a name pon's post-registry machinery would import:
-/// embedded AoT bodies first, then on-disk source roots — exactly
-/// `resolve_module_by_name`'s order past the curated registry. `None` means
-/// "not servable": curated-native and refused C-accelerated names are
-/// excluded (`BuiltinImporter` already claims the former through
-/// `_imp.is_builtin`; the latter must keep raising CPython's
+/// source-recompiled extensions, embedded AoT bodies, then on-disk source roots
+/// — exactly `resolve_module_by_name`'s order past the curated registry.
+/// `None` means "not servable": curated-native and refused C-accelerated names
+/// without a Pon extension file are excluded (`BuiltinImporter` already claims
+/// the former through `_imp.is_builtin`; the latter must keep raising CPython's
 /// `ModuleNotFoundError` when routed through `importlib`). Claim predicate of
 /// the `_pon_source_importer` meta-path finder (`crate::native::imp`).
 pub(crate) fn source_module_package_flag(name: &str) -> Option<bool> {
-    if crate::native::is_native_module(name) || is_unsupported_c_accelerated(name) {
+    if crate::native::is_native_module(name) {
+        return None;
+    }
+    if find_extension_module(name).is_some() {
+        return Some(false);
+    }
+    if is_unsupported_c_accelerated(name) {
         return None;
     }
     if let Some((is_package, _)) = embedded_module(name) {
@@ -990,7 +1023,7 @@ pub(crate) fn source_module_package_flag(name: &str) -> Option<bool> {
 }
 
 pub(crate) fn source_module_search_locations(name: &str) -> Option<Vec<PathBuf>> {
-    if crate::native::is_native_module(name) || is_unsupported_c_accelerated(name) {
+    if crate::native::is_native_module(name) || find_extension_module(name).is_some() || is_unsupported_c_accelerated(name) {
         return None;
     }
     find_source_module(name).and_then(|spec| spec.search_locations)

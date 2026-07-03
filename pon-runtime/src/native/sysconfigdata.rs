@@ -48,6 +48,11 @@ pub(super) const MODULE_NAME: &str = if cfg!(target_os = "macos") {
     "_sysconfigdata__unsupported_"
 };
 
+const PON_INCLUDEPY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/include");
+const PON_EXT_SUFFIX: &str = ".pon.so";
+#[cfg(test)]
+const PON_CAPI_BOOTSTRAP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/capi/pon_capi_bootstrap.c");
+
 /// One `build_time_vars` value.  CPython's generated dict holds strings and
 /// ints: flag vars parse as ints, while `sysconfig._ALWAYS_STR` names
 /// (`MACOSX_DEPLOYMENT_TARGET`) must stay strings.
@@ -68,18 +73,66 @@ fn build_time_vars() -> Vec<(&'static str, VarValue)> {
         // `_CONFIG_VARS['ABIFLAGS']` when `_PYTHON_PROJECT_BASE` is set;
         // mirrors `sys.abiflags` ('').
         ("ABIFLAGS", Str("")),
-        // `test.support.python_is_optimized` branches on it, and
-        // `_osx_support.customize_compiler` hard-derefs it on the
-        // extension-build path.
+        // Distutils-style build backends use this to link extension modules.
+        // The bootstrap source is linked into each extension so the loader can
+        // inject Pon's C-API table without relying on executable symbol export.
+        (
+            "BLDSHARED",
+            Str(if macos {
+                concat!(
+                    "clang -bundle -undefined dynamic_lookup -I",
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/include ",
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/capi/pon_capi_bootstrap.c"
+                )
+            } else {
+                concat!(
+                    "cc -shared -I",
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/include ",
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/capi/pon_capi_bootstrap.c"
+                )
+            }),
+        ),
+        // `test.support.check_sanitizer` reads it, and
+        // `_osx_support` scans it for `-isysroot`/`-arch`.  Pon compiles
+        // Python through Cranelift, not a C compiler.
         ("CC", Str(if macos { "clang" } else { "cc" })),
-        // THE ladder key: `test.support.check_sanitizer` reads it, and
-        // `_osx_support` scans it for `-isysroot`/`-arch`.  pon compiles
-        // Python through Cranelift, not a C compiler, so no flags is the
-        // honest value (no sanitizers, no universal-build args).
-        ("CFLAGS", Str("")),
+        // Extra compile flags for shared extension objects.
+        ("CCSHARED", Str(concat!("-I", env!("CARGO_MANIFEST_DIR"), "/include"))),
+        // Header search path for recompiled extensions including `Python.h`.
+        ("CFLAGS", Str(concat!("-I", env!("CARGO_MANIFEST_DIR"), "/include"))),
         // `test.support.check_sanitizer` / `check_bolt_optimized`: pon was
         // not configured with sanitizers or BOLT.
         ("CONFIG_ARGS", Str("")),
+        // Header roots used by sysconfig/distutils.
+        ("CONFINCLUDEPY", Str(PON_INCLUDEPY)),
+        // Extensions compiled for Pon's source C-API shim use a dedicated
+        // suffix so they never masquerade as CPython ABI wheels.
+        ("EXT_SUFFIX", Str(PON_EXT_SUFFIX)),
+        ("INCLUDEPY", Str(PON_INCLUDEPY)),
+        (
+            "LDSHARED",
+            Str(if macos {
+                concat!(
+                    "clang -bundle -undefined dynamic_lookup -I",
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/include ",
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/capi/pon_capi_bootstrap.c"
+                )
+            } else {
+                concat!(
+                    "cc -shared -I",
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/include ",
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/capi/pon_capi_bootstrap.c"
+                )
+            }),
+        ),
     ];
     if macos {
         // `_osx_support.get_platform_osx` (via `sysconfig.get_platform`):
@@ -97,12 +150,15 @@ fn build_time_vars() -> Vec<(&'static str, VarValue)> {
         // `test.support.python_is_optimized`: optimizing Python code is the
         // JIT's business, not a C-compiler flag; '' reports the conservative
         // "not a C-optimized build".
-        ("PY_CFLAGS", Str("")),
+        ("PY_CFLAGS", Str(concat!("-I", env!("CARGO_MANIFEST_DIR"), "/include"))),
         // `test.support.check_cflags_pgo`.
         ("PY_CFLAGS_NODIST", Str("")),
         // Module-scope `test.support.Py_GIL_DISABLED` and sysconfig's
         // `abi_thread` ('' for a GIL build): pon is not free-threaded.
         ("Py_GIL_DISABLED", Int(0)),
+        // Generic shared-library suffix and ABI tag used by sysconfig callers.
+        ("SHLIB_SUFFIX", Str(".so")),
+        ("SOABI", Str("pon-314")),
         // Module-scope `test.support.TEST_MODULES_ENABLED`: pon ships none
         // of CPython's C test modules (`_testcapi`, `_testinternalcapi`, …)
         // — exactly what a `--disable-test-modules` CPython reports — so
@@ -154,7 +210,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 mod tests {
     use std::ptr;
 
-    use super::{MODULE_NAME, VarValue, build_time_vars};
+    use super::{MODULE_NAME, PON_CAPI_BOOTSTRAP, PON_EXT_SUFFIX, PON_INCLUDEPY, VarValue, build_time_vars};
     use crate::abi::map::pon_dict_get_item;
     use crate::abi::{format_object_for_print, pon_const_str, pon_runtime_init};
     use crate::import::{pon_import_from, pon_import_name, reset_import_state_for_tests};
@@ -190,12 +246,31 @@ mod tests {
             "build_time_vars keys must be strictly sorted and unique"
         );
         let entry = |name: &str| vars.iter().find(|(key, _)| *key == name).map(|(_, value)| value);
-        for required in ["prefix", "exec_prefix", "CFLAGS", "CONFIG_ARGS", "Py_GIL_DISABLED", "TEST_MODULES", "WITH_DOC_STRINGS"] {
+        for required in [
+            "BLDSHARED",
+            "CFLAGS",
+            "CONFINCLUDEPY",
+            "CONFIG_ARGS",
+            "EXT_SUFFIX",
+            "INCLUDEPY",
+            "LDSHARED",
+            "Py_GIL_DISABLED",
+            "SHLIB_SUFFIX",
+            "SOABI",
+            "TEST_MODULES",
+            "WITH_DOC_STRINGS",
+            "exec_prefix",
+            "prefix",
+        ] {
             assert!(entry(required).is_some(), "missing audited key {required}");
         }
-        // The acceptance key stays a string, and the relocation probes stay
-        // equal to pon's sys.base_prefix/base_exec_prefix ('').
-        assert!(matches!(entry("CFLAGS"), Some(VarValue::Str(""))));
+        let expected_cflags = format!("-I{PON_INCLUDEPY}");
+        assert!(matches!(entry("CFLAGS"), Some(VarValue::Str(value)) if *value == expected_cflags.as_str()));
+        assert!(matches!(entry("CONFINCLUDEPY"), Some(VarValue::Str(value)) if *value == PON_INCLUDEPY));
+        assert!(matches!(entry("EXT_SUFFIX"), Some(VarValue::Str(value)) if *value == PON_EXT_SUFFIX));
+        assert!(matches!(entry("INCLUDEPY"), Some(VarValue::Str(value)) if *value == PON_INCLUDEPY));
+        assert!(matches!(entry("SHLIB_SUFFIX"), Some(VarValue::Str(".so"))));
+        assert!(matches!(entry("SOABI"), Some(VarValue::Str("pon-314"))));
         assert!(matches!(entry("prefix"), Some(VarValue::Str(""))));
         assert!(matches!(entry("exec_prefix"), Some(VarValue::Str(""))));
         assert!(matches!(entry("Py_GIL_DISABLED"), Some(VarValue::Int(0))));
@@ -227,9 +302,26 @@ mod tests {
             unsafe { pon_dict_get_item(vars_dict, key) }
         };
 
+        let includepy = lookup("INCLUDEPY");
+        assert!(!includepy.is_null(), "INCLUDEPY missing from build_time_vars");
+        assert_eq!(format_object_for_print(includepy).as_deref(), Ok(PON_INCLUDEPY));
+
+        let ext_suffix = lookup("EXT_SUFFIX");
+        assert!(!ext_suffix.is_null(), "EXT_SUFFIX missing from build_time_vars");
+        assert_eq!(format_object_for_print(ext_suffix).as_deref(), Ok(PON_EXT_SUFFIX));
+
+        let build_shared = lookup("BLDSHARED");
+        assert!(!build_shared.is_null(), "BLDSHARED missing from build_time_vars");
+        let build_shared = format_object_for_print(build_shared).expect("BLDSHARED text");
+        assert!(build_shared.contains(PON_CAPI_BOOTSTRAP), "BLDSHARED missing bootstrap source: {build_shared}");
+        let expected_builder = if cfg!(target_os = "macos") { "clang -bundle" } else { "cc -shared" };
+        assert!(build_shared.contains(expected_builder), "BLDSHARED missing expected linker form: {build_shared}");
+        assert!(build_shared.contains(PON_INCLUDEPY), "BLDSHARED missing Pon include path: {build_shared}");
+
         let cflags = lookup("CFLAGS");
         assert!(!cflags.is_null(), "CFLAGS missing from build_time_vars");
-        assert_eq!(format_object_for_print(cflags).as_deref(), Ok(""));
+        let expected_cflags = format!("-I{PON_INCLUDEPY}");
+        assert_eq!(format_object_for_print(cflags).as_deref(), Ok(expected_cflags.as_str()));
 
         let cc = lookup("CC");
         assert!(!cc.is_null(), "CC missing from build_time_vars");

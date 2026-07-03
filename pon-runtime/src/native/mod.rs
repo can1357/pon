@@ -33,6 +33,7 @@ pub(crate) mod io;
 pub(crate) mod itertools;
 mod math;
 mod opcode_;
+mod packaging_compat;
 mod os;
 pub(crate) mod pickle;
 mod posix;
@@ -54,6 +55,7 @@ mod time;
 mod tokenize;
 mod unicodedata;
 pub(crate) mod weakref;
+mod zlib;
 
 /// Sorted, insert-only lookup table of curated native modules: Python module
 /// name -> factory that allocates the module object and installs it into the
@@ -97,11 +99,14 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
     ("math", math::make_module),
     ("os", os::make_module),
     ("os.path", os::make_path_module),
+    ("packaging._manylinux", packaging_compat::make_manylinux_module),
+    ("packaging._musllinux", packaging_compat::make_musllinux_module),
     ("posix", posix::make_module),
     ("select", select::make_module),
     ("sys", sys::make_module),
     ("time", time::make_module),
     ("unicodedata", unicodedata::make_module),
+    ("zlib", zlib::make_module),
 ];
 
 /// Modules registered eagerly by [`register_modules`] at runtime init, in
