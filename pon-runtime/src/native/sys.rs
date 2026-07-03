@@ -6,8 +6,8 @@ use num_traits::ToPrimitive;
 
 use crate::abi::{pon_const_bool, pon_const_int, pon_const_str, pon_make_function, return_null_with_error};
 use crate::intern::intern;
-use crate::object::PyObject;
-
+use crate::object::{PyObject, PyType};
+use crate::types::type_::PyHeapInstance;
 use super::install_module;
 
 /// CPython `sys.platform` (PEP 11 build-time names): `"darwin"` on macOS and
@@ -109,6 +109,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         function_attr("setrecursionlimit", sys_setrecursionlimit),
         function_attr("getfilesystemencoding", sys_getfilesystemencoding),
         function_attr("getfilesystemencodeerrors", sys_getfilesystemencodeerrors),
+        function_attr("_clear_type_descriptors", sys_clear_type_descriptors),
         function_attr("audit", sys_audit),
         function_attr("addaudithook", sys_addaudithook),
         function_attr("getsizeof", sys_getsizeof),
@@ -1148,76 +1149,168 @@ fn implementation_cache_tag() -> String {
     format!("{IMPLEMENTATION_NAME}-{VERSION_INFO_MAJOR}{VERSION_INFO_MINOR}")
 }
 
-/// `sys.implementation` singleton (the flags/hash_info pattern: an opaque
-/// leaked object whose getattro serves the consumed field set).
+/// The `sys.implementation` singleton, backed by the same mutable
+/// `types.SimpleNamespace` type that vendored `types.py` re-exports via
+/// `type(sys.implementation)`.
 fn implementation_attr() -> Result<(u32, *mut PyObject), String> {
-    // Force the shared structseq singleton so the getattro below can never
+    // Force the shared structseq singleton so the seed below can never
     // observe a failed build: module init surfaces the error instead.
     version_info_object()?;
-    static IMPLEMENTATION_TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        let mut ty = crate::object::PyType::new(
-            std::ptr::null(),
-            "types.SimpleNamespace",
-            std::mem::size_of::<crate::object::PyObjectHeader>(),
-        );
-        ty.tp_getattro = Some(implementation_getattro);
-        ty.tp_repr = Some(implementation_repr);
-        Box::into_raw(Box::new(ty)) as usize
+    let ty = simple_namespace_type()?;
+    static IMPLEMENTATION: std::sync::LazyLock<Result<usize, String>> = std::sync::LazyLock::new(|| {
+        let object = empty_simple_namespace_instance(simple_namespace_type()?)?;
+        let name = unsafe { pon_const_str(IMPLEMENTATION_NAME.as_ptr(), IMPLEMENTATION_NAME.len()) };
+        if name.is_null() {
+            return Err("failed to allocate sys.implementation.name".to_owned());
+        }
+        simple_namespace_store_attr(object, "name", name)?;
+        let cache_tag_text = implementation_cache_tag();
+        let cache_tag = unsafe { pon_const_str(cache_tag_text.as_ptr(), cache_tag_text.len()) };
+        if cache_tag.is_null() {
+            return Err("failed to allocate sys.implementation.cache_tag".to_owned());
+        }
+        simple_namespace_store_attr(object, "cache_tag", cache_tag)?;
+        let version = version_info_object()?;
+        simple_namespace_store_attr(object, "version", version)?;
+        let hexversion = unsafe { pon_const_int(HEXVERSION) };
+        if hexversion.is_null() {
+            return Err("failed to allocate sys.implementation.hexversion".to_owned());
+        }
+        simple_namespace_store_attr(object, "hexversion", hexversion)?;
+        Ok(object as usize)
     });
-    static IMPLEMENTATION: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        Box::into_raw(Box::new(crate::object::PyObjectHeader::new(
-            *IMPLEMENTATION_TYPE as *mut crate::object::PyType,
-        ))) as usize
-    });
-    Ok((intern("implementation"), *IMPLEMENTATION as *mut PyObject))
+    let _ = ty;
+    IMPLEMENTATION.clone().map(|object| (intern("implementation"), object as *mut PyObject))
 }
 
-unsafe extern "C" fn implementation_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
-    let name = crate::tag::untag_arg(name);
-    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
-        crate::thread_state::pon_err_set("attribute name must be str");
-        return std::ptr::null_mut();
-    };
-    match name_text {
-        // SAFETY: Runtime allocation helpers return NULL with the error set.
-        "name" => unsafe { pon_const_str(IMPLEMENTATION_NAME.as_ptr(), IMPLEMENTATION_NAME.len()) },
-        "cache_tag" => {
-            let tag = implementation_cache_tag();
-            // SAFETY: As above; the String outlives the copying allocation.
-            unsafe { pon_const_str(tag.as_ptr(), tag.len()) }
+fn simple_namespace_type() -> Result<*mut PyType, String> {
+    static TYPE: std::sync::LazyLock<Result<usize, String>> = std::sync::LazyLock::new(|| {
+        let namespace = crate::types::type_::new_namespace();
+        if namespace.is_null() {
+            return Err("failed to allocate types.SimpleNamespace namespace".to_owned());
         }
-        // SAFETY: Integer boxing helper follows the NULL-sentinel contract.
-        "hexversion" => unsafe { pon_const_int(HEXVERSION) },
-        // Identity-shared with `sys.version_info`; the Err arm is unreachable
-        // in practice — `implementation_attr` forced the singleton at init.
-        "version" => match version_info_object() {
-            Ok(object) => object,
-            Err(message) => {
-                crate::thread_state::pon_err_set(&message);
-                std::ptr::null_mut()
+        class_str_attr(namespace, "__module__", "types")?;
+        class_str_attr(namespace, "__doc__", "A simple attribute-based namespace.")?;
+        let class =
+            unsafe { crate::types::type_::build_class_from_namespace("SimpleNamespace", &[], namespace, &[]) };
+        if class.is_null() {
+            let detail = crate::thread_state::pon_err_message().unwrap_or_else(|| "unknown error".to_owned());
+            crate::thread_state::pon_err_clear();
+            return Err(format!("failed to create types.SimpleNamespace: {detail}"));
+        }
+        unsafe {
+            if (*class).ob_type.is_null() {
+                (*class).ob_type = crate::abi::runtime_type_type().cast_const();
             }
-        },
-        // SAFETY: Raise helper with the interned attribute name.
-        _ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
+            let ty = class.cast::<PyType>();
+            (*ty).tp_new = Some(simple_namespace_new);
+            (*ty).tp_repr = Some(simple_namespace_repr);
+            (*ty).tp_str = Some(simple_namespace_repr);
+        }
+        Ok(class as usize)
+    });
+    TYPE.clone().map(|object| object as *mut PyType)
+}
+
+fn empty_simple_namespace_instance(ty: *mut PyType) -> Result<*mut PyObject, String> {
+    let object = unsafe { crate::types::type_::type_new(ty, std::ptr::null_mut(), std::ptr::null_mut()) };
+    if object.is_null() {
+        let detail = crate::thread_state::pon_err_message().unwrap_or_else(|| "unknown error".to_owned());
+        crate::thread_state::pon_err_clear();
+        Err(format!("failed to allocate types.SimpleNamespace instance: {detail}"))
+    } else {
+        Ok(object)
     }
 }
 
-/// The SimpleNamespace repr over the served fields in CPython's insertion
-/// order (name, cache_tag, version, hexversion); honest — the name and
-/// cache_tag VALUES diverge from the CPython oracle by design.
-unsafe extern "C" fn implementation_repr(_object: *mut PyObject) -> *mut PyObject {
-    let text = format!(
-        "namespace(name='{IMPLEMENTATION_NAME}', cache_tag='{}', version={}, hexversion={HEXVERSION})",
-        implementation_cache_tag(),
-        format_version_info(
-            VERSION_INFO_MAJOR,
-            VERSION_INFO_MINOR,
-            VERSION_INFO_MICRO,
-            VERSION_INFO_RELEASELEVEL,
-            VERSION_INFO_SERIAL,
-        ),
-    );
-    // SAFETY: Runtime string allocation helper; NULL on failure with the error set.
+fn simple_namespace_store_attr(object: *mut PyObject, name: &str, value: *mut PyObject) -> Result<(), String> {
+    if value.is_null() {
+        return Err(format!("refused to store NULL types.SimpleNamespace.{name}"));
+    }
+    let dict = unsafe { simple_namespace_dict(object)? };
+    unsafe { (&mut *dict).set(intern(name), value) };
+    Ok(())
+}
+
+unsafe fn simple_namespace_dict(object: *mut PyObject) -> Result<*mut crate::types::type_::PyClassDict, String> {
+    if object.is_null() {
+        return Err("types.SimpleNamespace instance is NULL".to_owned());
+    }
+    let instance = object.cast::<PyHeapInstance>();
+    let mut dict = unsafe { (*instance).dict };
+    if dict.is_null() {
+        dict = crate::types::type_::new_namespace();
+        if dict.is_null() {
+            return Err("failed to allocate types.SimpleNamespace.__dict__".to_owned());
+        }
+        unsafe { (*instance).dict = dict };
+    }
+    Ok(dict)
+}
+
+unsafe extern "C" fn simple_namespace_new(
+    cls: *mut PyType,
+    args: *mut PyObject,
+    kwargs: *mut PyObject,
+) -> *mut PyObject {
+    if cls.is_null() {
+        return return_null_with_error("types.SimpleNamespace constructor received NULL type");
+    }
+    let positional = match unsafe { crate::types::type_::positional_args_from_object(args) } {
+        Ok(args) => args,
+        Err(message) => return return_null_with_error(message),
+    };
+    if positional.len() > 1 {
+        return return_null_with_error("types.SimpleNamespace() takes at most 1 positional argument");
+    }
+    let object = match empty_simple_namespace_instance(cls) {
+        Ok(object) => object,
+        Err(message) => return return_null_with_error(message),
+    };
+    let mut pairs = Vec::new();
+    if let Some(&source) = positional.first() {
+        if unsafe { super::builtins_mod::collect_dict_update_pairs(source, &mut pairs) }.is_err() {
+            return std::ptr::null_mut();
+        }
+    }
+    if !kwargs.is_null() && unsafe { super::builtins_mod::collect_dict_update_pairs(kwargs, &mut pairs) }.is_err() {
+        return std::ptr::null_mut();
+    }
+    let dict = match unsafe { simple_namespace_dict(object) } {
+        Ok(dict) => dict,
+        Err(message) => return return_null_with_error(message),
+    };
+    for pair in pairs.chunks_exact(2) {
+        let key = crate::tag::untag_arg(pair[0]);
+        let Some(name) = (unsafe { crate::types::type_::unicode_text(key) }) else {
+            return return_null_with_error("types.SimpleNamespace keys must be strings");
+        };
+        unsafe { (&mut *dict).set(intern(name), pair[1]) };
+    }
+    object
+}
+
+unsafe extern "C" fn simple_namespace_repr(object: *mut PyObject) -> *mut PyObject {
+    use std::fmt::Write as _;
+
+    let text = if object.is_null() {
+        "namespace()".to_owned()
+    } else {
+        let instance = object.cast::<PyHeapInstance>();
+        let dict = unsafe { (*instance).dict };
+        if dict.is_null() {
+            "namespace()".to_owned()
+        } else {
+            let mut text = "namespace(".to_owned();
+            for (index, (name_id, value)) in unsafe { (&*dict).iter() }.enumerate() {
+                let separator = if index == 0 { "" } else { ", " };
+                let name = crate::intern::resolve(name_id).unwrap_or_else(|| format!("<interned:{name_id}>"));
+                let _ = write!(text, "{separator}{name}={}", super::builtins_mod::repr_text(value));
+            }
+            text.push(')');
+            text
+        }
+    };
     unsafe { pon_const_str(text.as_ptr(), text.len()) }
 }
 
@@ -1698,6 +1791,41 @@ fn path_attr() -> Result<(u32, *mut PyObject), String> {
     });
     PATH.clone().map(|object| (intern("path"), object as *mut PyObject))
 }
+// `sys._clear_type_descriptors(type)`.
+//
+// CPython 3.14 added this as a dataclasses-specific workaround for
+// `@dataclass(slots=True)`: after synthesizing the replacement slotted class,
+// it clears descriptor entries from the ORIGINAL class dict so lingering
+// references to that namespace do not keep the old class alive. pon has no
+// type-lookup cache here and never installs per-type `__weakref__`
+// descriptors, so the honest minimal surface is a best-effort delete of the
+// synthetic `__dict__` descriptor when present, a no-op miss for
+// `__weakref__`, and a type-version bump so any cached class-dict reads
+// re-resolve. `cls.__dict__` itself keeps working because type attribute
+// reads are served by `descr::generic_get_attr`'s special case, not by this
+// raw dict entry.
+unsafe extern "C" fn sys_clear_type_descriptors(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 1 {
+        return return_null_with_error(format!(
+            "_clear_type_descriptors() takes exactly 1 argument ({argc} given)"
+        ));
+    }
+    let ty = unsafe { call_args(argv, argc)[0] };
+    if ty.is_null() || unsafe { !crate::types::type_::is_type_object(ty) } {
+        return raise_type_error("argument must be a type");
+    }
+    let ty = ty.cast::<crate::object::PyType>();
+    let dict = unsafe { (*ty).tp_dict.cast::<crate::types::type_::PyClassDict>() };
+    if !dict.is_null() {
+        unsafe {
+            (&mut *dict).del(intern("__dict__"));
+            (&mut *dict).del(intern("__weakref__"));
+        }
+    }
+    crate::sync::type_modified(ty);
+    unsafe { crate::abi::pon_none() }
+}
+
 
 fn raise_type_error(message: &str) -> *mut PyObject {
     // SAFETY: Message bytes are a live UTF-8 slice for the duration of the call.
@@ -1707,4 +1835,45 @@ fn raise_type_error(message: &str) -> *mut PyObject {
 fn raise_value_error(message: &str) -> *mut PyObject {
     // SAFETY: Message bytes are a live UTF-8 slice for the duration of the call.
     unsafe { crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::thread_state::{pon_err_clear, test_state_lock};
+
+    fn init_runtime() {
+        assert_eq!(unsafe { crate::abi::pon_runtime_init() }, 0);
+        pon_err_clear();
+    }
+
+    #[test]
+    fn clear_type_descriptors_removes_heap_type_dunder_dict_descriptor() {
+        let _guard = test_state_lock();
+        init_runtime();
+        let namespace = crate::types::type_::new_namespace();
+        assert!(!namespace.is_null());
+        let object = crate::abi::runtime_global(intern("object")).expect("object type should exist");
+        let cls = unsafe { crate::types::type_::build_class_from_namespace("SlotsProbe", &[object], namespace, &[]) };
+        assert!(!cls.is_null());
+
+        let ty = cls.cast::<crate::object::PyType>();
+        let dict = unsafe { (*ty).tp_dict.cast::<crate::types::type_::PyClassDict>() };
+        assert!(!dict.is_null());
+        assert!(unsafe { (&*dict).get(intern("__dict__")) }.is_some());
+        assert!(unsafe { (&*dict).get(intern("__weakref__")) }.is_none());
+
+        let before = unsafe { (*ty).version() };
+        let mut argv = [cls];
+        let result = unsafe { sys_clear_type_descriptors(argv.as_mut_ptr(), argv.len()) };
+        assert_eq!(result, unsafe { crate::abi::pon_none() });
+        assert!(!crate::thread_state::pon_err_occurred());
+        assert!(unsafe { (&*dict).get(intern("__dict__")) }.is_none());
+        assert!(unsafe { (*ty).version() } > before);
+
+        let result = unsafe { sys_clear_type_descriptors(argv.as_mut_ptr(), argv.len()) };
+        assert_eq!(result, unsafe { crate::abi::pon_none() });
+        assert!(!crate::thread_state::pon_err_occurred());
+    }
 }

@@ -137,6 +137,16 @@ impl BuiltinCodec {
         }
     }
 
+    /// Vendored `encodings.<name>` module supplying the incremental and stream
+    /// helper classes paired with the builtin encode/decode functions.
+    fn encodings_module(self) -> &'static str {
+        match self {
+            BuiltinCodec::Utf8 => "encodings.utf_8",
+            BuiltinCodec::Ascii => "encodings.ascii",
+            BuiltinCodec::Latin1 => "encodings.latin_1",
+        }
+    }
+
     /// The quoted codec name used in CPython Unicode error messages.
     fn error_name(self) -> &'static str {
         match self {
@@ -698,6 +708,30 @@ fn build_builtin_codec_info(codec: BuiltinCodec) -> *mut PyObject {
     if codec_info_cls.is_null() {
         return ptr::null_mut();
     }
+    let encodings_name = intern(codec.encodings_module());
+    let encodings_module = match crate::import::cached_module(encodings_name) {
+        Some(module) => module,
+        // SAFETY: Non-empty `fromlist` keeps the dotted import result on the
+        // leaf module (`encodings.utf_8`), matching Python's `__import__`.
+        None => unsafe {
+            let fromlist = [intern("StreamWriter")];
+            crate::import::pon_import_name(encodings_name, fromlist.as_ptr(), fromlist.len(), 0)
+        },
+    };
+    if encodings_module.is_null() {
+        return ptr::null_mut();
+    }
+    let incremental_encoder = getattr(encodings_module, "IncrementalEncoder");
+    let incremental_decoder = getattr(encodings_module, "IncrementalDecoder");
+    let stream_reader = getattr(encodings_module, "StreamReader");
+    let stream_writer = getattr(encodings_module, "StreamWriter");
+    if incremental_encoder.is_null()
+        || incremental_decoder.is_null()
+        || stream_reader.is_null()
+        || stream_writer.is_null()
+    {
+        return ptr::null_mut();
+    }
     let name_obj = alloc_str_object(codec.canonical_name());
     if name_obj.is_null() {
         return ptr::null_mut();
@@ -705,10 +739,10 @@ fn build_builtin_codec_info(codec: BuiltinCodec) -> *mut PyObject {
     let mut call_args = [
         encode_fn as *mut PyObject,
         decode_fn as *mut PyObject,
-        none(),
-        none(),
-        none(),
-        none(),
+        incremental_encoder,
+        incremental_decoder,
+        stream_reader,
+        stream_writer,
         name_obj,
     ];
     // SAFETY: `call_args` is a live positional argument array.

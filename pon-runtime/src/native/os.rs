@@ -681,6 +681,7 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("open", os_open, crate::native::builtins_mod::VARIADIC_ARITY),
     ("putenv", os_putenv, 2),
     ("read", os_read, 2),
+    ("readinto", os_readinto, 2),
     ("readlink", os_readlink, 1),
     ("rmdir", os_rmdir, 1),
     ("scandir", os_scandir, 1),
@@ -988,6 +989,33 @@ unsafe extern "C" fn os_read(argv: *mut *mut PyObject, argc: usize) -> *mut PyOb
     // SAFETY: The syscall wrote `count` bytes; allocation copies them.
     unsafe { crate::abi::str_::pon_const_bytes(buffer.as_ptr(), count as usize) }
 }
+/// `os.readinto(fd, buffer)` over `read(2)`: fills a writable bytes-like
+/// target in place and returns the byte count. `_pyio.FileIO.readinto`
+/// dispatches here directly.
+unsafe extern "C" fn os_readinto(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.readinto expected two arguments");
+    }
+    let fd = match int_arg(args[0], "readinto fd") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    let target = crate::tag::untag_arg(args[1]);
+    let (dst, dst_len) = match writable_bytes_target(target) {
+        Ok(parts) => parts,
+        Err(error) => return error,
+    };
+    // SAFETY: `dst` addresses `dst_len` writable bytes for the syscall fill.
+    let count = unsafe { libc::read(fd as libc::c_int, dst.cast(), dst_len) };
+    if count < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    // SAFETY: Integer boxing helper follows the NULL-sentinel error contract.
+    unsafe { crate::abi::pon_const_int(count as i64) }
+}
+
 
 /// `os.write(fd, data)` over `write(2)`: returns the byte count written.
 unsafe extern "C" fn os_write(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -1063,6 +1091,50 @@ fn bytes_payload<'a>(object: *mut PyObject) -> Option<&'a [u8]> {
     } else {
         None
     }
+}
+/// Borrows a writable bytearray/memoryview target for `os.readinto`.
+fn writable_bytes_target(object: *mut PyObject) -> Result<(*mut u8, usize), *mut PyObject> {
+    if object.is_null() {
+        return Err(crate::abi::exc::raise_kind_error_text(
+            ExceptionKind::TypeError,
+            "readinto() argument must be read-write bytes-like object, not 'NoneType'",
+        ));
+    }
+    if crate::tag::is_small_int(object) {
+        return Err(crate::abi::exc::raise_kind_error_text(
+            ExceptionKind::TypeError,
+            "readinto() argument must be read-write bytes-like object, not int",
+        ));
+    }
+    // SAFETY: Heap pointer with a live header after the tag checks.
+    let ty = unsafe { (*object).ob_type };
+    if crate::types::bytearray_::is_bytearray_type(ty) {
+        let bytearray = unsafe { &mut *object.cast::<crate::types::bytearray_::PyByteArray>() };
+        return Ok((bytearray.bytes.as_mut_ptr(), bytearray.bytes.len()));
+    }
+    if crate::types::memoryview::is_memoryview_type(ty) {
+        let view = unsafe { &mut *object.cast::<crate::types::memoryview::PyMemoryView>() };
+        if view.released {
+            return Err(unsafe {
+                crate::abi::exc::pon_raise_value_error(
+                    crate::types::memoryview::RELEASED_ERROR.as_ptr(),
+                    crate::types::memoryview::RELEASED_ERROR.len(),
+                )
+            });
+        }
+        if view.readonly {
+            return Err(crate::abi::exc::raise_kind_error_text(
+                ExceptionKind::TypeError,
+                "readinto() argument must be read-write bytes-like object, not memoryview",
+            ));
+        }
+        return Ok((view.data, view.len));
+    }
+    let type_name = unsafe { crate::types::dict::type_name(object) }.unwrap_or("object");
+    Err(crate::abi::exc::raise_kind_error_text(
+        ExceptionKind::TypeError,
+        &format!("readinto() argument must be read-write bytes-like object, not {type_name}"),
+    ))
 }
 
 /// `os.unlink(path)` over `unlink(2)`.
