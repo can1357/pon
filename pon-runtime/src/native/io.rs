@@ -10,7 +10,8 @@ use crate::builtins;
 use crate::intern::intern;
 use crate::object::{PyLong, PyObject, PyObjectHeader, PyType};
 use crate::thread_state::{pon_err_clear, pon_err_message, pon_err_occurred, pon_err_set};
-use crate::types::{bytearray_, bytes_, method, type_};
+use crate::types::exc::ExceptionKind;
+use crate::types::{bytearray_, bytes_, memoryview, method, type_};
 
 use super::builtins_mod::VARIADIC_ARITY;
 use super::install_module;
@@ -174,6 +175,803 @@ fn binary_file_type() -> *mut PyType {
     *BINARY_FILE_TYPE as *mut PyType
 }
 
+// ---------------------------------------------------------------------------
+// BytesIO: real in-memory binary stream (CPython `Modules/_io/bytesio.c`
+// semantics).  The backing store is a growable byte vector; the position may
+// park beyond EOF (reads see empty, writes zero-fill the gap); live
+// `getbuffer()` exports pin the buffer size so exported window pointers stay
+// valid — size-changing operations raise BufferError exactly like CPython's
+// CHECK_EXPORTS.
+
+#[repr(C)]
+#[derive(Debug)]
+pub(crate) struct PyBytesIO {
+    /// Common object header; this field must remain first.
+    ob_base: PyObjectHeader,
+    /// Backing byte buffer. `None` is the closed state.
+    buffer: Option<Vec<u8>>,
+    /// Absolute stream position; `seek` may park it beyond the buffer end.
+    pos: usize,
+    /// Live buffer exports: `getbuffer()` views plus views derived from them
+    /// (copies, casts, step-1 slices).  While non-zero, `write`/`truncate`/
+    /// `close` raise BufferError, which keeps every exported data pointer
+    /// stable (the vector never reallocates in place-preserving writes).
+    exports: usize,
+}
+
+unsafe impl Send for PyBytesIO {}
+
+static BYTES_IO_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let mut ty = Box::new(PyType::new(
+        abi::runtime_type_type().cast_const(),
+        // Dotted tp_name (the `pickle.PickleBuffer` discipline): `repr(type)`
+        // shows the CPython path while `__name__` exposes the tail component.
+        "_io.BytesIO",
+        std::mem::size_of::<PyBytesIO>(),
+    ));
+    ty.tp_new = Some(bytesio_new);
+    ty.tp_getattro = Some(bytesio_getattro);
+    ty.tp_setattro = Some(bytesio_setattro);
+    ty.tp_iter = Some(bytesio_iter_slot);
+    ty.tp_iternext = Some(bytesio_iternext_slot);
+    // pon's `__module__` getter defaults static types to "builtins"; carry
+    // the CPython value (and the abstract-base `__doc__`) explicitly.
+    let namespace = type_::new_namespace();
+    if !namespace.is_null() {
+        let module = unsafe { pon_const_str("_io".as_ptr(), "_io".len()) };
+        let doc = "Buffered I/O implementation using an in-memory bytes buffer.";
+        let doc_object = unsafe { pon_const_str(doc.as_ptr(), doc.len()) };
+        if !module.is_null() && !doc_object.is_null() {
+            // SAFETY: Freshly allocated namespace box; values are live objects.
+            unsafe {
+                (*namespace).set(intern("__module__"), module);
+                (*namespace).set(intern("__doc__"), doc_object);
+            }
+            ty.tp_dict = namespace.cast::<PyObject>();
+        }
+    }
+    Box::into_raw(ty) as usize
+});
+
+fn bytesio_type() -> *mut PyType {
+    *BYTES_IO_TYPE as *mut PyType
+}
+
+unsafe fn as_bytesio<'a>(object: *mut PyObject) -> Option<&'a mut PyBytesIO> {
+    let object = crate::tag::untag_arg(object);
+    if object.is_null() {
+        return None;
+    }
+    // Non-forcing type fetch: before the first `_io` import no instance can
+    // exist (the pickle.rs `as_picklebuffer` discipline).
+    let ty = LazyLock::get(&BYTES_IO_TYPE).map_or(ptr::null(), |&ty| ty as *const PyType);
+    if ty.is_null() {
+        return None;
+    }
+    // SAFETY: NULL was rejected above; the type check gates the downcast.
+    (unsafe { (*object).ob_type } == ty).then(|| unsafe { &mut *object.cast::<PyBytesIO>() })
+}
+
+/// Registers one freshly-derived live view with its exporter (called from the
+/// `abi/str_.rs` view-derivation seams: `memoryview(view)`, `view.cast(..)`,
+/// step-1 slicing).  Only BytesIO exporters track the count; every other
+/// `base` ignores the signal.
+pub(crate) fn bytesio_export_cloned(base: *mut PyObject) {
+    if let Some(bio) = unsafe { as_bytesio(base) } {
+        bio.exports += 1;
+    }
+}
+
+/// Drops one live view on the `released: false -> true` transition (the
+/// `release()`/`__exit__` seams in `abi/str_.rs`).  Views dropped without an
+/// explicit release keep the export pinned — pon has no finalizers — which
+/// only ever errs toward CPython's stricter BufferError side.
+pub(crate) fn bytesio_export_released(base: *mut PyObject) {
+    if let Some(bio) = unsafe { as_bytesio(base) } {
+        bio.exports = bio.exports.saturating_sub(1);
+    }
+}
+
+/// BytesIO failure kinds, split by the CPython exception type they raise.
+#[derive(Debug)]
+enum BioError {
+    /// ValueError: closed-file operations, negative absolute seeks,
+    /// released-view sources.
+    Value(String),
+    /// TypeError: argument-type misuse.
+    Type(String),
+    /// BufferError: a live export pins the buffer size.
+    Buffer,
+}
+
+fn closed_bio() -> BioError {
+    BioError::Value("I/O operation on closed file.".to_owned())
+}
+
+fn raise_bio(error: BioError) -> *mut PyObject {
+    match error {
+        BioError::Value(message) => raise_value_error(&message),
+        BioError::Type(message) => raise_type_error(&message),
+        BioError::Buffer => crate::abi::exc::raise_kind_error_text(
+            ExceptionKind::BufferError,
+            "Existing exports of data: object cannot be re-sized",
+        ),
+    }
+}
+
+impl PyBytesIO {
+    /// Splits the open stream into `(buffer, position)` borrows, or the
+    /// closed-file ValueError.
+    fn open_parts(&mut self) -> Result<(&mut Vec<u8>, &mut usize), BioError> {
+        let Self { buffer, pos, .. } = self;
+        buffer.as_mut().map(|buffer| (buffer, pos)).ok_or_else(closed_bio)
+    }
+
+    /// `read`/`read1`: up to `size` bytes from the current position
+    /// (`None`/negative reads to EOF); a position parked past EOF reads empty
+    /// without moving.
+    fn read_bytes(&mut self, size: Option<i64>) -> Result<Vec<u8>, BioError> {
+        let (buffer, pos) = self.open_parts()?;
+        let start = (*pos).min(buffer.len());
+        let available = buffer.len() - start;
+        let count = match size {
+            Some(size) if size >= 0 => (size as usize).min(available),
+            _ => available,
+        };
+        let out = buffer[start..start + count].to_vec();
+        *pos += count;
+        Ok(out)
+    }
+
+    /// `readline`: bytes through the next `\n` (inclusive), capped by `size`.
+    fn read_line(&mut self, size: Option<i64>) -> Result<Vec<u8>, BioError> {
+        let (buffer, pos) = self.open_parts()?;
+        let start = (*pos).min(buffer.len());
+        let available = buffer.len() - start;
+        let limit = match size {
+            Some(size) if size >= 0 => (size as usize).min(available),
+            _ => available,
+        };
+        let window = &buffer[start..start + limit];
+        let count = window.iter().position(|&byte| byte == b'\n').map_or(limit, |at| at + 1);
+        let out = window[..count].to_vec();
+        *pos += count;
+        Ok(out)
+    }
+
+    /// `write`: overwrite/extend at the current position, zero-filling any
+    /// gap left by a past-EOF seek.  Checked closed -> exports first, exactly
+    /// like CPython's `write_bytes` (BufferError wins over the argument's
+    /// TypeError, which the entry parses afterwards).
+    fn write_bytes(&mut self, data: &[u8]) -> Result<usize, BioError> {
+        if self.buffer.is_none() {
+            return Err(closed_bio());
+        }
+        if self.exports > 0 {
+            return Err(BioError::Buffer);
+        }
+        let (buffer, pos) = self.open_parts()?;
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let end = *pos + data.len();
+        if end > buffer.len() {
+            buffer.resize(end, 0);
+        }
+        buffer[*pos..end].copy_from_slice(data);
+        *pos = end;
+        Ok(data.len())
+    }
+
+    /// `readinto`: fill `dst_len` bytes at `dst`, returning the count read.
+    /// Raw-pointer memmove because the destination may alias this very
+    /// buffer (`b.readinto(b.getbuffer())`).
+    fn read_into_raw(&mut self, dst: *mut u8, dst_len: usize) -> Result<usize, BioError> {
+        let (buffer, pos) = self.open_parts()?;
+        let start = (*pos).min(buffer.len());
+        let count = dst_len.min(buffer.len() - start);
+        if count > 0 {
+            // SAFETY: `dst` covers `dst_len >= count` writable bytes (the
+            // entry validated the target); overlapping ranges are defined
+            // under `ptr::copy`.
+            unsafe { ptr::copy(buffer.as_ptr().add(start), dst, count) };
+        }
+        *pos += count;
+        Ok(count)
+    }
+
+    /// `seek`: absolute negative positions raise; cur/end-relative results
+    /// clamp at zero (CPython `_io_BytesIO_seek_impl`).
+    fn seek_to(&mut self, offset: i64, whence: i64) -> Result<usize, BioError> {
+        let (buffer, pos) = self.open_parts()?;
+        let target = match whence {
+            0 => {
+                if offset < 0 {
+                    return Err(BioError::Value(format!("negative seek value {offset}")));
+                }
+                offset
+            }
+            1 => (*pos as i64).saturating_add(offset).max(0),
+            2 => (buffer.len() as i64).saturating_add(offset).max(0),
+            _ => {
+                return Err(BioError::Value(format!("invalid whence ({whence}, should be 0, 1 or 2)")));
+            }
+        };
+        *pos = target as usize;
+        Ok(*pos)
+    }
+
+    /// `truncate`: shrink-only resize that returns the REQUESTED size and
+    /// never moves the position (CPython contract).
+    fn truncate_to(&mut self, size: Option<i64>) -> Result<i64, BioError> {
+        if self.buffer.is_none() {
+            return Err(closed_bio());
+        }
+        if self.exports > 0 {
+            return Err(BioError::Buffer);
+        }
+        let (buffer, pos) = self.open_parts()?;
+        let size = size.unwrap_or(*pos as i64);
+        if size < 0 {
+            return Err(BioError::Value(format!("negative size value {size}")));
+        }
+        if (size as usize) < buffer.len() {
+            buffer.truncate(size as usize);
+        }
+        Ok(size)
+    }
+}
+
+/// Copies out a bytes-like argument (bytes, bytearray, memoryview,
+/// PickleBuffer) with the CPython diagnostics for released views and
+/// non-buffer types.
+fn bytes_like_bytes(object: *mut PyObject) -> Result<Vec<u8>, BioError> {
+    let object = crate::tag::untag_arg(object);
+    if object.is_null() {
+        return Err(BioError::Type("a bytes-like object is required, not 'NoneType'".to_owned()));
+    }
+    // SAFETY: `object` is a live untagged pointer; type checks gate downcasts.
+    let ty = unsafe { (*object).ob_type };
+    if bytes_::is_bytes_type(ty) {
+        let bytes = unsafe { &*object.cast::<bytes_::PyBytes>() };
+        return Ok(unsafe { bytes.as_slice() }.to_vec());
+    }
+    if bytearray_::is_bytearray_type(ty) {
+        let bytes = unsafe { &*object.cast::<bytearray_::PyByteArray>() };
+        return Ok(bytes.as_slice().to_vec());
+    }
+    if memoryview::is_memoryview_type(ty) {
+        let view = unsafe { &*object.cast::<memoryview::PyMemoryView>() };
+        if view.released {
+            return Err(BioError::Value(memoryview::RELEASED_ERROR.to_owned()));
+        }
+        return Ok(unsafe { view.as_slice() }.to_vec());
+    }
+    if let Some(result) = crate::native::pickle::picklebuffer_bytes(object) {
+        return result.map_err(BioError::Value);
+    }
+    let type_name = unsafe { crate::types::dict::type_name(object) }.unwrap_or("object");
+    Err(BioError::Type(format!("a bytes-like object is required, not '{type_name}'")))
+}
+
+/// Integer argument with CPython's index-coercion diagnostic.
+fn bio_index_arg(object: *mut PyObject) -> Result<i64, BioError> {
+    let object = crate::tag::untag_arg(object);
+    if object.is_null() {
+        return Err(BioError::Type("'NoneType' object cannot be interpreted as an integer".to_owned()));
+    }
+    // SAFETY: Untagged live pointer; the name check gates the PyLong read.
+    let ty = unsafe { (*object).ob_type };
+    if !ty.is_null() && unsafe { (*ty).name() == "int" || (*ty).name() == "bool" } {
+        return Ok(unsafe { (*object.cast::<PyLong>()).value });
+    }
+    let type_name = unsafe { crate::types::dict::type_name(object) }.unwrap_or("object");
+    Err(BioError::Type(format!("'{type_name}' object cannot be interpreted as an integer")))
+}
+
+/// Optional size argument (`read`/`readline`/`truncate`): missing or `None`
+/// pass through; anything non-integer raises CPython's clinic diagnostic.
+fn bio_optional_size(object: Option<*mut PyObject>) -> Result<Option<i64>, BioError> {
+    let Some(object) = object else {
+        return Ok(None);
+    };
+    let object = crate::tag::untag_arg(object);
+    if is_none(object) {
+        return Ok(None);
+    }
+    bio_index_arg(object).map(Some).map_err(|_| {
+        let type_name = unsafe { crate::types::dict::type_name(object) }.unwrap_or("object");
+        BioError::Type(format!("argument should be integer or None, not '{type_name}'"))
+    })
+}
+
+/// `tp_new` for `_io.BytesIO(initial_bytes=b"")`.
+unsafe extern "C" fn bytesio_new(_cls: *mut PyType, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    let positional = match unsafe { type_::positional_args_from_object(args) } {
+        Ok(args) => args,
+        Err(message) => {
+            pon_err_set(message);
+            return ptr::null_mut();
+        }
+    };
+    if positional.len() > 1 {
+        return raise_type_error(&format!("BytesIO() takes at most 1 argument ({} given)", positional.len()));
+    }
+    let mut initial = positional.first().copied();
+    if !kwargs.is_null() {
+        let entries = match unsafe { crate::types::dict::dict_entries_snapshot(kwargs) } {
+            Ok(entries) => entries,
+            Err(message) => return raise_type_error(&message),
+        };
+        for entry in entries {
+            let Some(key) = (unsafe { type_::unicode_text(entry.key) }) else {
+                return raise_type_error("keywords must be strings");
+            };
+            if key != "initial_bytes" {
+                return raise_type_error(&format!("'{key}' is an invalid keyword argument for BytesIO()"));
+            }
+            if initial.is_some() {
+                return raise_type_error("argument for BytesIO() given by name ('initial_bytes') and position (1)");
+            }
+            initial = Some(entry.value);
+        }
+    }
+    let data = match initial.map(crate::tag::untag_arg) {
+        None => Vec::new(),
+        Some(object) if is_none(object) => Vec::new(),
+        Some(object) => match bytes_like_bytes(object) {
+            Ok(data) => data,
+            Err(error) => return raise_bio(error),
+        },
+    };
+    Box::into_raw(Box::new(PyBytesIO {
+        ob_base: PyObjectHeader::new(bytesio_type()),
+        buffer: Some(data),
+        pos: 0,
+        exports: 0,
+    }))
+    .cast::<PyObject>()
+}
+
+unsafe extern "C" fn bytesio_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(attr) = (unsafe { type_::unicode_text(name) }) else {
+        return raise_type_error("BytesIO attribute name must be str");
+    };
+    let Some(bio) = (unsafe { as_bytesio(object) }) else {
+        return raise_type_error("BytesIO method receiver is not a BytesIO");
+    };
+    match attr {
+        "closed" => unsafe { abi::number::pon_const_bool(i32::from(bio.buffer.is_none())) },
+        "read" | "read1" => bound_file_method(object, attr, bytesio_read_method),
+        "readline" => bound_file_method(object, attr, bytesio_readline_method),
+        "readlines" => bound_file_method(object, attr, bytesio_readlines_method),
+        "readinto" | "readinto1" => bound_file_method(object, attr, bytesio_readinto_method),
+        "write" => bound_file_method(object, attr, bytesio_write_method),
+        "writelines" => bound_file_method(object, attr, bytesio_writelines_method),
+        "seek" => bound_file_method(object, attr, bytesio_seek_method),
+        "tell" => bound_file_method(object, attr, bytesio_tell_method),
+        "truncate" => bound_file_method(object, attr, bytesio_truncate_method),
+        "flush" => bound_file_method(object, attr, bytesio_flush_method),
+        "close" => bound_file_method(object, attr, bytesio_close_method),
+        "getvalue" => bound_file_method(object, attr, bytesio_getvalue_method),
+        "getbuffer" => bound_file_method(object, attr, bytesio_getbuffer_method),
+        "readable" | "writable" | "seekable" => bound_file_method(object, attr, bytesio_true_flag_method),
+        "isatty" => bound_file_method(object, attr, bytesio_isatty_method),
+        "fileno" => bound_file_method(object, attr, bytesio_fileno_method),
+        "detach" => bound_file_method(object, attr, bytesio_detach_method),
+        "__enter__" => bound_file_method(object, attr, bytesio_enter_method),
+        "__exit__" => bound_file_method(object, attr, bytesio_exit_method),
+        "__iter__" => bound_file_method(object, attr, bytesio_iter_method),
+        "__next__" => bound_file_method(object, attr, bytesio_next_method),
+        _ => raise_attribute_error(attr),
+    }
+}
+
+/// BytesIO instances carry no writable attributes (CPython: no `__dict__`).
+unsafe extern "C" fn bytesio_setattro(object: *mut PyObject, name: *mut PyObject, _value: *mut PyObject) -> core::ffi::c_int {
+    let attr = unsafe { type_::unicode_text(name) }.unwrap_or("?");
+    let type_name = unsafe { crate::types::dict::type_name(crate::tag::untag_arg(object)) }.unwrap_or("_io.BytesIO");
+    let _ = crate::abi::exc::raise_attribute_error_text(&format!("'{type_name}' object has no attribute '{attr}'"));
+    -1
+}
+
+unsafe extern "C" fn bytesio_iter_slot(object: *mut PyObject) -> *mut PyObject {
+    let Some(bio) = (unsafe { as_bytesio(object) }) else {
+        return raise_type_error("BytesIO iterator receiver is not a BytesIO");
+    };
+    if bio.buffer.is_none() {
+        return raise_bio(closed_bio());
+    }
+    object
+}
+
+unsafe extern "C" fn bytesio_iternext_slot(object: *mut PyObject) -> *mut PyObject {
+    let Some(bio) = (unsafe { as_bytesio(object) }) else {
+        return raise_type_error("BytesIO iterator receiver is not a BytesIO");
+    };
+    match bio.read_line(None) {
+        Ok(bytes) if bytes.is_empty() => unsafe { abi::pon_raise_stop_iteration(ptr::null_mut()) },
+        Ok(bytes) => unsafe { abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) },
+        Err(error) => raise_bio(error),
+    }
+}
+
+/// Shared entry preamble: bounds-checks arity and downcasts the receiver.
+unsafe fn bytesio_method_args<'a>(
+    argv: *mut *mut PyObject,
+    argc: usize,
+    name: &str,
+    max_extra: usize,
+) -> Result<(&'a mut PyBytesIO, &'a [*mut PyObject]), *mut PyObject> {
+    let args = match unsafe { method_args(argv, argc, name) } {
+        Ok(args) => args,
+        Err(message) => return Err(raise_type_error(&message)),
+    };
+    if args.len() > 1 + max_extra {
+        return Err(raise_type_error(&format!(
+            "{name}() expected at most {max_extra} arguments, got {}",
+            args.len() - 1
+        )));
+    }
+    let Some(bio) = (unsafe { as_bytesio(args[0]) }) else {
+        return Err(raise_type_error(&format!("{name}() receiver is not a BytesIO")));
+    };
+    Ok((bio, &args[1..]))
+}
+
+unsafe extern "C" fn bytesio_read_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (bio, args) = match unsafe { bytesio_method_args(argv, argc, "read", 1) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    let size = match bio_optional_size(args.first().copied()) {
+        Ok(size) => size,
+        Err(error) => return raise_bio(error),
+    };
+    match bio.read_bytes(size) {
+        Ok(bytes) => unsafe { abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) },
+        Err(error) => raise_bio(error),
+    }
+}
+
+unsafe extern "C" fn bytesio_readline_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (bio, args) = match unsafe { bytesio_method_args(argv, argc, "readline", 1) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    let size = match bio_optional_size(args.first().copied()) {
+        Ok(size) => size,
+        Err(error) => return raise_bio(error),
+    };
+    match bio.read_line(size) {
+        Ok(bytes) => unsafe { abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) },
+        Err(error) => raise_bio(error),
+    }
+}
+
+unsafe extern "C" fn bytesio_readlines_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (bio, args) = match unsafe { bytesio_method_args(argv, argc, "readlines", 1) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    let hint = match bio_optional_size(args.first().copied()) {
+        Ok(hint) => hint,
+        Err(error) => return raise_bio(error),
+    };
+    let hint = hint.filter(|&hint| hint > 0);
+    let mut lines = Vec::new();
+    let mut total = 0_usize;
+    loop {
+        match bio.read_line(None) {
+            Ok(bytes) if bytes.is_empty() => break,
+            Ok(bytes) => {
+                total += bytes.len();
+                let line = unsafe { abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) };
+                if line.is_null() {
+                    return ptr::null_mut();
+                }
+                lines.push(line);
+                if hint.is_some_and(|hint| total as i64 >= hint) {
+                    break;
+                }
+            }
+            Err(error) => return raise_bio(error),
+        }
+    }
+    super::builtins_mod::alloc_list(lines)
+}
+
+unsafe extern "C" fn bytesio_readinto_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (bio, args) = match unsafe { bytesio_method_args(argv, argc, "readinto", 1) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    let Some(&target) = args.first() else {
+        return raise_type_error("readinto() takes exactly one argument (0 given)");
+    };
+    let target = crate::tag::untag_arg(target);
+    if target.is_null() {
+        return raise_type_error("readinto() argument must be read-write bytes-like object, not 'NoneType'");
+    }
+    // SAFETY: Untagged live pointer; type checks gate each downcast.
+    let ty = unsafe { (*target).ob_type };
+    let (dst, dst_len) = if bytearray_::is_bytearray_type(ty) {
+        let bytearray = unsafe { &mut *target.cast::<bytearray_::PyByteArray>() };
+        (bytearray.bytes.as_mut_ptr(), bytearray.bytes.len())
+    } else if memoryview::is_memoryview_type(ty) {
+        let view = unsafe { &mut *target.cast::<memoryview::PyMemoryView>() };
+        if view.released {
+            return raise_value_error(memoryview::RELEASED_ERROR);
+        }
+        if view.readonly {
+            return raise_type_error("readinto() argument must be read-write bytes-like object, not memoryview");
+        }
+        (view.data, view.len)
+    } else {
+        let type_name = unsafe { crate::types::dict::type_name(target) }.unwrap_or("object");
+        return raise_type_error(&format!(
+            "readinto() argument must be read-write bytes-like object, not {type_name}"
+        ));
+    };
+    match bio.read_into_raw(dst, dst_len) {
+        Ok(count) => unsafe { abi::pon_const_int(count as i64) },
+        Err(error) => raise_bio(error),
+    }
+}
+
+unsafe extern "C" fn bytesio_write_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (bio, args) = match unsafe { bytesio_method_args(argv, argc, "write", 1) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    let Some(&data) = args.first() else {
+        return raise_type_error("write() takes exactly one argument (0 given)");
+    };
+    // CPython order: closed, then exports, then the buffer-protocol check.
+    if bio.buffer.is_none() {
+        return raise_bio(closed_bio());
+    }
+    if bio.exports > 0 {
+        return raise_bio(BioError::Buffer);
+    }
+    let data = match bytes_like_bytes(data) {
+        Ok(data) => data,
+        Err(error) => return raise_bio(error),
+    };
+    match bio.write_bytes(&data) {
+        Ok(count) => unsafe { abi::pon_const_int(count as i64) },
+        Err(error) => raise_bio(error),
+    }
+}
+
+unsafe extern "C" fn bytesio_writelines_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (bio, args) = match unsafe { bytesio_method_args(argv, argc, "writelines", 1) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    let Some(&lines) = args.first() else {
+        return raise_type_error("writelines() takes exactly one argument (0 given)");
+    };
+    if bio.buffer.is_none() {
+        return raise_bio(closed_bio());
+    }
+    let iter = unsafe { abi::pon_get_iter(lines, ptr::null_mut()) };
+    if iter.is_null() {
+        return ptr::null_mut();
+    }
+    loop {
+        let item = unsafe { abi::pon_iter_next(iter, ptr::null_mut()) };
+        if item.is_null() {
+            if stop_iteration_pending() || !pon_err_occurred() {
+                pon_err_clear();
+                break;
+            }
+            return ptr::null_mut();
+        }
+        if bio.exports > 0 {
+            return raise_bio(BioError::Buffer);
+        }
+        let data = match bytes_like_bytes(item) {
+            Ok(data) => data,
+            Err(error) => return raise_bio(error),
+        };
+        if let Err(error) = bio.write_bytes(&data) {
+            return raise_bio(error);
+        }
+    }
+    unsafe { abi::pon_none() }
+}
+
+unsafe extern "C" fn bytesio_seek_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (bio, args) = match unsafe { bytesio_method_args(argv, argc, "seek", 2) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    let Some(&offset) = args.first() else {
+        return raise_type_error("seek() takes at least 1 argument (0 given)");
+    };
+    let offset = match bio_index_arg(offset) {
+        Ok(offset) => offset,
+        Err(error) => return raise_bio(error),
+    };
+    let whence = match args.get(1) {
+        Some(&whence) => match bio_index_arg(whence) {
+            Ok(whence) => whence,
+            Err(error) => return raise_bio(error),
+        },
+        None => 0,
+    };
+    match bio.seek_to(offset, whence) {
+        Ok(position) => unsafe { abi::pon_const_int(position as i64) },
+        Err(error) => raise_bio(error),
+    }
+}
+
+unsafe extern "C" fn bytesio_tell_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (bio, _) = match unsafe { bytesio_method_args(argv, argc, "tell", 0) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    if bio.buffer.is_none() {
+        return raise_bio(closed_bio());
+    }
+    unsafe { abi::pon_const_int(bio.pos as i64) }
+}
+
+unsafe extern "C" fn bytesio_truncate_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (bio, args) = match unsafe { bytesio_method_args(argv, argc, "truncate", 1) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    let size = match bio_optional_size(args.first().copied()) {
+        Ok(size) => size,
+        Err(error) => return raise_bio(error),
+    };
+    match bio.truncate_to(size) {
+        Ok(size) => unsafe { abi::pon_const_int(size) },
+        Err(error) => raise_bio(error),
+    }
+}
+
+unsafe extern "C" fn bytesio_flush_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (bio, _) = match unsafe { bytesio_method_args(argv, argc, "flush", 0) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    if bio.buffer.is_none() {
+        return raise_bio(closed_bio());
+    }
+    unsafe { abi::pon_none() }
+}
+
+unsafe extern "C" fn bytesio_close_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (bio, _) = match unsafe { bytesio_method_args(argv, argc, "close", 0) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    if bio.exports > 0 {
+        return raise_bio(BioError::Buffer);
+    }
+    bio.buffer = None;
+    unsafe { abi::pon_none() }
+}
+
+unsafe extern "C" fn bytesio_getvalue_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (bio, _) = match unsafe { bytesio_method_args(argv, argc, "getvalue", 0) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    let Some(buffer) = bio.buffer.as_ref() else {
+        return raise_bio(closed_bio());
+    };
+    unsafe { abi::str_::pon_const_bytes(buffer.as_ptr(), buffer.len()) }
+}
+
+/// `getbuffer()`: a writable B-format memoryview aliasing the live buffer.
+/// The export count pins the buffer size until every derived view releases.
+unsafe extern "C" fn bytesio_getbuffer_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { method_args(argv, argc, "getbuffer") } {
+        Ok(args) => args,
+        Err(message) => return raise_type_error(&message),
+    };
+    if args.len() != 1 {
+        return raise_type_error(&format!("getbuffer() expected 0 arguments, got {}", args.len() - 1));
+    }
+    let receiver = crate::tag::untag_arg(args[0]);
+    let Some(bio) = (unsafe { as_bytesio(receiver) }) else {
+        return raise_type_error("getbuffer() receiver is not a BytesIO");
+    };
+    let Some(buffer) = bio.buffer.as_mut() else {
+        return raise_bio(closed_bio());
+    };
+    if let Err(message) = crate::abi::str_::install_memoryview_slots() {
+        return abi::return_null_with_error(message);
+    }
+    let view = memoryview::boxed_memoryview_from_raw(receiver, buffer.as_mut_ptr(), buffer.len(), false, b'B');
+    bio.exports += 1;
+    view.cast::<PyObject>()
+}
+
+/// `readable()`/`writable()`/`seekable()`: `True`, once open is proven.
+unsafe extern "C" fn bytesio_true_flag_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (bio, _) = match unsafe { bytesio_method_args(argv, argc, "readable", 0) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    if bio.buffer.is_none() {
+        return raise_bio(closed_bio());
+    }
+    unsafe { abi::number::pon_const_bool(1) }
+}
+
+unsafe extern "C" fn bytesio_isatty_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (bio, _) = match unsafe { bytesio_method_args(argv, argc, "isatty", 0) } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    if bio.buffer.is_none() {
+        return raise_bio(closed_bio());
+    }
+    unsafe { abi::number::pon_const_bool(0) }
+}
+
+/// `fileno()`: no host descriptor exists.  CPython raises
+/// `io.UnsupportedOperation` (an OSError/ValueError subclass); pon raises the
+/// OSError leg with the same message text.
+unsafe extern "C" fn bytesio_fileno_method(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+    unsafe { abi::exc::pon_raise_os_error("fileno".as_ptr(), "fileno".len()) }
+}
+
+/// `detach()`: same UnsupportedOperation contract as `fileno()`.
+unsafe extern "C" fn bytesio_detach_method(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+    unsafe { abi::exc::pon_raise_os_error("detach".as_ptr(), "detach".len()) }
+}
+
+unsafe extern "C" fn bytesio_enter_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { method_args(argv, argc, "__enter__") } {
+        Ok(args) => args,
+        Err(message) => return raise_type_error(&message),
+    };
+    let Some(bio) = (unsafe { as_bytesio(args[0]) }) else {
+        return raise_type_error("__enter__() receiver is not a BytesIO");
+    };
+    if bio.buffer.is_none() {
+        return raise_bio(closed_bio());
+    }
+    args[0]
+}
+
+unsafe extern "C" fn bytesio_exit_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { method_args(argv, argc, "__exit__") } {
+        Ok(args) => args,
+        Err(message) => return raise_type_error(&message),
+    };
+    let Some(bio) = (unsafe { as_bytesio(args[0]) }) else {
+        return raise_type_error("__exit__() receiver is not a BytesIO");
+    };
+    if bio.exports > 0 {
+        return raise_bio(BioError::Buffer);
+    }
+    bio.buffer = None;
+    unsafe { abi::pon_none() }
+}
+
+unsafe extern "C" fn bytesio_iter_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { method_args(argv, argc, "__iter__") } {
+        Ok(args) => args,
+        Err(message) => return raise_type_error(&message),
+    };
+    unsafe { bytesio_iter_slot(args[0]) }
+}
+
+unsafe extern "C" fn bytesio_next_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { method_args(argv, argc, "__next__") } {
+        Ok(args) => args,
+        Err(message) => return raise_type_error(&message),
+    };
+    unsafe { bytesio_iternext_slot(args[0]) }
+}
+
 /// Stream methods stubbed on `_io._IOBase`: `import io` only needs the heap
 /// classes to exist for subclassing/ABC registration, so unimplemented
 /// operations raise an honest `NotImplementedError` when actually called.
@@ -225,6 +1023,11 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
             (*text).tp_base = text_io_base.cast::<PyType>();
             (*text).bump_version();
         }
+        let bytes_io = bytesio_type();
+        if (*bytes_io).tp_base.is_null() {
+            (*bytes_io).tp_base = buffered_io_base.cast::<PyType>();
+            (*bytes_io).bump_version();
+        }
     }
     let attrs = vec![
         string_attr("__name__", "_io")?,
@@ -249,15 +1052,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         (intern("_TextIOBase"), text_io_base),
         (intern("FileIO"), binary_file_type().cast::<PyObject>()),
         (intern("TextIOWrapper"), text_file_type().cast::<PyObject>()),
-        (
-            intern("BytesIO"),
-            heap_class(
-                "BytesIO",
-                &[buffered_io_base],
-                "Buffered I/O implementation using an in-memory bytes buffer.",
-                &[],
-            )?,
-        ),
+        (intern("BytesIO"), bytesio_type().cast::<PyObject>()),
         (
             intern("StringIO"),
             heap_class("StringIO", &[text_io_base], "Text I/O implementation using an in-memory buffer.", &[])?,

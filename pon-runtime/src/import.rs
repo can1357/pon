@@ -537,6 +537,7 @@ fn resolve_module_by_name(name: &str) -> Result<*mut PyObject, String> {
         drop(handled_guard);
         end_module_execution(name);
         if loaded.is_null() {
+            evict_failed_module(name, module);
             if pon_err_occurred() {
                 return Err(format!("embedded module '{name}' returned NULL"));
             }
@@ -573,8 +574,15 @@ fn resolve_module_by_name(name: &str) -> Result<*mut PyObject, String> {
             });
             drop(handled_guard);
             end_module_execution(name);
-            let loaded = loaded?;
+            let loaded = match loaded {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    evict_failed_module(name, module);
+                    return Err(error);
+                }
+            };
             if loaded.is_null() {
+                evict_failed_module(name, module);
                 if pon_err_occurred() {
                     return Err(format!("source module '{name}' returned NULL"));
                 }
@@ -757,6 +765,14 @@ fn create_module(
             let attr = resolve(key).unwrap_or_else(|| format!("<interned:{key}>"));
             return Err(format!("module attribute '{attr}' for '{name}' is NULL"));
         }
+        // Function-valued attrs at module-creation time exist only for native
+        // (Rust-built) modules — user functions reach module namespaces via
+        // `store_module_attr` while the compiled body executes, never through
+        // this constructor.  Record them as CPython
+        // `builtin_function_or_method` equivalents: non-descriptors that read
+        // back bare off class attributes (see
+        // `types::function::mark_native_function`).
+        crate::types::function::mark_native_function(value);
         attr_map.insert(key, value);
     }
 
@@ -829,6 +845,52 @@ fn bind_child_to_parent(name: &str, module: *mut PyObject) {
         (&mut *parent).attrs.insert(child_id, module);
     }
     // J0.3 GlobalIC site: parent-module attr overlay insert.
+    crate::abi::bump_namespace_version();
+}
+
+/// Unwinds the registration of a module whose body failed to execute.
+///
+/// CPython's `importlib._bootstrap._load` runs `del sys.modules[spec.name]`
+/// when a module body raises, so a later import of the same name retries
+/// from scratch (and re-raises) instead of observing the half-initialized
+/// module. asyncio depends on exactly that: `base_events`' guarded
+/// `import ssl` fails and is caught, and `sslproto`'s follow-up
+/// `import ssl` must fail the same way — a cached corpse would flunk its
+/// `if ssl is not None:` guard and read missing attributes.  The
+/// parent-attr binding pon makes before execution (cycle support) is
+/// unwound with the cache entry; extra names the failing body itself
+/// published into `sys.modules` are kept, matching CPython.
+fn evict_failed_module(name: &str, module: *mut PyObject) {
+    let name_id = intern(name);
+    let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    state.modules.remove(&name_id);
+    let dict = state.modules_dict;
+    // Reverse of `bind_child_to_parent`, under the same lock; only a binding
+    // still pointing at the failed module is removed.
+    if let Some((parent_name, child_name)) = name.rsplit_once('.') {
+        let parent_id = intern(parent_name);
+        let child_id = intern(child_name);
+        if let Some(parent) = state.modules.get(&parent_id).copied()
+            && let Some(parent) = module_from_object_locked(&state, parent)
+        {
+            // SAFETY: The import state proved the object uses `PyModuleObject` layout.
+            let attrs = unsafe { &mut (*parent).attrs };
+            if attrs.get(&child_id).copied() == Some(module) {
+                attrs.remove(&child_id);
+            }
+        }
+    }
+    drop(state);
+    // Dict mutation takes its own critical section and must never nest
+    // inside `IMPORT_STATE` (see `mirror_module_registration`).
+    if !dict.is_null()
+        && let Ok(key) = runtime_string(name)
+    {
+        let _guard = crate::sync::begin_critical_section(dict);
+        // SAFETY: `dict` is an exact runtime dict; `key` is a live string.
+        let _ = unsafe { crate::types::dict::dict_remove(dict, key) };
+    }
+    // J0.3 GlobalIC site: the name -> module binding disappeared.
     crate::abi::bump_namespace_version();
 }
 

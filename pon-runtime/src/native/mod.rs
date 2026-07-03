@@ -28,13 +28,14 @@ pub(crate) mod contextvars;
 mod errno;
 mod gc;
 mod imp;
-mod io;
+pub(crate) mod io;
 mod itertools;
 mod math;
 mod opcode_;
 mod os;
 pub(crate) mod pickle;
 mod posix;
+mod posixsubprocess;
 mod random_;
 mod select;
 mod sha2;
@@ -64,6 +65,7 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
     ("_io", io::make_module),
     ("_opcode", opcode_::make_module),
     ("_pickle", pickle::make_module),
+    ("_posixsubprocess", posixsubprocess::make_module),
     ("_random", random_::make_module),
     ("_sha2", sha2::make_module),
     ("_signal", signal::make_module),

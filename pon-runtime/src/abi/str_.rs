@@ -1525,7 +1525,7 @@ unsafe extern "C" fn memoryview_cast_entry(argv: *mut *mut PyObject, argc: usize
         return raise_value_error(memoryview_type::RELEASED_ERROR);
     }
     match memoryview_type::cast(view, &format) {
-        Ok(cast_view) => as_object_ptr(cast_view),
+        Ok(cast_view) => as_object_ptr(register_derived_view(cast_view)),
         Err(message) => super::return_null_with_error(message),
     }
 }
@@ -1585,8 +1585,27 @@ unsafe extern "C" fn memoryview_release_entry(argv: *mut *mut PyObject, argc: us
         Ok(view) => view,
         Err(raised) => return raised,
     };
-    view.released = true;
+    release_view_once(view);
     unsafe { super::pon_none() }
+}
+
+/// Marks a view released exactly once, notifying the exporter on the
+/// transition so BytesIO's live-export count (its CPython CHECK_EXPORTS
+/// gate) stays balanced under idempotent `release()`/`__exit__` replays.
+fn release_view_once(view: &mut memoryview_type::PyMemoryView) {
+    if !view.released {
+        view.released = true;
+        crate::native::io::bytesio_export_released(view.base);
+    }
+}
+
+/// Registers a freshly-derived live view (`memoryview(view)`, `cast`, step-1
+/// slicing) with its exporter: BytesIO counts live views to gate resizing;
+/// every other `base` ignores the signal.
+fn register_derived_view(view: *mut memoryview_type::PyMemoryView) -> *mut memoryview_type::PyMemoryView {
+    // SAFETY: Callers pass the freshly-allocated live view.
+    crate::native::io::bytesio_export_cloned(unsafe { (*view).base });
+    view
 }
 
 /// `memoryview.__enter__()`: the view itself; released views refuse entry.
@@ -1616,7 +1635,7 @@ unsafe extern "C" fn memoryview_exit_entry(argv: *mut *mut PyObject, argc: usize
         Ok(view) => view,
         Err(raised) => return raised,
     };
-    view.released = true;
+    release_view_once(view);
     unsafe { super::pon_none() }
 }
 
@@ -2963,7 +2982,7 @@ pub unsafe extern "C" fn builtin_memoryview(argv: *mut *mut PyObject, argc: usiz
         // B-format view or the released-buffer ValueError).
         if let Some(result) = crate::native::pickle::memoryview_over_picklebuffer(args[0]) { return result; }
         match unsafe { memoryview_type::boxed_memoryview_from_object(args[0]) } {
-            Ok(view) => as_object_ptr(view),
+            Ok(view) => as_object_ptr(register_derived_view(view)),
             // Kind split: a released source is a state error (CPython raises
             // ValueError), everything else is a type error.
             Err(message) if message == memoryview_type::RELEASED_ERROR => raise_value_error(&message),
@@ -3102,7 +3121,8 @@ fn memoryview_slice_object(object: *mut PyObject, key: *mut PyObject) -> Result<
     let indices = normalize_str_slice(unsafe { &*key.cast::<PySlice>() }, view.len)?;
     if indices.step == 1 {
         let data = unsafe { view.data.add(indices.start as usize) };
-        return Ok(as_object_ptr(memoryview_type::boxed_memoryview_from_raw(view.base, data, indices.len, view.readonly, b'B')));
+        let derived = memoryview_type::boxed_memoryview_from_raw(view.base, data, indices.len, view.readonly, b'B');
+        return Ok(as_object_ptr(register_derived_view(derived)));
     }
     let slice = unsafe { view.as_slice() };
     let mut out = Vec::with_capacity(indices.len);

@@ -74,12 +74,27 @@ struct PyPickleBuffer {
 static PICKLEBUFFER_TYPE: LazyLock<usize> = LazyLock::new(|| {
     let mut ty = PyType::new(
         abi::runtime_type_type().cast_const(),
-        "PickleBuffer",
+        // CPython's C type is `pickle.PickleBuffer`: the dotted tp_name keeps
+        // `repr(type)` and type-in-error-message parity, while the `__name__`
+        // getter exposes only the tail component.
+        "pickle.PickleBuffer",
         std::mem::size_of::<PyPickleBuffer>(),
     );
     ty.tp_base = runtime_object_type();
     ty.tp_new = Some(picklebuffer_new);
     ty.tp_getattro = Some(picklebuffer_getattro);
+    // pon's `__module__` getter reads tp_dict with a "builtins" default for
+    // native types; carry the CPython value explicitly.
+    let namespace = crate::types::type_::new_namespace();
+    if !namespace.is_null() {
+        // SAFETY: String allocation helper; NULL skips the binding.
+        let module = unsafe { abi::pon_const_str("pickle".as_ptr(), "pickle".len()) };
+        if !module.is_null() {
+            // SAFETY: Freshly allocated namespace box.
+            unsafe { (&mut *namespace).set(intern("__module__"), module) };
+            ty.tp_dict = namespace.cast::<PyObject>();
+        }
+    }
     Box::into_raw(Box::new(ty)) as usize
 });
 
