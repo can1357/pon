@@ -403,6 +403,9 @@ fn declare_code_info<M: Module>(
 fn code_flags(target: &Function) -> u32 {
     // The state-machine transform consumes every Yield/YieldFrom marker, so
     // the IR flags are the only source of truth for generator-ness.
+    if target.is_async_generator {
+        return pon_runtime::abi::call::CODE_FLAG_ASYNC_GENERATOR;
+    }
     if target.is_coroutine {
         return pon_runtime::abi::call::CODE_FLAG_COROUTINE;
     }

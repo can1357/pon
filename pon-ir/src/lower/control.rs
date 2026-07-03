@@ -1,5 +1,5 @@
 use super::*;
-use crate::ir::{BinOp, CmpOp, UnOp};
+use crate::ir::{CmpOp, UnOp};
 
 pub(super) fn lower_return(
     driver: &mut LoweringDriver,
@@ -9,6 +9,14 @@ pub(super) fn lower_return(
     if scope.is_module() {
         return unsupported_at(
             "top-level return statement",
+            span_bounds(ret.range.start().to_u32(), ret.range.end().to_u32()),
+        );
+    }
+    if scope.info.is_async && scope.info.is_generator && ret.value.is_some() {
+        // CPython rejects this at compile time (PEP 525): async generators
+        // signal exhaustion with StopAsyncIteration, which carries no value.
+        return unsupported_at(
+            "'return' with value in async generator",
             span_bounds(ret.range.start().to_u32(), ret.range.end().to_u32()),
         );
     }
@@ -71,29 +79,48 @@ pub(super) fn lower_compare_expr_with_driver(
     if compare.ops.len() != compare.comparators.len() {
         return Err(LowerError::internal("comparison op/comparator arity mismatch"));
     }
+    let Some((&first_op, rest_ops)) = compare.ops.split_first() else {
+        return Err(LowerError::internal("empty comparison expression"));
+    };
+    let (first_comparator, rest_comparators) = compare
+        .comparators
+        .split_first()
+        .ok_or_else(|| LowerError::internal("empty comparison expression"))?;
 
-    let mut lhs = driver.lower_expr(scope, &compare.left)?;
-    let mut folded: Option<Value> = None;
-    for (op, rhs_expr) in compare.ops.iter().copied().zip(compare.comparators.iter()) {
-        let rhs = driver.lower_expr(scope, rhs_expr)?;
-        let comparison = lower_single_compare(scope, op, lhs, rhs)?;
-        folded = Some(match folded {
-            None => comparison,
-            Some(previous) => {
-                let previous_truth = scope.emit(InstKind::BoolTest { val: previous })?;
-                let comparison_truth = scope.emit(InstKind::BoolTest { val: comparison })?;
-                let combined = scope.emit(InstKind::BinaryOp {
-                    op: BinOp::And,
-                    lhs: previous_truth,
-                    rhs: comparison_truth,
-                })?;
-                scope.emit(InstKind::BoolTest { val: combined })?
-            }
-        });
-        lhs = rhs;
+    let lhs = driver.lower_expr(scope, &compare.left)?;
+    let rhs = driver.lower_expr(scope, first_comparator)?;
+    let first = lower_single_compare(scope, first_op, lhs, rhs)?;
+    if rest_ops.is_empty() {
+        return Ok(first);
     }
 
-    folded.ok_or_else(|| LowerError::internal("empty comparison expression"))
+    // CPython chain semantics: `a op1 b op2 c` is `a op1 b and b op2 c` with
+    // `b` evaluated once. Each intermediate RAW comparison result is
+    // truth-tested only to decide the short circuit; a falsy intermediate is
+    // itself the value of the whole expression, and the remaining
+    // comparators are never evaluated.
+    let result_slot = scope.alloc_temp_local();
+    let done_block = scope.alloc_block()?;
+    scope.emit(InstKind::StoreLocal(result_slot, first))?;
+    let mut lhs = rhs;
+    let mut comparison = first;
+    for (op, rhs_expr) in rest_ops.iter().copied().zip(rest_comparators) {
+        let cond = scope.emit(InstKind::BoolTest { val: comparison })?;
+        let next_block = scope.alloc_block()?;
+        scope.set_term(Terminator::CondBranch {
+            cond,
+            then_: next_block,
+            else_: done_block,
+        })?;
+        scope.switch_to(next_block)?;
+        let rhs = driver.lower_expr(scope, rhs_expr)?;
+        comparison = lower_single_compare(scope, op, lhs, rhs)?;
+        scope.emit(InstKind::StoreLocal(result_slot, comparison))?;
+        lhs = rhs;
+    }
+    scope.jump_if_open(done_block)?;
+    scope.switch_to(done_block)?;
+    scope.emit(InstKind::LoadLocal(result_slot))
 }
 
 pub(super) fn lower_bool_expr_with_driver(

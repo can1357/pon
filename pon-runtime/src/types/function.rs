@@ -184,6 +184,7 @@ const CPY_CO_VARARGS: u32 = 0x04;
 const CPY_CO_VARKEYWORDS: u32 = 0x08;
 const CPY_CO_GENERATOR: u32 = 0x20;
 const CPY_CO_COROUTINE: u32 = 0x80;
+const CPY_CO_ASYNC_GENERATOR: u32 = 0x200;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FunctionCodeMetadata {
@@ -522,6 +523,9 @@ fn cpython_code_flags(metadata: &FunctionCodeMetadata) -> u32 {
     }
     if metadata.flags & crate::abi::call::CODE_FLAG_COROUTINE != 0 {
         flags |= CPY_CO_COROUTINE;
+    }
+    if metadata.flags & crate::abi::call::CODE_FLAG_ASYNC_GENERATOR != 0 {
+        flags |= CPY_CO_ASYNC_GENERATOR;
     }
     flags
 }
@@ -2170,6 +2174,8 @@ mod tests {
 
     #[test]
     fn binds_positional_defaults_and_keyword_only_defaults() {
+        let _guard = crate::thread_state::test_state_lock();
+        pon_err_clear();
         let function = 0x1000usize as *mut PyObject;
         let names = [11_u32, 12, 13];
         let params = ParamSpec {
@@ -2212,6 +2218,8 @@ mod tests {
 
     #[test]
     fn binds_keyword_only_default_without_masking_later_required_parameter() {
+        let _guard = crate::thread_state::test_state_lock();
+        pon_err_clear();
         let function = 0x1200usize as *mut PyObject;
         let positional_name = crate::intern::intern("positional");
         let defaulted_kwonly_name = crate::intern::intern("defaulted_kwonly");
@@ -2289,6 +2297,8 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_keyword_binding() {
+        let _guard = crate::thread_state::test_state_lock();
+        pon_err_clear();
         let function = 0x1100usize as *mut PyObject;
         let names = [21_u32];
         let params = ParamSpec {

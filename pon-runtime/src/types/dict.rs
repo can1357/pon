@@ -361,6 +361,26 @@ pub unsafe fn dict_remove(dict: *mut PyObject, key: *mut PyObject) -> Result<Opt
         None => None,
     })
 }
+/// Removes and returns the most-recently-inserted entry (`dict.popitem` LIFO
+/// order), or `None` for an empty dict.
+pub unsafe fn dict_pop_last(dict: *mut PyObject) -> Result<Option<(*mut PyObject, *mut PyObject)>, String> {
+    let storage = unsafe { dict_mut(dict)? };
+    let Some(entry) = storage.entries.pop() else {
+        return Ok(None);
+    };
+    rebuild_dict_buckets(storage)?;
+    Ok(Some((entry.key, entry.value)))
+}
+
+/// Removes every entry (`dict.clear`): both the entry vector and the bucket
+/// index table are reset so stale indexes can never resolve.
+pub unsafe fn dict_clear(dict: *mut PyObject) -> Result<Vec<*mut PyObject>, String> {
+    let storage = unsafe { dict_mut(dict)? };
+    let keys = storage.entries.iter().map(|entry| entry.key).collect();
+    storage.entries.clear();
+    storage.buckets.clear();
+    Ok(keys)
+}
 
 /// Returns true if `key` is present in the dictionary.
 pub unsafe fn dict_contains(dict: *mut PyObject, key: *mut PyObject) -> Result<bool, String> {
@@ -477,6 +497,16 @@ unsafe fn object_equal_structural(left: *mut PyObject, right: *mut PyObject) -> 
             return Some(Ok(false));
         };
         return unsafe { slices_equal_structural(l, r) };
+    }
+    // Ranges (either runtime representation) key structurally through the
+    // shared sequence-key authority, consistent with the `Some("range")`
+    // hash arm below (CPython: `range_equals` + `range_hash` agree).
+    {
+        let left_key = crate::native::builtins_mod::range_cmp_key(left);
+        let right_key = crate::native::builtins_mod::range_cmp_key(right);
+        if let (Some(left_key), Some(right_key)) = (left_key, right_key) {
+            return Some(Ok(crate::native::builtins_mod::range_keys_equal(&left_key, &right_key)));
+        }
     }
     match (unsafe { type_name(left) }, unsafe { type_name(right) }) {
         (Some("str"), Some("str")) => {
@@ -740,6 +770,13 @@ fn hash_object_non_numeric(object: *mut PyObject) -> Result<isize, String> {
             Some(items) => structural_tuple_hash(items)?,
             // Non-PyTuple "tuple" (native representation): prior pointer
             // semantics — identity keying keeps working.
+            None => object as usize as isize,
+        },
+        // Ranges hash by the normalized sequence key so equal ranges (either
+        // runtime representation) land in one dict slot; a "range"-named
+        // non-range object keeps the identity default.
+        Some("range") => match crate::native::builtins_mod::range_hash_value(object) {
+            Some(hash) => hash,
             None => object as usize as isize,
         },
         Some(_) => object as usize as isize,
@@ -1020,7 +1057,7 @@ unsafe extern "C" fn dict_getattro_slot(object: *mut PyObject, name: *mut PyObje
         return ptr::null_mut();
     };
     match attr.as_str() {
-        "get" | "keys" | "values" | "items" | "setdefault" | "pop" | "update" | "copy" => unsafe {
+        "get" | "keys" | "values" | "items" | "setdefault" | "pop" | "popitem" | "clear" | "update" | "copy" => unsafe {
             crate::abi::map::pon_dict_bound_method(object, &attr)
         },
         // `fromkeys` is a classmethod in CPython: the receiver only supplies the
@@ -1450,6 +1487,8 @@ pub fn ensure_dict_subclass_methods_installed() {
         ("pop", crate::abi::map::dict_pop_method_trampoline as *const u8),
         ("update", crate::abi::map::dict_update_method_trampoline as *const u8),
         ("copy", crate::abi::map::dict_copy_method_trampoline as *const u8),
+        ("popitem", crate::abi::map::dict_popitem_method_trampoline as *const u8),
+        ("clear", crate::abi::map::dict_clear_method_trampoline as *const u8),
     ];
     for (name, code) in natives {
         let interned = crate::intern::intern(name);

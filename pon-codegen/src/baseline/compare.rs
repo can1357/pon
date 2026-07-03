@@ -60,8 +60,6 @@ pub(crate) fn lower_not() -> Result<ir::Value, CodegenError> {
 pub(crate) fn lower_compare_op(
     builder: &mut FunctionBuilder<'_>,
     rich_compare: FuncRef,
-    is_true: FuncRef,
-    const_bool: FuncRef,
     state: &LowerState,
     op: CmpOp,
     lhs: IrValue,
@@ -73,10 +71,11 @@ pub(crate) fn lower_compare_op(
     let lhs = state.value(lhs)?;
     let rhs = state.value(rhs)?;
     let feedback = builder.ins().iconst(ptr_ty, 0);
-    let result = call_pyobject_helper(builder, rich_compare, &[op, lhs, rhs, feedback], ptr_ty, exception_exit);
-    let truth = call_is_true(builder, is_true, result, exception_exit);
-    let condition = builder.ins().icmp_imm(IntCC::NotEqual, truth, 0);
-    Ok(box_bool_i32(builder, const_bool, condition, ptr_ty, exception_exit))
+    // CPython hands the rich-comparison result through uncoerced: a user
+    // dunder may return any object (`C() == 1` can be a string). Truth
+    // coercion belongs solely to boolean contexts (`BoolTest` / branch
+    // lowering), which call `pon_is_true` on demand.
+    Ok(call_pyobject_helper(builder, rich_compare, &[op, lhs, rhs, feedback], ptr_ty, exception_exit))
 }
 
 pub(crate) fn lower_is_op(

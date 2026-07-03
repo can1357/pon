@@ -139,10 +139,10 @@ fn lower_collecting_comprehension(
 /// exactly when the FIRST clause is async; a sync first clause with `await`
 /// deeper in still iterates synchronously.
 ///
-/// Async generator expressions stay rejected: their child would be an async
-/// generator object, which the runtime cannot represent yet (`GeneratorKind::
-/// AsyncGenerator` maps to the plain generator type without an `__anext__`
-/// surface).
+/// Async generator expressions (PEP 525) synthesize their child as an async
+/// generator function instead: the call site returns the async-generator
+/// object directly (constructing it awaits nothing), and consumers drive it
+/// through `__anext__`/`asend` awaitables.
 fn lower_comprehension_call(
     driver: &mut LoweringDriver,
     enclosing: &mut BodyScope,
@@ -160,17 +160,17 @@ fn lower_comprehension_call(
     let child_info =
         enclosing.next_child_scope(ScopeKind::Comprehension, child_name, Some((span.start, span.end)))?;
     let is_async_comp = child_info.is_async;
-    if is_async_comp {
-        if is_genexpr {
-            return unsupported_at("async generator expressions", span);
-        }
-        if !enclosing.info.is_async {
-            // CPython rejects this shape at compile time with the same words.
-            return unsupported_at(
-                "asynchronous comprehension outside of an asynchronous function",
-                span,
-            );
-        }
+    // Collecting comprehensions run eagerly: the child coroutine is awaited at
+    // the call site, which is only legal inside an async function.  A genexpr
+    // child merely constructs an async-generator object, which is legal in any
+    // context (PEP 530 / Python 3.7+).
+    let awaits_child = is_async_comp && !is_genexpr;
+    if awaits_child && !enclosing.info.is_async {
+        // CPython rejects this shape at compile time with the same words.
+        return unsupported_at(
+            "asynchronous comprehension outside of an asynchronous function",
+            span,
+        );
     }
     let outer_iter = if first_generator.is_async {
         enclosing.emit(InstKind::GetAIter {
@@ -187,7 +187,7 @@ fn lower_comprehension_call(
         callee: function,
         args: vec![outer_iter],
     })?;
-    if is_async_comp {
+    if awaits_child {
         let iter = enclosing.emit(InstKind::Await { awaitable: call })?;
         enclosing.emit(InstKind::YieldFrom { iter })
     } else {

@@ -615,7 +615,7 @@ mod tests {
 
     #[test]
     fn finds_region_across_noncontiguous_successor_block_ids() {
-        let function = Function { name: "branchy".to_owned(), arity: 0, is_coroutine: false, is_generator: false, params: Default::default(), n_locals: 0, blocks: vec![
+        let function = Function { name: "branchy".to_owned(), arity: 0, is_coroutine: false, is_generator: false, is_async_generator: false, params: Default::default(), n_locals: 0, blocks: vec![
             Block {
                 id: BlockId(10),
                 insts: vec![Inst::new(Value(0), InstKind::Const(PyConst::Int(1)))],

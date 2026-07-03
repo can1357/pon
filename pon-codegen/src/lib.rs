@@ -217,7 +217,7 @@ mod tests {
             functions: vec![Function {
                 name: "typed_arg".to_owned(),
                 arity: 1,
-                is_coroutine: false, is_generator: false,
+                is_coroutine: false, is_generator: false, is_async_generator: false,
                 params: Default::default(),
                 n_locals: 1,
                 blocks: vec![Block {

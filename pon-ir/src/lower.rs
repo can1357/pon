@@ -328,6 +328,7 @@ impl LoweringDriver {
             arity: 0,
             is_coroutine: false,
             is_generator: false,
+            is_async_generator: false,
             params: ParamLayout::default(),
             blocks: vec![Block {
                 id: BlockId(0),
@@ -1435,11 +1436,16 @@ impl BodyScope {
         });
         let params = param_layout(&self.info);
         let is_generator_body = self.info.is_generator || self.info.is_async;
+        // PEP 525: `async def` with `yield` is an async generator function, not
+        // a coroutine function — calls return an async-generator object and the
+        // call site must not await it.
+        let is_async_generator = self.info.is_generator && self.info.is_async;
         let mut function = Function {
             name: self.info.name,
             arity: self.info.parameters.arity(),
-            is_coroutine: self.info.is_async,
+            is_coroutine: self.info.is_async && !self.info.is_generator,
             is_generator: is_generator_body,
+            is_async_generator,
             params,
             blocks: self.blocks,
             n_locals: self.info.locals.len() + self.temp_locals,
@@ -2176,8 +2182,12 @@ def g(src):
     fn rejects_async_constructs_in_unsupported_scopes_with_exact_features() {
         let cases = [
             (
-                "async def f(y):\n    return (x async for x in y)\n",
-                "async generator expressions",
+                "async def f(y):\n    yield from y\n",
+                "'yield from' inside async function",
+            ),
+            (
+                "async def f(y):\n    yield 1\n    return 2\n",
+                "'return' with value in async generator",
             ),
             (
                 "def f(y):\n    async for x in y:\n        pass\n",
@@ -2199,6 +2209,86 @@ def g(src):
                 other => panic!("expected Unsupported for source:\n{source}\ngot {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn lowers_async_generator_expression_without_awaiting_the_call() {
+        let module = lower_source(
+            r#"
+async def f(y):
+    return (x async for x in y)
+
+def s(y):
+    return (x async for x in y)
+"#,
+        )
+        .expect("async generator expressions should lower in async and sync scopes");
+
+        let genexprs: Vec<_> = module
+            .functions
+            .iter()
+            .filter(|function| function.name == "<genexpr>")
+            .collect();
+        assert_eq!(genexprs.len(), 2, "each genexpr should synthesize a child function");
+        for genexpr in genexprs {
+            assert!(
+                genexpr.is_async_generator,
+                "an async genexpr child must be an async generator"
+            );
+            assert!(genexpr.is_generator, "the child must be a resumable state machine");
+            assert!(
+                !genexpr.is_coroutine,
+                "an async generator is not a coroutine: its call site must not await it"
+            );
+        }
+        for name in ["f", "s"] {
+            let enclosing = module
+                .functions
+                .iter()
+                .find(|function| function.name == name)
+                .expect("enclosing function should lower");
+            assert!(
+                insts_of(enclosing).any(|inst| matches!(inst.kind, InstKind::GetAIter { .. })),
+                "the async first clause acquires the outer iterator with GetAIter in `{name}`"
+            );
+            assert!(
+                !insts_of(enclosing).any(|inst| matches!(inst.kind, InstKind::Await { .. })),
+                "constructing the async generator must not be awaited in `{name}`"
+            );
+        }
+    }
+
+    #[test]
+    fn async_def_with_yield_lowers_as_async_generator_function() {
+        let module = lower_source(
+            r#"
+async def agen(y):
+    got = await y
+    yield got
+
+async def coro(y):
+    return await y
+"#,
+        )
+        .expect("async generator functions should lower");
+
+        let agen = module
+            .functions
+            .iter()
+            .find(|function| function.name == "agen")
+            .expect("async generator function should lower");
+        assert!(agen.is_async_generator);
+        assert!(agen.is_generator);
+        assert!(!agen.is_coroutine);
+
+        let coro = module
+            .functions
+            .iter()
+            .find(|function| function.name == "coro")
+            .expect("plain coroutine function should lower");
+        assert!(coro.is_coroutine);
+        assert!(!coro.is_async_generator);
+        assert!(coro.is_generator, "async bodies stay resumable state machines");
     }
 
     #[test]

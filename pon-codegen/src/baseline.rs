@@ -244,6 +244,16 @@ pub(crate) struct LowerState {
     pub(crate) values: HashMap<IrValue, ir::Value>,
     pub(crate) locals: Vec<Variable>,
     pub(crate) local_defined: Vec<bool>,
+    /// Explicit per-local frame slots mirroring every named-local store.
+    ///
+    /// Conservative collection scans frame memory, never registers, so a
+    /// local whose only up-to-date home is a register would be invisible to
+    /// a `gc.collect()` reached from inside the function (and rooting raw
+    /// registers instead retains *dead* values the allocator never cleared).
+    /// `store_local` mirrors each named-local write — including the unbind
+    /// sentinel written by `del` — into its shadow slot, so exactly the
+    /// still-bound locals stay reachable from the stack scan.
+    pub(crate) local_shadow: Vec<ir::StackSlot>,
     /// Own closure cells (`MakeCell` results) by dense cell id.  Cells are
     /// SSA `Variable`s, not raw values: generator bodies redefine them from
     /// frame spill slots in the dispatch block, so resume paths that never
@@ -262,11 +272,29 @@ impl LowerState {
         Self {
             values: HashMap::new(),
             locals: Vec::with_capacity(local_count),
+            local_shadow: Vec::with_capacity(local_count),
             local_defined: vec![false; local_count],
             cells: HashMap::new(),
             next_cell_id: 0,
             last_value: None,
             gen_ctx: None,
+        }
+    }
+
+    /// Declares the SSA variable and shadow frame slot for every local.
+    ///
+    /// Every `LowerState` construction site must call this exactly once
+    /// before lowering instructions; `store_local` indexes both vectors
+    /// unconditionally.
+    pub(crate) fn declare_local_storage(&mut self, builder: &mut FunctionBuilder<'_>, ptr_ty: ir::Type) {
+        for _ in 0..self.local_defined.len() {
+            self.locals.push(builder.declare_var(ptr_ty));
+            self.local_shadow.push(builder.create_sized_stack_slot(StackSlotData {
+                kind: StackSlotKind::ExplicitSlot,
+                size: ptr_ty.bytes(),
+                align_shift: ptr_ty.bytes().trailing_zeros() as u8,
+                key: None,
+            }));
         }
     }
 
@@ -394,13 +422,10 @@ pub fn compile_function<M: Module>(
     let _argc = builder.func.dfg.block_params(entry)[1];
 
     let mut state = LowerState::new(ir.n_locals);
-    for _ in 0..ir.n_locals {
-        state.locals.push(builder.declare_var(ptr_ty));
-    }
+    state.declare_local_storage(&mut builder, ptr_ty);
     let unbound = builder.ins().iconst(ptr_ty, 0);
     for slot in 0..ir.n_locals {
-        builder.def_var(state.locals[slot], unbound);
-        state.local_defined[slot] = true;
+        store_local(&mut builder, &mut state, slot as u32, unbound)?;
     }
     initialize_parameter_locals(&mut builder, &mut state, argv, ptr_bytes, entry_arg_count, ir, ptr_ty)?;
     emit_safepoint_poll(&mut builder, &helper_refs);
@@ -485,13 +510,10 @@ pub fn compile_osr_function<M: Module>(
     let buffer = builder.func.dfg.block_params(entry)[0];
 
     let mut state = LowerState::new(ir.n_locals);
-    for _ in 0..ir.n_locals {
-        state.locals.push(builder.declare_var(ptr_ty));
-    }
+    state.declare_local_storage(&mut builder, ptr_ty);
     for slot in 0..ir.n_locals {
         let value = builder.ins().load(ptr_ty, MemFlagsData::new(), buffer, offset_i32(8 + slot * ptr_bytes)?);
-        builder.def_var(state.locals[slot], value);
-        state.local_defined[slot] = true;
+        store_local(&mut builder, &mut state, slot as u32, value)?;
     }
     for (index, value) in live_values.iter().enumerate() {
         let offset = 8 + (ir.n_locals + index) * ptr_bytes;
@@ -1065,8 +1087,7 @@ fn define_local_from_argv(
 ) -> Result<(), CodegenError> {
     let offset = offset_i32(argv_slot * ptr_bytes)?;
     let value = builder.ins().load(ptr_ty, MemFlagsData::new(), argv, offset);
-    builder.def_var(state.locals[local_slot], value);
-    state.local_defined[local_slot] = true;
+    store_local(builder, state, local_slot as u32, value)?;
     Ok(())
 }
 
@@ -1252,18 +1273,7 @@ pub(crate) fn lower_inst<M: Module>(
             number::lower_unary_op(builder, helpers.number_unary, state, *op, *operand, ptr_ty, exception_exit)
         }
         InstKind::Compare { op, lhs, rhs } => {
-            compare::lower_compare_op(
-                builder,
-                helpers.rich_compare,
-                helpers.is_true,
-                helpers.const_bool,
-                state,
-                *op,
-                *lhs,
-                *rhs,
-                ptr_ty,
-                exception_exit,
-            )
+            compare::lower_compare_op(builder, helpers.rich_compare, state, *op, *lhs, *rhs, ptr_ty, exception_exit)
         }
         InstKind::Contains {
             item,
@@ -1611,6 +1621,9 @@ pub(crate) fn store_local(
     }
     // PHASE-E: WriteBarrier
     builder.def_var(state.locals[index], value);
+    // Mirror into the local's shadow frame slot: the conservative stack scan
+    // roots live locals through frame memory (see `LowerState::local_shadow`).
+    builder.ins().stack_store(value, state.local_shadow[index], 0);
     state.local_defined[index] = true;
     Ok(())
 }
@@ -2093,7 +2106,7 @@ mod tests {
             functions: vec![Function {
                 name: "binary".to_owned(),
                 arity: 2,
-                is_coroutine: false, is_generator: false,
+                is_coroutine: false, is_generator: false, is_async_generator: false,
                 params: Default::default(),
                 n_locals: 2,
                 blocks: vec![Block {
@@ -2181,7 +2194,7 @@ mod tests {
             functions: vec![Function {
                 name: "unary".to_owned(),
                 arity: 1,
-                is_coroutine: false, is_generator: false,
+                is_coroutine: false, is_generator: false, is_async_generator: false,
                 params: Default::default(),
                 n_locals: 1,
                 blocks: vec![Block {
@@ -2243,7 +2256,7 @@ mod tests {
             functions: vec![Function {
                 name: "next_item".to_owned(),
                 arity: 1,
-                is_coroutine: false, is_generator: false,
+                is_coroutine: false, is_generator: false, is_async_generator: false,
                 params: Default::default(),
                 n_locals: 1,
                 blocks: vec![Block {
@@ -2276,7 +2289,7 @@ mod tests {
             functions: vec![Function {
                 name: "loop_poll".to_owned(),
                 arity: 1,
-                is_coroutine: false, is_generator: false,
+                is_coroutine: false, is_generator: false, is_async_generator: false,
                 params: Default::default(),
                 n_locals: 2,
                 blocks: vec![
@@ -2346,7 +2359,7 @@ mod tests {
             functions: vec![Function {
                 name: "no_poll".to_owned(),
                 arity: 0,
-                is_coroutine: false, is_generator: false,
+                is_coroutine: false, is_generator: false, is_async_generator: false,
                 params: Default::default(),
                 n_locals: 0,
                 blocks: vec![Block {
@@ -2374,7 +2387,7 @@ mod tests {
                 Function {
                     name: "__main__".to_owned(),
                     arity: 0,
-                is_coroutine: false, is_generator: false,
+                is_coroutine: false, is_generator: false, is_async_generator: false,
                     params: Default::default(),
                     n_locals: 0,
                     blocks: vec![Block {
@@ -2397,7 +2410,7 @@ mod tests {
                 Function {
                     name: "add".to_owned(),
                     arity: 2,
-                is_coroutine: false, is_generator: false,
+                is_coroutine: false, is_generator: false, is_async_generator: false,
                     params: Default::default(),
                     n_locals: 2,
                     blocks: vec![Block {
@@ -2436,7 +2449,7 @@ mod tests {
                 Function {
                     name: "__main__".to_owned(),
                     arity: 0,
-                is_coroutine: false, is_generator: false,
+                is_coroutine: false, is_generator: false, is_async_generator: false,
                     params: Default::default(),
                     n_locals: 0,
                     blocks: vec![Block {
@@ -2461,7 +2474,7 @@ mod tests {
                 Function {
                     name: "with_defaults".to_owned(),
                     arity: 1,
-                is_coroutine: false, is_generator: false,
+                is_coroutine: false, is_generator: false, is_async_generator: false,
                     params: Default::default(),
                     n_locals: 2,
                     blocks: vec![Block {
@@ -2506,7 +2519,7 @@ mod tests {
                 Function {
                     name: "__main__".to_owned(),
                     arity: 1,
-                is_coroutine: false, is_generator: false,
+                is_coroutine: false, is_generator: false, is_async_generator: false,
                     params: Default::default(),
                     n_locals: 1,
                     blocks: vec![Block {
@@ -2530,7 +2543,7 @@ mod tests {
                 Function {
                     name: "inner".to_owned(),
                     arity: 0,
-                is_coroutine: false, is_generator: false,
+                is_coroutine: false, is_generator: false, is_async_generator: false,
                     params: Default::default(),
                     n_locals: 0,
                     blocks: vec![Block {
@@ -2578,7 +2591,7 @@ mod tests {
             functions: vec![Function {
                 name: "future".to_owned(),
                 arity: 0,
-                is_coroutine: false, is_generator: false,
+                is_coroutine: false, is_generator: false, is_async_generator: false,
                 params: Default::default(),
                 n_locals: 0,
                 blocks: vec![Block {
@@ -2600,7 +2613,7 @@ mod tests {
             functions: vec![Function {
                 name: "future_term".to_owned(),
                 arity: 0,
-                is_coroutine: false, is_generator: false,
+                is_coroutine: false, is_generator: false, is_async_generator: false,
                 params: Default::default(),
                 n_locals: 0,
                 blocks: vec![Block {

@@ -17,6 +17,9 @@ pub type CodeFlags = u32;
 pub const CODE_FLAG_GENERATOR: CodeFlags = 1 << 0;
 /// Function body was produced by `async def` and must return a coroutine object on call.
 pub const CODE_FLAG_COROUTINE: CodeFlags = 1 << 1;
+/// Function body was produced by `async def` with `yield` and must return an
+/// async-generator object on call (PEP 525).
+pub const CODE_FLAG_ASYNC_GENERATOR: CodeFlags = 1 << 2;
 
 /// Calls a boxed callable with positional, keyword, `*args`, and `**kwargs`
 /// operands.  Unsupported expansion forms report a NULL-sentinel error rather

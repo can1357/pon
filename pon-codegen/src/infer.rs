@@ -106,8 +106,12 @@ fn infer_inst(
             arithmetic_type(*op, value_type(values, *lhs), value_type(values, *rhs))
         }
         InstKind::UnaryOp { op, operand } => unary_type(*op, value_type(values, *operand)),
-        InstKind::Compare { .. }
-        | InstKind::BoolTest { .. }
+        // Rich comparisons pass the dunder result through raw (CPython
+        // semantics): a user `__eq__` may return any object, so `Bool` is
+        // not a sound upper bound. Truth-producing ops below stay `Bool`
+        // because their lowering canonicalizes through `pon_const_bool`.
+        InstKind::Compare { .. } => Type::Object,
+        InstKind::BoolTest { .. }
         | InstKind::Not { .. }
         | InstKind::Contains { .. }
         | InstKind::Is { .. }

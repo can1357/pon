@@ -166,7 +166,7 @@ pub struct HelperRefs {
     pub gen_consume_payload: FuncId,
     /// `pon_gen_finish(frame, retval) -> *mut PyObject`.
     pub gen_finish: FuncId,
-    /// `pon_gen_unwind(frame, is_coroutine) -> *mut PyObject`.
+    /// `pon_gen_unwind(frame, kind) -> *mut PyObject`.
     pub gen_unwind: FuncId,
     /// `pon_gen_delegate_step(frame, delegate) -> *mut PyObject`.
     pub gen_delegate_step: FuncId,

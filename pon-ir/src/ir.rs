@@ -92,6 +92,10 @@ pub struct Function {
     /// (contains `yield`/`yield from`, or was `async def`).  Calls allocate a
     /// frame and return a generator/coroutine object without running the body.
     pub is_generator: bool,
+    /// True when this function was produced from `async def` with `yield` in its
+    /// body (PEP 525): calls must return an async-generator object driven through
+    /// `__anext__`/`asend` awaitables rather than an awaitable coroutine.
+    pub is_async_generator: bool,
     /// Full formal-parameter layout used by Phase-B function binding.
     pub params: ParamLayout,
     /// Function control-flow blocks.

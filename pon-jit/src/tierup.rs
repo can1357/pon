@@ -1000,7 +1000,7 @@ mod tests {
                 name: "sum_range".to_owned(),
                 arity: 0,
                 params: Default::default(),
-                is_coroutine: false, is_generator: false,
+                is_coroutine: false, is_generator: false, is_async_generator: false,
                 n_locals: 1,
                 blocks: vec![
                     Block {

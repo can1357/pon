@@ -31,7 +31,7 @@ use pon_runtime::types::generator::{GEN_FRAME_HEADER_SIZE, GenFrame, RESUME_RUNN
 use super::{
     CodegenError, HelperFuncRefs, LowerState, call_pyobject_helper, declare_helper_refs,
     declare_feedback_cells, emit_safepoint_poll, lower_function_blocks, offset_i32,
-    parameter_bindings,
+    parameter_bindings, store_local,
 };
 use crate::helpers::HelperRefs;
 
@@ -49,11 +49,13 @@ pub(crate) struct GenBodyCtx {
     pub(crate) frame: ir::Value,
 }
 
-/// `pon_make_generator` kind flag for `function` (pin J0.1 §6: coroutines and
-/// async generators keep Coroutine-kind parity in J1).
+/// `pon_make_generator` kind flag for `function`; the same byte selects the
+/// PEP 479/525 wording family in `pon_gen_unwind`.
 fn generator_kind_flag(function: &Function) -> u8 {
     use pon_runtime::types::generator::GeneratorKind;
-    if function.is_coroutine {
+    if function.is_async_generator {
+        GeneratorKind::AsyncGenerator.as_u8()
+    } else if function.is_coroutine {
         GeneratorKind::Coroutine.as_u8()
     } else {
         GeneratorKind::Generator.as_u8()
@@ -261,13 +263,11 @@ fn compile_generator_body<M: Module>(
     // a defining store before any use, including in resume blocks entered
     // straight from the br_table.
     let mut lower_state = LowerState::new(ir_function.n_locals);
+    lower_state.declare_local_storage(&mut builder, ptr_ty);
     for slot in 0..ir_function.n_locals {
-        let var = builder.declare_var(ptr_ty);
-        lower_state.locals.push(var);
         let offset = frame_slot_offset(slot, ptr_bytes)?;
         let value = builder.ins().load(ptr_ty, MemFlagsData::new(), frame, offset);
-        builder.def_var(var, value);
-        lower_state.local_defined[slot] = true;
+        store_local(&mut builder, &mut lower_state, slot as u32, value)?;
     }
     for cell in 0..own_cell_count(ir_function) {
         let var = builder.declare_var(ptr_ty);
@@ -341,13 +341,13 @@ fn compile_generator_body<M: Module>(
     )?;
 
     // Function-level exception exit: nothing caught the pending exception —
-    // finish the frame via pon_gen_unwind (PEP 479 + slot zeroing) and
+    // finish the frame via pon_gen_unwind (PEP 479/525 + slot zeroing) and
     // propagate its NULL.
     builder.switch_to_block(exception_exit);
-    let is_coroutine = builder
+    let kind = builder
         .ins()
-        .iconst(ir::types::I8, i64::from(u8::from(ir_function.is_coroutine)));
-    let unwind_call = builder.ins().call(helper_refs.gen_unwind, &[frame, is_coroutine]);
+        .iconst(ir::types::I8, i64::from(generator_kind_flag(ir_function)));
+    let unwind_call = builder.ins().call(helper_refs.gen_unwind, &[frame, kind]);
     let unwind_result = builder.func.dfg.inst_results(unwind_call)[0];
     builder.ins().return_(&[unwind_result]);
     builder.seal_all_blocks();

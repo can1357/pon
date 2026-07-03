@@ -367,9 +367,9 @@ struct FastLowerState {
 impl FastLowerState {
     fn new(builder: &mut FunctionBuilder<'_>, local_count: usize, ptr_ty: ir::Type) -> Self {
         let mut boxed = LowerState::new(local_count);
+        boxed.declare_local_storage(builder, ptr_ty);
         let mut int_locals = Vec::with_capacity(local_count);
         for _ in 0..local_count {
-            boxed.locals.push(builder.declare_var(ptr_ty));
             int_locals.push(builder.declare_var(types::I64));
         }
         Self {
@@ -659,6 +659,9 @@ fn lower_cold_copy<M: Module>(
 ) -> Result<(), CodegenError> {
     let mut cold_state = LowerState::new(function.n_locals);
     cold_state.locals = fast_state.boxed.locals.clone();
+    // The cold twin shares the fast path's variables AND frame, so it reuses
+    // the same shadow slots; `store_local` in cold lowering keeps them fresh.
+    cold_state.local_shadow = fast_state.boxed.local_shadow.clone();
     cold_state.local_defined = vec![false; function.n_locals];
     for slot in formal_local_slots(function) {
         if slot < cold_state.local_defined.len() {
@@ -1893,7 +1896,7 @@ def mix(seed):
             functions: vec![Function {
                 name: "reload_arg".to_owned(),
                 arity: 1,
-                is_coroutine: false, is_generator: false,
+                is_coroutine: false, is_generator: false, is_async_generator: false,
                 params: Default::default(),
                 n_locals: 1,
                 blocks: vec![Block {

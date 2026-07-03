@@ -24,6 +24,14 @@ pub(super) fn lower_yield_from_expr(
     scope: &mut BodyScope,
     expr: &ruff_python_ast::ExprYieldFrom,
 ) -> Result<Value, LowerError> {
+    if scope.info.is_async {
+        // CPython rejects this at compile time (PEP 525): delegation has no
+        // async-generator semantics.
+        return unsupported_at(
+            "'yield from' inside async function",
+            span_bounds(expr.range.start().to_u32(), expr.range.end().to_u32()),
+        );
+    }
     let iterable = driver.lower_expr(scope, &expr.value)?;
     let iter = scope.emit(InstKind::GetIter { iterable })?;
     scope.emit(InstKind::YieldFrom { iter })

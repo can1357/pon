@@ -54,6 +54,7 @@ pub mod super_;
 /// Generator/coroutine/frame type modules.
 pub mod generator;
 pub mod coroutine;
+pub mod async_generator;
 pub mod frame;
 
 /// Import and typing support modules.

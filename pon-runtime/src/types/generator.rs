@@ -210,7 +210,7 @@ unsafe fn argv_slice<'a>(argv: *mut *mut PyObject, argc: usize) -> Result<&'a [*
     })
 }
 
-unsafe fn exact_args<'a>(argv: *mut *mut PyObject, argc: usize, expected: usize, name: &str) -> Result<&'a [*mut PyObject], String> {
+pub(crate) unsafe fn exact_args<'a>(argv: *mut *mut PyObject, argc: usize, expected: usize, name: &str) -> Result<&'a [*mut PyObject], String> {
     if argc != expected {
         return Err(format!("{name} expected {expected} arguments, got {argc}"));
     }
@@ -262,7 +262,7 @@ unsafe extern "C" fn generator_dunder_iter_method(argv: *mut *mut PyObject, argc
     args[0]
 }
 
-unsafe fn bound_generator_method(
+pub(crate) unsafe fn bound_generator_method(
     object: *mut PyObject,
     name: &'static str,
     arity: usize,
