@@ -199,3 +199,4 @@ pon-conformance/corpus/cpython/type_bases.py
 pon-conformance/corpus/cpython/async_genexpr.py
 pon-conformance/corpus/cpython/gc_iterator_safety.py
 pon-conformance/corpus/cpython/ast_parse.py
+pon-conformance/corpus/cpython/gc_frame_window.py
