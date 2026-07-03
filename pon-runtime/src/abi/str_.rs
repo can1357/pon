@@ -2527,10 +2527,10 @@ fn str_split_args(args: &[*mut PyObject], name: &str) -> Result<(Option<String>,
         return Err("empty separator".to_owned());
     }
     let maxsplit = match args.get(1).copied() {
-        // A missing trailing arg stays absent (`bind_optional_named_keywords_trimmed`);
-        // an explicit `None` still fails the int conversion like CPython.
-        Some(value) => str_long_value(value)? as isize,
-        None => -1,
+        // Keyword binding fills absent slots with None (`split`/`rsplit`
+        // binder rows): None keeps the unlimited default like CPython.
+        Some(value) if !is_none(value) => str_long_value(value)? as isize,
+        _ => -1,
     };
     Ok((sep, maxsplit))
 }

@@ -381,7 +381,7 @@ pub(crate) fn sync_globals_dict_bulk(dict_object: *mut PyObject) {
     if crate::import::active_module_name_id() != Some(binding.module_name) {
         return;
     }
-    let _ = copy_dict_to_active_module(dict_object);
+    let _ = copy_dict_to_module(dict_object, binding.module_name);
 }
 
 /// Dynamic-compile failure split by Python-visible type: `Syntax` raises a
@@ -573,19 +573,25 @@ fn execute_code(code: &PyCodeObject, globals: *mut PyObject, locals: *mut PyObje
     let Some(hook) = hook else {
         return Err("dynamic code execution is not available in this runtime".to_owned());
     };
+    let registered_module = execution_context_module(globals, locals);
+    let module_name = registered_module.unwrap_or_else(module_name_for_globals);
+    let name_key = intern("__name__");
+    let restore_name = registered_module.is_none().then(|| crate::import::module_attr(module_name, name_key)).flatten();
     if unsafe { dict::is_dict(globals) } {
-        copy_dict_to_active_module(globals)?;
+        copy_dict_to_module(globals, module_name)?;
     }
     if locals != globals && unsafe { dict::is_dict(locals) } {
-        copy_dict_to_active_module(locals)?;
+        copy_dict_to_module(locals, module_name)?;
     }
-    // The dynamic body executes as module-toplevel code of the module whose
-    // namespace backs `globals` (its stores/loads must land in that module's
-    // attrs, and the result probe reads them back from there).  Re-enter that
-    // module's execution context so the defining-module call floor masks the
-    // suspended caller frames, exactly as a real module import would.
-    let context_module = resolve(module_name_for_globals())
-        .filter(|name| crate::import::begin_module_execution(name).is_ok());
+    // Dynamic code always executes through one backing module namespace: a
+    // real registered module when `globals`/`locals` are that module's live
+    // `__dict__`, else the current active module / `__main__` scratch space.
+    // The scratch path preserves today's exec/eval plumbing (the JIT hook
+    // reads `active_module_attr("__pon_dyn_eval_result")`) but restores the
+    // caller's `__name__` afterward so helpers like `collections.namedtuple`
+    // do not permanently clobber the importing module (`decimal.__name__`
+    // must stay `decimal`, not `namedtuple_DecimalTuple`).
+    let context_module_name = resolve(module_name).filter(|name| crate::import::begin_module_execution(name).is_ok());
     let result = hook(DynExecuteRequest {
         source: &code.source,
         filename: &code.filename,
@@ -593,17 +599,26 @@ fn execute_code(code: &PyCodeObject, globals: *mut PyObject, locals: *mut PyObje
         globals,
         locals,
     });
-    if let Some(name) = context_module {
+    if let Some(name) = context_module_name {
         crate::import::end_module_execution(&name);
     }
-    let result = result?;
-    let module_name = module_name_for_globals();
     if unsafe { dict::is_dict(globals) } {
         sync_module_attrs_into_dict(module_name, globals)?;
     }
     if locals != globals && unsafe { dict::is_dict(locals) } {
         sync_module_attrs_into_dict(module_name, locals)?;
     }
+    if registered_module.is_none() {
+        match restore_name {
+            Some(value) => {
+                crate::import::store_module_attr(module_name, name_key, value);
+            }
+            None => {
+                crate::import::delete_module_attr(module_name, name_key);
+            }
+        }
+    }
+    let result = result?;
     if result.is_null() {
         Err("dynamic code execution returned NULL".to_owned())
     } else {
@@ -611,16 +626,23 @@ fn execute_code(code: &PyCodeObject, globals: *mut PyObject, locals: *mut PyObje
     }
 }
 
-fn copy_dict_to_active_module(dict_object: *mut PyObject) -> Result<(), String> {
+fn execution_context_module(globals: *mut PyObject, locals: *mut PyObject) -> Option<u32> {
+    binding_for_dict(globals)
+        .or_else(|| (locals != globals).then(|| binding_for_dict(locals)).flatten())
+        .map(|binding| binding.module_name)
+}
+
+fn copy_dict_to_module(dict_object: *mut PyObject, module_name: u32) -> Result<(), String> {
     let entries = unsafe { dict::dict_entries_snapshot(dict_object)? };
     for entry in entries {
         let Some(name) = key_name_id(entry.key) else {
             continue;
         };
-        crate::import::store_active_module_attr(name, entry.value);
+        crate::import::store_module_attr(module_name, name, entry.value);
     }
     Ok(())
 }
+
 
 fn namespace_args(args: &[*mut PyObject], name: &str) -> Result<(*mut PyObject, *mut PyObject), String> {
     if args.len() > 3 {
