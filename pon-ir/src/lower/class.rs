@@ -280,6 +280,47 @@ class C(int, x=1, **k1, **k2):
     }
 
     #[test]
+    fn lowers_implicit_dunder_class_cell_through_classcell_protocol() {
+        let module = lower_source(
+            r#"
+class C:
+    def capture(self):
+        return __class__
+"#,
+        )
+        .expect("method __class__ capture should lower");
+        let main = &module.functions[module.main.0 as usize];
+        let at = build_class_at(main);
+        let InstKind::BuildClass { body, .. } = &main.blocks[0].insts[at].kind else {
+            unreachable!();
+        };
+        let class_body = &module.functions[body.0 as usize];
+        assert_eq!(
+            class_body.n_locals, 1,
+            "the implicit __class__ cell needs one synthetic local backing slot"
+        );
+        assert!(
+            class_body
+                .blocks
+                .iter()
+                .flat_map(|block| block.insts.iter())
+                .any(|inst| matches!(inst.kind, InstKind::MakeCell(LocalId(0)))),
+            "class body must promote the synthetic slot into the implicit __class__ cell"
+        );
+        assert!(
+            class_body
+                .blocks
+                .iter()
+                .flat_map(|block| block.insts.iter())
+                .any(|inst| match inst.kind {
+                    InstKind::StoreName(name, _) => module.names[name.0 as usize] == "__classcell__",
+                    _ => false,
+                }),
+            "class body must publish the implicit cell via __classcell__"
+        );
+    }
+
+    #[test]
     fn pep646_starred_annotation_unpacks_in_annotate() {
         let module = lower_source(
             r#"

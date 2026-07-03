@@ -1048,6 +1048,14 @@ fn finalize_scope(mut builder: ScopeBuilder, enclosing_locals: &BTreeSet<String>
     all_names.extend(builder.global_decl.iter().cloned());
     all_names.extend(builder.nonlocal_decl.iter().cloned());
     all_names.extend(names_needed_by_children);
+    if needs_class_closure
+        && !builder.used.contains("__class__")
+        && !builder.bound.contains("__class__")
+        && !builder.global_decl.contains("__class__")
+        && !builder.nonlocal_decl.contains("__class__")
+    {
+        all_names.remove("__class__");
+    }
 
     let mut symbols = BTreeMap::new();
     for name in all_names {
@@ -1385,6 +1393,32 @@ def h(s):
         let symbol = class_scope.symbol("s").expect("s should be classified");
         assert!(matches!(symbol.class, NameClass::Free { slot: 0 }));
         assert!(symbol.is_nonlocal);
+    }
+
+    #[test]
+    fn class_scope_claims_implicit_dunder_class_cell_for_direct_capture() {
+        let analysis = analyze(
+            r#"
+class C:
+    def capture(self):
+        return __class__
+"#,
+        );
+        let class_scope = analysis
+            .root
+            .child(ScopeKind::Class, "C")
+            .expect("class scope should be discovered");
+        assert!(class_scope.needs_class_closure);
+        assert_eq!(class_scope.free_vars, Vec::<String>::new());
+        assert_eq!(class_scope.cell_vars, vec!["__class__".to_owned()]);
+        assert!(
+            class_scope.symbol("__class__").is_none(),
+            "the implicit class cell must stay metadata-only in the class namespace"
+        );
+        let method = class_scope
+            .child(ScopeKind::Function, "capture")
+            .expect("method scope should be discovered");
+        assert_eq!(method.free_vars, vec!["__class__".to_owned()]);
     }
 
     #[test]

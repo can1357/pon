@@ -1832,14 +1832,14 @@ pub(crate) fn bind_native_keywords_for_name(
         }
         // `str.split(sep=None, maxsplit=-1)` / `str.rsplit` (bytes/bytearray
         // share the row: same signature, dispatch is by function name): the
-        // bound receiver occupies the first slot (`to_bytes` precedent) and
-        // absent optionals arrive as None (`str_split_args` maps None to the
-        // whitespace-sep / unlimited-maxsplit defaults).  `ipaddress.py`
-        // module exec runs `ip_str.split(':', maxsplit=_max_parts)`.
-        "split" => bind_optional_named_keywords(positional, keywords, "split", &["self", "sep", "maxsplit"], 3),
-        "rsplit" => {
-            bind_optional_named_keywords(positional, keywords, "rsplit", &["self", "sep", "maxsplit"], 3)
-        }
+        // bound receiver occupies the first slot (`to_bytes` precedent).
+        // Preserve an omitted trailing `maxsplit` so the entry can still
+        // distinguish omission from an explicit `None` (CPython rejects
+        // `split(None, None)`), while interior gaps still materialize as
+        // None for `split(maxsplit=1)`. `ipaddress.py` module exec runs
+        // `ip_str.split(':', maxsplit=_max_parts)`.
+        "split" => bind_optional_named_keywords_trimmed(positional, keywords, "split", &["self", "sep", "maxsplit"], 3),
+        "rsplit" => bind_optional_named_keywords_trimmed(positional, keywords, "rsplit", &["self", "sep", "maxsplit"], 3),
         // `open(file, mode='r', buffering=-1, encoding=None, errors=None,
         // newline=None, closefd=True, opener=None)`: `_osx_support` and the
         // sysconfig/platform chain pass `encoding=` (and friends) as
@@ -1911,6 +1911,54 @@ fn bind_optional_named_keywords(
             *slot = none;
         }
     }
+    Ok(argv)
+}
+
+/// Like [`bind_optional_named_keywords`], but trims omitted trailing slots
+/// back off the argv tail after keyword placement. This lets entries
+/// distinguish "argument omitted" from an explicit trailing `None` while
+/// still materializing interior gaps as `None` for calls like
+/// `split(maxsplit=1)`.
+fn bind_optional_named_keywords_trimmed(
+    positional: &[*mut PyObject],
+    keywords: KeywordArgs<'_>,
+    function_name: &str,
+    names: &[&str],
+    max_positional: usize,
+) -> Result<Vec<*mut PyObject>, String> {
+    if positional.len() > max_positional {
+        return Err(format!(
+            "{function_name}() expected at most {max_positional} positional arguments, got {}",
+            positional.len()
+        ));
+    }
+    let mut argv = positional.to_vec();
+    let mut used = positional.len();
+    argv.resize(names.len(), ptr::null_mut());
+    for (name, value) in keywords.names.iter().copied().zip(keywords.values.iter().copied()) {
+        if value.is_null() {
+            return Err(format!("keyword argument {} is NULL", keyword_name(name)));
+        }
+        let actual = keyword_name(name);
+        let Some(index) = names.iter().position(|expected| *expected == actual) else {
+            return Err(format!("{function_name}() got an unexpected keyword argument '{actual}'"));
+        };
+        if index < positional.len() || !argv[index].is_null() {
+            return Err(format!("{function_name}() got multiple values for argument '{actual}'"));
+        }
+        argv[index] = value;
+        used = used.max(index + 1);
+    }
+    let none = unsafe { crate::abi::pon_none() };
+    if none.is_null() {
+        return Err(format!("failed to allocate None default for {function_name}()"));
+    }
+    for slot in &mut argv[..used] {
+        if slot.is_null() {
+            *slot = none;
+        }
+    }
+    argv.truncate(used);
     Ok(argv)
 }
 

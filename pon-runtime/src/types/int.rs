@@ -411,6 +411,7 @@ pub unsafe fn int_instance_attr(object: *mut PyObject, name: u32) -> Option<*mut
         "__index__" | "__int__" | "__trunc__" | "__floor__" | "__ceil__" => {
             bound_int_method(object, name, int_identity_method)
         }
+        "__add__" => bound_int_method(object, name, int_dunder_add_entry),
         "__format__" => bound_int_method(object, name, int_dunder_format_entry),
         "numerator" | "real" => Some(from_bigint(value)),
         "denominator" => Some(from_bigint(BigInt::from(1))),
@@ -471,6 +472,7 @@ pub(crate) fn ensure_int_type_methods_installed(ty: *mut PyType) {
         ("__trunc__", int_identity_method),
         ("__floor__", int_identity_method),
         ("__ceil__", int_identity_method),
+        ("__add__", int_dunder_add_entry),
         ("__format__", int_dunder_format_entry),
     ];
     for (name, entry) in natives {
@@ -511,6 +513,31 @@ unsafe extern "C" fn int_identity_method(argv: *mut *mut PyObject, argc: usize) 
         Ok(value) => from_bigint(value),
         Err(error) => error,
     }
+}
+ 
+/// `int.__add__(self, other)` — wrapper-descriptor surface used at import time
+/// by `multiprocessing.reduction` (`type(int.__add__)`).  Foreign RHS operands
+/// follow CPython and return `NotImplemented`; only receiver/arity mismatches
+/// raise.
+unsafe extern "C" fn int_dunder_add_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc == 0 {
+        return raise_type_error("descriptor '__add__' of 'int' object needs an argument");
+    }
+    let receiver = unsafe { crate::tag::untag_arg(*argv) };
+    let Some(left) = (unsafe { to_bigint_including_bool(receiver) }) else {
+        let got = unsafe { crate::types::dict::type_name(receiver) }.unwrap_or("object");
+        return raise_type_error(&format!(
+            "descriptor '__add__' requires a 'int' object but received a '{got}'"
+        ));
+    };
+    if argc != 2 {
+        return raise_type_error(&format!("expected 1 argument, got {}", argc.saturating_sub(1)));
+    }
+    let right = unsafe { crate::tag::untag_arg(*argv.add(1)) };
+    let Some(right) = (unsafe { to_bigint_including_bool(right) }) else {
+        return unsafe { abi::pon_not_implemented() };
+    };
+    from_bigint(left + right)
 }
 
 /// Receiver/arity validation for the zero-argument int instance methods,
