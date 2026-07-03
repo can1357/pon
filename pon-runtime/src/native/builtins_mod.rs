@@ -1527,7 +1527,7 @@ pub unsafe extern "C" fn builtin_issubclass(argv: *mut *mut PyObject, argc: usiz
 /// metaclass `__subclasscheck__` semantics; bare native shims keep the
 /// historical name comparison.  Returns 1/0 and -1 with a pending exception.
 unsafe fn class_is_subclass(cls: *mut PyObject, classinfo: *mut PyObject) -> c_int {
-    if let Some(entries) = unsafe { tuple_classinfo_entries(classinfo) } {
+    if let Some(entries) = unsafe { exact_tuple_entries(classinfo) } {
         for entry in entries.iter().copied() {
             let result = unsafe { class_is_subclass(cls, entry) };
             if result != 0 {
@@ -2267,7 +2267,11 @@ fn object_to_string(object: *mut PyObject) -> Option<String> {
 
 unsafe fn exception_message_text(object: *mut PyObject, mut ty: *const PyType) -> Option<String> {
     let original_name = unsafe { (*ty).name() };
+    let mut derives_os_error = false;
     while !ty.is_null() {
+        if unsafe { (*ty).name() == "OSError" } {
+            derives_os_error = true;
+        }
         if unsafe { (*ty).name() == "BaseException" } {
             // SAFETY: Reaching BaseException in the type chain proves compatible layout.
             let exception = unsafe { &*object.cast::<PyBaseException>() };
@@ -2275,6 +2279,13 @@ unsafe fn exception_message_text(object: *mut PyObject, mut ty: *const PyType) -
             // the whole args tuple; the stored tuple is non-NULL exactly for
             // multi-argument constructors.
             if !exception.args.is_null() {
+                // `OSError.__str__` overrides the tuple shape for the
+                // errno-carrying constructions (2..=5 args).
+                if derives_os_error {
+                    if let Some(text) = unsafe { os_error_str(exception.args) } {
+                        return Some(text);
+                    }
+                }
                 return Some(repr_text(exception.args));
             }
             let message = exception.message;
@@ -2290,6 +2301,34 @@ unsafe fn exception_message_text(object: *mut PyObject, mut ty: *const PyType) -
         ty = unsafe { (*ty).tp_base.cast_const() };
     }
     None
+}
+
+/// CPython `OSError.__str__` for errno-carrying constructions: 2..=5
+/// positional args render `[Errno n] strerror`, appending the optional
+/// filename (`args[2]`) and filename2 (`args[4]`) as reprs
+/// (`: 'src' -> 'dst'`); filename2 only prints alongside filename, exactly
+/// the C `oserror_str` branch order.  `None` falls back to
+/// `BaseException.__str__`'s args-tuple repr.
+unsafe fn os_error_str(args: *mut PyObject) -> Option<String> {
+    let items = unsafe { exact_tuple_entries(args) }?;
+    if !(2..=5).contains(&items.len()) {
+        return None;
+    }
+    let errno_text = str_text(items[0]);
+    let strerror_text = str_text(items[1]);
+    // pon spells None as a NULL slot (post-untag), so "filename is not None"
+    // reads as a non-NULL check.
+    let filename = items.get(2).copied().filter(|&slot| !crate::tag::untag_arg(slot).is_null());
+    let filename2 = (items.len() == 5)
+        .then(|| items[4])
+        .filter(|&slot| !crate::tag::untag_arg(slot).is_null());
+    Some(match (filename, filename2) {
+        (Some(name), Some(name2)) => {
+            format!("[Errno {errno_text}] {strerror_text}: {} -> {}", repr_text(name), repr_text(name2))
+        }
+        (Some(name), None) => format!("[Errno {errno_text}] {strerror_text}: {}", repr_text(name)),
+        (None, _) => format!("[Errno {errno_text}] {strerror_text}"),
+    })
 }
 
 unsafe fn type_name(object: *mut PyObject) -> Option<&'static str> {
@@ -2779,7 +2818,7 @@ unsafe fn object_is_instance(object: *mut PyObject, classinfo: *mut PyObject) ->
     }
     // Tuple of classes: first hit short-circuits, before later entries are
     // even validated (CPython parity).
-    if let Some(entries) = unsafe { tuple_classinfo_entries(classinfo) } {
+    if let Some(entries) = unsafe { exact_tuple_entries(classinfo) } {
         for entry in entries.iter().copied() {
             let result = unsafe { object_is_instance(object, entry) };
             if result != 0 {
@@ -2833,14 +2872,14 @@ unsafe fn object_is_instance(object: *mut PyObject, classinfo: *mut PyObject) ->
     i32::from(unsafe { (*object_type).name() == expected_name })
 }
 
-/// Elements of a tuple-of-classes `classinfo`, accepting both runtime tuple
+/// Elements of a tuple object, accepting both runtime tuple
 /// representations: the seq-family `PyTuple` and the native builtins_mod
-/// `NativePayload::Sequence` tuple.
-unsafe fn tuple_classinfo_entries<'a>(classinfo: *mut PyObject) -> Option<&'a [*mut PyObject]> {
-    if let Some(items) = unsafe { abi::seq::exact_tuple_slice(classinfo) } {
+/// `NativePayload::Sequence` tuple (isinstance classinfo, exception args).
+unsafe fn exact_tuple_entries<'a>(object: *mut PyObject) -> Option<&'a [*mut PyObject]> {
+    if let Some(items) = unsafe { abi::seq::exact_tuple_slice(object) } {
         return Some(items);
     }
-    let native: &'a NativeObject = unsafe { as_native(classinfo) }?;
+    let native: &'a NativeObject = unsafe { as_native(object) }?;
     match &native.payload {
         NativePayload::Sequence { kind: SequenceKind::Tuple, items } => Some(items.as_slice()),
         _ => None,

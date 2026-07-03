@@ -31,7 +31,7 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
         string_attr(module, "pardir", ".."),
     ];
     let mut attrs = attrs.into_iter().collect::<Result<Vec<_>, _>>()?;
-    for &(name, value) in [OPEN_FLAGS, ACCESS_FLAGS].into_iter().flatten() {
+    for &(name, value) in [OPEN_FLAGS, ACCESS_FLAGS, WAIT_OPTIONS].into_iter().flatten() {
         // SAFETY: Integer boxing helper; NULL is checked below.
         let boxed = unsafe { crate::abi::pon_const_int(i64::from(value)) };
         if boxed.is_null() {
@@ -372,6 +372,11 @@ const ACCESS_FLAGS: &[(&str, i32)] = &[
     ("X_OK", libc::X_OK),
 ];
 
+/// `waitpid(2)` option constants: `subprocess._del_safe` binds `WNOHANG` at
+/// import time (`Popen.__del__`'s non-blocking reap), and asyncio's child
+/// watchers pass it on every poll.
+const WAIT_OPTIONS: &[(&str, i32)] = &[("WNOHANG", libc::WNOHANG)];
+
 /// Snapshot of the process environment as a plain str->str dict.
 ///
 /// CPython's `os.environ` is a live `os._Environ` mapping whose writes call
@@ -403,10 +408,11 @@ fn environ_snapshot(module: &str) -> Result<*mut PyObject, String> {
 }
 
 // ---------------------------------------------------------------------------
-// POSIX syscall surface: open/close/read/write/unlink/rmdir/lstat plus the
-// scandir frontier stub.  Raw libc calls over the same process fd space the
-// `_io` native files wrap (`File::from_raw_fd`), with errno mapped onto
-// CPython's OSError subclass hierarchy (PEP 3151).
+// POSIX syscall surface: open/close/read/write/unlink/rmdir/lstat, the
+// waitpid/wait-status family, plus the scandir frontier stub.  Raw libc
+// calls over the same process fd space the `_io` native files wrap
+// (`File::from_raw_fd`), with errno mapped onto CPython's OSError subclass
+// hierarchy (PEP 3151).
 
 type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
 
@@ -415,6 +421,8 @@ type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObjec
 /// keyword-only `dir_fd` that the native keyword binder flattens into a
 /// trailing positional None slot.
 const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
+    ("WIFSTOPPED", os_wifstopped, 1),
+    ("WSTOPSIG", os_wstopsig, 1),
     ("close", os_close, 1),
     ("getcwd", os_getcwd, 0),
     ("lstat", os_lstat, crate::native::builtins_mod::VARIADIC_ARITY),
@@ -424,6 +432,8 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("rmdir", os_rmdir, 1),
     ("scandir", os_scandir, 1),
     ("unlink", os_unlink, 1),
+    ("waitpid", os_waitpid, 2),
+    ("waitstatus_to_exitcode", os_waitstatus_to_exitcode, 1),
     ("write", os_write, 2),
 ];
 
@@ -814,6 +824,100 @@ unsafe extern "C" fn os_scandir(_argv: *mut *mut PyObject, _argc: usize) -> *mut
         ExceptionKind::NotImplementedError,
         "os.scandir is not implemented in pon",
     )
+}
+
+/// Single int `status` word shared by the wait-status inspectors.
+fn status_arg(argv: *mut *mut PyObject, argc: usize, what: &str) -> Result<libc::c_int, *mut PyObject> {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return Err(crate::abi::return_null_with_error(format!("os.{what} expected one argument")));
+    }
+    int_arg(args[0], what).map(|status| status as libc::c_int)
+}
+
+/// `os.waitpid(pid, options)` over `waitpid(2)`: `(pid, status)` tuple.
+/// With nothing to reap the host answers ECHILD, surfaced as CPython's
+/// ChildProcessError — exactly what `subprocess.Popen.__del__`'s reaper and
+/// asyncio's child watchers catch on their no-child paths.
+unsafe extern "C" fn os_waitpid(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.waitpid expected two arguments");
+    }
+    let pid = match int_arg(args[0], "waitpid pid") {
+        Ok(pid) => pid,
+        Err(error) => return error,
+    };
+    let options = match int_arg(args[1], "waitpid options") {
+        Ok(options) => options,
+        Err(error) => return error,
+    };
+    let mut status: libc::c_int = 0;
+    // SAFETY: `status` is a live out-slot for the syscall to fill.
+    let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, options as libc::c_int) };
+    if reaped < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    // SAFETY: Integer boxing helpers follow the NULL-sentinel error contract.
+    let mut items = [unsafe { crate::abi::pon_const_int(i64::from(reaped)) }, unsafe {
+        crate::abi::pon_const_int(i64::from(status))
+    }];
+    if items.iter().any(|item| item.is_null()) {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `items` is a live window for the duration of the call.
+    unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) }
+}
+
+/// `os.waitstatus_to_exitcode(status)`: pure status-word math, exactly
+/// CPython's `os_waitstatus_to_exitcode_impl` — `WEXITSTATUS` for a normal
+/// exit, `-WTERMSIG` for a signal death, ValueError for stopped/invalid
+/// words.  `subprocess._handle_exitstatus` calls it on every reaped status.
+unsafe extern "C" fn os_waitstatus_to_exitcode(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let status = match status_arg(argv, argc, "waitstatus_to_exitcode") {
+        Ok(status) => status,
+        Err(error) => return error,
+    };
+    let exitcode = if libc::WIFEXITED(status) {
+        i64::from(libc::WEXITSTATUS(status))
+    } else if libc::WIFSIGNALED(status) {
+        -i64::from(libc::WTERMSIG(status))
+    } else if libc::WIFSTOPPED(status) {
+        return crate::abi::exc::raise_kind_error_text(
+            ExceptionKind::ValueError,
+            &format!("process stopped by delivery of signal {}", libc::WSTOPSIG(status)),
+        );
+    } else {
+        return crate::abi::exc::raise_kind_error_text(
+            ExceptionKind::ValueError,
+            &format!("invalid wait status: {status}"),
+        );
+    };
+    // SAFETY: Integer boxing helper follows the NULL-sentinel error contract.
+    unsafe { crate::abi::pon_const_int(exitcode) }
+}
+
+/// `os.WIFSTOPPED(status)`: true when the word reports a stopped child.
+/// `subprocess._del_safe` binds it at import time for the `__del__` reaper.
+unsafe extern "C" fn os_wifstopped(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    match status_arg(argv, argc, "WIFSTOPPED") {
+        Ok(status) => bool_object(libc::WIFSTOPPED(status)),
+        Err(error) => error,
+    }
+}
+
+/// `os.WSTOPSIG(status)`: the signal that stopped the child (import-time
+/// `subprocess._del_safe` binding, read next to `WIFSTOPPED`).
+unsafe extern "C" fn os_wstopsig(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    match status_arg(argv, argc, "WSTOPSIG") {
+        Ok(status) => {
+            // SAFETY: Integer boxing helper follows the NULL-sentinel error contract.
+            unsafe { crate::abi::pon_const_int(i64::from(libc::WSTOPSIG(status))) }
+        }
+        Err(error) => error,
+    }
 }
 
 // ---------------------------------------------------------------------------

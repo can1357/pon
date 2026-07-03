@@ -2,7 +2,7 @@
 
 use num_traits::ToPrimitive;
 
-use crate::abi::{pon_const_int, pon_const_str, pon_make_function, return_null_with_error};
+use crate::abi::{pon_const_bool, pon_const_int, pon_const_str, pon_make_function, return_null_with_error};
 use crate::intern::intern;
 use crate::object::PyObject;
 
@@ -83,6 +83,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         string_attr("platlibdir", "lib"),
         flags_attr(),
         hash_info_attr(),
+        jit_attr(),
         warnoptions_attr(),
         meta_path_attr(),
         modules_attr(),
@@ -271,6 +272,77 @@ unsafe extern "C" fn hash_info_getattro(object: *mut PyObject, name: *mut PyObje
         // SAFETY: Raise helper with the interned attribute name.
         _ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
     }
+}
+
+/// `sys._jit` singleton (the flags/hash_info pattern: an opaque leaked
+/// object whose getattro serves the consumed method set).  CPython 3.14
+/// ships it as a real module introspecting CPython's OWN experimental
+/// tier-2/uop JIT; `test.support` calls `is_enabled()` at import to gate
+/// CPython-JIT-specific tests (`requires_jit_enabled` /
+/// `requires_jit_disabled`).  pon has a JIT (tier-up), but it is not the
+/// JIT those tests probe, so `is_enabled()` honestly answers `False` and
+/// routes them to skip — the same answer the host oracle (a non-JIT
+/// CPython build) gives, keeping the differential suites stable.  The
+/// wider CPython surface (`is_available`, `is_active`) is deliberately
+/// unserved until a walk consumes it (`test.libregrtest.utils`,
+/// `test_sys`): unknown attributes raise so that frontier is loud.
+fn jit_attr() -> Result<(u32, *mut PyObject), String> {
+    static JIT_TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let mut ty = crate::object::PyType::new(
+            std::ptr::null(),
+            "sys._jit",
+            std::mem::size_of::<crate::object::PyObjectHeader>(),
+        );
+        ty.tp_getattro = Some(jit_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    static JIT: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        Box::into_raw(Box::new(crate::object::PyObjectHeader::new(*JIT_TYPE as *mut crate::object::PyType)))
+            as usize
+    });
+    Ok((intern("_jit"), *JIT as *mut PyObject))
+}
+
+unsafe extern "C" fn jit_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let name = crate::tag::untag_arg(name);
+    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        crate::thread_state::pon_err_set("attribute name must be str");
+        return std::ptr::null_mut();
+    };
+    match name_text {
+        "is_enabled" => {
+            // One function object for the process, like the singleton itself.
+            static IS_ENABLED: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+                // SAFETY: Live builtin entry point with the runtime calling
+                // convention; NULL propagates as allocation failure below.
+                let function = unsafe {
+                    pon_make_function(
+                        jit_is_enabled as *const u8,
+                        crate::builtins::variadic_arity(),
+                        intern("is_enabled"),
+                    )
+                };
+                function as usize
+            });
+            let function = *IS_ENABLED as *mut PyObject;
+            if function.is_null() {
+                return return_null_with_error("failed to allocate sys._jit.is_enabled");
+            }
+            function
+        }
+        // SAFETY: Raise helper with the interned attribute name.
+        _ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
+    }
+}
+
+/// `sys._jit.is_enabled()`: `False` — see [`jit_attr`] for why.
+unsafe extern "C" fn jit_is_enabled(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let _ = argv;
+    if argc != 0 {
+        return return_null_with_error(format!("is_enabled() takes no arguments ({argc} given)"));
+    }
+    // SAFETY: Boolean constant helper follows the NULL-sentinel contract.
+    unsafe { pon_const_bool(0) }
 }
 
 // ---------------------------------------------------------------------------
