@@ -728,24 +728,24 @@ fn resolve_module_by_name(name: &str) -> Result<*mut PyObject, String> {
             }
             return Err(format!("embedded module '{name}' returned NULL without setting an exception"));
         }
-        return Ok(module);
+        return adopt_post_body_sys_modules_replacement(name, module);
     }
 
     if let Some(spec) = find_source_module(name) {
-        let source = fs::read_to_string(&spec.path)
-            .map_err(|error| format!("failed to read source module '{}': {error}", spec.path.display()))?;
+        let module_attrs = source_module_attrs(&spec)?;
+        let Some(source_path) = spec.path.as_ref() else {
+            let module = create_module(name, true, module_attrs)?;
+            bind_child_to_parent(name, module);
+            return Ok(module);
+        };
+        let source = fs::read_to_string(source_path)
+            .map_err(|error| format!("failed to read source module '{}': {error}", source_path.display()))?;
         let loader = {
             let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
             state.source_loader
         };
         if let Some(loader) = loader {
-            // CPython sets `__file__` on source-imported modules, as an
-            // absolute path (sys.path[0] is absolutized since 3.11; abspath,
-            // not realpath). The JIT-loader path is the only importer that
-            // knows a source path (AoT-embedded bodies have none).
-            let file_path = std::path::absolute(&spec.path).unwrap_or_else(|_| spec.path.clone());
-            let file_object = runtime_string(&file_path.to_string_lossy())?;
-            let module = create_module(name, spec.is_package, [(intern("__file__"), file_object)])?;
+            let module = create_module(name, spec.is_package, module_attrs)?;
             bind_child_to_parent(name, module);
             begin_module_execution(name)?;
             // Bracket the module body like any call boundary (see the
@@ -753,7 +753,7 @@ fn resolve_module_by_name(name: &str) -> Result<*mut PyObject, String> {
             let handled_guard = crate::abi::HandledExcGuard::enter();
             let loaded = loader(SourceModuleRequest {
                 name,
-                path: &spec.path,
+                path: source_path,
                 source: &source,
                 is_package: spec.is_package,
             });
@@ -773,10 +773,10 @@ fn resolve_module_by_name(name: &str) -> Result<*mut PyObject, String> {
                 }
                 return Err(format!("source module '{name}' returned NULL without setting an exception"));
             }
-            return Ok(module);
+            return adopt_post_body_sys_modules_replacement(name, module);
         }
 
-        let module = load_curated_assignment_module(name, &source, spec.is_package)?;
+        let module = load_curated_assignment_module(name, &source, spec.is_package, module_attrs)?;
         bind_child_to_parent(name, module);
         return Ok(module);
     }
@@ -806,8 +806,33 @@ fn is_unsupported_c_accelerated(name: &str) -> bool {
 }
 
 struct SourceSpec {
-    path: PathBuf,
+    path: Option<PathBuf>,
     is_package: bool,
+    search_locations: Option<Vec<PathBuf>>,
+}
+
+impl SourceSpec {
+    fn module(path: PathBuf, is_package: bool) -> Self {
+        let search_locations = is_package.then(|| {
+            vec![path
+                .parent()
+                .expect("package __init__.py always has a parent directory")
+                .to_path_buf()]
+        });
+        Self {
+            path: Some(path),
+            is_package,
+            search_locations,
+        }
+    }
+
+    fn namespace(search_locations: Vec<PathBuf>) -> Self {
+        Self {
+            path: None,
+            is_package: true,
+            search_locations: Some(search_locations),
+        }
+    }
 }
 
 fn find_source_module(name: &str) -> Option<SourceSpec> {
@@ -818,21 +843,23 @@ fn find_source_module(name: &str) -> Option<SourceSpec> {
     for part in name.split('.') {
         relative.push(part);
     }
-    search_roots().into_iter().find_map(|root| {
-        let package_init = root.join(&relative).join("__init__.py");
+    let mut namespace_portions = Vec::new();
+    for root in search_roots() {
+        let package_dir = root.join(&relative);
+        let package_init = package_dir.join("__init__.py");
         if package_init.is_file() {
-            return Some(SourceSpec {
-                path: package_init,
-                is_package: true,
-            });
+            return Some(SourceSpec::module(package_init, true));
         }
         let mut module_path = root.join(&relative);
         module_path.set_extension("py");
-        module_path.is_file().then_some(SourceSpec {
-            path: module_path,
-            is_package: false,
-        })
-    })
+        if module_path.is_file() {
+            return Some(SourceSpec::module(module_path, false));
+        }
+        if package_dir.is_dir() {
+            namespace_portions.push(package_dir);
+        }
+    }
+    (!namespace_portions.is_empty()).then(|| SourceSpec::namespace(namespace_portions))
 }
 
 /// Environment override for the vendored-stdlib search root (HANDOFF J0.4).
@@ -936,6 +963,13 @@ pub(crate) fn source_module_package_flag(name: &str) -> Option<bool> {
     find_source_module(name).map(|spec| spec.is_package)
 }
 
+pub(crate) fn source_module_search_locations(name: &str) -> Option<Vec<PathBuf>> {
+    if crate::native::is_native_module(name) || is_unsupported_c_accelerated(name) {
+        return None;
+    }
+    find_source_module(name).and_then(|spec| spec.search_locations)
+}
+
 /// Imports `name` and returns exactly that module — never the root-package
 /// remap `pon_import_name` applies for empty fromlists — raising the same
 /// typed import failure on error. Serves loader entry points
@@ -949,8 +983,12 @@ pub(crate) fn import_named_module_raw(name: &str) -> *mut PyObject {
     }
 }
 
-fn load_curated_assignment_module(name: &str, source: &str, is_package: bool) -> Result<*mut PyObject, String> {
-    let mut attrs = Vec::new();
+fn load_curated_assignment_module(
+    name: &str,
+    source: &str,
+    is_package: bool,
+    mut attrs: Vec<(u32, *mut PyObject)>,
+) -> Result<*mut PyObject, String> {
     for line in source.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1137,6 +1175,39 @@ fn runtime_string(value: &str) -> Result<*mut PyObject, String> {
     (!object.is_null()).then_some(object).ok_or_else(|| format!("failed to allocate string literal '{value}'"))
 }
 
+fn runtime_path_list(paths: &[PathBuf]) -> Result<*mut PyObject, String> {
+    let mut items = Vec::with_capacity(paths.len());
+    for path in paths {
+        let text = path.to_string_lossy();
+        items.push(runtime_string(&text)?);
+    }
+    let list = unsafe {
+        crate::abi::seq::pon_build_list(
+            if items.is_empty() {
+                ptr::null_mut()
+            } else {
+                items.as_mut_ptr()
+            },
+            items.len(),
+        )
+    };
+    (!list.is_null()).then_some(list).ok_or_else(|| "failed to allocate path list".to_owned())
+}
+
+fn source_module_attrs(spec: &SourceSpec) -> Result<Vec<(u32, *mut PyObject)>, String> {
+    let mut attrs = Vec::with_capacity(2);
+    if let Some(path) = spec.path.as_ref() {
+        let file_path = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+        attrs.push((intern("__file__"), runtime_string(&file_path.to_string_lossy())?));
+    } else {
+        attrs.push((intern("__file__"), unsafe { pon_none() }));
+    }
+    if let Some(search_locations) = spec.search_locations.as_deref() {
+        attrs.push((intern("__path__"), runtime_path_list(search_locations)?));
+    }
+    Ok(attrs)
+}
+
 fn parent_module_name(name: &str) -> Option<&str> {
     name.rsplit_once('.').map(|(parent, _)| parent)
 }
@@ -1179,6 +1250,23 @@ fn bind_child_to_parent(name: &str, module: *mut PyObject) {
     }
     // J0.3 GlobalIC site: parent-module attr overlay insert.
     crate::abi::bump_namespace_version();
+}
+
+fn adopt_post_body_sys_modules_replacement(name: &str, module: *mut PyObject) -> Result<*mut PyObject, String> {
+    let Some(entry) = sys_modules_entry(name)? else {
+        return Ok(module);
+    };
+    if entry == module || is_none_binding(entry) {
+        return Ok(module);
+    }
+    let name_id = intern(name);
+    let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    state.modules.insert(name_id, entry);
+    drop(state);
+    bind_child_to_parent(name, entry);
+    // J0.3 GlobalIC site: the module behind this name changed after body exec.
+    crate::abi::bump_namespace_version();
+    Ok(entry)
 }
 
 /// Unwinds the registration of a module whose body failed to execute.
@@ -1523,7 +1611,7 @@ mod tests {
     }
 
     impl EnvVarGuard {
-        fn set(name: &'static str, value: &Path) -> Self {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
             let previous = env::var_os(name);
             unsafe {
                 env::set_var(name, value);
@@ -1686,6 +1774,59 @@ mod tests {
             "pon_tiny import should fail when PON_STDLIB_PATH points at a missing dir"
         );
         pon_err_clear();
+    }
+
+    #[test]
+    fn namespace_package_import_composes_roots() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+        pon_err_clear();
+        reset_import_state_for_tests();
+
+        let root1 = TempImportRoot::new();
+        let root2 = TempImportRoot::new();
+        let pkg_name = format!(
+            "pon_ns_pkg_{}_{}",
+            process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let ns1 = root1.path().join(&pkg_name);
+        let ns2 = root2.path().join(&pkg_name);
+        fs::create_dir_all(&ns1).unwrap();
+        fs::create_dir_all(&ns2).unwrap();
+        fs::write(ns1.join("alpha.py"), "VALUE = 'alpha-r1'\n").unwrap();
+        fs::write(ns2.join("beta.py"), "VALUE = 'beta-r2'\n").unwrap();
+        let import_path = env::join_paths([root1.path(), root2.path()]).unwrap();
+        let _env = EnvVarGuard::set("PON_IMPORT_PATH", &import_path);
+
+        let package = unsafe { pon_import_name(intern(&pkg_name), ptr::null(), 0, 0) };
+        assert!(
+            !package.is_null(),
+            "importing namespace package failed: {:?}",
+            pon_err_message()
+        );
+        let file = unsafe { pon_import_from(package, intern("__file__")) };
+        assert_eq!(format_object_for_print(file).as_deref(), Ok("None"));
+        let path = unsafe { pon_import_from(package, intern("__path__")) };
+        let path_text = format_object_for_print(path).expect("namespace __path__ must format");
+        assert!(
+            path_text.contains(ns1.to_string_lossy().as_ref())
+                && path_text.contains(ns2.to_string_lossy().as_ref()),
+            "namespace path should include both roots, got {path_text}"
+        );
+
+        let alpha = unsafe { pon_import_from(package, intern("alpha")) };
+        assert!(!alpha.is_null(), "importing namespace child alpha failed: {:?}", pon_err_message());
+        let alpha_value = unsafe { pon_import_from(alpha, intern("VALUE")) };
+        assert_eq!(format_object_for_print(alpha_value).as_deref(), Ok("alpha-r1"));
+
+        let beta = unsafe { pon_import_from(package, intern("beta")) };
+        assert!(!beta.is_null(), "importing namespace child beta failed: {:?}", pon_err_message());
+        let beta_value = unsafe { pon_import_from(beta, intern("VALUE")) };
+        assert_eq!(format_object_for_print(beta_value).as_deref(), Ok("beta-r2"));
     }
 
     #[test]

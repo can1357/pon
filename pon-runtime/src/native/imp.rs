@@ -528,7 +528,30 @@ unsafe extern "C" fn source_find_spec_entry(argv: *mut *mut PyObject, argc: usiz
     };
     let mut call_args = [name_object, loader];
     // SAFETY: `spec_from_loader` is a live callable; argv holds two live slots.
-    untag(unsafe { abi::pon_call(spec_from_loader, call_args.as_mut_ptr(), call_args.len()) })
+    let spec = untag(unsafe { abi::pon_call(spec_from_loader, call_args.as_mut_ptr(), call_args.len()) });
+    if spec.is_null() {
+        return ptr::null_mut();
+    }
+    if let Some(search_locations) = crate::import::source_module_search_locations(&name) {
+        // SAFETY: `ModuleSpec.submodule_search_locations` is the list
+        // `spec_from_loader` created for package specs.
+        let locations = unsafe { abi::pon_get_attr(spec, intern("submodule_search_locations"), ptr::null_mut()) };
+        if locations.is_null() {
+            return ptr::null_mut();
+        }
+        let locations = untag(locations);
+        for path in search_locations {
+            let text = path.to_string_lossy();
+            let path_object = str_object(&text);
+            if path_object.is_null() {
+                return ptr::null_mut();
+            }
+            if let Err(message) = crate::abi::seq::list_append_raw(locations, path_object) {
+                return crate::abi::return_null_with_error(message);
+            }
+        }
+    }
+    spec
 }
 
 /// `is_package(fullname)`: consulted by `spec_from_loader` while `find_spec`
