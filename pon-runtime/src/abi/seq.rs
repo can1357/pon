@@ -1419,6 +1419,30 @@ unsafe extern "C" fn list_reverse_method(argv: *mut *mut PyObject, argc: usize) 
         seq_none()
     })
 }
+unsafe extern "C" fn list_clear_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.clear") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_list_method_receiver(args, "clear") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        if args.len() != 1 {
+            return raise_seq_type_error(format!("list.clear() takes no arguments ({} given)", args.len().saturating_sub(1)));
+        }
+        let Some(list) = (unsafe { list_cells(receiver) }) else {
+            return raise_seq_type_error(format!("list.clear expected list, got {}", object_type_name(receiver)));
+        };
+        let _guard = crate::sync::begin_critical_section(receiver);
+        for index in 0..list.len {
+            unsafe { crate::sync::store_heap_pointer(list.items.add(index), ptr::null_mut()) };
+        }
+        list.len = 0;
+        seq_none()
+    })
+}
 
 unsafe extern "C" fn list_pop_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     catch_object_helper(|| {
@@ -1807,6 +1831,7 @@ unsafe extern "C" fn list_getattro_slot(object: *mut PyObject, name: *mut PyObje
         "extend" => bound_seq_method(object, &name, list_extend_method),
         "sort" => bound_seq_method(object, &name, list_sort_method),
         "reverse" => bound_seq_method(object, &name, list_reverse_method),
+        "clear" => bound_seq_method(object, &name, list_clear_method),
         "pop" => bound_seq_method(object, &name, list_pop_method),
         "index" => bound_seq_method(object, &name, list_index_method),
         "count" => bound_seq_method(object, &name, list_count_method),
@@ -1866,6 +1891,7 @@ pub(crate) fn ensure_list_type_methods_installed(ty: *mut PyType) {
         ("extend", list_extend_method as *const u8),
         ("sort", list_sort_method as *const u8),
         ("reverse", list_reverse_method as *const u8),
+        ("clear", list_clear_method as *const u8),
         ("pop", list_pop_method as *const u8),
         ("index", list_index_method as *const u8),
         ("count", list_count_method as *const u8),

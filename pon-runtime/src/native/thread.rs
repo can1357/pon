@@ -859,6 +859,10 @@ impl RLockState {
         let inner = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
         inner.count != 0 && inner.owner == me
     }
+    fn is_locked(&self) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
+        inner.count != 0
+    }
 }
 
 static RLOCK_TYPE: LazyLock<usize> = LazyLock::new(|| {
@@ -896,6 +900,7 @@ unsafe extern "C" fn rlock_getattro(object: *mut PyObject, name: *mut PyObject) 
         "release" => rlock_release_entry,
         "__exit__" => rlock_exit_entry,
         "_is_owned" => rlock_is_owned_entry,
+        "locked" => rlock_locked_entry,
         // SAFETY: Raise helper with the interned attribute name (Condition's
         // `_release_save`/`_acquire_restore` probes fall back on miss).
         _ => return unsafe { pon_raise_attribute_error(object, intern(name)) },
@@ -944,6 +949,12 @@ unsafe extern "C" fn rlock_is_owned_entry(argv: *mut *mut PyObject, argc: usize)
         return ptr::null_mut();
     };
     unsafe { pon_const_bool(i32::from((*rlock).state.is_owned())) }
+}
+unsafe extern "C" fn rlock_locked_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(rlock) = rlock_receiver(argv, argc) else {
+        return ptr::null_mut();
+    };
+    unsafe { pon_const_bool(i32::from((*rlock).state.is_locked())) }
 }
 
 fn rlock_receiver(argv: *mut *mut PyObject, argc: usize) -> Option<*mut PyRLock> {
