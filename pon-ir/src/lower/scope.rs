@@ -234,7 +234,10 @@ struct ScopeBuilder {
     kind: ScopeKind,
     name: String,
     span: Option<(u32, u32)>,
+    /// Positional-only + positional-or-keyword parameters for `ParameterSummary`.
     params: Vec<String>,
+    /// All formal parameters in local-slot order (`pos`, `*args`, kw-only, `**kwargs`).
+    formal_params: Vec<String>,
     positional_only: usize,
     has_vararg: bool,
     keyword_only: usize,
@@ -263,6 +266,7 @@ impl ScopeBuilder {
             name: name.to_owned(),
             span: None,
             params: Vec::new(),
+            formal_params: Vec::new(),
             positional_only: 0,
             has_vararg: false,
             keyword_only: 0,
@@ -317,6 +321,7 @@ fn annotate_builder(name: &str, type_params: &[String]) -> ScopeBuilder {
     let mut builder = ScopeBuilder::new(ScopeKind::Function, name, false);
     if name == ANNOTATE_SCOPE_NAME {
         builder.params.push("format".to_owned());
+        builder.formal_params.push("format".to_owned());
         builder.bind("format");
     }
     for param in type_params {
@@ -342,21 +347,25 @@ fn fill_parameters(parameters: &Parameters, builder: &mut ScopeBuilder) -> Resul
     for parameter in parameters.posonlyargs.iter().chain(&parameters.args) {
         let name = parameter.name().as_str();
         builder.params.push(name.to_owned());
+        builder.formal_params.push(name.to_owned());
         builder.bind(name);
     }
 
     if let Some(vararg) = parameters.vararg.as_deref() {
         let name = vararg.name().as_str();
+        builder.formal_params.push(name.to_owned());
         builder.bind(name);
     }
 
     for parameter in &parameters.kwonlyargs {
         let name = parameter.name().as_str();
+        builder.formal_params.push(name.to_owned());
         builder.bind(name);
     }
 
     if let Some(kwarg) = parameters.kwarg.as_deref() {
         let name = kwarg.name().as_str();
+        builder.formal_params.push(name.to_owned());
         builder.bind(name);
     }
 
@@ -1077,7 +1086,7 @@ fn finalize_scope(mut builder: ScopeBuilder, enclosing_locals: &BTreeSet<String>
         } else {
             NameClass::Global { explicit: false }
         };
-        let is_parameter = builder.params.iter().any(|param| param == &name);
+        let is_parameter = builder.formal_params.iter().any(|param| param == &name);
         symbols.insert(
             name.clone(),
             SymbolInfo {
@@ -1126,7 +1135,7 @@ fn local_names(builder: &ScopeBuilder) -> BTreeSet<String> {
 fn assign_local_slots(builder: &ScopeBuilder, local_names: &BTreeSet<String>) -> Vec<LocalSlotInfo> {
     let mut locals = Vec::new();
     let mut emitted = BTreeSet::new();
-    for name in &builder.params {
+    for name in &builder.formal_params {
         if local_names.contains(name) && emitted.insert(name.clone()) {
             locals.push(LocalSlotInfo {
                 name: name.clone(),
@@ -1231,6 +1240,38 @@ def outer(a):
             inner.symbol("print").map(|symbol| &symbol.class),
             Some(NameClass::Builtin)
         ));
+    }
+
+    #[test]
+    fn marks_variadic_and_keyword_only_parameters_as_formals_for_cells() {
+        let analysis = analyze(
+            r#"
+def outer(*args, flag, **kwargs):
+    def inner():
+        return args, flag, kwargs
+    return inner
+"#,
+        );
+
+        let outer = analysis
+            .root
+            .child(ScopeKind::Function, "outer")
+            .expect("outer function should be discovered");
+        assert_eq!(
+            outer.cell_vars,
+            vec!["args".to_owned(), "flag".to_owned(), "kwargs".to_owned()]
+        );
+        for (name, local_slot, cell_slot) in [("args", 0, 0), ("flag", 1, 1), ("kwargs", 2, 2)] {
+            let symbol = outer.symbol(name).expect("captured parameter should be classified");
+            assert!(symbol.is_parameter, "{name} should stay marked as a formal parameter");
+            assert!(matches!(
+                symbol.class,
+                NameClass::Cell {
+                    local_slot: ls,
+                    cell_slot: cs
+                } if ls == local_slot && cs == cell_slot
+            ));
+        }
     }
 
     #[test]
