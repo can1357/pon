@@ -1060,9 +1060,12 @@ mod tests {
     use super::{exception_type_named, is_exception_subclass};
     use crate::mro::set_c3_mro;
     use crate::object::PyType;
+    use crate::thread_state::{pon_err_clear, test_state_lock};
 
     #[test]
     fn second_base_matches_through_mro_carrier() {
+        let _guard = test_state_lock();
+        pon_err_clear();
         let mut type_type = PyType::new(ptr::null(), "type", core::mem::size_of::<PyType>());
         let type_ptr = &mut type_type as *mut PyType;
         unsafe { (*type_ptr).ob_base.ob_type = type_ptr };
@@ -1137,6 +1140,8 @@ mod tests {
 
     #[test]
     fn carried_exception_group_entry_matches_exception() {
+        let _guard = test_state_lock();
+        pon_err_clear();
         let mut type_type = PyType::new(ptr::null(), "type", core::mem::size_of::<PyType>());
         let type_ptr = &mut type_type as *mut PyType;
         unsafe { (*type_ptr).ob_base.ob_type = type_ptr };
@@ -1161,6 +1166,8 @@ mod tests {
 
     #[test]
     fn exception_type_named_walks_carrier() {
+        let _guard = test_state_lock();
+        pon_err_clear();
         let mut type_type = PyType::new(ptr::null(), "type", core::mem::size_of::<PyType>());
         let type_ptr = &mut type_type as *mut PyType;
         unsafe { (*type_ptr).ob_base.ob_type = type_ptr };

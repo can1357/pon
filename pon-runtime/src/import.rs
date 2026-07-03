@@ -265,7 +265,20 @@ pub unsafe extern "C" fn pon_import_from(module: *mut PyObject, name_interned: u
     raise_import_error_text(&format!("cannot import name '{attr}' from '{module_name}'"))
 }
 
-/// Imports all public module attributes into the active globals dictionary.
+/// Imports module attributes into the active globals dictionary, honoring
+/// `__all__` exactly like CPython's `import_all_from`: when the module
+/// defines `__all__`, precisely those names are copied — underscored names
+/// included, non-str items raise TypeError, and names the module lacks
+/// raise AttributeError (after a package-submodule import attempt, per
+/// `_handle_fromlist`'s `*` expansion).  Only a module without `__all__`
+/// falls back to the public (non-underscore) attribute snapshot.
+///
+/// Honoring `__all__` is load-bearing for packages whose `__init__` reads
+/// sibling-submodule bindings after star-imports: `asyncio/__init__` runs
+/// `from .subprocess import *` and later `subprocess.__all__` — the
+/// submodule's own `import subprocess` global must not leak through the
+/// star-copy and clobber the package's `subprocess` -> `asyncio.subprocess`
+/// child binding.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_import_star(module: *mut PyObject) -> *mut PyObject {
     crate::untag_prelude!(module);
@@ -275,19 +288,121 @@ pub unsafe extern "C" fn pon_import_star(module: *mut PyObject) -> *mut PyObject
     let Some(module) = as_module(module) else {
         return return_null_with_error("import-star receiver is not a module");
     };
-    // SAFETY: `as_module` proved the layout.
-    let module = unsafe { &*module };
-    for (name, value) in &module.attrs {
-        if is_public_name(*name) {
+    // Aliasing discipline: the stores and the package-submodule import below
+    // re-enter machinery that may mutate this very module's attr map
+    // (`pon_store_global` when a package star-imports in its own body,
+    // `bind_child_to_parent` inside `import_module_by_name`), so no borrow
+    // of the module may live across them — attrs are snapshotted or
+    // re-borrowed per access through the raw pointer.
+    // SAFETY: `as_module` proved the layout; the borrow ends at `.copied()`.
+    let all = unsafe { (*module).attrs.get(&intern("__all__")).copied() };
+    let Some(all) = all else {
+        // No `__all__`: copy the public attribute snapshot.
+        // SAFETY: The borrow ends when the snapshot Vec is collected.
+        let entries: Vec<(u32, *mut PyObject)> = unsafe {
+            (*module)
+                .attrs
+                .iter()
+                .filter(|&(&name, _)| is_public_name(name))
+                .map(|(&name, &value)| (name, value))
+                .collect()
+        };
+        for (name, value) in entries {
             // SAFETY: Store helper enforces the NULL-sentinel error contract.
-            let stored = unsafe { pon_store_global(*name, *value) };
+            let stored = unsafe { pon_store_global(name, value) };
             if stored.is_null() {
                 return ptr::null_mut();
             }
         }
+        // SAFETY: `pon_none` returns the initialized singleton or NULL with an error.
+        return unsafe { pon_none() };
+    };
+    // SAFETY: Reading the interned name id copies a u32 out of the borrow.
+    let module_name = {
+        let name = unsafe { (*module).name };
+        resolve(name).unwrap_or_else(|| format!("<module:{name}>"))
+    };
+    // SAFETY: The borrow ends when `module_is_package` returns.
+    let is_package = unsafe { module_is_package(&*module) };
+    let Some(items) = sequence_items(all) else {
+        return return_null_with_error(format!("{module_name}.__all__ is not a tuple or list"));
+    };
+    for item in items {
+        let Some(text) = (unsafe { exact_str_text(item) }) else {
+            // SAFETY: Type-name probe tolerates any live object.
+            let kind = unsafe { crate::types::dict::type_name(item) }.unwrap_or("<unknown>");
+            return crate::abi::exc::raise_kind_error_text(
+                crate::types::exc::ExceptionKind::TypeError,
+                &format!("Item in {module_name}.__all__ must be str, not {kind}"),
+            );
+        };
+        let name = intern(&text);
+        // SAFETY: The borrow ends at `.copied()`, before any re-entrant call.
+        let value = match unsafe { (*module).attrs.get(&name).copied() } {
+            Some(value) => value,
+            None => {
+                // A package `__all__` may name submodules that only importing
+                // makes visible: CPython's `_handle_fromlist` imports them for
+                // `from pkg import *` and swallows only the child's own
+                // ModuleNotFoundError (deeper failures surface verbatim).
+                let child_name = format!("{module_name}.{text}");
+                match (is_package, import_module_by_name(&child_name)) {
+                    (true, Ok(child)) => child,
+                    (true, Err(message)) if message != format!("No module named '{child_name}'") => {
+                        return raise_import_error_text(&message);
+                    }
+                    _ => {
+                        return raise_attribute_error_text(&format!(
+                            "module '{module_name}' has no attribute '{text}'"
+                        ));
+                    }
+                }
+            }
+        };
+        // SAFETY: Store helper enforces the NULL-sentinel error contract.
+        let stored = unsafe { pon_store_global(name, value) };
+        if stored.is_null() {
+            return ptr::null_mut();
+        }
     }
     // SAFETY: `pon_none` returns the initialized singleton or NULL with an error.
     unsafe { pon_none() }
+}
+
+/// Snapshot of the element slots of an exact tuple or list receiver; `None`
+/// for any other layout (subclasses included — stdlib `__all__` is always
+/// exact).  A copy, not a borrow: the star-import caller re-enters runtime
+/// code between elements, which may reallocate a list's storage.
+fn sequence_items(object: *mut PyObject) -> Option<Vec<*mut PyObject>> {
+    // SAFETY: Type-name probes tolerate any live object; the casts below are
+    // guarded by the exact layout checks, and the slices are copied before
+    // the borrow ends.
+    unsafe {
+        if crate::types::int::type_name_is(object, "tuple") {
+            return Some((&*object.cast::<crate::types::tuple::PyTuple>()).as_slice().to_vec());
+        }
+        if crate::types::int::type_name_is(object, "list") {
+            return Some((&*object.cast::<crate::types::list::PyList>()).as_slice().to_vec());
+        }
+    }
+    None
+}
+
+/// Exact-`str` payload (no `__str__` dispatch); `None` for other layouts.
+unsafe fn exact_str_text(object: *mut PyObject) -> Option<String> {
+    // SAFETY: Caller passes a live object; the cast is guarded by the exact
+    // layout check.
+    unsafe {
+        if !crate::types::int::type_name_is(object, "str") {
+            return None;
+        }
+        let unicode = &*object.cast::<PyUnicode>();
+        if unicode.data.is_null() && unicode.len != 0 {
+            return None;
+        }
+        let bytes = core::slice::from_raw_parts(unicode.data, unicode.len);
+        core::str::from_utf8(bytes).ok().map(ToOwned::to_owned)
+    }
 }
 
 /// Returns a cached module by interned name for tests and hub integration.

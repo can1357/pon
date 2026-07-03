@@ -11,6 +11,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 
 use pon_gc::{GcTypeInfo, TypeId};
+use num_bigint::BigInt;
 
 use crate::abstract_op::{self, RICH_EQ, RICH_GE, RICH_GT, RICH_LE, RICH_LT, RICH_NE};
 use crate::feedback::FeedbackCell;
@@ -140,6 +141,8 @@ fn range_type() -> *mut PyType {
             mp_ass_subscript: None,
         }));
         let mut ty = PyType::new(ptr::null(), "range", mem::size_of::<PyRange>());
+        ty.tp_hash = Some(range_hash_slot);
+        ty.tp_richcmp = Some(range_richcmp_slot);
         ty.tp_as_sequence = sequence;
         ty.tp_as_mapping = mapping;
         ty.gc_type_id = TYPE_ID_RANGE.0 as usize;
@@ -535,6 +538,25 @@ pub(crate) fn has_tuple_storage(object: *mut PyObject) -> bool {
 
 fn is_range(object: *mut PyObject) -> bool {
     unsafe { !object.is_null() && (*object).ob_type == range_type().cast_const() }
+}
+
+/// `(len, start, step)` comparison key of an abi seq-family `PyRange`
+/// (`None` for anything else), promoted to `BigInt` for the shared
+/// range-equality authority in `native::builtins_mod`.
+pub(crate) fn abi_range_cmp_key(object: *mut PyObject) -> Option<(BigInt, BigInt, BigInt)> {
+    if !is_range(object) {
+        return None;
+    }
+    let range = unsafe { &*object.cast::<PyRange>() };
+    Some((BigInt::from(range.len), BigInt::from(range.start), BigInt::from(range.step)))
+}
+
+unsafe extern "C" fn range_richcmp_slot(left: *mut PyObject, right: *mut PyObject, op: c_int) -> *mut PyObject {
+    unsafe { crate::native::builtins_mod::range_richcmp(left, right, op) }
+}
+
+unsafe extern "C" fn range_hash_slot(object: *mut PyObject) -> isize {
+    crate::native::builtins_mod::range_hash_value(object).unwrap_or(object as usize as isize)
 }
 
 pub(crate) fn is_slice(object: *mut PyObject) -> bool {
@@ -3008,6 +3030,92 @@ mod tests {
             assert_eq!(sorted[0], second);
             assert_eq!(sorted[1], first);
             assert_eq!(sorted[2], third);
+        }
+    }
+    /// Native `range(start, stop, step)` object (representation a): the
+    /// `NativePayload::Range` family built by the `range` builtin.
+    unsafe fn native_range(start: i64, stop: i64, step: i64) -> *mut PyObject {
+        let mut argv = unsafe { [pon_const_int(start), pon_const_int(stop), pon_const_int(step)] };
+        let object = unsafe { crate::native::builtins_mod::builtin_range(argv.as_mut_ptr(), argv.len()) };
+        assert!(!object.is_null());
+        object
+    }
+
+    /// Abi seq-family `PyRange` object (representation b).
+    unsafe fn abi_range(start: i64, stop: i64, step: i64) -> *mut PyObject {
+        let object = unsafe { pon_build_range(pon_const_int(start), pon_const_int(stop), pon_const_int(step)) };
+        assert!(!object.is_null());
+        object
+    }
+
+    /// Runs `range_richcmp` for an EQ/NE selector and returns the Python
+    /// truth of the result (1 true, 0 false); fails on NULL/NotImplemented.
+    unsafe fn range_richcmp_truth(left: *mut PyObject, right: *mut PyObject, op: u8) -> i32 {
+        let result = unsafe { crate::native::builtins_mod::range_richcmp(left, right, c_int::from(op)) };
+        assert!(!result.is_null());
+        assert!(!unsafe { crate::abstract_op::is_not_implemented(result) });
+        unsafe { abstract_op::is_true(result) }
+    }
+
+    #[test]
+    fn range_richcmp_crosses_representations() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+            // Same denoted sequence [0, 2] spelled with different stops
+            // (CPython range_equals normalizes: len, then start, then step).
+            let abi = abi_range(0, 3, 2);
+            let native = native_range(0, 4, 2);
+            assert_eq!(range_richcmp_truth(abi, native, RICH_EQ), 1);
+            assert_eq!(range_richcmp_truth(native, abi, RICH_EQ), 1);
+            assert_eq!(range_richcmp_truth(abi, native, RICH_NE), 0);
+            assert_eq!(range_richcmp_truth(native, abi, RICH_NE), 0);
+
+            // Different denoted sequences ([0, 1, 2] vs [0, 2]) are unequal.
+            let abi_dense = abi_range(0, 3, 1);
+            assert_eq!(range_richcmp_truth(abi_dense, native, RICH_EQ), 0);
+            assert_eq!(range_richcmp_truth(native, abi_dense, RICH_EQ), 0);
+            assert_eq!(range_richcmp_truth(native, abi_dense, RICH_NE), 1);
+
+            // Empty ranges are equal no matter how start/step are spelled.
+            let abi_empty = abi_range(5, 5, 1);
+            let native_empty = native_range(2, 2, 3);
+            assert_eq!(range_richcmp_truth(abi_empty, native_empty, RICH_EQ), 1);
+            assert_eq!(range_richcmp_truth(native_empty, abi_empty, RICH_EQ), 1);
+
+            // Ordering selectors yield the NotImplemented singleton, never a
+            // bool and never NULL, so the abstract fallback owns the TypeError.
+            let lt = crate::native::builtins_mod::range_richcmp(abi, native, c_int::from(RICH_LT));
+            assert!(!lt.is_null());
+            assert!(crate::abstract_op::is_not_implemented(lt));
+        }
+    }
+
+    #[test]
+    fn range_hash_crosses_representations() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+            let abi = abi_range(0, 3, 2);
+            let native = native_range(0, 4, 2);
+            let abi_hash = crate::native::builtins_mod::range_hash_value(abi).expect("abi range must hash");
+            let native_hash = crate::native::builtins_mod::range_hash_value(native).expect("native range must hash");
+            assert_eq!(abi_hash, native_hash);
+
+            // Equal empty ranges with different start/step spellings agree too.
+            let abi_empty = abi_range(5, 5, 1);
+            let native_empty = native_range(2, 2, 3);
+            assert_eq!(
+                crate::native::builtins_mod::range_hash_value(abi_empty).expect("abi empty range must hash"),
+                crate::native::builtins_mod::range_hash_value(native_empty).expect("native empty range must hash"),
+            );
+
+            // Dict-domain keying agrees across representations, so equal
+            // ranges land in the same dict slot regardless of spelling.
+            assert_eq!(
+                crate::types::dict::hash_object(abi).expect("abi range must be dict-hashable"),
+                crate::types::dict::hash_object(native).expect("native range must be dict-hashable"),
+            );
         }
     }
 }

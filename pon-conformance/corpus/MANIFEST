@@ -186,3 +186,16 @@ pon-conformance/corpus/cpython/builtin_binding.py
 pon-conformance/corpus/cpython/yield_shapes.py
 pon-conformance/corpus/cpython/subprocess_import.py
 pon-conformance/corpus/cpython/code_format_surface.py
+pon-conformance/corpus/cpython/bytesio_full.py
+pon-conformance/corpus/cpython/sys_recursion.py
+corpus/pkg2_driver.py
+pon-conformance/corpus/cpython/os_pid_surface.py
+pon-conformance/corpus/cpython/unicodedata_basic.py
+pon-conformance/corpus/cpython/abc_mixin_methods.py
+pon-conformance/corpus/cpython/range_equality.py
+pon-conformance/corpus/cpython/rich_compare_raw.py
+
+pon-conformance/corpus/cpython/type_bases.py
+pon-conformance/corpus/cpython/async_genexpr.py
+pon-conformance/corpus/cpython/gc_iterator_safety.py
+pon-conformance/corpus/cpython/ast_parse.py

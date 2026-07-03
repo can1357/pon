@@ -13,7 +13,8 @@ pub type RichCompareOp = u8;
 
 pub use abstract_op::{RICH_EQ, RICH_GE, RICH_GT, RICH_LE, RICH_LT, RICH_NE};
 
-/// Dispatches a Python rich comparison and returns a truth-value object.
+/// Dispatches a Python rich comparison and returns the raw result object
+/// (a user dunder's return value passes through uncoerced, as in CPython).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_rich_compare(
     op: RichCompareOp,

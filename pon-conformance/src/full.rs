@@ -439,22 +439,23 @@ fn configure_side(cmd: &mut Command, ctx: &ExecContext<'_>, side_dir: &Path, pat
 }
 
 // ---------------------------------------------------------------------------
-// Subprocess supervision (pin §5.2)
+// Subprocess supervision (pin §5.2). The aot suites reuse this machinery for
+// their own wall-clock caps (`aot.rs`); the pin governs only `cpython-full`.
 // ---------------------------------------------------------------------------
 
-struct SideResult {
+pub(crate) struct SideResult {
     /// `None` when the process was killed by a signal.
-    exit: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    pub(crate) exit: Option<i32>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 
-enum RunOutcome {
+pub(crate) enum RunOutcome {
     Completed(SideResult),
     TimedOut,
 }
 
-fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<RunOutcome> {
+pub(crate) fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<RunOutcome> {
     cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
     let deadline = Instant::now() + timeout;
@@ -534,7 +535,7 @@ fn finish_reader(handle: Option<thread::JoinHandle<()>>, buffer: &Arc<Mutex<Vec<
 }
 
 #[cfg(unix)]
-fn apply_unix_isolation(cmd: &mut Command, timeout: Duration) {
+pub(crate) fn apply_unix_isolation(cmd: &mut Command, timeout: Duration) {
     use std::os::unix::process::CommandExt;
 
     // Resource numbers are identical on Linux and macOS (the pinned CI hosts).
@@ -584,7 +585,7 @@ fn apply_unix_isolation(cmd: &mut Command, timeout: Duration) {
 }
 
 #[cfg(not(unix))]
-fn apply_unix_isolation(_cmd: &mut Command, _timeout: Duration) {}
+pub(crate) fn apply_unix_isolation(_cmd: &mut Command, _timeout: Duration) {}
 
 #[cfg(unix)]
 fn kill_process_group(pid: u32) {

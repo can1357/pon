@@ -606,6 +606,9 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
             )
         };
     }
+    if is_type && name_id == intern::intern("__bases__") {
+        return unsafe { type_bases_tuple(object.cast::<PyType>()) };
+    }
     if is_type && name_id == intern::intern("__subclasses__") {
         return unsafe { type_subclasses_method(object) };
     }
@@ -1114,6 +1117,9 @@ enum TypeGetSetKind {
     /// `type.__dict__['__mro__']` — read-only MRO tuple
     /// (inspect: `_static_getmro = type.__dict__['__mro__'].__get__`).
     Mro,
+    /// `type.__dict__['__bases__']` — declared direct bases (read-only in
+    /// pon; CPython's getset additionally supports assignment).
+    Bases,
     /// `type.__dict__['__dict__']` — read-only namespace snapshot
     /// (inspect: `_get_dunder_dict_of_class = type.__dict__["__dict__"].__get__`).
     DunderDict,
@@ -1124,6 +1130,7 @@ impl TypeGetSetKind {
         match self {
             Self::Annotations => "__annotations__",
             Self::Mro => "__mro__",
+            Self::Bases => "__bases__",
             Self::DunderDict => "__dict__",
         }
     }
@@ -1203,11 +1210,14 @@ fn type_getset_descriptor(kind: TypeGetSetKind) -> *mut PyObject {
         LazyLock::new(|| new_getset_descriptor(ptr::null_mut(), GetSetPayload::Type(TypeGetSetKind::Annotations)) as usize);
     static MRO: LazyLock<usize> =
         LazyLock::new(|| new_getset_descriptor(ptr::null_mut(), GetSetPayload::Type(TypeGetSetKind::Mro)) as usize);
+    static BASES: LazyLock<usize> =
+        LazyLock::new(|| new_getset_descriptor(ptr::null_mut(), GetSetPayload::Type(TypeGetSetKind::Bases)) as usize);
     static DUNDER_DICT: LazyLock<usize> =
         LazyLock::new(|| new_getset_descriptor(ptr::null_mut(), GetSetPayload::Type(TypeGetSetKind::DunderDict)) as usize);
     (match kind {
         TypeGetSetKind::Annotations => *ANNOTATIONS,
         TypeGetSetKind::Mro => *MRO,
+        TypeGetSetKind::Bases => *BASES,
         TypeGetSetKind::DunderDict => *DUNDER_DICT,
     }) as *mut PyObject
 }
@@ -1221,8 +1231,8 @@ pub fn annotations_descriptor() -> *mut PyObject {
 
 /// Every `(name, descriptor)` pair belonging in the builtin `type`'s dict.
 #[must_use]
-pub fn type_getset_entries() -> [(&'static str, *mut PyObject); 3] {
-    [TypeGetSetKind::Annotations, TypeGetSetKind::Mro, TypeGetSetKind::DunderDict]
+pub fn type_getset_entries() -> [(&'static str, *mut PyObject); 4] {
+    [TypeGetSetKind::Annotations, TypeGetSetKind::Mro, TypeGetSetKind::Bases, TypeGetSetKind::DunderDict]
         .map(|kind| (kind.attr_name(), type_getset_descriptor(kind)))
 }
 
@@ -1240,7 +1250,7 @@ pub(crate) fn new_function_getset_descriptor(name_id: u32, objclass: *mut PyType
 /// is order-independent.
 pub(crate) unsafe fn finalize_getset_descriptors(type_type: *mut PyType) {
     unsafe { (*getset_descriptor_type()).ob_base.ob_type = type_type };
-    for kind in [TypeGetSetKind::Annotations, TypeGetSetKind::Mro, TypeGetSetKind::DunderDict] {
+    for kind in [TypeGetSetKind::Annotations, TypeGetSetKind::Mro, TypeGetSetKind::Bases, TypeGetSetKind::DunderDict] {
         let descr = type_getset_descriptor(kind).cast::<PyGetSetDescr>();
         unsafe { (*descr).objclass = type_type };
     }
@@ -1339,6 +1349,24 @@ unsafe fn type_annotations_set(ty: *mut PyType, value: *mut PyObject) -> c_int {
     0
 }
 
+/// `cls.__bases__` tuple: a fresh tuple over the declared-bases construction
+/// record (`mro::base_entries` falls back to the `tp_base` chain head for
+/// static/native types, and to `()` for `object`).  Shared by the attribute
+/// fast path in `generic_get_attr_cached` and the
+/// `type.__dict__['__bases__']` getset so both surfaces agree.
+unsafe fn type_bases_tuple(ty: *mut PyType) -> *mut PyObject {
+    let mut entries = unsafe { mro::base_entries(ty) }
+        .into_iter()
+        .map(|base| base.cast::<PyObject>())
+        .collect::<Vec<_>>();
+    unsafe {
+        abi::seq::pon_build_tuple(
+            if entries.is_empty() { ptr::null_mut() } else { entries.as_mut_ptr() },
+            entries.len(),
+        )
+    }
+}
+
 /// CPython receiver-mismatch text: `descriptor 'X' for 'T' objects doesn't
 /// apply to a 'Y' object`.
 unsafe fn getset_receiver_mismatch(descr: *mut PyGetSetDescr, obj: *mut PyObject) -> String {
@@ -1379,6 +1407,7 @@ unsafe extern "C" fn getset_descr_get(descr: *mut PyObject, obj: *mut PyObject, 
                         )
                     }
                 }
+                TypeGetSetKind::Bases => unsafe { type_bases_tuple(ty) },
                 TypeGetSetKind::DunderDict => unsafe { type_dict_object(ty) },
             }
         }
@@ -1399,8 +1428,12 @@ unsafe extern "C" fn getset_descr_get(descr: *mut PyObject, obj: *mut PyObject, 
 
 /// `descriptor.__set__(obj, value)` / `__delete__(obj)` slot.  Of the `type`
 /// getsets only `__annotations__` is writable; `__mro__`/`__dict__` raise the
-/// CPython read-only AttributeError.  Function slots delegate to
-/// `function_setattro` — the same semantics as a plain attribute write.
+/// CPython read-only AttributeError.  `__bases__` is a deliberate divergence:
+/// CPython's getset supports live re-basing (`C.__bases__ = (B,)`), which pon
+/// does not implement — the write raises the same honest read-only
+/// AttributeError instead of silently storing to the dict.  Function slots
+/// delegate to `function_setattro` — the same semantics as a plain attribute
+/// write.
 unsafe extern "C" fn getset_descr_set(descr: *mut PyObject, obj: *mut PyObject, value: *mut PyObject) -> c_int {
     let d = descr.cast::<PyGetSetDescr>();
     match unsafe { (*d).payload } {
@@ -1559,6 +1592,7 @@ mod tests {
     use crate::feedback::{FeedbackCell, GlobalIC};
     use crate::object::PyUnicode;
     use crate::types::type_::{build_class_from_namespace, new_namespace, type_new};
+    use crate::thread_state::{pon_err_clear, test_state_lock};
 
     fn metatype() -> *mut PyType {
         let ty = Box::into_raw(Box::new(PyType::new(ptr::null(), "type", mem::size_of::<PyType>())));
@@ -1598,6 +1632,8 @@ mod tests {
 
     #[test]
     fn type_dict_set_invalidates_recorded_attr_ic() {
+        let _guard = test_state_lock();
+        pon_err_clear();
         let meta = metatype();
         let attr = intern::intern("payload");
         let old_value = unsafe { fake_str("old") };
@@ -1626,6 +1662,8 @@ mod tests {
 
     #[test]
     fn instance_mutation_does_not_invalidate_attr_ic() {
+        let _guard = test_state_lock();
+        pon_err_clear();
         let meta = metatype();
         let attr = intern::intern("field");
         let class_value = unsafe { fake_str("class") };
@@ -1648,6 +1686,8 @@ mod tests {
 
     #[test]
     fn base_mutation_invalidates_subclass_attr_ic() {
+        let _guard = test_state_lock();
+        pon_err_clear();
         let meta = metatype();
         let attr = intern::intern("shared");
         let old_value = unsafe { fake_str("base-old") };
@@ -1679,6 +1719,8 @@ mod tests {
 
     #[test]
     fn namespace_version_bump_invalidates_global_ic() {
+        let _guard = test_state_lock();
+        pon_err_clear();
         let cell = FeedbackCell::EMPTY;
         let identity = crate::abi::namespace_identity_for_tests();
         let version = crate::abi::namespace_version();

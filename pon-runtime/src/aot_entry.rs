@@ -125,7 +125,16 @@ unsafe fn pon_aot_entry_impl(argc: i32, argv: *const *const u8) -> i32 {
     exit_code
 }
 
-fn capture_stack_base(base: *mut u8) {
+/// Publishes `base` as the current thread's conservative-stack boundary.
+///
+/// Updates both consumers: the runtime thread state (handshake metadata) and
+/// the pon-gc external stack base that enables conservative scanning of
+/// generated-code frames during collection.  Entry drivers (AoT
+/// `pon_aot_entry`, the JIT CLI's `run_file_inner`) call this with a marker
+/// local from a frame that encloses all generated-code execution on the
+/// thread, so collections triggered under that frame scan every live
+/// generated-code slot.
+pub fn capture_stack_base(base: *mut u8) {
     thread_state_lock().stack_base = base;
     pon_gc::set_external_stack_base(base);
 }

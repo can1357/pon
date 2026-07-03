@@ -2248,4 +2248,119 @@ mod tests {
         assert!(eof.is_null());
         assert!(pon_err_message().unwrap_or_default().starts_with("EOFError"));
     }
+
+    fn bytesio_obj(initial: &[u8]) -> *mut PyObject {
+        Box::into_raw(Box::new(PyBytesIO {
+            ob_base: PyObjectHeader::new(bytesio_type()),
+            buffer: Some(initial.to_vec()),
+            pos: 0,
+            exports: 0,
+        }))
+        .cast::<PyObject>()
+    }
+
+    fn bytes_obj(data: &[u8]) -> *mut PyObject {
+        let object = unsafe { abi::str_::pon_const_bytes(data.as_ptr(), data.len()) };
+        assert!(!object.is_null());
+        object
+    }
+
+    #[test]
+    fn bytesio_seek_past_eof_reads_empty_and_write_zero_fills() {
+        let _guard = test_state_lock();
+        init_runtime();
+        let object = bytesio_obj(b"ab");
+        let bio = unsafe { as_bytesio(object) }.expect("receiver downcast");
+        assert_eq!(bio.seek_to(5, 0).unwrap(), 5);
+        // Reads past EOF see empty WITHOUT clamping the parked position.
+        assert_eq!(bio.read_bytes(None).unwrap(), b"");
+        assert_eq!(bio.pos, 5);
+        // Writes zero-fill the gap left by the past-EOF seek.
+        assert_eq!(bio.write_bytes(b"z").unwrap(), 1);
+        assert_eq!(bio.buffer.as_deref().unwrap(), b"ab\x00\x00\x00z");
+        // Relative seeks clamp negative results at zero (CPython contract).
+        assert_eq!(bio.seek_to(-100, 1).unwrap(), 0);
+        assert_eq!(bio.seek_to(-100, 2).unwrap(), 0);
+        assert!(matches!(bio.seek_to(-1, 0), Err(BioError::Value(_))));
+    }
+
+    #[test]
+    fn bytesio_truncate_returns_requested_size_and_keeps_position() {
+        let _guard = test_state_lock();
+        init_runtime();
+        let object = bytesio_obj(b"abcdef");
+        let bio = unsafe { as_bytesio(object) }.expect("receiver downcast");
+        assert_eq!(bio.seek_to(2, 0).unwrap(), 2);
+        assert_eq!(bio.truncate_to(None).unwrap(), 2);
+        assert_eq!(bio.buffer.as_deref().unwrap(), b"ab");
+        // Shrink-only: an oversized request returns verbatim, buffer intact.
+        assert_eq!(bio.truncate_to(Some(100)).unwrap(), 100);
+        assert_eq!(bio.buffer.as_deref().unwrap(), b"ab");
+        assert_eq!(bio.pos, 2);
+        assert!(matches!(bio.truncate_to(Some(-1)), Err(BioError::Value(_))));
+    }
+
+    #[test]
+    fn bytesio_exports_pin_resizing_until_release() {
+        let _guard = test_state_lock();
+        init_runtime();
+        pon_err_clear();
+        let object = bytesio_obj(b"abc");
+        let mut buffer_args = [object];
+        let view = unsafe { bytesio_getbuffer_method(buffer_args.as_mut_ptr(), buffer_args.len()) };
+        assert!(!view.is_null());
+        // A live export blocks every resizing operation with BufferError...
+        let mut write_args = [object, bytes_obj(b"q")];
+        assert!(unsafe { bytesio_write_method(write_args.as_mut_ptr(), write_args.len()) }.is_null());
+        assert!(pon_err_message().unwrap_or_default().contains("BufferError"));
+        pon_err_clear();
+        let mut close_args = [object];
+        assert!(unsafe { bytesio_close_method(close_args.as_mut_ptr(), close_args.len()) }.is_null());
+        assert!(pon_err_message().unwrap_or_default().contains("BufferError"));
+        pon_err_clear();
+        // ...while reads stay open (CPython allows them under exports).
+        {
+            let bio = unsafe { as_bytesio(object) }.expect("receiver downcast");
+            assert_eq!(bio.read_bytes(Some(2)).unwrap(), b"ab");
+            assert_eq!(bio.exports, 1);
+        }
+        // The str_.rs release seam decrements exactly once per view.
+        bytesio_export_released(object);
+        {
+            let bio = unsafe { as_bytesio(object) }.expect("receiver downcast");
+            assert_eq!(bio.exports, 0);
+        }
+        // Saturating: replayed releases never underflow.
+        bytesio_export_released(object);
+        let bio = unsafe { as_bytesio(object) }.expect("receiver downcast");
+        assert_eq!(bio.exports, 0);
+        assert_eq!(bio.write_bytes(b"z").unwrap(), 1);
+    }
+
+    #[test]
+    fn bytesio_closed_operations_raise_value_error() {
+        let _guard = test_state_lock();
+        init_runtime();
+        pon_err_clear();
+        let object = bytesio_obj(b"bye");
+        let mut close_args = [object];
+        assert!(!unsafe { bytesio_close_method(close_args.as_mut_ptr(), close_args.len()) }.is_null());
+        // Idempotent close.
+        assert!(!unsafe { bytesio_close_method(close_args.as_mut_ptr(), close_args.len()) }.is_null());
+        let mut read_args = [object];
+        assert!(unsafe { bytesio_read_method(read_args.as_mut_ptr(), read_args.len()) }.is_null());
+        assert!(
+            pon_err_message()
+                .unwrap_or_default()
+                .contains("ValueError: I/O operation on closed file.")
+        );
+        pon_err_clear();
+        let mut buffer_args = [object];
+        assert!(unsafe { bytesio_getbuffer_method(buffer_args.as_mut_ptr(), buffer_args.len()) }.is_null());
+        assert!(
+            pon_err_message()
+                .unwrap_or_default()
+                .contains("ValueError: I/O operation on closed file.")
+        );
+    }
 }

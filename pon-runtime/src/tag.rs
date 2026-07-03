@@ -245,6 +245,8 @@ mod macro_tests {
     #[cfg(feature = "tagged-ints")]
     #[test]
     fn prelude_boxes_tagged_arguments() {
+        let _guard = crate::thread_state::test_state_lock();
+        crate::thread_state::pon_err_clear();
         // SAFETY: init is idempotent and required before allocating helpers.
         unsafe {
             assert_eq!(crate::abi::pon_runtime_init(), 0);

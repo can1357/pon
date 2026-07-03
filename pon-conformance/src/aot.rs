@@ -4,9 +4,11 @@ use std::fs;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
+use crate::full;
 use crate::ratchet;
 use crate::scoreboard::{Scoreboard, Status};
 use crate::suite::{self, RunResult};
@@ -15,6 +17,12 @@ const AOT_SUBSET_SUITE_NAME: &str = "cpython-aot-subset";
 pub const AOT_PARITY_SUITE_NAME: &str = "aot-parity";
 pub const AOT_PARITY_RESULTS_FILE: &str = "aot-parity.json";
 pub const AOT_PARITY_FLOOR_FILE: &str = "aot-parity-floor.json";
+
+/// Default wall-clock cap in seconds for each `pon build` and AoT-executable
+/// subprocess; override with `PON_AOT_TIMEOUT_SECS`. A timed-out subprocess
+/// classifies as a failure with a `timed out after <N>s` detail — no other
+/// classification changes.
+const AOT_DEFAULT_TIMEOUT_SECS: u64 = 60;
 
 /// Static scripts that can be built as closed AoT units: no eval/exec, no dynamic
 /// imports, and no extension-module dependency. Increase `AOT_MIN_PASS_COUNT`
@@ -209,6 +217,7 @@ pub fn run_aot_suite(root: &Path, requested_modules: &[PathBuf]) -> Result<Score
 
     let pon_binary = suite::ensure_pon_cli(root)?;
     let run_dir = aot_run_dir(root)?;
+    let timeout = aot_timeout();
 
     for (index, (label, script)) in modules.into_iter().enumerate() {
         let Some(script) = script else {
@@ -232,8 +241,15 @@ pub fn run_aot_suite(root: &Path, requested_modules: &[PathBuf]) -> Result<Score
         };
 
         let exe = run_dir.join(format!("{}-{}{}", index, safe_exe_stem(&label), env::consts::EXE_SUFFIX));
-        let build = run_build(root, &pon_binary, &script, &exe)
-            .with_context(|| format!("failed to spawn pon build for `{}`", script.display()))?;
+        let build = match run_build(root, &pon_binary, &script, &exe, timeout)
+            .with_context(|| format!("failed to spawn pon build for `{}`", script.display()))?
+        {
+            AotRun::Completed(build) => build,
+            AotRun::TimedOut => {
+                scoreboard.push(label, Status::Fail, Some(format!("pon build timed out after {}s", timeout.as_secs())));
+                continue;
+            }
+        };
         if build.exit != 0 {
             scoreboard.push(label, Status::Fail, Some(build_failure_report(&exe, &build)));
             continue;
@@ -247,8 +263,12 @@ pub fn run_aot_suite(root: &Path, requested_modules: &[PathBuf]) -> Result<Score
             continue;
         }
 
-        let aot = match run_executable_without_pon(root, &exe) {
-            Ok(aot) => aot,
+        let aot = match run_executable_without_pon(root, &exe, timeout) {
+            Ok(AotRun::Completed(aot)) => aot,
+            Ok(AotRun::TimedOut) => {
+                scoreboard.push(label, Status::Fail, Some(format!("AoT executable timed out after {}s", timeout.as_secs())));
+                continue;
+            }
             Err(error) => {
                 scoreboard.push(label, Status::Fail, Some(format!("failed to run AoT executable without pon on PATH: {error:#}")));
                 continue;
@@ -296,6 +316,7 @@ pub fn run_aot_parity_suite(root: &Path, requested_modules: &[PathBuf]) -> Resul
     let pon_binary = suite::ensure_pon_cli(root)?;
     let run_dir = aot_run_dir(root)?;
     let python_available = suite::python314_available();
+    let timeout = aot_timeout();
 
     for (index, (label, script)) in modules.into_iter().enumerate() {
         let record = classify_aot_parity_module(
@@ -306,6 +327,7 @@ pub fn run_aot_parity_suite(root: &Path, requested_modules: &[PathBuf]) -> Resul
             label,
             script,
             python_available,
+            timeout,
         );
         report.push(record);
     }
@@ -336,6 +358,7 @@ fn classify_aot_parity_module(
     label: String,
     script: Option<PathBuf>,
     python_available: bool,
+    timeout: Duration,
 ) -> AotParityRecord {
     let Some(script) = script else {
         return AotParityRecord::new(label, AotParityStatus::Error, Some("manifest entry is not present".to_owned()));
@@ -357,8 +380,15 @@ fn classify_aot_parity_module(
     };
 
     let exe = run_dir.join(format!("{}-{}{}", index, safe_exe_stem(&label), env::consts::EXE_SUFFIX));
-    let build = match run_build(root, pon_binary, &script, &exe) {
-        Ok(build) => build,
+    let build = match run_build(root, pon_binary, &script, &exe, timeout) {
+        Ok(AotRun::Completed(build)) => build,
+        Ok(AotRun::TimedOut) => {
+            return AotParityRecord::new(
+                label,
+                AotParityStatus::Error,
+                Some(format!("pon build timed out after {}s", timeout.as_secs())),
+            );
+        }
         Err(error) => {
             return AotParityRecord::new(label, AotParityStatus::Error, Some(format!("failed to spawn pon build: {error:#}")));
         }
@@ -377,8 +407,15 @@ fn classify_aot_parity_module(
         );
     }
 
-    let aot = match run_executable_without_pon(root, &exe) {
-        Ok(aot) => aot,
+    let aot = match run_executable_without_pon(root, &exe, timeout) {
+        Ok(AotRun::Completed(aot)) => aot,
+        Ok(AotRun::TimedOut) => {
+            return AotParityRecord::new(
+                label,
+                AotParityStatus::Fail,
+                Some(format!("AoT executable timed out after {}s", timeout.as_secs())),
+            );
+        }
         Err(error) => {
             return AotParityRecord::new(
                 label,
@@ -459,24 +496,63 @@ fn aot_run_dir(root: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
-fn run_build(root: &Path, pon_binary: &Path, script: &Path, exe: &Path) -> Result<RunResult> {
-    suite::run_command(
+/// Outcome of a wall-clock-bounded aot-suite subprocess (`run_bounded`).
+enum AotRun {
+    Completed(RunResult),
+    TimedOut,
+}
+
+/// Wall-clock cap applied to each `pon build` and AoT-executable subprocess:
+/// `PON_AOT_TIMEOUT_SECS` (positive integer seconds) or 60s. Pin J0.7 §2
+/// reserves the `--timeout` flag for `--suite cpython-full`, so the aot
+/// suites take their cap from the environment instead of the CLI.
+fn aot_timeout() -> Duration {
+    timeout_from(env::var("PON_AOT_TIMEOUT_SECS").ok().as_deref())
+}
+
+fn timeout_from(value: Option<&str>) -> Duration {
+    let secs = value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(AOT_DEFAULT_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Runs `command` under the cpython-full supervision machinery (process-group
+/// isolation + SIGKILL past `timeout`, `full.rs` pin §5.2). A timeout is a
+/// distinct outcome; the exit-code mapping matches `suite::run_command`
+/// (signal deaths surface as exit 1).
+fn run_bounded(command: &mut Command, timeout: Duration) -> Result<AotRun> {
+    full::apply_unix_isolation(command, timeout);
+    match full::run_with_timeout(command, timeout).context("failed to spawn process")? {
+        full::RunOutcome::TimedOut => Ok(AotRun::TimedOut),
+        full::RunOutcome::Completed(side) => Ok(AotRun::Completed(RunResult {
+            stdout: side.stdout,
+            stderr: side.stderr,
+            exit: side.exit.unwrap_or(1),
+        })),
+    }
+}
+
+fn run_build(root: &Path, pon_binary: &Path, script: &Path, exe: &Path, timeout: Duration) -> Result<AotRun> {
+    run_bounded(
         Command::new(pon_binary)
             .arg("build")
             .arg(script)
             .arg("-o")
             .arg(exe)
             .current_dir(root),
+        timeout,
     )
 }
 
-fn run_executable_without_pon(root: &Path, exe: &Path) -> Result<RunResult> {
+fn run_executable_without_pon(root: &Path, exe: &Path, timeout: Duration) -> Result<AotRun> {
     let mut command = Command::new(exe);
     command.env_clear().env("PATH", "/usr/bin:/bin").current_dir(root);
     if let Some(home) = env::var_os("HOME") {
         command.env("HOME", home);
     }
-    suite::run_command(&mut command)
+    run_bounded(&mut command, timeout)
 }
 
 fn build_failure_report(exe: &Path, build: &RunResult) -> String {
@@ -558,7 +634,10 @@ print(add(2, 3))
         ));
         let pon_binary = suite::ensure_pon_cli(&root).expect("build pon-cli for AoT regression");
 
-        let build = run_build(&root, &pon_binary, &script, &exe).expect("spawn pon build");
+        let build = match run_build(&root, &pon_binary, &script, &exe, aot_timeout()).expect("spawn pon build") {
+            AotRun::Completed(build) => build,
+            AotRun::TimedOut => panic!("pon build timed out"),
+        };
         assert_eq!(
             build.exit,
             0,
@@ -568,7 +647,11 @@ print(add(2, 3))
         );
         assert!(exe.is_file(), "pon build did not create {}", exe.display());
 
-        let aot = run_executable_without_pon(&root, &exe).expect("run no-class AoT executable");
+        let aot = match run_executable_without_pon(&root, &exe, aot_timeout()).expect("run no-class AoT executable")
+        {
+            AotRun::Completed(aot) => aot,
+            AotRun::TimedOut => panic!("no-class AoT executable timed out"),
+        };
         let stderr = String::from_utf8_lossy(&aot.stderr);
         assert!(
             !stderr.contains("__build_class__"),
@@ -581,6 +664,36 @@ print(add(2, 3))
         );
         assert_eq!(aot.stdout.as_slice(), b"hello, world\n5\n");
         assert_eq!(aot.stderr.as_slice(), b"");
+    }
+
+    #[test]
+    fn run_bounded_kills_hung_subprocess_at_deadline() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("30");
+        let outcome = run_bounded(&mut command, Duration::from_secs(1)).expect("spawn sleep");
+        assert!(matches!(outcome, AotRun::TimedOut), "sleep 30 must hit the 1s deadline");
+    }
+
+    #[test]
+    fn run_bounded_passes_through_fast_subprocess() {
+        let mut command = Command::new("/bin/echo");
+        command.arg("bounded");
+        match run_bounded(&mut command, Duration::from_secs(60)).expect("spawn echo") {
+            AotRun::Completed(result) => {
+                assert_eq!(result.exit, 0);
+                assert_eq!(result.stdout.as_slice(), b"bounded\n");
+            }
+            AotRun::TimedOut => panic!("echo must not time out"),
+        }
+    }
+
+    #[test]
+    fn timeout_env_parsing_defaults_and_overrides() {
+        assert_eq!(timeout_from(None), Duration::from_secs(AOT_DEFAULT_TIMEOUT_SECS));
+        assert_eq!(timeout_from(Some("5")), Duration::from_secs(5));
+        assert_eq!(timeout_from(Some(" 90 ")), Duration::from_secs(90));
+        assert_eq!(timeout_from(Some("0")), Duration::from_secs(AOT_DEFAULT_TIMEOUT_SECS));
+        assert_eq!(timeout_from(Some("junk")), Duration::from_secs(AOT_DEFAULT_TIMEOUT_SECS));
     }
 
     struct TempDir {

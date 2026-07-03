@@ -44,7 +44,12 @@
 //! `codecs.lookup_error(...)` succeeds at `import codecs` time, but raise
 //! `NotImplementedError` when invoked (pon strings are Rust UTF-8 strings and
 //! cannot carry the lone surrogates `surrogateescape`/`surrogatepass`
-//! produce).  Exotic codec functions (`utf_16_*`, `utf_32_*`, `utf_7_*`,
+//! produce).  Decode-side, the builtin cores degrade a requested
+//! `surrogateescape` to the strict-mode `UnicodeDecodeError` instead of a
+//! `LookupError` — the CPython-shaped FAILURE for the fs-encoding probes
+//! that only catch `UnicodeDecodeError` (documented divergence: CPython
+//! would succeed with lone surrogates; see [`utf8_decode_core`]).
+//! Exotic codec functions (`utf_16_*`, `utf_32_*`, `utf_7_*`,
 //! `charmap_*`, `*_escape_*`, `readbuffer_encode`) are exported so
 //! `from _codecs import *` succeeds, and raise `NotImplementedError` when
 //! called.
@@ -414,7 +419,7 @@ pub(crate) enum CoreError {
 }
 
 impl CoreError {
-    fn raise(&self) -> *mut PyObject {
+    pub(crate) fn raise(&self) -> *mut PyObject {
         match self {
             CoreError::Decode(message) => raise_kind(ExceptionKind::UnicodeDecodeError, message),
             CoreError::Encode(message) => raise_kind(ExceptionKind::UnicodeEncodeError, message),
@@ -561,11 +566,18 @@ pub(crate) fn utf8_decode_core(bytes: &[u8], errors: &str, final_: bool) -> Resu
                             out.push_str(&format!("\\x{byte:02x}"));
                         }
                     }
+                    // pon str cannot carry the lone surrogates PEP 383
+                    // produces, so a requested 'surrogateescape' degrades to
+                    // the strict-mode UnicodeDecodeError rather than a
+                    // LookupError (documented divergence: CPython SUCCEEDS
+                    // here, mapping the bytes to U+DC80..U+DCFF).  Callers
+                    // probing fs-encoding decodability — os.fsdecode and
+                    // `test.support.os_helper`'s TESTFN_UNDECODABLE loop
+                    // (`except UnicodeDecodeError`) — keep their CPython
+                    // control flow: the except arm engages instead of a
+                    // LookupError escaping the probe.
                     "surrogateescape" => {
-                        return Err(CoreError::Handler(
-                            "the 'surrogateescape' error handler is not supported by pon (str cannot carry lone surrogates)"
-                                .to_owned(),
-                        ));
+                        return Err(CoreError::Decode(utf8_decode_error_message(bytes, pos, span, reason)));
                     }
                     _ => return Err(unknown_handler(errors)),
                 }
@@ -592,11 +604,12 @@ pub(crate) fn ascii_decode_core(bytes: &[u8], errors: &str) -> Result<String, Co
             "ignore" => {}
             "replace" => out.push('\u{FFFD}'),
             "backslashreplace" => out.push_str(&format!("\\x{byte:02x}")),
+            // Degrades to the strict-mode UnicodeDecodeError; see the
+            // `utf8_decode_core` surrogateescape arm for the rationale.
             "surrogateescape" => {
-                return Err(CoreError::Handler(
-                    "the 'surrogateescape' error handler is not supported by pon (str cannot carry lone surrogates)"
-                        .to_owned(),
-                ));
+                return Err(CoreError::Decode(format!(
+                    "'ascii' codec can't decode byte 0x{byte:02x} in position {pos}: ordinal not in range(128)"
+                )));
             }
             _ => return Err(unknown_handler(errors)),
         }

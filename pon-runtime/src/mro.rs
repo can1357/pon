@@ -1,15 +1,16 @@
 //! C3 method-resolution-order support for heap type objects.
 //!
 //! The module is intentionally self-contained: type creation owns the final
-//! `tp_mro` pointer, while attribute lookup can borrow the frozen entries without
-//! knowing how the linearization was produced.
+//! `tp_mro` and `tp_bases` pointers, while attribute lookup can borrow the
+//! frozen entries without knowing how the linearization was produced.
 
 use core::ptr;
 
 use crate::object::{PyObject, PyObjectHeader, PyType};
 use crate::thread_state::pon_err_set;
 
-/// Boxed runtime carrier stored in `PyType::tp_mro`.
+/// Boxed runtime carrier stored in `PyType::tp_mro` (C3 linearization) and
+/// `PyType::tp_bases` (declared-bases construction record).
 #[repr(C)]
 #[derive(Debug)]
 pub struct PyMro {
@@ -89,6 +90,43 @@ pub unsafe fn mro_entries(ty: *mut PyType) -> Vec<*mut PyType> {
     out
 }
 
+/// Record the declared (direct) bases on `ty` — the `cls.__bases__` surface.
+///
+/// `tp_base` keeps only the leading base, so multi-base heap classes would
+/// otherwise lose the construction record `__bases__` must report.  The
+/// carrier is leaked like the type object itself (heap types are immortal),
+/// so the collector never traces `tp_bases`.
+pub unsafe fn set_declared_bases(ty: *mut PyType, bases: &[*mut PyType]) {
+    if ty.is_null() {
+        return;
+    }
+    let carrier = Box::into_raw(Box::new(PyMro {
+        ob_base: PyObjectHeader::new(ptr::null()),
+        entries: bases.to_vec(),
+    }));
+    unsafe {
+        (*ty).tp_bases = carrier.cast::<PyObject>();
+    }
+}
+
+/// Direct bases of a type: the stored construction record when present,
+/// otherwise the single `tp_base` (static/native types — CPython's
+/// `PyType_Ready` derives `tp_bases = (tp_base,)` the same way), otherwise
+/// empty (`object.__bases__ == ()`).
+#[must_use]
+pub unsafe fn base_entries(ty: *mut PyType) -> Vec<*mut PyType> {
+    if ty.is_null() {
+        return Vec::new();
+    }
+    let carrier = unsafe { (*ty).tp_bases };
+    if !carrier.is_null() {
+        let bases = unsafe { &*carrier.cast::<PyMro>() };
+        return bases.entries.clone();
+    }
+    let base = unsafe { (*ty).tp_base };
+    if base.is_null() { Vec::new() } else { vec![base] }
+}
+
 /// Compute CPython-style C3 linearization for `ty + bases`.
 #[must_use]
 pub unsafe fn compute_c3_mro(ty: *mut PyType, bases: &[*mut PyType]) -> Option<Vec<*mut PyType>> {
@@ -143,9 +181,12 @@ pub unsafe fn compute_c3_mro(ty: *mut PyType, bases: &[*mut PyType]) -> Option<V
 mod tests {
     use super::*;
     use crate::object::PyType;
+    use crate::thread_state::{pon_err_clear, test_state_lock};
 
     #[test]
     fn c3_linearizes_diamond() {
+        let _guard = test_state_lock();
+        pon_err_clear();
         let mut type_type = PyType::new(ptr::null(), "type", core::mem::size_of::<PyType>());
         let type_ptr = &mut type_type as *mut PyType;
         unsafe { (*type_ptr).ob_base.ob_type = type_ptr };
@@ -176,6 +217,8 @@ mod tests {
 
     #[test]
     fn c3_rejects_inconsistent_base_order() {
+        let _guard = test_state_lock();
+        pon_err_clear();
         let mut type_type = PyType::new(ptr::null(), "type", core::mem::size_of::<PyType>());
         let type_ptr = &mut type_type as *mut PyType;
         unsafe { (*type_ptr).ob_base.ob_type = type_ptr };

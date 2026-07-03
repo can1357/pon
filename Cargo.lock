@@ -1316,6 +1316,9 @@ dependencies = [
  "pon-ir",
  "pon-jit",
  "pon-runtime",
+ "ruff_python_ast",
+ "ruff_python_parser",
+ "ruff_text_size",
 ]
 
 [[package]]

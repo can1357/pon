@@ -265,7 +265,7 @@ pub unsafe fn rich_compare(op: u8, a: *mut PyObject, b: *mut PyObject) -> *mut P
             RICH_GE => left >= right,
             _ => return raise_type_error("unknown rich comparison operation"),
         };
-        return unsafe { abi::pon_const_int(if result { 1 } else { 0 }) };
+        return const_bool_object(result);
     }
 
     let same_type = left_type == right_type;
@@ -341,13 +341,39 @@ pub unsafe fn rich_compare(op: u8, a: *mut PyObject, b: *mut PyObject) -> *mut P
     }
 
     match op {
-        RICH_EQ => unsafe { abi::pon_const_int(i64::from(a == b)) },
-        RICH_NE => unsafe { abi::pon_const_int(i64::from(a != b)) },
+        RICH_EQ => const_bool_object(a == b),
+        RICH_NE => {
+            // `object.__ne__` default: delegate to the operand's own
+            // `__eq__` and invert, NotImplemented passing through (CPython
+            // `object_richcompare`).  Reached only after every `__ne__`
+            // slot/dunder attempt above fell through; subtype priority
+            // mirrors those attempts.  Identity stays the final default.
+            let ordered = if right_subtype { [(right_type, b, a), (left_type, a, b)] } else { [(left_type, a, b), (right_type, b, a)] };
+            for (ty, obj, other) in ordered {
+                if same_type && !core::ptr::eq(obj, a) {
+                    continue;
+                }
+                if let Some(result) = unsafe { ne_delegates_to_eq(ty, obj, other) } {
+                    return result;
+                }
+            }
+            const_bool_object(a != b)
+        }
         _ => {
             let message = unsafe { rich_unsupported_message(op, a, b) };
             raise_type_error(&message)
         }
     }
+}
+
+/// Canonical `bool` result for a synthesized (non-dunder) rich comparison.
+///
+/// Builtin comparisons yield real `True`/`False` objects in CPython. Codegen
+/// no longer coerces comparison results, so every path that fabricates a
+/// truth value here must hand back the bool singletons; only user dunders may
+/// inject other result types, and those pass through the dispatcher raw.
+fn const_bool_object(value: bool) -> *mut PyObject {
+    unsafe { abi::number::pon_const_bool(i32::from(value)) }
 }
 
 enum RichNumericValue {
@@ -395,7 +421,7 @@ fn rich_compare_complex_to_real(op: u8, real: f64, imag: f64, other: RichNumeric
                 RichNumericValue::Complex(_, _) => false,
             };
             let equal = imag == 0.0 && real_equal;
-            unsafe { abi::pon_const_int(i64::from(if op == RICH_EQ { equal } else { !equal })) }
+            const_bool_object(if op == RICH_EQ { equal } else { !equal })
         }
         _ => raise_type_error("complex numbers are not orderable"),
     }
@@ -405,7 +431,7 @@ fn rich_compare_complex(op: u8, left_real: f64, left_imag: f64, right_real: f64,
     match op {
         RICH_EQ | RICH_NE => {
             let equal = left_real == right_real && left_imag == right_imag;
-            unsafe { abi::pon_const_int(i64::from(if op == RICH_EQ { equal } else { !equal })) }
+            const_bool_object(if op == RICH_EQ { equal } else { !equal })
         }
         _ => raise_type_error("complex numbers are not orderable"),
     }
@@ -421,13 +447,13 @@ fn rich_compare_floats(op: u8, left: f64, right: f64) -> *mut PyObject {
         RICH_GE => left >= right,
         _ => return raise_type_error("unknown rich comparison operation"),
     };
-    unsafe { abi::pon_const_int(i64::from(result)) }
+    const_bool_object(result)
 }
 
 fn rich_compare_int_float(op: u8, integer: &num_bigint::BigInt, float: f64) -> *mut PyObject {
     if float.is_nan() {
         let result = op == RICH_NE;
-        return unsafe { abi::pon_const_int(i64::from(result)) };
+        return const_bool_object(result);
     }
     let Some(ordering) = compare_int_float(integer, float) else {
         return raise_type_error("unknown rich comparison operation");
@@ -445,7 +471,7 @@ fn rich_compare_ordering(op: u8, ordering: core::cmp::Ordering) -> *mut PyObject
         RICH_GE => !ordering.is_lt(),
         _ => return raise_type_error("unknown rich comparison operation"),
     };
-    unsafe { abi::pon_const_int(i64::from(result)) }
+    const_bool_object(result)
 }
 
 fn compare_int_float(integer: &num_bigint::BigInt, float: f64) -> Option<core::cmp::Ordering> {
@@ -580,7 +606,9 @@ pub unsafe fn get_attr(object: *mut PyObject, name: u32) -> *mut PyObject {
         // Slotless native receivers (e.g. int) still expose the universal
         // `__class__` (CPython: `object.__class__` getset).
         if name == crate::intern::intern("__class__") {
-            return ty.cast::<PyObject>();
+            // Canonicalize helper-family shadow types so `x.__class__ is
+            // list` holds (the `type(x)` builtin applies the same repair).
+            return unsafe { crate::types::type_::canonical_type_object(ty) }.cast::<PyObject>();
         }
         // Exact `int`/`bool` receivers: the narrow instance-method surface
         // (`bit_length`, `bit_count`, `numerator`/`denominator`/...).
@@ -607,7 +635,7 @@ pub unsafe fn get_attr(object: *mut PyObject, name: u32) -> *mut PyObject {
             && !core::ptr::fn_addr_eq(slot, crate::descr::generic_get_attr as unsafe extern "C" fn(_, _) -> _)
         {
             crate::thread_state::pon_err_clear();
-            return ty.cast::<PyObject>();
+            return unsafe { crate::types::type_::canonical_type_object(ty) }.cast::<PyObject>();
         }
         ensure_exception("attribute lookup returned NULL without setting an exception");
     }
@@ -1027,6 +1055,28 @@ unsafe fn call_rich_dunder(method: *mut PyObject, obj: *mut PyObject, other: *mu
     let mut argv = [other];
     let result = unsafe { abi::pon_call(callable, argv.as_mut_ptr(), argv.len()) };
     slot_result(result, "rich comparison method returned NULL without setting an exception")
+}
+/// `object.__ne__` default for one operand of the rich-compare terminus:
+/// resolve `ty`'s Python-level `__eq__`, call it as `obj.__eq__(other)`, and
+/// invert a non-`NotImplemented` result's truth value.  `None` keeps the
+/// dispatcher falling through (no `__eq__`, or it reported NotImplemented);
+/// a raised error surfaces as `Some(NULL)`.
+unsafe fn ne_delegates_to_eq(ty: *mut PyType, obj: *mut PyObject, other: *mut PyObject) -> Option<*mut PyObject> {
+    let eq = unsafe { rich_dunder(ty, RICH_EQ) };
+    if eq.is_null() {
+        return None;
+    }
+    match unsafe { call_rich_dunder(eq, obj, other, ty) } {
+        SlotOutcome::Value(value) => {
+            let truth = unsafe { is_true(value) };
+            if truth < 0 {
+                return Some(ptr::null_mut());
+            }
+            Some(unsafe { abi::number::pon_const_bool(i32::from(truth == 0)) })
+        }
+        SlotOutcome::Error => Some(ptr::null_mut()),
+        SlotOutcome::Missing | SlotOutcome::NotImplemented => None,
+    }
 }
 
 /// Forward/reflected Python dunder spellings for a binary numeric op.

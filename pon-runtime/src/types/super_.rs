@@ -90,9 +90,12 @@ pub fn install_super_slots(ty: &mut PyType) {
 mod tests {
     use super::*;
     use crate::object::PyType;
+    use crate::thread_state::{pon_err_clear, test_state_lock};
 
     #[test]
     fn rejects_unrelated_type() {
+        let _guard = test_state_lock();
+        pon_err_clear();
         let mut type_type = PyType::new(ptr::null(), "type", core::mem::size_of::<PyType>());
         let type_ptr = &mut type_type as *mut PyType;
         unsafe { (*type_ptr).ob_base.ob_type = type_ptr };

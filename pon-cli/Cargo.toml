@@ -17,3 +17,6 @@ pon-jit.workspace = true
 pon-runtime.workspace = true
 pon-aot.workspace = true
 anyhow.workspace = true
+ruff_python_ast.workspace = true
+ruff_python_parser.workspace = true
+ruff_text_size.workspace = true

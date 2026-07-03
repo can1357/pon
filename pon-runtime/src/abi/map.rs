@@ -741,6 +741,34 @@ if updated.is_null() {
     crate::dynexec::sync_globals_dict_bulk(receiver);
     map_none()
 } }
+pub(crate) unsafe extern "C" fn dict_popitem_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject { let args = match map_method_args(argv, argc, "dict.popitem") {
+    Ok(args) => args,
+    Err(message) => return null_error(message),
+};
+let receiver = match ensure_dict_method_receiver(args, "popitem") {
+    Ok(receiver) => receiver,
+    Err(raised) => return raised,
+};
+if args.len() != 1 {
+    return raise_map_type_error(format!("dict.popitem() expected 0 arguments, got {}", args.len().saturating_sub(1)));
+}
+unsafe { pon_dict_popitem(receiver) } }
+
+pub(crate) unsafe extern "C" fn dict_clear_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject { let args = match map_method_args(argv, argc, "dict.clear") {
+    Ok(args) => args,
+    Err(message) => return null_error(message),
+};
+let receiver = match ensure_dict_method_receiver(args, "clear") {
+    Ok(receiver) => receiver,
+    Err(raised) => return raised,
+};
+if args.len() != 1 {
+    return raise_map_type_error(format!("dict.clear() expected 0 arguments, got {}", args.len().saturating_sub(1)));
+}
+if unsafe { pon_dict_clear(receiver) }.is_null() {
+    return ptr::null_mut();
+}
+map_none() }
 
 /// Returns a bound dict method object for attribute lookup.
 pub unsafe fn pon_dict_bound_method(map: *mut PyObject, name: &str) -> *mut PyObject {
@@ -753,6 +781,8 @@ pub unsafe fn pon_dict_bound_method(map: *mut PyObject, name: &str) -> *mut PyOb
         "pop" => alloc_bound_native_method(map, name, dict_pop_method_trampoline),
         "update" => alloc_bound_native_method(map, name, dict_update_method_trampoline),
         "copy" => alloc_bound_native_method(map, name, dict_copy_method_trampoline),
+        "popitem" => alloc_bound_native_method(map, name, dict_popitem_method_trampoline),
+        "clear" => alloc_bound_native_method(map, name, dict_clear_method_trampoline),
         _ => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
     }
 }
@@ -795,6 +825,52 @@ pub unsafe extern "C" fn pon_dict_pop(map: *mut PyObject, key: *mut PyObject, de
             Ok(Some(value)) => value,
             Ok(None) if !default.is_null() => default,
             Ok(None) => raise_key_error(key),
+            Err(message) => null_error(message),
+        }
+    })
+}
+/// `dict.popitem()` helper: LIFO removal returning a `(key, value)` pair;
+/// an empty dict raises `KeyError('popitem(): dictionary is empty')`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_dict_popitem(map: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(map);
+    super::catch_object_helper(|| {
+        let _guard = crate::sync::begin_critical_section(map);
+        match unsafe { dict::dict_pop_last(map) } {
+            Ok(Some((key, value))) => {
+                crate::dynexec::sync_globals_dict_delete(map, key);
+                match super::with_runtime(|runtime| super::seq::alloc_tuple_from_slice(runtime, &[key, value])) {
+                    Some(Ok(pair)) => pair,
+                    Some(Err(message)) => null_error(message),
+                    None => null_error("runtime is not initialized"),
+                }
+            }
+            Ok(None) => {
+                let message = "popitem(): dictionary is empty";
+                let text = unsafe { super::pon_const_str(message.as_ptr(), message.len()) };
+                if text.is_null() {
+                    return null_error("failed to allocate popitem KeyError message");
+                }
+                unsafe { super::exc::pon_raise_key_error(text) }
+            }
+            Err(message) => null_error(message),
+        }
+    })
+}
+
+/// `dict.clear()` helper: removes every entry; NULL only on a raised error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_dict_clear(map: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(map);
+    super::catch_object_helper(|| {
+        let _guard = crate::sync::begin_critical_section(map);
+        match unsafe { dict::dict_clear(map) } {
+            Ok(keys) => {
+                for key in keys {
+                    crate::dynexec::sync_globals_dict_delete(map, key);
+                }
+                map_none()
+            }
             Err(message) => null_error(message),
         }
     })

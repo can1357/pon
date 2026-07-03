@@ -1184,7 +1184,6 @@ unsafe fn construct_class(
     };
     let mut ty = PyType::new(metaclass, static_name, instance_size);
     ty.tp_base = base_types.first().copied().unwrap_or(ptr::null_mut());
-    ty.tp_bases = ptr::null_mut();
     ty.tp_dict = namespace.cast::<PyObject>();
     ty.tp_dictoffset = if namespace_allows_dict(base_types, &slot_spec) { 1 } else { 0 };
     if derives_exception {
@@ -1207,6 +1206,11 @@ unsafe fn construct_class(
     // GC visibility: the type box is malloc'd, so the collector can only keep
     // the namespace's GC values alive through the namespaced-type root set.
     crate::sync::register_namespaced_type(ty);
+    // Declared-bases construction record for `cls.__bases__`: `tp_base` keeps
+    // only the leading base, and the implicit-`object` default above is
+    // Python-visible there too (CPython: `class C: pass` → `C.__bases__ ==
+    // (object,)`).
+    unsafe { mro::set_declared_bases(ty, base_types) };
     if unsafe { mro::set_c3_mro(ty, base_types) } < 0 {
         return ptr::null_mut();
     }
@@ -1655,7 +1659,7 @@ unsafe fn call_init_subclass(ty: *mut PyType, base_types: &[*mut PyType], keywor
 /// `type(x)` preserves identity (`type([]) is list`) and attribute access on
 /// the result works.  Properly constructed types — user classes and installed
 /// builtins — carry a metatype and pass through untouched.
-unsafe fn canonical_type_object(ty: *mut PyType) -> *mut PyType {
+pub(crate) unsafe fn canonical_type_object(ty: *mut PyType) -> *mut PyType {
     if ty.is_null() || !unsafe { (*ty).ob_base.ob_type.is_null() } {
         return ty;
     }
@@ -1868,9 +1872,12 @@ pub unsafe fn isinstance(obj: *mut PyObject, cls: *mut PyObject) -> c_int {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thread_state::{pon_err_clear, test_state_lock};
 
     #[test]
     fn class_namespace_stores_attrs_and_dunders() {
+        let _guard = test_state_lock();
+        pon_err_clear();
         let ns = new_namespace();
         let value = unsafe { fake_str("callable") };
         unsafe {
@@ -1883,6 +1890,8 @@ mod tests {
 
     #[test]
     fn slot_only_instance_rejects_unknown_dict_storage() {
+        let _guard = test_state_lock();
+        pon_err_clear();
         let ns = new_namespace();
         unsafe {
             (&mut *ns).set(intern::intern("__slots__"), fake_str("x"));
@@ -1898,6 +1907,8 @@ mod tests {
 
     #[test]
     fn most_derived_metaclass_wins_across_bases() {
+        let _guard = test_state_lock();
+        pon_err_clear();
         let mut type_type = PyType::new(ptr::null(), "type", mem::size_of::<PyType>());
         let type_ptr = &mut type_type as *mut PyType;
         unsafe { (*type_ptr).ob_base.ob_type = type_ptr };
@@ -1934,6 +1945,8 @@ mod tests {
 
     #[test]
     fn unrelated_base_metaclasses_conflict() {
+        let _guard = test_state_lock();
+        pon_err_clear();
         let mut type_type = PyType::new(ptr::null(), "type", mem::size_of::<PyType>());
         let type_ptr = &mut type_type as *mut PyType;
         unsafe { (*type_ptr).ob_base.ob_type = type_ptr };
@@ -1967,6 +1980,8 @@ mod tests {
 
     #[test]
     fn multiple_slotted_bases_report_layout_conflict() {
+        let _guard = test_state_lock();
+        pon_err_clear();
         unsafe {
             let base_a_ns = new_namespace();
             (&mut *base_a_ns).set(intern::intern("__slots__"), fake_str("a"));

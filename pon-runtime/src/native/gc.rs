@@ -19,6 +19,12 @@ unsafe extern "C" fn gc_collect(_argv: *mut *mut PyObject, argc: usize) -> *mut 
     if argc != 0 {
         return crate::abi::return_null_with_error("gc.collect expected no arguments");
     }
+    // Scrub before any collection frame is pushed: `abi::collect` re-scrubs,
+    // but its own wrapper frame would otherwise sit in unscrubbed territory
+    // still holding ghosts of the previous deep call chain (see
+    // `abi::scrub_dead_stack_below`).  Scrubbing from the native entry point
+    // pushes the ghost boundary up to this frame.
+    crate::abi::scrub_dead_stack_below();
     match crate::abi::collect() {
         Ok(()) => unsafe { crate::abi::pon_const_int(0) },
         Err(message) => crate::abi::return_null_with_error(message),

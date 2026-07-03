@@ -313,9 +313,12 @@ pub fn install_property_slots(ty: &mut PyType) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thread_state::{pon_err_clear, test_state_lock};
 
     #[test]
     fn property_without_getter_is_data_descriptor_error() {
+        let _guard = test_state_lock();
+        pon_err_clear();
         let mut property_type = PyType::new(ptr::null(), "property", core::mem::size_of::<PyProperty>());
         install_property_slots(&mut property_type);
         let property = unsafe { new_property(&property_type, ptr::null_mut(), ptr::null_mut(), ptr::null_mut(), ptr::null_mut()) };
