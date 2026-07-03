@@ -1,5 +1,7 @@
 //! Native `sys` module seed for WS-IMPORT.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use num_traits::ToPrimitive;
 
 use crate::abi::{pon_const_bool, pon_const_int, pon_const_str, pon_make_function, return_null_with_error};
@@ -93,6 +95,8 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         function_attr("exception", sys_exception),
         function_attr("exc_info", sys_exc_info),
         function_attr("excepthook", sys_excepthook),
+        function_attr("getrecursionlimit", sys_getrecursionlimit),
+        function_attr("setrecursionlimit", sys_setrecursionlimit),
         std_stream_attr("stdout", 1),
         std_stream_attr("stderr", 2),
     ];
@@ -918,4 +922,88 @@ unsafe extern "C" fn sys_excepthook(argv: *mut *mut PyObject, argc: usize) -> *m
     }
     // SAFETY: Singleton accessor.
     unsafe { crate::abi::pon_none() }
+}
+
+// ---------------------------------------------------------------------------
+// sys.getrecursionlimit / sys.setrecursionlimit
+//
+// CPython stores the recursion limit on the thread state and enforces it on
+// every interpreter frame push.  pon compiles calls natively and never
+// consults this value on its call paths, so the limit is STORED BUT NOT
+// ENFORCED (documented divergence): no depth of pon recursion raises
+// RecursionError from this limit.  The stored value exists because
+// `inspect.unwrap()` reads `sys.getrecursionlimit()` as a pure loop bound —
+// reached at import time by `import asyncio` (asyncio.graph's frozen
+// dataclasses resolve annotations through `annotationlib`/`functools`, which
+// import `inspect`) — and stdlib callers of `setrecursionlimit` expect the
+// next `getrecursionlimit` to reflect the write.  If a RecursionError
+// consumer ever appears, the enforcement hook is the compiled call-depth
+// tracking already counted by `crate::abi::current_function_stack_depth()`.
+// CPython's second `setrecursionlimit` guard — RecursionError("cannot set
+// the recursion limit to N at the recursion depth D: the limit is too low")
+// when the new limit does not clear the current depth — is unimplemented
+// for the same reason.  Validation wording matches the host CPython 3.14.6
+// oracle exactly.
+// ---------------------------------------------------------------------------
+
+/// CPython `Py_DEFAULT_RECURSION_LIMIT`.
+const DEFAULT_RECURSION_LIMIT: usize = 1000;
+
+/// The stored `sys.setrecursionlimit` value; see the section comment for
+/// the enforcement divergence.  Relaxed suffices: readers only need to
+/// observe a value some `setrecursionlimit` call stored, and the value
+/// carries no happens-before payload.
+static RECURSION_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_RECURSION_LIMIT);
+
+/// `sys.getrecursionlimit()`: the stored limit (default 1000).
+unsafe extern "C" fn sys_getrecursionlimit(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let _ = argv;
+    if argc != 0 {
+        return raise_type_error(&format!("getrecursionlimit() takes no arguments ({argc} given)"));
+    }
+    // SAFETY: Runtime allocation helper returns NULL with a diagnostic on failure.
+    unsafe { pon_const_int(RECURSION_LIMIT.load(Ordering::Relaxed) as i64) }
+}
+
+/// `sys.setrecursionlimit(limit)`: validates a positive int and stores it;
+/// never enforced (see the section comment).
+unsafe extern "C" fn sys_setrecursionlimit(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 1 {
+        return raise_type_error(&format!("setrecursionlimit() takes exactly one argument ({argc} given)"));
+    }
+    if argv.is_null() {
+        return return_null_with_error("argv pointer is null");
+    }
+    // SAFETY: `argv` carries `argc` argument slots per the call ABI.
+    let limit_object = crate::tag::untag_arg(unsafe { *argv });
+    if limit_object.is_null() {
+        // Boxing a tagged immediate failed; the error is already recorded.
+        return core::ptr::null_mut();
+    }
+    // CPython converts through `__index__` (bool included); int/bool payload
+    // extraction is the same acceptance set for the types pon has.
+    let Some(value) = (unsafe { crate::types::int::to_bigint_including_bool(limit_object) }) else {
+        let type_name = unsafe { crate::types::dict::type_name(limit_object) }.unwrap_or("object");
+        return raise_type_error(&format!("'{type_name}' object cannot be interpreted as an integer"));
+    };
+    if value.sign() != num_bigint::Sign::Plus {
+        return raise_value_error("recursion limit must be greater or equal than 1");
+    }
+    let Some(limit) = value.to_usize() else {
+        // Positive but unstorable; CPython's C-int conversion overflow leg.
+        return return_null_with_error("Python int too large to convert to C int");
+    };
+    RECURSION_LIMIT.store(limit, Ordering::Relaxed);
+    // SAFETY: Singleton accessor.
+    unsafe { crate::abi::pon_none() }
+}
+
+fn raise_type_error(message: &str) -> *mut PyObject {
+    // SAFETY: Message bytes are a live UTF-8 slice for the duration of the call.
+    unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) }
+}
+
+fn raise_value_error(message: &str) -> *mut PyObject {
+    // SAFETY: Message bytes are a live UTF-8 slice for the duration of the call.
+    unsafe { crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) }
 }
