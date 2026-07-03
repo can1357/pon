@@ -31,6 +31,9 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
         string_attr(module, "pardir", ".."),
     ];
     let mut attrs = attrs.into_iter().collect::<Result<Vec<_>, _>>()?;
+    if module == "os" {
+        attrs.push((intern("altsep"), unsafe { crate::abi::pon_none() }));
+    }
     for &(name, value) in [OPEN_FLAGS, ACCESS_FLAGS, WAIT_OPTIONS, SEEK_MODES].into_iter().flatten() {
         // SAFETY: Integer boxing helper; NULL is checked below.
         let boxed = unsafe { crate::abi::pon_const_int(i64::from(value)) };
@@ -498,6 +501,35 @@ unsafe extern "C" fn os_chmod(argv: *mut *mut PyObject, argc: usize) -> *mut PyO
     unsafe { crate::abi::pon_none() }
 }
 
+/// `os.access(path, mode)` over `access(2)`: reports whether the process can
+/// access `path` under `mode` (an `F_OK`/`R_OK`/`W_OK`/`X_OK` combination).
+/// Never raises for an inaccessible path — a failing check returns `False`,
+/// matching CPython.
+unsafe extern "C" fn os_access(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.access expected two arguments (path, mode)");
+    }
+    let path = match path_arg(args[0], "access") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let mode = match int_arg(args[1], "access mode") {
+        Ok(mode) => mode,
+        Err(error) => return error,
+    };
+    let c_path = match c_path(&path) {
+        Ok(c_path) => c_path,
+        Err(error) => return error,
+    };
+    // SAFETY: `c_path` is NUL-terminated; `access(2)` returning nonzero (with
+    // errno set) means "not accessible", which CPython folds into False.
+    let ok = unsafe { libc::access(c_path.as_ptr(), mode as libc::c_int) } == 0;
+    // SAFETY: Singleton accessor.
+    unsafe { crate::abi::number::pon_const_bool(i32::from(ok)) }
+}
+
 /// `os.getuid()` over `getuid(2)` (`netrc._can_security_check` gates on its
 /// presence; the check itself compares it to the file owner).
 unsafe extern "C" fn os_getuid(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
@@ -676,6 +708,7 @@ type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObjec
 const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("WIFSTOPPED", os_wifstopped, 1),
     ("WSTOPSIG", os_wstopsig, 1),
+    ("access", os_access, 2),
     ("chmod", os_chmod, 2),
     ("close", os_close, 1),
     ("fstat", os_fstat, 1),
@@ -687,6 +720,7 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("lstat", os_lstat, crate::native::builtins_mod::VARIADIC_ARITY),
     ("mkdir", os_mkdir, crate::native::builtins_mod::VARIADIC_ARITY),
     ("open", os_open, crate::native::builtins_mod::VARIADIC_ARITY),
+    ("pipe", os_pipe, 0),
     ("putenv", os_putenv, 2),
     ("read", os_read, 2),
     ("readinto", os_readinto, 2),
@@ -1166,6 +1200,24 @@ unsafe extern "C" fn os_unlink(argv: *mut *mut PyObject, argc: usize) -> *mut Py
     }
     // SAFETY: Singleton accessor.
     unsafe { crate::abi::pon_none() }
+}
+
+/// `os.pipe()` over `pipe(2)`: returns the `(read_fd, write_fd)` pair.
+unsafe extern "C" fn os_pipe(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is the 2-element array `pipe(2)` writes into.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    // SAFETY: Singleton/boxing accessors follow the NULL-sentinel contract.
+    let mut items = unsafe {
+        [
+            crate::abi::pon_const_int(i64::from(fds[0])),
+            crate::abi::pon_const_int(i64::from(fds[1])),
+        ]
+    };
+    // SAFETY: `items` holds two live boxed ints.
+    unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) }
 }
 
 /// `os.mkdir(path, mode=0o777, *, dir_fd=None)` over `mkdir(2)`; the mode is
