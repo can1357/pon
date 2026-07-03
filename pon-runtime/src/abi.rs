@@ -1587,6 +1587,10 @@ pub(crate) struct Runtime {
 struct ClassBodyFrame {
     namespace: *mut type_::PyClassDict,
     mapping: *mut PyObject,
+    /// Pre-resolution bases tuple (PEP 560), NULL when `__mro_entries__`
+    /// never fired.  Rooted with the frame so a mid-body `gc.collect()`
+    /// cannot sweep it before `__orig_bases__` publication.
+    orig_bases: *mut PyObject,
 }
 
 /// Scope guard for one entry on `Runtime::class_construction_stack`.
@@ -4170,11 +4174,13 @@ unsafe fn build_class_with_body(
         ClassBodyFrame {
             namespace: type_::new_namespace(),
             mapping: ptr::null_mut(),
+            orig_bases: scope.orig_bases,
         }
     } else {
         ClassBodyFrame {
             namespace: ptr::null_mut(),
             mapping: scope.mapping,
+            orig_bases: scope.orig_bases,
         }
     };
     if with_runtime(|runtime| runtime.class_namespace_stack.push(frame)).is_none() {
@@ -4204,6 +4210,23 @@ unsafe fn build_class_with_body(
     }
     if !body.is_null() && body_result.is_null() {
         return ptr::null_mut();
+    }
+    // PEP 560: publish the pre-resolution bases through the class namespace
+    // so construction exposes them as `__orig_bases__` (CPython
+    // `__build_class__` stores the original tuple exactly when
+    // `update_bases` changed anything).
+    if !frame.orig_bases.is_null() {
+        if frame.mapping.is_null() {
+            unsafe { (&mut *frame.namespace).set(crate::intern::intern("__orig_bases__"), frame.orig_bases) };
+        } else {
+            let key = unsafe { class_mapping_key(crate::intern::intern("__orig_bases__")) };
+            if key.is_null() {
+                return ptr::null_mut();
+            }
+            if unsafe { map::pon_subscript_set(frame.mapping, key, frame.orig_bases) }.is_null() {
+                return ptr::null_mut();
+            }
+        }
     }
     let class = if scope.mapping.is_null() {
         unsafe { type_::build_class_from_namespace(name, &scope.bases, frame.namespace, keywords) }
@@ -4909,6 +4932,12 @@ fn collect_impl() -> Result<(), String> {
     // bodies still executing, `class_construction_stack` covers popped bodies
     // whose class is being constructed (metaclass hooks may collect).
     for frame in runtime.class_namespace_stack.iter().chain(runtime.class_construction_stack.iter()) {
+        // The pre-resolution `__orig_bases__` tuple is reachable only through
+        // this frame until the body's publication step lands it in the
+        // namespace; root it for both windows.
+        if !frame.orig_bases.is_null() {
+            roots.push(frame.orig_bases.cast::<u8>());
+        }
         // A `__prepare__` mapping is held only by this frame during body
         // execution; root it so its storage (and transitively the body's
         // stores) survives a mid-body collection.

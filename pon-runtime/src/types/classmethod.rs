@@ -116,10 +116,43 @@ pub fn install_classmethod_slots(ty: &mut PyType) {
     ty.tp_getattro = Some(method_descriptor_getattro);
 }
 
+/// `staticmethod.__call__` (CPython 3.10+, bpo-43682): a staticmethod object
+/// invoked directly delegates to the wrapped callable.  Load-bearing for
+/// module-level `@staticmethod` functions (`_pyio.open` in 3.14): module
+/// attribute access does NOT run the descriptor protocol, so callers receive
+/// the carrier itself and call it.  The args/kwargs carriers are forwarded
+/// verbatim through `pon_call_ex`'s `*`/`**` legs.
+unsafe extern "C" fn staticmethod_call(descr: *mut PyObject, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    if descr.is_null() {
+        return raise_method("staticmethod object is NULL");
+    }
+    // SAFETY: tp_call receivers are live PyStaticMethod allocations.
+    let staticmethod = unsafe { &*descr.cast::<PyStaticMethod>() };
+    if staticmethod.callable.is_null() {
+        return raise_method("uninitialized staticmethod object");
+    }
+    // SAFETY: Delegation through the established call-expansion helper; the
+    // positional tuple and keyword mapping ride the star/dstar carriers.
+    unsafe {
+        crate::abi::call::pon_call_ex(
+            staticmethod.callable,
+            ptr::null_mut(),
+            0,
+            args,
+            ptr::null(),
+            ptr::null_mut(),
+            0,
+            kwargs,
+            ptr::null_mut(),
+        )
+    }
+}
+
 /// Populate slots on the `staticmethod` type descriptor.
 pub fn install_staticmethod_slots(ty: &mut PyType) {
     ty.tp_descr_get = Some(staticmethod_descr_get);
     ty.tp_getattro = Some(method_descriptor_getattro);
+    ty.tp_call = Some(staticmethod_call);
 }
 
 

@@ -1102,6 +1102,35 @@ unsafe fn stamp_unhashable_for_eq_without_hash(namespace: *mut PyClassDict) {
     }
 }
 
+/// CPython `type_new_set_attrs` parity: a plain function `__class_getitem__`
+/// in the class namespace is implicitly wrapped in a `classmethod` carrier
+/// before the namespace becomes `tp_dict` (PEP 560).  Without the carrier
+/// the subscript fallback in `abstract_op::subscript_get` would resolve the
+/// hook unbound and call it without `cls`.  The `function` gate matches
+/// `wrap_init_subclass_as_classmethod`.
+unsafe fn wrap_class_getitem_as_classmethod(namespace: *mut PyClassDict) {
+    let getitem_id = intern::intern("__class_getitem__");
+    let Some(value) = (unsafe { (&*namespace).get(getitem_id) }) else {
+        return;
+    };
+    if unsafe { object_type_display(value) } != "function" {
+        return;
+    }
+    let Some(carrier_type) = abi::runtime_global(intern::intern("classmethod")) else {
+        return;
+    };
+    if unsafe { !is_type_object(carrier_type) } {
+        return;
+    }
+    // SAFETY: `carrier_type` is the builtin classmethod type object and
+    // `value` is a live function object owned by the namespace (the
+    // `wrap_dunder_new_as_staticmethod` contract).
+    let carrier = unsafe { crate::types::classmethod::new_classmethod(carrier_type.cast::<PyType>(), value) };
+    if !carrier.is_null() {
+        unsafe { (&mut *namespace).set(getitem_id, carrier) };
+    }
+}
+
 /// `type.__new__` core: allocate and publish the heap type object.
 #[must_use]
 unsafe fn construct_class(
@@ -1116,6 +1145,7 @@ unsafe fn construct_class(
     }
     unsafe { wrap_dunder_new_as_staticmethod(namespace) };
     unsafe { wrap_init_subclass_as_classmethod(namespace) };
+    unsafe { wrap_class_getitem_as_classmethod(namespace) };
     unsafe { stamp_unhashable_for_eq_without_hash(namespace) };
     // CPython: `class C:` means `class C(object):` — the implicit terminus
     // applies to the CONSTRUCTED type (tp_base, MRO, registries) while the
