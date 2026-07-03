@@ -411,20 +411,13 @@ unsafe fn normalize_bases(bases: &[*mut PyObject]) -> Option<(Vec<*mut PyType>, 
 }
 
 unsafe fn resolve_mro_entries(base: *mut PyObject, original_bases: *mut PyObject) -> Result<Vec<*mut PyObject>, String> {
-    let base_ty = unsafe { object_type(base) };
-    if base_ty.is_null() {
-        return Err("class base has no type".to_owned());
-    }
-    let method = unsafe { descr::lookup_in_type(base_ty, intern::intern("__mro_entries__")) };
+    let method = unsafe { abi::pon_get_attr(base, intern::intern("__mro_entries__"), ptr::null_mut()) };
     if method.is_null() {
+        crate::thread_state::pon_err_clear();
         return Err(format!("{} is not an acceptable base type", unsafe { object_type_display(base) }));
     }
-    let bound = unsafe { descr::descriptor_get(method, base, base_ty) };
-    if bound.is_null() {
-        return Err("__mro_entries__ descriptor binding failed".to_owned());
-    }
     let mut argv = [original_bases];
-    let replacement = unsafe { abi::pon_call(bound, argv.as_mut_ptr(), 1) };
+    let replacement = unsafe { abi::pon_call(method, argv.as_mut_ptr(), 1) };
     if replacement.is_null() {
         return Err("__mro_entries__ failed".to_owned());
     }
@@ -469,6 +462,42 @@ unsafe fn select_metaclass(bases: &[*mut PyType], explicit: *mut PyObject) -> Op
     Some(winner)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TypingSpecialBase {
+    NamedTuple,
+    TypedDict,
+}
+
+unsafe fn typing_special_base(bases: &[*mut PyObject]) -> Option<TypingSpecialBase> {
+    if bases.len() != 1 {
+        return None;
+    }
+    let base = bases[0];
+    if base.is_null() || unsafe { object_type_display(base) != "function" } {
+        return None;
+    }
+    let module = unsafe { abi::pon_get_attr(base, intern::intern("__module__"), ptr::null_mut()) };
+    let name = unsafe { abi::pon_get_attr(base, intern::intern("__name__"), ptr::null_mut()) };
+    if module.is_null() || name.is_null() {
+        crate::thread_state::pon_err_clear();
+        return None;
+    }
+    let Some(module_text) = (unsafe { unicode_text(module) }) else {
+        return None;
+    };
+    let Some(name_text) = (unsafe { unicode_text(name) }) else {
+        return None;
+    };
+    if module_text != "typing" {
+        return None;
+    }
+    match name_text {
+        "NamedTuple" => Some(TypingSpecialBase::NamedTuple),
+        "TypedDict" => Some(TypingSpecialBase::TypedDict),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct SlotSpec {
     declared: bool,
@@ -494,6 +523,16 @@ fn slot_spec_from_namespace(namespace: &PyClassDict) -> Result<SlotSpec, String>
     unsafe {
         if let Some(text) = unicode_text(raw) {
             add_slot_name(&mut spec, &mut seen, text)?;
+            return Ok(spec);
+        }
+        if dict::has_dict_storage(raw) {
+            let entries = dict::dict_entries_snapshot(raw).map_err(|_| "__slots__ must be a string or iterable of strings".to_owned())?;
+            for entry in entries {
+                let Some(text) = unicode_text(entry.key) else {
+                    return Err("__slots__ items must be strings".to_owned());
+                };
+                add_slot_name(&mut spec, &mut seen, text)?;
+            }
             return Ok(spec);
         }
         let items = positional_args_from_object(raw).map_err(|_| "__slots__ must be a string or iterable of strings".to_owned())?;
@@ -524,6 +563,47 @@ fn add_slot_name(spec: &mut SlotSpec, seen: &mut HashSet<u32>, text: &str) -> Re
     }
     spec.names.push(name);
     Ok(())
+}
+
+pub(crate) unsafe fn set_declared_bases_during_construction(ty: *mut PyType, value: *mut PyObject) -> c_int {
+    if value.is_null() {
+        let _ = unsafe {
+            abi::exc::pon_raise_type_error("__bases__ may not be deleted".as_ptr(), "__bases__ may not be deleted".len())
+        };
+        return -1;
+    }
+    if !abi::class_construction_active() {
+        let message = "attribute '__bases__' of 'type' objects is not writable";
+        let _ = abi::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::AttributeError, message);
+        return -1;
+    }
+    let bases = match unsafe { positional_args_from_object(value) } {
+        Ok(bases) => bases,
+        Err(_) => {
+            let _ = unsafe {
+                abi::exc::pon_raise_type_error(
+                    "__bases__ must be set to a tuple of types".as_ptr(),
+                    "__bases__ must be set to a tuple of types".len(),
+                )
+            };
+            return -1;
+        }
+    };
+    let mut typed = Vec::with_capacity(bases.len());
+    for base in bases {
+        if base.is_null() || unsafe { !is_type_object(base) } {
+            let _ = unsafe {
+                abi::exc::pon_raise_type_error(
+                    "__bases__ must be set to a tuple of types".as_ptr(),
+                    "__bases__ must be set to a tuple of types".len(),
+                )
+            };
+            return -1;
+        }
+        typed.push(base.cast::<PyType>());
+    }
+    unsafe { mro::set_declared_bases(ty, &typed) };
+    0
 }
 
 unsafe fn validate_slot_layout(namespace: &PyClassDict, bases: &[*mut PyType], spec: &SlotSpec) -> bool {
@@ -629,51 +709,37 @@ unsafe fn namespace_to_dict_object(namespace: *mut PyClassDict) -> *mut PyObject
     out
 }
 
-/// Call one metaclass constructor hook with `(head, name, bases, ns)` plus
-/// class keywords.  Python functions receive keywords through the binder;
-/// other callables only support keyword-free class statements.
+/// Call one resolved metaclass hook with `(head, name, bases, ns)` plus class
+/// keywords. The caller passes the same bound callable Python attribute access
+/// would produce (`meta.__prepare__`, `meta.__new__`, `meta.__init__`).
 unsafe fn call_constructor_hook(
-    hook: *mut PyObject,
-    owner: *mut PyType,
+    callable: *mut PyObject,
     argv: &[*mut PyObject],
     keywords: &[ClassKeyword],
 ) -> *mut PyObject {
-    let callable = unsafe { descr::descriptor_get(hook, ptr::null_mut(), owner) };
     if callable.is_null() {
         return ptr::null_mut();
     }
-    // Classmethod hooks (`__prepare__`) bind into a method pair; pierce it so
-    // class keywords still reach the underlying Python function's binder.
-    let (hook_function, receiver) = match crate::types::method::bound_method_parts(callable) {
-        Some((im_func, im_self)) if unsafe { object_type_display(im_func) == "function" } => {
-            (im_func, Some(im_self))
-        }
-        _ => (callable, None),
-    };
-    if unsafe { object_type_display(hook_function) == "function" } {
-        let argv_with_receiver = receiver.map(|receiver| {
-            let mut out = Vec::with_capacity(argv.len() + 1);
-            out.push(receiver);
-            out.extend_from_slice(argv);
-            out
-        });
-        let full_argv = argv_with_receiver.as_deref().unwrap_or(argv);
-        let kw_names = keywords.iter().map(|keyword| keyword.name).collect::<Vec<_>>();
-        let kw_values = keywords.iter().map(|keyword| keyword.value).collect::<Vec<_>>();
-        let bound_keywords = function::KeywordArgs {
-            names: kw_names.as_slice(),
-            values: kw_values.as_slice(),
-        };
-        return unsafe {
-            function::call_bound_function(hook_function, full_argv, bound_keywords, None, None)
-                .unwrap_or_else(|message| raise_object(message))
-        };
+    if keywords.is_empty() {
+        let mut call_argv = argv.to_vec();
+        return unsafe { abi::pon_call(callable, call_argv.as_mut_ptr(), call_argv.len()) };
     }
-    if !keywords.is_empty() {
-        return raise_object("class keywords require a Python-level metaclass constructor");
-    }
+    let kw_names = keywords.iter().map(|keyword| keyword.name).collect::<Vec<_>>();
+    let mut kw_values = keywords.iter().map(|keyword| keyword.value).collect::<Vec<_>>();
     let mut call_argv = argv.to_vec();
-    unsafe { abi::pon_call(callable, call_argv.as_mut_ptr(), call_argv.len()) }
+    unsafe {
+        abi::call::pon_call_ex(
+            callable,
+            if call_argv.is_empty() { ptr::null_mut() } else { call_argv.as_mut_ptr() },
+            call_argv.len(),
+            ptr::null_mut(),
+            kw_names.as_ptr(),
+            kw_values.as_mut_ptr(),
+            kw_names.len(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    }
 }
 
 /// CPython `__build_class__` parity: invoke `meta(name, bases, ns, **kwds)`
@@ -726,7 +792,8 @@ unsafe fn call_metaclass_constructor(
         unsafe { construct_class(metaclass, name, base_types, namespace, keywords) }
     } else {
         let argv = [metaclass.cast::<PyObject>(), name_object, bases_tuple, ns_object];
-        unsafe { call_constructor_hook(hooks.new_hook, metaclass, &argv, &class_keywords) }
+        let callable = unsafe { abi::pon_get_attr(metaclass.cast::<PyObject>(), intern::intern("__new__"), ptr::null_mut()) };
+        unsafe { call_constructor_hook(callable, &argv, &class_keywords) }
     };
     if cls.is_null() {
         return ptr::null_mut();
@@ -736,7 +803,8 @@ unsafe fn call_metaclass_constructor(
         let cls_type = unsafe { object_type(cls) };
         if !cls_type.is_null() && unsafe { mro::is_subtype(cls_type, metaclass) } {
             let argv = [cls, name_object, bases_tuple, ns_object];
-            let result = unsafe { call_constructor_hook(hooks.init_hook, metaclass, &argv, &class_keywords) };
+            let callable = unsafe { abi::pon_get_attr(metaclass.cast::<PyObject>(), intern::intern("__init__"), ptr::null_mut()) };
+            let result = unsafe { call_constructor_hook(callable, &argv, &class_keywords) };
             if result.is_null() {
                 return ptr::null_mut();
             }
@@ -879,13 +947,16 @@ unsafe fn find_prepare_hook(meta: *mut PyType) -> *mut PyObject {
 }
 
 /// Pre-body scope for one class statement, from [`prepare_class_scope`].
-pub struct PreparedClassScope {
+pub(crate) struct PreparedClassScope {
     /// `__prepare__`-provided namespace mapping; NULL selects the internal
     /// `PyClassDict` fast path.
     pub mapping: *mut PyObject,
     /// Bases with `__mro_entries__` already resolved (CPython `update_bases`
     /// runs once, before `__prepare__` and the body).
     pub bases: Vec<*mut PyObject>,
+    /// Typing helpers detected on the original bases (`typing.NamedTuple` /
+    /// `typing.TypedDict`), for a targeted post-body functional-syntax detour.
+    pub typing_special: Option<TypingSpecialBase>,
     /// Original bases tuple when `__mro_entries__` resolution fired (the
     /// class body publishes it as `__orig_bases__`), NULL when bases were
     /// used as written.  Rooted by the caller's `ClassBodyFrame` across the
@@ -898,11 +969,12 @@ pub struct PreparedClassScope {
 /// below the builtin `type`.  Ordinary classes skip the call entirely — the
 /// internal class namespace IS `type.__prepare__`'s empty dict.  Returns
 /// `Err(())` with the exception set when resolution or the hook fails.
-pub unsafe fn prepare_class_scope(
+pub(crate) unsafe fn prepare_class_scope(
     name: &str,
     bases: &[*mut PyObject],
     keywords: &[ClassKeyword],
 ) -> Result<PreparedClassScope, ()> {
+    let typing_special = unsafe { typing_special_base(bases) };
     let Some((base_types, orig_bases)) = (unsafe { normalize_bases(bases) }) else {
         return Err(());
     };
@@ -920,6 +992,7 @@ pub unsafe fn prepare_class_scope(
         return Ok(PreparedClassScope {
             mapping: ptr::null_mut(),
             bases: resolved_bases,
+            typing_special,
             orig_bases,
         });
     }
@@ -947,7 +1020,8 @@ pub unsafe fn prepare_class_scope(
         .filter(|keyword| intern::resolve(keyword.name).as_deref() != Some("metaclass"))
         .collect::<Vec<_>>();
     let argv = [name_object, bases_tuple];
-    let mapping = unsafe { call_constructor_hook(hook, metaclass, &argv, &class_keywords) };
+    let callable = unsafe { abi::pon_get_attr(metaclass.cast::<PyObject>(), intern::intern("__prepare__"), ptr::null_mut()) };
+    let mapping = unsafe { call_constructor_hook(callable, &argv, &class_keywords) };
     if mapping.is_null() {
         return Err(());
     }
@@ -971,8 +1045,110 @@ pub unsafe fn prepare_class_scope(
     Ok(PreparedClassScope {
         mapping,
         bases: resolved_bases,
+        typing_special,
         orig_bases,
     })
+}
+
+unsafe fn typing_annotations_dict(namespace: *mut PyClassDict) -> *mut PyObject {
+    if namespace.is_null() {
+        return ptr::null_mut();
+    }
+    if let Some(existing) = unsafe { (&*namespace).get(intern::intern("__annotations__")) } {
+        return existing;
+    }
+    unsafe { abi::map::pon_build_map(ptr::null_mut(), 0) }
+}
+
+pub(crate) unsafe fn build_typing_special_class(
+    name: &str,
+    namespace: *mut PyClassDict,
+    keywords: &[ClassKeyword],
+    kind: TypingSpecialBase,
+) -> *mut PyObject {
+    let typing = intern::intern("typing");
+    let callable_name = match kind {
+        TypingSpecialBase::NamedTuple => "NamedTuple",
+        TypingSpecialBase::TypedDict => "TypedDict",
+    };
+    let Some(callable) = crate::import::module_attr(typing, intern::intern(callable_name)) else {
+        return raise_object(format!("typing.{callable_name} is not available"));
+    };
+    let name_object = unsafe { abi::pon_const_str(name.as_ptr(), name.len()) };
+    if name_object.is_null() {
+        return ptr::null_mut();
+    }
+    let annotations = unsafe { typing_annotations_dict(namespace) };
+    if annotations.is_null() {
+        return ptr::null_mut();
+    }
+    match kind {
+        TypingSpecialBase::NamedTuple => {
+            let Some(make_eager_annotate) = crate::import::module_attr(typing, intern::intern("_make_eager_annotate")) else {
+                return raise_object("typing._make_eager_annotate is not available");
+            };
+            let Some(make_nmtuple) = crate::import::module_attr(typing, intern::intern("_make_nmtuple")) else {
+                return raise_object("typing._make_nmtuple is not available");
+            };
+            let annotate_func = {
+                let mut argv = [annotations];
+                let result = unsafe { abi::pon_call(make_eager_annotate, argv.as_mut_ptr(), argv.len()) };
+                if result.is_null() {
+                    return result;
+                }
+                result
+            };
+            let entries = match unsafe { dict::dict_entries_snapshot(annotations) } {
+                Ok(entries) => entries,
+                Err(message) => return raise_object(message),
+            };
+            let mut field_names = entries.iter().map(|entry| entry.key).collect::<Vec<_>>();
+            let fields_list = unsafe {
+                abi::seq::pon_build_list(
+                    if field_names.is_empty() { ptr::null_mut() } else { field_names.as_mut_ptr() },
+                    field_names.len(),
+                )
+            };
+            if fields_list.is_null() {
+                return ptr::null_mut();
+            }
+            let module_name = crate::import::active_module_name_id()
+                .and_then(intern::resolve)
+                .unwrap_or_else(|| "__main__".to_owned());
+            let module_object = unsafe { abi::pon_const_str(module_name.as_ptr(), module_name.len()) };
+            if module_object.is_null() {
+                return ptr::null_mut();
+            }
+            let mut argv = [name_object, fields_list, annotate_func, module_object];
+            unsafe { abi::pon_call(make_nmtuple, argv.as_mut_ptr(), argv.len()) }
+        }
+        TypingSpecialBase::TypedDict => {
+            let class_keywords = keywords
+                .iter()
+                .copied()
+                .filter(|keyword| intern::resolve(keyword.name).as_deref() != Some("metaclass"))
+                .collect::<Vec<_>>();
+            let mut argv = [name_object, annotations];
+            if class_keywords.is_empty() {
+                return unsafe { abi::pon_call(callable, argv.as_mut_ptr(), argv.len()) };
+            }
+            let kw_names = class_keywords.iter().map(|keyword| keyword.name).collect::<Vec<_>>();
+            let mut kw_values = class_keywords.iter().map(|keyword| keyword.value).collect::<Vec<_>>();
+            unsafe {
+                abi::call::pon_call_ex(
+                    callable,
+                    argv.as_mut_ptr(),
+                    argv.len(),
+                    ptr::null_mut(),
+                    kw_names.as_ptr(),
+                    kw_values.as_mut_ptr(),
+                    kw_names.len(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            }
+        }
+    }
 }
 
 /// Build a class whose body executed into a `__prepare__`-provided mapping.
