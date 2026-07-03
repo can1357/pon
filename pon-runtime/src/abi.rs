@@ -2502,18 +2502,62 @@ unsafe fn object_type_name_for_error(object: *mut PyObject) -> &'static str {
     if ty.is_null() { "object" } else { unsafe { (*ty).name() } }
 }
 
+unsafe extern "C" fn object_dunder_setattr_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() {
+        return return_null_with_error("__setattr__ received a null argv pointer");
+    }
+    let args = unsafe { core::slice::from_raw_parts(argv, argc) };
+    if args.len() != 3 {
+        return return_null_with_error(format!(
+            "__setattr__ expected 2 arguments, got {}",
+            args.len().saturating_sub(1)
+        ));
+    }
+    let receiver = args[0];
+    let Some(name) = (unsafe { type_::unicode_text(args[1]) }) else {
+        return return_null_with_error("attribute name must be str");
+    };
+    if unsafe { pon_set_attr(receiver, crate::intern::intern(name), args[2]) } < 0 {
+        return ptr::null_mut();
+    }
+    unsafe { pon_none() }
+}
+
+unsafe extern "C" fn object_dunder_delattr_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() {
+        return return_null_with_error("__delattr__ received a null argv pointer");
+    }
+    let args = unsafe { core::slice::from_raw_parts(argv, argc) };
+    if args.len() != 2 {
+        return return_null_with_error(format!(
+            "__delattr__ expected 1 argument, got {}",
+            args.len().saturating_sub(1)
+        ));
+    }
+    let receiver = args[0];
+    let Some(name) = (unsafe { type_::unicode_text(args[1]) }) else {
+        return return_null_with_error("attribute name must be str");
+    };
+    if unsafe { pon_del_attr(receiver, crate::intern::intern(name)) } < 0 {
+        return ptr::null_mut();
+    }
+    unsafe { pon_none() }
+}
+
 /// Default dunder surface on `object`'s dict: `__repr__`/`__str__`/
 /// `__format__`/`__reduce_ex__`/`__init__` as plain functions (unbound on
 /// class access, bound on instance access), plus a staticmethod-wrapped
 /// `__new__` allocator, the MRO terminus class machinery like enum's
 /// `EnumType.__new__`/`_find_new_` identity-compares against.
 fn install_object_dunders(runtime: &mut Runtime, object_type: *mut PyType) {
-    let entries: [(&str, *const u8); 5] = [
+    let entries: [(&str, *const u8); 7] = [
         ("__repr__", object_dunder_repr_native as *const u8),
         ("__str__", object_dunder_str_native as *const u8),
         ("__format__", object_dunder_format_native as *const u8),
         ("__reduce_ex__", object_dunder_reduce_ex_native as *const u8),
         ("__init__", object_dunder_init_native as *const u8),
+        ("__setattr__", object_dunder_setattr_native as *const u8),
+        ("__delattr__", object_dunder_delattr_native as *const u8),
     ];
     for (spelling, entry) in entries {
         let name = crate::intern::intern(spelling);
