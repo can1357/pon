@@ -117,6 +117,7 @@ pub const BYTES_METHOD_POP: BytesMethodId = 44;
 pub const BYTES_METHOD_REMOVE: BytesMethodId = 45;
 pub const BYTES_METHOD_CLEAR: BytesMethodId = 46;
 pub const BYTES_METHOD_TRANSLATE: BytesMethodId = 47;
+pub const BYTES_METHOD_RESIZE: BytesMethodId = 48;
 
 
 #[repr(C)]
@@ -650,6 +651,7 @@ fn bytearray_method_entry_for_name(name: &str) -> Option<unsafe extern "C" fn(*m
         "pop" => bytes_pop_entry,
         "remove" => bytes_remove_entry,
         "clear" => bytes_clear_entry,
+        "resize" => bytes_resize_entry,
         _ => bytes_method_entry_for_name(name)?,
     })
 }
@@ -723,6 +725,11 @@ fn raise_type_error(message: impl AsRef<str>) -> *mut PyObject {
 /// `substring not found`).
 fn raise_value_error(message: impl AsRef<str>) -> *mut PyObject {
     raise_typed(ExceptionKind::ValueError, message.as_ref())
+}
+
+/// Typed `OverflowError` for Python-int / ssize_t conversion failures.
+fn raise_overflow_error(message: impl AsRef<str>) -> *mut PyObject {
+    raise_typed(ExceptionKind::OverflowError, message.as_ref())
 }
 
 /// `str.split`/`bytes.split`-family failures: the CPython
@@ -1395,7 +1402,7 @@ pub(crate) fn ensure_bytearray_type_methods_installed(ty: *mut PyType) {
     if INSTALLED.swap(true, AtomicOrdering::SeqCst) {
         return;
     }
-    const BYTEARRAY_EXTRA: &[&str] = &["append", "extend", "insert", "pop", "remove", "clear"];
+    const BYTEARRAY_EXTRA: &[&str] = &["append", "extend", "insert", "pop", "remove", "clear", "resize"];
     let names: Vec<&str> = BYTES_TYPE_METHOD_NAMES.iter().chain(BYTEARRAY_EXTRA).copied().collect();
     install_binary_type_methods(ty, &names, bytearray_method_entry_for_name, bytearray_fromhex_static_entry);
 }
@@ -1510,6 +1517,7 @@ bytes_entry!(bytes_insert_entry, BYTES_METHOD_INSERT);
 bytes_entry!(bytes_pop_entry, BYTES_METHOD_POP);
 bytes_entry!(bytes_remove_entry, BYTES_METHOD_REMOVE);
 bytes_entry!(bytes_clear_entry, BYTES_METHOD_CLEAR);
+bytes_entry!(bytes_resize_entry, BYTES_METHOD_RESIZE);
 bytes_entry!(bytes_translate_entry, BYTES_METHOD_TRANSLATE);
 
 unsafe extern "C" fn memoryview_tobytes_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -2043,6 +2051,7 @@ pub unsafe extern "C" fn pon_bytes_method(
             BYTES_METHOD_POP => bytearray_pop_method(receiver_object, args),
             BYTES_METHOD_REMOVE => bytearray_remove_method(receiver_object, args),
             BYTES_METHOD_CLEAR => bytearray_clear_method(receiver_object, args),
+            BYTES_METHOD_RESIZE => bytearray_resize_method(receiver_object, args),
             BYTES_METHOD_TRANSLATE => bytes_translate_method(&receiver, args, mutable_receiver),
             _ => super::return_null_with_error("unknown bytes method selector"),
         }
@@ -3006,6 +3015,28 @@ fn bytearray_remove_method(receiver: *mut PyObject, args: &[*mut PyObject]) -> *
 fn bytearray_clear_method(receiver: *mut PyObject, args: &[*mut PyObject]) -> *mut PyObject {
     if !args.is_empty() { return raise_type_error("bytearray.clear expected no arguments"); }
     match bytearray_object_mut(receiver) { Ok(array) => bytearray_type::clear(array), Err(message) => return raise_type_error(message) }
+    unsafe { super::pon_none() }
+}
+
+fn bytearray_resize_method(receiver: *mut PyObject, args: &[*mut PyObject]) -> *mut PyObject {
+    if args.len() != 1 {
+        return raise_type_error("bytearray.resize expected exactly one argument");
+    }
+    let size = match str_long_value(args[0]) {
+        Ok(size) => size,
+        Err(message) => return raise_type_error(message),
+    };
+    if size < 0 {
+        return raise_value_error(format!("Can only resize to positive sizes, got {size}"));
+    }
+    let size = match usize::try_from(size) {
+        Ok(size) => size,
+        Err(_) => return raise_overflow_error("Python int too large to convert to C ssize_t"),
+    };
+    match bytearray_object_mut(receiver) {
+        Ok(array) => bytearray_type::resize(array, size),
+        Err(message) => return raise_type_error(message),
+    }
     unsafe { super::pon_none() }
 }
 

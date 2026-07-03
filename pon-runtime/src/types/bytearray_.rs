@@ -321,6 +321,10 @@ pub fn clear(array: &mut PyByteArray) {
     array.bytes.clear();
 }
 
+pub fn resize(array: &mut PyByteArray, size: usize) {
+    array.bytes.resize(size, 0);
+}
+
 pub fn set_index(array: &mut PyByteArray, index: isize, value: u8) -> Result<(), String> {
     let index = normalize_existing_index(index, array.bytes.len())?;
     array.bytes[index] = value;
