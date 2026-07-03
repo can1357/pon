@@ -5,6 +5,7 @@
 pub mod aot_entry;
 pub mod abstract_op;
 pub mod abi;
+pub mod capi;
 pub mod builtins;
 pub mod descr;
 pub mod dynexec;
