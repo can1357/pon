@@ -178,3 +178,11 @@ pon-conformance/corpus/cpython/exception_ctor_kwargs.py
 pon-conformance/corpus/cpython/sysconfig_build_config.py
 pon-conformance/corpus/cpython/async_comprehensions.py
 pon-conformance/corpus/cpython/float_format_impl.py
+pon-conformance/corpus/cpython/time_strftime.py
+pon-conformance/corpus/cpython/socket_surface.py
+pon-conformance/corpus/cpython/pickle_buffer.py
+pon-conformance/corpus/cpython/sys_jit.py
+pon-conformance/corpus/cpython/builtin_binding.py
+pon-conformance/corpus/cpython/yield_shapes.py
+pon-conformance/corpus/cpython/subprocess_import.py
+pon-conformance/corpus/cpython/code_format_surface.py

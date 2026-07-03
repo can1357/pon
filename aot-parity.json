@@ -3,8 +3,8 @@
   "cpython_tag": "v3.14.0",
   "results_file": "aot-parity.json",
   "summary": {
-    "aot-pass": 157,
-    "aot-fail": 13,
+    "aot-pass": 167,
+    "aot-fail": 16,
     "aot-refused": 2,
     "aot-error": 0
   },
@@ -184,6 +184,19 @@
     { "module": "pon-conformance/corpus/cpython/user_hash_eq.py", "status": "aot-pass" },
     { "module": "pon-conformance/corpus/cpython/super_attr_miss.py", "status": "aot-pass" },
     { "module": "pon-conformance/corpus/cpython/signal_sys_exception.py", "status": "aot-pass" },
-    { "module": "pon-conformance/corpus/cpython/sys_import_surface.py", "status": "aot-pass" }
+    { "module": "pon-conformance/corpus/cpython/sys_import_surface.py", "status": "aot-pass" },
+    { "module": "pon-conformance/corpus/cpython/sys_version_info.py", "status": "aot-pass" },
+    { "module": "pon-conformance/corpus/cpython/open_kwargs.py", "status": "aot-pass" },
+    { "module": "pon-conformance/corpus/cpython/exception_ctor_kwargs.py", "status": "aot-pass" },
+    { "module": "pon-conformance/corpus/cpython/sysconfig_build_config.py", "status": "aot-fail", "detail": "FAIL pon-conformance/corpus/cpython/sysconfig_build_config.py\n  AoT executable: exit=1 stdout=\"\" stderr=\"Traceback (most recent call last):\\nImportError: embedded module 'sysconfig' returned NULL\\n\"\n  python3.14: exit=0 stdout=\"str\\nint\\nNone\\ndict\\nTrue\\nstr\\n\" stderr=\"\"" },
+    { "module": "pon-conformance/corpus/cpython/async_comprehensions.py", "status": "aot-pass" },
+    { "module": "pon-conformance/corpus/cpython/float_format_impl.py", "status": "aot-pass" },
+    { "module": "pon-conformance/corpus/cpython/time_strftime.py", "status": "aot-pass" },
+    { "module": "pon-conformance/corpus/cpython/socket_surface.py", "status": "aot-pass" },
+    { "module": "pon-conformance/corpus/cpython/pickle_buffer.py", "status": "aot-fail", "detail": "FAIL pon-conformance/corpus/cpython/pickle_buffer.py\n  AoT executable: exit=1 stdout=\"\" stderr=\"Traceback (most recent call last):\\nImportError: embedded module 'pickle' returned NULL\\n\"\n  python3.14: exit=0 stdout=\"PickleBuffer pickle\\n<class 'pickle.PickleBuffer'> PickleBuffer pickle\\nTrue\\nb'pon payload'\\n11 B 1 1 True True\\nb'pon payload'\\nb'pon payload' 112 100 b'pay'\\n10 B b'\\\\x00\\\\x01\\\\x02rawtail'\\nFalse b'mutable!'\\nbytearray(b'Mutable!')\\nValueError: operation forbidden on released PickleBuffer object\\nValueError: operation forbidden on released PickleBuffer object\\nrelease-idempotent-ok\\nTypeError: a bytes-like object is required, not 'int'\\nb'ctx'\\n\" stderr=\"\"" },
+    { "module": "pon-conformance/corpus/cpython/sys_jit.py", "status": "aot-pass" },
+    { "module": "pon-conformance/corpus/cpython/builtin_binding.py", "status": "aot-pass" },
+    { "module": "pon-conformance/corpus/cpython/yield_shapes.py", "status": "aot-pass" },
+    { "module": "pon-conformance/corpus/cpython/subprocess_import.py", "status": "aot-fail", "detail": "FAIL pon-conformance/corpus/cpython/subprocess_import.py\n  AoT executable: exit=1 stdout=\"\" stderr=\"Traceback (most recent call last):\\nImportError: embedded module 'subprocess' returned NULL\\n\"\n  python3.14: exit=0 stdout=\"True\\nTrue\\nFalse True\\n1\\n1 10\\nTrue True\\nFalse True\\n19 0\\n0\\n2\\n-15\\nValueError: process stopped by delivery of signal 2\\nChildProcessError\\n-1 -2 -3\\nSubprocessError\\nTrue\\nTrue\\n['CalledProcessError', 'CompletedProcess', 'DEVNULL', 'PIPE', 'Popen', 'STDOUT', 'SubprocessError', 'TimeoutExpired', 'call', 'check_call', 'check_output', 'getoutput', 'getstatusoutput', 'run']\\n\" stderr=\"\"" }
   ]
 }
