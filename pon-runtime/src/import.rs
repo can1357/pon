@@ -510,9 +510,27 @@ fn import_module_by_name(name: &str) -> Result<*mut PyObject, String> {
         ensure_os_path_alias();
     }
     if name == "importlib._bootstrap" {
+        ensure_source_importlib_alias("_frozen_importlib", module)?;
         seed_meta_path_finders();
     }
     Ok(module)
+}
+
+/// After pon's source fallback imports `importlib._bootstrap`, later stdlib
+/// modules still absolute-import `_frozen_importlib` for the bootstrap classes
+/// it exposes (`importlib.abc` registers them with its ABCs).  Mirror the live
+/// source bootstrap module under that legacy top-level key once it exists, but
+/// only while the alias slot is still empty: user-inserted `sys.modules`
+/// bindings keep winning.
+fn ensure_source_importlib_alias(alias: &str, module: *mut PyObject) -> Result<(), String> {
+    if sys_modules_entry(alias)?.is_some() {
+        return Ok(());
+    }
+    let alias_id = intern(alias);
+    let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    state.modules.insert(alias_id, module);
+    drop(state);
+    mirror_module_registration(alias, module)
 }
 
 /// Mirrors `importlib._bootstrap._install`: seeds `sys.meta_path` with
@@ -773,10 +791,18 @@ fn resolve_module_by_name(name: &str) -> Result<*mut PyObject, String> {
                 }
                 return Err(format!("source module '{name}' returned NULL without setting an exception"));
             }
+            if let Err(error) = finalize_source_module_identity_attrs(name, loaded, &spec) {
+                evict_failed_module(name, module);
+                return Err(error);
+            }
             return adopt_post_body_sys_modules_replacement(name, module);
         }
 
         let module = load_curated_assignment_module(name, &source, spec.is_package, module_attrs)?;
+        if let Err(error) = finalize_source_module_identity_attrs(name, module, &spec) {
+            evict_failed_module(name, module);
+            return Err(error);
+        }
         bind_child_to_parent(name, module);
         return Ok(module);
     }
@@ -1206,6 +1232,59 @@ fn source_module_attrs(spec: &SourceSpec) -> Result<Vec<(u32, *mut PyObject)>, S
         attrs.push((intern("__path__"), runtime_path_list(search_locations)?));
     }
     Ok(attrs)
+}
+/// Backfills `__loader__`/`__spec__` for concrete source modules once
+/// `importlib._bootstrap` is itself live.  pon cannot ask the bootstrap to
+/// seed these attrs before executing `importlib` and `importlib._bootstrap`
+/// because those modules are the bootstrap; doing the `_spec_from_module`
+/// pass immediately after body execution restores the CPython-visible surface
+/// (`importlib.__spec__`, fresh-import helpers) without replaying the
+/// namespace-package lane.
+fn finalize_source_module_identity_attrs(
+    name: &str,
+    module: *mut PyObject,
+    spec: &SourceSpec,
+) -> Result<(), String> {
+    if spec.path.is_none() {
+        return Ok(());
+    }
+    let Some(module_ptr) = as_module(module) else {
+        return Ok(());
+    };
+    let existing_loader = unsafe { (&*module_ptr).attrs.get(&intern("__loader__")).copied() };
+    let needs_loader = existing_loader.is_none();
+    let needs_spec = unsafe { !(&*module_ptr).attrs.contains_key(&intern("__spec__")) };
+    if !needs_loader && !needs_spec {
+        return Ok(());
+    }
+    let Some(spec_from_module) = module_attr(intern("importlib._bootstrap"), intern("_spec_from_module")) else {
+        return Ok(());
+    };
+    let loader = match existing_loader {
+        Some(loader) => loader,
+        None => crate::native::imp::make_source_importer_module()?,
+    };
+    let mut argv = [module, loader];
+    let spec_object = crate::tag::untag_arg(unsafe { crate::abi::pon_call(spec_from_module, argv.as_mut_ptr(), argv.len()) });
+    if spec_object.is_null() {
+        return Err(format!("failed to build __spec__ for source module '{name}'"));
+    }
+    let mut mutated = false;
+    unsafe {
+        let attrs = &mut (*module_ptr).attrs;
+        if needs_loader {
+            attrs.insert(intern("__loader__"), loader);
+            mutated = true;
+        }
+        if needs_spec {
+            attrs.insert(intern("__spec__"), spec_object);
+            mutated = true;
+        }
+    }
+    if mutated {
+        crate::abi::bump_namespace_version();
+    }
+    Ok(())
 }
 
 fn parent_module_name(name: &str) -> Option<&str> {
@@ -1827,6 +1906,54 @@ mod tests {
         assert!(!beta.is_null(), "importing namespace child beta failed: {:?}", pon_err_message());
         let beta_value = unsafe { pon_import_from(beta, intern("VALUE")) };
         assert_eq!(format_object_for_print(beta_value).as_deref(), Ok("beta-r2"));
+    }
+    #[test]
+    fn source_package_import_sets_loader_and_spec() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+        pon_err_clear();
+        reset_import_state_for_tests();
+
+        let module = unsafe { pon_import_name(intern("importlib"), ptr::null(), 0, 0) };
+        assert!(!module.is_null(), "importing importlib failed: {:?}", pon_err_message());
+
+        let loader = unsafe { pon_import_from(module, intern("__loader__")) };
+        assert!(!loader.is_null(), "importlib.__loader__ missing: {:?}", pon_err_message());
+        let loader_name = unsafe { crate::abi::object::pon_get_attr(loader, intern("__name__"), ptr::null_mut()) };
+        assert!(!loader_name.is_null(), "importlib.__loader__.__name__ missing: {:?}", pon_err_message());
+        assert_eq!(format_object_for_print(loader_name).as_deref(), Ok("_pon_source_importer"));
+
+        let spec = unsafe { pon_import_from(module, intern("__spec__")) };
+        assert!(!spec.is_null(), "importlib.__spec__ missing: {:?}", pon_err_message());
+        let spec_name = unsafe { crate::abi::object::pon_get_attr(spec, intern("name"), ptr::null_mut()) };
+        assert!(!spec_name.is_null(), "importlib.__spec__.name missing: {:?}", pon_err_message());
+        assert_eq!(format_object_for_print(spec_name).as_deref(), Ok("importlib"));
+        let spec_origin = unsafe { crate::abi::object::pon_get_attr(spec, intern("origin"), ptr::null_mut()) };
+        assert!(!spec_origin.is_null(), "importlib.__spec__.origin missing: {:?}", pon_err_message());
+        let origin_text = format_object_for_print(spec_origin).expect("importlib.__spec__.origin must format");
+        assert!(
+            origin_text.ends_with("/Lib/importlib/__init__.py"),
+            "importlib.__spec__.origin should point at __init__.py, got {origin_text}"
+        );
+        let spec_loader = unsafe { crate::abi::object::pon_get_attr(spec, intern("loader"), ptr::null_mut()) };
+        assert!(!spec_loader.is_null(), "importlib.__spec__.loader missing: {:?}", pon_err_message());
+        assert_eq!(spec_loader, loader, "importlib.__spec__.loader should match importlib.__loader__");
+        let search_locations =
+            unsafe { crate::abi::object::pon_get_attr(spec, intern("submodule_search_locations"), ptr::null_mut()) };
+        assert!(
+            !search_locations.is_null(),
+            "importlib.__spec__.submodule_search_locations missing: {:?}",
+            pon_err_message()
+        );
+        let locations_text = format_object_for_print(search_locations)
+            .expect("importlib.__spec__.submodule_search_locations must format");
+        assert!(
+            locations_text.contains("/Lib/importlib"),
+            "importlib.__spec__.submodule_search_locations should include the package dir, got {locations_text}"
+        );
     }
 
     #[test]
