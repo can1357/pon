@@ -3525,7 +3525,7 @@ fn str_slice_object(object: *mut PyObject, key: *mut PyObject) -> Result<*mut Py
     Ok(alloc_str_object(&out))
 }
 
-fn expect_bytes_like(value: *mut PyObject) -> Result<Vec<u8>, String> {
+pub(crate) fn expect_bytes_like(value: *mut PyObject) -> Result<Vec<u8>, String> {
     if value.is_null() {
         return Err("expected bytes-like object, got NULL".to_owned());
     }

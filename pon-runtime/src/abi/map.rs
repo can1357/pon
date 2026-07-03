@@ -1259,11 +1259,64 @@ pub unsafe extern "C" fn pon_set_difference(left: *mut PyObject, right: *mut PyO
     })
 }
 
+/// Materializes a set-method argument's elements: set flavors snapshot
+/// directly, any other iterable advances like `pon_set_update` (CPython
+/// `issubset`/`issuperset` coerce arbitrary iterables, `str` included).
+///
+/// GC note: the accumulated `Vec` is a Rust-heap buffer invisible to the
+/// stack scan (watch-only residual family with `collect_iterable` and
+/// sorted(key=)/min/max) — a collect inside an adversarial `__next__` can
+/// sweep earlier entries until the systemic rooting fix lands.
+fn set_argument_entries(object: *mut PyObject) -> Result<Vec<*mut PyObject>, String> {
+    if let Ok(entries) = unsafe { set_::entries_snapshot(object) } {
+        return Ok(entries);
+    }
+    let iter = unsafe { super::iter::pon_get_iter(object, ptr::null_mut()) };
+    if iter.is_null() {
+        // Mirror `pon_set_update`: iterables without `tp_iter` (indexed
+        // sequences such as str) fall back to materialized indexing.
+        if crate::thread_state::pon_err_occurred() {
+            crate::thread_state::pon_err_clear();
+        }
+        return super::seq::sequence_to_vec(object);
+    }
+    let mut entries = Vec::new();
+    loop {
+        let item = unsafe { super::iter::pon_iter_next(iter, ptr::null_mut()) };
+        if item.is_null() {
+            // Exhaustion convention shared with `pon_set_update`.
+            if crate::thread_state::pon_err_occurred() {
+                crate::thread_state::pon_err_clear();
+            }
+            return Ok(entries);
+        }
+        entries.push(item);
+    }
+}
+
 fn set_is_subset(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    // `right` may be any iterable (CPython `set.issubset` coerces its
+    // argument): every receiver element must appear in the argument.
     let result = unsafe {
         set_::entries_snapshot(left).and_then(|left_entries| {
-            let right_entries = set_::entries_snapshot(right)?;
+            let right_entries = set_argument_entries(right)?;
             set_::entries_subset(&left_entries, &right_entries)
+        })
+    };
+    match result {
+        Ok(value) => unsafe { super::number::pon_const_bool(c_int::from(value)) },
+        Err(message) => null_error(message),
+    }
+}
+
+/// Dual of `set_is_subset`: every argument element must appear in the
+/// receiver.  `ipaddress._parse_hextet` guards hex digits with
+/// `_HEX_DIGITS.issuperset(hextet_str)` during `_IPv6Constants` module exec.
+fn set_is_superset(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    let result = unsafe {
+        set_::entries_snapshot(left).and_then(|left_entries| {
+            let right_entries = set_argument_entries(right)?;
+            set_::entries_subset(&right_entries, &left_entries)
         })
     };
     match result {
@@ -1356,6 +1409,20 @@ unsafe extern "C" fn set_issubset_method_trampoline(argv: *mut *mut PyObject, ar
     set_is_subset(args[0], args[1])
 }
 
+unsafe extern "C" fn set_issuperset_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match map_method_args(argv, argc, "set.issuperset") {
+        Ok(args) => args,
+        Err(message) => return null_error(message),
+    };
+    if args.len() != 2 {
+        return raise_map_type_error(format!(
+            "set.issuperset() expected 1 argument, got {}",
+            args.len().saturating_sub(1)
+        ));
+    }
+    set_is_superset(args[0], args[1])
+}
+
 unsafe extern "C" fn set_copy_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let args = match map_method_args(argv, argc, "set.copy") {
         Ok(args) => args,
@@ -1440,6 +1507,7 @@ pub unsafe fn pon_set_bound_method(set: *mut PyObject, name: &str) -> *mut PyObj
         "intersection" => alloc_bound_native_method(set, name, set_intersection_method_trampoline),
         "difference" => alloc_bound_native_method(set, name, set_difference_method_trampoline),
         "issubset" => alloc_bound_native_method(set, name, set_issubset_method_trampoline),
+        "issuperset" => alloc_bound_native_method(set, name, set_issuperset_method_trampoline),
         "__contains__" => alloc_bound_native_method(set, name, set_contains_method_trampoline),
         "copy" => alloc_bound_native_method(set, name, set_copy_method_trampoline),
         "remove" => alloc_bound_native_method(set, name, set_remove_method_trampoline),

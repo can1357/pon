@@ -1319,7 +1319,7 @@ unsafe extern "C" fn list_append_method(argv: *mut *mut PyObject, argc: usize) -
             Err(raised) => return raised,
         };
         if args.len() != 2 {
-            return raise_seq_type_error(format!("list.append expected 1 argument, got {}", args.len().saturating_sub(1)));
+            return raise_seq_type_error(format!("list.append() takes exactly one argument ({} given)", args.len().saturating_sub(1)));
         }
         match list_append_raw(receiver, args[1]) {
             Ok(()) => seq_none(),
@@ -1335,7 +1335,7 @@ unsafe extern "C" fn list_extend_method(argv: *mut *mut PyObject, argc: usize) -
             Err(message) => return return_null_with_error(message),
         };
         if args.len() != 2 {
-            return raise_seq_type_error(format!("list.extend expected 1 argument, got {}", args.len().saturating_sub(1)));
+            return raise_seq_type_error(format!("list.extend() takes exactly one argument ({} given)", args.len().saturating_sub(1)));
         }
         let values = match sequence_to_vec(args[1]) {
             Ok(values) => values,
@@ -1427,7 +1427,7 @@ unsafe extern "C" fn list_pop_method(argv: *mut *mut PyObject, argc: usize) -> *
             Err(message) => return return_null_with_error(message),
         };
         if !(args.len() == 1 || args.len() == 2) {
-            return raise_seq_type_error(format!("list.pop expected at most 1 argument, got {}", args.len().saturating_sub(1)));
+            return raise_seq_type_error(format!("pop expected at most 1 argument, got {}", args.len().saturating_sub(1)));
         }
         let index = if args.len() == 2 {
             match index_value(args[1]) {
@@ -1467,7 +1467,7 @@ unsafe extern "C" fn list_count_method(argv: *mut *mut PyObject, argc: usize) ->
             Err(message) => return return_null_with_error(message),
         };
         if args.len() != 2 {
-            return raise_seq_type_error(format!("list.count expected 1 argument, got {}", args.len().saturating_sub(1)));
+            return raise_seq_type_error(format!("list.count() takes exactly one argument ({} given)", args.len().saturating_sub(1)));
         }
         match list_count_raw(args[0], args[1]) {
             Ok(count) => unsafe { super::pon_const_int(count as i64) },
@@ -1514,7 +1514,7 @@ unsafe extern "C" fn list_remove_method(argv: *mut *mut PyObject, argc: usize) -
             Err(message) => return return_null_with_error(message),
         };
         if args.len() != 2 {
-            return raise_seq_type_error(format!("list.remove expected 1 argument, got {}", args.len().saturating_sub(1)));
+            return raise_seq_type_error(format!("list.remove() takes exactly one argument ({} given)", args.len().saturating_sub(1)));
         }
         let index = match list_index_raw(args[0], args[1]) {
             Ok(index) => index,

@@ -497,6 +497,25 @@ unsafe extern "C" fn os_getuid(_argv: *mut *mut PyObject, _argc: usize) -> *mut 
     unsafe { crate::abi::pon_const_int(i64::from(libc::getuid())) }
 }
 
+/// `os.isatty(fd)` over `isatty(3)` (`_pyio.open`'s default-buffering path
+/// probes `raw.isatty()` to pick line buffering).
+unsafe extern "C" fn os_isatty(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return crate::abi::return_null_with_error("os.isatty expected one argument");
+    }
+    let fd = match int_arg(args[0], "isatty fd") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    // SAFETY: Plain fd probe; a non-tty (or bad fd) answers 0 with errno,
+    // which CPython folds into False rather than raising.
+    let is_tty = unsafe { libc::isatty(fd as libc::c_int) } != 0;
+    // SAFETY: Singleton accessor.
+    unsafe { crate::abi::number::pon_const_bool(i32::from(is_tty)) }
+}
+
 /// `os.path`: CPython's `os.py` publishes `sys.modules['os.path'] =
 /// posixpath`; the native seed mirrors that aliasing lazily by resolving the
 /// vendored `posixpath` source module on first import.  The importer then
@@ -655,6 +674,7 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("getcwd", os_getcwd, 0),
     ("getpid", os_getpid, 0),
     ("getuid", os_getuid, 0),
+    ("isatty", os_isatty, 1),
     ("lseek", os_lseek, 3),
     ("lstat", os_lstat, crate::native::builtins_mod::VARIADIC_ARITY),
     ("mkdir", os_mkdir, crate::native::builtins_mod::VARIADIC_ARITY),

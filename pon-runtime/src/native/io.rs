@@ -2224,6 +2224,10 @@ unsafe extern "C" fn file_getattro(object: *mut PyObject, name: *mut PyObject) -
         "tell" => bound_file_method(object, "tell", file_tell_method),
         "close" => bound_file_method(object, "close", file_close_method),
         "flush" => bound_file_method(object, "flush", file_flush_method),
+        "readable" => bound_file_method(object, "readable", file_readable_method),
+        "writable" => bound_file_method(object, "writable", file_writable_method),
+        "seekable" => bound_file_method(object, "seekable", file_seekable_method),
+        "fileno" => bound_file_method(object, "fileno", file_fileno_method),
         "__enter__" => bound_file_method(object, "__enter__", file_enter_method),
         "__exit__" => bound_file_method(object, "__exit__", file_exit_method),
         "__iter__" => bound_file_method(object, "__iter__", file_iter_method),
@@ -2488,6 +2492,85 @@ unsafe extern "C" fn file_flush_method(argv: *mut *mut PyObject, argc: usize) ->
         return raise_io_error("failed to flush file");
     }
     unsafe { abi::pon_none() }
+}
+
+/// Shared zero-argument receiver decode for the IOBase flag methods below.
+unsafe fn file_flag_receiver<'a>(
+    argv: *mut *mut PyObject,
+    argc: usize,
+    what: &str,
+) -> Result<&'a mut PyNativeFile, *mut PyObject> {
+    // SAFETY: Forwarded argument slots per the runtime calling convention.
+    let args = match unsafe { method_args(argv, argc, what) } {
+        Ok(args) => args,
+        Err(message) => return Err(raise_type_error(&message)),
+    };
+    if args.len() != 1 {
+        return Err(raise_type_error(&format!(
+            "{what}() expected 0 arguments, got {}",
+            args.len().saturating_sub(1)
+        )));
+    }
+    // SAFETY: Receiver slot is live per the call ABI.
+    match unsafe { as_file(args[0]) } {
+        Some(file) => Ok(file),
+        None => Err(raise_type_error(&format!("{what}() receiver is not a native file"))),
+    }
+}
+
+/// `file.readable()`: the open-mode read flag (CPython `IOBase.readable`).
+unsafe extern "C" fn file_readable_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded argument slots per the runtime calling convention.
+    let file = match unsafe { file_flag_receiver(argv, argc, "readable") } {
+        Ok(file) => file,
+        Err(error) => return error,
+    };
+    // SAFETY: Boolean boxing helper follows the NULL-sentinel contract.
+    unsafe { abi::number::pon_const_bool(i32::from(file.readable)) }
+}
+
+/// `file.writable()`: the open-mode write flag (CPython `IOBase.writable`).
+unsafe extern "C" fn file_writable_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Forwarded argument slots per the runtime calling convention.
+    let file = match unsafe { file_flag_receiver(argv, argc, "writable") } {
+        Ok(file) => file,
+        Err(error) => return error,
+    };
+    // SAFETY: Boolean boxing helper follows the NULL-sentinel contract.
+    unsafe { abi::number::pon_const_bool(i32::from(file.writable)) }
+}
+
+/// `file.seekable()`: the honest host probe — a zero-displacement
+/// `lseek(fd, 0, SEEK_CUR)`, exactly CPython's `_io` check: regular files
+/// answer True, pipes/sockets (ESPIPE) answer False, so a piped stdin
+/// reports unseekable on both engines.  Closed files raise like the
+/// sibling methods.
+unsafe extern "C" fn file_seekable_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let file = match unsafe { file_flag_receiver(argv, argc, "seekable") } {
+        Ok(file) => file,
+        Err(error) => return error,
+    };
+    let Some(handle) = file.file.as_mut() else {
+        return raise_value_error("I/O operation on closed file.");
+    };
+    let seekable = handle.seek(SeekFrom::Current(0)).is_ok();
+    // SAFETY: Boolean boxing helper follows the NULL-sentinel contract.
+    unsafe { abi::number::pon_const_bool(i32::from(seekable)) }
+}
+
+/// `file.fileno()`: the wrapped raw descriptor; closed files raise the
+/// CPython ValueError.
+unsafe extern "C" fn file_fileno_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    use std::os::fd::AsRawFd;
+    let file = match unsafe { file_flag_receiver(argv, argc, "fileno") } {
+        Ok(file) => file,
+        Err(error) => return error,
+    };
+    let Some(handle) = file.file.as_ref() else {
+        return raise_value_error("I/O operation on closed file.");
+    };
+    // SAFETY: Integer boxing helper follows the NULL-sentinel contract.
+    unsafe { abi::pon_const_int(i64::from(handle.as_raw_fd())) }
 }
 
 unsafe extern "C" fn file_enter_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {

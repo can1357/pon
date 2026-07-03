@@ -235,7 +235,7 @@ unsafe extern "C" fn frozenset_getattro_slot(object: *mut PyObject, name: *mut P
         return crate::abi::return_null_with_error("frozenset attribute name must be str");
     };
     match name {
-        "union" | "intersection" | "difference" | "issubset" | "__contains__" | "copy" => unsafe {
+        "union" | "intersection" | "difference" | "issubset" | "issuperset" | "__contains__" | "copy" => unsafe {
             crate::abi::map::pon_set_bound_method(object, name)
         },
         _ => crate::abi::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),

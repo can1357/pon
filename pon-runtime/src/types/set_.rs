@@ -551,8 +551,8 @@ unsafe extern "C" fn set_getattro_slot(object: *mut PyObject, name: *mut PyObjec
         return crate::abi::return_null_with_error("set attribute name must be str");
     };
     match name {
-        "add" | "discard" | "union" | "intersection" | "difference" | "issubset" | "__contains__" | "copy"
-        | "remove" | "clear" | "pop" => unsafe {
+        "add" | "discard" | "union" | "intersection" | "difference" | "issubset" | "issuperset" | "__contains__"
+        | "copy" | "remove" | "clear" | "pop" => unsafe {
             crate::abi::map::pon_set_bound_method(object, name)
         },
         _ => crate::abi::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
