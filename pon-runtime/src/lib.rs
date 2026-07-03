@@ -9,6 +9,7 @@ pub mod builtins;
 pub mod descr;
 pub mod dynexec;
 pub mod feedback;
+pub(crate) mod gcroot;
 pub mod import;
 pub mod intern;
 pub mod mro;

@@ -11,6 +11,7 @@ use core::ptr;
 use std::borrow::Cow;
 use std::sync::{LazyLock, OnceLock};
 
+use crate::gcroot::{HeldRoots, RootRegistry};
 use crate::object::{PyLong, PyMappingMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType, PyUnicode, as_object_ptr, is_exact_type};
 use crate::types::{bytearray_ as bytearray_type, bytes_ as bytes_type, memoryview as memoryview_type, method, slice_::PySlice, str_ as str_type, type_};
 use crate::types::exc::ExceptionKind;
@@ -313,6 +314,18 @@ unsafe extern "C" fn str_contains_slot(object: *mut PyObject, item: *mut PyObjec
     c_int::from(haystack.contains(needle))
 }
 
+/// Every `str_iterator` allocation, for GC root reporting: the leaked boxes
+/// borrow their GC-heap unicode receiver, which marking cannot see through
+/// (`crate::gcroot`).  The bytes/bytearray iterators above hold only leaked
+/// non-GC receivers and are never registered.
+static STR_ITER_REGISTRY: RootRegistry = RootRegistry::new();
+
+/// References held by live `str` iterators.  Consumed by
+/// `crate::abi::collect` while the runtime lock is held.
+pub(crate) fn gc_held_roots() -> Vec<*mut PyObject> {
+    STR_ITER_REGISTRY.held_roots()
+}
+
 /// Iterator over an immutable str payload, yielding one-code-point strings.
 #[repr(C)]
 struct PyStrIter {
@@ -321,6 +334,12 @@ struct PyStrIter {
     text: *mut PyObject,
     /// Byte offset of the next code point within the UTF-8 payload.
     byte_index: usize,
+}
+
+impl HeldRoots for PyStrIter {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.text);
+    }
 }
 
 /// Process-lifetime `str_iterator` type so `type(iter(''))` is stable.
@@ -346,12 +365,14 @@ unsafe extern "C" fn str_iter_slot(object: *mut PyObject) -> *mut PyObject {
     if !is_str {
         return super::return_null_with_error("str iterator slot received a non-str receiver");
     }
-    Box::into_raw(Box::new(PyStrIter {
-        ob_base: PyObjectHeader::new(str_iter_type()),
-        text: object,
-        byte_index: 0,
-    }))
-    .cast::<PyObject>()
+    STR_ITER_REGISTRY.register::<PyStrIter>(
+        Box::into_raw(Box::new(PyStrIter {
+            ob_base: PyObjectHeader::new(str_iter_type()),
+            text: object,
+            byte_index: 0,
+        }))
+        .cast::<PyObject>(),
+    )
 }
 
 unsafe extern "C" fn str_iter_next_slot(object: *mut PyObject) -> *mut PyObject {

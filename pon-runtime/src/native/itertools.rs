@@ -27,6 +27,7 @@ use num_traits::ToPrimitive;
 
 use crate::abi::{self, pon_call, pon_get_iter, pon_iter_next};
 use crate::abstract_op::{self, BINARY_ADD, RICH_EQ};
+use crate::gcroot::{HeldRoots, RootRegistry};
 use crate::intern::intern;
 use crate::object::{PyObject, PyObjectHeader, PyType, UnaryFunc};
 use crate::thread_state::{pon_err_clear, thread_state_lock};
@@ -334,8 +335,172 @@ unsafe extern "C" fn iterator_iter_method(argv: *mut *mut PyObject, argc: usize)
     unsafe { *argv }
 }
 
-fn alloc_object<T>(value: T) -> *mut PyObject {
-    Box::into_raw(Box::new(value)).cast::<PyObject>()
+/// Every itertools iterator allocation, for GC root reporting: the leaked
+/// boxes hold source iterators, callables, and saved values that live on the
+/// GC heap and are invisible to marking (`crate::gcroot`).  Objects are
+/// immortal, so the registry only grows.
+static REGISTRY: RootRegistry = RootRegistry::new();
+
+/// References held by live itertools iterators.  Consumed by
+/// `crate::abi::collect` while the runtime lock is held.
+pub(crate) fn gc_held_roots() -> Vec<*mut PyObject> {
+    REGISTRY.held_roots()
+}
+
+fn alloc_object<T: HeldRoots>(value: T) -> *mut PyObject {
+    REGISTRY.register::<T>(Box::into_raw(Box::new(value)).cast::<PyObject>())
+}
+
+// GC-held references per iterator layout.  Exhausted iterators null their
+// source slots, so reporting raw fields naturally stops pinning consumed
+// inputs; Vec-held items (cycle saves, zip_longest sources, pools) stay
+// pinned for the object's lifetime because `tp_iternext` re-reads them.
+
+impl HeldRoots for PyItertoolsCount {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.current);
+        push(self.step);
+    }
+}
+
+impl HeldRoots for PyItertoolsCycle {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.source);
+        for &saved in &self.saved {
+            push(saved);
+        }
+    }
+}
+
+impl HeldRoots for PyItertoolsRepeat {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.object);
+    }
+}
+
+impl HeldRoots for PyItertoolsChain {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.outer);
+        push(self.inner);
+    }
+}
+
+impl HeldRoots for PyItertoolsISlice {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.source);
+    }
+}
+
+impl HeldRoots for PyItertoolsStarmap {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.function);
+        push(self.source);
+    }
+}
+
+impl HeldRoots for PyItertoolsZipLongest {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        for &source in &self.sources {
+            push(source);
+        }
+        push(self.fillvalue);
+    }
+}
+
+impl HeldRoots for PyItertoolsProduct {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        for pool in &self.pools {
+            for &item in pool {
+                push(item);
+            }
+        }
+    }
+}
+
+impl HeldRoots for PyItertoolsPermutations {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        for &item in &self.pool {
+            push(item);
+        }
+    }
+}
+
+impl HeldRoots for PyItertoolsCombinations {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        for &item in &self.pool {
+            push(item);
+        }
+    }
+}
+
+impl HeldRoots for PyItertoolsAccumulate {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.source);
+        push(self.function);
+        push(self.total);
+        push(self.initial);
+    }
+}
+
+impl HeldRoots for PyItertoolsFilterFalse {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.predicate);
+        push(self.source);
+    }
+}
+
+impl HeldRoots for PyItertoolsTakewhile {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.predicate);
+        push(self.source);
+    }
+}
+
+impl HeldRoots for PyItertoolsDropwhile {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.predicate);
+        push(self.source);
+    }
+}
+
+impl HeldRoots for PyItertoolsCompress {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.data);
+        push(self.selectors);
+    }
+}
+
+impl HeldRoots for PyItertoolsPairwise {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.source);
+        push(self.previous);
+    }
+}
+
+impl HeldRoots for PyItertoolsBatched {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.source);
+    }
+}
+
+impl HeldRoots for PyItertoolsGroupBy {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.source);
+        push(self.keyfunc);
+        push(self.currkey);
+        push(self.currvalue);
+        push(self.tgtkey);
+        // `currgrouper` is a leaked `_grouper` box: reported harmlessly.
+        push(self.currgrouper);
+    }
+}
+
+impl HeldRoots for PyItertoolsGrouper {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        // `parent` is a leaked groupby box: reported harmlessly.
+        push(self.parent);
+        push(self.tgtkey);
+    }
 }
 
 // ---------------------------------------------------------------------------

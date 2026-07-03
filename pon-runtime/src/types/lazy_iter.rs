@@ -11,6 +11,7 @@ use core::ptr;
 use std::sync::LazyLock;
 
 use crate::abi;
+use crate::gcroot::{HeldRoots, RootRegistry};
 use crate::object::{PyObject, PyObjectHeader, PyType};
 use crate::thread_state::{pon_err_clear, thread_state_lock};
 
@@ -130,51 +131,121 @@ fn plain_type(name: &'static str, size: usize) -> *mut PyType {
     Box::into_raw(Box::new(PyType::new(ptr::null(), name, size)))
 }
 
+/// Every lazy-iterator / options-carrier allocation, for GC root reporting:
+/// the leaked boxes hold source iterators, callables, and option values that
+/// live on the GC heap and are invisible to marking (`crate::gcroot`).
+/// Objects are immortal, so the registry only grows.  `PyZipStrictMarker`
+/// holds no references and is never registered.
+static REGISTRY: RootRegistry = RootRegistry::new();
+
+/// References held by live lazy iterators and option carriers.  Consumed by
+/// `crate::abi::collect` while the runtime lock is held.
+pub(crate) fn gc_held_roots() -> Vec<*mut PyObject> {
+    REGISTRY.held_roots()
+}
+
+fn alloc<T: HeldRoots>(value: T) -> *mut PyObject {
+    REGISTRY.register::<T>(Box::into_raw(Box::new(value)).cast::<PyObject>())
+}
+
+impl HeldRoots for PyMap {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.function);
+        for &iter in &self.iters {
+            push(iter);
+        }
+    }
+}
+
+impl HeldRoots for PyFilter {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.function);
+        push(self.iter);
+    }
+}
+
+impl HeldRoots for PyZip {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        for &iter in &self.iters {
+            push(iter);
+        }
+    }
+}
+
+impl HeldRoots for PyReversed {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.seq);
+    }
+}
+
+impl HeldRoots for PySeqIter {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.seq);
+    }
+}
+
+impl HeldRoots for PyMinMaxOptions {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.key);
+        push(self.default);
+    }
+}
+
+impl HeldRoots for PySortOptions {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.key);
+    }
+}
+
+impl HeldRoots for PyKwMarker {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        for &(_, value) in &self.pairs {
+            push(value);
+        }
+    }
+}
+
 pub fn new_map(function: *mut PyObject, iters: Vec<*mut PyObject>) -> *mut PyObject {
-    Box::into_raw(Box::new(PyMap {
+    alloc(PyMap {
         ob_base: PyObjectHeader::new(*MAP_TYPE as *const PyType),
         function,
         iters,
-    }))
-    .cast::<PyObject>()
+    })
 }
 
 pub fn new_filter(function: *mut PyObject, iter: *mut PyObject) -> *mut PyObject {
-    Box::into_raw(Box::new(PyFilter {
+    alloc(PyFilter {
         ob_base: PyObjectHeader::new(*FILTER_TYPE as *const PyType),
         function,
         iter,
-    }))
-    .cast::<PyObject>()
+    })
 }
 
 pub fn new_zip(iters: Vec<*mut PyObject>, strict: bool) -> *mut PyObject {
-    Box::into_raw(Box::new(PyZip {
+    alloc(PyZip {
         ob_base: PyObjectHeader::new(*ZIP_TYPE as *const PyType),
         iters,
         strict,
-    }))
-    .cast::<PyObject>()
+    })
 }
 
 pub fn new_reversed(seq: *mut PyObject, len: isize) -> *mut PyObject {
-    Box::into_raw(Box::new(PyReversed {
+    alloc(PyReversed {
         ob_base: PyObjectHeader::new(*REVERSED_TYPE as *const PyType),
         seq,
         index: len.saturating_sub(1),
-    }))
-    .cast::<PyObject>()
+    })
 }
 
 pub fn new_seq_iter(seq: *mut PyObject) -> *mut PyObject {
-    Box::into_raw(Box::new(PySeqIter {
+    alloc(PySeqIter {
         ob_base: PyObjectHeader::new(*SEQ_ITER_TYPE as *const PyType),
         seq,
         index: 0,
-    }))
-    .cast::<PyObject>()
+    })
 }
 
+/// Never registered: the marker carries only a flag, no GC references.
 pub fn new_zip_strict_marker(strict: bool) -> *mut PyObject {
     Box::into_raw(Box::new(PyZipStrictMarker {
         ob_base: PyObjectHeader::new(*ZIP_STRICT_MARKER_TYPE as *const PyType),
@@ -184,30 +255,27 @@ pub fn new_zip_strict_marker(strict: bool) -> *mut PyObject {
 }
 
 pub fn new_minmax_options(key: *mut PyObject, default: *mut PyObject, has_default: bool) -> *mut PyObject {
-    Box::into_raw(Box::new(PyMinMaxOptions {
+    alloc(PyMinMaxOptions {
         ob_base: PyObjectHeader::new(*MINMAX_OPTIONS_TYPE as *const PyType),
         key,
         default,
         has_default,
-    }))
-    .cast::<PyObject>()
+    })
 }
 
 pub fn new_sort_options(key: *mut PyObject, reverse: bool) -> *mut PyObject {
-    Box::into_raw(Box::new(PySortOptions {
+    alloc(PySortOptions {
         ob_base: PyObjectHeader::new(*SORT_OPTIONS_TYPE as *const PyType),
         key,
         reverse,
-    }))
-    .cast::<PyObject>()
+    })
 }
 
 pub fn new_kw_marker(pairs: Vec<(u32, *mut PyObject)>) -> *mut PyObject {
-    Box::into_raw(Box::new(PyKwMarker {
+    alloc(PyKwMarker {
         ob_base: PyObjectHeader::new(*KW_MARKER_TYPE as *const PyType),
         pairs,
-    }))
-    .cast::<PyObject>()
+    })
 }
 
 pub unsafe fn zip_strict_marker_value(object: *mut PyObject) -> Option<bool> {

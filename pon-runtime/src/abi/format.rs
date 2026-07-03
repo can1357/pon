@@ -12,6 +12,7 @@ use std::sync::LazyLock;
 use num_bigint::{BigInt, Sign};
 use num_traits::{FromPrimitive, Signed, ToPrimitive};
 
+use crate::gcroot::{HeldRoots, RootRegistry};
 use crate::intern::{intern, resolve};
 use crate::object::{PyNumberMethods, PyObject, PyObjectHeader, PyType, PyUnicode, as_object_ptr, is_exact_type};
 use crate::thread_state::{pon_err_clear, pon_err_message};
@@ -36,6 +37,35 @@ struct PyInterpolation {
     expression: *mut PyObject,
     conversion: *mut PyObject,
     format_spec: *mut PyObject,
+}
+
+/// Every template / interpolation allocation, for GC root reporting: the
+/// leaked boxes hold GC-heap tuples and strings that marking cannot see
+/// through (`crate::gcroot`).  Objects are immortal, so the registry only
+/// grows.
+static TEMPLATE_REGISTRY: RootRegistry = RootRegistry::new();
+
+/// References held by live t-string templates and interpolations.  Consumed
+/// by `crate::abi::collect` while the runtime lock is held.
+pub(crate) fn gc_held_roots() -> Vec<*mut PyObject> {
+    TEMPLATE_REGISTRY.held_roots()
+}
+
+impl HeldRoots for PyTemplate {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.strings);
+        push(self.interpolations);
+        push(self.values);
+    }
+}
+
+impl HeldRoots for PyInterpolation {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.value);
+        push(self.expression);
+        push(self.conversion);
+        push(self.format_spec);
+    }
 }
 
 static TEMPLATE_NUMBER_METHODS: LazyLock<usize> = LazyLock::new(|| {
@@ -947,7 +977,7 @@ fn template_from_parts(strings: Vec<*mut PyObject>, interpolations: Vec<*mut PyO
         values: values_tuple,
         interpolations: interpolations_tuple,
     }));
-    Ok(as_object_ptr(object))
+    Ok(TEMPLATE_REGISTRY.register::<PyTemplate>(as_object_ptr(object)))
 }
 
 fn template_tuple(items: &[*mut PyObject]) -> Result<*mut PyObject, String> {
@@ -978,7 +1008,7 @@ fn boxed_interpolation(part: &TStrPartRaw) -> Result<*mut PyObject, String> {
         conversion,
         format_spec,
     }));
-    Ok(as_object_ptr(object))
+    Ok(TEMPLATE_REGISTRY.register::<PyInterpolation>(as_object_ptr(object)))
 }
 
 fn conversion_object(conversion: u8) -> Result<*mut PyObject, String> {

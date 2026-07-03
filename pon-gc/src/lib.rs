@@ -577,7 +577,34 @@ impl Heap {
             state.finish_object_scan(index, scan);
 
         }
-        state.sweep();
+        let unreachable = state.sweep();
+        drop(state);
+        // Finalizers run OUTSIDE the state lock: Python-level hooks
+        // (`__del__`, weakref death callbacks) re-enter `Heap::alloc`, which
+        // takes the same mutex — running them under the lock self-deadlocks
+        // the collecting thread.  The heap tables are already consistent
+        // (survivors re-indexed, unreachable detached), so re-entrant
+        // allocation and even a nested collection are safe: detached blocks
+        // are invisible to both and freed only by this frame below.
+        for allocation in &unreachable {
+            if let Some(finalize) = allocation.finalize {
+                // SAFETY: The object is unreachable and still allocated.  All
+                // unreachable allocation storage remains live until the
+                // deallocation pass below, so finalizers may safely inspect
+                // other unreachable objects they still reference.
+                unsafe {
+                    finalize(allocation.start.as_ptr());
+                }
+            }
+        }
+        for allocation in unreachable {
+            // SAFETY: Every allocation record was created from `alloc_zeroed`
+            // with the same layout and has not yet been deallocated; detached
+            // records are owned solely by this frame.
+            unsafe {
+                dealloc(allocation.start.as_ptr(), allocation.layout);
+            }
+        }
     }
 
     fn lock_state(&self) -> MutexGuard<'_, HeapState> {
@@ -754,7 +781,11 @@ impl HeapState {
         }
     }
 
-    fn sweep(&mut self) {
+    /// Detaches every unreached allocation from the heap tables and re-indexes
+    /// the survivors.  Finalization and deallocation are the CALLER's job,
+    /// outside the state lock (see [`Heap::collect`]): the returned records
+    /// carry the resolved finalizer so no further table access is needed.
+    fn sweep(&mut self) -> Vec<UnreachableAllocation> {
         let old_allocations = std::mem::take(&mut self.allocations);
         let old_mark_states = std::mem::take(&mut self.mark_states);
         let mut survivors = Vec::with_capacity(old_allocations.len());
@@ -770,36 +801,20 @@ impl HeapState {
             {
                 survivors.push(allocation);
             } else {
-                unreachable.push(allocation);
-            }
-        }
-
-        for allocation in &unreachable {
-            if let Some(finalize) = self
-                .types
-                .get(&allocation.type_id)
-                .and_then(|info| info.finalize)
-            {
-                // SAFETY: The object is unreachable and still allocated.  All
-                // unreachable allocation storage remains live until the
-                // deallocation pass below, so finalizers may safely inspect
-                // other unreachable objects they still reference.
-                unsafe {
-                    finalize(allocation.start.as_ptr());
-                }
-            }
-        }
-
-        for allocation in unreachable {
-            // SAFETY: Every allocation record was created from `alloc_zeroed`
-            // with the same layout and has not yet been deallocated.
-            unsafe {
-                dealloc(allocation.start.as_ptr(), allocation.layout);
+                unreachable.push(UnreachableAllocation {
+                    start: allocation.start,
+                    layout: allocation.layout,
+                    finalize: self
+                        .types
+                        .get(&allocation.type_id)
+                        .and_then(|info| info.finalize),
+                });
             }
         }
 
         self.allocations = survivors;
         self.rebuild_allocation_metadata();
+        unreachable
     }
 
     fn rebuild_allocation_metadata(&mut self) {
@@ -830,6 +845,13 @@ struct Allocation {
     layout: Layout,
     type_id: TypeId,
     classification: AllocationClass,
+}
+/// A detached, unreached allocation awaiting finalization and deallocation
+/// outside the heap state lock (produced by [`HeapState::sweep`]).
+struct UnreachableAllocation {
+    start: NonNull<u8>,
+    layout: Layout,
+    finalize: Option<FinalizeFn>,
 }
 
 impl Allocation {
@@ -1062,6 +1084,15 @@ fn collect_external_stack_roots(visitor: &mut dyn FnMut(usize, *mut u8)) {
     if current == base {
         return;
     }
+
+    // Registers are deliberately NOT scanned.  A callee-saved register can
+    // hold a *dead* pointer long after its value's last use (the register
+    // allocator frees the register without clearing it), so treating the
+    // register file as roots retains semantic garbage and breaks CPython
+    // finalization parity (`del x; gc.collect()` never finalizing).  Live
+    // named locals do not need register scanning: tier-0 codegen mirrors
+    // every local store into an explicit frame stack slot (`store_local`'s
+    // shadow slot in pon-codegen), which this stack walk observes.
 
     let (low, high) = if current < base { (current, base) } else { (base, current) };
     let word = core::mem::size_of::<usize>();

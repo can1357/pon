@@ -323,6 +323,36 @@ unsafe fn is_weakref_layout(object: *mut PyObject) -> bool {
     let ty = unsafe { (*object).ob_type };
     ty == weakref_type().cast_const() || ty == (*WEAKPROXY_TYPE as *mut PyType).cast_const()
 }
+/// Referent of any weakref-shaped object — a plain `ref`/`proxy` or a
+/// payload-subclass wrapper (`KeyedRef`, `WeakMethod`).  `None` when `object`
+/// is not a weak reference; `Some(NULL)` when the referent already died.
+#[must_use]
+pub(crate) unsafe fn weakref_referent_any(object: *mut PyObject) -> Option<*mut PyObject> {
+    unsafe {
+        if is_weakref_layout(object) {
+            return Some((*object.cast::<PyWeakRef>()).referent);
+        }
+        wrapper_payload(object).map(|payload| (*payload).referent)
+    }
+}
+
+/// Python-visible weak references registered against `referent` (subclass
+/// wrapper instances stand in for their canonical payloads — the object user
+/// code constructed, mirroring CPython's `tp_weaklist` contents).
+#[must_use]
+pub(crate) fn weakrefs_of(referent: *mut PyObject) -> Vec<*mut PyObject> {
+    let addrs = registry().get(&(referent as usize)).cloned().unwrap_or_default();
+    addrs
+        .into_iter()
+        .map(|addr| {
+            let weakref = addr as *mut PyWeakRef;
+            // SAFETY: registry entries are live registered refs; wrapper is
+            // NULL or the owning payload-subclass instance.
+            let wrapper = unsafe { (*weakref).wrapper };
+            if wrapper.is_null() { weakref.cast::<PyObject>() } else { wrapper }
+        })
+        .collect()
+}
 
 /// Detaches the canonical payload of a dying wrapper instance: unregisters it
 /// so referent death can never call back into freed wrapper memory.

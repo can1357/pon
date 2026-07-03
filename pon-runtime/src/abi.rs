@@ -1577,6 +1577,7 @@ pub(crate) struct Runtime {
     globals: HashMap<u32, *mut PyObject>,
     ellipsis: *mut PyNone,
     class_namespace_stack: Vec<ClassBodyFrame>,
+    class_construction_stack: Vec<ClassBodyFrame>,
 }
 
 /// One active class-body scope.  `mapping` is the `__prepare__`-provided
@@ -1586,6 +1587,21 @@ pub(crate) struct Runtime {
 struct ClassBodyFrame {
     namespace: *mut type_::PyClassDict,
     mapping: *mut PyObject,
+}
+
+/// Scope guard for one entry on `Runtime::class_construction_stack`.
+///
+/// `build_class_with_body` pushes the popped body frame onto the construction
+/// registry and holds this guard across class construction, so the
+/// `__prepare__` mapping and the internal namespace's values stay rooted while
+/// metaclass hooks run.  Dropping pops on every exit path, including panics
+/// unwinding to the ABI `catch_object_helper` boundary.
+struct ClassConstructionRootGuard;
+
+impl Drop for ClassConstructionRootGuard {
+    fn drop(&mut self) {
+        let _ = with_runtime(|runtime| runtime.class_construction_stack.pop());
+    }
 }
 
 unsafe impl Send for Runtime {}
@@ -1800,6 +1816,7 @@ fn perform_runtime_init() -> Result<(), String> {
                 ellipsis,
                 globals: HashMap::new(),
                 class_namespace_stack: Vec::new(),
+                class_construction_stack: Vec::new(),
             };
 
             register_builtins(&mut runtime)?;
@@ -2298,13 +2315,13 @@ fn install_type_check_dunders(runtime: &mut Runtime) {
 }
 
 /// Installs the `type.__dict__` getset descriptors — `__annotations__`
-/// (PEP 649 class-annotations surface), `__mro__`, and `__dict__` (inspect's
-/// static-introspection captures) — see the descriptor section in `descr.rs`.
-/// Attribute reads on class receivers keep resolving through the fast paths
-/// in `generic_get_attr_cached`; the dict entries exist for direct
-/// `type.__dict__[...]` consumers (annotationlib, inspect) and give
-/// class-level writes data-descriptor routing (`__annotations__` writable,
-/// the other two read-only).
+/// (PEP 649 class-annotations surface), `__mro__`, `__bases__`, and
+/// `__dict__` (inspect's static-introspection captures) — see the descriptor
+/// section in `descr.rs`.  Attribute reads on class receivers keep resolving
+/// through the fast paths in `generic_get_attr_cached`; the dict entries
+/// exist for direct `type.__dict__[...]` consumers (annotationlib, inspect)
+/// and give class-level writes data-descriptor routing (`__annotations__`
+/// writable, the rest read-only).
 fn install_type_getset_descriptors(runtime: &mut Runtime) {
     // Stamp the shared descriptor type's metatype and the descriptors'
     // `__objclass__` (the builtin `type`); idempotent with the function-type
@@ -4119,6 +4136,19 @@ unsafe fn build_class_with_body(
     } else {
         unsafe { pon_call(body, ptr::null_mut(), 0) }
     };
+    // Class-construction GC window (body-frame pop → `construct_class`): once
+    // the body frame pops below, the namespace/mapping pair is reachable only
+    // through Rust locals while metaclass hooks (`__new__`/`__init__`),
+    // `__set_name__`, and `__init_subclass__` run arbitrary Python that may
+    // `gc.collect()`.  Push the pair onto the scoped construction registry
+    // BEFORE the pop (no unrooted instant) and keep it there until the
+    // constructed class (or an error) leaves this frame; `construct_class`
+    // publishes the namespace via `register_namespaced_type` before those
+    // hooks fire, so this entry covers the whole remaining window.
+    if with_runtime(|runtime| runtime.class_construction_stack.push(frame)).is_none() {
+        return return_null_with_error("runtime is not initialized");
+    }
+    let _construction_root = ClassConstructionRootGuard;
     let popped = with_runtime(|runtime| runtime.class_namespace_stack.pop()).flatten();
     if popped != Some(frame) {
         return return_null_with_error("class namespace stack is corrupted");
@@ -4778,8 +4808,41 @@ fn push_namespace_value_roots(value: *mut PyObject, roots: &mut Vec<*mut u8>) {
     }
 }
 
+/// Overwrites the dead stack region the collection call chain is about to
+/// occupy with zeros.
+///
+/// The conservative stack scan reads every word between the collecting
+/// thread's stack pointer and the entry boundary.  Frames pushed by the
+/// collection itself are allocated but only partially written, so their
+/// padding and dead slots would otherwise show *ghosts*: leftover pointer
+/// words from earlier, deeper call chains (e.g. the allocation path that
+/// constructed an object since deleted).  Ghosts turn `del x; gc.collect()`
+/// nondeterministic — the swept object stays reachable through garbage.
+/// Zeroing the region below this frame before any collection frame is pushed
+/// makes the scan see only live frame contents.  A chain deeper than the
+/// scrub degrades to conservative retention, never to unsoundness.
+#[inline(never)]
+pub(crate) fn scrub_dead_stack_below() {
+    const DEAD_STACK_SCRUB_BYTES: usize = 64 * 1024;
+    let mut scrub = [0u8; DEAD_STACK_SCRUB_BYTES];
+    // Keep the zero-fill: without an observable use the compiler elides the
+    // whole frame.
+    std::hint::black_box(scrub.as_mut_ptr());
+}
+
 /// Runs a stop-the-world collection using the runtime's current root set.
 pub fn collect() -> Result<(), String> {
+    // Scrub first, then run the whole collection in a fresh callee frame so
+    // every collection-path frame — including `collect_impl`'s own — is
+    // allocated inside the zeroed region.  Root gathering and marking frames
+    // are fat in debug builds; ghosts in their dead zones must not become
+    // conservative stack roots.
+    scrub_dead_stack_below();
+    collect_impl()
+}
+
+#[inline(never)]
+fn collect_impl() -> Result<(), String> {
     let mut slot = runtime_lock();
     let Some(runtime) = slot.as_mut() else {
         return Err("runtime is not initialized".to_owned());
@@ -4793,7 +4856,10 @@ pub fn collect() -> Result<(), String> {
     for value in runtime.globals.values().copied() {
         roots.push(value.cast::<u8>());
     }
-    for frame in runtime.class_namespace_stack.iter() {
+    // Both class stacks root their frames: `class_namespace_stack` covers
+    // bodies still executing, `class_construction_stack` covers popped bodies
+    // whose class is being constructed (metaclass hooks may collect).
+    for frame in runtime.class_namespace_stack.iter().chain(runtime.class_construction_stack.iter()) {
         // A `__prepare__` mapping is held only by this frame during body
         // execution; root it so its storage (and transitively the body's
         // stores) survives a mid-body collection.
@@ -4887,48 +4953,74 @@ pub fn collect() -> Result<(), String> {
     // Values held by native `_contextvars` state (context entries, token
     // snapshots, constructor defaults): the holder objects are immortal
     // leaked boxes marking cannot reach, mirroring `rooted_globals_dicts`.
+    // Every family below pushes through `push_namespace_value_roots` so held
+    // values that are themselves malloc'd carriers (bound methods,
+    // classmethod/staticmethod/property wrappers) have their wrapped GC
+    // callables and receivers rooted too.
     for value in crate::native::contextvars::gc_held_roots() {
-        roots.push(value.cast::<u8>());
+        push_namespace_value_roots(value, &mut roots);
     }
     // Values held by native `_thread._local` per-thread namespaces,
     // mirroring `_contextvars`.
     for value in crate::native::thread::gc_held_roots() {
-        roots.push(value.cast::<u8>());
+        push_namespace_value_roots(value, &mut roots);
     }
     // Values held by native `_codecs` registry state (search functions,
     // error handlers, cached CodecInfo objects), mirroring `_contextvars`.
     for value in crate::native::codecs::gc_held_roots() {
-        roots.push(value.cast::<u8>());
+        push_namespace_value_roots(value, &mut roots);
     }
     // Entries held by native `_collections` deques, mirroring `_contextvars`.
     for value in crate::native::collections::gc_held_roots() {
-        roots.push(value.cast::<u8>());
+        push_namespace_value_roots(value, &mut roots);
     }
     // Python handler objects held by the native `_signal` handler table,
     // mirroring `_contextvars`.
     for value in crate::native::signal::gc_held_roots() {
-        roots.push(value.cast::<u8>());
-    }
-    // Weakref key objects and values held by native `WeakKeyDictionary`
-    // instances, mirroring `_contextvars`.
-    for value in crate::native::weakref::gc_held_roots() {
-        roots.push(value.cast::<u8>());
+        push_namespace_value_roots(value, &mut roots);
     }
     // Registered exit callbacks held by native `atexit`, mirroring
     // `_contextvars`.
     for value in crate::native::atexit::gc_held_roots() {
-        roots.push(value.cast::<u8>());
+        push_namespace_value_roots(value, &mut roots);
     }
     // Buffer exporters held by live native `PickleBuffer` instances,
     // mirroring `_contextvars`.
     for value in crate::native::pickle::gc_held_roots() {
-        roots.push(value.cast::<u8>());
+        push_namespace_value_roots(value, &mut roots);
     }
     // Module attribute values held by the import registry (module objects are
     // immortal leaked boxes marking cannot traverse) plus the `sys.modules`
     // dict: every module-scope binding in every module.
     for value in crate::import::gc_held_roots() {
-        roots.push(value.cast::<u8>());
+        push_namespace_value_roots(value, &mut roots);
+    }
+    // Source iterators, callables, and saved values held by leaked-box
+    // itertools iterators, mirroring `_contextvars`.
+    for value in crate::native::itertools::gc_held_roots() {
+        push_namespace_value_roots(value, &mut roots);
+    }
+    // Sources and options held by the lazy builtins (`map`/`filter`/`zip`/
+    // `reversed`, legacy seq-iter, binder option carriers), mirroring
+    // `_contextvars`.
+    for value in crate::types::lazy_iter::gc_held_roots() {
+        push_namespace_value_roots(value, &mut roots);
+    }
+    // Unicode receivers borrowed by live `str` iterators, mirroring
+    // `_contextvars`.
+    for value in str_::gc_held_roots() {
+        push_namespace_value_roots(value, &mut roots);
+    }
+    // Source iterators and callables held by ref-holding native payloads
+    // (`enumerate`, JIT-surface `zip`/`map`/`filter`, sentinel iterators),
+    // mirroring `_contextvars`.
+    for value in crate::native::builtins_mod::gc_held_roots() {
+        push_namespace_value_roots(value, &mut roots);
+    }
+    // Strings/values/interpolations tuples held by leaked-box t-string
+    // templates and interpolation records, mirroring `_contextvars`.
+    for value in format::gc_held_roots() {
+        push_namespace_value_roots(value, &mut roots);
     }
     extend_tierup_roots(&mut roots);
 

@@ -12,9 +12,10 @@ use std::io::{self, Write};
 use std::ptr;
 use std::sync::{LazyLock, OnceLock};
 use num_bigint::BigInt;
-use num_traits::{Signed, ToPrimitive, Zero};
+use num_traits::{One, Signed, ToPrimitive, Zero};
 
 use crate::abi::{self, pon_get_iter, pon_iter_next};
+use crate::gcroot::{HeldRoots, RootRegistry};
 use crate::intern::{intern, resolve};
 use crate::object::{PyFunction, PyMappingMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType, PyUnicode, UnaryFunc};
 use crate::thread_state::{pon_err_clear, pon_err_message, pon_err_occurred, pon_err_set};
@@ -202,17 +203,10 @@ enum SequenceKind {
 
 #[derive(Debug)]
 enum NativePayload {
-    /// Dead since `alloc_sequence` began emitting real seq-family objects;
-    /// the arms consuming it (iter/bool/richcmp/repr/len/classinfo) are
-    /// unreachable.  Excision, incl. the placeholder list/tuple slot surface,
-    /// belongs to the build-hygiene lane.
-    #[allow(dead_code)]
-    Sequence { kind: SequenceKind, items: Vec<*mut PyObject> },
     Range { start: i64, stop: i64, step: i64 },
     RangeIterator { current: i64, stop: i64, step: i64 },
     LongRange { start: BigInt, stop: BigInt, step: BigInt },
     LongRangeIterator { current: BigInt, stop: BigInt, step: BigInt },
-    VecIterator { items: Vec<*mut PyObject>, index: usize },
     Enumerate { iter: *mut PyObject, index: i64 },
     Zip { iters: Vec<*mut PyObject> },
     Map { function: *mut PyObject, iters: Vec<*mut PyObject> },
@@ -234,7 +228,6 @@ static LIST_TYPE: OnceLock<usize> = OnceLock::new();
 static TUPLE_TYPE: OnceLock<usize> = OnceLock::new();
 static RANGE_TYPE: OnceLock<usize> = OnceLock::new();
 static RANGE_ITER_TYPE: OnceLock<usize> = OnceLock::new();
-static SEQ_ITER_TYPE: OnceLock<usize> = OnceLock::new();
 static ENUMERATE_TYPE: OnceLock<usize> = OnceLock::new();
 static ZIP_TYPE: OnceLock<usize> = OnceLock::new();
 static MAP_TYPE: OnceLock<usize> = OnceLock::new();
@@ -297,19 +290,11 @@ fn type_from(
 }
 
 fn list_type() -> *mut PyType {
-    let ty = type_from(&LIST_TYPE, "list", Some(sequence_iter_slot), None);
-    unsafe {
-        (*ty).tp_richcmp = Some(native_list_richcmp_slot);
-    }
-    ty
+    type_from(&LIST_TYPE, "list", None, None)
 }
 
 fn tuple_type() -> *mut PyType {
-    let ty = type_from(&TUPLE_TYPE, "tuple", Some(sequence_iter_slot), None);
-    unsafe {
-        (*ty).tp_richcmp = Some(native_tuple_richcmp_slot);
-    }
-    ty
+    type_from(&TUPLE_TYPE, "tuple", None, None)
 }
 
 
@@ -322,7 +307,8 @@ fn range_type() -> *mut PyType {
         let mut ty = Box::new(PyType::new(ptr::null(), "range", std::mem::size_of::<NativeObject>()));
         ty.tp_iter = Some(range_iter_slot);
         ty.tp_bool = Some(native_bool_slot);
-        ty.tp_hash = Some(native_hash_slot);
+        ty.tp_hash = Some(native_range_hash_slot);
+        ty.tp_richcmp = Some(native_range_richcmp_slot);
         ty.tp_as_sequence = Box::into_raw(Box::new(PySequenceMethods {
             sq_length: Some(native_range_len_slot),
             sq_concat: None,
@@ -350,10 +336,6 @@ fn range_iter_type() -> *mut PyType {
 
 fn longrange_iter_type() -> *mut PyType {
     *LONGRANGE_ITER_TYPE as *mut PyType
-}
-
-fn seq_iter_type() -> *mut PyType {
-    type_from(&SEQ_ITER_TYPE, "list_iterator", Some(identity_iter_slot), Some(native_next_slot))
 }
 
 fn enumerate_type() -> *mut PyType {
@@ -427,19 +409,71 @@ unsafe extern "C" fn placeholder_getattro_slot(object: *mut PyObject, name: *mut
 }
 
 
+/// Ref-holding native-payload allocations (`enumerate`, JIT-surface
+/// `zip`/`map`/`filter`, `iter(callable, sentinel)`), for GC root reporting:
+/// the leaked boxes hold source iterators and callables that live on the GC
+/// heap and are invisible to marking (`crate::gcroot`).  Numeric payloads
+/// (range families) and placeholders hold no references and are never
+/// registered.  Objects are immortal, so the registry only grows.
+static REGISTRY: RootRegistry = RootRegistry::new();
+
+/// References held by live ref-holding native payloads.  Consumed by
+/// `crate::abi::collect` while the runtime lock is held.
+pub(crate) fn gc_held_roots() -> Vec<*mut PyObject> {
+    REGISTRY.held_roots()
+}
+
+impl HeldRoots for NativeObject {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        match &self.payload {
+            NativePayload::Enumerate { iter, .. } => push(*iter),
+            NativePayload::Zip { iters } => {
+                for &iter in iters {
+                    push(iter);
+                }
+            }
+            NativePayload::Map { function, iters } => {
+                push(*function);
+                for &iter in iters {
+                    push(iter);
+                }
+            }
+            NativePayload::Filter { function, iter } => {
+                push(*function);
+                push(*iter);
+            }
+            NativePayload::CallableSentinelIterator { callable, sentinel } => {
+                push(*callable);
+                push(*sentinel);
+            }
+            NativePayload::Range { .. }
+            | NativePayload::RangeIterator { .. }
+            | NativePayload::LongRange { .. }
+            | NativePayload::LongRangeIterator { .. }
+            | NativePayload::Placeholder(_) => {}
+        }
+    }
+}
+
 fn alloc_native(payload: NativePayload, ty: *mut PyType) -> *mut PyObject {
-    Box::into_raw(Box::new(NativeObject {
+    let holds_refs = matches!(
+        payload,
+        NativePayload::Enumerate { .. }
+            | NativePayload::Zip { .. }
+            | NativePayload::Map { .. }
+            | NativePayload::Filter { .. }
+            | NativePayload::CallableSentinelIterator { .. }
+    );
+    let object = Box::into_raw(Box::new(NativeObject {
         ob_base: PyObjectHeader::new(ty),
         payload,
     }))
-    .cast::<PyObject>()
+    .cast::<PyObject>();
+    if holds_refs { REGISTRY.register::<NativeObject>(object) } else { object }
 }
 
 fn alloc_sequence(kind: SequenceKind, mut items: Vec<*mut PyObject>) -> *mut PyObject {
-    // Real seq-family objects: placeholder `NativePayload::Sequence` results
-    // had no subscript slots, so `list(...)[0]` raised TypeError while list
-    // literals worked.  The payload branches in this file stay for values
-    // routed through them, but constructor results are full-protocol objects.
+    // Constructor results are real, full-protocol seq-family objects.
     // SAFETY: The builders copy `items.len()` slots and follow the
     // NULL-sentinel error contract; an empty Vec's dangling pointer is legal
     // for a zero count.
@@ -498,7 +532,6 @@ unsafe fn as_native<'a>(object: *mut PyObject) -> Option<&'a mut NativeObject> {
         range_type(),
         range_iter_type(),
         longrange_iter_type(),
-        seq_iter_type(),
         enumerate_type(),
         zip_type(),
         map_type(),
@@ -512,22 +545,6 @@ unsafe fn as_native<'a>(object: *mut PyObject) -> Option<&'a mut NativeObject> {
 
 unsafe extern "C" fn identity_iter_slot(object: *mut PyObject) -> *mut PyObject {
     object
-}
-
-unsafe extern "C" fn sequence_iter_slot(object: *mut PyObject) -> *mut PyObject {
-    let Some(native) = (unsafe { as_native(object) }) else {
-        return fail("sequence iterator receiver is not native");
-    };
-    let NativePayload::Sequence { items, .. } = &native.payload else {
-        return fail("sequence iterator receiver is not a sequence");
-    };
-    alloc_native(
-        NativePayload::VecIterator {
-            items: items.clone(),
-            index: 0,
-        },
-        seq_iter_type(),
-    )
 }
 
 unsafe extern "C" fn range_iter_slot(object: *mut PyObject) -> *mut PyObject {
@@ -553,6 +570,87 @@ fn range_payload_parts(payload: &NativePayload) -> Option<(BigInt, BigInt, BigIn
             Some((start.clone(), step.clone(), longrange_len(start, stop, step)))
         }
         _ => None,
+    }
+}
+
+/// `(len, start, step)` comparison key of any range object — the native
+/// `Range`/`LongRange` payloads here or the abi seq-family `PyRange` — so
+/// both representations (and cross-representation pairs) compare and hash
+/// through one authority.  `None` when `object` is not a range.
+pub(crate) fn range_cmp_key(object: *mut PyObject) -> Option<(BigInt, BigInt, BigInt)> {
+    if object.is_null() || !crate::tag::is_heap(object) {
+        return None;
+    }
+    if let Some(native) = unsafe { as_native(object) } {
+        let (start, step, len) = range_payload_parts(&native.payload)?;
+        return Some((len, start, step));
+    }
+    crate::abi::seq::abi_range_cmp_key(object)
+}
+
+/// CPython `range_equals`: ranges compare as the sequences they denote —
+/// lengths must match, then `start` matters only for non-empty ranges and
+/// `step` only past the first element (`range(0, 3, 2) == range(0, 4, 2)`).
+pub(crate) fn range_keys_equal(left: &(BigInt, BigInt, BigInt), right: &(BigInt, BigInt, BigInt)) -> bool {
+    let (left_len, left_start, left_step) = left;
+    let (right_len, right_start, right_step) = right;
+    if left_len != right_len {
+        return false;
+    }
+    if left_len.is_zero() {
+        return true;
+    }
+    if left_start != right_start {
+        return false;
+    }
+    left_len.is_one() || left_step == right_step
+}
+
+/// Equality-consistent range hash over the normalized key (CPython
+/// `range_hash` hashes `(len, start, step)` with components that don't
+/// affect the denoted sequence blanked out).  Every entry point — both
+/// `tp_hash` slots, dict/set keying, the `hash()` builtin — routes here, so
+/// equal ranges can never land in different dict slots.  The value carries
+/// the dict-domain `-1 -> -2` normalization already, keeping it identical
+/// across normalizing and raw callers.
+pub(crate) fn range_hash_value(object: *mut PyObject) -> Option<isize> {
+    let (len, start, step) = range_cmp_key(object)?;
+    let text = if len.is_zero() {
+        "range:0".to_owned()
+    } else if len.is_one() {
+        format!("range:1:{start}")
+    } else {
+        format!("range:{len}:{start}:{step}")
+    };
+    let hash = stable_hash(&text) as isize;
+    Some(if hash == -1 { -2 } else { hash })
+}
+
+/// Shared `tp_richcmp` for both range representations: EQ/NE compare
+/// structurally when both operands are ranges; ordering selectors and
+/// non-range operands return NotImplemented so the abstract fallback raises
+/// the standard ordering TypeError (CPython `range_richcompare`).
+pub(crate) unsafe fn range_richcmp(left: *mut PyObject, right: *mut PyObject, op: c_int) -> *mut PyObject {
+    let selector = match u8::try_from(op) {
+        Ok(selector @ (crate::abstract_op::RICH_EQ | crate::abstract_op::RICH_NE)) => selector,
+        _ => return unsafe { abi::pon_not_implemented() },
+    };
+    let (Some(left_key), Some(right_key)) = (range_cmp_key(left), range_cmp_key(right)) else {
+        return unsafe { abi::pon_not_implemented() };
+    };
+    let equal = range_keys_equal(&left_key, &right_key);
+    let result = equal == (selector == crate::abstract_op::RICH_EQ);
+    unsafe { abi::number::pon_const_bool(i32::from(result)) }
+}
+
+unsafe extern "C" fn native_range_richcmp_slot(left: *mut PyObject, right: *mut PyObject, op: c_int) -> *mut PyObject {
+    unsafe { range_richcmp(left, right, op) }
+}
+
+unsafe extern "C" fn native_range_hash_slot(object: *mut PyObject) -> isize {
+    match range_hash_value(object) {
+        Some(hash) => hash,
+        None => unsafe { native_hash_slot(object) },
     }
 }
 
@@ -735,13 +833,6 @@ unsafe extern "C" fn native_next_slot(object: *mut PyObject) -> *mut PyObject {
             *current += &*step;
             crate::types::int::from_bigint(value)
         }
-        NativePayload::VecIterator { items, index } => {
-            let Some(value) = items.get(*index).copied() else {
-                return stop_iteration();
-            };
-            *index += 1;
-            value
-        }
         NativePayload::Enumerate { iter, index } => {
             let value = unsafe { pon_iter_next(*iter, ptr::null_mut()) };
             if value.is_null() {
@@ -824,7 +915,6 @@ unsafe extern "C" fn native_bool_slot(object: *mut PyObject) -> i32 {
         return 1;
     };
     match &native.payload {
-        NativePayload::Sequence { items, .. } => if items.is_empty() { 0 } else { 1 },
         NativePayload::Range { start, stop, step } => {
             if (*step > 0 && *start < *stop) || (*step < 0 && *start > *stop) { 1 } else { 0 }
         }
@@ -838,92 +928,6 @@ unsafe extern "C" fn native_bool_slot(object: *mut PyObject) -> i32 {
 unsafe extern "C" fn native_hash_slot(object: *mut PyObject) -> isize {
     stable_hash(&repr_text(object)) as isize
 }
-unsafe extern "C" fn native_list_richcmp_slot(left: *mut PyObject, right: *mut PyObject, op: c_int) -> *mut PyObject {
-    unsafe { native_sequence_richcmp(left, right, op, SequenceKind::List) }
-}
-
-unsafe extern "C" fn native_tuple_richcmp_slot(left: *mut PyObject, right: *mut PyObject, op: c_int) -> *mut PyObject {
-    unsafe { native_sequence_richcmp(left, right, op, SequenceKind::Tuple) }
-}
-
-unsafe fn native_sequence_richcmp(
-    left: *mut PyObject,
-    right: *mut PyObject,
-    op: c_int,
-    kind: SequenceKind,
-) -> *mut PyObject {
-    let Some(left_items) = (unsafe { native_sequence_items(left, kind) }) else {
-        return unsafe { abi::pon_not_implemented() };
-    };
-    let Some(right_items) = (unsafe { native_sequence_items(right, kind) }) else {
-        return unsafe { abi::pon_not_implemented() };
-    };
-    let Ok(op) = u8::try_from(op) else {
-        return fail("unknown rich comparison operation");
-    };
-    if !matches!(
-        op,
-        crate::abstract_op::RICH_LT
-            | crate::abstract_op::RICH_LE
-            | crate::abstract_op::RICH_EQ
-            | crate::abstract_op::RICH_NE
-            | crate::abstract_op::RICH_GT
-            | crate::abstract_op::RICH_GE
-    ) {
-        return fail("unknown rich comparison operation");
-    }
-
-    for index in 0..left_items.len().min(right_items.len()) {
-        let equal = unsafe {
-            abi::pon_rich_compare(
-                crate::abstract_op::RICH_EQ,
-                left_items[index],
-                right_items[index],
-                ptr::null_mut(),
-            )
-        };
-        if equal.is_null() {
-            return ptr::null_mut();
-        }
-        let is_equal = match unsafe { truth(equal) } {
-            Ok(value) => value,
-            Err(message) => return fail_preserving(message),
-        };
-        if !is_equal {
-            return match op {
-                crate::abstract_op::RICH_EQ => unsafe { abi::number::pon_const_bool(0) },
-                crate::abstract_op::RICH_NE => unsafe { abi::number::pon_const_bool(1) },
-                crate::abstract_op::RICH_LT
-                | crate::abstract_op::RICH_LE
-                | crate::abstract_op::RICH_GT
-                | crate::abstract_op::RICH_GE => unsafe {
-                    abi::pon_rich_compare(op, left_items[index], right_items[index], ptr::null_mut())
-                },
-                _ => unreachable!(),
-            };
-        }
-    }
-
-    let result = match op {
-        crate::abstract_op::RICH_EQ => left_items.len() == right_items.len(),
-        crate::abstract_op::RICH_NE => left_items.len() != right_items.len(),
-        crate::abstract_op::RICH_LT => left_items.len() < right_items.len(),
-        crate::abstract_op::RICH_LE => left_items.len() <= right_items.len(),
-        crate::abstract_op::RICH_GT => left_items.len() > right_items.len(),
-        crate::abstract_op::RICH_GE => left_items.len() >= right_items.len(),
-        _ => unreachable!(),
-    };
-    unsafe { abi::number::pon_const_bool(i32::from(result)) }
-}
-
-unsafe fn native_sequence_items(object: *mut PyObject, kind: SequenceKind) -> Option<Vec<*mut PyObject>> {
-    let native = unsafe { as_native(object) }?;
-    match &native.payload {
-        NativePayload::Sequence { kind: actual, items } if *actual == kind => Some(items.clone()),
-        _ => None,
-    }
-}
-
 
 pub unsafe extern "C" fn builtin_print(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let Some(args) = (unsafe { argv_slice(argv, argc) }) else {
@@ -1233,7 +1237,7 @@ unsafe fn builtin_hash_value(object: *mut PyObject) -> Result<i64, String> {
         return Err("unhashable type: 'set'".to_owned());
     } else if matches!(
         unsafe { crate::types::dict::type_name(object) },
-        Some("str" | "bytes" | "dict" | "list" | "bytearray" | "tuple")
+        Some("str" | "bytes" | "dict" | "list" | "bytearray" | "tuple" | "range")
     ) || unsafe { crate::types::dict::is_dict_subclass_instance(object) }
     {
         // `hash_object` owns the content-hash (str/bytes CPython seed-0
@@ -2037,6 +2041,15 @@ pub(crate) fn repr_text_no_dispatch(object: *mut PyObject) -> Result<String, ()>
     if is_none(object) {
         return Ok("None".to_owned());
     }
+    // `Ellipsis`/`NotImplemented`: named singleton reprs (the print path in
+    // `format_object_for_print` already special-cases both; `ast.dump` and
+    // container reprs reach them through `repr()`).
+    if unsafe { crate::types::int::type_name_is(object, "ellipsis") } {
+        return Ok("Ellipsis".to_owned());
+    }
+    if unsafe { crate::types::int::type_name_is(object, "NotImplementedType") } {
+        return Ok("NotImplemented".to_owned());
+    }
     if crate::types::typealias::is_type_alias(object) {
         return Ok(crate::types::typealias::type_alias_repr(object));
     }
@@ -2052,7 +2065,6 @@ pub(crate) fn repr_text_no_dispatch(object: *mut PyObject) -> Result<String, ()>
     unsafe {
         if let Some(native) = as_native(object) {
             return match &native.payload {
-                NativePayload::Sequence { kind, items } => format_sequence(*kind, items),
                 NativePayload::Range { start, stop, step } => {
                     if *step == 1 {
                         Ok(format!("range({start}, {stop})"))
@@ -2069,7 +2081,6 @@ pub(crate) fn repr_text_no_dispatch(object: *mut PyObject) -> Result<String, ()>
                 }
                 NativePayload::RangeIterator { .. } => Ok("<range_iterator object>".to_owned()),
                 NativePayload::LongRangeIterator { .. } => Ok("<longrange_iterator object>".to_owned()),
-                NativePayload::VecIterator { .. } => Ok("<list_iterator object>".to_owned()),
                 NativePayload::Enumerate { .. } => Ok("<enumerate object>".to_owned()),
                 NativePayload::Zip { .. } => Ok("<zip object>".to_owned()),
                 NativePayload::Map { .. } => Ok("<map object>".to_owned()),
@@ -2512,7 +2523,6 @@ fn length(object: *mut PyObject) -> Result<i64, String> {
     unsafe {
         if let Some(native) = as_native(object) {
             return match &native.payload {
-                NativePayload::Sequence { items, .. } => Ok(items.len() as i64),
                 NativePayload::Range { start, stop, step } => Ok(range_len(*start, *stop, *step)),
                 NativePayload::LongRange { start, stop, step } => longrange_len(start, stop, step)
                     .to_i64()
@@ -2872,18 +2882,10 @@ unsafe fn object_is_instance(object: *mut PyObject, classinfo: *mut PyObject) ->
     i32::from(unsafe { (*object_type).name() == expected_name })
 }
 
-/// Elements of a tuple object, accepting both runtime tuple
-/// representations: the seq-family `PyTuple` and the native builtins_mod
-/// `NativePayload::Sequence` tuple (isinstance classinfo, exception args).
+/// Elements of an exact seq-family `PyTuple` (isinstance classinfo,
+/// exception args).
 unsafe fn exact_tuple_entries<'a>(object: *mut PyObject) -> Option<&'a [*mut PyObject]> {
-    if let Some(items) = unsafe { abi::seq::exact_tuple_slice(object) } {
-        return Some(items);
-    }
-    let native: &'a NativeObject = unsafe { as_native(object) }?;
-    match &native.payload {
-        NativePayload::Sequence { kind: SequenceKind::Tuple, items } => Some(items.as_slice()),
-        _ => None,
-    }
+    unsafe { abi::seq::exact_tuple_slice(object) }
 }
 
 
