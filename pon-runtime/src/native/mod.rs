@@ -19,6 +19,7 @@ pub(crate) use crate::import::install_module;
 
 mod array;
 mod ast_;
+pub use ast_::{AstNode, AstValue, NodeSpan, build_ast_object};
 pub mod atexit;
 mod binascii;
 pub(crate) mod codecs;
@@ -29,7 +30,7 @@ mod errno;
 mod gc;
 mod imp;
 pub(crate) mod io;
-mod itertools;
+pub(crate) mod itertools;
 mod math;
 mod opcode_;
 mod os;
@@ -49,6 +50,7 @@ mod sysconfigdata;
 pub(crate) mod thread;
 mod time;
 mod tokenize;
+mod unicodedata;
 pub(crate) mod weakref;
 
 /// Sorted, insert-only lookup table of curated native modules: Python module
@@ -95,7 +97,7 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
     ("select", select::make_module),
     ("sys", sys::make_module),
     ("time", time::make_module),
-    ("weakref", weakref::make_module),
+    ("unicodedata", unicodedata::make_module),
 ];
 
 /// Modules registered eagerly by [`register_modules`] at runtime init, in

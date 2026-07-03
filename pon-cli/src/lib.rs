@@ -9,10 +9,11 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use pon_ir::lower_source;
 use pon_jit::JitEngine;
-use pon_runtime::dynexec::{DynCodeMode, DynCompileRequest, DynExecuteRequest, set_dynamic_code_hooks};
+use pon_runtime::dynexec::{DynCodeMode, DynCompileRequest, DynExecuteRequest, set_ast_parse_hook, set_dynamic_code_hooks};
 use pon_runtime::import::{SourceModuleRequest, active_module_attr, begin_module_execution, cached_module, end_module_execution, install_module, set_source_module_loader};
 use pon_runtime::{PyObject, intern, pon_none, pon_runtime_init, pon_sys_set_argv};
 
+mod astconv;
 pub mod build;
 
 /// Dispatches the process command line using the same behavior as the `pon-cli` binary.
@@ -66,10 +67,18 @@ fn run_file_inner(path: &Path, argv: &[String]) -> Result<()> {
     let module = lower_source(&source).context("failed to parse/lower source")?;
     set_source_module_loader(load_source_module);
     set_dynamic_code_hooks(validate_dynamic_source, execute_dynamic_source);
+    set_ast_parse_hook(astconv::parse_dynamic_ast);
     let init_status = unsafe { pon_runtime_init() };
     if init_status != 0 {
         bail!("runtime initialization failed");
     }
+    // Conservative-stack root boundary for the JIT, mirroring `pon_aot_entry`:
+    // all generated code runs in frames below this one, so a `gc.collect()`
+    // triggered inside JIT code scans the native stack range holding JIT frame
+    // locals.  Without the boundary the collector sees no stack roots at all
+    // and frees objects held only by JIT frame slots (locals across collect).
+    let mut stack_base_marker = 0usize;
+    pon_runtime::aot_entry::capture_stack_base(std::ptr::addr_of_mut!(stack_base_marker).cast::<u8>());
     let mut argv_cstrings = Vec::with_capacity(argv.len());
     for arg in argv {
         let c_arg = match CString::new(arg.as_str()) {

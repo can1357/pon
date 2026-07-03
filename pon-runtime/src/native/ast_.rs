@@ -13,12 +13,24 @@
 //! zip against the class `_fields` and keyword args store as instance
 //! attributes (CPython `ast_type_init` shape).  Both call paths treat a
 //! non-default `tp_new` as full construction, so no `__init__` leg exists.
-//! NOT modeled in v0: 3.13+ field defaults for optional fields and the
-//! missing-required-field DeprecationWarning; `compile(source, filename,
-//! mode, PyCF_ONLY_AST)` (ast.parse) is the dynexec `compile` builtin's
-//! contract, not this module's.
+//! CPython 3.13+ class data modeled for `ast.dump` default-omission parity:
+//! optional (`?`-typed) fields get a class-level `None` default, and
+//! `_field_types` maps each list (`*`-typed) field to a marker class whose
+//! `__origin__` is the builtin `list` (dump only probes `__origin__ is
+//! list`; full `typing` generics are deliberately not modeled).  NOT modeled
+//! in v0: the missing-required-field DeprecationWarning.
+//!
+//! `compile(source, filename, mode, PyCF_ONLY_AST)` (`ast.parse`) is served
+//! by the dynexec `compile` builtin through [`AstNode`]/[`AstValue`]: the
+//! host frontend parses with ruff and returns this neutral pure-data tree,
+//! and [`build_ast_object`] materializes it as `_ast` instances here, where
+//! the class table and construction machinery live.  Operator/context
+//! singletons (`Add`, `Load`, ...) are fresh instances per node, not
+//! CPython's interned singletons.
 
+use std::collections::HashMap;
 use std::ptr;
+use std::sync::OnceLock;
 
 use crate::abi::{self, pon_const_str};
 use crate::intern::intern;
@@ -170,7 +182,14 @@ static NODES: &[NodeSpec] = &[
     NodeSpec { name: "withitem", base: "AST", fields: &["context_expr", "optional_vars"], attrs: Some(&[]), doc: "withitem(expr context_expr, expr? optional_vars)" },
 ];
 
+/// Class registry for [`build_ast_object`]: node-class name -> live class
+/// object address, populated once by [`make_module`].  `OnceLock` (not
+/// `LazyLock`): the values are runtime-built heap classes, so the initializer
+/// cannot exist at declaration time.
+static CLASSES: OnceLock<HashMap<&'static str, usize>> = OnceLock::new();
+
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
+    let list_field_marker = list_field_marker_class()?;
     let mut classes: Vec<(&'static str, *mut PyObject)> = Vec::with_capacity(NODES.len());
     for spec in NODES {
         let base = if spec.base.is_empty() {
@@ -182,8 +201,9 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
                 .map(|&(_, class)| class)
                 .ok_or_else(|| format!("_ast table order broken: base '{}' of '{}' not built yet", spec.base, spec.name))?
         };
-        classes.push((spec.name, ast_class(spec, base)?));
+        classes.push((spec.name, ast_class(spec, base, list_field_marker)?));
     }
+    let _ = CLASSES.set(classes.iter().map(|&(name, class)| (name, class as usize)).collect());
     let mut attrs = Vec::with_capacity(classes.len() + 5);
     attrs.push(string_attr("__name__", "_ast")?);
     // CPython 3.14 compiler-flag constants re-exported by `ast.py`.
@@ -200,7 +220,10 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 /// Builds one `_ast` heap class: `__doc__`/`__module__`/`_fields`/
 /// `__match_args__` (+ own `_attributes` for category classes) in the
 /// namespace, then a real heap type with [`ast_node_new`] as its constructor.
-fn ast_class(spec: &NodeSpec, base: *mut PyObject) -> Result<*mut PyObject, String> {
+/// Leaf classes additionally get the CPython 3.13+ dump-parity class data:
+/// class-level `None` for `?`-optional fields and a `_field_types` dict
+/// mapping `*`-list fields to the shared list marker class.
+fn ast_class(spec: &NodeSpec, base: *mut PyObject, list_field_marker: *mut PyObject) -> Result<*mut PyObject, String> {
     let namespace = type_::new_namespace();
     if namespace.is_null() {
         return Err(format!("failed to allocate _ast.{} namespace", spec.name));
@@ -226,6 +249,14 @@ fn ast_class(spec: &NodeSpec, base: *mut PyObject) -> Result<*mut PyObject, Stri
         if let Some(names) = spec.attrs {
             namespace.set(intern("_attributes"), str_tuple(spec.name, "_attributes", names)?);
         }
+        let none = crate::abi::pon_none();
+        if none.is_null() {
+            return Err(format!("failed to fetch None for _ast.{} field defaults", spec.name));
+        }
+        for name in optional_field_names(spec) {
+            namespace.set(intern(name), none);
+        }
+        namespace.set(intern("_field_types"), field_types_dict(spec, list_field_marker)?);
     }
     let bases = if base.is_null() { &[][..] } else { std::slice::from_ref(&base) };
     // SAFETY: Bases are live class objects owned by this module build.
@@ -356,4 +387,249 @@ fn fail(message: impl Into<String>) -> *mut PyObject {
 
 fn raise_type_error(message: &str) -> *mut PyObject {
     abi::exc::raise_kind_error_text(ExceptionKind::TypeError, message)
+}
+
+/// Names of `spec`'s fields whose ASDL type in the leaf signature docstring
+/// ends with exactly `?` (optional): these get a class-level `None` default,
+/// which `ast.dump` probes via `getattr(cls, name, ...) is None` to omit
+/// unset/None fields.  `?*` is a list of optionals, not an optional field.
+fn optional_field_names(spec: &NodeSpec) -> Vec<&'static str> {
+    signature_entries(spec)
+        .filter(|&(ty, _)| ty.ends_with('?'))
+        .map(|(_, name)| name)
+        .collect()
+}
+
+/// `_field_types` payload: a dict mapping each `*`-list field to the shared
+/// list marker class.  `ast.dump` only consults `_field_types.get(name,
+/// object).__origin__ is list` to omit empty list fields, so non-list fields
+/// are simply absent (the `object` default has no `__origin__`).
+fn field_types_dict(spec: &NodeSpec, list_field_marker: *mut PyObject) -> Result<*mut PyObject, String> {
+    // SAFETY: An empty Vec's dangling pointer is valid for a zero-length read.
+    let dict = unsafe { abi::map::pon_build_map(Vec::new().as_mut_ptr(), 0) };
+    if dict.is_null() {
+        return Err(format!("failed to allocate _ast.{}._field_types", spec.name));
+    }
+    for (ty, name) in signature_entries(spec) {
+        if !ty.ends_with('*') {
+            continue;
+        }
+        // SAFETY: Allocation helpers return NULL with a diagnostic on failure.
+        let key = unsafe { pon_const_str(name.as_ptr(), name.len()) };
+        if key.is_null() {
+            return Err(format!("failed to allocate _ast.{}._field_types key '{name}'", spec.name));
+        }
+        // SAFETY: `dict`, `key`, and the marker class are live heap objects.
+        if unsafe { abi::map::pon_map_insert(dict, key, list_field_marker) }.is_null() {
+            return Err(drain_error(format!("failed to populate _ast.{}._field_types", spec.name)));
+        }
+    }
+    Ok(dict)
+}
+
+/// Parses the flat leaf ASDL signature in `spec.doc` — e.g. `Assign(expr*
+/// targets, expr value, string? type_comment)` — into `(type, name)` entries.
+/// Category classes have empty `fields` and multi-signature docs; they yield
+/// nothing.
+fn signature_entries(spec: &NodeSpec) -> impl Iterator<Item = (&'static str, &'static str)> {
+    let body = if spec.fields.is_empty() {
+        None
+    } else {
+        spec.doc
+            .find('(')
+            .and_then(|open| spec.doc.rfind(')').map(|close| &spec.doc[open + 1..close]))
+    };
+    body.unwrap_or("").split(',').filter_map(|entry| {
+        let mut parts = entry.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some(ty), Some(name)) => Some((ty, name)),
+            _ => None,
+        }
+    })
+}
+
+/// Builds the shared `_field_types` list marker: a minimal heap class whose
+/// only class datum is `__origin__ = <builtins.list>`.  `ast.dump` treats any
+/// value with `__origin__ is list` as a list-typed field; full `typing`
+/// generic aliases are deliberately not modeled (documented divergence:
+/// `repr(SomeNode._field_types)` differs from CPython).
+fn list_field_marker_class() -> Result<*mut PyObject, String> {
+    // SAFETY: Global loads return NULL with the runtime error set on failure.
+    let list_type = unsafe { abi::pon_load_global(intern("list"), ptr::null_mut()) };
+    if list_type.is_null() {
+        return Err(drain_error("builtin `list` unavailable while building _ast"));
+    }
+    let namespace = type_::new_namespace();
+    if namespace.is_null() {
+        return Err("failed to allocate _ast list-field marker namespace".to_owned());
+    }
+    // SAFETY: `new_namespace` returned a live namespace box; `list_type` is live.
+    unsafe {
+        (*namespace).set(intern("__origin__"), list_type);
+    }
+    // SAFETY: Empty bases slice; namespace ownership transfers to the class.
+    let class = unsafe { type_::build_class_from_namespace("_ListFieldType", &[], namespace, &[]) };
+    if class.is_null() {
+        return Err(drain_error("failed to create _ast list-field marker class"));
+    }
+    // SAFETY: Freshly built class; mirror `pon_build_class`'s ob_type fix.
+    unsafe {
+        if (*class).ob_type.is_null() {
+            (*class).ob_type = abi::runtime_type_type().cast_const();
+        }
+    }
+    Ok(class)
+}
+
+/// Reads and clears the pending runtime error, prefixing it with `context`.
+fn drain_error(context: impl Into<String>) -> String {
+    let context = context.into();
+    let Some(detail) = pon_err_message() else {
+        return context;
+    };
+    pon_err_clear();
+    format!("{context}: {detail}")
+}
+
+/// Location attributes for one node of a ruff-parsed tree: 1-based lines and
+/// 0-based UTF-8 byte column offsets, CPython's `ast` convention.  Present
+/// only on nodes whose class has location `_attributes`.
+#[derive(Clone, Copy, Debug)]
+pub struct NodeSpan {
+    pub lineno: u32,
+    pub col_offset: u32,
+    pub end_lineno: u32,
+    pub end_col_offset: u32,
+}
+
+/// One `_ast` node of the neutral tree produced by the host's ruff-AST
+/// converter: class name from [`NODES`], field values in `_fields` order,
+/// and optional location attributes.
+#[derive(Debug)]
+pub struct AstNode {
+    pub class: &'static str,
+    pub span: Option<NodeSpan>,
+    pub fields: Vec<(&'static str, AstValue)>,
+}
+
+/// One field value of an [`AstNode`]: the closed set of Python values the
+/// CPython 3.14 ASDL schema stores in AST fields.
+#[derive(Debug)]
+pub enum AstValue {
+    /// Python `None` (absent optional field or `Constant(None)`).
+    None,
+    /// Python `Ellipsis` (`Constant(...)`).
+    Ellipsis,
+    Bool(bool),
+    Int(i64),
+    /// Integer literal token wider than `i64`, in `pon_const_bigint` syntax
+    /// (decimal or `0b`/`0o`/`0x` prefixed, `_` separators allowed).
+    BigInt(String),
+    Float(f64),
+    Complex { real: f64, imag: f64 },
+    Str(String),
+    Bytes(Vec<u8>),
+    Node(Box<AstNode>),
+    List(Vec<AstValue>),
+}
+
+/// Materializes a neutral tree as real `_ast` instances.  Ensures the `_ast`
+/// module exists first (a direct `compile(..., PyCF_ONLY_AST)` call needs no
+/// prior `import ast`), so class identities always match the import cache.
+pub fn build_ast_object(root: &AstNode) -> Result<*mut PyObject, String> {
+    ensure_ast_classes()?;
+    build_node(root)
+}
+
+/// Guarantees [`CLASSES`] is populated by forcing the `_ast` module through
+/// the normal import-cache path exactly once.
+fn ensure_ast_classes() -> Result<(), String> {
+    if CLASSES.get().is_some() {
+        return Ok(());
+    }
+    if crate::import::cached_module(intern("_ast")).is_none() {
+        super::make_module("_ast")?;
+    }
+    if CLASSES.get().is_some() {
+        Ok(())
+    } else {
+        Err("_ast class registry unavailable after module construction".to_owned())
+    }
+}
+
+fn class_object(name: &str) -> Result<*mut PyObject, String> {
+    CLASSES
+        .get()
+        .and_then(|map| map.get(name).copied())
+        .map(|address| address as *mut PyObject)
+        .ok_or_else(|| format!("_ast has no node class named '{name}'"))
+}
+
+fn build_node(node: &AstNode) -> Result<*mut PyObject, String> {
+    let class = class_object(node.class)?;
+    // SAFETY: Registry entries are live `_ast` heap classes built by
+    // `make_module`; `type_new` allocates a plain instance of `class`.
+    let instance = unsafe { type_::type_new(class.cast::<PyType>(), ptr::null_mut(), ptr::null_mut()) };
+    if instance.is_null() {
+        return Err(drain_error(format!("failed to allocate _ast.{} instance", node.class)));
+    }
+    for (field, value) in &node.fields {
+        let object = build_value(value)?;
+        store_field(instance, node.class, field, object)?;
+    }
+    if let Some(span) = &node.span {
+        for (name, value) in [
+            ("lineno", i64::from(span.lineno)),
+            ("col_offset", i64::from(span.col_offset)),
+            ("end_lineno", i64::from(span.end_lineno)),
+            ("end_col_offset", i64::from(span.end_col_offset)),
+        ] {
+            // SAFETY: `pon_const_int` returns NULL with a diagnostic on failure.
+            let object = unsafe { abi::pon_const_int(value) };
+            if object.is_null() {
+                return Err(drain_error(format!("failed to allocate _ast.{}.{name}", node.class)));
+            }
+            store_field(instance, node.class, name, object)?;
+        }
+    }
+    Ok(instance)
+}
+
+fn store_field(instance: *mut PyObject, class: &str, field: &str, value: *mut PyObject) -> Result<(), String> {
+    // SAFETY: The store helper untags the value and enforces the
+    // NULL-sentinel error contract (same leg as `ast_node_new`).
+    if unsafe { abi::attr::pon_store_attr(instance, intern(field), value) }.is_null() {
+        return Err(drain_error(format!("failed to store _ast.{class}.{field}")));
+    }
+    Ok(())
+}
+
+fn build_value(value: &AstValue) -> Result<*mut PyObject, String> {
+    // SAFETY: Every constructor below returns NULL with a diagnostic on
+    // failure; inputs are plain scalars or live objects built here.
+    let object = match value {
+        AstValue::None => unsafe { abi::pon_none() },
+        AstValue::Ellipsis => unsafe { abi::pon_load_global(intern("Ellipsis"), ptr::null_mut()) },
+        AstValue::Bool(value) => unsafe { abi::number::pon_const_bool(i32::from(*value)) },
+        AstValue::Int(value) => unsafe { abi::pon_const_int(*value) },
+        AstValue::BigInt(token) => unsafe { abi::number::pon_const_bigint(token.as_ptr(), token.len()) },
+        AstValue::Float(value) => unsafe { abi::number::pon_const_float(*value) },
+        AstValue::Complex { real, imag } => unsafe { abi::number::pon_const_complex(*real, *imag) },
+        AstValue::Str(text) => unsafe { pon_const_str(text.as_ptr(), text.len()) },
+        AstValue::Bytes(bytes) => unsafe { abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) },
+        AstValue::Node(node) => return build_node(node),
+        AstValue::List(items) => {
+            let mut built = Vec::with_capacity(items.len());
+            for item in items {
+                built.push(build_value(item)?);
+            }
+            // SAFETY: `built` is a live contiguous slice for the call; an
+            // empty Vec's dangling pointer is valid for a zero-length read.
+            unsafe { abi::seq::pon_build_list(built.as_mut_ptr(), built.len()) }
+        }
+    };
+    if object.is_null() {
+        return Err(drain_error("failed to build _ast field value"));
+    }
+    Ok(object)
 }

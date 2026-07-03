@@ -70,11 +70,16 @@ pub struct DynExecuteRequest<'a> {
 pub type DynCompileHook = for<'a> fn(DynCompileRequest<'a>) -> Result<(), String>;
 /// Compile and execute dynamic source.
 pub type DynExecuteHook = for<'a> fn(DynExecuteRequest<'a>) -> Result<*mut PyObject, String>;
+/// Parse dynamic source to a neutral `_ast` tree (`compile` with
+/// `PyCF_ONLY_AST`, i.e. `ast.parse`).  `Err` means the source failed to
+/// parse and surfaces as `SyntaxError`.
+pub type DynAstParseHook = for<'a> fn(DynCompileRequest<'a>) -> Result<crate::native::AstNode, String>;
 
 #[derive(Default)]
 struct DynHooks {
     compile: Option<DynCompileHook>,
     execute: Option<DynExecuteHook>,
+    ast_parse: Option<DynAstParseHook>,
 }
 
 static DYN_HOOKS: LazyLock<Mutex<DynHooks>> = LazyLock::new(|| Mutex::new(DynHooks::default()));
@@ -84,6 +89,14 @@ pub fn set_dynamic_code_hooks(compile: DynCompileHook, execute: DynExecuteHook) 
     let mut hooks = DYN_HOOKS.lock().unwrap_or_else(|poison| poison.into_inner());
     hooks.compile = Some(compile);
     hooks.execute = Some(execute);
+}
+
+/// Install the host callback serving `compile(..., PyCF_ONLY_AST)`.
+/// Separate from [`set_dynamic_code_hooks`] so embeddings without an AST
+/// bridge (AoT products) keep the typed refusal.
+pub fn set_ast_parse_hook(hook: DynAstParseHook) {
+    let mut hooks = DYN_HOOKS.lock().unwrap_or_else(|poison| poison.into_inner());
+    hooks.ast_parse = Some(hook);
 }
 
 #[repr(C)]
@@ -471,8 +484,10 @@ fn namespace_args(args: &[*mut PyObject], name: &str) -> Result<(*mut PyObject, 
 }
 
 /// CPython `PyCF_ONLY_AST` (`ast.PyCF_ONLY_AST` / `_ast` re-export): compile
-/// to an AST object instead of a code object.  pon's `compile` builds code
-/// objects only; `ast.parse` routes here and gets the typed refusal below.
+/// to an AST object instead of a code object.  With an installed
+/// [`DynAstParseHook`] the host parses the source and the `_ast` builder
+/// materializes real node trees; without one (AoT products) the typed
+/// refusal below stands.
 const PYCF_ONLY_AST: i64 = 0x400;
 
 #[unsafe(no_mangle)]
@@ -486,7 +501,9 @@ pub unsafe extern "C" fn builtin_compile(argv: *mut *mut PyObject, argc: usize) 
     // full signature to seven slots (absent = NULL); positional callers pass
     // three to six.  `dont_inherit`/`optimize`/`_feature_version` select
     // CPython pipeline variants pon does not model and are accepted unread
-    // (`ast.parse` passes their defaults).
+    // (`ast.parse` passes their defaults).  Of the remaining flag bits only
+    // `PyCF_ONLY_AST` is honored; `PyCF_TYPE_COMMENTS`/`ALLOW_TOP_LEVEL_AWAIT`
+    // /`OPTIMIZED_AST` are accepted unread.
     if args.len() < 3 || args.len() > 7 {
         return return_null_with_error(format!("compile() expected 3 to 6 arguments, got {}", args.len()));
     }
@@ -503,17 +520,38 @@ pub unsafe extern "C" fn builtin_compile(argv: *mut *mut PyObject, argc: usize) 
         Ok(flags) => flags,
         Err(message) => return return_null_with_error(message),
     };
-    if flags & PYCF_ONLY_AST != 0 {
-        const MESSAGE: &str =
-            "pon does not support compile() with ast.PyCF_ONLY_AST (ast.parse); only code-object compilation is available";
-        return abi::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::NotImplementedError, MESSAGE);
-    }
     let Some(mode) = DynCodeMode::from_str(&mode_text) else {
         return return_null_with_error("compile() mode must be 'exec', 'eval', or 'single'");
     };
+    if flags & PYCF_ONLY_AST != 0 {
+        return compile_only_ast(&source, &filename, mode);
+    }
     match compile_source(source, filename, mode) {
         Ok(code) => code,
         Err(message) => return_null_with_error(message),
+    }
+}
+
+/// `compile(source, filename, mode, PyCF_ONLY_AST)`: host hook parses to a
+/// neutral tree, the `_ast` builder materializes node objects.  Parse
+/// failures raise `SyntaxError`; builder failures surface through the
+/// standard dynamic-code error path.
+fn compile_only_ast(source: &str, filename: &str, mode: DynCodeMode) -> *mut PyObject {
+    let hook = {
+        let hooks = DYN_HOOKS.lock().unwrap_or_else(|poison| poison.into_inner());
+        hooks.ast_parse
+    };
+    let Some(hook) = hook else {
+        const MESSAGE: &str =
+            "pon does not support compile() with ast.PyCF_ONLY_AST (ast.parse) in this embedding; only code-object compilation is available";
+        return abi::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::NotImplementedError, MESSAGE);
+    };
+    match hook(DynCompileRequest { source, filename, mode }) {
+        Ok(tree) => match crate::native::build_ast_object(&tree) {
+            Ok(object) => object,
+            Err(message) => return_null_with_error(message),
+        },
+        Err(message) => abi::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::SyntaxError, &message),
     }
 }
 
