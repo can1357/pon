@@ -97,6 +97,8 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         function_attr("excepthook", sys_excepthook),
         function_attr("getrecursionlimit", sys_getrecursionlimit),
         function_attr("setrecursionlimit", sys_setrecursionlimit),
+        function_attr("getfilesystemencoding", sys_getfilesystemencoding),
+        function_attr("getfilesystemencodeerrors", sys_getfilesystemencodeerrors),
         std_stream_attr("stdout", 1),
         std_stream_attr("stderr", 2),
     ];
@@ -820,6 +822,45 @@ unsafe extern "C" fn sys_intern(argv: *mut *mut PyObject, argc: usize) -> *mut P
         return return_null_with_error("intern() argument must be str");
     }
     value
+}
+
+/// `sys.getfilesystemencoding()`: `'utf-8'`.
+///
+/// CPython derives the filesystem encoding from the locale / PEP 529/540
+/// machinery; on macOS (and every UTF-8-mode POSIX build) the answer is
+/// `'utf-8'`, which is also the only encoding pon's fs surface actually
+/// uses (`os.fsencode`/`os.fsdecode` are strict UTF-8 — `native/os.rs`).
+/// `test.support.os_helper` calls it at import (:142/:145) to build the
+/// `TESTFN_UNDECODABLE` probe.
+unsafe extern "C" fn sys_getfilesystemencoding(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let _ = argv;
+    if argc != 0 {
+        return raise_type_error(&format!("sys.getfilesystemencoding() takes no arguments ({argc} given)"));
+    }
+    const ENCODING: &str = "utf-8";
+    // SAFETY: Runtime allocation helper returns NULL with a diagnostic on failure.
+    unsafe { pon_const_str(ENCODING.as_ptr(), ENCODING.len()) }
+}
+
+/// `sys.getfilesystemencodeerrors()`: `'surrogateescape'`.
+///
+/// The CPython POSIX contract (PEP 383): `os.fsdecode` maps undecodable
+/// bytes to lone surrogates.  pon reports the same handler NAME — stdlib
+/// readers branch on it — but pon str cannot carry lone surrogates, so the
+/// builtin codec cores degrade a requested-but-unsupported
+/// `'surrogateescape'` into the strict-mode `UnicodeDecodeError` instead
+/// (documented divergence; see `native/codecs.rs::utf8_decode_core`).
+/// `test.support.os_helper:145-147` consumes exactly that shape: its
+/// `except UnicodeDecodeError` arm engages and `TESTFN_UNDECODABLE`
+/// honestly stays `None` (CPython would bind a surrogate-carrying name).
+unsafe extern "C" fn sys_getfilesystemencodeerrors(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let _ = argv;
+    if argc != 0 {
+        return raise_type_error(&format!("sys.getfilesystemencodeerrors() takes no arguments ({argc} given)"));
+    }
+    const ERRORS: &str = "surrogateescape";
+    // SAFETY: Runtime allocation helper returns NULL with a diagnostic on failure.
+    unsafe { pon_const_str(ERRORS.as_ptr(), ERRORS.len()) }
 }
 
 /// Source of `sys.exception()` / `sys.exc_info()`: the object-safe pending

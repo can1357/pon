@@ -107,6 +107,17 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
             return Err(format!("failed to allocate {module}._get_exports_list"));
         }
         attrs.push((intern("_get_exports_list"), exports_list));
+        // `os.py`'s fs-codec pair (`fsencode`/`fsdecode`, never re-exported
+        // into `posix`); `test.support.os_helper` consumes both at module
+        // body in its FS_NONASCII probe loop.
+        for (name, entry) in [("fsencode", os_fsencode as BuiltinFn), ("fsdecode", os_fsdecode as BuiltinFn)] {
+            // SAFETY: Live builtin entry points with the runtime calling convention.
+            let function = unsafe { crate::abi::pon_make_function(entry as *const u8, 1, intern(name)) };
+            if function.is_null() {
+                return Err(format!("failed to allocate {module}.{name}"));
+            }
+            attrs.push((intern(name), function));
+        }
         attrs.push((intern("PathLike"), pathlike_class()?));
     }
     Ok(attrs)
@@ -186,6 +197,84 @@ unsafe extern "C" fn os_fspath(argv: *mut *mut PyObject, argc: usize) -> *mut Py
     let message = format!("expected str, bytes or os.PathLike object, not {display}");
     // SAFETY: Typed raise helper.
     unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) }
+}
+
+/// `os.fsencode(filename)`: `os.py`'s fs-codec pair, served natively.
+/// fspath coercion first (str/bytes pass, `__fspath__` defers), then str
+/// encodes with the filesystem encoding.  Divergence: pon's filesystem
+/// encoding is strict UTF-8 with no `surrogateescape` — pon str never
+/// carries lone surrogates, so the encode step itself is total.
+unsafe extern "C" fn os_fsencode(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Delegated coercion under the caller's own live argv contract.
+    let coerced = unsafe { os_fspath(argv, argc) };
+    if coerced.is_null() {
+        return std::ptr::null_mut();
+    }
+    let raw = crate::tag::untag_arg(coerced);
+    if !raw.is_null() && !crate::tag::is_small_int(raw) {
+        // SAFETY: Heap pointer with a live header after the tag checks.
+        if let Some(text) = unsafe { crate::types::type_::unicode_text(raw) } {
+            // SAFETY: Bytes allocation helper follows the NULL-sentinel contract.
+            return unsafe { crate::abi::str_::pon_const_bytes(text.as_ptr(), text.len()) };
+        }
+        // SAFETY: Live header per the checks above.
+        if crate::types::bytes_::is_bytes_type(unsafe { (*raw).ob_type }) {
+            return coerced;
+        }
+    }
+    fs_codec_hook_type_error("fsencode", raw)
+}
+
+/// `os.fsdecode(filename)`: bytes decode with the filesystem encoding
+/// (strict UTF-8 — see [`os_fsencode`] for the surrogateescape divergence),
+/// str passes through.
+unsafe extern "C" fn os_fsdecode(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Delegated coercion under the caller's own live argv contract.
+    let coerced = unsafe { os_fspath(argv, argc) };
+    if coerced.is_null() {
+        return std::ptr::null_mut();
+    }
+    let raw = crate::tag::untag_arg(coerced);
+    if !raw.is_null() && !crate::tag::is_small_int(raw) {
+        // SAFETY: Heap pointer with a live header after the tag checks.
+        if unsafe { crate::types::type_::unicode_text(raw) }.is_some() {
+            return coerced;
+        }
+        // SAFETY: Live header per the checks above.
+        if crate::types::bytes_::is_bytes_type(unsafe { (*raw).ob_type }) {
+            // SAFETY: The type check proved PyBytes layout.
+            let payload = unsafe { (*raw.cast::<crate::types::bytes_::PyBytes>()).as_slice() };
+            return match super::codecs::utf8_decode_core(payload, "strict", true) {
+                Ok((text, _)) => {
+                    // SAFETY: String allocation helper follows the NULL-sentinel contract.
+                    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+                }
+                Err(error) => error.raise(),
+            };
+        }
+    }
+    fs_codec_hook_type_error("fsdecode", raw)
+}
+
+/// TypeError for a `__fspath__` hook that returned a non-str/bytes object.
+/// Direct non-path arguments already raised inside the fspath coercion;
+/// CPython raises this shape check inside `fspath` itself (`expected
+/// X.__fspath__() to return str or bytes, not Y`), pon's message names the
+/// consuming codec instead because the coercion returns hook results
+/// unvalidated.
+fn fs_codec_hook_type_error(what: &str, raw: *mut PyObject) -> *mut PyObject {
+    let display = if raw.is_null() {
+        "NoneType"
+    } else if crate::tag::is_small_int(raw) {
+        "int"
+    } else {
+        // SAFETY: Heap pointer with a live header per the caller's checks.
+        unsafe { crate::types::dict::type_name(raw) }.unwrap_or("object")
+    };
+    crate::abi::exc::raise_kind_error_text(
+        ExceptionKind::TypeError,
+        &format!("os.{what}: __fspath__() must return str or bytes, not {display}"),
+    )
 }
 
 /// `os.urandom(size)`: `size` cryptographically random bytes from the OS
@@ -425,6 +514,7 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("WSTOPSIG", os_wstopsig, 1),
     ("close", os_close, 1),
     ("getcwd", os_getcwd, 0),
+    ("getpid", os_getpid, 0),
     ("lstat", os_lstat, crate::native::builtins_mod::VARIADIC_ARITY),
     ("open", os_open, crate::native::builtins_mod::VARIADIC_ARITY),
     ("read", os_read, 2),
@@ -449,6 +539,14 @@ unsafe extern "C" fn os_getcwd(_argv: *mut *mut PyObject, _argc: usize) -> *mut 
         }
         Err(error) => raise_errno(error.raw_os_error().unwrap_or(libc::EIO), None),
     }
+}
+
+/// `os.getpid()` over `std::process::id` (`test.support.os_helper` reads it
+/// at module body: `TESTFN_ASCII` embeds the pid to disambiguate parallel
+/// test runs).
+unsafe extern "C" fn os_getpid(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+    // SAFETY: Integer boxing helper follows the NULL-sentinel error contract.
+    unsafe { crate::abi::pon_const_int(i64::from(std::process::id())) }
 }
 
 /// `os.readlink(path)` over `std::fs::read_link` (`posixpath.realpath`'s
