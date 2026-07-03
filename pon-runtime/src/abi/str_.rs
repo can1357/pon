@@ -1095,6 +1095,7 @@ unsafe extern "C" fn str_getattro(object: *mut PyObject, name: *mut PyObject) ->
         "maketrans" => bound_str_method(object, name, str_maketrans_entry),
         "format" => bound_str_method(object, name, str_format_entry),
         "format_map" => bound_str_method(object, name, str_format_map_entry),
+        "__doc__" => unsafe { super::pon_none() },
         _ => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
     }
 }
