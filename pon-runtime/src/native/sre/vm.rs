@@ -967,26 +967,32 @@ fn execute(nodes: &[Node], subject: &SubjectData, start: MatchState, collect_all
                     stack.push(Thread { segments, state: thread.state.clone() });
                 }
             }
-            Node::Repeat { body, min, max, kind } => {
-                let candidates = repeat_candidates(body, subject, thread.state, *min, *max, *kind)?;
-                match kind {
-                    RepeatKind::Greedy => {
-                        for state in candidates {
-                            stack.push(Thread { segments: rest.clone(), state });
-                        }
-                    }
-                    RepeatKind::Lazy => {
-                        for state in candidates.into_iter().rev() {
-                            stack.push(Thread { segments: rest.clone(), state });
-                        }
-                    }
-                    RepeatKind::Possessive => {
-                        if let Some(state) = candidates.into_iter().last() {
-                            stack.push(Thread { segments: rest, state });
-                        }
+            Node::Repeat { body, min, max, kind } => match kind {
+                RepeatKind::Possessive => {
+                    // Possessive `X{m,n}+` is an atomic wrapper over the greedy
+                    // repeat (CPython/Python docs: `x*+` == `(?>x*)`): commit to
+                    // the greedy repeat's most-preferred (forward-march) result
+                    // and never backtrack into it.
+                    if let Some(state) =
+                        repeat_candidates(body, subject, thread.state, *min, *max, RepeatKind::Greedy)?
+                            .into_iter()
+                            .next()
+                    {
+                        stack.push(Thread { segments: rest, state });
                     }
                 }
-            }
+                RepeatKind::Greedy | RepeatKind::Lazy => {
+                    // `repeat_candidates` returns candidates most-preferred
+                    // first; push reversed so the preferred one lands on top of
+                    // the LIFO backtracking stack and is tried first.
+                    for state in repeat_candidates(body, subject, thread.state, *min, *max, *kind)?
+                        .into_iter()
+                        .rev()
+                    {
+                        stack.push(Thread { segments: rest.clone(), state });
+                    }
+                }
+            },
             Node::Assert { positive, width, body } => {
                 if thread.state.pos >= *width {
                     let mut assert_state = thread.state.clone();
@@ -1023,38 +1029,81 @@ fn repeat_candidates(
     max: Option<usize>,
     kind: RepeatKind,
 ) -> Result<Vec<MatchState>, Error> {
-    let cap = max.unwrap_or_else(|| subject.len().saturating_sub(state.pos).saturating_add(min).saturating_add(1));
-    let mut candidates = Vec::new();
-    let mut frontier = vec![(0usize, state)];
-    let mut seen = HashSet::new();
-    while !frontier.is_empty() {
-        let mut next_frontier = Vec::new();
-        for (count, current) in frontier {
-            if count >= min {
-                candidates.push(current.clone());
-                if candidates.len() >= RESULT_LIMIT {
-                    return Ok(candidates);
-                }
-            }
-            if count >= cap {
-                continue;
-            }
-            for next in execute(body, subject, current.clone(), true)? {
-                if next.pos == current.pos {
-                    continue;
-                }
-                let key = (count + 1, next.pos, next.marks.clone(), next.lastindex);
-                if seen.insert(key) {
-                    next_frontier.push((count + 1, next));
-                }
-            }
-        }
-        if kind == RepeatKind::Possessive && next_frontier.is_empty() {
-            break;
-        }
-        frontier = next_frontier;
+    // Preference-ordered depth-first enumeration of repetition end states:
+    // index 0 is the match the backtracking engine tries first — greedy prefers
+    // more repetitions (forward-march longest), lazy prefers fewer.  Emitted
+    // iteratively through an explicit work stack so deep repetitions (`.*` over
+    // a long input) cannot overflow the native stack.  `execute(body, .., true)`
+    // already yields body matches in preference order, so visiting them
+    // left-to-right and interleaving an `Emit` for the current stop point
+    // reproduces CPython's nested backtracking order.
+    enum Work {
+        Visit { count: usize, state: MatchState },
+        Emit(MatchState),
     }
-    Ok(candidates)
+    let lazy = matches!(kind, RepeatKind::Lazy);
+    let cap = max.unwrap_or_else(|| subject.len().saturating_sub(state.pos).saturating_add(min).saturating_add(1));
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut work = vec![Work::Visit { count: 0, state }];
+    let mut steps = 0usize;
+    while let Some(item) = work.pop() {
+        steps += 1;
+        if steps > STEP_LIMIT {
+            return Err(Error::ExecutionLimit);
+        }
+        match item {
+            Work::Emit(state) => {
+                out.push(state);
+                if out.len() >= RESULT_LIMIT {
+                    return Ok(out);
+                }
+            }
+            Work::Visit { count, state } => {
+                let children = if count < cap {
+                    let mut kids = Vec::new();
+                    for next in execute(body, subject, state.clone(), true)? {
+                        if next.pos == state.pos && count >= min {
+                            // A zero-width repetition once the minimum is met
+                            // makes no progress: stop expanding to keep the
+                            // enumeration terminating, matching CPython's guard.
+                            // Below the minimum an empty body match still counts
+                            // toward `min` (e.g. `(?:)+`, `(?:a*)+` on ""), so it
+                            // is accepted; `count` strictly rises to `min`, which
+                            // bounds the empty chain.
+                            continue;
+                        }
+                        let key = (count + 1, next.pos, next.marks.clone(), next.lastindex);
+                        if seen.insert(key) {
+                            kids.push(next);
+                        }
+                    }
+                    kids
+                } else {
+                    Vec::new()
+                };
+                let emit_self = count >= min;
+                if lazy {
+                    // Lazy stops before recursing: children below, `Emit` on top.
+                    for child in children.into_iter().rev() {
+                        work.push(Work::Visit { count: count + 1, state: child });
+                    }
+                    if emit_self {
+                        work.push(Work::Emit(state));
+                    }
+                } else {
+                    // Greedy recurses before stopping: `Emit` below the children.
+                    if emit_self {
+                        work.push(Work::Emit(state));
+                    }
+                    for child in children.into_iter().rev() {
+                        work.push(Work::Visit { count: count + 1, state: child });
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 impl Charset {
