@@ -72,6 +72,7 @@
     "pon-conformance/corpus/cpython/function_attrs.py",
     "pon-conformance/corpus/cpython/function_defaults_assign.py",
     "pon-conformance/corpus/cpython/function_doc_meta.py",
+    "pon-conformance/corpus/cpython/future_annotations_pep563.py",
     "pon-conformance/corpus/cpython/gen_try_stack.py",
     "pon-conformance/corpus/cpython/generator_expressions.py",
     "pon-conformance/corpus/cpython/generators_plain_yield.py",
@@ -125,6 +126,9 @@
     "pon-conformance/corpus/cpython/pickle_buffer.py",
     "pon-conformance/corpus/cpython/properties_descriptors.py",
     "pon-conformance/corpus/cpython/re_basic.py",
+    "pon-conformance/corpus/cpython/re_match_subscript.py",
+    "pon-conformance/corpus/cpython/re_pos_endpos.py",
+    "pon-conformance/corpus/cpython/re_possessive_atomic.py",
     "pon-conformance/corpus/cpython/richcmp.py",
     "pon-conformance/corpus/cpython/seq_ordering.py",
     "pon-conformance/corpus/cpython/seq_repeat.py",
@@ -180,6 +184,7 @@
     "pon-conformance/corpus/cpython/type_dict_descriptors.py",
     "pon-conformance/corpus/cpython/type_name_attrs.py",
     "pon-conformance/corpus/cpython/type_unbound_methods.py",
+    "pon-conformance/corpus/cpython/typing_namedtuple_construct.py",
     "pon-conformance/corpus/cpython/unicodedata_basic.py",
     "pon-conformance/corpus/cpython/union_types.py",
     "pon-conformance/corpus/cpython/unittest_smoke.py",
@@ -194,5 +199,5 @@
     "pon-conformance/corpus/cpython/yield_from_list.py",
     "pon-conformance/corpus/cpython/yield_shapes.py"
   ],
-  "min_pass_count": 192
+  "min_pass_count": 197
 }
