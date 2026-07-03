@@ -322,6 +322,34 @@ impl Pattern {
         self.finditer_data(SubjectData::from_bytes(subject))
     }
 
+    pub fn match_str_at(&self, subject: &str, pos: usize) -> Result<Option<Match>, Error> {
+        self.match_data(SubjectData::from_str(subject), pos, None)
+    }
+
+    pub fn match_bytes_at(&self, subject: &[u8], pos: usize) -> Result<Option<Match>, Error> {
+        self.match_data(SubjectData::from_bytes(subject), pos, None)
+    }
+
+    pub fn fullmatch_str_at(&self, subject: &str, pos: usize) -> Result<Option<Match>, Error> {
+        let data = SubjectData::from_str(subject);
+        let end = data.len();
+        self.match_data(data, pos, Some(end))
+    }
+
+    pub fn fullmatch_bytes_at(&self, subject: &[u8], pos: usize) -> Result<Option<Match>, Error> {
+        let data = SubjectData::from_bytes(subject);
+        let end = data.len();
+        self.match_data(data, pos, Some(end))
+    }
+
+    pub fn search_str_at(&self, subject: &str, pos: usize) -> Result<Option<Match>, Error> {
+        self.search_data_from(SubjectData::from_str(subject), pos)
+    }
+
+    pub fn search_bytes_at(&self, subject: &[u8], pos: usize) -> Result<Option<Match>, Error> {
+        self.search_data_from(SubjectData::from_bytes(subject), pos)
+    }
+
     pub fn findall_str(&self, subject: &str) -> Result<Vec<Vec<Option<MatchedValue>>>, Error> {
         Ok(self.finditer_str(subject)?.iter().map(Match::findall_groups).collect())
     }
@@ -355,8 +383,14 @@ impl Pattern {
     }
 
     fn search_data(&self, data: SubjectData) -> Result<Option<Match>, Error> {
-        for start in 0..=data.len() {
-            if let Some(matched) = self.match_data(data.clone(), start, None)? {
+        self.search_data_from(data, 0)
+    }
+
+    /// Search for the leftmost match at or after `start` (CPython
+    /// `Pattern.search`'s `pos`), scanning successive start offsets.
+    fn search_data_from(&self, data: SubjectData, start: usize) -> Result<Option<Match>, Error> {
+        for pos in start..=data.len() {
+            if let Some(matched) = self.match_data(data.clone(), pos, None)? {
                 return Ok(Some(matched));
             }
         }
@@ -1060,44 +1094,56 @@ fn repeat_candidates(
                 }
             }
             Work::Visit { count, state } => {
-                let children = if count < cap {
-                    let mut kids = Vec::new();
-                    for next in execute(body, subject, state.clone(), true)? {
-                        if next.pos == state.pos && count >= min {
-                            // A zero-width repetition once the minimum is met
-                            // makes no progress: stop expanding to keep the
-                            // enumeration terminating, matching CPython's guard.
-                            // Below the minimum an empty body match still counts
-                            // toward `min` (e.g. `(?:)+`, `(?:a*)+` on ""), so it
-                            // is accepted; `count` strictly rises to `min`, which
-                            // bounds the empty chain.
-                            continue;
-                        }
-                        let key = (count + 1, next.pos, next.marks.clone(), next.lastindex);
-                        if seen.insert(key) {
-                            kids.push(next);
-                        }
-                    }
-                    kids
+                let body_matches = if count < cap {
+                    execute(body, subject, state.clone(), true)?
                 } else {
                     Vec::new()
                 };
+                // Classify each body match (kept in preference order): a deeper
+                // repetition (advancing, or an empty match while still below
+                // `min`, which still counts toward it) versus a trailing empty
+                // iteration.  Once `min` is met CPython performs exactly one
+                // empty iteration — updating captures — then stops, so an empty
+                // match becomes a terminal candidate rather than a recursion.
+                enum Step {
+                    Recurse(MatchState),
+                    Trailing(MatchState),
+                }
+                let mut steps_out = Vec::new();
+                for next in body_matches {
+                    if next.pos == state.pos && count >= min {
+                        steps_out.push(Step::Trailing(next));
+                        continue;
+                    }
+                    let key = (count + 1, next.pos, next.marks.clone(), next.lastindex);
+                    if seen.insert(key) {
+                        steps_out.push(Step::Recurse(next));
+                    }
+                }
                 let emit_self = count >= min;
                 if lazy {
-                    // Lazy stops before recursing: children below, `Emit` on top.
-                    for child in children.into_iter().rev() {
-                        work.push(Work::Visit { count: count + 1, state: child });
+                    // Lazy prefers the fewest repetitions: bare stop first, then
+                    // the body steps in preference order.
+                    for step in steps_out.into_iter().rev() {
+                        match step {
+                            Step::Recurse(s) => work.push(Work::Visit { count: count + 1, state: s }),
+                            Step::Trailing(s) => work.push(Work::Emit(s)),
+                        }
                     }
                     if emit_self {
                         work.push(Work::Emit(state));
                     }
                 } else {
-                    // Greedy recurses before stopping: `Emit` below the children.
+                    // Greedy prefers more repetitions: body steps first, then the
+                    // bare stop.
                     if emit_self {
                         work.push(Work::Emit(state));
                     }
-                    for child in children.into_iter().rev() {
-                        work.push(Work::Visit { count: count + 1, state: child });
+                    for step in steps_out.into_iter().rev() {
+                        match step {
+                            Step::Recurse(s) => work.push(Work::Visit { count: count + 1, state: s }),
+                            Step::Trailing(s) => work.push(Work::Emit(s)),
+                        }
                     }
                 }
             }

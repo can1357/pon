@@ -1057,6 +1057,21 @@ unsafe fn typing_annotations_dict(namespace: *mut PyClassDict) -> *mut PyObject 
     if let Some(existing) = unsafe { (&*namespace).get(intern::intern("__annotations__")) } {
         return existing;
     }
+    // PEP 649: class-body annotations are deferred into the synthesized
+    // `__annotate__` function rather than stored eagerly in `__annotations__`
+    // (see `pon-ir` class lowering).  Materialize them in VALUE format,
+    // mirroring `typing.NamedTupleMeta`'s `get_annotate_from_class_namespace`
+    // path, so field names are recovered from the class body.
+    if let Some(annotate) = unsafe { (&*namespace).get(intern::intern("__annotate__")) } {
+        if !annotate.is_null() && annotate != unsafe { abi::pon_none() } {
+            // Return the annotate result directly: a NULL (with its pending
+            // exception) propagates a real annotation failure instead of being
+            // flattened into an empty field set.
+            let mut argv = [unsafe { abi::pon_const_int(1) }];
+            return unsafe { abi::pon_call(annotate, argv.as_mut_ptr(), argv.len()) };
+        }
+    }
+    // No `__annotate__`: a genuinely empty annotation set.
     unsafe { abi::map::pon_build_map(ptr::null_mut(), 0) }
 }
 
@@ -1119,7 +1134,34 @@ pub(crate) unsafe fn build_typing_special_class(
             if module_object.is_null() {
                 return ptr::null_mut();
             }
-            let mut argv = [name_object, fields_list, annotate_func, module_object];
+            // PEP 649 defaults: a field also bound in the class body is a
+            // namedtuple default (CPython `NamedTupleMeta`).  Defaults must form
+            // a contiguous trailing run.
+            let mut default_values = Vec::new();
+            for entry in &entries {
+                let Some(field_name) = (unsafe { unicode_text(entry.key) }) else {
+                    return raise_object("NamedTuple field name is not a string");
+                };
+                match unsafe { (&*namespace).get(intern::intern(field_name)) } {
+                    Some(value) => default_values.push(value),
+                    None if !default_values.is_empty() => {
+                        return raise_object(format!(
+                            "Non-default namedtuple field {field_name} cannot follow default field"
+                        ));
+                    }
+                    None => {}
+                }
+            }
+            let defaults_list = unsafe {
+                abi::seq::pon_build_list(
+                    if default_values.is_empty() { ptr::null_mut() } else { default_values.as_mut_ptr() },
+                    default_values.len(),
+                )
+            };
+            if defaults_list.is_null() {
+                return ptr::null_mut();
+            }
+            let mut argv = [name_object, fields_list, annotate_func, module_object, defaults_list];
             unsafe { abi::pon_call(make_nmtuple, argv.as_mut_ptr(), argv.len()) }
         }
         TypingSpecialBase::TypedDict => {

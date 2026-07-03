@@ -248,6 +248,36 @@ pub(crate) struct LoweringDriver {
     source: Option<String>,
     /// Byte offset of each 1-based line start; `None` without source text.
     line_starts: Option<Vec<u32>>,
+    /// `from __future__ import annotations` (PEP 563) is active for the module
+    /// being lowered: annotation values are stored as their source text and
+    /// the synthesized `__annotate__` returns those strings for every format
+    /// rather than evaluating the expressions.
+    future_annotations: bool,
+}
+
+/// True when the module opens with `from __future__ import annotations`
+/// (PEP 563).  Mirrors Python's future-statement placement rule: an optional
+/// leading docstring, then a run of `from __future__` imports; the first
+/// ordinary statement closes the future block.
+fn module_enables_future_annotations(body: &[Stmt]) -> bool {
+    let mut start = 0;
+    if let Some(Stmt::Expr(stmt)) = body.first() {
+        if matches!(&*stmt.value, Expr::StringLiteral(_)) {
+            start = 1;
+        }
+    }
+    for stmt in &body[start..] {
+        let Stmt::ImportFrom(import) = stmt else {
+            return false;
+        };
+        if import.module.as_ref().map(ruff_python_ast::Identifier::as_str) != Some("__future__") {
+            return false;
+        }
+        if import.names.iter().any(|alias| alias.name.as_str() == "annotations") {
+            return true;
+        }
+    }
+    false
 }
 
 impl LoweringDriver {
@@ -257,6 +287,7 @@ impl LoweringDriver {
             names: NameTable::default(),
             source: None,
             line_starts: None,
+            future_annotations: false,
         }
     }
 
@@ -266,9 +297,9 @@ impl LoweringDriver {
             names: NameTable::default(),
             source: Some(source.to_owned()),
             line_starts: Some(compute_line_starts(source)),
+            future_annotations: false,
         }
     }
-
     pub(crate) fn source_slice(&self, span: SourceSpan) -> Option<&str> {
         let source = self.source.as_deref()?;
         source.get(span.start as usize..span.end as usize)
@@ -295,6 +326,7 @@ impl LoweringDriver {
         let analysis = scope::analyze_module(module)?;
         let main = self.reserve_function("__main__")?;
         let mut body = BodyScope::new(&analysis.root);
+        self.future_annotations = module_enables_future_annotations(&module.body);
 
         // PEP 649: synthesize and store the module `__annotate__` FIRST —
         // CPython stores it before any user statement (probed via dis on

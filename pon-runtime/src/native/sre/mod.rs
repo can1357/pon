@@ -21,7 +21,7 @@ use num_traits::ToPrimitive;
 
 use crate::abi::{self, pon_get_iter, pon_iter_next};
 use crate::intern::intern;
-use crate::object::{PyObject, PyObjectHeader, PyType};
+use crate::object::{PyMappingMethods, PyObject, PyObjectHeader, PyType};
 use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set};
 use crate::types::type_::unicode_text;
 use crate::types::{bool_, bytes_};
@@ -130,6 +130,12 @@ static MATCH_TYPE: LazyLock<usize> = LazyLock::new(|| {
     ty.tp_str = Some(match_repr);
     ty.tp_hash = Some(identity_hash);
     ty.tp_bool = Some(always_true);
+    // CPython `match_getitem`: `m[group]` is `m.group(group)` for a single
+    // int or str selector.
+    ty.tp_as_mapping = Box::into_raw(Box::new(PyMappingMethods {
+        mp_subscript: Some(match_subscript),
+        ..PyMappingMethods::EMPTY
+    }));
     Box::into_raw(ty) as usize
 });
 
@@ -617,14 +623,35 @@ enum MatchMode {
     Search,
 }
 
-fn run_match(pattern: &vm::Pattern, subject: &Subject, mode: MatchMode) -> Result<Option<vm::Match>, vm::Error> {
-    match (subject, mode) {
-        (Subject::Str { text, .. }, MatchMode::Match) => pattern.match_str(text),
-        (Subject::Str { text, .. }, MatchMode::Fullmatch) => pattern.fullmatch_str(text),
-        (Subject::Str { text, .. }, MatchMode::Search) => pattern.search_str(text),
-        (Subject::Bytes { data }, MatchMode::Match) => pattern.match_bytes(data),
-        (Subject::Bytes { data }, MatchMode::Fullmatch) => pattern.fullmatch_bytes(data),
-        (Subject::Bytes { data }, MatchMode::Search) => pattern.search_bytes(data),
+/// Run `mode` matching honoring CPython `pos`/`endpos`: matching starts at
+/// `pos` (so `^`/`\A` still anchor at the real beginning, not `pos`) and the
+/// subject is treated as `endpos` units long, so `$`/`\Z` and character
+/// availability stop there.  Both bounds are pre-clamped to `[0, units]` with
+/// `pos <= endpos`.
+fn run_match(
+    pattern: &vm::Pattern,
+    subject: &Subject,
+    mode: MatchMode,
+    pos: usize,
+    endpos: usize,
+) -> Result<Option<vm::Match>, vm::Error> {
+    match subject {
+        Subject::Str { text, offsets } => {
+            let sub = &text[..offsets[endpos]];
+            match mode {
+                MatchMode::Match => pattern.match_str_at(sub, pos),
+                MatchMode::Fullmatch => pattern.fullmatch_str_at(sub, pos),
+                MatchMode::Search => pattern.search_str_at(sub, pos),
+            }
+        }
+        Subject::Bytes { data } => {
+            let sub = &data[..endpos];
+            match mode {
+                MatchMode::Match => pattern.match_bytes_at(sub, pos),
+                MatchMode::Fullmatch => pattern.fullmatch_bytes_at(sub, pos),
+                MatchMode::Search => pattern.search_bytes_at(sub, pos),
+            }
+        }
     }
 }
 
@@ -661,11 +688,37 @@ unsafe fn pattern_method_prelude<'a>(
     Some((pattern, subject, args))
 }
 
+/// Read an optional integer position argument (`pos`/`endpos`), clamped to
+/// `[0, units]`.  A missing argument yields `default`; a non-integer sets a
+/// `TypeError` and returns `Err`.
+fn optional_bound(args: &[*mut PyObject], index: usize, default: usize, units: usize, name: &str) -> Result<usize, ()> {
+    let Some(&arg) = args.get(index) else {
+        return Ok(default);
+    };
+    match to_i64(arg) {
+        Some(value) => Ok(value.clamp(0, units as i64) as usize),
+        None => {
+            pon_err_set(format!("{name}() expected an integer position argument"));
+            Err(())
+        }
+    }
+}
+
 unsafe fn pattern_run_match(argv: *mut *mut PyObject, argc: usize, name: &str, mode: MatchMode) -> *mut PyObject {
     let Some((pattern, subject, args)) = (unsafe { pattern_method_prelude(argv, argc, name, 1) }) else {
         return ptr::null_mut();
     };
-    match run_match(&pattern.pattern, &subject, mode) {
+    let units = subject.units();
+    let (Ok(pos), Ok(endpos)) = (
+        optional_bound(args, 2, 0, units, name),
+        optional_bound(args, 3, units, units, name),
+    ) else {
+        return ptr::null_mut();
+    };
+    if pos > endpos {
+        return none();
+    }
+    match run_match(&pattern.pattern, &subject, mode, pos, endpos) {
         Ok(Some(matched)) => alloc_match(matched, args[0], untag(args[1])),
         Ok(None) => none(),
         Err(error) => fail(format!("{name}(): {error}")),
@@ -1101,6 +1154,19 @@ fn group_value(matched: &vm::Match, index: usize) -> *mut PyObject {
         Some(Some(_)) => matched
             .group(index)
             .map_or_else(none, |value| matched_value_object(&value)),
+    }
+}
+
+/// `re.Match` subscript slot: `m[group]` delegates to `m.group(group)` for a
+/// single int or str selector (CPython `match_getitem`), returning the group's
+/// text, `None` for an unmatched optional group, or an error for a bad group.
+unsafe extern "C" fn match_subscript(object: *mut PyObject, key: *mut PyObject) -> *mut PyObject {
+    let Some(matched) = (unsafe { as_match(object) }) else {
+        return fail("expected an re.Match object");
+    };
+    match resolve_group_selector(&matched.matched, key) {
+        Ok(index) => group_value(&matched.matched, index),
+        Err(message) => fail(message),
     }
 }
 

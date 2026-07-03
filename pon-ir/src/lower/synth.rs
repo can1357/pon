@@ -99,7 +99,12 @@ pub(crate) fn synthesize_annotate_scope(
     child_info: ScopeInfo,
     entries: &[(String, &Expr)],
 ) -> Result<Value, LowerError> {
-    synthesize_lazy_scope(driver, enclosing, child_info, true, |driver, body| {
+    // PEP 563 (`from __future__ import annotations`): the annotate function
+    // returns annotation source text for every format, so it never evaluates
+    // expressions and drops the `if format > 2: raise NotImplementedError`
+    // guard — `annotationlib` reads the string dict directly.
+    let format_guard = !driver.future_annotations;
+    synthesize_lazy_scope(driver, enclosing, child_info, format_guard, |driver, body| {
         emit_annotations_map(driver, body, entries)
     })
 }
@@ -234,7 +239,7 @@ fn emit_type_param_prologue(
     Ok(())
 }
 
-/// Evaluate annotation entries in source order and build the result dict.
+/// Build the annotation dict from `entries` in source order.
 fn emit_annotations_map(
     driver: &mut LoweringDriver,
     body: &mut BodyScope,
@@ -243,25 +248,35 @@ fn emit_annotations_map(
     let mut pairs = Vec::with_capacity(entries.len());
     for (key, annotation) in entries {
         let key = body.emit(InstKind::Const(PyConst::Str(key.clone())))?;
-        // PEP 646 `*args: *Ts`: CPython compiles the starred annotation to
-        // `Ts` + `UNPACK_SEQUENCE 1` — iterating the operand yields exactly
-        // the unpacked form (`GenericAlias`/`TypeVarTuple.__iter__` produce
-        // one `Unpack[...]`-shaped item).  Mirror that shape; every other
-        // annotation lowers as a plain expression.
-        let value = if let Expr::Starred(starred) = annotation {
-            let seq = driver.lower_expr(body, &starred.value)?;
-            let unpacked = body.emit(InstKind::UnpackSeq { val: seq, n: 1 })?;
-            let index = body.emit(InstKind::Const(PyConst::Int(0)))?;
-            body.emit(InstKind::SubscriptGet {
-                obj: unpacked,
-                index,
-            })?
-        } else {
-            driver.lower_expr(body, annotation)?
-        };
+        let value = emit_annotation_value(driver, body, annotation)?;
         pairs.push((key, value));
     }
     body.emit(InstKind::BuildMap { pairs })
+}
+
+/// Lower one annotation entry's value.  Under PEP 563 this is the annotation's
+/// verbatim source text as a string constant (never evaluated); otherwise the
+/// evaluated expression, where PEP 646 `*args: *Ts` unpacks to its single
+/// `Unpack[...]` item and every other annotation lowers as a plain expression.
+fn emit_annotation_value(
+    driver: &mut LoweringDriver,
+    body: &mut BodyScope,
+    annotation: &Expr,
+) -> Result<Value, LowerError> {
+    if driver.future_annotations {
+        if let Some(text) = driver.expr_source(annotation) {
+            let text = text.to_owned();
+            return body.emit(InstKind::Const(PyConst::Str(text)));
+        }
+    }
+    if let Expr::Starred(starred) = annotation {
+        let seq = driver.lower_expr(body, &starred.value)?;
+        let unpacked = body.emit(InstKind::UnpackSeq { val: seq, n: 1 })?;
+        let index = body.emit(InstKind::Const(PyConst::Int(0)))?;
+        body.emit(InstKind::SubscriptGet { obj: unpacked, index })
+    } else {
+        driver.lower_expr(body, annotation)
+    }
 }
 
 /// Collect name-target `AnnAssign` annotations in source order, recursing
