@@ -15,6 +15,7 @@ use cranelift_module::{FuncId, Module};
 use pon_ir::Type;
 use pon_ir::ir::{BinOp, Block as IrBlock, BlockId, CmpOp, Function, Inst, InstKind, PyConst, Terminator, UnOp, Value as IrValue};
 
+use crate::baseline::spill::TempSpillPlan;
 use crate::baseline::{self, CodegenError, HelperFuncRefs, LowerState, NameMap, control};
 use crate::helpers::HelperRefs;
 use crate::region::{self, TypedInput, TypedRegion, TypedValue};
@@ -286,6 +287,11 @@ pub fn compile_function<M: Module>(
     let int_type = initialize_int_type(&mut builder, &helper_refs, ptr_ty, exception_exit);
     let region_blocks = region_block_set(&plan.region);
     let range_iter_specs = range_iter_specs(function);
+    // Shared GC temp-spill schedule for both copies: primary boxed escapes
+    // and the cold twin lower the same IR sites, and both run in this one
+    // CLIF frame, so one pool keeps the exactly-live invariant global (a
+    // second pool would hold stale copies while the other copy executes).
+    let temp_spill = TempSpillPlan::compute(&mut builder, function, ptr_ty)?;
 
     lower_primary_copy(
         module,
@@ -304,6 +310,7 @@ pub fn compile_function<M: Module>(
         &cold_blocks,
         int_type,
         &range_iter_specs,
+        temp_spill.as_ref(),
     )?;
 
     lower_cold_copy(
@@ -319,6 +326,7 @@ pub fn compile_function<M: Module>(
         function,
         &plan.region,
         &cold_blocks,
+        temp_spill.as_ref(),
     )?;
 
     builder.switch_to_block(exception_exit);
@@ -411,6 +419,7 @@ fn lower_primary_copy<M: Module>(
     cold_blocks: &[(BlockId, ir::Block)],
     int_type: ir::Value,
     range_iter_specs: &HashMap<IrValue, RangeIterSpec>,
+    temp_spill: Option<&TempSpillPlan>,
 ) -> Result<(), CodegenError> {
     for block in &function.blocks {
         let clif_block = find_clif_block(primary_blocks, block.id)?;
@@ -432,7 +441,7 @@ fn lower_primary_copy<M: Module>(
                 int_type,
             )?;
         }
-        for inst in &block.insts {
+        for (inst_index, inst) in block.insts.iter().enumerate() {
             let lowered = if in_region {
                 lower_fast_inst(
                     module,
@@ -456,7 +465,13 @@ fn lower_primary_copy<M: Module>(
             };
             let value = match lowered {
                 Some(value) => value,
-                None => lower_baseline_inst(
+                None => {
+                    // Boxed escape: root call-crossing temporaries before the
+                    // baseline helper window (see `baseline::spill`).
+                    if let Some(plan) = temp_spill {
+                        plan.emit_inst_window(builder, &state.boxed, block.id, inst_index, ptr_ty);
+                    }
+                    lower_baseline_inst(
                     module,
                     builder,
                     helpers,
@@ -467,7 +482,8 @@ fn lower_primary_copy<M: Module>(
                     ptr_bytes,
                     exception_exit,
                     inst,
-                )?,
+                    )?
+                }
             };
             if !state.unboxed_values.contains_key(&inst.result) {
                 state.boxed.define_value(inst.result, value);
@@ -487,6 +503,7 @@ fn lower_primary_copy<M: Module>(
             block.id,
             &block.term,
             primary_blocks,
+            temp_spill,
         )?;
     }
     Ok(())
@@ -656,6 +673,7 @@ fn lower_cold_copy<M: Module>(
     function: &Function,
     region: &TypedRegion,
     cold_blocks: &[(BlockId, ir::Block)],
+    temp_spill: Option<&TempSpillPlan>,
 ) -> Result<(), CodegenError> {
     let mut cold_state = LowerState::new(function.n_locals);
     cold_state.locals = fast_state.boxed.locals.clone();
@@ -674,7 +692,10 @@ fn lower_cold_copy<M: Module>(
         if block.id == region.entry {
             define_cold_region_live_in_params(builder, &mut cold_state, region, cold_blocks)?;
         }
-        for inst in &block.insts {
+        for (inst_index, inst) in block.insts.iter().enumerate() {
+            if let Some(plan) = temp_spill {
+                plan.emit_inst_window(builder, &cold_state, block.id, inst_index, ptr_ty);
+            }
             let value = baseline::lower_inst(
                 module,
                 builder,
@@ -690,6 +711,9 @@ fn lower_cold_copy<M: Module>(
                 None,
             )?;
             cold_state.define_value(inst.result, value);
+        }
+        if let Some(plan) = temp_spill {
+            plan.emit_term_window(builder, &cold_state, block.id, ptr_ty);
         }
         lower_cold_terminator_with_region_args(
             builder,
@@ -998,6 +1022,7 @@ fn lower_primary_terminator(
     current_block: BlockId,
     term: &Terminator,
     block_map: &[(BlockId, ir::Block)],
+    temp_spill: Option<&TempSpillPlan>,
 ) -> Result<(), CodegenError> {
     match term {
         Terminator::Return(value) => {
@@ -1100,6 +1125,9 @@ fn lower_primary_terminator(
                 lower_unboxed_branch(builder, cond, *then_blk, *else_blk, block_map)
             } else {
                 ensure_boxed_value(builder, helpers, state, ptr_ty, exception_exit, *cond)?;
+                if let Some(plan) = temp_spill {
+                    plan.emit_term_window(builder, &state.boxed, current_block, ptr_ty);
+                }
                 control::lower_terminator_with_blocks(
                     builder,
                     &state.boxed,
@@ -1147,6 +1175,9 @@ fn lower_primary_terminator(
                 lower_unboxed_branch(builder, cond, *then_, *else_, block_map)
             } else {
                 ensure_boxed_value(builder, helpers, state, ptr_ty, exception_exit, *cond)?;
+                if let Some(plan) = temp_spill {
+                    plan.emit_term_window(builder, &state.boxed, current_block, ptr_ty);
+                }
                 control::lower_terminator_with_blocks(
                     builder,
                     &state.boxed,

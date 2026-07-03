@@ -11,6 +11,7 @@ pub(crate) mod mapping;
 pub(crate) mod match_;
 pub(crate) mod name;
 pub(crate) mod number;
+pub(crate) mod spill;
 pub(crate) mod strings;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -593,7 +594,7 @@ fn exception_successors(term: &Terminator, stack: &[BlockId]) -> Vec<BlockId> {
     }
 }
 
-fn block_exception_entry_stacks(ir: &Function) -> Result<HashMap<BlockId, ExceptionTargetStack>, CodegenError> {
+pub(crate) fn block_exception_entry_stacks(ir: &Function) -> Result<HashMap<BlockId, ExceptionTargetStack>, CodegenError> {
     let Some(entry) = ir.blocks.first().map(|block| block.id) else {
         return Ok(HashMap::new());
     };
@@ -671,6 +672,10 @@ pub(crate) fn lower_function_blocks<M: Module>(
     prefilled_entry: Option<ir::Block>,
 ) -> Result<(), CodegenError> {
     let exception_entry_stacks = block_exception_entry_stacks(ir)?;
+    // GC temp-spill schedule: root call-crossing expression temporaries in
+    // frame memory around every helper window that may re-enter user code
+    // (see `baseline::spill`).
+    let temp_spill = spill::TempSpillPlan::compute(builder, ir, ptr_ty)?;
 
     for block in &ir.blocks {
         let clif_block = block_map
@@ -688,7 +693,10 @@ pub(crate) fn lower_function_blocks<M: Module>(
             "exception handler target block",
         )?;
         let mut last_line = 0u32;
-        for inst in &block.insts {
+        for (inst_index, inst) in block.insts.iter().enumerate() {
+            if let Some(plan) = &temp_spill {
+                plan.emit_inst_window(builder, state, block.id, inst_index, ptr_ty);
+            }
             // Statement-line transition: record the new line into the runtime
             // cell before the statement's first effect can raise or call.
             if let Some(line_cell_gv) = line_cell_gv {
@@ -768,6 +776,9 @@ pub(crate) fn lower_function_blocks<M: Module>(
             };
             state.define_value(inst.result, value);
         }
+        if let Some(plan) = &temp_spill {
+            plan.emit_term_window(builder, state, block.id, ptr_ty);
+        }
         if ir.blocks.len() == 1 && prefilled_entry.is_some() {
             control::lower_terminator(builder, state, helper_refs, ptr_ty, current_exception_exit, &block.term)?;
         } else {
@@ -807,6 +818,7 @@ fn lower_function_blocks_subset<M: Module>(
     reachable: &HashSet<BlockId>,
 ) -> Result<(), CodegenError> {
     let exception_entry_stacks = block_exception_entry_stacks(ir)?;
+    let temp_spill = spill::TempSpillPlan::compute(builder, ir, ptr_ty)?;
 
     for block in &ir.blocks {
         if !reachable.contains(&block.id) {
@@ -825,7 +837,10 @@ fn lower_function_blocks_subset<M: Module>(
             "OSR exception handler target block",
         )?;
         let mut last_line = 0u32;
-        for inst in &block.insts {
+        for (inst_index, inst) in block.insts.iter().enumerate() {
+            if let Some(plan) = &temp_spill {
+                plan.emit_inst_window(builder, state, block.id, inst_index, ptr_ty);
+            }
             if let Some(line_cell_gv) = line_cell_gv {
                 if inst.line != 0 && inst.line != last_line {
                     emit_line_store(builder, line_cell_gv, ptr_ty, inst.line);
@@ -900,6 +915,9 @@ fn lower_function_blocks_subset<M: Module>(
                 )?,
             };
             state.define_value(inst.result, value);
+        }
+        if let Some(plan) = &temp_spill {
+            plan.emit_term_window(builder, state, block.id, ptr_ty);
         }
         control::lower_terminator_with_blocks(
             builder,
@@ -1953,7 +1971,7 @@ fn reachable_from(function: &Function, entry: BlockId) -> HashSet<BlockId> {
     reachable
 }
 
-fn successors(term: &Terminator) -> Vec<BlockId> {
+pub(crate) fn successors(term: &Terminator) -> Vec<BlockId> {
     match term {
         Terminator::Jump(target) => vec![*target],
         Terminator::Branch { then_blk, else_blk, .. } => vec![*then_blk, *else_blk],
