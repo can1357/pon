@@ -26,6 +26,7 @@ pub(crate) mod codecs;
 pub(crate) mod collections;
 mod colorize;
 pub(crate) mod contextvars;
+mod csv_;
 mod errno;
 mod gc;
 pub(crate) mod imp;
@@ -67,6 +68,7 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
     ("_collections", collections::make_module),
     ("_colorize", colorize::make_module),
     ("_contextvars", contextvars::make_module),
+    ("_csv", csv_::make_module),
     ("_imp", imp::make_module),
     ("_io", io::make_module),
     ("_opcode", opcode_::make_module),
