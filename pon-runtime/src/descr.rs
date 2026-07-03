@@ -282,6 +282,13 @@ unsafe fn synthetic_type_attr(ty: *mut PyType, name_id: u32) -> *mut PyObject {
         crate::abi::str_::ensure_bytearray_type_methods_installed(ty);
     } else if type_name == "float" {
         crate::types::float::ensure_float_type_methods_installed(ty);
+    } else if type_name == "int" {
+        crate::types::int::ensure_int_type_methods_installed(ty);
+    } else if type_name == "bool" {
+        // `bool.bit_length`-style access inherits int's surface through the
+        // bool→int MRO rung; nothing lands in bool's own tp_dict, keeping
+        // CPython's `bool.bit_length is int.bit_length` identity.
+        crate::types::int::ensure_int_surface_on_global();
     }
     if (type_name == "dict" || unsafe { dict::type_is_dict_subclass(ty) }) && name_id == intern::intern("fromkeys") {
         return crate::native::builtins_mod::dict_fromkeys_function();
@@ -681,6 +688,18 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
         return obj_ty.cast::<PyObject>();
     }
     if !is_type && name_id == intern::intern("__dict__") {
+        // Heap-layout receivers (plain instances and payload subclasses,
+        // which share the PyHeapInstance prefix) get the LIVE view: writes
+        // through `obj.__dict__` are attribute writes (mock initializes
+        // every Mock that way).  Exception-layout receivers keep the
+        // legacy snapshot — their layout carries no PyHeapInstance prefix
+        // for the view to bind.
+        let type_id = unsafe { (*obj_ty).gc_type_id };
+        if type_id == crate::types::type_::TYPE_ID_HEAP_INSTANCE.0 as usize
+            || type_id == crate::types::type_::TYPE_ID_PAYLOAD_SUBCLASS_INSTANCE.0 as usize
+        {
+            return unsafe { crate::types::instance_dict::new_view(object.cast::<PyHeapInstance>()) };
+        }
         let dict = unsafe { instance_dict(object) };
         if dict.is_null() {
             return unsafe { abi::pon_raise_attribute_error(object, name_id) };

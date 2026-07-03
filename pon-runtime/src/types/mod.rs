@@ -37,6 +37,7 @@ pub mod lazy_iter;
 
 /// Mapping and set type modules.
 pub mod dict;
+pub mod instance_dict;
 pub mod set_;
 pub mod frozenset;
 

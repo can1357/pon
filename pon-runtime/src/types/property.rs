@@ -5,7 +5,6 @@ use core::ptr;
 
 use crate::abi;
 use crate::object::{PyObject, PyObjectHeader, PyType};
-use crate::thread_state::pon_err_set;
 
 /// Python `property` object.
 #[repr(C)]
@@ -23,13 +22,16 @@ pub struct PyProperty {
     pub doc: *mut PyObject,
 }
 
+/// Typed `AttributeError` raise for the descriptor protocol's refusal
+/// paths: CPython raises AttributeError for an unreadable attribute and for
+/// set/delete without a setter/deleter, and consumers catch exactly that
+/// (`except AttributeError:` around a read-only structseq field write).
 fn raise_property(message: &str) -> *mut PyObject {
-    pon_err_set(message);
-    ptr::null_mut()
+    crate::abi::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::AttributeError, message)
 }
 
 fn raise_property_status(message: &str) -> c_int {
-    pon_err_set(message);
+    crate::abi::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::AttributeError, message);
     -1
 }
 
