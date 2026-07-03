@@ -47,6 +47,8 @@ mod string_mod;
 mod struct_;
 pub(crate) mod sys;
 mod sysconfigdata;
+mod testinternalcapi;
+mod testsinglephase;
 pub(crate) mod thread;
 mod time;
 mod tokenize;
@@ -78,6 +80,8 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
     // Name is cfg-selected per target (`_sysconfigdata__darwin_` /
     // `_sysconfigdata__linux_`); the row sorts identically either way.
     (sysconfigdata::MODULE_NAME, sysconfigdata::make_module),
+    ("_testinternalcapi", testinternalcapi::make_module),
+    ("_testsinglephase", testsinglephase::make_module),
     ("_thread", thread::make_module),
     ("_tokenize", tokenize::make_module),
     ("_warnings", imp::make_warnings_module),
