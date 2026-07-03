@@ -310,15 +310,26 @@ unsafe extern "C" fn time_asctime(argv: *mut *mut PyObject, argc: usize) -> *mut
         Ok(tm) => tm,
         Err(error) => return error,
     };
+    use std::fmt::Write as _;
     let mut text = String::with_capacity(24);
-    render("%a %b %e %H:%M:%S %Y", &tm, &mut text);
+    let _ = write!(
+        text,
+        "{} {} {:>2} {:02}:{:02}:{:02} {}",
+        DAYS_ABBR[tm.c_wday as usize],
+        MONTHS_ABBR[tm.mon0 as usize],
+        tm.mday,
+        tm.hour,
+        tm.min,
+        tm.sec,
+        tm.year
+    );
     // SAFETY: String allocation helper follows the NULL-sentinel contract.
     unsafe { pon_const_str(text.as_ptr(), text.len()) }
 }
 
 /// `time.mktime(t)`: seconds since the Unix epoch for a local-time tuple.
 /// With `TZ=UTC` pinned for the conformance runs, this reduces to UTC civil
-/// arithmetic plus CPython's forward-only overflow normalization.
+/// arithmetic plus CPython/libc-style overflow/underflow normalization.
 unsafe extern "C" fn time_mktime(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     if argc != 1 {
         return raise_type_error(&format!("time.mktime() takes exactly one argument ({argc} given)"));
@@ -560,9 +571,10 @@ fn tm_from_fields(fields: [i64; 9]) -> Result<Tm, *mut PyObject> {
     Ok(Tm { year, mon0, mday, hour, min, sec, c_wday, yday0 })
 }
 
-/// `mktime()`'s UTC-pinned civil arithmetic.  CPython/libc normalize positive
-/// month/day/time overflow forward (month 13 -> next January, hour 24 -> next
-/// day) but reject underflow legs such as month 0 or hour -1 with the shared
+/// `mktime()`'s UTC-pinned civil arithmetic.  CPython/libc normalize both
+/// overflow and underflow across month/day/time legs (month 0 -> previous
+/// December, hour -1 -> previous day's 23:00) before converting to epoch
+/// seconds; only an out-of-range final year / timestamp raises the shared
 /// `mktime argument out of range` wording.
 fn mktime_seconds(fields: [i64; 9]) -> Result<i64, *mut PyObject> {
     let month = i128::from(fields[1]);
@@ -570,14 +582,11 @@ fn mktime_seconds(fields: [i64; 9]) -> Result<i64, *mut PyObject> {
     let hour = i128::from(fields[3]);
     let min = i128::from(fields[4]);
     let sec = i128::from(fields[5]);
-    if month <= 0 || mday <= 0 || hour < 0 || min < 0 || sec < 0 {
-        return Err(raise_overflow_error("mktime argument out of range"));
-    }
 
     let month0 = month - 1;
-    let year = i128::from(fields[0]) + month0 / 12;
-    let year = i64::try_from(year).map_err(|_| {
-        if year.is_negative() {
+    let year128 = i128::from(fields[0]) + month0.div_euclid(12);
+    let year = i64::try_from(year128).map_err(|_| {
+        if year128.is_negative() {
             raise_overflow_error("year out of range")
         } else {
             raise_overflow_error("signed integer is greater than maximum")
@@ -585,10 +594,10 @@ fn mktime_seconds(fields: [i64; 9]) -> Result<i64, *mut PyObject> {
     })?;
     check_year_range(year)?;
 
-    let mon0 = (month0 % 12) as u32;
+    let mon0 = u32::try_from(month0.rem_euclid(12)).unwrap_or(0);
     let total_seconds = hour * 3_600 + min * 60 + sec;
-    let day_offset = (mday - 1) + total_seconds / 86_400;
-    let second_of_day = total_seconds % 86_400;
+    let day_offset = (mday - 1) + total_seconds.div_euclid(86_400);
+    let second_of_day = total_seconds.rem_euclid(86_400);
     let base_days = i128::from(days_from_civil(year, mon0 + 1, 1));
     let epoch_seconds = (base_days + day_offset) * 86_400 + second_of_day;
     i64::try_from(epoch_seconds).map_err(|_| raise_overflow_error("mktime argument out of range"))
@@ -691,7 +700,7 @@ fn emit(directive: char, pad: Pad, tm: &Tm, out: &mut String) {
         'A' => out.push_str(DAYS_FULL[tm.c_wday as usize]),
         'b' | 'h' => out.push_str(MONTHS_ABBR[tm.mon0 as usize]),
         'B' => out.push_str(MONTHS_FULL[tm.mon0 as usize]),
-        'c' => render("%a %b %d %H:%M:%S %Y", tm, out),
+        'c' => render("%a %b %e %H:%M:%S %Y", tm, out),
         'C' => out.push_str(&yconv(tm.year, true, false)),
         'd' => conv(tm.mday, 2, '0', pad, out),
         'D' | 'x' => render("%m/%d/%y", tm, out),
@@ -732,33 +741,9 @@ fn emit(directive: char, pad: Pad, tm: &Tm, out: &mut String) {
     }
 }
 
-/// Apple's `strftime` accepts a bare decimal field width for `%y`/`%Y`
-/// (`%3y` -> `025`, `%4Y` -> `0001`).  Other directives keep the historical
-/// "drop `%`, keep the remainder verbatim" fallback.
-fn emit_year_width(directive: char, pad: Pad, width: usize, tm: &Tm, out: &mut String) {
-    let text = match directive {
-        'y' => yconv(tm.year, false, true),
-        'Y' => yconv(tm.year, true, true),
-        other => {
-            out.push_str(&width.to_string());
-            emit(other, pad, tm, out);
-            return;
-        }
-    };
-    if matches!(pad, Pad::Suppress) || text.len() >= width {
-        out.push_str(&text);
-        return;
-    }
-    let fill = match pad {
-        Pad::Default | Pad::Zero => '0',
-        Pad::Space => ' ',
-        Pad::Suppress => unreachable!(),
-    };
-    for _ in 0..(width - text.len()) {
-        out.push(fill);
-    }
-    out.push_str(&text);
-}
+/// Bare decimal width text after `%` is not a year-width extension on the
+/// pinned Apple/C locale path; it falls through the historical "drop `%`,
+/// keep the remainder verbatim" behavior (`"%4Y"` -> `"4Y"`).
 
 /// The format walker: literal text, `%%`, and `% [-_0]? [EO]? conv` specs.
 /// A spec cut off by end-of-string emits its last consumed character
@@ -810,25 +795,9 @@ fn render(format: &str, tm: &Tm, out: &mut String) {
                 }
             }
         }
-        if matches!(pad, Pad::Default) && cursor.is_ascii_digit() {
-            let mut width_text = String::from(cursor);
-            while let Some(&digit) = chars.get(i) {
-                if !digit.is_ascii_digit() {
-                    break;
-                }
-                width_text.push(digit);
-                i += 1;
-            }
-            let Some(&after_width) = chars.get(i) else {
-                out.push_str(&width_text);
-                break;
-            };
-            cursor = after_width;
-            i += 1;
-            let width = width_text.parse::<usize>().unwrap_or(0);
-            emit_year_width(cursor, pad, width, tm, out);
-            continue;
-        }
+        // Bare decimal width text is not parsed as an extension here:
+        // `%4Y` emits `4Y`, and the trailing directive becomes the next
+        // literal character in the outer loop.
         emit(cursor, pad, tm, out);
     }
 }
