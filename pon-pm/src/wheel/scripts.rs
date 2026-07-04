@@ -33,8 +33,8 @@ enum Section {
 ///
 /// Only `[console_scripts]` and `[gui_scripts]` entries are collected. Blank
 /// lines and full-line comments beginning with `#` or `;` are ignored. Entries
-/// must be written as `name = module:attr`; any `; extras` suffix after the
-/// target is ignored.
+/// must be written as `name = module:attr`; an optional extras suffix such as
+/// ` [extra]` or a trailing `; comment` after the target is ignored.
 pub fn parse_entry_points(text: &str, label: &str) -> Result<EntryPoints> {
     let mut entry_points = EntryPoints::default();
     let mut section = Section::Other;
@@ -87,7 +87,7 @@ fn parse_script(line: &str, label: &str, line_number: usize) -> Result<EntryPoin
         return Err(malformed(label, line_number, "script name is empty"));
     }
 
-    let target = target.split_once(';').map_or(target, |(before_extras, _)| before_extras).trim();
+    let target = strip_entry_point_suffix(target);
     let Some((module, attr)) = target.split_once(':') else {
         return Err(malformed(label, line_number, "script target is missing `:`"));
     };
@@ -105,6 +105,21 @@ fn parse_script(line: &str, label: &str, line_number: usize) -> Result<EntryPoin
         module: module.to_owned(),
         attr: attr.to_owned(),
     })
+}
+
+fn strip_entry_point_suffix(target: &str) -> &str {
+    let target = target.split_once(';').map_or(target, |(before_comment, _)| before_comment).trim();
+    if let Some(open_index) = target.rfind('[') {
+        if target.ends_with(']')
+            && target[..open_index]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+        {
+            return target[..open_index].trim_end();
+        }
+    }
+    target
 }
 
 fn malformed(label: &str, line_number: usize, reason: &str) -> Error {
