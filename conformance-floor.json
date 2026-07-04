@@ -53,6 +53,7 @@
     "pon-conformance/corpus/cpython/dict_subclass_attrs.py",
     "pon-conformance/corpus/cpython/dict_union.py",
     "pon-conformance/corpus/cpython/dict_update_protocol.py",
+    "pon-conformance/corpus/cpython/dict_views_setops.py",
     "pon-conformance/corpus/cpython/dict_views_unpack.py",
     "pon-conformance/corpus/cpython/dynexec.py",
     "pon-conformance/corpus/cpython/except_multibase.py",
@@ -84,6 +85,7 @@
     "pon-conformance/corpus/cpython/int_parse.py",
     "pon-conformance/corpus/cpython/io_module_surface.py",
     "pon-conformance/corpus/cpython/isinstance_abc.py",
+    "pon-conformance/corpus/cpython/isinstance_object_universal.py",
     "pon-conformance/corpus/cpython/iterator_protocol.py",
     "pon-conformance/corpus/cpython/itertools_basic.py",
     "pon-conformance/corpus/cpython/itertools_tee_lazy.py",
@@ -97,6 +99,7 @@
     "pon-conformance/corpus/cpython/lang_scope_nonlocal_class.py",
     "pon-conformance/corpus/cpython/list_methods.py",
     "pon-conformance/corpus/cpython/list_subclass.py",
+    "pon-conformance/corpus/cpython/lock_fork_reinit.py",
     "pon-conformance/corpus/cpython/long_spill.py",
     "pon-conformance/corpus/cpython/loop_control.py",
     "pon-conformance/corpus/cpython/match_class_patterns.py",
@@ -126,6 +129,7 @@
     "pon-conformance/corpus/cpython/os_functions.py",
     "pon-conformance/corpus/cpython/os_pid_surface.py",
     "pon-conformance/corpus/cpython/os_surface.py",
+    "pon-conformance/corpus/cpython/pep562_module_getattr.py",
     "pon-conformance/corpus/cpython/pickle_buffer.py",
     "pon-conformance/corpus/cpython/properties_descriptors.py",
     "pon-conformance/corpus/cpython/re_basic.py",
@@ -152,6 +156,7 @@
     "pon-conformance/corpus/cpython/string_formatter.py",
     "pon-conformance/corpus/cpython/struct_basic.py",
     "pon-conformance/corpus/cpython/subprocess_import.py",
+    "pon-conformance/corpus/cpython/subprocess_input_roundtrip.py",
     "pon-conformance/corpus/cpython/subscript_assignment.py",
     "pon-conformance/corpus/cpython/super_attr_miss.py",
     "pon-conformance/corpus/cpython/sys_getframe.py",
@@ -196,6 +201,7 @@
     "pon-conformance/corpus/cpython/unpack_generalizations.py",
     "pon-conformance/corpus/cpython/unreachable_flow.py",
     "pon-conformance/corpus/cpython/user_hash_eq.py",
+    "pon-conformance/corpus/cpython/varargs_keyword_binding.py",
     "pon-conformance/corpus/cpython/walrus.py",
     "pon-conformance/corpus/cpython/weakref_basic.py",
     "pon-conformance/corpus/cpython/weakref_class_objects.py",
@@ -204,5 +210,5 @@
     "pon-conformance/corpus/cpython/yield_from_list.py",
     "pon-conformance/corpus/cpython/yield_shapes.py"
   ],
-  "min_pass_count": 202
+  "min_pass_count": 208
 }

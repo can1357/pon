@@ -134,3 +134,8 @@ def reload(module):
             del _RELOADING[name]
         except KeyError:
             pass
+
+# CPython exposes these helper submodules on the already-imported importlib
+# package during interpreter startup.  Pon reaches the same steady state through
+# source imports, so bind them explicitly once the bootstrap has completed.
+from . import _abc, machinery, util  # noqa: F401

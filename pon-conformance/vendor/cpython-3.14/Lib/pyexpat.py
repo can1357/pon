@@ -17,6 +17,23 @@ XML_PARAM_ENTITY_PARSING_NEVER = 0
 XML_PARAM_ENTITY_PARSING_UNLESS_STANDALONE = 1
 XML_PARAM_ENTITY_PARSING_ALWAYS = 2
 
+# Expat exposes this informational feature table at module scope.  Pon's
+# Python parser is UTF-8/Unicode backed, has a finite context window, supports
+# namespace callbacks, and deliberately does not advertise the C-only DTD or
+# general-entity engines.
+features = [
+    ("sizeof(XML_Char)", 1),
+    ("sizeof(XML_LChar)", 1),
+    ("XML_DTD", 0),
+    ("XML_CONTEXT_BYTES", 1024),
+    ("XML_NS", 1),
+    ("XML_BLAP_MAX_AMP", 100),
+    ("XML_BLAP_ACT_THRES", 8388608),
+    ("XML_GE", 0),
+    ("XML_AT_MAX_AMP", 100),
+    ("XML_AT_ACT_THRES", 67108864),
+]
+
 XML_ERROR_NONE = 0
 XML_ERROR_NO_MEMORY = 1
 XML_ERROR_SYNTAX = 2
@@ -442,12 +459,15 @@ class xmlparser:
     def _raise(self, code, message):
         raise ExpatError(message, code, self.CurrentLineNumber, self.CurrentColumnNumber)
 
+XMLParserType = xmlparser
+
 def ParserCreate(encoding=None, namespace_separator=None, intern=None):
     return xmlparser(encoding, namespace_separator, intern)
 
 __all__ = [
-    "EXPAT_VERSION", "ErrorString", "ExpatError", "ParserCreate", "XML_PARAM_ENTITY_PARSING_ALWAYS",
-    "XML_PARAM_ENTITY_PARSING_NEVER", "XML_PARAM_ENTITY_PARSING_UNLESS_STANDALONE", "error", "errors",
+    "EXPAT_VERSION", "ErrorString", "ExpatError", "ParserCreate", "XMLParserType",
+    "XML_PARAM_ENTITY_PARSING_ALWAYS", "XML_PARAM_ENTITY_PARSING_NEVER",
+    "XML_PARAM_ENTITY_PARSING_UNLESS_STANDALONE", "error", "errors", "features",
     "model", "native_encoding", "version_info", "xmlparser",
 ]
 for _name in list(globals()):
