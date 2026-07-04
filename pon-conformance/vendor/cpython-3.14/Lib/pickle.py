@@ -1900,6 +1900,19 @@ except ImportError:
     Pickler, Unpickler = _Pickler, _Unpickler
     dump, dumps, load, loads = _dump, _dumps, _load, _loads
 
+try:
+    import _pickle as _pon_pickle_accel
+except ImportError:
+    pass
+else:
+    for _name in (
+        "PickleError", "PicklingError", "UnpicklingError",
+        "Pickler", "Unpickler", "dump", "dumps", "load", "loads",
+    ):
+        if not hasattr(_pon_pickle_accel, _name):
+            setattr(_pon_pickle_accel, _name, globals()[_name])
+    del _name, _pon_pickle_accel
+
 
 def _main(args=None):
     import argparse

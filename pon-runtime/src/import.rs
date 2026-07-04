@@ -13,7 +13,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::{LazyLock, Mutex};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::abi::{
     pon_const_int, pon_const_str, pon_none, pon_store_global, raise_import_error_text, return_minus_one_with_error, return_null_with_error,
@@ -530,6 +530,9 @@ fn import_module_by_name(name: &str) -> Result<*mut PyObject, String> {
         ensure_source_importlib_alias("_frozen_importlib", module)?;
         seed_meta_path_finders();
     }
+    if name == "importlib._bootstrap_external" {
+        ensure_source_importlib_alias("_frozen_importlib_external", module)?;
+    }
     Ok(module)
 }
 
@@ -548,6 +551,47 @@ fn ensure_source_importlib_alias(alias: &str, module: *mut PyObject) -> Result<(
     state.modules.insert(alias_id, module);
     drop(state);
     mirror_module_registration(alias, module)
+}
+
+static IMPORTLIB_FROZEN_ALIAS_BOOTSTRAP: AtomicBool = AtomicBool::new(false);
+
+fn importlib_frozen_alias_target(alias: &str) -> Option<&'static str> {
+    match alias {
+        "_frozen_importlib" => Some("importlib._bootstrap"),
+        "_frozen_importlib_external" => Some("importlib._bootstrap_external"),
+        _ => None,
+    }
+}
+
+fn resolve_source_importlib_alias_request(name: &str) -> Result<Option<*mut PyObject>, String> {
+    let Some(target) = importlib_frozen_alias_target(name) else {
+        return Ok(None);
+    };
+
+    if let Some(module) = cached_module(intern(target)) {
+        ensure_source_importlib_alias(name, module)?;
+        return Ok(Some(module));
+    }
+
+    if IMPORTLIB_FROZEN_ALIAS_BOOTSTRAP.load(Ordering::Acquire)
+        || active_module_name_id().and_then(resolve).is_some_and(|active| active == "importlib")
+    {
+        return Err(format!("No module named '{name}'"));
+    }
+
+    if IMPORTLIB_FROZEN_ALIAS_BOOTSTRAP.swap(true, Ordering::AcqRel) {
+        return Err(format!("No module named '{name}'"));
+    }
+    let import_result = import_module_by_name("importlib");
+    IMPORTLIB_FROZEN_ALIAS_BOOTSTRAP.store(false, Ordering::Release);
+    import_result?;
+
+    if let Some(module) = cached_module(intern(target)) {
+        ensure_source_importlib_alias(name, module)?;
+        return Ok(Some(module));
+    }
+
+    Err(format!("No module named '{name}'"))
 }
 
 /// Mirrors `importlib._bootstrap._install`: seeds `sys.meta_path` with
@@ -710,6 +754,10 @@ fn resolve_module_by_name(name: &str) -> Result<*mut PyObject, String> {
         (None, None) => {}
     }
 
+    if let Some(module) = resolve_source_importlib_alias_request(name)? {
+        return Ok(module);
+    }
+
     if let Some(parent) = parent_module_name(name) {
         import_module_by_name(parent)?;
         // CPython bootstrap's "crazy side-effects" re-check: executing the
@@ -847,9 +895,6 @@ fn is_unsupported_c_accelerated(name: &str) -> bool {
         "_json"
             | "_ssl"
             | "_sqlite3"
-            | "_hashlib"
-            | "_bz2"
-            | "_lzma"
             | "_ctypes"
     )
 }

@@ -2024,6 +2024,18 @@ fn register_builtins(runtime: &mut Runtime) -> Result<(), String> {
     runtime
         .globals
         .insert(crate::intern::intern("Ellipsis"), as_object_ptr(runtime.ellipsis));
+    runtime
+        .globals
+        .insert(crate::intern::intern("None"), as_object_ptr(runtime.none));
+    runtime
+        .globals
+        .insert(crate::intern::intern("False"), bool_::from_bool(false));
+    runtime
+        .globals
+        .insert(crate::intern::intern("True"), bool_::from_bool(true));
+    runtime
+        .globals
+        .insert(crate::intern::intern("__debug__"), bool_::from_bool(true));
     register_exception_builtins(runtime);
     if runtime.globals.contains_key(&runtime_builtins::print_name_interned()) && runtime.globals.contains_key(&crate::intern::intern("ValueError")) {
         Ok(())

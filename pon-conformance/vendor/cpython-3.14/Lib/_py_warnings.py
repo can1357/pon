@@ -42,6 +42,17 @@ onceregistry = {}
 _lock = _thread.RLock()
 _filters_version = 1
 
+def _acquire_lock():
+    _lock.acquire()
+
+
+def _release_lock():
+    _lock.release()
+
+
+_defaultaction = defaultaction
+_onceregistry = onceregistry
+
 
 # If true, catch_warnings() will use a context var to hold the modified
 # filters list.  Otherwise, catch_warnings() will operate on the 'filters'

@@ -192,6 +192,153 @@ except ImportError:
     pass
 
 
+if 'pbkdf2_hmac' not in globals():
+    def pbkdf2_hmac(hash_name, password, salt, iterations, dklen=None):
+        """Password based key derivation function 2 (PKCS #5 v2.0)."""
+        from operator import index as _index
+        import hmac as _hmac
+
+        if not isinstance(hash_name, str):
+            raise TypeError("hash_name must be a string")
+        password = bytes(password)
+        salt = bytes(salt)
+        iterations = _index(iterations)
+        if iterations < 1:
+            raise ValueError("iteration value must be greater than 0.")
+
+        digest = new(hash_name)
+        hlen = digest.digest_size
+        if dklen is None:
+            dklen = hlen
+        else:
+            dklen = _index(dklen)
+            if dklen < 1:
+                raise ValueError("key length must be greater than 0.")
+
+        blocks, extra = divmod(dklen, hlen)
+        if extra:
+            blocks += 1
+        if blocks > 0xffffffff:
+            raise OverflowError("derived key too long")
+
+        out = bytearray()
+        for block_index in range(1, blocks + 1):
+            u = _hmac.digest(password, salt + block_index.to_bytes(4, 'big'), hash_name)
+            acc = bytearray(u)
+            for _ in range(iterations - 1):
+                u = _hmac.digest(password, u, hash_name)
+                for i, value in enumerate(u):
+                    acc[i] ^= value
+            out.extend(acc)
+        return bytes(out[:dklen])
+
+    __all__ += ('pbkdf2_hmac',)
+
+
+if 'scrypt' not in globals():
+    def _scrypt_rotl(value, shift):
+        return ((value << shift) | (value >> (32 - shift))) & 0xffffffff
+
+
+    def _scrypt_salsa208(block):
+        words = [int.from_bytes(block[i:i + 4], 'little') for i in range(0, 64, 4)]
+        x = words[:]
+        for _ in range(4):
+            x[4] ^= _scrypt_rotl((x[0] + x[12]) & 0xffffffff, 7)
+            x[8] ^= _scrypt_rotl((x[4] + x[0]) & 0xffffffff, 9)
+            x[12] ^= _scrypt_rotl((x[8] + x[4]) & 0xffffffff, 13)
+            x[0] ^= _scrypt_rotl((x[12] + x[8]) & 0xffffffff, 18)
+            x[9] ^= _scrypt_rotl((x[5] + x[1]) & 0xffffffff, 7)
+            x[13] ^= _scrypt_rotl((x[9] + x[5]) & 0xffffffff, 9)
+            x[1] ^= _scrypt_rotl((x[13] + x[9]) & 0xffffffff, 13)
+            x[5] ^= _scrypt_rotl((x[1] + x[13]) & 0xffffffff, 18)
+            x[14] ^= _scrypt_rotl((x[10] + x[6]) & 0xffffffff, 7)
+            x[2] ^= _scrypt_rotl((x[14] + x[10]) & 0xffffffff, 9)
+            x[6] ^= _scrypt_rotl((x[2] + x[14]) & 0xffffffff, 13)
+            x[10] ^= _scrypt_rotl((x[6] + x[2]) & 0xffffffff, 18)
+            x[3] ^= _scrypt_rotl((x[15] + x[11]) & 0xffffffff, 7)
+            x[7] ^= _scrypt_rotl((x[3] + x[15]) & 0xffffffff, 9)
+            x[11] ^= _scrypt_rotl((x[7] + x[3]) & 0xffffffff, 13)
+            x[15] ^= _scrypt_rotl((x[11] + x[7]) & 0xffffffff, 18)
+            x[1] ^= _scrypt_rotl((x[0] + x[3]) & 0xffffffff, 7)
+            x[2] ^= _scrypt_rotl((x[1] + x[0]) & 0xffffffff, 9)
+            x[3] ^= _scrypt_rotl((x[2] + x[1]) & 0xffffffff, 13)
+            x[0] ^= _scrypt_rotl((x[3] + x[2]) & 0xffffffff, 18)
+            x[6] ^= _scrypt_rotl((x[5] + x[4]) & 0xffffffff, 7)
+            x[7] ^= _scrypt_rotl((x[6] + x[5]) & 0xffffffff, 9)
+            x[4] ^= _scrypt_rotl((x[7] + x[6]) & 0xffffffff, 13)
+            x[5] ^= _scrypt_rotl((x[4] + x[7]) & 0xffffffff, 18)
+            x[11] ^= _scrypt_rotl((x[10] + x[9]) & 0xffffffff, 7)
+            x[8] ^= _scrypt_rotl((x[11] + x[10]) & 0xffffffff, 9)
+            x[9] ^= _scrypt_rotl((x[8] + x[11]) & 0xffffffff, 13)
+            x[10] ^= _scrypt_rotl((x[9] + x[8]) & 0xffffffff, 18)
+            x[12] ^= _scrypt_rotl((x[15] + x[14]) & 0xffffffff, 7)
+            x[13] ^= _scrypt_rotl((x[12] + x[15]) & 0xffffffff, 9)
+            x[14] ^= _scrypt_rotl((x[13] + x[12]) & 0xffffffff, 13)
+            x[15] ^= _scrypt_rotl((x[14] + x[13]) & 0xffffffff, 18)
+        return b''.join(((x[i] + words[i]) & 0xffffffff).to_bytes(4, 'little')
+                        for i in range(16))
+
+
+    def _scrypt_blockmix(block, r):
+        x = block[-64:]
+        y = []
+        for i in range(2 * r):
+            chunk = block[i * 64:(i + 1) * 64]
+            x = _scrypt_salsa208(bytes(a ^ b for a, b in zip(x, chunk)))
+            y.append(x)
+        return b''.join(y[::2] + y[1::2])
+
+
+    def _scrypt_integerify(block, r):
+        return int.from_bytes(block[(2 * r - 1) * 64:(2 * r - 1) * 64 + 8],
+                              'little')
+
+
+    def _scrypt_romix(block, n, r):
+        x = block
+        v = []
+        for _ in range(n):
+            v.append(x)
+            x = _scrypt_blockmix(x, r)
+        for _ in range(n):
+            j = _scrypt_integerify(x, r) & (n - 1)
+            x = _scrypt_blockmix(bytes(a ^ b for a, b in zip(x, v[j])), r)
+        return x
+
+
+    def scrypt(password, *, salt, n, r, p, maxmem=0, dklen=64):
+        """Derive a key from *password* using the scrypt KDF."""
+        from operator import index as _index
+
+        password = bytes(password)
+        salt = bytes(salt)
+        n = _index(n)
+        r = _index(r)
+        p = _index(p)
+        maxmem = _index(maxmem)
+        dklen = _index(dklen)
+        if n <= 1 or n & (n - 1):
+            raise ValueError("n must be a power of 2.")
+        if r <= 0 or p <= 0:
+            raise ValueError("r and p must be positive.")
+        if dklen <= 0:
+            raise ValueError("dklen must be greater than 0.")
+        memory = 128 * n * r
+        if maxmem and memory > maxmem:
+            raise ValueError("memory limit exceeded")
+
+        block_size = 128 * r
+        b = pbkdf2_hmac('sha256', password, salt, 1, p * block_size)
+        mixed = [
+            _scrypt_romix(b[i * block_size:(i + 1) * block_size], n, r)
+            for i in range(p)
+        ]
+        return pbkdf2_hmac('sha256', password, b''.join(mixed), 1, dklen)
+
+    __all__ += ('scrypt',)
+
+
 def file_digest(fileobj, digest, /, *, _bufsize=2**18):
     """Hash the contents of a file-like object. Returns a digest object.
 

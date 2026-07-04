@@ -112,6 +112,19 @@ pub(crate) fn make_module() -> Result<*mut PyObject, String> {
             attrs.push((name, value));
         }
     });
+    for (constant_name, value) in [
+        ("None", unsafe { abi::pon_none() }),
+        ("False", bool_::from_bool(false)),
+        ("True", bool_::from_bool(true)),
+        ("__debug__", bool_::from_bool(true)),
+        ("NotImplemented", unsafe { abi::pon_load_global(crate::intern::intern("NotImplemented"), core::ptr::null_mut()) }),
+        ("Ellipsis", unsafe { abi::pon_load_global(crate::intern::intern("Ellipsis"), core::ptr::null_mut()) }),
+    ] {
+        if value.is_null() {
+            return Err(format!("builtin constant '{constant_name}' is not registered"));
+        }
+        attrs.push((crate::intern::intern(constant_name), value));
+    }
     for exception_name in [
         "BaseException",
         "BaseExceptionGroup",

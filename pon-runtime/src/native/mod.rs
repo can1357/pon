@@ -20,29 +20,39 @@ pub(crate) use crate::import::install_module;
 mod array;
 mod ast_;
 pub use ast_::{AstNode, AstValue, NodeSpan, build_ast_object};
+mod asyncio;
 pub mod atexit;
 mod binascii;
+mod cext;
 pub(crate) mod codecs;
 pub(crate) mod collections;
 mod colorize;
 pub(crate) mod contextvars;
 mod csv_;
 mod errno;
+mod faulthandler;
 mod fcntl_;
 mod gc;
+mod grp;
 mod hashes;
 pub(crate) mod imp;
 pub(crate) mod io;
 pub(crate) mod itertools;
 mod lsprof;
+mod mmap;
 mod math;
+mod multibyte_codecs;
 mod opcode_;
 mod packaging_compat;
 pub(crate) mod os;
 pub(crate) mod pickle;
+mod pwd;
 mod posix;
+mod posixshmem;
 mod posixsubprocess;
 mod random_;
+mod readline;
+mod resource;
 #[cfg(target_os = "macos")]
 mod scproxy;
 mod select;
@@ -50,17 +60,24 @@ mod sha2;
 pub(crate) mod signal;
 mod socket_;
 mod sre;
+mod statistics;
 mod string_mod;
 mod struct_;
+mod suggestions;
+mod symtable;
 pub(crate) mod sys;
 mod sysconfigdata;
+mod syslog;
+mod termios;
 mod testinternalcapi;
 mod testsinglephase;
 pub(crate) mod thread;
 mod time;
 mod tokenize;
+mod tracemalloc;
 mod unicodedata;
 pub(crate) mod weakref;
+mod zoneinfo;
 mod zlib;
 
 /// Sorted, insert-only lookup table of curated native modules: Python module
@@ -69,18 +86,30 @@ mod zlib;
 /// factories must be self-contained and never rely on another row having run.
 pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>)] = &[
     ("_ast", ast_::make_module),
+    ("_asyncio", asyncio::make_module),
     ("_blake2", hashes::make_blake2_module),
+    ("_bz2", cext::make_bz2_module),
     ("_codecs", codecs::make_module),
+    ("_codecs_cn", multibyte_codecs::make_codecs_cn_module),
+    ("_codecs_hk", multibyte_codecs::make_codecs_hk_module),
+    ("_codecs_iso2022", multibyte_codecs::make_codecs_iso2022_module),
+    ("_codecs_jp", multibyte_codecs::make_codecs_jp_module),
+    ("_codecs_kr", multibyte_codecs::make_codecs_kr_module),
+    ("_codecs_tw", multibyte_codecs::make_codecs_tw_module),
     ("_collections", collections::make_module),
     ("_colorize", colorize::make_module),
     ("_contextvars", contextvars::make_module),
     ("_csv", csv_::make_module),
+    ("_hashlib", cext::make_hashlib_module),
+    ("_hmac", cext::make_hmac_module),
     ("_imp", imp::make_module),
     ("_io", io::make_module),
     ("_lsprof", lsprof::make_module),
+    ("_lzma", cext::make_lzma_module),
     ("_md5", hashes::make_md5_module),
     ("_opcode", opcode_::make_module),
     ("_pickle", pickle::make_module),
+    ("_posixshmem", posixshmem::make_module),
     ("_posixsubprocess", posixsubprocess::make_module),
     ("_random", random_::make_module),
     #[cfg(target_os = "macos")]
@@ -91,8 +120,12 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
     ("_signal", signal::make_module),
     ("_socket", socket_::make_module),
     ("_sre", sre::make_module),
+    ("_statistics", statistics::make_module),
     ("_string", string_mod::make_module),
     ("_struct", struct_::make_module),
+    ("_suggestions", suggestions::make_module),
+    ("_symtable", symtable::make_module),
+    ("_sysconfig", sysconfigdata::make_sysconfig_module),
     // Name is cfg-selected per target (`_sysconfigdata__darwin_` /
     // `_sysconfigdata__linux_`); the row sorts identically either way.
     (sysconfigdata::MODULE_NAME, sysconfigdata::make_module),
@@ -100,26 +133,38 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
     ("_testsinglephase", testsinglephase::make_module),
     ("_thread", thread::make_module),
     ("_tokenize", tokenize::make_module),
+    ("_tracemalloc", tracemalloc::make_module),
+    ("_uuid", cext::make_uuid_module),
     ("_warnings", imp::make_warnings_module),
     ("_weakref", weakref::make_underscore_module),
+    ("_zoneinfo", zoneinfo::make_module),
+    ("_zstd", cext::make_zstd_module),
     ("array", array::make_module),
     ("atexit", atexit::make_module),
     ("binascii", binascii::make_module),
     ("builtins", builtins_mod::make_module),
     ("errno", errno::make_module),
+    ("faulthandler", faulthandler::make_module),
     ("fcntl", fcntl_::make_module),
     ("gc", gc::make_module),
+    ("grp", grp::make_module),
     ("itertools", itertools::make_module),
     ("marshal", imp::make_marshal_module),
     ("math", math::make_module),
+    ("mmap", mmap::make_module),
     ("os", os::make_module),
     ("os.path", os::make_path_module),
     ("packaging._manylinux", packaging_compat::make_manylinux_module),
     ("packaging._musllinux", packaging_compat::make_musllinux_module),
+    ("pwd", pwd::make_module),
     ("posix", posix::make_module),
+    ("readline", readline::make_module),
+    ("resource", resource::make_module),
     ("select", select::make_module),
     ("sys", sys::make_module),
+    ("syslog", syslog::make_module),
     ("time", time::make_module),
+    ("termios", termios::make_module),
     ("unicodedata", unicodedata::make_module),
     ("zlib", zlib::make_module),
 ];

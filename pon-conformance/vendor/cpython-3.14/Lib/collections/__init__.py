@@ -1607,3 +1607,13 @@ class UserString(_collections_abc.Sequence):
 
     def zfill(self, width):
         return self.__class__(self.data.zfill(width))
+
+try:
+    import _collections as _pon_collections_accel
+except ImportError:
+    pass
+else:
+    for _name in ("OrderedDict", "_count_elements", "_tuplegetter"):
+        if not hasattr(_pon_collections_accel, _name):
+            setattr(_pon_collections_accel, _name, globals()[_name])
+    del _name, _pon_collections_accel
