@@ -1,0 +1,4 @@
+{1, 4} frozenset({2, 5}) frozenset
+[1, 2, 5]
+set TypeError 'int' object is not iterable
+frozenset TypeError 'int' object is not iterable

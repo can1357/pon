@@ -1,0 +1,10 @@
+print('A')
+import typing as T
+print('B')
+S = T.NewType('S', str)
+print('C')
+v = S('')
+print('D', repr(v))
+v2 = S('hello')
+print('E', repr(v2))
+print('F done')

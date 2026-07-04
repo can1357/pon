@@ -1,0 +1,4 @@
+{'exclude_simple': False, 'exceptions': ('*.local', '169.254/16')}
+{}
+exceptions tuple ('*.local', '169.254/16')
+exclude_simple bool False
