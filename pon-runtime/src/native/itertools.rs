@@ -9,17 +9,16 @@
 //! consume these exactly like CPython's C implementations.
 //!
 //! Surface: count, cycle, repeat, chain (+ chain.from_iterable), islice,
-//! starmap, zip_longest, product, permutations, combinations, accumulate,
-//! filterfalse, takewhile, dropwhile, compress, pairwise, batched, groupby
-//! (with its `_grouper`).  `tee` is deliberately absent: nothing in the
-//! import chain (collections/traceback/unittest/functools/enum/re/textwrap/
-//! linecache) references it.
+//! starmap, tee, zip_longest, product, permutations, combinations,
+//! accumulate, filterfalse, takewhile, dropwhile, compress, pairwise,
+//! batched, groupby (with its `_grouper`).
 //!
 //! Keyword arguments arrive either pre-bound to a fixed positional shape
 //! (`bind_optional_named_keywords` in `types::function`) or, for the variadic
 //! constructors `zip_longest` / `product`, as a trailing
 //! `types::lazy_iter::PyKwMarker` carrier appended by the binder.
 
+use std::collections::VecDeque;
 use std::ptr;
 use std::sync::LazyLock;
 
@@ -49,7 +48,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         return Err("failed to allocate itertools.__name__".to_owned());
     }
     let mut attrs = vec![(intern("__name__"), name_object)];
-    let functions: [(&str, BuiltinFn); 17] = [
+    let functions: [(&str, BuiltinFn); 18] = [
         ("accumulate", itertools_accumulate),
         ("batched", itertools_batched),
         ("combinations", itertools_combinations),
@@ -66,6 +65,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         ("repeat", itertools_repeat),
         ("starmap", itertools_starmap),
         ("takewhile", itertools_takewhile),
+        ("tee", itertools_tee),
         ("zip_longest", itertools_zip_longest),
     ];
     for (name, entry) in functions {
@@ -502,6 +502,18 @@ impl HeldRoots for PyItertoolsGrouper {
         push(self.tgtkey);
     }
 }
+impl HeldRoots for PyItertoolsTee {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        // SAFETY: `shared` is a leaked box owned jointly by the sibling
+        // clones, which are themselves immortal registry entries.
+        let shared = unsafe { &*self.shared };
+        push(shared.source);
+        for &item in &shared.buffer {
+            push(item);
+        }
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // count(start=0, step=1)
@@ -1818,4 +1830,127 @@ unsafe extern "C" fn grouper_next(object: *mut PyObject) -> *mut PyObject {
     let value = state.currvalue;
     state.currvalue = ptr::null_mut();
     value
+}
+
+// ---------------------------------------------------------------------------
+// tee(iterable, n=2)
+
+/// State shared by every clone of one `tee()` call: the single source
+/// iterator plus the pulled items some clone has not consumed yet.  `base`
+/// is the absolute index of `buffer[0]`; each clone records the absolute
+/// index it reads next, and after every step the prefix consumed by ALL
+/// clones is dropped — CPython's teedataobject chain frees exhausted blocks
+/// the same way.  A clone abandoned mid-stream keeps its slot pinned
+/// (itertools objects are immortal leaked boxes), retaining the buffer from
+/// its position on: memory-only divergence, values are unaffected.
+struct TeeShared {
+    source: *mut PyObject,
+    exhausted: bool,
+    buffer: VecDeque<*mut PyObject>,
+    base: usize,
+    positions: Vec<usize>,
+}
+
+#[repr(C)]
+struct PyItertoolsTee {
+    ob_base: PyObjectHeader,
+    /// Leaked box shared with the sibling clones of one `tee()` call.
+    shared: *mut TeeShared,
+    /// This clone's slot in [`TeeShared::positions`].
+    slot: usize,
+}
+
+static TEE_TYPE: LazyLock<usize> = LazyLock::new(|| iterator_type("_tee", size_of::<PyItertoolsTee>(), tee_next));
+
+unsafe extern "C" fn itertools_tee(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { arg_vec(argv, argc) }) else {
+        return raise_type_error("tee received an invalid argument window");
+    };
+    let (args, named) = split_kw_marker(&args);
+    if !named.is_empty() {
+        return raise_type_error("itertools.tee() takes no keyword arguments");
+    }
+    if args.is_empty() {
+        return raise_type_error("tee expected at least 1 argument, got 0");
+    }
+    if args.len() > 2 {
+        return raise_type_error(&format!("tee expected at most 2 arguments, got {}", args.len()));
+    }
+    let n = match args.get(1) {
+        None => 2,
+        Some(&value) if value.is_null() => 2,
+        Some(&value) => {
+            let Some(n) = to_i64(value) else {
+                let name = unsafe { crate::types::dict::type_name(value) }.unwrap_or("object");
+                return raise_type_error(&format!("'{name}' object cannot be interpreted as an integer"));
+            };
+            if n < 0 {
+                return raise_value_error("n must be >= 0");
+            }
+            n as usize
+        }
+    };
+    // CPython returns the empty tuple BEFORE touching the iterable.
+    if n == 0 {
+        return tuple_from(Vec::new());
+    }
+    // SAFETY: `pon_get_iter` self-normalizes its argument.
+    let source = untag(unsafe { pon_get_iter(args[0], ptr::null_mut()) });
+    if source.is_null() {
+        pon_err_clear();
+        let name = unsafe { crate::types::dict::type_name(args[0]) }.unwrap_or("object");
+        return raise_type_error(&format!("'{name}' object is not iterable"));
+    }
+    let shared = Box::into_raw(Box::new(TeeShared {
+        source,
+        exhausted: false,
+        buffer: VecDeque::new(),
+        base: 0,
+        positions: vec![0; n],
+    }));
+    let mut clones = Vec::with_capacity(n);
+    for slot in 0..n {
+        let clone = alloc_object(PyItertoolsTee {
+            ob_base: PyObjectHeader::new(*TEE_TYPE as *const PyType),
+            shared,
+            slot,
+        });
+        if clone.is_null() {
+            return ptr::null_mut();
+        }
+        clones.push(clone);
+    }
+    tuple_from(clones)
+}
+
+unsafe extern "C" fn tee_next(object: *mut PyObject) -> *mut PyObject {
+    let state = unsafe { &mut *object.cast::<PyItertoolsTee>() };
+    // SAFETY: `shared` is the leaked box installed at construction.
+    let shared = unsafe { &mut *state.shared };
+    let rel = shared.positions[state.slot] - shared.base;
+    let item = if let Some(&buffered) = shared.buffer.get(rel) {
+        buffered
+    } else if shared.exhausted {
+        return raise_stop_iteration();
+    } else {
+        match unsafe { next_item(shared.source) } {
+            NextItem::Value(value) => {
+                shared.buffer.push_back(value);
+                value
+            }
+            NextItem::Stop => {
+                shared.exhausted = true;
+                return raise_stop_iteration();
+            }
+            NextItem::Error => return ptr::null_mut(),
+        }
+    };
+    shared.positions[state.slot] += 1;
+    // Drop the prefix every clone has consumed.
+    let slowest = shared.positions.iter().copied().min().unwrap_or(shared.base);
+    while shared.base < slowest {
+        shared.buffer.pop_front();
+        shared.base += 1;
+    }
+    item
 }
