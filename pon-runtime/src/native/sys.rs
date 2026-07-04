@@ -58,11 +58,15 @@ fn format_version_info(major: i64, minor: i64, micro: i64, releaselevel: &str, s
     )
 }
 
-/// Absolute path to the running interpreter for `sys.executable`.  CPython
-/// code (notably `mesonpy`/`subprocess` spawning `[sys.executable, script]`)
-/// requires a spawnable path, not a bare name; fall back to `"pon"` only when
-/// the OS cannot report the current executable.
+/// Absolute path to the Python-compatible interpreter for `sys.executable`.
+/// CPython code (notably `mesonpy`/`subprocess` spawning
+/// `[sys.executable, script]`) requires a spawnable Python runner, not merely
+/// the embedding process.  Embedders may provide `PON_SYS_EXECUTABLE`; the CLI
+/// path remains the fallback.
 fn sys_executable_path() -> String {
+    if let Some(path) = std::env::var_os("PON_SYS_EXECUTABLE").filter(|path| !path.is_empty()) {
+        return path.to_string_lossy().into_owned();
+    }
     std::env::current_exe()
         .ok()
         .and_then(|path| path.to_str().map(str::to_owned))

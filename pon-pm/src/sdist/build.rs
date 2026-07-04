@@ -392,11 +392,28 @@ fn build_runtime_env(build_env: &EnvLayout, source_root: &Path, backend_path: &[
         (OsString::from("PON_HOME"), build_env.pon_dir.clone().into_os_string()),
         (OsString::from("PONPATH"), import_path.clone()),
         (OsString::from("PON_IMPORT_PATH"), import_path),
+        (OsString::from("PON_SYS_EXECUTABLE"), pon_sys_executable()),
         (
             OsString::from("PON_NATIVE_MODULE_REGISTRY"),
             build_env.native_registry_path.clone().into_os_string(),
         ),
     ]
+}
+
+/// Spawnable Python-runner path advertised to build hooks as
+/// `sys.executable` (through `PON_SYS_EXECUTABLE`): the `pon-cli` binary
+/// next to this `pon-pm` executable, so backend code spawning
+/// `[sys.executable, script, ...]` (mesonpy launching meson) gets a real
+/// script runner instead of re-entering pon-pm. Falls back to the current
+/// executable when no sibling exists.
+fn pon_sys_executable() -> OsString {
+    let current = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pon"));
+    let sibling = current.with_file_name(if cfg!(windows) { "pon-cli.exe" } else { "pon-cli" });
+    if sibling.exists() {
+        sibling.into_os_string()
+    } else {
+        current.into_os_string()
+    }
 }
 
 fn build_import_path(build_env: &EnvLayout, source_root: &Path, backend_path: &[String]) -> OsString {

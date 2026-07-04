@@ -85,14 +85,18 @@ fn script_module_attrs(path: &Path) -> Result<Vec<(u32, *mut PyObject)>> {
     let file_text = file_path.to_string_lossy();
     let file_object = unsafe { pon_const_str(file_text.as_ptr(), file_text.len()) };
     if file_object.is_null() {
-        let detail = pon_runtime::pon_err_message().unwrap_or_else(|| format!("failed to allocate __file__ for `{}`", path.display()));
+        let detail = pon_runtime::pon_err_message()
+            .unwrap_or_else(|| format!("failed to allocate __file__ for `{}`", path.display()));
         bail!(detail);
     }
     let cached = unsafe { pon_none() };
     if cached.is_null() {
         bail!("failed to allocate None for __cached__");
     }
-    Ok(vec![(intern("__file__"), file_object), (intern("__cached__"), cached)])
+    Ok(vec![
+        (intern("__file__"), file_object),
+        (intern("__cached__"), cached),
+    ])
 }
 
 fn run_file_inner(path: &Path, argv: &[String]) -> Result<()> {

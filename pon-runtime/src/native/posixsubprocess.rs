@@ -563,10 +563,11 @@ fn object_to_cstring(object: *mut PyObject, what: &str) -> Result<CString, *mut 
     CString::new(bytes).map_err(|_| value_error(&format!("{what} must not contain embedded null byte")))
 }
 
-fn object_to_bytes(object: *mut PyObject, what: &str) -> Result<Vec<u8>, *mut PyObject> {
-    let raw = crate::tag::untag_arg(object);
+fn object_to_bytes(object: *mut PyObject, _what: &str) -> Result<Vec<u8>, *mut PyObject> {
+    let coerced = fspath_coerce(object)?;
+    let raw = crate::tag::untag_arg(coerced);
     if raw.is_null() || crate::tag::is_small_int(raw) {
-        return Err(type_error(&format!("{what} must be str or bytes")));
+        return Err(path_result_type_error(object, raw));
     }
     // SAFETY: Heap pointer with a live header after the checks above.
     if let Some(text) = unsafe { crate::types::type_::unicode_text(raw) } {
@@ -577,7 +578,55 @@ fn object_to_bytes(object: *mut PyObject, what: &str) -> Result<Vec<u8>, *mut Py
         // SAFETY: Type check proved the PyBytes layout.
         return Ok(unsafe { (*raw.cast::<crate::types::bytes_::PyBytes>()).as_slice() }.to_vec());
     }
-    Err(type_error(&format!("{what} must be str or bytes")))
+    Err(path_result_type_error(object, raw))
+}
+
+fn fspath_coerce(object: *mut PyObject) -> Result<*mut PyObject, *mut PyObject> {
+    let raw = crate::tag::untag_arg(object);
+    if !raw.is_null() && !crate::tag::is_small_int(raw) {
+        // SAFETY: Heap pointer with a live header after the tag checks.
+        if matches!(unsafe { crate::types::dict::type_name(raw) }, Some("str" | "bytes")) {
+            return Ok(object);
+        }
+        // SAFETY: Heap pointer with a live header after the tag checks.
+        let ty = unsafe { (*raw).ob_type.cast_mut() };
+        let hook = unsafe { crate::descr::lookup_in_type(ty, intern("__fspath__")) };
+        if !hook.is_null() {
+            let bound = unsafe { crate::descr::descriptor_get(hook, raw, ty) };
+            if bound.is_null() {
+                return Err(ptr::null_mut());
+            }
+            let result = unsafe { crate::abi::pon_call(bound, ptr::null_mut(), 0) };
+            if result.is_null() {
+                return Err(ptr::null_mut());
+            }
+            return Ok(result);
+        }
+    }
+    Err(type_error(&format!(
+        "expected str, bytes or os.PathLike object, not {}",
+        object_type_display(raw)
+    )))
+}
+
+fn path_result_type_error(source: *mut PyObject, result: *mut PyObject) -> *mut PyObject {
+    let source_raw = crate::tag::untag_arg(source);
+    type_error(&format!(
+        "expected {}.__fspath__() to return str or bytes, not {}",
+        object_type_display(source_raw),
+        object_type_display(result)
+    ))
+}
+
+fn object_type_display(object: *mut PyObject) -> &'static str {
+    if object.is_null() {
+        "NoneType"
+    } else if crate::tag::is_small_int(object) {
+        "int"
+    } else {
+        // SAFETY: Heap pointer with a live header after the tag checks above.
+        unsafe { crate::types::dict::type_name(object) }.unwrap_or("object")
+    }
 }
 
 fn sequence_items<'a>(object: *mut PyObject, what: &str) -> Result<&'a [*mut PyObject], *mut PyObject> {
@@ -721,4 +770,50 @@ fn inherited_envp() -> *const *mut libc::c_char {
         static mut environ: *mut *mut libc::c_char;
     }
     unsafe { environ.cast_const() }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ptr;
+
+    use super::*;
+    use crate::abi;
+    use crate::thread_state::{pon_err_clear, pon_err_message, test_state_lock};
+    use crate::types::type_::{build_class_from_namespace, new_namespace, type_new};
+
+    fn init_runtime() {
+        assert_eq!(unsafe { abi::pon_runtime_init() }, 0);
+        pon_err_clear();
+    }
+
+    unsafe extern "C" fn fspath_returns_tmp(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+        let path = b"/tmp";
+        unsafe { abi::pon_const_str(path.as_ptr(), path.len()) }
+    }
+
+    unsafe fn pathlike_instance() -> *mut PyObject {
+        let fspath_name = intern("__fspath__");
+        let fspath = unsafe { abi::pon_make_function(fspath_returns_tmp as *const u8, 1, fspath_name) };
+        assert!(!fspath.is_null(), "failed to allocate __fspath__ function");
+        let namespace = new_namespace();
+        unsafe {
+            (&mut *namespace).set(fspath_name, fspath);
+        }
+        let class = unsafe { build_class_from_namespace("Pathish", &[], namespace, &[]) }.cast::<crate::object::PyType>();
+        assert!(!class.is_null(), "failed to build Pathish class: {:?}", pon_err_message());
+        let instance = unsafe { type_new(class, ptr::null_mut(), ptr::null_mut()) };
+        assert!(!instance.is_null(), "failed to allocate Pathish instance: {:?}", pon_err_message());
+        instance
+    }
+
+    #[test]
+    fn object_to_bytes_accepts_pathlike_fspath_result() {
+        let _guard = test_state_lock();
+        init_runtime();
+        let instance = unsafe { pathlike_instance() };
+
+        let bytes = object_to_bytes(instance, "cwd").expect("PathLike __fspath__ should coerce to bytes");
+
+        assert_eq!(bytes, b"/tmp");
+    }
 }
