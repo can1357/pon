@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 
 use num_bigint::BigInt;
 
-use crate::object::{PyMappingMethods, PyNumberMethods, PyObject, PyObjectHeader, PyType, PyUnicode};
+use crate::object::{PyMappingMethods, PyNumberMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType, PyUnicode};
 use crate::thread_state::pon_err_set;
 use core::ops::RangeInclusive;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -78,6 +78,18 @@ pub struct PyDictIter {
     pub kind: DictIterKind,
 }
 
+/// Live dictionary view over keys, values, or items.
+#[repr(C)]
+#[derive(Debug)]
+pub struct PyDictView {
+    /// Common object header; this field must remain first.
+    pub ob_base: PyObjectHeader,
+    /// Dictionary reflected by this view.
+    pub dict: *mut PyObject,
+    /// Projection yielded by this view.
+    pub kind: DictIterKind,
+}
+
 /// Dictionary iterator projection.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,6 +144,100 @@ pub fn dict_iter_type(type_type: *const PyType) -> *mut PyType {
     ty
 }
 
+/// Builds the runtime type object for `dict_keys` views.
+#[must_use]
+pub fn dict_keys_type(type_type: *const PyType) -> *mut PyType {
+    static TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut sequence = PySequenceMethods::EMPTY;
+        sequence.sq_length = Some(dict_view_len_slot);
+        sequence.sq_contains = Some(dict_view_contains_slot);
+
+        let mut number = PyNumberMethods::EMPTY;
+        number.nb_subtract = Some(dict_view_difference_slot);
+        number.nb_and = Some(dict_view_intersection_slot);
+        number.nb_or = Some(dict_view_union_slot);
+        number.nb_xor = Some(dict_view_symmetric_difference_slot);
+        number.nb_reflected_subtract = Some(dict_view_reflected_difference_slot);
+        number.nb_reflected_and = Some(dict_view_reflected_intersection_slot);
+        number.nb_reflected_or = Some(dict_view_reflected_union_slot);
+        number.nb_reflected_xor = Some(dict_view_reflected_symmetric_difference_slot);
+
+        let mut ty = PyType::new(ptr::null(), "dict_keys", size_of::<PyDictView>());
+        ty.tp_as_sequence = Box::into_raw(Box::new(sequence));
+        ty.tp_as_number = Box::into_raw(Box::new(number));
+        ty.tp_iter = Some(dict_view_iter_slot);
+        ty.tp_repr = Some(dict_view_repr_slot);
+        ty.tp_richcmp = Some(dict_view_richcmp_slot);
+        ty.tp_getattro = Some(dict_view_getattro_slot);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    let ty = *TYPE as *mut PyType;
+    unsafe { install_type_type(ty, type_type) };
+    ty
+}
+
+/// Builds the runtime type object for `dict_values` views.
+#[must_use]
+pub fn dict_values_type(type_type: *const PyType) -> *mut PyType {
+    static TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut sequence = PySequenceMethods::EMPTY;
+        sequence.sq_length = Some(dict_view_len_slot);
+        sequence.sq_contains = Some(dict_view_contains_slot);
+
+        let mut ty = PyType::new(ptr::null(), "dict_values", size_of::<PyDictView>());
+        ty.tp_as_sequence = Box::into_raw(Box::new(sequence));
+        ty.tp_iter = Some(dict_view_iter_slot);
+        ty.tp_repr = Some(dict_view_repr_slot);
+        ty.tp_getattro = Some(dict_view_getattro_slot);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    let ty = *TYPE as *mut PyType;
+    unsafe { install_type_type(ty, type_type) };
+    ty
+}
+
+/// Builds the runtime type object for `dict_items` views.
+#[must_use]
+pub fn dict_items_type(type_type: *const PyType) -> *mut PyType {
+    static TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut sequence = PySequenceMethods::EMPTY;
+        sequence.sq_length = Some(dict_view_len_slot);
+        sequence.sq_contains = Some(dict_view_contains_slot);
+
+        let mut number = PyNumberMethods::EMPTY;
+        number.nb_subtract = Some(dict_view_difference_slot);
+        number.nb_and = Some(dict_view_intersection_slot);
+        number.nb_or = Some(dict_view_union_slot);
+        number.nb_xor = Some(dict_view_symmetric_difference_slot);
+        number.nb_reflected_subtract = Some(dict_view_reflected_difference_slot);
+        number.nb_reflected_and = Some(dict_view_reflected_intersection_slot);
+        number.nb_reflected_or = Some(dict_view_reflected_union_slot);
+        number.nb_reflected_xor = Some(dict_view_reflected_symmetric_difference_slot);
+
+        let mut ty = PyType::new(ptr::null(), "dict_items", size_of::<PyDictView>());
+        ty.tp_as_sequence = Box::into_raw(Box::new(sequence));
+        ty.tp_as_number = Box::into_raw(Box::new(number));
+        ty.tp_iter = Some(dict_view_iter_slot);
+        ty.tp_repr = Some(dict_view_repr_slot);
+        ty.tp_richcmp = Some(dict_view_richcmp_slot);
+        ty.tp_getattro = Some(dict_view_getattro_slot);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    let ty = *TYPE as *mut PyType;
+    unsafe { install_type_type(ty, type_type) };
+    ty
+}
+
+/// Selects the concrete dict-view type for an iterator projection.
+#[must_use]
+pub fn dict_view_type(type_type: *const PyType, kind: DictIterKind) -> *mut PyType {
+    match kind {
+        DictIterKind::Keys => dict_keys_type(type_type),
+        DictIterKind::Values => dict_values_type(type_type),
+        DictIterKind::Items => dict_items_type(type_type),
+    }
+}
+
 /// Traces dictionary keys and values.
 pub unsafe extern "C" fn trace_dict(object: *mut u8, visitor: &mut dyn FnMut(*mut u8)) {
     if object.is_null() {
@@ -169,6 +275,17 @@ pub unsafe extern "C" fn trace_dict_iter(object: *mut u8, visitor: &mut dyn FnMu
     }
 }
 
+/// Traces the dictionary retained by a view.
+pub unsafe extern "C" fn trace_dict_view(object: *mut u8, visitor: &mut dyn FnMut(*mut u8)) {
+    if object.is_null() {
+        return;
+    }
+    let view = unsafe { &*object.cast::<PyDictView>() };
+    if !view.dict.is_null() {
+        visitor(view.dict.cast::<u8>());
+    }
+}
+
 /// Initializes a freshly allocated dictionary object.
 pub unsafe fn init_dict(ptr: *mut PyDict, ob_type: *const PyType, capacity: usize) {
     unsafe {
@@ -198,6 +315,20 @@ pub unsafe fn init_dict_iter(ptr: *mut PyDictIter, ob_type: *const PyType, dict:
     }
 }
 
+/// Initializes a freshly allocated dictionary view.
+pub unsafe fn init_dict_view(ptr: *mut PyDictView, ob_type: *const PyType, dict: *mut PyObject, kind: DictIterKind) {
+    unsafe {
+        ptr::write(
+            ptr,
+            PyDictView {
+                ob_base: PyObjectHeader::new(ob_type),
+                dict,
+                kind,
+            },
+        );
+    }
+}
+
 /// Returns whether `object` is an exact runtime dictionary.
 #[must_use]
 pub unsafe fn is_dict(object: *mut PyObject) -> bool {
@@ -208,6 +339,43 @@ pub unsafe fn is_dict(object: *mut PyObject) -> bool {
 #[must_use]
 pub unsafe fn is_dict_iter(object: *mut PyObject) -> bool {
     (unsafe { type_name(object) }) == Some("dict_keyiterator")
+}
+
+/// Returns whether `object` is any runtime dictionary view.
+#[must_use]
+pub unsafe fn is_dict_view(object: *mut PyObject) -> bool {
+    matches!(
+        unsafe { type_name(object) },
+        Some("dict_keys" | "dict_values" | "dict_items")
+    )
+}
+
+/// Returns whether `object` is a set-like dictionary view.
+#[must_use]
+pub unsafe fn is_setlike_dict_view(object: *mut PyObject) -> bool {
+    matches!(unsafe { type_name(object) }, Some("dict_keys" | "dict_items"))
+}
+
+/// Borrows a dictionary view payload.
+#[must_use]
+pub unsafe fn dict_view_ref(object: *mut PyObject) -> Option<&'static PyDictView> {
+    if unsafe { is_dict_view(object) } {
+        Some(unsafe { &*object.cast::<PyDictView>() })
+    } else {
+        None
+    }
+}
+
+/// Returns a dictionary view's projection kind.
+#[must_use]
+pub unsafe fn dict_view_kind(object: *mut PyObject) -> Option<DictIterKind> {
+    unsafe { dict_view_ref(object).map(|view| view.kind) }
+}
+
+/// Returns the dictionary reflected by a dictionary view.
+#[must_use]
+pub unsafe fn dict_view_dict(object: *mut PyObject) -> Option<*mut PyObject> {
+    unsafe { dict_view_ref(object).map(|view| view.dict) }
 }
 
 /// Returns whether `ty` is a heap class whose instances embed dict storage.
@@ -1051,6 +1219,77 @@ unsafe extern "C" fn dict_iter_next_slot(iterator: *mut PyObject) -> *mut PyObje
     unsafe { crate::abi::map::pon_dict_iter_next(iterator) }
 }
 
+unsafe extern "C" fn dict_view_len_slot(object: *mut PyObject) -> isize {
+    let Some(view) = (unsafe { dict_view_ref(object) }) else {
+        return -1;
+    };
+    match unsafe { dict_ref(view.dict) } {
+        Ok(dict) => isize::try_from(dict.entries.len()).unwrap_or(isize::MAX),
+        Err(_) => -1,
+    }
+}
+
+unsafe extern "C" fn dict_view_contains_slot(object: *mut PyObject, item: *mut PyObject) -> c_int {
+    unsafe { crate::abi::map::pon_dict_view_contains_status(object, item) }
+}
+
+unsafe extern "C" fn dict_view_iter_slot(object: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abi::map::pon_dict_view_iter(object) }
+}
+
+unsafe extern "C" fn dict_view_repr_slot(object: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abi::map::pon_dict_view_repr(object) }
+}
+
+unsafe extern "C" fn dict_view_difference_slot(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abi::map::pon_dict_view_difference(left, right) }
+}
+
+unsafe extern "C" fn dict_view_intersection_slot(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abi::map::pon_dict_view_intersection(left, right) }
+}
+
+unsafe extern "C" fn dict_view_union_slot(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abi::map::pon_dict_view_union(left, right) }
+}
+
+unsafe extern "C" fn dict_view_symmetric_difference_slot(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abi::map::pon_dict_view_symmetric_difference(left, right) }
+}
+
+unsafe extern "C" fn dict_view_reflected_difference_slot(view: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abi::map::pon_dict_view_reflected_difference(view, other) }
+}
+
+unsafe extern "C" fn dict_view_reflected_intersection_slot(view: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abi::map::pon_dict_view_reflected_intersection(view, other) }
+}
+
+unsafe extern "C" fn dict_view_reflected_union_slot(view: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abi::map::pon_dict_view_reflected_union(view, other) }
+}
+
+unsafe extern "C" fn dict_view_reflected_symmetric_difference_slot(view: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abi::map::pon_dict_view_reflected_symmetric_difference(view, other) }
+}
+
+unsafe extern "C" fn dict_view_richcmp_slot(left: *mut PyObject, right: *mut PyObject, op: c_int) -> *mut PyObject {
+    unsafe { crate::abi::map::pon_dict_view_richcompare(left, right, op) }
+}
+
+unsafe extern "C" fn dict_view_getattro_slot(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(attr) = (unsafe { unicode_attr_name_display(name) }) else {
+        pon_err_set("dict view attribute name must be str");
+        return ptr::null_mut();
+    };
+    match attr.as_str() {
+        "isdisjoint" if unsafe { is_setlike_dict_view(object) } => unsafe {
+            crate::abi::map::pon_dict_view_bound_method(object, &attr)
+        },
+        _ => crate::abi::exc::raise_attribute_error_text(&format!("attribute '{attr}' was not found")),
+    }
+}
+
 unsafe extern "C" fn dict_getattro_slot(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
     let Some(attr) = (unsafe { unicode_attr_name_display(name) }) else {
         pon_err_set("dict attribute name must be str");
@@ -1543,7 +1782,7 @@ pub unsafe extern "C" fn finalize_dict_subclass_instance(object: *mut u8) {
 const _: () = {
     assert!(offset_of!(PyDict, ob_base) == 0);
     assert!(offset_of!(PyDictIter, ob_base) == 0);
-    // `dict_storage_ptr` overlays `PyDictStorage` on `PyDict`'s tail.
+    assert!(offset_of!(PyDictView, ob_base) == 0);
     assert!(offset_of!(PyDictStorage, entries) == 0);
     assert!(offset_of!(PyDict, buckets) - offset_of!(PyDict, entries) == offset_of!(PyDictStorage, buckets));
     assert!(size_of::<PyDict>() == offset_of!(PyDict, entries) + size_of::<PyDictStorage>());

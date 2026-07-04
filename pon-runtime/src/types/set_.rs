@@ -43,8 +43,8 @@ pub fn set_type(type_type: *const PyType) -> *mut PyType {
         let mut number = PyNumberMethods::EMPTY;
         number.nb_or = Some(set_union_slot);
         number.nb_and = Some(set_intersection_slot);
+        number.nb_xor = Some(set_symmetric_difference_slot);
         number.nb_subtract = Some(set_difference_slot);
-
         let mut ty = PyType::new(ptr::null(), "set", size_of::<PySet>());
         ty.tp_as_sequence = Box::into_raw(Box::new(sequence));
         ty.tp_as_number = Box::into_raw(Box::new(number));
@@ -546,13 +546,18 @@ unsafe extern "C" fn set_difference_slot(left: *mut PyObject, right: *mut PyObje
     unsafe { crate::abi::map::pon_set_difference(left, right) }
 }
 
+unsafe extern "C" fn set_symmetric_difference_slot(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abi::map::pon_set_symmetric_difference(left, right) }
+}
+
 unsafe extern "C" fn set_getattro_slot(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
     let Some(name) = (unsafe { type_::unicode_text(name) }) else {
         return crate::abi::return_null_with_error("set attribute name must be str");
     };
     match name {
-        "add" | "discard" | "union" | "intersection" | "difference" | "update" | "issubset" | "issuperset"
-        | "isdisjoint" | "__contains__" | "copy" | "remove" | "clear" | "pop" => unsafe {
+        "add" | "discard" | "union" | "intersection" | "difference" | "symmetric_difference"
+        | "symmetric_difference_update" | "update" | "issubset" | "issuperset" | "isdisjoint" | "__contains__"
+        | "copy" | "remove" | "clear" | "pop" => unsafe {
             crate::abi::map::pon_set_bound_method(object, name)
         },
         _ => crate::abi::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),

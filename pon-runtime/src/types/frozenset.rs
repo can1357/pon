@@ -35,8 +35,8 @@ pub fn frozenset_type(type_type: *const PyType) -> *mut PyType {
         let mut number = PyNumberMethods::EMPTY;
         number.nb_or = Some(frozenset_union_slot);
         number.nb_and = Some(frozenset_intersection_slot);
+        number.nb_xor = Some(frozenset_symmetric_difference_slot);
         number.nb_subtract = Some(frozenset_difference_slot);
-
         let mut ty = PyType::new(ptr::null(), "frozenset", size_of::<PyFrozenSet>());
         ty.tp_hash = Some(frozenset_hash_slot);
         ty.tp_as_sequence = Box::into_raw(Box::new(sequence));
@@ -235,8 +235,8 @@ unsafe extern "C" fn frozenset_getattro_slot(object: *mut PyObject, name: *mut P
         return crate::abi::return_null_with_error("frozenset attribute name must be str");
     };
     match name {
-        "union" | "intersection" | "difference" | "issubset" | "issuperset" | "isdisjoint" | "__contains__"
-        | "copy" => unsafe {
+        "union" | "intersection" | "difference" | "symmetric_difference" | "issubset" | "issuperset"
+        | "isdisjoint" | "__contains__" | "copy" => unsafe {
             crate::abi::map::pon_set_bound_method(object, name)
         },
         "__doc__" => unsafe { crate::abi::pon_none() },
@@ -258,6 +258,10 @@ unsafe extern "C" fn frozenset_intersection_slot(left: *mut PyObject, right: *mu
 
 unsafe extern "C" fn frozenset_difference_slot(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
     unsafe { crate::abi::map::pon_set_difference(left, right) }
+}
+
+unsafe extern "C" fn frozenset_symmetric_difference_slot(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abi::map::pon_set_symmetric_difference(left, right) }
 }
 
 fn build_buckets(entries: &[*mut PyObject]) -> Result<Vec<Option<usize>>, String> {

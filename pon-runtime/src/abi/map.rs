@@ -18,6 +18,7 @@ pub type MapStatus = i32;
 
 const TYPE_ID_DICT: TypeId = TypeId(101);
 const TYPE_ID_DICT_ITER: TypeId = TypeId(102);
+const TYPE_ID_DICT_VIEW: TypeId = TypeId(111);
 const TYPE_ID_SET: TypeId = TypeId(104);
 const TYPE_ID_SET_ITER: TypeId = TypeId(105);
 const TYPE_ID_FROZENSET: TypeId = TypeId(106);
@@ -39,6 +40,14 @@ fn register_map_types(runtime: &super::Runtime) {
         GcTypeInfo {
             size: mem::size_of::<dict::PyDictIter>(),
             trace: dict::trace_dict_iter,
+            finalize: None,
+        },
+    );
+    runtime.heap.register_type(
+        TYPE_ID_DICT_VIEW,
+        GcTypeInfo {
+            size: mem::size_of::<dict::PyDictView>(),
+            trace: dict::trace_dict_view,
             finalize: None,
         },
     );
@@ -82,10 +91,12 @@ fn ensure_runtime_for_map() -> Result<(), String> {
 
 fn null_error(message: impl Into<String>) -> *mut PyObject {
     let message = message.into();
-    // Hash failures must surface as catchable TypeError objects (CPython:
-    // `except TypeError` around `d[[1]] = 1`), not opaque diagnostics. Covers
-    // both the bare hash message and the dict-key/set-element wrapped form.
-    if message.starts_with("unhashable type") || message.starts_with("cannot use '") {
+    // Hash failures and iterable coercion failures must surface as catchable
+    // TypeError objects, not opaque diagnostics.
+    if message.starts_with("unhashable type")
+        || message.starts_with("cannot use '")
+        || message.ends_with(" object is not iterable")
+    {
         return unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
     }
     super::return_null_with_error(message)
@@ -141,6 +152,16 @@ fn alloc_dict_iter(runtime: &super::Runtime, source: *mut PyObject, kind: dict::
     as_object_ptr(object)
 }
 
+fn alloc_dict_view(runtime: &super::Runtime, source: *mut PyObject, kind: dict::DictIterKind) -> *mut PyObject {
+    register_map_types(runtime);
+    let object = runtime
+        .heap
+        .alloc(mem::size_of::<dict::PyDictView>(), TYPE_ID_DICT_VIEW)
+        .cast::<dict::PyDictView>();
+    unsafe { dict::init_dict_view(object, dict::dict_view_type(runtime._type_type, kind), source, kind) };
+    as_object_ptr(object)
+}
+
 fn alloc_set(runtime: &super::Runtime, capacity: usize) -> *mut PyObject {
     register_map_types(runtime);
     let object = runtime.heap.alloc(mem::size_of::<set_::PySet>(), TYPE_ID_SET).cast::<set_::PySet>();
@@ -180,6 +201,26 @@ fn build_set_from_entries(runtime: &super::Runtime, left: *mut PyObject, entries
         // SAFETY: The freshly allocated object is an exact set.
         unsafe { set_::set_mut(result).expect("fresh set").entries = entries };
         result
+    }
+}
+
+fn build_plain_set_from_entries(runtime: &super::Runtime, entries: Vec<*mut PyObject>) -> *mut PyObject {
+    let result = alloc_set(runtime, entries.len());
+    // SAFETY: The freshly allocated object is an exact set.
+    unsafe { set_::set_mut(result).expect("fresh set").entries = entries };
+    result
+}
+
+fn build_set_binary_result(
+    runtime: &super::Runtime,
+    left: *mut PyObject,
+    right: *mut PyObject,
+    entries: Vec<*mut PyObject>,
+) -> *mut PyObject {
+    if unsafe { dict::is_setlike_dict_view(right) } {
+        build_plain_set_from_entries(runtime, entries)
+    } else {
+        build_set_from_entries(runtime, left, entries)
     }
 }
 
@@ -880,37 +921,25 @@ pub unsafe extern "C" fn pon_dict_clear(map: *mut PyObject) -> *mut PyObject {
         }
     })
 }
-/// Returns an insertion-order key iterator for a dict.
+/// Returns a live `dict_keys` view for a dict.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_keys(map: *mut PyObject) -> *mut PyObject {
     crate::untag_prelude!(map);
-    unsafe { pon_dict_iter_keys(map) }
+    dict_view_for_map(map, dict::DictIterKind::Keys)
 }
 
-/// Returns an insertion-order value iterator for a dict.
+/// Returns a live `dict_values` view for a dict.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_values(map: *mut PyObject) -> *mut PyObject {
     crate::untag_prelude!(map);
-    super::catch_object_helper(|| match super::with_runtime(|runtime| {
-        register_map_types(runtime);
-        alloc_dict_iter(runtime, map, dict::DictIterKind::Values)
-    }) {
-        Some(iter) => iter,
-        None => null_error("runtime is not initialized"),
-    })
+    dict_view_for_map(map, dict::DictIterKind::Values)
 }
 
-/// Returns an insertion-order item iterator for a dict.
+/// Returns a live `dict_items` view for a dict.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_items(map: *mut PyObject) -> *mut PyObject {
     crate::untag_prelude!(map);
-    super::catch_object_helper(|| match super::with_runtime(|runtime| {
-        register_map_types(runtime);
-        alloc_dict_iter(runtime, map, dict::DictIterKind::Items)
-    }) {
-        Some(iter) => iter,
-        None => null_error("runtime is not initialized"),
-    })
+    dict_view_for_map(map, dict::DictIterKind::Items)
 }
 
 /// Returns an insertion-order key iterator for a dict.
@@ -962,6 +991,447 @@ pub unsafe extern "C" fn pon_dict_iter_next(iterator: *mut PyObject) -> *mut PyO
             }
         }
     })
+}
+
+fn dict_view_for_map(map: *mut PyObject, kind: dict::DictIterKind) -> *mut PyObject {
+    super::catch_object_helper(|| {
+        if unsafe { !dict::has_dict_storage(map) } {
+            return null_error("expected dict object");
+        }
+        match super::with_runtime(|runtime| {
+            register_map_types(runtime);
+            alloc_dict_view(runtime, map, kind)
+        }) {
+            Some(view) => view,
+            None => null_error("runtime is not initialized"),
+        }
+    })
+}
+
+fn dict_view_type_name(kind: dict::DictIterKind) -> &'static str {
+    match kind {
+        dict::DictIterKind::Keys => "dict_keys",
+        dict::DictIterKind::Values => "dict_values",
+        dict::DictIterKind::Items => "dict_items",
+    }
+}
+
+fn dict_projection_entries(map: *mut PyObject, kind: dict::DictIterKind) -> Result<Vec<*mut PyObject>, String> {
+    let entries = unsafe { dict::dict_entries_snapshot(map)? };
+    Ok(match kind {
+        dict::DictIterKind::Keys => entries.into_iter().map(|entry| entry.key).collect(),
+        dict::DictIterKind::Values => entries.into_iter().map(|entry| entry.value).collect(),
+        dict::DictIterKind::Items => {
+            let mut projected = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let pair = match super::with_runtime(|runtime| super::seq::alloc_tuple_from_slice(runtime, &[entry.key, entry.value])) {
+                    Some(Ok(pair)) => pair,
+                    Some(Err(message)) => return Err(message),
+                    None => return Err("runtime is not initialized".to_owned()),
+                };
+                projected.push(pair);
+            }
+            projected
+        },
+    })
+}
+
+fn dict_view_set_entries(view: *mut PyObject) -> Result<Vec<*mut PyObject>, String> {
+    let Some(view_ref) = (unsafe { dict::dict_view_ref(view) }) else {
+        return Err("expected dict view object".to_owned());
+    };
+    if view_ref.kind == dict::DictIterKind::Values {
+        return Err("dict_values object is not set-like".to_owned());
+    }
+    dict_projection_entries(view_ref.dict, view_ref.kind)
+}
+
+fn set_binary_rhs_entries(object: *mut PyObject) -> Result<Vec<*mut PyObject>, String> {
+    if unsafe { dict::is_setlike_dict_view(object) } {
+        dict_view_set_entries(object)
+    } else {
+        unsafe { set_::entries_snapshot(object) }
+    }
+}
+
+fn push_repr_text(out: &mut String, object: *mut PyObject) -> Result<(), ()> {
+    out.push_str(&crate::native::builtins_mod::try_repr_text(object)?);
+    Ok(())
+}
+
+/// Returns a fresh iterator over a dictionary view's current contents.
+pub unsafe extern "C" fn pon_dict_view_iter(view: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(view);
+    super::catch_object_helper(|| {
+        let Some(view_ref) = (unsafe { dict::dict_view_ref(view) }) else {
+            return null_error("expected dict view object");
+        };
+        match super::with_runtime(|runtime| {
+            register_map_types(runtime);
+            alloc_dict_iter(runtime, view_ref.dict, view_ref.kind)
+        }) {
+            Some(iter) => iter,
+            None => null_error("runtime is not initialized"),
+        }
+    })
+}
+
+/// Returns CPython-style `dict_keys([...])`/`dict_values([...])`/`dict_items([...])` repr text.
+pub unsafe extern "C" fn pon_dict_view_repr(view: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(view);
+    super::catch_object_helper(|| {
+        let Some(view_ref) = (unsafe { dict::dict_view_ref(view) }) else {
+            return null_error("expected dict view object");
+        };
+        let entries = match unsafe { dict::dict_entries_snapshot(view_ref.dict) } {
+            Ok(entries) => entries,
+            Err(message) => return null_error(message),
+        };
+        let mut out = String::new();
+        out.push_str(dict_view_type_name(view_ref.kind));
+        out.push_str("([");
+        for (index, entry) in entries.iter().enumerate() {
+            if index > 0 {
+                out.push_str(", ");
+            }
+            let repr_result = match view_ref.kind {
+                dict::DictIterKind::Keys => push_repr_text(&mut out, entry.key),
+                dict::DictIterKind::Values => push_repr_text(&mut out, entry.value),
+                dict::DictIterKind::Items => {
+                    out.push('(');
+                    if push_repr_text(&mut out, entry.key).is_err() {
+                        Err(())
+                    } else {
+                        out.push_str(", ");
+                        if push_repr_text(&mut out, entry.value).is_err() {
+                            Err(())
+                        } else {
+                            out.push(')');
+                            Ok(())
+                        }
+                    }
+                },
+            };
+            if repr_result.is_err() {
+                return ptr::null_mut();
+            }
+        }
+        out.push_str("])");
+        let text = unsafe { super::pon_const_str(out.as_ptr(), out.len()) };
+        if text.is_null() {
+            null_error("failed to allocate dict view repr")
+        } else {
+            text
+        }
+    })
+}
+
+fn dict_view_contains(view: *mut PyObject, item: *mut PyObject) -> Result<bool, String> {
+    let Some(view_ref) = (unsafe { dict::dict_view_ref(view) }) else {
+        return Err("expected dict view object".to_owned());
+    };
+    match view_ref.kind {
+        dict::DictIterKind::Keys => unsafe { dict::dict_contains(view_ref.dict, item) },
+        dict::DictIterKind::Values => {
+            let entries = unsafe { dict::dict_entries_snapshot(view_ref.dict)? };
+            for entry in entries {
+                if unsafe { dict::object_equal(entry.value, item)? } {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        },
+        dict::DictIterKind::Items => {
+            let Some(pair) = (unsafe { super::seq::tuple_storage_slice(item) }) else {
+                return Ok(false);
+            };
+            if pair.len() != 2 {
+                return Ok(false);
+            }
+            let entries = unsafe { dict::dict_entries_snapshot(view_ref.dict)? };
+            for entry in entries {
+                if unsafe { dict::object_equal(entry.key, pair[0])? }
+                    && unsafe { dict::object_equal(entry.value, pair[1])? }
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        },
+    }
+}
+
+/// Contains predicate for dictionary views. Returns `1`, `0`, or `-1` on error.
+pub unsafe extern "C" fn pon_dict_view_contains_status(view: *mut PyObject, item: *mut PyObject) -> c_int {
+    crate::untag_prelude!(err = -1; view, item);
+    super::catch_status_helper(|| contains_result(dict_view_contains(view, item)))
+}
+
+#[derive(Clone, Copy)]
+enum DictViewSetOp {
+    Difference,
+    Intersection,
+    Union,
+    SymmetricDifference,
+}
+
+fn set_op_entries(
+    left: &[*mut PyObject],
+    right: &[*mut PyObject],
+    op: DictViewSetOp,
+) -> Result<Vec<*mut PyObject>, String> {
+    match op {
+        DictViewSetOp::Difference => {
+            let mut entries = Vec::new();
+            for item in left {
+                if unsafe { set_::find_element_index(right, *item)? }.is_none() {
+                    entries.push(*item);
+                }
+            }
+            Ok(entries)
+        },
+        DictViewSetOp::Intersection => {
+            let mut entries = Vec::new();
+            for item in left {
+                if unsafe { set_::find_element_index(right, *item)? }.is_some() {
+                    entries.push(*item);
+                }
+            }
+            Ok(entries)
+        },
+        DictViewSetOp::Union => {
+            let mut entries = left.to_vec();
+            unsafe { set_::insert_unique_entries(&mut entries, right)? };
+            Ok(entries)
+        },
+        DictViewSetOp::SymmetricDifference => {
+            let mut entries = Vec::new();
+            for item in left {
+                if unsafe { set_::find_element_index(right, *item)? }.is_none() {
+                    entries.push(*item);
+                }
+            }
+            for item in right {
+                if unsafe { set_::find_element_index(left, *item)? }.is_none() {
+                    entries.push(*item);
+                }
+            }
+            Ok(entries)
+        },
+    }
+}
+
+fn dict_view_set_op(
+    view: *mut PyObject,
+    other: *mut PyObject,
+    op: DictViewSetOp,
+    reflected: bool,
+) -> *mut PyObject {
+    super::catch_object_helper(|| {
+        if unsafe { !dict::is_setlike_dict_view(view) } {
+            return unsafe { super::pon_not_implemented() };
+        }
+        let (left_values, right_values) = if reflected {
+            let left = match set_argument_entries(other) {
+                Ok(entries) => entries,
+                Err(message) => return null_error(message),
+            };
+            let right = match dict_view_set_entries(view) {
+                Ok(entries) => entries,
+                Err(message) => return null_error(message),
+            };
+            (left, right)
+        } else {
+            let left = match dict_view_set_entries(view) {
+                Ok(entries) => entries,
+                Err(message) => return null_error(message),
+            };
+            let right = match set_argument_entries(other) {
+                Ok(entries) => entries,
+                Err(message) => return null_error(message),
+            };
+            (left, right)
+        };
+        let left_entries = match unsafe { frozenset::unique_entries(&left_values) } {
+            Ok(entries) => entries,
+            Err(message) => return null_error(message),
+        };
+        let right_entries = match unsafe { frozenset::unique_entries(&right_values) } {
+            Ok(entries) => entries,
+            Err(message) => return null_error(message),
+        };
+        let entries = match set_op_entries(&left_entries, &right_entries, op) {
+            Ok(entries) => entries,
+            Err(message) => return null_error(message),
+        };
+        match super::with_runtime(|runtime| build_plain_set_from_entries(runtime, entries)) {
+            Some(object) => object,
+            None => null_error("runtime is not initialized"),
+        }
+    })
+}
+
+pub unsafe extern "C" fn pon_dict_view_difference(view: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(view, other);
+    dict_view_set_op(view, other, DictViewSetOp::Difference, false)
+}
+
+pub unsafe extern "C" fn pon_dict_view_intersection(view: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(view, other);
+    dict_view_set_op(view, other, DictViewSetOp::Intersection, false)
+}
+
+pub unsafe extern "C" fn pon_dict_view_union(view: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(view, other);
+    dict_view_set_op(view, other, DictViewSetOp::Union, false)
+}
+
+pub unsafe extern "C" fn pon_dict_view_symmetric_difference(view: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(view, other);
+    dict_view_set_op(view, other, DictViewSetOp::SymmetricDifference, false)
+}
+
+pub unsafe extern "C" fn pon_dict_view_reflected_difference(view: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(view, other);
+    dict_view_set_op(view, other, DictViewSetOp::Difference, true)
+}
+
+pub unsafe extern "C" fn pon_dict_view_reflected_intersection(view: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(view, other);
+    dict_view_set_op(view, other, DictViewSetOp::Intersection, true)
+}
+
+pub unsafe extern "C" fn pon_dict_view_reflected_union(view: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(view, other);
+    dict_view_set_op(view, other, DictViewSetOp::Union, true)
+}
+
+pub unsafe extern "C" fn pon_dict_view_reflected_symmetric_difference(view: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(view, other);
+    dict_view_set_op(view, other, DictViewSetOp::SymmetricDifference, true)
+}
+
+fn dict_view_compare_rhs_entries(object: *mut PyObject) -> Option<Result<Vec<*mut PyObject>, String>> {
+    if unsafe { dict::is_setlike_dict_view(object) } {
+        Some(dict_view_set_entries(object))
+    } else if unsafe { set_::is_any_set(object) } {
+        Some(unsafe { set_::entries_snapshot(object) })
+    } else {
+        None
+    }
+}
+
+/// Rich comparison for `dict_keys`/`dict_items` views against set-like operands.
+pub unsafe extern "C" fn pon_dict_view_richcompare(left: *mut PyObject, right: *mut PyObject, op: c_int) -> *mut PyObject {
+    crate::untag_prelude!(left, right);
+    super::catch_object_helper(|| {
+        use crate::abstract_op::{RICH_EQ, RICH_GE, RICH_GT, RICH_LE, RICH_LT, RICH_NE};
+
+        if unsafe { !dict::is_setlike_dict_view(left) } {
+            return unsafe { super::pon_not_implemented() };
+        }
+        let op = match u8::try_from(op) {
+            Ok(op) => op,
+            Err(_) => return null_error("unknown rich comparison operation"),
+        };
+        if !matches!(op, RICH_EQ | RICH_NE | RICH_LE | RICH_GE | RICH_LT | RICH_GT) {
+            return unsafe { super::pon_not_implemented() };
+        }
+        let right_entries = match dict_view_compare_rhs_entries(right) {
+            Some(Ok(entries)) => entries,
+            Some(Err(message)) => return null_error(message),
+            None => return unsafe { super::pon_not_implemented() },
+        };
+        let left_values = match dict_view_set_entries(left) {
+            Ok(entries) => entries,
+            Err(message) => return null_error(message),
+        };
+        let left_entries = match unsafe { frozenset::unique_entries(&left_values) } {
+            Ok(entries) => entries,
+            Err(message) => return null_error(message),
+        };
+        let right_entries = match unsafe { frozenset::unique_entries(&right_entries) } {
+            Ok(entries) => entries,
+            Err(message) => return null_error(message),
+        };
+        let result = match op {
+            RICH_EQ | RICH_NE => {
+                let equal = if left_entries.len() == right_entries.len() {
+                    match unsafe { set_::entries_subset(&left_entries, &right_entries) } {
+                        Ok(value) => value,
+                        Err(message) => return null_error(message),
+                    }
+                } else {
+                    false
+                };
+                if op == RICH_EQ { equal } else { !equal }
+            },
+            RICH_LE => match unsafe { set_::entries_subset(&left_entries, &right_entries) } {
+                Ok(value) => value,
+                Err(message) => return null_error(message),
+            },
+            RICH_GE => match unsafe { set_::entries_subset(&right_entries, &left_entries) } {
+                Ok(value) => value,
+                Err(message) => return null_error(message),
+            },
+            RICH_LT => {
+                left_entries.len() < right_entries.len()
+                    && match unsafe { set_::entries_subset(&left_entries, &right_entries) } {
+                        Ok(value) => value,
+                        Err(message) => return null_error(message),
+                    }
+            },
+            RICH_GT => {
+                right_entries.len() < left_entries.len()
+                    && match unsafe { set_::entries_subset(&right_entries, &left_entries) } {
+                        Ok(value) => value,
+                        Err(message) => return null_error(message),
+                    }
+            },
+            _ => return unsafe { super::pon_not_implemented() },
+        };
+        unsafe { super::number::pon_const_bool(c_int::from(result)) }
+    })
+}
+
+fn dict_view_is_disjoint(view: *mut PyObject, other: *mut PyObject) -> Result<bool, String> {
+    let left_entries = dict_view_set_entries(view)?;
+    let left_entries = unsafe { frozenset::unique_entries(&left_entries)? };
+    let right_entries = set_argument_entries(other)?;
+    for item in right_entries {
+        if unsafe { set_::find_element_index(&left_entries, item)? }.is_some() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+unsafe extern "C" fn dict_view_isdisjoint_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match map_method_args(argv, argc, "dict view.isdisjoint") {
+        Ok(args) => args,
+        Err(message) => return null_error(message),
+    };
+    if args.len() != 2 {
+        return raise_map_type_error(format!(
+            "isdisjoint() expected 1 argument, got {}",
+            args.len().saturating_sub(1)
+        ));
+    }
+    if unsafe { !dict::is_setlike_dict_view(args[0]) } {
+        return raise_map_type_error("isdisjoint() requires a set-like dict view");
+    }
+    match dict_view_is_disjoint(args[0], args[1]) {
+        Ok(value) => unsafe { super::number::pon_const_bool(c_int::from(value)) },
+        Err(message) => null_error(message),
+    }
+}
+
+/// Returns a bound dictionary-view method object for attribute lookup.
+pub unsafe fn pon_dict_view_bound_method(view: *mut PyObject, name: &str) -> *mut PyObject {
+    match name {
+        "isdisjoint" => alloc_bound_native_method(view, name, dict_view_isdisjoint_method_trampoline),
+        _ => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
+    }
 }
 
 /// Adds an element to a set and returns the receiver.
@@ -1191,7 +1661,7 @@ pub unsafe extern "C" fn pon_set_union(left: *mut PyObject, right: *mut PyObject
             Ok(entries) => entries,
             Err(message) => return null_error(message),
         };
-        let right_entries = match unsafe { set_::entries_snapshot(right) } {
+        let right_entries = match set_binary_rhs_entries(right) {
             Ok(entries) => entries,
             Err(message) => return null_error(message),
         };
@@ -1199,7 +1669,7 @@ pub unsafe extern "C" fn pon_set_union(left: *mut PyObject, right: *mut PyObject
         if let Err(message) = unsafe { set_::insert_unique_entries(&mut entries, &right_entries) } {
             return null_error(message);
         }
-        match super::with_runtime(|runtime| build_set_from_entries(runtime, left, entries)) {
+        match super::with_runtime(|runtime| build_set_binary_result(runtime, left, right, entries)) {
             Some(object) => object,
             None => null_error("runtime is not initialized"),
         }
@@ -1216,7 +1686,7 @@ pub unsafe extern "C" fn pon_set_intersection(left: *mut PyObject, right: *mut P
             Ok(entries) => entries,
             Err(message) => return null_error(message),
         };
-        let right_entries = match unsafe { set_::entries_snapshot(right) } {
+        let right_entries = match set_binary_rhs_entries(right) {
             Ok(entries) => entries,
             Err(message) => return null_error(message),
         };
@@ -1228,7 +1698,7 @@ pub unsafe extern "C" fn pon_set_intersection(left: *mut PyObject, right: *mut P
                 Err(message) => return null_error(message),
             }
         }
-        match super::with_runtime(|runtime| build_set_from_entries(runtime, left, entries)) {
+        match super::with_runtime(|runtime| build_set_binary_result(runtime, left, right, entries)) {
             Some(object) => object,
             None => null_error("runtime is not initialized"),
         }
@@ -1245,7 +1715,7 @@ pub unsafe extern "C" fn pon_set_difference(left: *mut PyObject, right: *mut PyO
             Ok(entries) => entries,
             Err(message) => return null_error(message),
         };
-        let right_entries = match unsafe { set_::entries_snapshot(right) } {
+        let right_entries = match set_binary_rhs_entries(right) {
             Ok(entries) => entries,
             Err(message) => return null_error(message),
         };
@@ -1257,11 +1727,60 @@ pub unsafe extern "C" fn pon_set_difference(left: *mut PyObject, right: *mut PyO
                 Err(message) => return null_error(message),
             }
         }
-        match super::with_runtime(|runtime| build_set_from_entries(runtime, left, entries)) {
+        match super::with_runtime(|runtime| build_set_binary_result(runtime, left, right, entries)) {
             Some(object) => object,
             None => null_error("runtime is not initialized"),
         }
     })
+}
+
+unsafe fn symmetric_difference_entries(
+    left_entries: &[*mut PyObject],
+    right_values: &[*mut PyObject],
+) -> Result<Vec<*mut PyObject>, String> {
+    let right_entries = unsafe { frozenset::unique_entries(right_values)? };
+    let mut entries = Vec::with_capacity(left_entries.len().saturating_add(right_entries.len()));
+    for item in left_entries {
+        if unsafe { set_::find_element_index(&right_entries, *item)? }.is_none() {
+            entries.push(*item);
+        }
+    }
+    for item in &right_entries {
+        if unsafe { set_::find_element_index(left_entries, *item)? }.is_none() {
+            entries.push(*item);
+        }
+    }
+    Ok(entries)
+}
+
+/// Returns `left ^ right` for set/frozenset operands.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_set_symmetric_difference(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    crate::untag_prelude!(left, right);
+    super::catch_object_helper(|| {
+        let _guard = crate::sync::begin_critical_section2(left, right);
+        let left_entries = match unsafe { set_::entries_snapshot(left) } {
+            Ok(entries) => entries,
+            Err(message) => return null_error(message),
+        };
+        let right_entries = match set_binary_rhs_entries(right) {
+            Ok(entries) => entries,
+            Err(message) => return null_error(message),
+        };
+        let entries = match unsafe { symmetric_difference_entries(&left_entries, &right_entries) } {
+            Ok(entries) => entries,
+            Err(message) => return null_error(message),
+        };
+        match super::with_runtime(|runtime| build_set_binary_result(runtime, left, right, entries)) {
+            Some(object) => object,
+            None => null_error("runtime is not initialized"),
+        }
+    })
+}
+
+fn set_iterable_type_error(object: *mut PyObject) -> String {
+    let type_name = unsafe { dict::type_name(object) }.unwrap_or("object");
+    format!("'{type_name}' object is not iterable")
 }
 
 /// Materializes a set-method argument's elements: set flavors snapshot
@@ -1283,7 +1802,15 @@ fn set_argument_entries(object: *mut PyObject) -> Result<Vec<*mut PyObject>, Str
         if crate::thread_state::pon_err_occurred() {
             crate::thread_state::pon_err_clear();
         }
-        return super::seq::sequence_to_vec(object);
+        return super::seq::sequence_to_vec(object).map_err(|message| {
+            if message == format!("object of type {} is not a sequence", unsafe {
+                dict::type_name(object).unwrap_or("object")
+            }) {
+                set_iterable_type_error(object)
+            } else {
+                message
+            }
+        });
     }
     let mut entries = Vec::new();
     loop {
@@ -1419,6 +1946,71 @@ unsafe extern "C" fn set_difference_method_trampoline(argv: *mut *mut PyObject, 
         return raise_map_type_error(format!("set.difference() expected 1 argument, got {}", args.len().saturating_sub(1)));
     }
     unsafe { pon_set_difference(args[0], args[1]) }
+}
+
+unsafe extern "C" fn set_symmetric_difference_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match map_method_args(argv, argc, "set.symmetric_difference") {
+        Ok(args) => args,
+        Err(message) => return null_error(message),
+    };
+    if args.len() != 2 {
+        return raise_map_type_error(format!(
+            "set.symmetric_difference() expected 1 argument, got {}",
+            args.len().saturating_sub(1)
+        ));
+    }
+    let left_entries = match unsafe { set_::entries_snapshot(args[0]) } {
+        Ok(entries) => entries,
+        Err(message) => return null_error(message),
+    };
+    let right_values = match set_argument_entries(args[1]) {
+        Ok(entries) => entries,
+        Err(message) => return null_error(message),
+    };
+    let entries = match unsafe { symmetric_difference_entries(&left_entries, &right_values) } {
+        Ok(entries) => entries,
+        Err(message) => return null_error(message),
+    };
+    match super::with_runtime(|runtime| build_set_from_entries(runtime, args[0], entries)) {
+        Some(object) => object,
+        None => null_error("runtime is not initialized"),
+    }
+}
+
+unsafe extern "C" fn set_symmetric_difference_update_method_trampoline(
+    argv: *mut *mut PyObject,
+    argc: usize,
+) -> *mut PyObject {
+    let args = match map_method_args(argv, argc, "set.symmetric_difference_update") {
+        Ok(args) => args,
+        Err(message) => return null_error(message),
+    };
+    if args.len() != 2 {
+        return raise_map_type_error(format!(
+            "set.symmetric_difference_update() expected 1 argument, got {}",
+            args.len().saturating_sub(1)
+        ));
+    }
+    let left_entries = match unsafe { set_::entries_snapshot(args[0]) } {
+        Ok(entries) => entries,
+        Err(message) => return null_error(message),
+    };
+    let right_values = match set_argument_entries(args[1]) {
+        Ok(entries) => entries,
+        Err(message) => return null_error(message),
+    };
+    let entries = match unsafe { symmetric_difference_entries(&left_entries, &right_values) } {
+        Ok(entries) => entries,
+        Err(message) => return null_error(message),
+    };
+    let _guard = crate::sync::begin_critical_section(args[0]);
+    let set = match unsafe { set_::set_mut(args[0]) } {
+        Ok(set) => set,
+        Err(message) => return null_error(message),
+    };
+    set.entries = entries;
+    set.buckets.clear();
+    map_none()
 }
 
 unsafe extern "C" fn set_update_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -1559,6 +2151,10 @@ pub unsafe fn pon_set_bound_method(set: *mut PyObject, name: &str) -> *mut PyObj
         "union" => alloc_bound_native_method(set, name, set_union_method_trampoline),
         "intersection" => alloc_bound_native_method(set, name, set_intersection_method_trampoline),
         "difference" => alloc_bound_native_method(set, name, set_difference_method_trampoline),
+        "symmetric_difference" => alloc_bound_native_method(set, name, set_symmetric_difference_method_trampoline),
+        "symmetric_difference_update" => {
+            alloc_bound_native_method(set, name, set_symmetric_difference_update_method_trampoline)
+        },
         "update" => alloc_bound_native_method(set, name, set_update_method_trampoline),
         "issubset" => alloc_bound_native_method(set, name, set_issubset_method_trampoline),
         "issuperset" => alloc_bound_native_method(set, name, set_issuperset_method_trampoline),

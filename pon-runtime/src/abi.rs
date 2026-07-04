@@ -1171,6 +1171,12 @@ pub static HELPERS: &[HelperDecl] = &[
         ret: AbiTy::PyObjectPtr,
     },
     HelperDecl {
+        symbol: "pon_set_symmetric_difference",
+        address: map::pon_set_symmetric_difference as *const (),
+        params: PARAMS_BINARY_ADD,
+        ret: AbiTy::PyObjectPtr,
+    },
+    HelperDecl {
         symbol: "pon_frozenset_hash",
         address: map::pon_frozenset_hash as *const (),
         params: PARAMS_OBJ,
