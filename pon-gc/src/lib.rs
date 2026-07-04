@@ -637,6 +637,16 @@ struct HeapState {
     allocations: Vec<Allocation>,
     mark_states: Vec<MarkState>,
     spans: Vec<SmallSpan>,
+    /// Index of the newest (only possibly non-full) span per size class.
+    ///
+    /// `span_for_size_class` used to scan `spans` linearly on EVERY small
+    /// allocation; spans never regain capacity in place (`used_bytes` only
+    /// grows; sweep clears and rebuilds the whole table), so the first
+    /// accepting span of a class is always its newest one.  Caching that
+    /// index turns allocation from O(spans) — quadratic over a program's
+    /// lifetime, minutes of wall time in allocation-heavy workloads like
+    /// the Cython compiler — into O(1) with identical span assignment.
+    open_spans: HashMap<usize, usize>,
     large_fallbacks: Vec<usize>,
 }
 
@@ -654,6 +664,7 @@ impl HeapState {
             allocations: Vec::new(),
             mark_states: Vec::new(),
             spans: Vec::new(),
+            open_spans: HashMap::new(),
             large_fallbacks: Vec::new(),
         }
     }
@@ -689,17 +700,15 @@ impl HeapState {
     }
 
     fn span_for_size_class(&mut self, size_class: usize) -> usize {
-        if let Some((index, _)) = self
-            .spans
-            .iter()
-            .enumerate()
-            .find(|(_, span)| span.accepts(size_class))
-        {
-            return index;
+        if let Some(&index) = self.open_spans.get(&size_class) {
+            if self.spans[index].accepts(size_class) {
+                return index;
+            }
         }
 
         let span_index = self.spans.len();
         self.spans.push(SmallSpan::new(self.config.span_size, size_class));
+        self.open_spans.insert(size_class, span_index);
         span_index
     }
 
@@ -792,6 +801,7 @@ impl HeapState {
         let mut unreachable = Vec::new();
 
         self.spans.clear();
+        self.open_spans.clear();
         self.large_fallbacks.clear();
 
         for (index, allocation) in old_allocations.into_iter().enumerate() {
@@ -820,6 +830,7 @@ impl HeapState {
     fn rebuild_allocation_metadata(&mut self) {
         self.mark_states = vec![MarkState::default(); self.allocations.len()];
         self.spans.clear();
+        self.open_spans.clear();
         self.large_fallbacks.clear();
 
         for allocation in &mut self.allocations {
