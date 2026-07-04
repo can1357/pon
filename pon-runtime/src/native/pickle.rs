@@ -26,7 +26,7 @@ use std::sync::{LazyLock, Mutex};
 use crate::abi;
 use crate::intern::intern;
 use crate::object::{PyObject, PyObjectHeader, PyType, as_object_ptr};
-use crate::thread_state::pon_err_set;
+use crate::thread_state::{pon_err_clear, pon_err_set};
 use crate::types::type_::unicode_text;
 use crate::types::{bytearray_, bytes_, memoryview};
 
@@ -45,13 +45,26 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
     if name_obj.is_null() {
         return Err("failed to allocate _pickle.__name__".to_owned());
     }
-    install_module(
+    let module = install_module(
         name,
         vec![
             (intern("__name__"), name_obj),
             (intern("PickleBuffer"), picklebuffer_type().cast::<PyObject>()),
         ],
-    )
+    )?;
+    populate_python_pickle_exports();
+    Ok(module)
+}
+
+fn populate_python_pickle_exports() {
+    let pickle_id = intern("pickle");
+    if crate::import::module_attrs_snapshot(pickle_id).is_some() {
+        return;
+    }
+    let module = unsafe { crate::import::pon_import_name(pickle_id, ptr::null(), 0, 0) };
+    if module.is_null() {
+        pon_err_clear();
+    }
 }
 
 // ---------------------------------------------------------------------------

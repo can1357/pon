@@ -1926,6 +1926,53 @@ pub(crate) fn bind_native_keywords_for_name(
         "sha3_512" => bind_optional_named_keywords(positional, keywords, "sha3_512", &["data", "usedforsecurity"], 1),
         "shake_128" => bind_optional_named_keywords(positional, keywords, "shake_128", &["data", "usedforsecurity"], 1),
         "shake_256" => bind_optional_named_keywords(positional, keywords, "shake_256", &["data", "usedforsecurity"], 1),
+        // Native `_hashlib` OpenSSL-compatible constructors mirror the same
+        // data/usedforsecurity surface as the builtin digest fallbacks.
+        "openssl_new" => {
+            bind_optional_named_keywords(positional, keywords, "openssl_new", &["name", "data", "usedforsecurity"], 2)
+        }
+        "openssl_md5" => bind_optional_named_keywords(positional, keywords, "openssl_md5", &["data", "usedforsecurity"], 1),
+        "openssl_sha1" => bind_optional_named_keywords(positional, keywords, "openssl_sha1", &["data", "usedforsecurity"], 1),
+        "openssl_sha224" => bind_optional_named_keywords(positional, keywords, "openssl_sha224", &["data", "usedforsecurity"], 1),
+        "openssl_sha256" => bind_optional_named_keywords(positional, keywords, "openssl_sha256", &["data", "usedforsecurity"], 1),
+        "openssl_sha384" => bind_optional_named_keywords(positional, keywords, "openssl_sha384", &["data", "usedforsecurity"], 1),
+        "openssl_sha512" => bind_optional_named_keywords(positional, keywords, "openssl_sha512", &["data", "usedforsecurity"], 1),
+        "openssl_sha3_224" => {
+            bind_optional_named_keywords(positional, keywords, "openssl_sha3_224", &["data", "usedforsecurity"], 1)
+        }
+        "openssl_sha3_256" => {
+            bind_optional_named_keywords(positional, keywords, "openssl_sha3_256", &["data", "usedforsecurity"], 1)
+        }
+        "openssl_sha3_384" => {
+            bind_optional_named_keywords(positional, keywords, "openssl_sha3_384", &["data", "usedforsecurity"], 1)
+        }
+        "openssl_sha3_512" => {
+            bind_optional_named_keywords(positional, keywords, "openssl_sha3_512", &["data", "usedforsecurity"], 1)
+        }
+        "openssl_shake_128" => {
+            bind_optional_named_keywords(positional, keywords, "openssl_shake_128", &["data", "usedforsecurity"], 1)
+        }
+        "openssl_shake_256" => {
+            bind_optional_named_keywords(positional, keywords, "openssl_shake_256", &["data", "usedforsecurity"], 1)
+        }
+        "hmac_new" => bind_optional_named_keywords(positional, keywords, "hmac_new", &["key", "msg", "digestmod"], 2),
+        "hmac_digest" => bind_optional_named_keywords(positional, keywords, "hmac_digest", &["key", "msg", "digest"], 3),
+        "_hmac_new" => bind_optional_named_keywords(positional, keywords, "_hmac_new", &["key", "msg", "digestmod"], 2),
+        "_hmac_compute_digest" => {
+            bind_optional_named_keywords(positional, keywords, "_hmac_compute_digest", &["key", "msg", "digest"], 3)
+        }
+        "pbkdf2_hmac" => {
+            bind_optional_named_keywords(positional, keywords, "pbkdf2_hmac", &["hash_name", "password", "salt", "iterations", "dklen"], 5)
+        }
+        "scrypt" => {
+            bind_optional_named_keywords(positional, keywords, "scrypt", &["password", "salt", "n", "r", "p", "maxmem", "dklen"], 7)
+        }
+        // `_zstd` exposes keyword-bearing native functions/methods.
+        "compress" => bind_optional_named_keywords(positional, keywords, "compress", &["self", "data", "mode"], 2),
+        "flush" => bind_optional_named_keywords(positional, keywords, "flush", &["self", "mode"], 1),
+        "get_param_bounds" => {
+            bind_optional_named_keywords(positional, keywords, "get_param_bounds", &["parameter", "is_compress"], 1)
+        }
         // Native `_blake2` constructors: CPython makes every parameter after
         // the initial data keyword-only; unsupported tree-mode knobs are
         // validated by the native entry so they fail loudly, never silently.
@@ -2008,6 +2055,10 @@ pub(crate) fn bind_native_keywords_for_name(
         // selects the plain non-fd syscall and non-None values raise the
         // honest NotImplementedError in the entry.
         "lstat" => bind_optional_named_keywords(positional, keywords, "lstat", &["path", "dir_fd"], 1),
+        // Native `_posixshmem.shm_open(path, flags, mode=0o777)`: the
+        // shared_memory module passes `mode=` as a keyword when creating a
+        // block; absent mode keeps CPython's default.
+        "shm_open" => bind_optional_named_keywords(positional, keywords, "shm_open", &["path", "flags", "mode"], 2),
         // Native `_thread.start_joinable_thread(function, handle=None,
         // daemon=True)`: `threading.Thread.start` passes `handle`/`daemon`
         // as keywords; absent optionals arrive as None and the entry

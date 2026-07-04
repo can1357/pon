@@ -30,12 +30,13 @@
 
 use std::mem;
 use std::ptr;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 
 use crate::abi;
 use crate::intern::intern;
 use crate::object::{PyObject, PyObjectHeader, PyType};
 use crate::thread_state::pon_err_clear;
+use crate::types::exc::ExceptionKind;
 
 use super::builtins_mod::VARIADIC_ARITY;
 use super::install_module;
@@ -249,8 +250,18 @@ static THEMES: LazyLock<[usize; 2]> = LazyLock::new(|| {
     })
 });
 
+static CURRENT_THEME: Mutex<usize> = Mutex::new(0);
+
 fn theme_object(colored: bool) -> *mut PyObject {
     THEMES[usize::from(colored)] as *mut PyObject
+}
+
+fn current_theme_object() -> *mut PyObject {
+    let mut slot = CURRENT_THEME.lock().unwrap_or_else(|poison| poison.into_inner());
+    if *slot == 0 {
+        *slot = theme_object(true) as usize;
+    }
+    *slot as *mut PyObject
 }
 
 fn alloc_str_object(text: &str) -> *mut PyObject {
@@ -467,7 +478,20 @@ unsafe extern "C" fn get_theme_entry(argv: *mut *mut PyObject, argc: usize) -> *
     } else {
         can_colorize_value(args.first().copied())
     };
-    theme_object(colored)
+    if colored { current_theme_object() } else { theme_object(false) }
+}
+
+unsafe extern "C" fn set_theme_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 1 || argv.is_null() {
+        return abi::exc::raise_kind_error_text(ExceptionKind::TypeError, "set_theme() takes exactly one argument");
+    }
+    let theme = crate::tag::untag_arg(unsafe { *argv });
+    if theme.is_null() || unsafe { (*theme).ob_type } != *THEME_TYPE as *const PyType {
+        return abi::exc::raise_kind_error_text(ExceptionKind::ValueError, "Expected Theme object");
+    }
+    *CURRENT_THEME.lock().unwrap_or_else(|poison| poison.into_inner()) = theme as usize;
+    crate::import::store_module_attr(intern("_colorize"), intern("_theme"), theme);
+    none()
 }
 
 /// `get_colors(colorize=False, *, file=None)`; keyword binding delivers
@@ -520,6 +544,54 @@ unsafe extern "C" fn decolor_entry(argv: *mut *mut PyObject, argc: usize) -> *mu
     alloc_str_object(&out)
 }
 
+fn string_attr(name: &str, value: &str) -> Result<(u32, *mut PyObject), String> {
+    let object = alloc_str_object(value);
+    if object.is_null() {
+        return Err(format!("failed to allocate _colorize.{name}"));
+    }
+    Ok((intern(name), object))
+}
+
+fn object_attr(name: &str, value: *mut PyObject) -> Result<(u32, *mut PyObject), String> {
+    if value.is_null() {
+        return Err(format!("failed to allocate _colorize.{name}"));
+    }
+    Ok((intern(name), value))
+}
+
+fn import_module(name: &str) -> Option<*mut PyObject> {
+    let module = unsafe { crate::import::pon_import_name(intern(name), ptr::null(), 0, 0) };
+    if module.is_null() {
+        pon_err_clear();
+        None
+    } else {
+        Some(module)
+    }
+}
+
+fn import_attr(module_name: &str, attr: &str) -> Option<*mut PyObject> {
+    let module = import_module(module_name)?;
+    let value = unsafe { abi::pon_get_attr(module, intern(attr), ptr::null_mut()) };
+    if value.is_null() {
+        pon_err_clear();
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn color_codes_set() -> *mut PyObject {
+    let mut items = Vec::with_capacity(COLOR_CODES.len());
+    for &code in COLOR_CODES {
+        let object = alloc_str_object(code);
+        if object.is_null() {
+            return ptr::null_mut();
+        }
+        items.push(object);
+    }
+    unsafe { abi::map::pon_build_set(items.as_mut_ptr(), items.len()) }
+}
+
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
     let name = "_colorize";
     // SAFETY: Runtime allocation helper; NULL is checked below.
@@ -531,6 +603,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
     for (fn_name, entry) in [
         ("can_colorize", can_colorize_entry as BuiltinFn),
         ("get_theme", get_theme_entry),
+        ("set_theme", set_theme_entry),
         ("decolor", decolor_entry),
         ("get_colors", get_colors_entry),
     ] {
@@ -548,5 +621,39 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
     }
     attrs.push((intern("COLORIZE"), colorize_flag));
     attrs.push((intern("ANSIColors"), ansi_colors_object(true)));
+    attrs.push((intern("NoColors"), ansi_colors_object(false)));
+    attrs.push(object_attr("ColorCodes", color_codes_set())?);
+    attrs.push((intern("Theme"), (*THEME_TYPE as *mut PyType).cast::<PyObject>()));
+    attrs.push((intern("ThemeSection"), (*SECTION_TYPE as *mut PyType).cast::<PyObject>()));
+    for class_name in ["Argparse", "Syntax", "Traceback", "Unittest"] {
+        attrs.push((intern(class_name), (*SECTION_TYPE as *mut PyType).cast::<PyObject>()));
+    }
+    attrs.push((intern("default_theme"), theme_object(true)));
+    attrs.push((intern("theme_no_color"), theme_object(false)));
+    attrs.push((intern("_theme"), current_theme_object()));
+    attrs.push(string_attr("attr", "INTENSE_BACKGROUND_YELLOW")?);
+    attrs.push(string_attr("code", "\x1b[103m")?);
+    attrs.push(object_attr("__annotate__", none())?);
+    attrs.push(object_attr("__conditional_annotations__", unsafe {
+        abi::map::pon_build_map(ptr::null_mut(), 0)
+    })?);
+    if let Some(module) = import_module("os") {
+        attrs.push((intern("os"), module));
+    }
+    if let Some(module) = import_module("sys") {
+        attrs.push((intern("sys"), module));
+    }
+    for &(module_name, attr_name) in &[
+        ("_collections_abc", "Callable"),
+        ("_collections_abc", "Iterator"),
+        ("_collections_abc", "Mapping"),
+        ("dataclasses", "dataclass"),
+        ("dataclasses", "field"),
+        ("dataclasses", "Field"),
+    ] {
+        if let Some(value) = import_attr(module_name, attr_name) {
+            attrs.push((intern(attr_name), value));
+        }
+    }
     install_module(name, attrs)
 }

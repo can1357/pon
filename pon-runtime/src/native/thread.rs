@@ -13,6 +13,7 @@
 //! [`gc_held_roots`] (the `_contextvars` pattern).
 
 use std::cell::Cell;
+use std::ffi::{CStr, CString};
 use std::collections::HashMap;
 use std::ptr;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -30,6 +31,7 @@ use crate::intern::intern;
 use crate::native::builtins_mod::VARIADIC_ARITY;
 use crate::object::{PyObject, PyObjectHeader, PyType};
 use crate::thread_state::pon_err_set;
+use crate::types::exc::ExceptionKind;
 use crate::types::{method, type_};
 
 use super::install_module;
@@ -39,6 +41,8 @@ type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObjec
 /// `_thread.TIMEOUT_MAX` (CPython 3.14 darwin: `PY_TIMEOUT_MAX` microseconds
 /// as seconds).
 const TIMEOUT_MAX: f64 = 9_223_372_036.0;
+const NAME_MAXLEN: usize = 63;
+static ACTIVE_THREAD_COUNT: AtomicI64 = AtomicI64::new(1);
 
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
     // Pin the main-thread ident while make_module still runs on it (the
@@ -59,13 +63,22 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         "_thread",
         vec![
             (intern("start_new_thread"), module_function("start_new_thread", native_start_new_thread)?),
+            (intern("start_new"), module_function("start_new", native_start_new_thread)?),
             (
                 intern("start_joinable_thread"),
                 module_function("start_joinable_thread", native_start_joinable_thread)?,
             ),
             (intern("daemon_threads_allowed"), module_function("daemon_threads_allowed", native_daemon_threads_allowed)?),
             (intern("allocate_lock"), module_function("allocate_lock", native_allocate_lock)?),
+            (intern("allocate"), module_function("allocate", native_allocate_lock)?),
             (intern("get_ident"), module_function("get_ident", native_get_ident)?),
+            (intern("get_native_id"), module_function("get_native_id", native_get_native_id)?),
+            (intern("_count"), module_function("_count", native_count)?),
+            (intern("_get_name"), module_function("_get_name", native_get_name)?),
+            (intern("set_name"), module_function("set_name", native_set_name)?),
+            (intern("interrupt_main"), module_function("interrupt_main", native_interrupt_main)?),
+            (intern("exit"), module_function("exit", native_exit)?),
+            (intern("exit_thread"), module_function("exit_thread", native_exit)?),
             (intern("_get_main_thread_ident"), module_function("_get_main_thread_ident", native_get_main_thread_ident)?),
             (intern("_is_main_interpreter"), module_function("_is_main_interpreter", native_is_main_interpreter)?),
             (intern("_shutdown"), module_function("_shutdown", native_shutdown)?),
@@ -73,10 +86,12 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
             (intern("stack_size"), module_function("stack_size", native_stack_size)?),
             (intern("RLock"), module_function("RLock", native_rlock_new)?),
             (intern("LockType"), lock_type().cast::<PyObject>()),
+            (intern("lock"), lock_type().cast::<PyObject>()),
             (intern("_ThreadHandle"), thread_handle_type().cast::<PyObject>()),
             (intern("_local"), local_type().cast::<PyObject>()),
             (intern("error"), error_type),
             (intern("TIMEOUT_MAX"), timeout_max),
+            (intern("_NAME_MAXLEN"), unsafe { pon_const_int(NAME_MAXLEN as i64) }),
         ],
     )
 }
@@ -182,6 +197,97 @@ unsafe extern "C" fn native_stack_size(_argv: *mut *mut PyObject, argc: usize) -
     unsafe { pon_const_int(0) }
 }
 
+unsafe extern "C" fn native_exit(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        pon_err_set(format!("exit() takes no arguments ({argc} given)"));
+        return ptr::null_mut();
+    }
+    crate::abi::exc::raise_system_exit(ptr::null_mut())
+}
+
+unsafe extern "C" fn native_interrupt_main(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc > 1 {
+        pon_err_set(format!("interrupt_main() takes at most 1 argument ({argc} given)"));
+        return ptr::null_mut();
+    }
+    crate::abi::exc::raise_kind_error_no_args(ExceptionKind::KeyboardInterrupt)
+}
+
+unsafe extern "C" fn native_count(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        pon_err_set(format!("_count() takes no arguments ({argc} given)"));
+        return ptr::null_mut();
+    }
+    unsafe { pon_const_int(ACTIVE_THREAD_COUNT.load(Ordering::Relaxed)) }
+}
+
+unsafe extern "C" fn native_get_native_id(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        pon_err_set(format!("get_native_id() takes no arguments ({argc} given)"));
+        return ptr::null_mut();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut tid: u64 = 0;
+        let rc = unsafe { libc::pthread_threadid_np(0, &mut tid) };
+        if rc != 0 {
+            pon_err_set(format!("pthread_threadid_np failed with errno {rc}"));
+            return ptr::null_mut();
+        }
+        return unsafe { pon_const_int(tid as i64) };
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        unsafe { pon_const_int(current_ident()) }
+    }
+}
+
+unsafe extern "C" fn native_get_name(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        pon_err_set(format!("_get_name() takes no arguments ({argc} given)"));
+        return ptr::null_mut();
+    }
+    let mut buffer = [0 as libc::c_char; NAME_MAXLEN + 1];
+    #[cfg(target_os = "macos")]
+    {
+        let rc = unsafe { libc::pthread_getname_np(libc::pthread_self(), buffer.as_mut_ptr(), buffer.len()) };
+        if rc != 0 {
+            pon_err_set(format!("pthread_getname_np failed with errno {rc}"));
+            return ptr::null_mut();
+        }
+    }
+    let text = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_string_lossy();
+    unsafe { crate::abi::pon_const_str(text.as_ptr(), text.len()) }
+}
+
+unsafe extern "C" fn native_set_name(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 1 || argv.is_null() {
+        pon_err_set(format!("set_name() takes exactly one argument ({argc} given)"));
+        return ptr::null_mut();
+    }
+    let Some(name) = (unsafe { type_::unicode_text(crate::tag::untag_arg(*argv)) }) else {
+        pon_err_set("set_name() argument must be str");
+        return ptr::null_mut();
+    };
+    let mut end = name.len().min(NAME_MAXLEN);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    let Ok(c_name) = CString::new(&name.as_bytes()[..end]) else {
+        pon_err_set("thread name must not contain null bytes");
+        return ptr::null_mut();
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let rc = unsafe { libc::pthread_setname_np(c_name.as_ptr()) };
+        if rc != 0 {
+            pon_err_set(format!("pthread_setname_np failed with errno {rc}"));
+            return ptr::null_mut();
+        }
+    }
+    unsafe { pon_none() }
+}
+
 // ---------------------------------------------------------------------------
 // start_new_thread (free-threading stress surface)
 
@@ -206,8 +312,10 @@ unsafe extern "C" fn native_start_new_thread(argv: *mut *mut PyObject, argc: usi
     };
     let call = Box::new(ThreadCall { callable, args });
     let call_arg = Box::into_raw(call).cast::<PyObject>();
+    ACTIVE_THREAD_COUNT.fetch_add(1, Ordering::Relaxed);
     let status = unsafe { pon_thread_start_new(start_new_trampoline as *const u8, call_arg) };
     if status != 0 {
+        ACTIVE_THREAD_COUNT.fetch_sub(1, Ordering::Relaxed);
         unsafe { drop(Box::from_raw(call_arg.cast::<ThreadCall>())) };
         return ptr::null_mut();
     }
@@ -227,7 +335,9 @@ unsafe extern "C" fn start_new_trampoline(call: *mut PyObject) -> *mut PyObject 
     let mut call = unsafe { Box::from_raw(call.cast::<ThreadCall>()) };
     let argc = call.args.len();
     let argv = if argc == 0 { ptr::null_mut() } else { call.args.as_mut_ptr() };
-    unsafe { pon_call(call.callable, argv, argc) }
+    let result = unsafe { pon_call(call.callable, argv, argc) };
+    ACTIVE_THREAD_COUNT.fetch_sub(1, Ordering::Relaxed);
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +584,7 @@ unsafe extern "C" fn joinable_trampoline(call: *mut PyObject) -> *mut PyObject {
     // Done is flagged even when the body raised: `Thread._bootstrap` already
     // reported the exception and joiners must not hang.
     call.state.set_done();
+    ACTIVE_THREAD_COUNT.fetch_sub(1, Ordering::Relaxed);
     result
 }
 
@@ -516,8 +627,10 @@ unsafe extern "C" fn native_start_joinable_thread(argv: *mut *mut PyObject, argc
     if cfg!(feature = "free-threading") {
         let call = Box::new(JoinableCall { callable, state });
         let call_arg = Box::into_raw(call).cast::<PyObject>();
+        ACTIVE_THREAD_COUNT.fetch_add(1, Ordering::Relaxed);
         let status = unsafe { pon_thread_start_new(joinable_trampoline as *const u8, call_arg) };
         if status != 0 {
+            ACTIVE_THREAD_COUNT.fetch_sub(1, Ordering::Relaxed);
             unsafe { drop(Box::from_raw(call_arg.cast::<JoinableCall>())) };
             return ptr::null_mut();
         }

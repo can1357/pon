@@ -53,6 +53,7 @@ struct PyDequeIter {
     ob_base: PyObjectHeader,
     deque: *mut PyDeque,
     index: usize,
+    reverse: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +88,17 @@ static DEQUE_ITER_TYPE: LazyLock<usize> = LazyLock::new(|| {
     let mut ty = PyType::new(
         abi::runtime_type_type().cast_const(),
         "_collections._deque_iterator",
+        std::mem::size_of::<PyDequeIter>(),
+    );
+    ty.tp_iter = Some(identity_iter);
+    ty.tp_iternext = Some(deque_iter_next);
+    Box::into_raw(Box::new(ty)) as usize
+});
+
+static DEQUE_REVERSE_ITER_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let mut ty = PyType::new(
+        abi::runtime_type_type().cast_const(),
+        "_collections._deque_reverse_iterator",
         std::mem::size_of::<PyDequeIter>(),
     );
     ty.tp_iter = Some(identity_iter);
@@ -334,6 +346,7 @@ unsafe extern "C" fn deque_getattro(object: *mut PyObject, name: *mut PyObject) 
         "index" => bound_method(object, name_text, deque_index_method),
         "remove" => bound_method(object, name_text, deque_remove_method),
         "rotate" => bound_method(object, name_text, deque_rotate_method),
+        "__reversed__" => bound_method(object, name_text, deque_reversed_method),
         // SAFETY: Raise helper with the interned attribute name.
         _ => unsafe { abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
     }
@@ -380,6 +393,24 @@ unsafe extern "C" fn deque_iter(object: *mut PyObject) -> *mut PyObject {
         ob_base: PyObjectHeader::new(*DEQUE_ITER_TYPE as *mut PyType),
         deque: untag(object).cast::<PyDeque>(),
         index: 0,
+        reverse: false,
+    }));
+    iter.cast::<PyObject>()
+}
+
+unsafe extern "C" fn deque_reversed_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc == 0 || argv.is_null() {
+        return fail("deque.__reversed__ missing receiver");
+    }
+    let receiver = untag(unsafe { *argv });
+    if unsafe { as_deque(receiver) }.is_none() {
+        return fail("deque.__reversed__ receiver is invalid");
+    }
+    let iter = Box::into_raw(Box::new(PyDequeIter {
+        ob_base: PyObjectHeader::new(*DEQUE_REVERSE_ITER_TYPE as *mut PyType),
+        deque: receiver.cast::<PyDeque>(),
+        index: 0,
+        reverse: true,
     }));
     iter.cast::<PyObject>()
 }
@@ -397,7 +428,15 @@ unsafe extern "C" fn deque_iter_next(object: *mut PyObject) -> *mut PyObject {
     let iter = unsafe { &mut *object.cast::<PyDequeIter>() };
     // SAFETY: The referenced deque is an immortal leaked box.
     let deque = unsafe { &*iter.deque };
-    match deque.entries.get(iter.index) {
+    let entry = if iter.reverse {
+        iter.index
+            .checked_add(1)
+            .and_then(|offset| deque.entries.len().checked_sub(offset))
+            .and_then(|index| deque.entries.get(index))
+    } else {
+        deque.entries.get(iter.index)
+    };
+    match entry {
         Some(&entry) => {
             iter.index += 1;
             entry
@@ -945,12 +984,27 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         return Err("failed to allocate _collections.__name__".to_owned());
     }
     let defaultdict = defaultdict_type()?;
-    install_module(
+    let module = install_module(
         name,
         vec![
             (intern("__name__"), name_obj),
             (intern("defaultdict"), defaultdict),
             (intern("deque"), deque_type().cast::<PyObject>()),
+            (intern("_deque_iterator"), (*DEQUE_ITER_TYPE as *mut PyType).cast::<PyObject>()),
+            (intern("_deque_reverse_iterator"), (*DEQUE_REVERSE_ITER_TYPE as *mut PyType).cast::<PyObject>()),
         ],
-    )
+    )?;
+    populate_python_collections_exports();
+    Ok(module)
+}
+
+fn populate_python_collections_exports() {
+    let collections_id = intern("collections");
+    if crate::import::module_attrs_snapshot(collections_id).is_some() {
+        return;
+    }
+    let module = unsafe { crate::import::pon_import_name(collections_id, ptr::null(), 0, 0) };
+    if module.is_null() {
+        pon_err_clear();
+    }
 }

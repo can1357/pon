@@ -1975,6 +1975,47 @@ unsafe extern "C" fn set_difference_method_trampoline(argv: *mut *mut PyObject, 
     set_method_binary_result(args[0], args[1], DictViewSetOp::Difference)
 }
 
+unsafe extern "C" fn set_difference_update_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match map_method_args(argv, argc, "set.difference_update") {
+        Ok(args) => args,
+        Err(message) => return null_error(message),
+    };
+    if args.is_empty() {
+        return raise_map_type_error("set.difference_update() expected at least 1 argument".to_owned());
+    }
+    let mut entries = match unsafe { set_::entries_snapshot(args[0]) } {
+        Ok(entries) => entries,
+        Err(message) => return null_error(message),
+    };
+    for iterable in &args[1..] {
+        let values = match set_argument_entries(*iterable) {
+            Ok(values) => values,
+            Err(message) => return null_error(message),
+        };
+        let right_entries = match unsafe { frozenset::unique_entries(&values) } {
+            Ok(entries) => entries,
+            Err(message) => return null_error(message),
+        };
+        let mut kept = Vec::with_capacity(entries.len());
+        for item in entries {
+            match unsafe { set_::find_element_index(&right_entries, item) } {
+                Ok(Some(_)) => {}
+                Ok(None) => kept.push(item),
+                Err(message) => return null_error(message),
+            }
+        }
+        entries = kept;
+    }
+    let _guard = crate::sync::begin_critical_section(args[0]);
+    let set = match unsafe { set_::set_mut(args[0]) } {
+        Ok(set) => set,
+        Err(message) => return null_error(message),
+    };
+    set.entries = entries;
+    set.buckets.clear();
+    map_none()
+}
+
 unsafe extern "C" fn set_symmetric_difference_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let args = match map_method_args(argv, argc, "set.symmetric_difference") {
         Ok(args) => args,
@@ -2178,6 +2219,7 @@ pub unsafe fn pon_set_bound_method(set: *mut PyObject, name: &str) -> *mut PyObj
         "union" => alloc_bound_native_method(set, name, set_union_method_trampoline),
         "intersection" => alloc_bound_native_method(set, name, set_intersection_method_trampoline),
         "difference" => alloc_bound_native_method(set, name, set_difference_method_trampoline),
+        "difference_update" => alloc_bound_native_method(set, name, set_difference_update_method_trampoline),
         "symmetric_difference" => alloc_bound_native_method(set, name, set_symmetric_difference_method_trampoline),
         "symmetric_difference_update" => {
             alloc_bound_native_method(set, name, set_symmetric_difference_update_method_trampoline)

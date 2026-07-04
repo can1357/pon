@@ -19,6 +19,8 @@ use crate::types::{bytearray_ as bytearray_type, bytes_ as bytes_type};
 use super::builtins_mod::VARIADIC_ARITY;
 use super::install_module;
 
+const HASHLIB_GIL_MINSIZE: i64 = 2048;
+
 fn sha224_digest(message: &[u8]) -> [u8; 28] {
     ::sha2::Sha224::digest(message).into()
 }
@@ -53,6 +55,15 @@ impl Sha2Kind {
             Self::Sha256 => "sha256",
             Self::Sha384 => "sha384",
             Self::Sha512 => "sha512",
+        }
+    }
+
+    const fn type_name(self) -> &'static str {
+        match self {
+            Self::Sha224 => "SHA224Type",
+            Self::Sha256 => "SHA256Type",
+            Self::Sha384 => "SHA384Type",
+            Self::Sha512 => "SHA512Type",
         }
     }
 
@@ -338,6 +349,14 @@ fn constructor_entry(kind: Sha2Kind) -> unsafe extern "C" fn(*mut *mut PyObject,
     }
 }
 
+fn int_attr(name: &str, value: i64) -> Result<(u32, *mut PyObject), String> {
+    let object = unsafe { abi::pon_const_int(value) };
+    if object.is_null() {
+        return Err(format!("failed to allocate _sha2.{name}"));
+    }
+    Ok((intern(name), object))
+}
+
 fn module_constructor(kind: Sha2Kind) -> Result<*mut PyObject, String> {
     let name = kind.constructor_name();
     // SAFETY: Live builtin entry point with the runtime calling convention.
@@ -355,9 +374,10 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
     if name_object.is_null() {
         return Err("failed to allocate _sha2.__name__".to_owned());
     }
-    let mut attrs = vec![(intern("__name__"), name_object)];
+    let mut attrs = vec![(intern("__name__"), name_object), int_attr("_GIL_MINSIZE", HASHLIB_GIL_MINSIZE)?];
     for kind in Sha2Kind::ALL {
         attrs.push((intern(kind.constructor_name()), module_constructor(kind)?));
+        attrs.push((intern(kind.type_name()), sha2_type(kind).cast::<PyObject>()));
     }
     install_module(name, attrs)
 }

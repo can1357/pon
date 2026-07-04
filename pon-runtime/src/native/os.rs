@@ -8,6 +8,12 @@ use crate::types::exc::ExceptionKind;
 use num_traits::ToPrimitive;
 
 use super::install_module;
+unsafe extern "C" {
+    fn ctermid(s: *mut libc::c_char) -> *mut libc::c_char;
+    fn lchflags(path: *const libc::c_char, flags: libc::c_uint) -> libc::c_int;
+    fn lchmod(path: *const libc::c_char, mode: libc::mode_t) -> libc::c_int;
+}
+
 
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
     install_module("os", build_attrs("os")?)
@@ -34,7 +40,7 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
     if module == "os" {
         attrs.push((intern("altsep"), unsafe { crate::abi::pon_none() }));
     }
-    for &(name, value) in [OPEN_FLAGS, ACCESS_FLAGS, WAIT_OPTIONS, SEEK_MODES].into_iter().flatten() {
+    for &(name, value) in [OPEN_FLAGS, ACCESS_FLAGS, WAIT_OPTIONS, SEEK_MODES, POSIX_CONSTANTS].into_iter().flatten() {
         // SAFETY: Integer boxing helper; NULL is checked below.
         let boxed = unsafe { crate::abi::pon_const_int(i64::from(value)) };
         if boxed.is_null() {
@@ -43,6 +49,19 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
         attrs.push((intern(name), boxed));
     }
     attrs.push((intern("environ"), environ_snapshot(module)?));
+    if module == "posix" {
+        for &(name, value) in POSIX_PRIVATE_CONSTANTS {
+            let boxed = unsafe { crate::abi::pon_const_int(i64::from(value)) };
+            if boxed.is_null() {
+                return Err(format!("failed to allocate {module}.{name}"));
+            }
+            attrs.push((intern(name), boxed));
+        }
+    }
+    attrs.push((intern("error"), builtin_global("OSError")?));
+    attrs.push(int_name_map_attr(module, "confstr_names", CONFSTR_NAMES)?);
+    attrs.push(int_name_map_attr(module, "pathconf_names", PATHCONF_NAMES)?);
+    attrs.push(int_name_map_attr(module, "sysconf_names", SYSCONF_NAMES)?);
     // SAFETY: Live builtin entry points with the runtime calling convention.
     let fspath = unsafe { crate::abi::pon_make_function(os_fspath as *const u8, 1, intern("fspath")) };
     if fspath.is_null() {
@@ -96,6 +115,24 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
         }
         attrs.push((intern(name), function));
     }
+    for &(name, entry, arity) in &[
+        ("WCOREDUMP", os_wcoredump as BuiltinFn, 1usize),
+        ("confstr", os_confstr as BuiltinFn, 1usize),
+        ("device_encoding", os_device_encoding as BuiltinFn, 1usize),
+        ("fpathconf", os_fpathconf as BuiltinFn, 2usize),
+        ("get_terminal_size", os_get_terminal_size as BuiltinFn, crate::native::builtins_mod::VARIADIC_ARITY),
+        ("lockf", os_lockf as BuiltinFn, 3usize),
+        ("login_tty", os_login_tty as BuiltinFn, 1usize),
+        ("mknod", os_mknod as BuiltinFn, crate::native::builtins_mod::VARIADIC_ARITY),
+        ("pathconf", os_pathconf as BuiltinFn, 2usize),
+        ("sysconf", os_sysconf as BuiltinFn, 1usize),
+    ] {
+        let function = unsafe { crate::abi::pon_make_function(entry as *const u8, arity, intern(name)) };
+        if function.is_null() {
+            return Err(format!("failed to allocate {module}.{name}"));
+        }
+        attrs.push((intern(name), function));
+    }
     // `terminal_size` is defined by CPython's C `posix` module, so both
     // names serve the shared class object (see the section comment for why
     // `get_terminal_size` itself stays absent).
@@ -112,7 +149,12 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
         // mutable sets, exactly CPython's `os.py` (`supports_dir_fd = set()`
         // populated per-platform); an empty frozenset would flunk
         // `type(os.supports_dir_fd)` probes for no benefit.
-        for name in ["supports_dir_fd", "supports_fd", "supports_follow_symlinks"] {
+        for name in [
+            "supports_dir_fd",
+            "supports_effective_ids",
+            "supports_fd",
+            "supports_follow_symlinks",
+        ] {
             let mut entries: Vec<*mut PyObject> = Vec::new();
             // SAFETY: A zero-element build reads nothing through the pointer.
             let set = unsafe { crate::abi::map::pon_build_set(entries.as_mut_ptr(), 0) };
@@ -121,6 +163,8 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
             }
             attrs.push((intern(name), set));
         }
+        attrs.push((intern("supports_bytes_environ"), bool_object(cfg!(unix))));
+        attrs.push((intern("environb"), environb_snapshot(module)?));
         // CPython defines `_get_exports_list` in `os.py` itself (never
         // re-exported into `posix`); `socket.py` consumes it at module body:
         // `__all__.extend(os._get_exports_list(_socket))`.
@@ -158,6 +202,17 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
             return Err(format!("failed to allocate {module}.getenv"));
         }
         attrs.push((intern("getenv"), getenv));
+        let getenvb = unsafe {
+            crate::abi::pon_make_function(
+                os_getenvb as *const u8,
+                crate::native::builtins_mod::VARIADIC_ARITY,
+                intern("getenvb"),
+            )
+        };
+        if getenvb.is_null() {
+            return Err(format!("failed to allocate {module}.getenvb"));
+        }
+        attrs.push((intern("getenvb"), getenvb));
         // `os.get_exec_path(env=None)`: subprocess uses this to build the
         // `_posixsubprocess.fork_exec` executable candidate tuple when the
         // requested program name has no directory component.
@@ -222,9 +277,23 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
             }
             attrs.push((intern(name), boxed));
         }
+        for &(name, value) in OS_ONLY_CONSTANTS {
+            // SAFETY: Integer boxing helper; NULL is checked below.
+            let boxed = unsafe { crate::abi::pon_const_int(i64::from(value)) };
+            if boxed.is_null() {
+                return Err(format!("failed to allocate {module}.{name}"));
+            }
+            attrs.push((intern(name), boxed));
+        }
         attrs.push(string_attr(module, "defpath", if cfg!(windows) { ".;C:\\\\bin" } else { "/bin:/usr/bin" })?);
         attrs.push(string_attr(module, "devnull", if cfg!(windows) { "nul" } else { "/dev/null" })?);
+        attrs.push(string_attr(module, "extsep", ".")?);
         attrs.push((intern("PathLike"), pathlike_class()?));
+        let process_cpu_count = unsafe { crate::abi::pon_make_function(os_cpu_count as *const u8, 0, intern("process_cpu_count")) };
+        if process_cpu_count.is_null() {
+            return Err(format!("failed to allocate {module}.process_cpu_count"));
+        }
+        attrs.push((intern("process_cpu_count"), process_cpu_count));
     }
     Ok(attrs)
 }
@@ -861,12 +930,34 @@ fn os_name() -> &'static str {
     }
 }
 
+fn builtin_global(name: &str) -> Result<*mut PyObject, String> {
+    crate::abi::runtime_global(intern(name)).ok_or_else(|| format!("missing builtin {name}"))
+}
+
 fn string_attr(module: &str, name: &str, value: &str) -> Result<(u32, *mut PyObject), String> {
     // SAFETY: Runtime allocation helpers return NULL with a diagnostic on failure.
     let object = unsafe { pon_const_str(value.as_ptr(), value.len()) };
     (!object.is_null())
         .then_some((intern(name), object))
         .ok_or_else(|| format!("failed to allocate {module}.{name}"))
+}
+fn int_name_map_attr(module: &str, name: &str, pairs: &[(&str, i32)]) -> Result<(u32, *mut PyObject), String> {
+    let mut objects = Vec::with_capacity(pairs.len() * 2);
+    for &(key, value) in pairs {
+        let key_obj = unsafe { pon_const_str(key.as_ptr(), key.len()) };
+        let value_obj = unsafe { crate::abi::pon_const_int(i64::from(value)) };
+        if key_obj.is_null() || value_obj.is_null() {
+            return Err(format!("failed to allocate {module}.{name} entry"));
+        }
+        objects.push(key_obj);
+        objects.push(value_obj);
+    }
+    let pair_count = objects.len() / 2;
+    let map = unsafe { crate::abi::map::pon_build_map(objects.as_mut_ptr(), pair_count) };
+    if map.is_null() {
+        return Err(format!("failed to allocate {module}.{name}"));
+    }
+    Ok((intern(name), map))
 }
 
 /// `open(2)` flag constants shared by macOS and Linux (errno.rs's
@@ -880,14 +971,22 @@ const OPEN_FLAGS: &[(&str, i32)] = &[
     ("O_CREAT", libc::O_CREAT),
     ("O_DIRECTORY", libc::O_DIRECTORY),
     ("O_DSYNC", libc::O_DSYNC),
+    ("O_EVTONLY", libc::O_EVTONLY),
     ("O_EXCL", libc::O_EXCL),
+    ("O_EXEC", libc::O_EXEC),
+    ("O_EXLOCK", libc::O_EXLOCK),
+    ("O_FSYNC", libc::O_FSYNC),
     ("O_NDELAY", libc::O_NDELAY),
     ("O_NOCTTY", libc::O_NOCTTY),
     ("O_NOFOLLOW", libc::O_NOFOLLOW),
+    ("O_NOFOLLOW_ANY", libc::O_NOFOLLOW_ANY),
     ("O_NONBLOCK", libc::O_NONBLOCK),
     ("O_RDONLY", libc::O_RDONLY),
     ("O_RDWR", libc::O_RDWR),
+    ("O_SEARCH", libc::O_SEARCH),
+    ("O_SHLOCK", libc::O_SHLOCK),
     ("O_SYNC", libc::O_SYNC),
+    ("O_SYMLINK", libc::O_SYMLINK),
     ("O_TRUNC", libc::O_TRUNC),
     ("O_WRONLY", libc::O_WRONLY),
 ];
@@ -901,10 +1000,225 @@ const ACCESS_FLAGS: &[(&str, i32)] = &[
     ("X_OK", libc::X_OK),
 ];
 
-/// `waitpid(2)` option constants: `subprocess._del_safe` binds `WNOHANG` at
-/// import time (`Popen.__del__`'s non-blocking reap), and asyncio's child
-/// watchers pass it on every poll.
-const WAIT_OPTIONS: &[(&str, i32)] = &[("WNOHANG", libc::WNOHANG)];
+/// `waitpid(2)` option constants.
+const WAIT_OPTIONS: &[(&str, i32)] = &[
+    ("WCONTINUED", libc::WCONTINUED),
+    ("WNOHANG", libc::WNOHANG),
+    ("WUNTRACED", libc::WUNTRACED),
+];
+
+/// POSIX/Darwin constants exported by CPython's C `posix` module and then
+/// re-exported by `os.py` when the name is public.
+const POSIX_CONSTANTS: &[(&str, i32)] = &[
+    ("CLD_CONTINUED", libc::CLD_CONTINUED),
+    ("CLD_DUMPED", libc::CLD_DUMPED),
+    ("CLD_EXITED", libc::CLD_EXITED),
+    ("CLD_KILLED", libc::CLD_KILLED),
+    ("CLD_STOPPED", libc::CLD_STOPPED),
+    ("CLD_TRAPPED", libc::CLD_TRAPPED),
+    // sysexits.h values surfaced by CPython on Darwin.
+    ("EX_CANTCREAT", 73),
+    ("EX_CONFIG", 78),
+    ("EX_DATAERR", 65),
+    ("EX_IOERR", 74),
+    ("EX_NOHOST", 68),
+    ("EX_NOINPUT", 66),
+    ("EX_NOPERM", 77),
+    ("EX_NOUSER", 67),
+    ("EX_OK", 0),
+    ("EX_OSERR", 71),
+    ("EX_OSFILE", 72),
+    ("EX_PROTOCOL", 76),
+    ("EX_SOFTWARE", 70),
+    ("EX_TEMPFAIL", 75),
+    ("EX_UNAVAILABLE", 69),
+    ("EX_USAGE", 64),
+    ("F_LOCK", libc::F_LOCK),
+    ("F_TEST", libc::F_TEST),
+    ("F_TLOCK", libc::F_TLOCK),
+    ("F_ULOCK", libc::F_ULOCK),
+    // Darwin's compile-time NGROUPS_MAX is not exposed by libc.
+    ("NGROUPS_MAX", 16),
+    // posix_spawn file-action tags from Darwin spawn.h.
+    ("POSIX_SPAWN_CLOSE", 1),
+    ("POSIX_SPAWN_DUP2", 2),
+    ("POSIX_SPAWN_OPEN", 0),
+    ("PRIO_DARWIN_BG", libc::PRIO_DARWIN_BG),
+    ("PRIO_DARWIN_NONUI", libc::PRIO_DARWIN_NONUI),
+    ("PRIO_DARWIN_PROCESS", libc::PRIO_DARWIN_PROCESS),
+    ("PRIO_DARWIN_THREAD", libc::PRIO_DARWIN_THREAD),
+    ("PRIO_PGRP", libc::PRIO_PGRP),
+    ("PRIO_PROCESS", libc::PRIO_PROCESS),
+    ("PRIO_USER", libc::PRIO_USER),
+    ("P_ALL", libc::P_ALL as i32),
+    ("P_PGID", libc::P_PGID as i32),
+    ("P_PID", libc::P_PID as i32),
+    ("RTLD_GLOBAL", libc::RTLD_GLOBAL),
+    ("RTLD_LAZY", libc::RTLD_LAZY),
+    ("RTLD_LOCAL", libc::RTLD_LOCAL),
+    ("RTLD_NODELETE", libc::RTLD_NODELETE),
+    ("RTLD_NOLOAD", libc::RTLD_NOLOAD),
+    ("RTLD_NOW", libc::RTLD_NOW),
+    // sched.h Darwin policy constants missing from the libc crate.
+    ("SCHED_FIFO", 4),
+    ("SCHED_OTHER", 1),
+    ("SCHED_RR", 2),
+    ("ST_NOSUID", libc::ST_NOSUID as i32),
+    ("ST_RDONLY", libc::ST_RDONLY as i32),
+    ("TMP_MAX", libc::TMP_MAX as i32),
+    ("WEXITED", libc::WEXITED),
+    ("WNOWAIT", libc::WNOWAIT),
+    ("WSTOPPED", libc::WSTOPPED),
+];
+
+/// Private Darwin constants present on `posix` but not re-exported by `os.py`.
+const POSIX_PRIVATE_CONSTANTS: &[(&str, i32)] = &[
+    ("_COPYFILE_ACL", libc::COPYFILE_ACL as i32),
+    ("_COPYFILE_DATA", libc::COPYFILE_DATA as i32),
+    ("_COPYFILE_STAT", libc::COPYFILE_STAT as i32),
+    ("_COPYFILE_XATTR", libc::COPYFILE_XATTR as i32),
+];
+
+/// `os.py`-only constants.
+const OS_ONLY_CONSTANTS: &[(&str, i32)] = &[
+    ("P_NOWAIT", 1),
+    ("P_NOWAITO", 1),
+    ("P_WAIT", 0),
+];
+const CONFSTR_NAMES: &[(&str, i32)] = &[
+    ("CS_PATH", 1),
+    ("CS_XBS5_ILP32_OFF32_CFLAGS", 20),
+    ("CS_XBS5_ILP32_OFF32_LDFLAGS", 21),
+    ("CS_XBS5_ILP32_OFF32_LIBS", 22),
+    ("CS_XBS5_ILP32_OFF32_LINTFLAGS", 23),
+    ("CS_XBS5_ILP32_OFFBIG_CFLAGS", 24),
+    ("CS_XBS5_ILP32_OFFBIG_LDFLAGS", 25),
+    ("CS_XBS5_ILP32_OFFBIG_LIBS", 26),
+    ("CS_XBS5_ILP32_OFFBIG_LINTFLAGS", 27),
+    ("CS_XBS5_LP64_OFF64_CFLAGS", 28),
+    ("CS_XBS5_LP64_OFF64_LDFLAGS", 29),
+    ("CS_XBS5_LP64_OFF64_LIBS", 30),
+    ("CS_XBS5_LP64_OFF64_LINTFLAGS", 31),
+    ("CS_XBS5_LPBIG_OFFBIG_CFLAGS", 32),
+    ("CS_XBS5_LPBIG_OFFBIG_LDFLAGS", 33),
+    ("CS_XBS5_LPBIG_OFFBIG_LIBS", 34),
+    ("CS_XBS5_LPBIG_OFFBIG_LINTFLAGS", 35),
+];
+
+const PATHCONF_NAMES: &[(&str, i32)] = &[
+    ("PC_ALLOC_SIZE_MIN", 16),
+    ("PC_ASYNC_IO", 17),
+    ("PC_CHOWN_RESTRICTED", 7),
+    ("PC_FILESIZEBITS", 18),
+    ("PC_LINK_MAX", 1),
+    ("PC_MAX_CANON", 2),
+    ("PC_MAX_INPUT", 3),
+    ("PC_MIN_HOLE_SIZE", 27),
+    ("PC_NAME_MAX", 4),
+    ("PC_NO_TRUNC", 8),
+    ("PC_PATH_MAX", 5),
+    ("PC_PIPE_BUF", 6),
+    ("PC_PRIO_IO", 19),
+    ("PC_REC_INCR_XFER_SIZE", 20),
+    ("PC_REC_MAX_XFER_SIZE", 21),
+    ("PC_REC_MIN_XFER_SIZE", 22),
+    ("PC_REC_XFER_ALIGN", 23),
+    ("PC_SYMLINK_MAX", 24),
+    ("PC_SYNC_IO", 25),
+    ("PC_VDISABLE", 9),
+];
+
+const SYSCONF_NAMES: &[(&str, i32)] = &[
+    ("SC_2_CHAR_TERM", 20),
+    ("SC_2_C_BIND", 18),
+    ("SC_2_C_DEV", 19),
+    ("SC_2_FORT_DEV", 21),
+    ("SC_2_FORT_RUN", 22),
+    ("SC_2_LOCALEDEF", 23),
+    ("SC_2_SW_DEV", 24),
+    ("SC_2_UPE", 25),
+    ("SC_2_VERSION", 17),
+    ("SC_AIO_LISTIO_MAX", 42),
+    ("SC_AIO_MAX", 43),
+    ("SC_AIO_PRIO_DELTA_MAX", 44),
+    ("SC_ARG_MAX", 1),
+    ("SC_ASYNCHRONOUS_IO", 28),
+    ("SC_ATEXIT_MAX", 107),
+    ("SC_BC_BASE_MAX", 9),
+    ("SC_BC_DIM_MAX", 10),
+    ("SC_BC_SCALE_MAX", 11),
+    ("SC_BC_STRING_MAX", 12),
+    ("SC_CHILD_MAX", 2),
+    ("SC_CLK_TCK", 3),
+    ("SC_COLL_WEIGHTS_MAX", 13),
+    ("SC_DELAYTIMER_MAX", 45),
+    ("SC_EXPR_NEST_MAX", 14),
+    ("SC_FSYNC", 38),
+    ("SC_GETGR_R_SIZE_MAX", 70),
+    ("SC_GETPW_R_SIZE_MAX", 71),
+    ("SC_IOV_MAX", 56),
+    ("SC_JOB_CONTROL", 6),
+    ("SC_LINE_MAX", 15),
+    ("SC_LOGIN_NAME_MAX", 73),
+    ("SC_MAPPED_FILES", 47),
+    ("SC_MEMLOCK", 30),
+    ("SC_MEMLOCK_RANGE", 31),
+    ("SC_MEMORY_PROTECTION", 32),
+    ("SC_MESSAGE_PASSING", 33),
+    ("SC_MQ_OPEN_MAX", 46),
+    ("SC_MQ_PRIO_MAX", 75),
+    ("SC_NGROUPS_MAX", 4),
+    ("SC_NPROCESSORS_CONF", 57),
+    ("SC_NPROCESSORS_ONLN", 58),
+    ("SC_OPEN_MAX", 5),
+    ("SC_PAGESIZE", 29),
+    ("SC_PAGE_SIZE", 29),
+    ("SC_PASS_MAX", 131),
+    ("SC_PHYS_PAGES", 200),
+    ("SC_PRIORITIZED_IO", 34),
+    ("SC_PRIORITY_SCHEDULING", 35),
+    ("SC_REALTIME_SIGNALS", 36),
+    ("SC_RE_DUP_MAX", 16),
+    ("SC_RTSIG_MAX", 48),
+    ("SC_SAVED_IDS", 7),
+    ("SC_SEMAPHORES", 37),
+    ("SC_SEM_NSEMS_MAX", 49),
+    ("SC_SEM_VALUE_MAX", 50),
+    ("SC_SHARED_MEMORY_OBJECTS", 39),
+    ("SC_SIGQUEUE_MAX", 51),
+    ("SC_STREAM_MAX", 26),
+    ("SC_SYNCHRONIZED_IO", 40),
+    ("SC_THREADS", 96),
+    ("SC_THREAD_ATTR_STACKADDR", 82),
+    ("SC_THREAD_ATTR_STACKSIZE", 83),
+    ("SC_THREAD_DESTRUCTOR_ITERATIONS", 85),
+    ("SC_THREAD_KEYS_MAX", 86),
+    ("SC_THREAD_PRIORITY_SCHEDULING", 89),
+    ("SC_THREAD_PRIO_INHERIT", 87),
+    ("SC_THREAD_PRIO_PROTECT", 88),
+    ("SC_THREAD_PROCESS_SHARED", 90),
+    ("SC_THREAD_SAFE_FUNCTIONS", 91),
+    ("SC_THREAD_STACK_MIN", 93),
+    ("SC_THREAD_THREADS_MAX", 94),
+    ("SC_TIMERS", 41),
+    ("SC_TIMER_MAX", 52),
+    ("SC_TTY_NAME_MAX", 101),
+    ("SC_TZNAME_MAX", 27),
+    ("SC_VERSION", 8),
+    ("SC_XBS5_ILP32_OFF32", 122),
+    ("SC_XBS5_ILP32_OFFBIG", 123),
+    ("SC_XBS5_LP64_OFF64", 124),
+    ("SC_XBS5_LPBIG_OFFBIG", 125),
+    ("SC_XOPEN_CRYPT", 108),
+    ("SC_XOPEN_ENH_I18N", 109),
+    ("SC_XOPEN_LEGACY", 110),
+    ("SC_XOPEN_REALTIME", 111),
+    ("SC_XOPEN_REALTIME_THREADS", 112),
+    ("SC_XOPEN_SHM", 113),
+    ("SC_XOPEN_UNIX", 115),
+    ("SC_XOPEN_VERSION", 116),
+    ("SC_XOPEN_XCU_VERSION", 121),
+];
 
 /// `lseek(2)` whence constants served by the C `posix` module on the host
 /// oracle: `SEEK_HOLE`/`SEEK_DATA` (sparse-file navigation) live on BOTH
@@ -966,6 +1280,28 @@ fn environ_snapshot(module: &str) -> Result<*mut PyObject, String> {
     let environ = unsafe { crate::abi::map::pon_build_map(pairs.as_mut_ptr(), pair_count) };
     if environ.is_null() {
         return Err(format!("failed to allocate {module}.environ"));
+    }
+    Ok(environ)
+}
+fn environb_snapshot(module: &str) -> Result<*mut PyObject, String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut pairs: Vec<*mut PyObject> = Vec::new();
+    for (key, value) in std::env::vars_os() {
+        let key = key.as_os_str().as_bytes();
+        let value = value.as_os_str().as_bytes();
+        let key_obj = unsafe { crate::abi::str_::pon_const_bytes(key.as_ptr(), key.len()) };
+        let value_obj = unsafe { crate::abi::str_::pon_const_bytes(value.as_ptr(), value.len()) };
+        if key_obj.is_null() || value_obj.is_null() {
+            return Err(format!("failed to allocate {module}.environb entry"));
+        }
+        pairs.push(key_obj);
+        pairs.push(value_obj);
+    }
+    let pair_count = pairs.len() / 2;
+    let environ = unsafe { crate::abi::map::pon_build_map(pairs.as_mut_ptr(), pair_count) };
+    if environ.is_null() {
+        return Err(format!("failed to allocate {module}.environb"));
     }
     Ok(environ)
 }
@@ -1870,33 +2206,108 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("WIFSTOPPED", os_wifstopped, 1),
     ("WSTOPSIG", os_wstopsig, 1),
     ("WTERMSIG", os_wtermsig, 1),
+    ("_exit", os_exit, 1),
+    ("abort", os_abort, 0),
     ("access", os_access, 2),
     ("chdir", os_chdir, 1),
+    ("chflags", os_chflags, 2),
+    ("chown", os_chown, 3),
+    ("chroot", os_chroot, 1),
     ("close", os_close, 1),
+    ("closerange", os_closerange, 2),
+    ("cpu_count", os_cpu_count, 0),
+    ("ctermid", os_ctermid, 0),
     ("dup", os_dup, 1),
     ("dup2", os_dup2, crate::native::builtins_mod::VARIADIC_ARITY),
+    ("fchdir", os_fchdir, 1),
+    ("fchmod", os_fchmod, 2),
+    ("fchown", os_fchown, 3),
     ("fdopen", os_fdopen, crate::native::builtins_mod::VARIADIC_ARITY),
     ("fstat", os_fstat, 1),
+    ("fork", os_fork, 0),
+    ("forkpty", os_forkpty, 0),
+    ("fsync", os_fsync, 1),
+    ("ftruncate", os_ftruncate, 2),
+    ("get_blocking", os_get_blocking, 1),
+    ("get_inheritable", os_get_inheritable, 1),
     ("getcwd", os_getcwd, 0),
+    ("getcwdb", os_getcwdb, 0),
+    ("getegid", os_getegid, 0),
+    ("geteuid", os_geteuid, 0),
+    ("getgid", os_getgid, 0),
+    ("getgroups", os_getgroups, 0),
+    ("getgrouplist", os_getgrouplist, 2),
+    ("getloadavg", os_getloadavg, 0),
+    ("getlogin", os_getlogin, 0),
+    ("getpgid", os_getpgid, 1),
+    ("getpgrp", os_getpgrp, 0),
     ("getpid", os_getpid, 0),
+    ("getppid", os_getppid, 0),
+    ("getpriority", os_getpriority, 2),
+    ("getsid", os_getsid, 1),
+    ("grantpt", os_grantpt, 1),
+    ("initgroups", os_initgroups, 2),
     ("getuid", os_getuid, 0),
     ("isatty", os_isatty, 1),
     ("kill", os_kill, 2),
     ("killpg", os_killpg, 2),
+    ("lchflags", os_lchflags, 2),
+    ("lchmod", os_lchmod, 2),
+    ("lchown", os_lchown, 3),
+    ("link", os_link, crate::native::builtins_mod::VARIADIC_ARITY),
     ("lseek", os_lseek, 3),
     ("lstat", os_lstat, crate::native::builtins_mod::VARIADIC_ARITY),
+    ("major", os_major, 1),
+    ("makedev", os_makedev, 2),
+    ("minor", os_minor, 1),
     ("mkdir", os_mkdir, crate::native::builtins_mod::VARIADIC_ARITY),
+    ("mkfifo", os_mkfifo, crate::native::builtins_mod::VARIADIC_ARITY),
+    ("nice", os_nice, 1),
+    ("openpty", os_openpty, 0),
     ("open", os_open, crate::native::builtins_mod::VARIADIC_ARITY),
     ("pipe", os_pipe, 0),
+    ("posix_openpt", os_posix_openpt, 1),
+    ("pread", os_pread, 3),
     ("putenv", os_putenv, 2),
+    ("pwrite", os_pwrite, 3),
+    ("ptsname", os_ptsname, 1),
     ("read", os_read, 2),
     ("readinto", os_readinto, 2),
     ("readlink", os_readlink, 1),
+    ("rename", os_rename, crate::native::builtins_mod::VARIADIC_ARITY),
+    ("replace", os_replace, crate::native::builtins_mod::VARIADIC_ARITY),
     ("rmdir", os_rmdir, 1),
+    ("sched_get_priority_max", os_sched_get_priority_max, 1),
+    ("sched_get_priority_min", os_sched_get_priority_min, 1),
+    ("sched_yield", os_sched_yield, 0),
+    ("set_blocking", os_set_blocking, 2),
+    ("set_inheritable", os_set_inheritable, 2),
+    ("setegid", os_setegid, 1),
+    ("seteuid", os_seteuid, 1),
+    ("setgid", os_setgid, 1),
+    ("setgroups", os_setgroups, 1),
+    ("setpgid", os_setpgid, 2),
+    ("setpgrp", os_setpgrp, 0),
+    ("setpriority", os_setpriority, 3),
+    ("setregid", os_setregid, 2),
+    ("setreuid", os_setreuid, 2),
+    ("setsid", os_setsid, 0),
+    ("setuid", os_setuid, 1),
     ("strerror", os_strerror, 1),
+    ("symlink", os_symlink, crate::native::builtins_mod::VARIADIC_ARITY),
+    ("sync", os_sync, 0),
+    ("system", os_system, 1),
+    ("tcgetpgrp", os_tcgetpgrp, 1),
+    ("tcsetpgrp", os_tcsetpgrp, 2),
+    ("times", os_times, 0),
+    ("truncate", os_truncate, 2),
+    ("ttyname", os_ttyname, 1),
     ("umask", os_umask, 1),
+    ("uname", os_uname, 0),
     ("unlink", os_unlink, 1),
+    ("unlockpt", os_unlockpt, 1),
     ("unsetenv", os_unsetenv, 1),
+    ("wait", os_wait, 0),
     ("waitpid", os_waitpid, 2),
     ("waitstatus_to_exitcode", os_waitstatus_to_exitcode, 1),
     ("write", os_write, 2),
@@ -1946,6 +2357,186 @@ unsafe extern "C" fn os_getpid(_argv: *mut *mut PyObject, _argc: usize) -> *mut 
     // SAFETY: Integer boxing helper follows the NULL-sentinel error contract.
     unsafe { crate::abi::pon_const_int(i64::from(std::process::id())) }
 }
+unsafe extern "C" fn os_exit(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return crate::abi::return_null_with_error("os._exit expected one argument");
+    }
+    let status = match int_arg(args[0], "_exit status") {
+        Ok(status) => status,
+        Err(error) => return error,
+    };
+    unsafe { libc::_exit(status as libc::c_int) }
+}
+
+unsafe extern "C" fn os_abort(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::return_null_with_error("os.abort expected no arguments");
+    }
+    unsafe { libc::abort() }
+}
+
+unsafe extern "C" fn os_getcwdb(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::return_null_with_error("os.getcwdb expected no arguments");
+    }
+    use std::os::unix::ffi::OsStrExt;
+    match std::env::current_dir() {
+        Ok(path) => {
+            let bytes = path.as_os_str().as_bytes();
+            unsafe { crate::abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) }
+        }
+        Err(error) => raise_errno(error.raw_os_error().unwrap_or(libc::EIO), None),
+    }
+}
+
+macro_rules! noarg_int_fn {
+    ($name:ident, $py:literal, $expr:expr) => {
+        unsafe extern "C" fn $name(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+            if argc != 0 {
+                return crate::abi::return_null_with_error(concat!("os.", $py, " expected no arguments"));
+            }
+            let value = $expr;
+            unsafe { crate::abi::pon_const_int(i64::from(value)) }
+        }
+    };
+}
+
+noarg_int_fn!(os_getegid, "getegid", unsafe { libc::getegid() });
+noarg_int_fn!(os_geteuid, "geteuid", unsafe { libc::geteuid() });
+noarg_int_fn!(os_getgid, "getgid", unsafe { libc::getgid() });
+noarg_int_fn!(os_getpgrp, "getpgrp", unsafe { libc::getpgrp() });
+noarg_int_fn!(os_getppid, "getppid", unsafe { libc::getppid() });
+
+unsafe extern "C" fn os_cpu_count(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::return_null_with_error("os.cpu_count expected no arguments");
+    }
+    match std::thread::available_parallelism() {
+        Ok(count) => unsafe { crate::abi::pon_const_int(count.get() as i64) },
+        Err(_) => unsafe { crate::abi::pon_none() },
+    }
+}
+
+unsafe extern "C" fn os_getgroups(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::return_null_with_error("os.getgroups expected no arguments");
+    }
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    let mut groups = vec![0 as libc::gid_t; count as usize];
+    let count = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+    if count < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    let mut objects = Vec::with_capacity(count as usize);
+    for group in groups.into_iter().take(count as usize) {
+        let object = unsafe { crate::abi::pon_const_int(i64::from(group)) };
+        if object.is_null() {
+            return std::ptr::null_mut();
+        }
+        objects.push(object);
+    }
+    unsafe { crate::abi::seq::pon_build_list(objects.as_mut_ptr(), objects.len()) }
+}
+
+unsafe extern "C" fn os_getloadavg(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::return_null_with_error("os.getloadavg expected no arguments");
+    }
+    let mut loads = [0.0 as libc::c_double; 3];
+    if unsafe { libc::getloadavg(loads.as_mut_ptr(), loads.len() as libc::c_int) } != 3 {
+        return raise_errno(last_errno(), None);
+    }
+    let mut items = [
+        unsafe { crate::abi::number::pon_const_float(loads[0]) },
+        unsafe { crate::abi::number::pon_const_float(loads[1]) },
+        unsafe { crate::abi::number::pon_const_float(loads[2]) },
+    ];
+    if items.iter().any(|item| item.is_null()) {
+        return std::ptr::null_mut();
+    }
+    unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) }
+}
+
+unsafe extern "C" fn os_getlogin(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::return_null_with_error("os.getlogin expected no arguments");
+    }
+    let ptr = unsafe { libc::getlogin() };
+    if ptr.is_null() {
+        return raise_errno(last_errno(), None);
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy();
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+unsafe extern "C" fn os_ctermid(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::return_null_with_error("os.ctermid expected no arguments");
+    }
+    let ptr = unsafe { ctermid(std::ptr::null_mut()) };
+    if ptr.is_null() {
+        return raise_errno(last_errno(), None);
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy();
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+unsafe extern "C" fn os_getpgid(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return crate::abi::return_null_with_error("os.getpgid expected one argument");
+    }
+    let pid = match int_arg(args[0], "getpgid pid") {
+        Ok(pid) => pid,
+        Err(error) => return error,
+    };
+    let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+    if pgid < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_const_int(i64::from(pgid)) }
+}
+
+unsafe extern "C" fn os_getsid(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return crate::abi::return_null_with_error("os.getsid expected one argument");
+    }
+    let pid = match int_arg(args[0], "getsid pid") {
+        Ok(pid) => pid,
+        Err(error) => return error,
+    };
+    let sid = unsafe { libc::getsid(pid as libc::pid_t) };
+    if sid < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_const_int(i64::from(sid)) }
+}
+
+unsafe extern "C" fn os_getpriority(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.getpriority expected two arguments");
+    }
+    let which = match int_arg(args[0], "getpriority which") {
+        Ok(which) => which,
+        Err(error) => return error,
+    };
+    let who = match int_arg(args[1], "getpriority who") {
+        Ok(who) => who,
+        Err(error) => return error,
+    };
+    let value = unsafe { libc::getpriority(which as libc::c_int, who as libc::id_t) };
+    if value == -1 && last_errno() != 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_const_int(i64::from(value)) }
+}
+
 
 /// `os.kill(pid, sig)` over `kill(2)`, raising the PEP 3151 errno subclass.
 unsafe extern "C" fn os_kill(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -1992,6 +2583,158 @@ unsafe extern "C" fn os_killpg(argv: *mut *mut PyObject, argc: usize) -> *mut Py
     // SAFETY: Singleton accessor.
     unsafe { crate::abi::pon_none() }
 }
+unsafe extern "C" fn os_fork(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::return_null_with_error("os.fork expected no arguments");
+    }
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_const_int(i64::from(pid)) }
+}
+
+macro_rules! one_id_none_fn {
+    ($name:ident, $py:literal, $call:path, $ty:ty) => {
+        unsafe extern "C" fn $name(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+            let args = unsafe { call_args(argv, argc) };
+            if args.len() != 1 {
+                return crate::abi::return_null_with_error(concat!("os.", $py, " expected one argument"));
+            }
+            let value = match int_arg(args[0], concat!($py, " value")) {
+                Ok(value) => value,
+                Err(error) => return error,
+            };
+            if unsafe { $call(value as $ty) } < 0 {
+                return raise_errno(last_errno(), None);
+            }
+            unsafe { crate::abi::pon_none() }
+        }
+    };
+}
+
+one_id_none_fn!(os_setegid, "setegid", libc::setegid, libc::gid_t);
+one_id_none_fn!(os_seteuid, "seteuid", libc::seteuid, libc::uid_t);
+one_id_none_fn!(os_setgid, "setgid", libc::setgid, libc::gid_t);
+one_id_none_fn!(os_setuid, "setuid", libc::setuid, libc::uid_t);
+
+unsafe extern "C" fn os_setregid(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.setregid expected two arguments");
+    }
+    let rgid = match int_arg(args[0], "setregid rgid") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let egid = match int_arg(args[1], "setregid egid") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if unsafe { libc::setregid(rgid as libc::gid_t, egid as libc::gid_t) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_setreuid(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.setreuid expected two arguments");
+    }
+    let ruid = match int_arg(args[0], "setreuid ruid") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let euid = match int_arg(args[1], "setreuid euid") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if unsafe { libc::setreuid(ruid as libc::uid_t, euid as libc::uid_t) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_setpgid(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.setpgid expected two arguments");
+    }
+    let pid = match int_arg(args[0], "setpgid pid") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let pgrp = match int_arg(args[1], "setpgid pgrp") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if unsafe { libc::setpgid(pid as libc::pid_t, pgrp as libc::pid_t) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_setpgrp(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::return_null_with_error("os.setpgrp expected no arguments");
+    }
+    if unsafe { libc::setpgid(0, 0) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_setsid(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::return_null_with_error("os.setsid expected no arguments");
+    }
+    let sid = unsafe { libc::setsid() };
+    if sid < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_const_int(i64::from(sid)) }
+}
+
+unsafe extern "C" fn os_nice(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return crate::abi::return_null_with_error("os.nice expected one argument");
+    }
+    let increment = match int_arg(args[0], "nice increment") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let value = unsafe { libc::nice(increment as libc::c_int) };
+    if value == -1 && last_errno() != 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_const_int(i64::from(value)) }
+}
+
+unsafe extern "C" fn os_setpriority(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 3 {
+        return crate::abi::return_null_with_error("os.setpriority expected three arguments");
+    }
+    let which = match int_arg(args[0], "setpriority which") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let who = match int_arg(args[1], "setpriority who") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let priority = match int_arg(args[2], "setpriority priority") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if unsafe { libc::setpriority(which as libc::c_int, who as libc::id_t, priority as libc::c_int) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
 
 /// `os.readlink(path)` over `std::fs::read_link` (`posixpath.realpath`'s
 /// symlink resolution, reached from `sysconfig._safe_realpath`).  Non-link
@@ -2014,6 +2757,1156 @@ unsafe extern "C" fn os_readlink(argv: *mut *mut PyObject, argc: usize) -> *mut 
         }
         Err(error) => raise_errno(error.raw_os_error().unwrap_or(libc::EIO), Some(&path)),
     }
+}
+unsafe extern "C" fn os_fchdir(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let fd = match one_fd_arg(argv, argc, "fchdir") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    if unsafe { libc::fchdir(fd) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_fchmod(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.fchmod expected two arguments");
+    }
+    let fd = match int_arg(args[0], "fchmod fd") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let mode = match int_arg(args[1], "fchmod mode") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if unsafe { libc::fchmod(fd as libc::c_int, mode as libc::mode_t) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_fchown(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 3 {
+        return crate::abi::return_null_with_error("os.fchown expected three arguments");
+    }
+    let fd = match int_arg(args[0], "fchown fd") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let uid = match int_arg(args[1], "fchown uid") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let gid = match int_arg(args[2], "fchown gid") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if unsafe { libc::fchown(fd as libc::c_int, uid as libc::uid_t, gid as libc::gid_t) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_fsync(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let fd = match one_fd_arg(argv, argc, "fsync") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    if unsafe { libc::fsync(fd) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_ftruncate(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.ftruncate expected two arguments");
+    }
+    let fd = match int_arg(args[0], "ftruncate fd") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let length = match int_arg(args[1], "ftruncate length") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if unsafe { libc::ftruncate(fd as libc::c_int, length as libc::off_t) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_chown(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    chown_like(argv, argc, "chown", libc::chown)
+}
+
+unsafe extern "C" fn os_lchown(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    chown_like(argv, argc, "lchown", libc::lchown)
+}
+
+fn chown_like(
+    argv: *mut *mut PyObject,
+    argc: usize,
+    name: &str,
+    call: unsafe extern "C" fn(*const libc::c_char, libc::uid_t, libc::gid_t) -> libc::c_int,
+) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 3 {
+        return crate::abi::return_null_with_error(format!("os.{name} expected three arguments"));
+    }
+    let path = match path_arg(args[0], name) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let uid = match int_arg(args[1], &format!("{name} uid")) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let gid = match int_arg(args[2], &format!("{name} gid")) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let c_path = match c_path(&path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    if unsafe { call(c_path.as_ptr(), uid as libc::uid_t, gid as libc::gid_t) } < 0 {
+        return raise_errno(last_errno(), Some(&path));
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_chflags(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    chflags_like(argv, argc, "chflags", libc::chflags)
+}
+
+unsafe extern "C" fn os_lchflags(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    chflags_like(argv, argc, "lchflags", lchflags)
+}
+
+fn chflags_like(
+    argv: *mut *mut PyObject,
+    argc: usize,
+    name: &str,
+    call: unsafe extern "C" fn(*const libc::c_char, libc::c_uint) -> libc::c_int,
+) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error(format!("os.{name} expected two arguments"));
+    }
+    let path = match path_arg(args[0], name) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let flags = match int_arg(args[1], &format!("{name} flags")) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let c_path = match c_path(&path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    if unsafe { call(c_path.as_ptr(), flags as libc::c_uint) } < 0 {
+        return raise_errno(last_errno(), Some(&path));
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_lchmod(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.lchmod expected two arguments");
+    }
+    let path = match path_arg(args[0], "lchmod") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let mode = match int_arg(args[1], "lchmod mode") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let c_path = match c_path(&path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    if unsafe { lchmod(c_path.as_ptr(), mode as libc::mode_t) } < 0 {
+        return raise_errno(last_errno(), Some(&path));
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_chroot(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return crate::abi::return_null_with_error("os.chroot expected one argument");
+    }
+    let path = match path_arg(args[0], "chroot") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let c_path = match c_path(&path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    if unsafe { libc::chroot(c_path.as_ptr()) } < 0 {
+        return raise_errno(last_errno(), Some(&path));
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_truncate(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.truncate expected two arguments");
+    }
+    let path = match path_arg(args[0], "truncate") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let length = match int_arg(args[1], "truncate length") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let c_path = match c_path(&path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    if unsafe { libc::truncate(c_path.as_ptr(), length as libc::off_t) } < 0 {
+        return raise_errno(last_errno(), Some(&path));
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_rename(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    rename_like(argv, argc, "rename")
+}
+
+unsafe extern "C" fn os_replace(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    rename_like(argv, argc, "replace")
+}
+
+fn rename_like(argv: *mut *mut PyObject, argc: usize, name: &str) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() < 2 || args.len() > 4 {
+        return crate::abi::return_null_with_error(format!("os.{name} expected two paths"));
+    }
+    if let Err(error) = reject_dir_fd(args, 2, name).and_then(|()| reject_dir_fd(args, 3, name)) {
+        return error;
+    }
+    let src = match path_arg(args[0], name) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let dst = match path_arg(args[1], name) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let c_src = match c_path(&src) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let c_dst = match c_path(&dst) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    if unsafe { libc::rename(c_src.as_ptr(), c_dst.as_ptr()) } < 0 {
+        return raise_errno(last_errno(), Some(&src));
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_link(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() < 2 || args.len() > 5 {
+        return crate::abi::return_null_with_error("os.link expected two paths");
+    }
+    for index in 2..args.len() {
+        if optional_arg(args, index).is_some() {
+            return crate::abi::exc::raise_kind_error_text(ExceptionKind::NotImplementedError, "os.link optional fd/follow_symlinks arguments are unavailable");
+        }
+    }
+    let src = match path_arg(args[0], "link") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let dst = match path_arg(args[1], "link") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let c_src = match c_path(&src) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let c_dst = match c_path(&dst) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    if unsafe { libc::link(c_src.as_ptr(), c_dst.as_ptr()) } < 0 {
+        return raise_errno(last_errno(), Some(&src));
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_symlink(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() < 2 || args.len() > 4 {
+        return crate::abi::return_null_with_error("os.symlink expected source and destination");
+    }
+    if let Err(error) = reject_dir_fd(args, 3, "symlink") {
+        return error;
+    }
+    let src = match path_arg(args[0], "symlink") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let dst = match path_arg(args[1], "symlink") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let c_src = match c_path(&src) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let c_dst = match c_path(&dst) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    if unsafe { libc::symlink(c_src.as_ptr(), c_dst.as_ptr()) } < 0 {
+        return raise_errno(last_errno(), Some(&dst));
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+
+fn one_fd_arg(argv: *mut *mut PyObject, argc: usize, name: &str) -> Result<libc::c_int, *mut PyObject> {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return Err(crate::abi::return_null_with_error(format!("os.{name} expected one argument")));
+    }
+    int_arg(args[0], &format!("{name} fd")).map(|fd| fd as libc::c_int)
+}
+
+unsafe extern "C" fn os_closerange(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.closerange expected two arguments");
+    }
+    let low = match int_arg(args[0], "closerange low") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let high = match int_arg(args[1], "closerange high") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    for fd in low..high {
+        if fd >= 0 && fd <= i64::from(libc::c_int::MAX) {
+            unsafe { libc::close(fd as libc::c_int) };
+        }
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_get_inheritable(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let fd = match one_fd_arg(argv, argc, "get_inheritable") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    bool_object((flags & libc::FD_CLOEXEC) == 0)
+}
+
+unsafe extern "C" fn os_set_inheritable(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.set_inheritable expected two arguments");
+    }
+    let fd = match int_arg(args[0], "set_inheritable fd") {
+        Ok(value) => value as libc::c_int,
+        Err(error) => return error,
+    };
+    let inheritable = match truth_arg(args[1]) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if let Err(errno) = set_fd_cloexec(fd, !inheritable) {
+        return raise_errno(errno, None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_get_blocking(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let fd = match one_fd_arg(argv, argc, "get_blocking") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    bool_object((flags & libc::O_NONBLOCK) == 0)
+}
+
+unsafe extern "C" fn os_set_blocking(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.set_blocking expected two arguments");
+    }
+    let fd = match int_arg(args[0], "set_blocking fd") {
+        Ok(value) => value as libc::c_int,
+        Err(error) => return error,
+    };
+    let blocking = match truth_arg(args[1]) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    let new_flags = if blocking {
+        flags & !libc::O_NONBLOCK
+    } else {
+        flags | libc::O_NONBLOCK
+    };
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, new_flags) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_mkfifo(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.is_empty() || args.len() > 3 {
+        return crate::abi::return_null_with_error("os.mkfifo expected path and optional mode");
+    }
+    let path = match path_arg(args[0], "mkfifo") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let mode = match optional_arg(args, 1).map(|object| int_arg(object, "mkfifo mode")) {
+        None => 0o666,
+        Some(Ok(value)) => value,
+        Some(Err(error)) => return error,
+    };
+    if let Err(error) = reject_dir_fd(args, 2, "mkfifo") {
+        return error;
+    }
+    let c_path = match c_path(&path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    if unsafe { libc::mkfifo(c_path.as_ptr(), mode as libc::mode_t) } < 0 {
+        return raise_errno(last_errno(), Some(&path));
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_pread(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 3 {
+        return crate::abi::return_null_with_error("os.pread expected three arguments");
+    }
+    let fd = match int_arg(args[0], "pread fd") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let size = match int_arg(args[1], "pread size") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let offset = match int_arg(args[2], "pread offset") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if size < 0 {
+        return raise_errno(libc::EINVAL, None);
+    }
+    let mut buffer = vec![0u8; size as usize];
+    let count = unsafe { libc::pread(fd as libc::c_int, buffer.as_mut_ptr().cast(), buffer.len(), offset as libc::off_t) };
+    if count < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::str_::pon_const_bytes(buffer.as_ptr(), count as usize) }
+}
+
+unsafe extern "C" fn os_pwrite(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 3 {
+        return crate::abi::return_null_with_error("os.pwrite expected three arguments");
+    }
+    let fd = match int_arg(args[0], "pwrite fd") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let data = crate::tag::untag_arg(args[1]);
+    let payload = match readable_bytes_payload(data) {
+        Ok(payload) => payload,
+        Err(error) => return error,
+    };
+    let offset = match int_arg(args[2], "pwrite offset") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let count = unsafe { libc::pwrite(fd as libc::c_int, payload.as_ptr().cast(), payload.len(), offset as libc::off_t) };
+    if count < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_const_int(count as i64) }
+}
+
+unsafe extern "C" fn os_major(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let dev = match single_int_arg(argv, argc, "major") {
+        Ok(value) => value as u64,
+        Err(error) => return error,
+    };
+    unsafe { crate::abi::pon_const_int(((dev >> 24) & 0xff) as i64) }
+}
+
+unsafe extern "C" fn os_minor(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let dev = match single_int_arg(argv, argc, "minor") {
+        Ok(value) => value as u64,
+        Err(error) => return error,
+    };
+    unsafe { crate::abi::pon_const_int((dev & 0x00ff_ffff) as i64) }
+}
+
+unsafe extern "C" fn os_makedev(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.makedev expected two arguments");
+    }
+    let major = match int_arg(args[0], "makedev major") {
+        Ok(value) => value as u64,
+        Err(error) => return error,
+    };
+    let minor = match int_arg(args[1], "makedev minor") {
+        Ok(value) => value as u64,
+        Err(error) => return error,
+    };
+    unsafe { crate::abi::pon_const_int((((major & 0xff) << 24) | (minor & 0x00ff_ffff)) as i64) }
+}
+
+fn single_int_arg(argv: *mut *mut PyObject, argc: usize, name: &str) -> Result<i64, *mut PyObject> {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return Err(crate::abi::return_null_with_error(format!("os.{name} expected one argument")));
+    }
+    int_arg(args[0], name)
+}
+
+unsafe extern "C" fn os_sched_get_priority_max(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let policy = match single_int_arg(argv, argc, "sched_get_priority_max") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let value = unsafe { libc::sched_get_priority_max(policy as libc::c_int) };
+    if value < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_const_int(i64::from(value)) }
+}
+
+unsafe extern "C" fn os_sched_get_priority_min(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let policy = match single_int_arg(argv, argc, "sched_get_priority_min") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let value = unsafe { libc::sched_get_priority_min(policy as libc::c_int) };
+    if value < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_const_int(i64::from(value)) }
+}
+
+unsafe extern "C" fn os_sched_yield(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::return_null_with_error("os.sched_yield expected no arguments");
+    }
+    if unsafe { libc::sched_yield() } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_sync(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::return_null_with_error("os.sync expected no arguments");
+    }
+    unsafe { libc::sync() };
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_system(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return crate::abi::return_null_with_error("os.system expected one argument");
+    }
+    let command = match path_arg(args[0], "system") {
+        Ok(command) => command,
+        Err(error) => return error,
+    };
+    let c_command = match std::ffi::CString::new(command) {
+        Ok(command) => command,
+        Err(_) => return crate::abi::exc::raise_kind_error_text(ExceptionKind::ValueError, "embedded null byte"),
+    };
+    let status = unsafe { libc::system(c_command.as_ptr()) };
+    unsafe { crate::abi::pon_const_int(i64::from(status)) }
+}
+
+unsafe extern "C" fn os_tcgetpgrp(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let fd = match one_fd_arg(argv, argc, "tcgetpgrp") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    let pgid = unsafe { libc::tcgetpgrp(fd) };
+    if pgid < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_const_int(i64::from(pgid)) }
+}
+
+unsafe extern "C" fn os_tcsetpgrp(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.tcsetpgrp expected two arguments");
+    }
+    let fd = match int_arg(args[0], "tcsetpgrp fd") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let pgid = match int_arg(args[1], "tcsetpgrp pgid") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if unsafe { libc::tcsetpgrp(fd as libc::c_int, pgid as libc::pid_t) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_ttyname(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let fd = match one_fd_arg(argv, argc, "ttyname") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    let ptr = unsafe { libc::ttyname(fd) };
+    if ptr.is_null() {
+        return raise_errno(last_errno(), None);
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy();
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+unsafe extern "C" fn os_uname(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::return_null_with_error("os.uname expected no arguments");
+    }
+    let mut uts = std::mem::MaybeUninit::<libc::utsname>::zeroed();
+    if unsafe { libc::uname(uts.as_mut_ptr()) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    let uts = unsafe { uts.assume_init() };
+    let fields = [
+        c_array_string(&uts.sysname),
+        c_array_string(&uts.nodename),
+        c_array_string(&uts.release),
+        c_array_string(&uts.version),
+        c_array_string(&uts.machine),
+    ];
+    let mut objects = Vec::with_capacity(fields.len());
+    for field in fields {
+        let object = unsafe { pon_const_str(field.as_ptr(), field.len()) };
+        if object.is_null() {
+            return std::ptr::null_mut();
+        }
+        objects.push(object);
+    }
+    unsafe { crate::abi::seq::pon_build_tuple(objects.as_mut_ptr(), objects.len()) }
+}
+
+fn c_array_string(buffer: &[libc::c_char]) -> String {
+    let ptr = buffer.as_ptr();
+    unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+}
+
+unsafe extern "C" fn os_times(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::return_null_with_error("os.times expected no arguments");
+    }
+    let mut tms = std::mem::MaybeUninit::<libc::tms>::zeroed();
+    let elapsed = unsafe { libc::times(tms.as_mut_ptr()) };
+    if elapsed == !0 {
+        return raise_errno(last_errno(), None);
+    }
+    let tms = unsafe { tms.assume_init() };
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+    let values = [
+        tms.tms_utime as f64 / ticks,
+        tms.tms_stime as f64 / ticks,
+        tms.tms_cutime as f64 / ticks,
+        tms.tms_cstime as f64 / ticks,
+        elapsed as f64 / ticks,
+    ];
+    let mut objects = [
+        unsafe { crate::abi::number::pon_const_float(values[0]) },
+        unsafe { crate::abi::number::pon_const_float(values[1]) },
+        unsafe { crate::abi::number::pon_const_float(values[2]) },
+        unsafe { crate::abi::number::pon_const_float(values[3]) },
+        unsafe { crate::abi::number::pon_const_float(values[4]) },
+    ];
+    if objects.iter().any(|object| object.is_null()) {
+        return std::ptr::null_mut();
+    }
+    unsafe { crate::abi::seq::pon_build_tuple(objects.as_mut_ptr(), objects.len()) }
+}
+
+unsafe extern "C" fn os_wait(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::return_null_with_error("os.wait expected no arguments");
+    }
+    let mut status = 0 as libc::c_int;
+    let pid = unsafe { libc::wait(&mut status) };
+    if pid < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    let mut items = [
+        unsafe { crate::abi::pon_const_int(i64::from(pid)) },
+        unsafe { crate::abi::pon_const_int(i64::from(status)) },
+    ];
+    if items.iter().any(|item| item.is_null()) {
+        return std::ptr::null_mut();
+    }
+    unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) }
+}
+
+unsafe extern "C" fn os_posix_openpt(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let flags = match single_int_arg(argv, argc, "posix_openpt") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let fd = unsafe { libc::posix_openpt(flags as libc::c_int) };
+    if fd < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    if let Err(errno) = set_fd_cloexec(fd, true) {
+        unsafe { libc::close(fd) };
+        return raise_errno(errno, None);
+    }
+    unsafe { crate::abi::pon_const_int(i64::from(fd)) }
+}
+
+unsafe extern "C" fn os_grantpt(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let fd = match one_fd_arg(argv, argc, "grantpt") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    if unsafe { libc::grantpt(fd) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_unlockpt(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let fd = match one_fd_arg(argv, argc, "unlockpt") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    if unsafe { libc::unlockpt(fd) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_ptsname(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let fd = match one_fd_arg(argv, argc, "ptsname") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    let ptr = unsafe { libc::ptsname(fd) };
+    if ptr.is_null() {
+        return raise_errno(last_errno(), None);
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy();
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+unsafe extern "C" fn os_openpty(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::return_null_with_error("os.openpty expected no arguments");
+    }
+    let mut master = 0 as libc::c_int;
+    let mut slave = 0 as libc::c_int;
+    if unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } < 0
+    {
+        return raise_errno(last_errno(), None);
+    }
+    if let Err(errno) = set_fd_cloexec(master, true).and_then(|()| set_fd_cloexec(slave, true)) {
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+        return raise_errno(errno, None);
+    }
+    let mut items = [
+        unsafe { crate::abi::pon_const_int(i64::from(master)) },
+        unsafe { crate::abi::pon_const_int(i64::from(slave)) },
+    ];
+    if items.iter().any(|item| item.is_null()) {
+        return std::ptr::null_mut();
+    }
+    unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) }
+}
+
+unsafe extern "C" fn os_forkpty(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::return_null_with_error("os.forkpty expected no arguments");
+    }
+    let mut master = 0 as libc::c_int;
+    let pid = unsafe {
+        libc::forkpty(
+            &mut master,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if pid < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    if pid > 0 {
+        if let Err(errno) = set_fd_cloexec(master, true) {
+            unsafe { libc::close(master) };
+            return raise_errno(errno, None);
+        }
+    }
+    let mut items = [
+        unsafe { crate::abi::pon_const_int(i64::from(pid)) },
+        unsafe { crate::abi::pon_const_int(i64::from(master)) },
+    ];
+    if items.iter().any(|item| item.is_null()) {
+        return std::ptr::null_mut();
+    }
+    unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) }
+}
+
+unsafe extern "C" fn os_initgroups(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.initgroups expected two arguments");
+    }
+    let user = match path_arg(args[0], "initgroups user") {
+        Ok(user) => user,
+        Err(error) => return error,
+    };
+    let gid = match int_arg(args[1], "initgroups gid") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let c_user = match std::ffi::CString::new(user) {
+        Ok(user) => user,
+        Err(_) => return crate::abi::exc::raise_kind_error_text(ExceptionKind::ValueError, "embedded null byte"),
+    };
+    if unsafe { libc::initgroups(c_user.as_ptr(), gid as libc::c_int) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_getgrouplist(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.getgrouplist expected two arguments");
+    }
+    let user = match path_arg(args[0], "getgrouplist user") {
+        Ok(user) => user,
+        Err(error) => return error,
+    };
+    let gid = match int_arg(args[1], "getgrouplist gid") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let c_user = match std::ffi::CString::new(user) {
+        Ok(user) => user,
+        Err(_) => return crate::abi::exc::raise_kind_error_text(ExceptionKind::ValueError, "embedded null byte"),
+    };
+    let mut ngroups = 0 as libc::c_int;
+    unsafe { libc::getgrouplist(c_user.as_ptr(), gid as libc::c_int, std::ptr::null_mut(), &mut ngroups) };
+    if ngroups <= 0 {
+        ngroups = 16;
+    }
+    loop {
+        let mut groups = vec![0 as libc::c_int; ngroups as usize];
+        let mut capacity = ngroups;
+        let rc = unsafe { libc::getgrouplist(c_user.as_ptr(), gid as libc::c_int, groups.as_mut_ptr(), &mut capacity) };
+        if rc >= 0 {
+            let mut objects = Vec::with_capacity(capacity as usize);
+            for group in groups.into_iter().take(capacity as usize) {
+                let object = unsafe { crate::abi::pon_const_int(i64::from(group)) };
+                if object.is_null() {
+                    return std::ptr::null_mut();
+                }
+                objects.push(object);
+            }
+            return unsafe { crate::abi::seq::pon_build_list(objects.as_mut_ptr(), objects.len()) };
+        }
+        if capacity <= ngroups {
+            return raise_errno(last_errno(), None);
+        }
+        ngroups = capacity;
+    }
+}
+
+unsafe extern "C" fn os_setgroups(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return crate::abi::return_null_with_error("os.setgroups expected one argument");
+    }
+    let values = match super::builtins_batch::collect_iterable(args[0]) {
+        Ok(values) => values,
+        Err(message) => return crate::abi::return_null_with_error(message),
+    };
+    let mut groups = Vec::with_capacity(values.len());
+    for value in values {
+        let group = match int_arg(value, "setgroups group") {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        groups.push(group as libc::gid_t);
+    }
+    if unsafe { libc::setgroups(groups.len() as libc::c_int, groups.as_ptr()) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+unsafe extern "C" fn os_wcoredump(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    match status_arg(argv, argc, "WCOREDUMP") {
+        Ok(status) => bool_object((status & 0x80) != 0),
+        Err(error) => error,
+    }
+}
+
+unsafe extern "C" fn os_sysconf(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let name = match single_int_arg(argv, argc, "sysconf") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    sysconf_result(unsafe { libc::sysconf(name as libc::c_int) })
+}
+
+unsafe extern "C" fn os_confstr(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let name = match single_int_arg(argv, argc, "confstr") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    clear_errno();
+    let size = unsafe { libc::confstr(name as libc::c_int, std::ptr::null_mut(), 0) };
+    let errno = current_errno();
+    if size == 0 && errno != 0 {
+        return raise_errno(errno, None);
+    }
+    let mut buffer = vec![0u8; size.max(1)];
+    let written = unsafe { libc::confstr(name as libc::c_int, buffer.as_mut_ptr().cast(), buffer.len()) };
+    let errno = current_errno();
+    if written == 0 && errno != 0 {
+        return raise_errno(errno, None);
+    }
+    let slice = if written == 0 { &[][..] } else { &buffer[..written.saturating_sub(1)] };
+    match std::str::from_utf8(slice) {
+        Ok(text) => unsafe { pon_const_str(text.as_ptr(), text.len()) },
+        Err(_) => crate::abi::exc::raise_kind_error_text(ExceptionKind::UnicodeDecodeError, "confstr result is not valid UTF-8"),
+    }
+}
+
+unsafe extern "C" fn os_pathconf(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.pathconf expected two arguments");
+    }
+    let path = match path_arg(args[0], "pathconf") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let name = match int_arg(args[1], "pathconf name") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let c_path = match c_path(&path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    clear_errno();
+    let value = unsafe { libc::pathconf(c_path.as_ptr(), name as libc::c_int) };
+    sysconf_result(value)
+}
+
+unsafe extern "C" fn os_fpathconf(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.fpathconf expected two arguments");
+    }
+    let fd = match int_arg(args[0], "fpathconf fd") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let name = match int_arg(args[1], "fpathconf name") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    clear_errno();
+    let value = unsafe { libc::fpathconf(fd as libc::c_int, name as libc::c_int) };
+    sysconf_result(value)
+}
+
+fn sysconf_result(value: libc::c_long) -> *mut PyObject {
+    if value == -1 && current_errno() != 0 {
+        return raise_errno(current_errno(), None);
+    }
+    unsafe { crate::abi::pon_const_int(value as i64) }
+}
+
+fn clear_errno() {
+    unsafe { *libc::__error() = 0 };
+}
+
+fn current_errno() -> i32 {
+    unsafe { *libc::__error() }
+}
+
+unsafe extern "C" fn os_device_encoding(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let fd = match one_fd_arg(argv, argc, "device_encoding") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    if unsafe { libc::isatty(fd) } == 0 {
+        return unsafe { crate::abi::pon_none() };
+    }
+    let ptr = unsafe { libc::nl_langinfo(libc::CODESET) };
+    if ptr.is_null() {
+        return unsafe { crate::abi::pon_none() };
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy();
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+unsafe extern "C" fn os_get_terminal_size(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() > 1 {
+        return crate::abi::return_null_with_error("os.get_terminal_size expected at most one argument");
+    }
+    let fd = if let Some(arg) = args.first() {
+        match int_arg(*arg, "get_terminal_size fd") {
+            Ok(value) => value as libc::c_int,
+            Err(error) => return error,
+        }
+    } else {
+        libc::STDOUT_FILENO
+    };
+    let mut size = std::mem::MaybeUninit::<libc::winsize>::zeroed();
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, size.as_mut_ptr()) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    let size = unsafe { size.assume_init() };
+    terminal_size_object(size.ws_col as i64, size.ws_row as i64)
+}
+
+fn terminal_size_object(columns: i64, lines: i64) -> *mut PyObject {
+    let class = match terminal_size_class() {
+        Ok(class) => class,
+        Err(message) => return crate::abi::return_null_with_error(message),
+    };
+    let mut items = [unsafe { crate::abi::pon_const_int(columns) }, unsafe { crate::abi::pon_const_int(lines) }];
+    if items.iter().any(|item| item.is_null()) {
+        return std::ptr::null_mut();
+    }
+    let tuple = unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) };
+    if tuple.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut argv = [tuple];
+    unsafe { crate::abi::pon_call(class, argv.as_mut_ptr(), argv.len()) }
+}
+
+unsafe extern "C" fn os_lockf(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 3 {
+        return crate::abi::return_null_with_error("os.lockf expected three arguments");
+    }
+    let fd = match int_arg(args[0], "lockf fd") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let cmd = match int_arg(args[1], "lockf cmd") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let len = match int_arg(args[2], "lockf len") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if unsafe { libc::lockf(fd as libc::c_int, cmd as libc::c_int, len as libc::off_t) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_login_tty(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let fd = match one_fd_arg(argv, argc, "login_tty") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    if unsafe { libc::login_tty(fd) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn os_mknod(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.is_empty() || args.len() > 4 {
+        return crate::abi::return_null_with_error("os.mknod expected path with optional mode and device");
+    }
+    let path = match path_arg(args[0], "mknod") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let mode = match optional_arg(args, 1).map(|object| int_arg(object, "mknod mode")) {
+        None => 0o600,
+        Some(Ok(value)) => value,
+        Some(Err(error)) => return error,
+    };
+    let device = match optional_arg(args, 2).map(|object| int_arg(object, "mknod device")) {
+        None => 0,
+        Some(Ok(value)) => value,
+        Some(Err(error)) => return error,
+    };
+    if let Err(error) = reject_dir_fd(args, 3, "mknod") {
+        return error;
+    }
+    let c_path = match c_path(&path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    if unsafe { libc::mknodat(libc::AT_FDCWD, c_path.as_ptr(), mode as libc::mode_t, device as libc::dev_t) } < 0 {
+        return raise_errno(last_errno(), Some(&path));
+    }
+    unsafe { crate::abi::pon_none() }
 }
 
 /// Borrows the argv slots as a slice; NULL argv reads as empty.
@@ -3620,4 +5513,46 @@ unsafe extern "C" fn os_getenv(argv: *mut *mut PyObject, argc: usize) -> *mut Py
     let mut call_argv = [key, default];
     // SAFETY: Live bound method and two live argument slots.
     unsafe { crate::abi::pon_call(get, call_argv.as_mut_ptr(), call_argv.len()) }
+}
+unsafe extern "C" fn os_getenvb(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    if argc == 0 || argv.is_null() {
+        let message = "getenvb() missing 1 required positional argument: 'key'";
+        return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    if argc > 2 {
+        let message = format!("getenvb() takes from 1 to 2 positional arguments but {argc} were given");
+        return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    }
+    let key = unsafe { *argv };
+    let raw_key = crate::tag::untag_arg(key);
+    if raw_key.is_null() {
+        return std::ptr::null_mut();
+    }
+    let key_bytes = match bytes_payload(raw_key) {
+        Some(bytes) => bytes,
+        None => {
+            let display = if crate::tag::is_small_int(raw_key) {
+                "int"
+            } else {
+                unsafe { crate::types::dict::type_name(raw_key) }.unwrap_or("object")
+            };
+            let message = format!("bytes expected, not {display}");
+            return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+        }
+    };
+    let default = if argc == 2 {
+        unsafe { *argv.add(1) }
+    } else {
+        unsafe { crate::abi::pon_none() }
+    };
+    let key_os = std::ffi::OsStr::from_bytes(key_bytes);
+    match std::env::var_os(key_os) {
+        Some(value) => {
+            let bytes = value.into_vec();
+            unsafe { crate::abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) }
+        }
+        None => default,
+    }
 }

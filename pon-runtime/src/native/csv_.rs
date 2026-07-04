@@ -34,6 +34,7 @@ const QUOTE_NOTNULL: i64 = 5;
 const DEFAULT_FIELD_SIZE_LIMIT: i64 = 131_072;
 static FIELD_SIZE_LIMIT: AtomicI64 = AtomicI64::new(DEFAULT_FIELD_SIZE_LIMIT);
 static DIALECTS: LazyLock<Mutex<BTreeMap<String, DialectConfig>>> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+static DIALECTS_DICT: Mutex<usize> = Mutex::new(0);
 
 #[derive(Clone, Debug)]
 struct DialectConfig {
@@ -97,6 +98,9 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         string_attr("__version__", "1.0")?,
         (intern("Error"), csv_error_type().cast::<PyObject>()),
         (intern("Dialect"), dialect_type().cast::<PyObject>()),
+        (intern("Reader"), reader_type().cast::<PyObject>()),
+        (intern("Writer"), writer_type().cast::<PyObject>()),
+        (intern("_dialects"), dialects_dict()),
     ];
 
     for &(const_name, value) in &[
@@ -479,19 +483,64 @@ fn registry_get(name: &str) -> Option<DialectConfig> {
         .cloned()
 }
 
+fn dialects_dict() -> *mut PyObject {
+    let mut slot = DIALECTS_DICT.lock().unwrap_or_else(|poison| poison.into_inner());
+    if *slot == 0 {
+        // SAFETY: A NULL pointer with zero pairs is the empty-dict builder contract.
+        let object = unsafe { abi::map::pon_build_map(ptr::null_mut(), 0) };
+        if object.is_null() {
+            return object;
+        }
+        *slot = object as usize;
+    }
+    *slot as *mut PyObject
+}
+
+fn dialects_dict_insert(name: &str, config: &DialectConfig) {
+    let dict = dialects_dict();
+    if dict.is_null() {
+        return;
+    }
+    let key = alloc_str_object(name);
+    let value = alloc_dialect(config.clone());
+    if key.is_null() || value.is_null() {
+        return;
+    }
+    let _guard = crate::sync::begin_critical_section(dict);
+    let _ = unsafe { crate::types::dict::dict_insert(dict, key, value) };
+}
+
+fn dialects_dict_remove(name: &str) {
+    let dict = dialects_dict();
+    if dict.is_null() {
+        return;
+    }
+    let key = alloc_str_object(name);
+    if key.is_null() {
+        return;
+    }
+    let _guard = crate::sync::begin_critical_section(dict);
+    let _ = unsafe { crate::types::dict::dict_remove(dict, key) };
+}
+
 fn registry_insert(name: String, config: DialectConfig) {
     DIALECTS
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
-        .insert(name, config);
+        .insert(name.clone(), config.clone());
+    dialects_dict_insert(&name, &config);
 }
 
 fn registry_remove(name: &str) -> bool {
-    DIALECTS
+    let removed = DIALECTS
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .remove(name)
-        .is_some()
+        .is_some();
+    if removed {
+        dialects_dict_remove(name);
+    }
+    removed
 }
 
 // ---------------------------------------------------------------------------

@@ -85,6 +85,10 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
             "version",
             &format!("{VERSION_INFO_MAJOR}.{VERSION_INFO_MINOR}.{VERSION_INFO_MICRO} (pon, Jan  1 2026, 00:00:00) [pon]"),
         ),
+        string_attr(
+            "copyright",
+            "Copyright (c) 2001 Python Software Foundation.\nAll Rights Reserved.\n\nCopyright (c) 2000 BeOpen.com.\nAll Rights Reserved.\n\nCopyright (c) 1995-2001 Corporation for National Research Initiatives.\nAll Rights Reserved.\n\nCopyright (c) 1991-1995 Stichting Mathematisch Centrum, Amsterdam.\nAll Rights Reserved.",
+        ),
         version_info_attr(),
         implementation_attr(),
         int_attr("hexversion", HEXVERSION),

@@ -25,10 +25,13 @@ use super::install_module;
 const BLAKE2_ARG_SLOTS: usize = 13;
 const BLAKE2B_MAX_DIGEST_SIZE: usize = 64;
 const BLAKE2S_MAX_DIGEST_SIZE: usize = 32;
+const BLAKE2B_MAX_KEY_SIZE: usize = 64;
+const BLAKE2S_MAX_KEY_SIZE: usize = 32;
 const BLAKE2B_BLOCK_SIZE: usize = 128;
 const BLAKE2S_BLOCK_SIZE: usize = 64;
 const BLAKE2B_PERSON_SIZE: usize = 16;
 const BLAKE2S_PERSON_SIZE: usize = 8;
+const HASHLIB_GIL_MINSIZE: i64 = 2048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HashKind {
@@ -731,6 +734,14 @@ fn constructor_entry(kind: HashKind) -> unsafe extern "C" fn(*mut *mut PyObject,
     }
 }
 
+fn int_attr(name: &str, value: i64) -> Result<(u32, *mut PyObject), String> {
+    let object = unsafe { abi::pon_const_int(value) };
+    if object.is_null() {
+        return Err(format!("failed to allocate hash module {name}"));
+    }
+    Ok((intern(name), object))
+}
+
 fn module_constructor(kind: HashKind) -> Result<*mut PyObject, String> {
     let name = kind.constructor_name();
     // SAFETY: Live builtin entry point with the runtime calling convention.
@@ -750,6 +761,26 @@ fn make_hash_module(name: &str, kinds: &[HashKind]) -> Result<*mut PyObject, Str
     let mut attrs = vec![(intern("__name__"), name_object)];
     for &kind in kinds {
         attrs.push((intern(kind.constructor_name()), module_constructor(kind)?));
+    }
+    attrs.push(int_attr("_GIL_MINSIZE", HASHLIB_GIL_MINSIZE)?);
+    match name {
+        "_md5" => attrs.push((intern("MD5Type"), hash_type(HashKind::Md5).cast::<PyObject>())),
+        "_sha1" => attrs.push((intern("SHA1Type"), hash_type(HashKind::Sha1).cast::<PyObject>())),
+        "_blake2" => {
+            for &(const_name, value) in &[
+                ("BLAKE2B_MAX_DIGEST_SIZE", BLAKE2B_MAX_DIGEST_SIZE as i64),
+                ("BLAKE2B_MAX_KEY_SIZE", BLAKE2B_MAX_KEY_SIZE as i64),
+                ("BLAKE2B_PERSON_SIZE", BLAKE2B_PERSON_SIZE as i64),
+                ("BLAKE2B_SALT_SIZE", BLAKE2B_PERSON_SIZE as i64),
+                ("BLAKE2S_MAX_DIGEST_SIZE", BLAKE2S_MAX_DIGEST_SIZE as i64),
+                ("BLAKE2S_MAX_KEY_SIZE", BLAKE2S_MAX_KEY_SIZE as i64),
+                ("BLAKE2S_PERSON_SIZE", BLAKE2S_PERSON_SIZE as i64),
+                ("BLAKE2S_SALT_SIZE", BLAKE2S_PERSON_SIZE as i64),
+            ] {
+                attrs.push(int_attr(const_name, value)?);
+            }
+        }
+        _ => {}
     }
     install_module(name, attrs)
 }

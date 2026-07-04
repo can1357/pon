@@ -37,6 +37,46 @@ const POLL_EVENTS: &[(&str, i16)] = &[
     ("POLLWRNORM", libc::POLLWRNORM),
 ];
 
+#[cfg(target_os = "macos")]
+const KQUEUE_CONSTANTS: &[(&str, i64)] = &[
+    ("KQ_EV_ADD", 1),
+    ("KQ_EV_CLEAR", 32),
+    ("KQ_EV_DELETE", 2),
+    ("KQ_EV_DISABLE", 8),
+    ("KQ_EV_ENABLE", 4),
+    ("KQ_EV_EOF", 32768),
+    ("KQ_EV_ERROR", 16384),
+    ("KQ_EV_FLAG1", 8192),
+    ("KQ_EV_ONESHOT", 16),
+    ("KQ_EV_SYSFLAGS", 61440),
+    ("KQ_FILTER_AIO", -3),
+    ("KQ_FILTER_PROC", -5),
+    ("KQ_FILTER_READ", -1),
+    ("KQ_FILTER_SIGNAL", -6),
+    ("KQ_FILTER_TIMER", -7),
+    ("KQ_FILTER_VNODE", -4),
+    ("KQ_FILTER_WRITE", -2),
+    ("KQ_NOTE_ATTRIB", 8),
+    ("KQ_NOTE_CHILD", 4),
+    ("KQ_NOTE_DELETE", 1),
+    ("KQ_NOTE_EXEC", 536870912),
+    ("KQ_NOTE_EXIT", 2147483648),
+    ("KQ_NOTE_EXTEND", 4),
+    ("KQ_NOTE_FORK", 1073741824),
+    ("KQ_NOTE_LINK", 16),
+    ("KQ_NOTE_LOWAT", 1),
+    ("KQ_NOTE_PCTRLMASK", -1048576),
+    ("KQ_NOTE_PDATAMASK", 1048575),
+    ("KQ_NOTE_RENAME", 32),
+    ("KQ_NOTE_REVOKE", 64),
+    ("KQ_NOTE_TRACK", 1),
+    ("KQ_NOTE_TRACKERR", 2),
+    ("KQ_NOTE_WRITE", 2),
+];
+
+#[cfg(not(target_os = "macos"))]
+const KQUEUE_CONSTANTS: &[(&str, i64)] = &[];
+
 #[derive(Clone, Copy, Debug)]
 struct PollEntry {
     fd: libc::c_int,
@@ -64,6 +104,55 @@ fn poll_type() -> *mut PyType {
     *POLL_TYPE as *mut PyType
 }
 
+#[repr(C)]
+#[derive(Debug)]
+struct PyKqueue {
+    ob_base: PyObjectHeader,
+    fd: libc::c_int,
+    closed: bool,
+}
+
+#[repr(C)]
+#[derive(Debug)]
+struct PyKevent {
+    ob_base: PyObjectHeader,
+    ident: usize,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    data: isize,
+    udata: usize,
+}
+
+static KQUEUE_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let mut ty = PyType::new(
+        crate::abi::runtime_type_type().cast_const(),
+        "select.kqueue",
+        std::mem::size_of::<PyKqueue>(),
+    );
+    ty.tp_getattro = Some(kqueue_getattro);
+    Box::into_raw(Box::new(ty)) as usize
+});
+
+static KEVENT_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let mut ty = PyType::new(
+        crate::abi::runtime_type_type().cast_const(),
+        "select.kevent",
+        std::mem::size_of::<PyKevent>(),
+    );
+    ty.tp_getattro = Some(kevent_getattro);
+    ty.tp_repr = Some(kevent_repr);
+    Box::into_raw(Box::new(ty)) as usize
+});
+
+fn kqueue_type() -> *mut PyType {
+    *KQUEUE_TYPE as *mut PyType
+}
+
+fn kevent_type() -> *mut PyType {
+    *KEVENT_TYPE as *mut PyType
+}
+
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
     let name = "select";
     // SAFETY: Runtime allocation helper; NULL is checked below.
@@ -74,6 +163,9 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
     let mut attrs = vec![(intern("__name__"), name_obj)];
     for &(const_name, value) in POLL_EVENTS {
         attrs.push(int_attr(const_name, i64::from(value))?);
+    }
+    for &(const_name, value) in KQUEUE_CONSTANTS {
+        attrs.push(int_attr(const_name, value)?);
     }
     attrs.push(int_attr("PIPE_BUF", libc::PIPE_BUF as i64)?);
     // `select.error` has been an alias of the builtin OSError since 3.3;
@@ -86,6 +178,11 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
     attrs.push((intern("error"), error));
     attrs.push(function_attr("select", select_select)?);
     attrs.push(function_attr("poll", select_poll)?);
+    #[cfg(target_os = "macos")]
+    {
+        attrs.push(function_attr("kqueue", select_kqueue)?);
+        attrs.push(function_attr("kevent", select_kevent)?);
+    }
     install_module(name, attrs)
 }
 
@@ -515,6 +612,323 @@ fn is_none(object: *mut PyObject) -> bool {
 
 fn none() -> *mut PyObject {
     unsafe { crate::abi::pon_none() }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn select_kqueue(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return raise_type_error("select.kqueue() takes no arguments");
+    }
+    let fd = unsafe { libc::kqueue() };
+    if fd < 0 {
+        return raise_errno(last_errno());
+    }
+    Box::into_raw(Box::new(PyKqueue {
+        ob_base: PyObjectHeader::new(kqueue_type()),
+        fd,
+        closed: false,
+    }))
+    .cast::<PyObject>()
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn select_kevent(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { arg_slice(argv, argc) } {
+        Some(args) if (1..=6).contains(&args.len()) => args,
+        _ => return raise_type_error(&format!("kevent expected 1 to 6 arguments, got {argc}")),
+    };
+    let ident = match int_arg(args[0], "ident").and_then(|value| {
+        usize::try_from(value).map_err(|_| raise_value_error("ident is out of range"))
+    }) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let filter = match args.get(1).copied() {
+        Some(object) => match i16_arg(object, "filter") {
+            Ok(value) => value,
+            Err(error) => return error,
+        },
+        None => libc::EVFILT_READ,
+    };
+    let flags = match args.get(2).copied() {
+        Some(object) => match u16_arg(object, "flags") {
+            Ok(value) => value,
+            Err(error) => return error,
+        },
+        None => libc::EV_ADD as u16,
+    };
+    let fflags = match args.get(3).copied() {
+        Some(object) => match u32_arg(object, "fflags") {
+            Ok(value) => value,
+            Err(error) => return error,
+        },
+        None => 0,
+    };
+    let data = match args.get(4).copied() {
+        Some(object) => match isize_arg(object, "data") {
+            Ok(value) => value,
+            Err(error) => return error,
+        },
+        None => 0,
+    };
+    let udata = match args.get(5).copied() {
+        Some(object) => match int_arg(object, "udata").and_then(|value| {
+            usize::try_from(value).map_err(|_| raise_value_error("udata is out of range"))
+        }) {
+            Ok(value) => value,
+            Err(error) => return error,
+        },
+        None => 0,
+    };
+    kevent_object(ident, filter, flags, fflags, data, udata)
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn kqueue_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(crate::tag::untag_arg(name)) }) else {
+        return raise_type_error("attribute name must be str");
+    };
+    match name_text {
+        "close" => bound_method(object, name_text, kqueue_close_method),
+        "fileno" => bound_method(object, name_text, kqueue_fileno_method),
+        "control" => bound_method(object, name_text, kqueue_control_method),
+        _ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn kqueue_close_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (queue, _) = match unsafe { kqueue_receiver(argv, argc, "close", 0) } {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if !queue.closed {
+        unsafe { libc::close(queue.fd) };
+        queue.closed = true;
+        queue.fd = -1;
+    }
+    none()
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn kqueue_fileno_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (queue, _) = match unsafe { kqueue_receiver(argv, argc, "fileno", 0) } {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    unsafe { pon_const_int(i64::from(queue.fd)) }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn kqueue_control_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (queue, args) = match unsafe { kqueue_receiver(argv, argc, "control", 3) } {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if args.len() < 2 {
+        return raise_type_error("control() requires changelist and max_events");
+    }
+    let changes = match kevent_list_arg(args[0]) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let max_events = match int_arg(args[1], "max_events").and_then(|value| {
+        libc::c_int::try_from(value).map_err(|_| raise_value_error("max_events is out of range"))
+    }) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if max_events < 0 {
+        return raise_value_error("max_events must be positive");
+    }
+    let timeout = match args.get(2).copied() {
+        Some(object) => match timeout_timespec(object) {
+            Ok(value) => value,
+            Err(error) => return error,
+        },
+        None => None,
+    };
+    let mut events = vec![unsafe { std::mem::zeroed::<libc::kevent>() }; max_events as usize];
+    let timeout_ptr = timeout.as_ref().map_or(ptr::null(), |value| value as *const libc::timespec);
+    let result = unsafe {
+        libc::kevent(
+            queue.fd,
+            if changes.is_empty() { ptr::null() } else { changes.as_ptr() },
+            changes.len() as libc::c_int,
+            if events.is_empty() { ptr::null_mut() } else { events.as_mut_ptr() },
+            max_events,
+            timeout_ptr,
+        )
+    };
+    if result < 0 {
+        return raise_errno(last_errno());
+    }
+    let mut objects = Vec::with_capacity(result as usize);
+    for event in events.into_iter().take(result as usize) {
+        let object = kevent_object(event.ident as usize, event.filter, event.flags, event.fflags, event.data, event.udata as usize);
+        if object.is_null() {
+            return ptr::null_mut();
+        }
+        objects.push(object);
+    }
+    unsafe { crate::abi::seq::pon_build_list(if objects.is_empty() { ptr::null_mut() } else { objects.as_mut_ptr() }, objects.len()) }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn kevent_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(crate::tag::untag_arg(name)) }) else {
+        return raise_type_error("attribute name must be str");
+    };
+    let event = unsafe { &*object.cast::<PyKevent>() };
+    match name_text {
+        "ident" => unsafe { pon_const_int(event.ident as i64) },
+        "filter" => unsafe { pon_const_int(i64::from(event.filter)) },
+        "flags" => unsafe { pon_const_int(i64::from(event.flags)) },
+        "fflags" => unsafe { pon_const_int(i64::from(event.fflags)) },
+        "data" => unsafe { pon_const_int(event.data as i64) },
+        "udata" => unsafe { pon_const_int(event.udata as i64) },
+        _ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
+    }
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn kevent_repr(object: *mut PyObject) -> *mut PyObject {
+    let event = unsafe { &*object.cast::<PyKevent>() };
+    let text = format!(
+        "select.kevent(ident={}, filter={}, flags={}, fflags={}, data={}, udata={})",
+        event.ident, event.filter, event.flags, event.fflags, event.data, event.udata
+    );
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn kqueue_receiver<'a>(
+    argv: *mut *mut PyObject,
+    argc: usize,
+    function: &str,
+    max_extra: usize,
+) -> Result<(&'a mut PyKqueue, &'a [*mut PyObject]), *mut PyObject> {
+    let args = unsafe { arg_slice(argv, argc) }.ok_or_else(|| raise_type_error("invalid argument vector"))?;
+    if args.is_empty() || args.len() > max_extra + 1 {
+        return Err(raise_type_error(&format!("{function} expected at most {max_extra} arguments")));
+    }
+    let object = crate::tag::untag_arg(args[0]);
+    if object.is_null() || unsafe { (*object).ob_type } != kqueue_type().cast_const() {
+        return Err(raise_type_error("kqueue method called with invalid receiver"));
+    }
+    let queue = unsafe { &mut *object.cast::<PyKqueue>() };
+    if queue.closed {
+        return Err(raise_value_error("I/O operation on closed kqueue object"));
+    }
+    Ok((queue, &args[1..]))
+}
+
+#[cfg(target_os = "macos")]
+fn kevent_list_arg(object: *mut PyObject) -> Result<Vec<libc::kevent>, *mut PyObject> {
+    if is_none(object) {
+        return Ok(Vec::new());
+    }
+    let items = object_sequence(object, "changelist")?;
+    items
+        .iter()
+        .copied()
+        .map(|item| {
+            let item = crate::tag::untag_arg(item);
+            if item.is_null() || unsafe { (*item).ob_type } != kevent_type().cast_const() {
+                return Err(raise_type_error("changelist must contain select.kevent objects"));
+            }
+            let event = unsafe { &*item.cast::<PyKevent>() };
+            Ok(raw_kevent(event.ident, event.filter, event.flags, event.fflags, event.data, event.udata))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn object_sequence(object: *mut PyObject, what: &str) -> Result<Vec<*mut PyObject>, *mut PyObject> {
+    let raw = crate::tag::untag_arg(object);
+    if raw.is_null() || crate::tag::is_small_int(raw) {
+        return Err(raise_type_error(&format!("{what} must be a list or tuple")));
+    }
+    match unsafe { crate::types::dict::type_name(raw) } {
+        Some("list") => Ok(unsafe { (*raw.cast::<crate::types::list::PyList>()).as_slice() }.to_vec()),
+        Some("tuple") => Ok(unsafe { (*raw.cast::<crate::types::tuple::PyTuple>()).as_slice() }.to_vec()),
+        _ => Err(raise_type_error(&format!("{what} must be a list or tuple"))),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn raw_kevent(ident: usize, filter: i16, flags: u16, fflags: u32, data: isize, udata: usize) -> libc::kevent {
+    libc::kevent {
+        ident: ident as libc::uintptr_t,
+        filter,
+        flags,
+        fflags,
+        data: data as libc::intptr_t,
+        udata: udata as *mut libc::c_void,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn kevent_object(ident: usize, filter: i16, flags: u16, fflags: u32, data: isize, udata: usize) -> *mut PyObject {
+    Box::into_raw(Box::new(PyKevent {
+        ob_base: PyObjectHeader::new(kevent_type()),
+        ident,
+        filter,
+        flags,
+        fflags,
+        data,
+        udata,
+    }))
+    .cast::<PyObject>()
+}
+
+#[cfg(target_os = "macos")]
+fn timeout_timespec(object: *mut PyObject) -> Result<Option<libc::timespec>, *mut PyObject> {
+    if is_none(object) {
+        return Ok(None);
+    }
+    let value = number_to_f64(object).ok_or_else(|| raise_type_error("timeout must be a number or None"))?;
+    if !value.is_finite() {
+        return Err(raise_value_error("timeout must be finite"));
+    }
+    if value < 0.0 {
+        return Err(raise_value_error("timeout must be non-negative"));
+    }
+    let seconds = value.floor();
+    let mut nsec = ((value - seconds) * 1_000_000_000.0).ceil() as i64;
+    let mut sec = seconds as i64;
+    if nsec >= 1_000_000_000 {
+        sec += 1;
+        nsec -= 1_000_000_000;
+    }
+    Ok(Some(libc::timespec {
+        tv_sec: sec as libc::time_t,
+        tv_nsec: nsec as libc::c_long,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn i16_arg(object: *mut PyObject, what: &str) -> Result<i16, *mut PyObject> {
+    let value = int_arg(object, what)?;
+    i16::try_from(value).map_err(|_| raise_value_error(&format!("{what} is out of range")))
+}
+
+#[cfg(target_os = "macos")]
+fn u16_arg(object: *mut PyObject, what: &str) -> Result<u16, *mut PyObject> {
+    let value = int_arg(object, what)?;
+    u16::try_from(value).map_err(|_| raise_value_error(&format!("{what} is out of range")))
+}
+
+#[cfg(target_os = "macos")]
+fn u32_arg(object: *mut PyObject, what: &str) -> Result<u32, *mut PyObject> {
+    let value = int_arg(object, what)?;
+    u32::try_from(value).map_err(|_| raise_value_error(&format!("{what} is out of range")))
+}
+
+#[cfg(target_os = "macos")]
+fn isize_arg(object: *mut PyObject, what: &str) -> Result<isize, *mut PyObject> {
+    let value = int_arg(object, what)?;
+    isize::try_from(value).map_err(|_| raise_value_error(&format!("{what} is out of range")))
 }
 
 fn raise_errno(errno: i32) -> *mut PyObject {

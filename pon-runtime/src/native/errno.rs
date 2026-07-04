@@ -106,6 +106,32 @@ const CONSTANTS: &[(&str, i32)] = &[
     ("ENOTRECOVERABLE", libc::ENOTRECOVERABLE),
 ];
 
+#[cfg(target_os = "macos")]
+const OS_CONSTANTS: &[(&str, i32)] = &[
+    ("EAUTH", 80),
+    ("EBADARCH", 86),
+    ("EBADEXEC", 85),
+    ("EBADMACHO", 88),
+    ("EBADRPC", 72),
+    ("EDEVERR", 83),
+    ("EFTYPE", 79),
+    ("ENEEDAUTH", 81),
+    ("ENOATTR", 93),
+    ("ENOPOLICY", 103),
+    ("ENOTCAPABLE", 107),
+    ("EPROCLIM", 67),
+    ("EPROCUNAVAIL", 76),
+    ("EPROGMISMATCH", 75),
+    ("EPROGUNAVAIL", 74),
+    ("EPWROFF", 82),
+    ("EQFULL", 106),
+    ("ERPCMISMATCH", 73),
+    ("ESHLIBVERS", 87),
+];
+
+#[cfg(not(target_os = "macos"))]
+const OS_CONSTANTS: &[(&str, i32)] = &[];
+
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
     let name = "errno";
     // SAFETY: runtime allocation helper; NULL is checked below.
@@ -114,8 +140,8 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         return Err("failed to allocate errno.__name__".to_owned());
     }
     let mut attrs = vec![(intern("__name__"), name_obj)];
-    let mut pairs: Vec<*mut PyObject> = Vec::with_capacity(CONSTANTS.len() * 2);
-    for &(const_name, value) in CONSTANTS {
+    let mut pairs: Vec<*mut PyObject> = Vec::with_capacity((CONSTANTS.len() + OS_CONSTANTS.len()) * 2);
+    for &(const_name, value) in CONSTANTS.iter().chain(OS_CONSTANTS) {
         // SAFETY: integer boxing helper; NULL is checked below.
         let boxed = unsafe { crate::abi::pon_const_int(i64::from(value)) };
         if boxed.is_null() {
@@ -130,8 +156,8 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         pairs.push(boxed);
         pairs.push(name_str);
     }
-    // SAFETY: `pairs` holds `CONSTANTS.len()` live key/value pairs.
-    let errorcode = unsafe { crate::abi::map::pon_build_map(pairs.as_mut_ptr(), CONSTANTS.len()) };
+    // SAFETY: `pairs` holds `CONSTANTS.len() + OS_CONSTANTS.len()` live key/value pairs.
+    let errorcode = unsafe { crate::abi::map::pon_build_map(pairs.as_mut_ptr(), CONSTANTS.len() + OS_CONSTANTS.len()) };
     if errorcode.is_null() {
         return Err("failed to allocate errno.errorcode".to_owned());
     }

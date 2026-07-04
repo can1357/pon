@@ -177,7 +177,7 @@ fn build_time_vars() -> Vec<(&'static str, VarValue)> {
     vars
 }
 
-pub(super) fn make_module() -> Result<*mut PyObject, String> {
+fn build_time_vars_dict() -> Result<*mut PyObject, String> {
     let vars = build_time_vars();
     let mut pairs: Vec<*mut PyObject> = Vec::with_capacity(vars.len() * 2);
     for (key, value) in &vars {
@@ -203,7 +203,45 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
     if build_time_vars.is_null() {
         return Err("failed to allocate build_time_vars dict".to_owned());
     }
-    install_module(MODULE_NAME, [(intern("build_time_vars"), build_time_vars)])
+    Ok(build_time_vars)
+}
+
+pub(super) fn make_module() -> Result<*mut PyObject, String> {
+    install_module(MODULE_NAME, [(intern("build_time_vars"), build_time_vars_dict()?)])
+}
+
+pub(super) fn make_sysconfig_module() -> Result<*mut PyObject, String> {
+    let function = unsafe { crate::abi::pon_make_function(config_vars_entry as *const u8, 0, intern("config_vars")) };
+    if function.is_null() {
+        return Err("failed to allocate _sysconfig.config_vars".to_owned());
+    }
+    install_module(
+        "_sysconfig",
+        [
+            (intern("__name__"), str_object("_sysconfig")?),
+            (intern("config_vars"), function),
+        ],
+    )
+}
+
+unsafe extern "C" fn config_vars_entry(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return crate::abi::exc::raise_kind_error_text(
+            crate::types::exc::ExceptionKind::TypeError,
+            "config_vars() takes no arguments",
+        );
+    }
+    match build_time_vars_dict() {
+        Ok(dict) => dict,
+        Err(message) => crate::abi::return_null_with_error(message),
+    }
+}
+
+fn str_object(text: &str) -> Result<*mut PyObject, String> {
+    let object = unsafe { crate::abi::pon_const_str(text.as_ptr(), text.len()) };
+    (!object.is_null())
+        .then_some(object)
+        .ok_or_else(|| format!("failed to allocate string {text:?}"))
 }
 
 #[cfg(test)]

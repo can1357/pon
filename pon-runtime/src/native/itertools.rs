@@ -48,10 +48,11 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         return Err("failed to allocate itertools.__name__".to_owned());
     }
     let mut attrs = vec![(intern("__name__"), name_object)];
-    let functions: [(&str, BuiltinFn); 18] = [
+    let functions: [(&str, BuiltinFn); 19] = [
         ("accumulate", itertools_accumulate),
         ("batched", itertools_batched),
         ("combinations", itertools_combinations),
+        ("combinations_with_replacement", itertools_combinations_with_replacement),
         ("compress", itertools_compress),
         ("count", itertools_count),
         ("cycle", itertools_cycle),
@@ -71,6 +72,9 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
     for (name, entry) in functions {
         attrs.push(function_attr(name, entry)?);
     }
+    attrs.push((intern("_grouper"), (*GROUPER_TYPE as *mut PyType).cast::<PyObject>()));
+    attrs.push((intern("_tee"), (*TEE_TYPE as *mut PyType).cast::<PyObject>()));
+    attrs.push((intern("_tee_dataobject"), (*TEE_DATAOBJECT_TYPE as *mut PyType).cast::<PyObject>()));
     attrs.push((intern("chain"), make_chain_callable()?));
     install_module("itertools", attrs)
 }
@@ -426,6 +430,14 @@ impl HeldRoots for PyItertoolsPermutations {
 }
 
 impl HeldRoots for PyItertoolsCombinations {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        for &item in &self.pool {
+            push(item);
+        }
+    }
+}
+
+impl HeldRoots for PyItertoolsCombinationsWithReplacement {
     unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
         for &item in &self.pool {
             push(item);
@@ -1254,6 +1266,87 @@ unsafe extern "C" fn combinations_next(object: *mut PyObject) -> *mut PyObject {
 }
 
 // ---------------------------------------------------------------------------
+// combinations_with_replacement(iterable, r)
+
+#[repr(C)]
+struct PyItertoolsCombinationsWithReplacement {
+    ob_base: PyObjectHeader,
+    pool: Vec<*mut PyObject>,
+    r: usize,
+    indices: Vec<usize>,
+    started: bool,
+    done: bool,
+}
+
+static COMBINATIONS_WITH_REPLACEMENT_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    iterator_type(
+        "combinations_with_replacement",
+        size_of::<PyItertoolsCombinationsWithReplacement>(),
+        combinations_with_replacement_next,
+    )
+});
+
+unsafe extern "C" fn itertools_combinations_with_replacement(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { arg_vec(argv, argc) }) else {
+        return raise_type_error("combinations_with_replacement received an invalid argument window");
+    };
+    if args.len() != 2 {
+        return raise_type_error(&format!(
+            "combinations_with_replacement expected 2 arguments, got {}",
+            args.len()
+        ));
+    }
+    let Ok(pool) = (unsafe { collect_iterable(args[0], "combinations_with_replacement") }) else {
+        return ptr::null_mut();
+    };
+    let Some(r) = to_i64(args[1]) else {
+        return raise_type_error("Expected int as r");
+    };
+    if r < 0 {
+        return raise_value_error("r must be non-negative");
+    }
+    let r = r as usize;
+    let done = pool.is_empty() && r > 0;
+    alloc_object(PyItertoolsCombinationsWithReplacement {
+        ob_base: PyObjectHeader::new(*COMBINATIONS_WITH_REPLACEMENT_TYPE as *const PyType),
+        indices: vec![0; r],
+        pool,
+        r,
+        started: false,
+        done,
+    })
+}
+
+unsafe extern "C" fn combinations_with_replacement_next(object: *mut PyObject) -> *mut PyObject {
+    let state = unsafe { &mut *object.cast::<PyItertoolsCombinationsWithReplacement>() };
+    if state.done {
+        return raise_stop_iteration();
+    }
+    let n = state.pool.len();
+    if !state.started {
+        state.started = true;
+    } else {
+        let mut slot = state.r;
+        loop {
+            if slot == 0 {
+                state.done = true;
+                return raise_stop_iteration();
+            }
+            slot -= 1;
+            if state.indices[slot] != n - 1 {
+                break;
+            }
+        }
+        let next = state.indices[slot] + 1;
+        for follow in slot..state.r {
+            state.indices[follow] = next;
+        }
+    }
+    let items = state.indices.iter().map(|&index| state.pool[index]).collect();
+    tuple_from(items)
+}
+
+// ---------------------------------------------------------------------------
 // accumulate(iterable, func=None, *, initial=None)
 
 #[repr(C)]
@@ -1861,6 +1954,14 @@ struct PyItertoolsTee {
 }
 
 static TEE_TYPE: LazyLock<usize> = LazyLock::new(|| iterator_type("_tee", size_of::<PyItertoolsTee>(), tee_next));
+static TEE_DATAOBJECT_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let ty = PyType::new(
+        abi::runtime_type_type().cast_const(),
+        "_tee_dataobject",
+        0,
+    );
+    Box::into_raw(Box::new(ty)) as usize
+});
 
 unsafe extern "C" fn itertools_tee(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let Some(args) = (unsafe { arg_vec(argv, argc) }) else {
