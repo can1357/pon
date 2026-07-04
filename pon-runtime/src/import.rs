@@ -61,6 +61,8 @@ struct ImportState {
     source_loader: Option<SourceModuleLoader>,
     module_type: *mut PyType,
     current_modules: Vec<u32>,
+    /// Original module object for each active module-execution frame.
+    current_module_objects: Vec<*mut PyObject>,
     /// Per-`current_modules` entry: the compiled-call stack depth captured at
     /// `begin_module_execution`.  Call-stack entries at or above this floor
     /// were pushed while the module body ran, so global loads/stores made by
@@ -91,6 +93,7 @@ impl ImportState {
             source_loader: None,
             module_type: Box::into_raw(ty),
             current_modules: Vec::new(),
+            current_module_objects: Vec::new(),
             current_module_floors: Vec::new(),
             modules_dict: ptr::null_mut(),
         }
@@ -118,6 +121,7 @@ pub fn reset_import_state_for_tests() {
         state.modules.clear();
         state.source_loader = None;
         state.current_modules.clear();
+        state.current_module_objects.clear();
         state.current_module_floors.clear();
         state.modules_dict = ptr::null_mut();
     }
@@ -274,13 +278,26 @@ pub unsafe extern "C" fn pon_import_from(module: *mut PyObject, name_interned: u
         return return_null_with_error("import-from receiver is not a module");
     };
     // SAFETY: `as_module` proved the layout.
-    let module_ref = unsafe { &mut *module_ptr };
-    if let Some(value) = module_ref.attrs.get(&name_interned).copied() {
+    let module_name = resolve(unsafe { (*module_ptr).name }).unwrap_or_else(|| format!("<module:{}>", unsafe {
+        (*module_ptr).name
+    }));
+    let attr = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
+    if let Some(value) = module_direct_attr(module_ptr, name_interned, &attr) {
         return value;
     }
+    if let Some(value) = call_module_getattr_hook(module_ptr, &attr) {
+        if !value.is_null() {
+            return value;
+        }
+        if crate::abi::exc::pending_exception_is("AttributeError") {
+            pon_err_clear();
+        } else {
+            return value;
+        }
+    }
 
-    let module_name = resolve(module_ref.name).unwrap_or_else(|| format!("<module:{}>", module_ref.name));
-    let attr = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
+    // SAFETY: `as_module` proved the layout.
+    let module_ref = unsafe { &*module_ptr };
     if module_is_package(module_ref) {
         let child_name = format!("{module_name}.{attr}");
         match import_module_by_name(&child_name) {
@@ -1475,10 +1492,11 @@ pub fn begin_module_execution(name: &str) -> Result<(), String> {
     // executing thread's compiled-call stack.
     let floor = crate::abi::current_function_stack_depth();
     let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
-    if !state.modules.contains_key(&name_id) {
+    let Some(&module_object) = state.modules.get(&name_id) else {
         return Err(format!("cannot execute uncached module '{name}'"));
-    }
+    };
     state.current_modules.push(name_id);
+    state.current_module_objects.push(module_object);
     state.current_module_floors.push(floor);
     // J0.3 GlobalIC site: context switch changes which attr overlay
     // `pon_load_global` consults.
@@ -1492,6 +1510,7 @@ pub fn end_module_execution(name: &str) {
     if state.current_modules.last().copied() == Some(name_id) {
         state.current_modules.pop();
         state.current_module_floors.pop();
+        state.current_module_objects.pop();
         // J0.3 GlobalIC site: context switch (see begin_module_execution).
         crate::abi::bump_namespace_version();
     }
@@ -1516,20 +1535,30 @@ pub fn active_module_call_floor() -> usize {
 /// never nested: `current_defining_module` briefly takes `IMPORT_STATE`
 /// itself (via `active_module_call_floor`).
 fn current_importer_package() -> Option<String> {
-    let module_id = crate::abi::current_defining_module().or_else(active_module_name_id)?;
-    let package = {
-        let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
-        let module = state.modules.get(&module_id).copied()?;
-        let module = module_from_object_locked(&state, module)?;
-        // SAFETY: The import state proved the object uses `PyModuleObject` layout.
-        unsafe { (&*module).attrs.get(&intern("__package__")).copied()? }
-    };
+    let module = crate::abi::current_defining_module_object().or_else(active_module_object)?;
+    let package = module_object_attr(module, intern("__package__"))?;
     unicode_text(package).map(str::to_owned)
 }
 
 pub fn active_module_name_id() -> Option<u32> {
     let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
     state.current_modules.last().copied()
+}
+
+/// Original module object for the innermost active module body.
+#[must_use]
+pub fn active_module_object() -> Option<*mut PyObject> {
+    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    state.current_module_objects.last().copied()
+}
+
+/// Interned name plus original module object for the active module body.
+#[must_use]
+pub fn active_module_context() -> Option<(u32, *mut PyObject)> {
+    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    let name = state.current_modules.last().copied()?;
+    let object = state.current_module_objects.last().copied()?;
+    Some((name, object))
 }
 
 pub fn module_attrs_snapshot(module_name: u32) -> Option<Vec<(u32, *mut PyObject)>> {
@@ -1619,11 +1648,8 @@ pub fn active_module_attrs_snapshot() -> Option<Vec<(u32, *mut PyObject)>> {
 }
 
 pub fn active_module_attr(name: u32) -> Option<*mut PyObject> {
-    let current = {
-        let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
-        state.current_modules.last().copied()?
-    };
-    module_attr(current, name)
+    let module = active_module_object()?;
+    module_object_attr(module, name)
 }
 
 /// Live attribute binding of one cached module, by interned module name.
@@ -1635,15 +1661,38 @@ pub fn module_attr(module_name: u32, name: u32) -> Option<*mut PyObject> {
     unsafe { (&*module).attrs.get(&name).copied() }
 }
 
+/// Registry key backing a module object's live namespace dictionary.
+#[must_use]
+pub fn module_object_registry_key(module_object: *mut PyObject) -> Option<u32> {
+    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    let module = module_from_object_locked(&state, module_object)?;
+    // SAFETY: The import state proved the object uses `PyModuleObject` layout.
+    Some(unsafe { (*module).registry_key })
+}
+
+/// Live attribute binding of one original module object.
+#[must_use]
+pub fn module_object_attr(module_object: *mut PyObject, name: u32) -> Option<*mut PyObject> {
+    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    let module = module_from_object_locked(&state, module_object)?;
+    // SAFETY: The import state proved the object uses `PyModuleObject` layout.
+    unsafe { (&*module).attrs.get(&name).copied() }
+}
+
+/// Snapshot all attribute values held by one original module object.
+#[must_use]
+pub fn module_object_attr_values(module_object: *mut PyObject) -> Option<Vec<*mut PyObject>> {
+    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    let module = module_from_object_locked(&state, module_object)?;
+    // SAFETY: The import state proved the object uses `PyModuleObject` layout.
+    Some(unsafe { (&*module).attrs.values().copied().collect() })
+}
+
 pub fn store_active_module_attr(name: u32, value: *mut PyObject) -> bool {
-    let current = {
-        let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
-        let Some(current) = state.current_modules.last().copied() else {
-            return false;
-        };
-        current
+    let Some(module) = active_module_object() else {
+        return false;
     };
-    store_module_attr(current, name, value)
+    store_module_object_attr(module, name, value)
 }
 
 /// Store one attribute binding into a cached module, by interned module name.
@@ -1664,15 +1713,26 @@ pub fn store_module_attr(module_name: u32, name: u32, value: *mut PyObject) -> b
     true
 }
 
-pub fn delete_active_module_attr(name: u32) -> bool {
-    let current = {
-        let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
-        let Some(current) = state.current_modules.last().copied() else {
-            return false;
-        };
-        current
+/// Store one attribute binding into an original module object.
+pub fn store_module_object_attr(module_object: *mut PyObject, name: u32, value: *mut PyObject) -> bool {
+    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    let Some(module) = module_from_object_locked(&state, module_object) else {
+        return false;
     };
-    delete_module_attr(current, name)
+    // SAFETY: The import state proved the object uses `PyModuleObject` layout.
+    unsafe {
+        (&mut *module).attrs.insert(name, value);
+    }
+    // J0.3 GlobalIC site: module attr overlay insert/replace.
+    crate::abi::bump_namespace_version();
+    true
+}
+
+pub fn delete_active_module_attr(name: u32) -> bool {
+    let Some(module) = active_module_object() else {
+        return false;
+    };
+    delete_module_object_attr(module, name)
 }
 
 /// Delete one attribute binding from a cached module, by interned module name.
@@ -1682,6 +1742,21 @@ pub fn delete_module_attr(module_name: u32, name: u32) -> bool {
         return false;
     };
     let Some(module) = module_from_object_locked(&state, module) else {
+        return false;
+    };
+    // SAFETY: The import state proved the object uses `PyModuleObject` layout.
+    let removed = unsafe { (&mut *module).attrs.remove(&name).is_some() };
+    if removed {
+        // J0.3 GlobalIC site: module attr overlay removal.
+        crate::abi::bump_namespace_version();
+    }
+    removed
+}
+
+/// Delete one attribute binding from an original module object.
+pub fn delete_module_object_attr(module_object: *mut PyObject, name: u32) -> bool {
+    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    let Some(module) = module_from_object_locked(&state, module_object) else {
         return false;
     };
     // SAFETY: The import state proved the object uses `PyModuleObject` layout.
@@ -1736,12 +1811,13 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        STDLIB_PATH_ENV_VAR, pon_import_from, pon_import_name, reset_import_state_for_tests, resolve_import_name,
-        runtime_string, sys_modules_dict,
+        STDLIB_PATH_ENV_VAR, install_module, pon_import_from, pon_import_name, reset_import_state_for_tests,
+        resolve_import_name, runtime_string, sys_modules_dict,
     };
     use crate::abi::pon_none;
     use crate::abi::{format_object_for_print, pon_runtime_init};
     use crate::intern::intern;
+    use crate::object::PyObject;
     use crate::thread_state::{pon_err_clear, pon_err_message, test_state_lock};
 
     static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
@@ -1803,6 +1879,119 @@ mod tests {
             reset_import_state_for_tests();
         }
     }
+
+    unsafe extern "C" fn pep562_lazy_getattr(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+        if argv.is_null() || argc != 1 {
+            return crate::abi::return_null_with_error("module __getattr__ expected one name argument");
+        }
+        let name = unsafe { *argv };
+        let value = match format_object_for_print(name).as_deref() {
+            Ok("lazy_attr") => "plain-lazy-value",
+            Ok("lazy_from") => "from-lazy-value",
+            _ => return unsafe { crate::abi::exc::pon_raise_attribute_error(ptr::null_mut(), intern("unknown")) },
+        };
+        match runtime_string(value) {
+            Ok(object) => object,
+            Err(message) => crate::abi::return_null_with_error(message),
+        }
+    }
+
+    unsafe extern "C" fn pep562_missing_getattr(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+        if argv.is_null() || argc != 1 {
+            return crate::abi::return_null_with_error("module __getattr__ expected one name argument");
+        }
+        let name = unsafe { *argv };
+        let name_id = match format_object_for_print(name) {
+            Ok(text) => intern(&text),
+            Err(_) => intern("missing"),
+        };
+        unsafe { crate::abi::exc::pon_raise_attribute_error(ptr::null_mut(), name_id) }
+    }
+
+    fn module_with_getattr(
+        module_name: &str,
+        entry: unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject,
+    ) -> *mut PyObject {
+        let getattr = unsafe { crate::abi::pon_make_function(entry as *const u8, 1, intern("__getattr__")) };
+        assert!(!getattr.is_null(), "creating __getattr__ function failed: {:?}", pon_err_message());
+        install_module(module_name, [(intern("__getattr__"), getattr)])
+            .unwrap_or_else(|message| panic!("installing {module_name} failed: {message}"))
+    }
+
+    #[test]
+    fn pep562_module_attr_miss_calls_module_getattr() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+        pon_err_clear();
+        reset_import_state_for_tests();
+
+        let module_name = format!("pon_pep562_attr_{}_{}", process::id(), NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed));
+        let module = module_with_getattr(&module_name, pep562_lazy_getattr);
+
+        let value = unsafe { crate::abi::object::pon_get_attr(module, intern("lazy_attr"), ptr::null_mut()) };
+        assert!(!value.is_null(), "module lazy attr lookup failed: {:?}", pon_err_message());
+        assert_eq!(format_object_for_print(value).as_deref(), Ok("plain-lazy-value"));
+    }
+
+    #[test]
+    fn pep562_import_from_miss_calls_module_getattr() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+        pon_err_clear();
+        reset_import_state_for_tests();
+
+        let module_name = format!("pon_pep562_from_{}_{}", process::id(), NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed));
+        let module = module_with_getattr(&module_name, pep562_lazy_getattr);
+
+        let value = unsafe { pon_import_from(module, intern("lazy_from")) };
+        assert!(!value.is_null(), "from-import lazy attr lookup failed: {:?}", pon_err_message());
+        assert_eq!(format_object_for_print(value).as_deref(), Ok("from-lazy-value"));
+    }
+
+    #[test]
+    fn pep562_import_from_getattr_attribute_error_becomes_import_error() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+        pon_err_clear();
+        reset_import_state_for_tests();
+
+        let module_name = format!(
+            "pon_pep562_import_error_{}_{}",
+            process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let module = module_with_getattr(&module_name, pep562_missing_getattr);
+
+        let value = unsafe { pon_import_from(module, intern("missing")) };
+        assert!(value.is_null(), "from-import should fail when module __getattr__ raises AttributeError");
+        assert!(
+            crate::abi::exc::pending_exception_is("ImportError"),
+            "from-import miss should surface ImportError, got {:?}",
+            pon_err_message()
+        );
+        let message = pon_err_message();
+        assert!(
+            message
+                .as_deref()
+                .is_some_and(|text| text.contains(&format!("cannot import name 'missing' from '{module_name}'"))),
+            "unexpected from-import error message: {message:?}"
+        );
+        assert!(
+            !crate::abi::exc::pending_exception_is("AttributeError"),
+            "from-import must clear the hook's AttributeError"
+        );
+        pon_err_clear();
+    }
+
     #[test]
     fn absolute_import_keeps_name() {
         assert_eq!(resolve_import_name("pkg.sub", 0, None).unwrap(), "pkg.sub");
@@ -2132,6 +2321,32 @@ fn as_module(object: *mut PyObject) -> Option<*mut PyModuleObject> {
     is_module.then_some(object.cast::<PyModuleObject>())
 }
 
+fn module_direct_attr(module: *mut PyModuleObject, name_id: u32, name_text: &str) -> Option<*mut PyObject> {
+    if module.is_null() {
+        return None;
+    }
+    // SAFETY: Callers pass a pointer proved by `as_module`; the borrow ends
+    // before any user code can run.
+    if let Some(value) = unsafe { (&*module).attrs.get(&name_id).copied() } {
+        return Some(value);
+    }
+    // SAFETY: Same layout proof; snapshot the registry key only.
+    let registry_key = unsafe { (*module).registry_key };
+    crate::dynexec::peek_module_namespace_value(registry_key, name_text)
+}
+
+fn call_module_getattr_hook(module: *mut PyModuleObject, name_text: &str) -> Option<*mut PyObject> {
+    let getattr = module_direct_attr(module, intern("__getattr__"), "__getattr__")?;
+    let name_object = match runtime_string(name_text) {
+        Ok(object) => object,
+        Err(message) => return Some(return_null_with_error(message)),
+    };
+    let mut argv = [name_object];
+    // SAFETY: Module-level `__getattr__` is a plain callable stored in the
+    // module namespace; modules do not descriptor-bind functions.
+    Some(unsafe { crate::abi::pon_call(getattr, argv.as_mut_ptr(), argv.len()) })
+}
+
 /// Live namespace dict for a module OBJECT, or `None` when `object` is not a
 /// module. This is the same dict `module.__dict__` serves (mutations through
 /// it sync back into module attrs); `dir(module)` enumerates it exactly like
@@ -2164,18 +2379,15 @@ unsafe extern "C" fn module_getattro(module: *mut PyObject, name: *mut PyObject)
         };
     }
     let name_id = intern(name_text);
-    // SAFETY: `as_module` proved the layout.
-    let module_ref = unsafe { &*module };
-    if let Some(value) = module_ref.attrs.get(&name_id).copied() {
+    if let Some(value) = module_direct_attr(module, name_id, name_text) {
         return value;
     }
-    // Attrs miss: consult the registered namespace dict. CPython module
-    // attribute lookup IS a `__dict__` lookup, so bindings created only
-    // through the dict view (`vars(mod)["k"] = v`) must resolve here too.
-    if let Some(value) = crate::dynexec::peek_module_namespace_value(module_ref.registry_key, name_text) {
+    if let Some(value) = call_module_getattr_hook(module, name_text) {
         return value;
     }
-    let module_name = resolve(module_ref.name).unwrap_or_else(|| format!("<module:{}>", module_ref.name));
+    let module_name = resolve(unsafe { (*module).name }).unwrap_or_else(|| format!("<module:{}>", unsafe {
+        (*module).name
+    }));
     raise_attribute_error_text(&format!("module '{module_name}' has no attribute '{name_text}'"))
 }
 
