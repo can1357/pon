@@ -382,7 +382,7 @@ fn write_entry_point_scripts(env: &EnvLayout, filename: &str, entry_point: &Entr
     let script_content = format!(
         "#!/bin/sh\nexec \"${{PON_SYS_EXECUTABLE:-pon-cli}}\" \"{script_path_literal}\" \"$@\"\n"
     );
-    let launcher_content = python_launcher_content(entry_point, &env.scripts_dir);
+    let launcher_content = python_launcher_content(entry_point, &env.scripts_dir, &env.site_packages);
 
     Ok(vec![
         write_recorded_file(
@@ -414,28 +414,69 @@ fn shell_double_quoted(value: &str) -> String {
     quoted
 }
 
-fn python_launcher_prelude(script_dir: &Path) -> String {
+fn python_launcher_prelude(script_dir: &Path, site_packages: &Path, root_module: &str) -> String {
     let script_dir = script_dir.to_string_lossy();
-    format!("import sys\nif sys.path and sys.path[0] == {}:\n    del sys.path[0]\n", python_string_literal(&script_dir))
+    let site_packages = site_packages.to_string_lossy();
+    format!(
+        r#"import sys
+_pon_script_dir = {}
+_pon_site_packages = {}
+_pon_root_module = {}
+if __name__ != '__main__':
+    _pon_module = __name__
+    _pon_package_dir = _pon_site_packages + '/' + _pon_module
+    _pon_package_init = _pon_package_dir + '/__init__.py'
+    _pon_module_file = _pon_site_packages + '/' + _pon_module + '.py'
+    if _pon_module == _pon_root_module:
+        _pon_candidates = [(_pon_package_init, _pon_package_dir, True), (_pon_module_file, '', False)]
+    else:
+        _pon_candidates = [(_pon_module_file, '', False), (_pon_package_init, _pon_package_dir, True)]
+    _pon_file = None
+    for _pon_path, _pon_dir, _pon_is_package in _pon_candidates:
+        try:
+            _pon_file = open(_pon_path)
+            __file__ = _pon_path
+            if _pon_is_package:
+                __path__ = [_pon_dir]
+                __package__ = _pon_module
+            else:
+                __package__ = ''
+            break
+        except Exception:
+            pass
+    if _pon_file is None:
+        raise ImportError(_pon_module)
+    _pon_source = _pon_file.read()
+    _pon_file.close()
+    exec(_pon_source, globals())
+else:
+    if sys.path and sys.path[0] == _pon_script_dir:
+        del sys.path[0]
+"#,
+        python_string_literal(&script_dir),
+        python_string_literal(&site_packages),
+        python_string_literal(root_module)
+    )
 }
 
-fn python_launcher_content(entry_point: &EntryPoint, script_dir: &Path) -> String {
-    let prelude = python_launcher_prelude(script_dir);
+fn python_launcher_content(entry_point: &EntryPoint, script_dir: &Path, site_packages: &Path) -> String {
+    let root_module = entry_point.module.split('.').next().unwrap_or(&entry_point.module);
+    let prelude = python_launcher_prelude(script_dir, site_packages, root_module);
     if is_simple_identifier(&entry_point.attr) {
         return format!(
-            "{}from {} import {}\nsys.exit({}())\n",
+            "{}    from {} import {}\n    sys.exit({}())\n",
             prelude, entry_point.module, entry_point.attr, entry_point.attr
         );
     }
 
     let mut content = format!(
-        "{}import {} as _pon_entry_module\n_pon_entry = _pon_entry_module\n",
+        "{}    import {} as _pon_entry_module\n    _pon_entry = _pon_entry_module\n",
         prelude, entry_point.module
     );
     for attr in entry_point.attr.split('.').filter(|attr| !attr.is_empty()) {
-        content.push_str(&format!("_pon_entry = getattr(_pon_entry, {})\n", python_string_literal(attr)));
+        content.push_str(&format!("    _pon_entry = getattr(_pon_entry, {})\n", python_string_literal(attr)));
     }
-    content.push_str("sys.exit(_pon_entry())\n");
+    content.push_str("    sys.exit(_pon_entry())\n");
     content
 }
 
@@ -794,10 +835,13 @@ mod tests {
             fs::read_to_string(&script_path).expect("shell shim"),
             format!("#!/bin/sh\nexec \"${{PON_SYS_EXECUTABLE:-pon-cli}}\" \"{script_path_literal}\" \"$@\"\n")
         );
-        assert_eq!(
-            fs::read_to_string(&launcher_path).expect("python launcher"),
-            format!("import sys\nif sys.path and sys.path[0] == {}:\n    del sys.path[0]\nfrom demo.cli import main\nsys.exit(main())\n", python_string_literal(&layout.scripts_dir.to_string_lossy()))
-        );
+        let launcher = fs::read_to_string(&launcher_path).expect("python launcher");
+        assert!(launcher.contains("if __name__ != '__main__':\n"));
+        assert!(launcher.contains(&format!(
+            "_pon_script_dir = {}\n",
+            python_string_literal(&layout.scripts_dir.to_string_lossy())
+        )));
+        assert!(launcher.contains("    from demo.cli import main\n    sys.exit(main())\n"));
         assert_eq!(
             entries.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(),
             vec!["../../bin/demo", "../../bin/demo.py"]
