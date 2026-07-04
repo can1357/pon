@@ -323,8 +323,8 @@ fn run_get_requires_for_build_wheel_hook(
     let mut script = backend_object_script(backend);
     script.push_str("_pon_hook = getattr(_pon_backend, 'get_requires_for_build_wheel', None)\n");
     script.push_str("_pon_requirements = []\n");
-    script.push_str("if _pon_hook is not None:\n");
-    script.push_str("    _pon_requirements = _pon_hook(None)\n");
+    script.push_str("import traceback as _pon_tb\n");
+    script.push_str("if _pon_hook is not None:\n    try:\n        _pon_requirements = _pon_hook(None)\n    except BaseException:\n        _pon_tb.print_exc()\n        raise\n");
     script.push_str(&format!(
         "_pon_file = open({}, 'w')\n",
         python_string_literal(&output_path.display().to_string())
@@ -369,8 +369,9 @@ fn run_build_wheel_hook(
 ) -> Result<()> {
     let script_path = source_root.join("__pon_pep517_build.py");
     let mut script = backend_object_script(backend);
+    script.push_str("import traceback as _pon_tb\n");
     script.push_str(&format!(
-        "_pon_backend.build_wheel({})\n",
+        "try:\n    _pon_backend.build_wheel({})\nexcept BaseException:\n    _pon_tb.print_exc()\n    raise\n",
         python_string_literal(&wheel_dir.display().to_string())
     ));
     fs::write(&script_path, script)?;

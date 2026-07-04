@@ -16,6 +16,21 @@ use pon_runtime::{PyObject, intern, pon_none, pon_runtime_init, pon_sys_set_argv
 mod astconv;
 pub mod build;
 
+
+/// A `sys.exit(code)` request surfaced from a top-level run.  The CLI entry
+/// point (`main`) maps it to the process exit status; embedded callers such as
+/// `pon-pm`'s in-process build hooks treat it as an ordinary error so they can
+/// report a backend failure instead of terminating their own process.
+#[derive(Debug)]
+pub struct SystemExitRequested(pub i32);
+
+impl std::fmt::Display for SystemExitRequested {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SystemExit: {}", self.0)
+    }
+}
+
+impl std::error::Error for SystemExitRequested {}
 /// Dispatches the process command line using the same behavior as the `pon-cli` binary.
 pub fn run_from_env() -> Result<()> {
     run_from_args(env::args())
@@ -38,7 +53,20 @@ pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()> {
         }
         Some("build") => build_from_args(args),
         Some("repl") => bail!("`pon repl` is unsupported in Phase A"),
-        Some(command) => bail!("unknown subcommand `{command}`\n{}", usage(&program)),
+        Some(command) => {
+            // Python-compatible script invocation: `pon <script> [args...]`
+            // runs the file directly (like `python script.py args`), so tools
+            // that spawn `[sys.executable, <script>, ...]` (e.g. meson-python
+            // invoking meson) work.  Gated on `command` naming an existing file
+            // so real subcommand typos still error out.
+            let script = Path::new(command);
+            if script.is_file() {
+                let mut argv = vec![command.to_owned()];
+                argv.extend(args);
+                return run_file_with_env(script, std::iter::empty::<(OsString, OsString)>(), &argv);
+            }
+            bail!("unknown subcommand `{command}`\n{}", usage(&program));
+        }
         None => bail!(usage(program)),
     }
 }
@@ -98,14 +126,18 @@ fn run_file_inner(path: &Path, argv: &[String]) -> Result<()> {
     let mut engine = JitEngine::new();
     begin_module_execution("__main__").map_err(anyhow::Error::msg)?;
     let result = engine.run(&module).context("JIT execution failed");
-    // CPython finalization order: atexit callbacks run once `__main__`
-    // finishes (normally or raising) but before module teardown
-    // (`Py_FinalizeEx` calls them before destroying modules), so hooks still
-    // see live module state.  On the error path the uncaught report is
-    // printed by `main()` after this returns, so callback output precedes it
-    // — pon's uncaught shape already diverges from CPython there.
+    // `sys.exit` raises SystemExit; capture the requested process exit status
+    // before finalizers run (CPython runs atexit callbacks, then exits with
+    // the code).
+    let system_exit = pon_runtime::abi::take_pending_system_exit();
+    // atexit callbacks run once `__main__` finishes (normally or raising) but
+    // before module teardown, so hooks still see live module state.
     pon_runtime::native::atexit::run_exit_callbacks();
     end_module_execution("__main__");
+    if let Some(code) = system_exit {
+        io::stdout().flush().context("failed to flush stdout")?;
+        return Err(SystemExitRequested(code).into());
+    }
     result?;
     io::stdout().flush().context("failed to flush stdout")
 }

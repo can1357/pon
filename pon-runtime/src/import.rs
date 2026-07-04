@@ -1465,13 +1465,23 @@ pub fn active_module_call_floor() -> usize {
     state.current_module_floors.last().copied().unwrap_or(0)
 }
 
+/// Package context for a relative import, mirroring CPython's
+/// calling-frame-globals rule (`_calc___package__`): the innermost executing
+/// compiled function's DEFINING module wins — a function-scope
+/// `from . import x` called long after its module finished importing still
+/// resolves against that module — and a toplevel import statement falls back
+/// to the actively executing module body.  Both locks are taken sequentially,
+/// never nested: `current_defining_module` briefly takes `IMPORT_STATE`
+/// itself (via `active_module_call_floor`).
 fn current_importer_package() -> Option<String> {
-    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
-    let current = state.current_modules.last().copied()?;
-    let module = state.modules.get(&current).copied()?;
-    let module = module_from_object_locked(&state, module)?;
-    // SAFETY: The import state proved the object uses `PyModuleObject` layout.
-    let package = unsafe { (&*module).attrs.get(&intern("__package__")).copied()? };
+    let module_id = crate::abi::current_defining_module().or_else(active_module_name_id)?;
+    let package = {
+        let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let module = state.modules.get(&module_id).copied()?;
+        let module = module_from_object_locked(&state, module)?;
+        // SAFETY: The import state proved the object uses `PyModuleObject` layout.
+        unsafe { (&*module).attrs.get(&intern("__package__")).copied()? }
+    };
     unicode_text(package).map(str::to_owned)
 }
 
