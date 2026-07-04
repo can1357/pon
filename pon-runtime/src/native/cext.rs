@@ -142,11 +142,6 @@ fn optional_int_arg(args: &[*mut PyObject], index: usize, default: i64, name: &s
     }
 }
 
-fn function_object(name: &str, entry: BuiltinFn) -> Result<*mut PyObject, String> {
-    // SAFETY: Entry points are live Rust functions using Pon's variadic ABI.
-    let function = unsafe { abi::pon_make_function(entry as *const u8, VARIADIC_ARITY, intern(name)) };
-    (!function.is_null()).then_some(function).ok_or_else(|| format!("failed to allocate native function {name}"))
-}
 
 fn function_attr(attr: &str, function_name: &str, entry: BuiltinFn) -> Result<(u32, *mut PyObject), String> {
     // SAFETY: Entry points are live Rust functions using Pon's variadic ABI.
@@ -1088,12 +1083,25 @@ pub(super) fn make_hashlib_module() -> Result<*mut PyObject, String> {
     attrs.push(function_attr("hmac_new", "hmac_new", hashlib_hmac_new_entry)?);
     attrs.push(function_attr("hmac_digest", "hmac_digest", hmac_digest_entry)?);
     attrs.push(function_attr("get_fips_mode", "get_fips_mode", get_fips_mode_entry)?);
+    let mut constructor_pairs = Vec::new();
     for kind in DigestKind::ALL {
         if matches!(kind, DigestKind::Blake2b | DigestKind::Blake2s) {
             continue;
         }
-        attrs.push(function_attr(kind.openssl_name(), kind.openssl_name(), hash_constructor_entry(kind))?);
+        let attr = function_attr(kind.openssl_name(), kind.openssl_name(), hash_constructor_entry(kind))?;
+        let digest_name = py_str(kind.name());
+        if digest_name.is_null() {
+            return Err("failed to allocate _hashlib._constructors entry".to_owned());
+        }
+        constructor_pairs.push(attr.1);
+        constructor_pairs.push(digest_name);
+        attrs.push(attr);
     }
+    let constructors = unsafe { abi::map::pon_build_map(constructor_pairs.as_mut_ptr(), constructor_pairs.len() / 2) };
+    if constructors.is_null() {
+        return Err("failed to allocate _hashlib._constructors".to_owned());
+    }
+    attrs.push((intern("_constructors"), constructors));
     let mut names = Vec::new();
     for kind in DigestKind::ALL {
         let name = py_str(kind.name());

@@ -40,12 +40,15 @@ pub fn for_each_builtin(mut f: impl FnMut(&'static str, usize, *const u8)) {
     builtin!("range", VARIADIC_ARITY, builtin_range);
     builtin!("iter", VARIADIC_ARITY, builtin_iter);
     builtin!("next", VARIADIC_ARITY, builtin_next);
+    builtin!("aiter", 1, builtin_aiter);
+    builtin!("anext", VARIADIC_ARITY, builtin_anext);
     builtin!("isinstance", 2, builtin_isinstance);
     builtin!("type", VARIADIC_ARITY, builtin_type);
     builtin!("getattr", VARIADIC_ARITY, builtin_getattr);
     builtin!("setattr", 3, builtin_setattr);
     builtin!("hasattr", 2, builtin_hasattr);
     builtin!("repr", 1, builtin_repr);
+    builtin!("ascii", 1, builtin_ascii);
     builtin!("str", VARIADIC_ARITY, builtin_str);
     builtin!("format", VARIADIC_ARITY, super::builtins_batch::builtin_format);
     builtin!("hash", 1, builtin_hash);
@@ -90,6 +93,9 @@ pub fn for_each_builtin(mut f: impl FnMut(&'static str, usize, *const u8)) {
     builtin!("compile", VARIADIC_ARITY, builtin_compile);
     builtin!("eval", VARIADIC_ARITY, builtin_eval);
     builtin!("exec", VARIADIC_ARITY, builtin_exec);
+    builtin!("breakpoint", VARIADIC_ARITY, builtin_breakpoint);
+    builtin!("exit", VARIADIC_ARITY, builtin_exit);
+    builtin!("quit", VARIADIC_ARITY, builtin_exit);
     builtin!("__import__", VARIADIC_ARITY, builtin_dunder_import);
     builtin!("vars", VARIADIC_ARITY, super::builtins_batch::builtin_vars);
     builtin!("ord", 1, super::builtins_batch::builtin_ord);
@@ -415,7 +421,14 @@ unsafe extern "C" fn placeholder_getattro_slot(object: *mut PyObject, name: *mut
     if !ty.is_null() {
         let hook = unsafe { crate::descr::lookup_in_type(ty, intern(name)) };
         if !hook.is_null() {
-            return unsafe { crate::descr::descriptor_get(hook, object, ty) };
+            let bound = unsafe { crate::descr::descriptor_get(hook, object, ty) };
+            if bound != hook {
+                return bound;
+            }
+            return match crate::types::method::new_bound_method(hook, object) {
+                Ok(method) => method.cast::<PyObject>(),
+                Err(message) => fail(message),
+            };
         }
     }
     fail(format!("attribute '{name}' was not found"))
@@ -1255,6 +1268,16 @@ pub unsafe extern "C" fn builtin_repr(argv: *mut *mut PyObject, argc: usize) -> 
     }
 }
 
+pub unsafe extern "C" fn builtin_ascii(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { exact_args(argv, argc, 1, "ascii") }) else {
+        return ptr::null_mut();
+    };
+    match try_repr_text(args[0]) {
+        Ok(text) => alloc_str(&crate::types::str_::escape_non_ascii(&text)),
+        Err(()) => ptr::null_mut(),
+    }
+}
+
 pub unsafe extern "C" fn builtin_str(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let Some(args) = (unsafe { argv_slice(argv, argc) }) else {
         return fail("str() received a null argv pointer");
@@ -2010,6 +2033,40 @@ pub unsafe extern "C" fn builtin_callable(argv: *mut *mut PyObject, argc: usize)
     unsafe { abi::number::pon_const_bool(i32::from(result)) }
 }
 
+pub unsafe extern "C" fn builtin_aiter(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { exact_args(argv, argc, 1, "aiter") }) else {
+        return ptr::null_mut();
+    };
+    let method = unsafe { abi::pon_get_attr(args[0], intern("__aiter__"), ptr::null_mut()) };
+    if method.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { abi::pon_call(method, ptr::null_mut(), 0) }
+}
+
+pub unsafe extern "C" fn builtin_anext(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { argv_slice(argv, argc) }.unwrap_or(&[]);
+    if args.len() != 1 {
+        return fail("anext() default handling requires the async runtime and is not implemented");
+    }
+    let method = unsafe { abi::pon_get_attr(args[0], intern("__anext__"), ptr::null_mut()) };
+    if method.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { abi::pon_call(method, ptr::null_mut(), 0) }
+}
+
+pub unsafe extern "C" fn builtin_breakpoint(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(hook) = crate::import::module_attr(intern("sys"), intern("breakpointhook")) else {
+        return fail("sys.breakpointhook is not available");
+    };
+    unsafe { abi::pon_call(hook, argv, argc) }
+}
+
+pub unsafe extern "C" fn builtin_exit(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { super::sys::sys_exit(argv, argc) }
+}
+
 pub unsafe extern "C" fn builtin_globals(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     unsafe { crate::dynexec::builtin_globals(argv, argc) }
 }
@@ -2567,24 +2624,34 @@ fn carrier_types() -> [*mut PyType; 2] {
 /// The wrapped callable when `value` is a classmethod/staticmethod carrier
 /// (exact type match against `carrier_types`).  Zero-arg `super()` must see
 /// through carriers: class creation implicitly wraps a plain-function
-/// `__new__` in a staticmethod (`wrap_dunder_new_as_staticmethod`), and
-/// `classmethod(f)`/`staticmethod(f)` store carriers in the class dict while
-/// the executing frame holds the naked function.
-fn carrier_payload(value: *mut PyObject, carrier_types: &[*mut PyType; 2]) -> Option<*mut PyObject> {
+/// `__new__` in a staticmethod (`wrap_dunder_new_as_staticmethod`),
+/// `classmethod(f)`/`staticmethod(f)`, and `property(fget, fset, fdel)` store
+/// carriers in the class dict while the executing frame holds the naked
+/// function.
+fn carrier_matches(value: *mut PyObject, carrier_types: &[*mut PyType; 2], function: *mut PyObject) -> bool {
     if !crate::tag::is_heap(value) {
-        return None;
+        return false;
     }
     let ty = unsafe { (*value).ob_type.cast_mut() };
-    if ty.is_null() || !carrier_types.contains(&ty) {
-        return None;
+    if ty.is_null() {
+        return false;
     }
-    // SAFETY: Carrier layout verified above; PyClassMethod and PyStaticMethod
-    // carry the wrapped callable at the same offset.
-    Some(unsafe { (*value.cast::<crate::types::classmethod::PyClassMethod>()).callable })
+    if carrier_types.contains(&ty) {
+        // SAFETY: Carrier layout verified above; PyClassMethod and
+        // PyStaticMethod carry the wrapped callable at the same offset.
+        return unsafe { (*value.cast::<crate::types::classmethod::PyClassMethod>()).callable } == function;
+    }
+    if ty == property_type() {
+        let property = unsafe { &*value.cast::<crate::types::property::PyProperty>() };
+        return property.fget == function || property.fset == function || property.fdel == function;
+    }
+    false
 }
 
 fn find_defining_class(function: *mut PyObject, ty: *mut PyType) -> Option<*mut PyType> {
     let carriers = carrier_types();
+    let function_name = crate::types::function::function_name(function);
+    let function_name_id = function_name.as_deref().map(intern);
     for class in unsafe { crate::mro::mro_entries(ty) } {
         if class.is_null() {
             continue;
@@ -2594,7 +2661,15 @@ fn find_defining_class(function: *mut PyObject, ty: *mut PyType) -> Option<*mut 
             continue;
         }
         let dict = unsafe { &*dict.cast::<crate::types::type_::PyClassDict>() };
-        if dict.iter().any(|(_, value)| value == function || carrier_payload(value, &carriers) == Some(function)) {
+        if let Some(name_id) = function_name_id {
+            if let Some(value) = dict.get(name_id)
+                && (value == function || carrier_matches(value, &carriers, function))
+            {
+                return Some(class);
+            }
+            continue;
+        }
+        if dict.iter().any(|(_, value)| value == function || carrier_matches(value, &carriers, function)) {
             return Some(class);
         }
     }
@@ -3183,5 +3258,16 @@ mod tests {
         // legacy fallback text.
         assert_eq!(repr_text(object), "<object>");
         assert!(!crate::thread_state::pon_err_occurred());
+    }
+
+    #[test]
+    fn builtin_ascii_escapes_repr_non_ascii() {
+        let _guard = test_state_lock();
+        init_runtime();
+        let value = alloc_str("é😀x");
+        let mut args = [value];
+        let ascii = unsafe { builtin_ascii(args.as_mut_ptr(), args.len()) };
+        assert!(!ascii.is_null());
+        assert_eq!(object_to_string(ascii).as_deref(), Some("'\\xe9\\U0001f600x'"));
     }
 }

@@ -560,6 +560,7 @@ unsafe extern "C" fn set_getattro_slot(object: *mut PyObject, name: *mut PyObjec
         | "isdisjoint" | "__contains__" | "copy" | "remove" | "clear" | "pop" => unsafe {
             crate::abi::map::pon_set_bound_method(object, name)
         },
+        "__doc__" => unsafe { crate::abi::pon_none() },
         _ => crate::abi::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
     }
 }

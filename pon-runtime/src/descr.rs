@@ -99,9 +99,6 @@ pub(crate) unsafe fn class_dict_to_dict(class_dict: *mut PyClassDict) -> *mut Py
     out
 }
 
-unsafe fn synthetic_builtin_descriptor() -> *mut PyObject {
-    unsafe { abi::pon_load_global(intern::intern("len"), ptr::null_mut()) }
-}
 
 unsafe fn set_str_key(dict: *mut PyObject, name: &str, value: *mut PyObject) -> bool {
     if dict.is_null() || value.is_null() {
@@ -295,10 +292,6 @@ unsafe fn synthetic_type_attr(ty: *mut PyType, name_id: u32) -> *mut PyObject {
     }
     if type_name == "int" && name_id == intern::intern("from_bytes") {
         return crate::types::int::from_bytes_function();
-    }
-    let is_known_descriptor = type_name == "object" && name_id == intern::intern("__init__");
-    if is_known_descriptor {
-        return unsafe { synthetic_builtin_descriptor() };
     }
     ptr::null_mut()
 }
@@ -684,7 +677,7 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
         return unsafe { descriptor_get(class_descr, object, obj_ty) };
     }
 
-    if !is_type && name_id == intern::intern("__class__") {
+    if name_id == intern::intern("__class__") {
         return obj_ty.cast::<PyObject>();
     }
     if !is_type && name_id == intern::intern("__dict__") {
@@ -883,6 +876,7 @@ pub unsafe fn super_lookup(start: *mut PyType, obj: *mut PyObject, owner: *mut P
     let Some(index) = mro.iter().position(|ty| *ty == start) else {
         return raise_attr_error("super(type, obj): obj is not an instance or subtype of type");
     };
+    let object_type = crate::native::builtins_mod::builtin_native_type("object").unwrap_or(ptr::null_mut());
     for cls in mro.iter().skip(index + 1).copied() {
         if cls.is_null() {
             continue;
@@ -896,6 +890,13 @@ pub unsafe fn super_lookup(start: *mut PyType, obj: *mut PyObject, owner: *mut P
                 // come back unbound; instance-bound proxies bind the receiver.
                 let bind_obj = if obj == owner.cast::<PyObject>() { ptr::null_mut() } else { obj };
                 return unsafe { descriptor_get(value, bind_obj, owner) };
+            }
+        }
+        if cls == object_type {
+            let fallback = unsafe { object_slot_method_fallback(cls, name) };
+            if !fallback.is_null() {
+                let bind_obj = if obj == owner.cast::<PyObject>() { ptr::null_mut() } else { obj };
+                return unsafe { descriptor_get(fallback, bind_obj, owner) };
             }
         }
     }

@@ -890,13 +890,7 @@ fn native_module(name: &str) -> Result<Option<*mut PyObject>, String> {
 /// (one `NATIVE_MODULES` row) shadows its entry here; delete the stale entry in
 /// the same change.
 fn is_unsupported_c_accelerated(name: &str) -> bool {
-    matches!(
-        name,
-        "_json"
-            | "_ssl"
-            | "_sqlite3"
-            | "_ctypes"
-    )
+    matches!(name, "_json")
 }
 
 struct SourceSpec {

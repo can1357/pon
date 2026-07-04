@@ -792,12 +792,13 @@ fn function_attr_by_id(function: *mut PyObject, name_id: u32) -> Option<*mut PyO
         return Some(function_annotate(function).unwrap_or_else(|| unsafe { crate::abi::pon_none() }));
     }
     if name_id == intern("__get__") {
-        // CPython parity: builtin functions (`builtin_function_or_method`)
-        // implement no descriptor protocol, so a native function has no
-        // `__get__` at all (enum's `_is_descriptor` classifies them as plain
-        // members).  Falling through raises AttributeError in
-        // `function_getattro`.
-        if is_native_function(function) {
+        // CPython parity: module/flat-pool builtin functions
+        // (`builtin_function_or_method`) implement no descriptor protocol, so
+        // a native function has no `__get__` at all (enum's `_is_descriptor`
+        // classifies them as plain members).  Native slot-wrapper carriers
+        // installed in type dictionaries are the exception: they ARE
+        // descriptors and bind their receiver.
+        if is_native_function(function) && !is_native_method_descriptor(function) {
             return None;
         }
         // Python-visible descriptor protocol: `_is_descriptor`-style probes
@@ -1163,14 +1164,32 @@ pub fn clear_function_module(function: *mut PyObject) {
 static NATIVE_FUNCTIONS: LazyLock<Mutex<HashSet<usize>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// Record `function` as a native (builtin) function — a non-descriptor.
-/// Values that are not function objects are ignored, so module-attr walks
-/// can pass every installed value unfiltered.
+/// Native carriers installed in type dictionaries that model CPython
+/// slot-wrapper/method-descriptor values rather than module-level builtins.
+///
+/// They keep the native marking for module/provenance behavior, but descriptor
+/// lookup must still bind them when an instance receiver is supplied.
+static NATIVE_METHOD_DESCRIPTORS: LazyLock<Mutex<HashSet<usize>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Record `function` as a native (builtin) function — normally a
+/// non-descriptor.  Values that are not function objects are ignored, so
+/// module-attr walks can pass every installed value unfiltered.
 pub(crate) fn mark_native_function(function: *mut PyObject) {
     if !is_function_object(function) {
         return;
     }
     if let Ok(mut table) = NATIVE_FUNCTIONS.lock() {
+        table.insert(function as usize);
+    }
+}
+
+/// Record a native function carrier as a type-dict descriptor.
+pub(crate) fn mark_native_method_descriptor(function: *mut PyObject) {
+    if !is_function_object(function) {
+        return;
+    }
+    if let Ok(mut table) = NATIVE_METHOD_DESCRIPTORS.lock() {
         table.insert(function as usize);
     }
 }
@@ -1187,9 +1206,24 @@ pub(crate) fn is_native_function(function: *mut PyObject) -> bool {
         .unwrap_or(false)
 }
 
-/// Drop the native marking for a freed `function` allocation.
+/// True when a native carrier must behave as a descriptor.
+#[must_use]
+pub(crate) fn is_native_method_descriptor(function: *mut PyObject) -> bool {
+    if function.is_null() {
+        return false;
+    }
+    NATIVE_METHOD_DESCRIPTORS
+        .lock()
+        .map(|table| table.contains(&(function as usize)))
+        .unwrap_or(false)
+}
+
+/// Drop native markings for a freed `function` allocation.
 pub fn clear_native_function(function: *mut PyObject) {
     if let Ok(mut table) = NATIVE_FUNCTIONS.lock() {
+        table.remove(&(function as usize));
+    }
+    if let Ok(mut table) = NATIVE_METHOD_DESCRIPTORS.lock() {
         table.remove(&(function as usize));
     }
 }
@@ -1258,15 +1292,15 @@ unsafe fn build_annotations_dict(names: &[u32], values: &[*mut PyObject]) -> Res
 
 /// Descriptor binding for function attributes stored on Python classes.
 ///
-/// Native (builtin) functions are exempt: CPython's
+/// Native (builtin) functions are usually exempt: CPython's
 /// `builtin_function_or_method` has a NULL `tp_descr_get`, so
 /// `class A: conv = time.localtime; A().conv` reads back the BARE function
 /// with no `self` prepended (`logging.Formatter.formatTime`'s
-/// `self.converter(record.created)` depends on this).  User functions keep
-/// full descriptor binding.
+/// `self.converter(record.created)` depends on this).  Native carriers that
+/// model type-dict slot wrappers/method descriptors bind like descriptors.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn function_descr_get(descr: *mut PyObject, obj: *mut PyObject, _owner: *mut PyObject) -> *mut PyObject {
-    if descr.is_null() || obj.is_null() || is_native_function(descr) {
+    if descr.is_null() || obj.is_null() || (is_native_function(descr) && !is_native_method_descriptor(descr)) {
         return descr;
     }
     match crate::types::method::new_bound_method(descr, obj) {
@@ -1397,7 +1431,7 @@ fn format_missing_required_arguments(function: *mut PyObject, names: &[u32], kin
     )
 }
 
-fn function_name(function: *mut PyObject) -> Option<String> {
+pub(crate) fn function_name(function: *mut PyObject) -> Option<String> {
     if function.is_null() {
         return None;
     }
@@ -1598,7 +1632,11 @@ pub fn bind_arguments(
     }
 
     if let Some(slot) = params.varargs_slot() {
-        bound[slot] = unsafe { build_tuple_from_slice(&positional[positional_arity..]) }?;
+        // Fewer positionals than named parameters (the rest arrive via
+        // keywords/defaults) leaves `*args` empty — clamp so the slice
+        // start never passes the end (`f(1, b=2)` for `def f(a, b, *args)`).
+        let rest = positional.get(positional_arity..).unwrap_or(&[]);
+        bound[slot] = unsafe { build_tuple_from_slice(rest) }?;
     }
     let mut varkw_pairs = Vec::new();
 
@@ -1967,6 +2005,9 @@ pub(crate) fn bind_native_keywords_for_name(
         "scrypt" => {
             bind_optional_named_keywords(positional, keywords, "scrypt", &["password", "salt", "n", "r", "p", "maxmem", "dklen"], 7)
         }
+        // `_ssl.txt2obj(txt, name=False)`: vendored ssl.py passes `name=`
+        // while constructing Purpose enum members from OpenSSL OIDs.
+        "txt2obj" => bind_optional_named_keywords(positional, keywords, "txt2obj", &["txt", "name"], 1),
         // `_zstd` exposes keyword-bearing native functions/methods.
         "compress" => bind_optional_named_keywords(positional, keywords, "compress", &["self", "data", "mode"], 2),
         "flush" => bind_optional_named_keywords(positional, keywords, "flush", &["self", "mode"], 1),
@@ -2114,6 +2155,29 @@ pub(crate) fn bind_native_keywords_for_name(
             "open",
             &["file", "mode", "buffering", "encoding", "errors", "newline", "closefd", "opener"],
             8,
+        ),
+        // `_sqlite3.connect(database, timeout=5.0, detect_types=0,
+        // isolation_level='', check_same_thread=True, factory=Connection,
+        // cached_statements=128, uri=False, autocommit=False)`: dbm.sqlite3
+        // imports `sqlite3` and immediately opens with `autocommit=True,
+        // uri=True`, so native `_sqlite3` must accept the CPython keyword
+        // surface even before higher-level wrappers install adapters.
+        "connect" => bind_optional_named_keywords(
+            positional,
+            keywords,
+            "connect",
+            &[
+                "database",
+                "timeout",
+                "detect_types",
+                "isolation_level",
+                "check_same_thread",
+                "factory",
+                "cached_statements",
+                "uri",
+                "autocommit",
+            ],
+            9,
         ),
         _ => Err(format!("keyword arguments require Phase-B function metadata ('{name}')")),
     }

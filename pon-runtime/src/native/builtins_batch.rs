@@ -79,13 +79,31 @@ pub unsafe extern "C" fn builtin_dir(argv: *mut *mut PyObject, argc: usize) -> *
                 Err(message) => return raise_type_error(&message),
             }
         } else if let Some(namespace) = crate::import::module_namespace_for_object(object) {
-            // Module arm: CPython's `module.__dir__` returns `list(module.__dict__)`.
-            // Module attrs live on the module object (mirrored into the registered
-            // namespace dict), not in any class dict, so the fallback below would
-            // see nothing.
-            match namespace.and_then(|dict| unsafe { names_from_mapping(dict) }) {
-                Ok(names) => names,
-                Err(message) => return raise_type_error(&message),
+            // Module arm: CPython first honors a module-level `__dir__` hook
+            // (PEP 562), then falls back to `list(module.__dict__)`.
+            if let Some(dir_method) = unsafe { try_get_attr(object, "__dir__") } {
+                let result = unsafe { abi::pon_call(dir_method, ptr::null_mut(), 0) };
+                if result.is_null() {
+                    return ptr::null_mut();
+                }
+                let mut hook_names = match collect_iterable(result) {
+                    Ok(values) => values.into_iter().map(name_text).collect::<Vec<_>>(),
+                    Err(message) => return raise_type_error(&message),
+                };
+                match namespace.and_then(|dict| unsafe { names_from_mapping(dict) }) {
+                    Ok(names) => hook_names.extend(
+                        names
+                            .into_iter()
+                            .filter(|name| !(name.starts_with("__") && name.ends_with("__"))),
+                    ),
+                    Err(message) => return raise_type_error(&message),
+                }
+                hook_names
+            } else {
+                match namespace.and_then(|dict| unsafe { names_from_mapping(dict) }) {
+                    Ok(names) => names,
+                    Err(message) => return raise_type_error(&message),
+                }
             }
         } else {
             names_for_object(object)
