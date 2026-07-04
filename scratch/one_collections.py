@@ -1,0 +1,2 @@
+import collections
+print("OK")
