@@ -162,6 +162,7 @@ fn bytes_iter_type() -> *mut PyType {
 }
 
 unsafe extern "C" fn bytes_iter_slot(object: *mut PyObject) -> *mut PyObject {
+    let object = unsafe { crate::types::type_::payload_subclass_value(object) }.unwrap_or(object);
     if object.is_null() || !bytes_type::is_bytes_type(unsafe { (*object).ob_type }) {
         return super::return_null_with_error("bytes iterator slot received a non-bytes receiver");
     }
@@ -238,9 +239,14 @@ unsafe extern "C" fn bytearray_iter_next_slot(object: *mut PyObject) -> *mut PyO
     unsafe { super::pon_const_int(i64::from(byte)) }
 }
 
-/// Borrows the payload of an exact bytes or bytearray object without copying.
+/// Borrows the payload of an exact bytes/bytearray object, or a bytes payload
+/// subclass, without copying.
 unsafe fn borrow_bytes_like<'a>(value: *mut PyObject) -> Option<&'a [u8]> {
     if value.is_null() {
+        return None;
+    }
+    let value = unsafe { crate::types::type_::payload_subclass_value(value) }.unwrap_or(value);
+    if !crate::tag::is_heap(value) {
         return None;
     }
     let ty = unsafe { (*value).ob_type };
@@ -315,6 +321,49 @@ unsafe extern "C" fn str_contains_slot(object: *mut PyObject, item: *mut PyObjec
     c_int::from(haystack.contains(needle))
 }
 
+/// `str.__contains__(self, needle)` native entry: the tp_dict seam that
+/// lets str-SUBCLASS instances (payload layout, no `sq_contains` slot of
+/// their own) resolve `in` through MRO lookup (Cython probes membership on
+/// `EncodedString` receivers at parse time).
+unsafe extern "C" fn str_dunder_contains_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 2 {
+        return raise_typed(
+            ExceptionKind::TypeError,
+            &format!("str.__contains__() takes exactly one argument ({} given)", argc.saturating_sub(1)),
+        );
+    }
+    // SAFETY: The caller passes a live argv window of length argc.
+    let args = unsafe { core::slice::from_raw_parts(argv, argc) };
+    let receiver = crate::tag::untag_arg(args[0]);
+    let needle = crate::tag::untag_arg(args[1]);
+    match unsafe { str_contains_slot(receiver, needle) } {
+        -1 => core::ptr::null_mut(),
+        verdict => {
+            // SAFETY: Bool constructor returns the shared singletons.
+            unsafe { super::number::pon_const_bool(verdict) }
+        }
+    }
+}
+
+/// `bytes.__contains__(self, needle)` native entry: payload-subclass receivers
+/// have no native sequence table of their own, so MRO lookup reaches this
+/// bytes method and delegates to the exact-slot implementation.
+unsafe extern "C" fn bytes_dunder_contains_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 2 {
+        return raise_typed(
+            ExceptionKind::TypeError,
+            &format!("bytes.__contains__() takes exactly one argument ({} given)", argc.saturating_sub(1)),
+        );
+    }
+    let args = unsafe { core::slice::from_raw_parts(argv, argc) };
+    let receiver = crate::tag::untag_arg(args[0]);
+    let needle = crate::tag::untag_arg(args[1]);
+    match unsafe { bytes_contains_slot(receiver, needle) } {
+        -1 => core::ptr::null_mut(),
+        verdict => unsafe { super::number::pon_const_bool(verdict) },
+    }
+}
+
 /// Every `str_iterator` allocation, for GC root reporting: the leaked boxes
 /// borrow their GC-heap unicode receiver, which marking cannot see through
 /// (`crate::gcroot`).  The bytes/bytearray iterators above hold only leaked
@@ -374,6 +423,38 @@ unsafe extern "C" fn str_iter_slot(object: *mut PyObject) -> *mut PyObject {
         }))
         .cast::<PyObject>(),
     )
+}
+
+/// `str.__iter__(self)` native entry: the tp_dict seam letting str-SUBCLASS
+/// instances (payload layout, no `sq_iter` slot of their own) iterate
+/// through MRO lookup.  The iterator borrows the CANONICAL payload object;
+/// the iterator registry roots it for the iterator's lifetime.
+unsafe extern "C" fn str_dunder_iter_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 1 {
+        return raise_typed(
+            ExceptionKind::TypeError,
+            &format!("str.__iter__() takes no arguments ({} given)", argc.saturating_sub(1)),
+        );
+    }
+    let receiver = crate::tag::untag_arg(unsafe { *argv });
+    let receiver = unsafe { crate::types::type_::payload_subclass_value(receiver) }.unwrap_or(receiver);
+    unsafe { str_iter_slot(receiver) }
+}
+
+/// `str.__getitem__(self, key)` native entry: index/slice through the
+/// payload for str-SUBCLASS receivers (Cython subscripts `EncodedString`).
+unsafe extern "C" fn str_dunder_getitem_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 2 {
+        return raise_typed(
+            ExceptionKind::TypeError,
+            &format!("str.__getitem__() takes exactly one argument ({} given)", argc.saturating_sub(1)),
+        );
+    }
+    // SAFETY: The caller passes a live argv window of length argc.
+    let args = unsafe { core::slice::from_raw_parts(argv, argc) };
+    let receiver = crate::tag::untag_arg(args[0]);
+    let receiver = unsafe { crate::types::type_::payload_subclass_value(receiver) }.unwrap_or(receiver);
+    unsafe { str_subscript_slot(receiver, args[1]) }
 }
 
 unsafe extern "C" fn str_iter_next_slot(object: *mut PyObject) -> *mut PyObject {
@@ -598,6 +679,10 @@ fn memoryview_extent_tuple(extent: usize) -> *mut PyObject {
 
 fn bytes_method_entry_for_name(name: &str) -> Option<unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject> {
     Some(match name {
+        "__len__" => bytes_dunder_len_entry,
+        "__contains__" => bytes_dunder_contains_entry,
+        "__getitem__" => bytes_dunder_getitem_entry,
+        "__iter__" => bytes_dunder_iter_entry,
         "split" => bytes_split_entry,
         "rsplit" => bytes_rsplit_entry,
         "splitlines" => bytes_splitlines_entry,
@@ -645,6 +730,10 @@ fn bytes_method_entry_for_name(name: &str) -> Option<unsafe extern "C" fn(*mut *
 
 fn bytearray_method_entry_for_name(name: &str) -> Option<unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject> {
     Some(match name {
+        "__len__" => bytes_dunder_len_entry,
+        "__contains__" => bytes_dunder_contains_entry,
+        "__getitem__" => bytearray_dunder_getitem_entry,
+        "__iter__" => bytearray_dunder_iter_entry,
         "append" => bytes_append_entry,
         "extend" => bytes_extend_entry,
         "insert" => bytes_insert_entry,
@@ -699,6 +788,28 @@ unsafe extern "C" fn str_len_slot(object: *mut PyObject) -> isize {
     match expect_str(object) {
         Ok(text) => isize::try_from(str_type::codepoint_len(&text)).unwrap_or(isize::MAX),
         Err(_) => -1,
+    }
+}
+
+/// `str.__len__(self)` native entry: the tp_dict seam that lets
+/// str-SUBCLASS instances (payload layout, no `sq_length` slot of their
+/// own) resolve `len()`/truth through MRO lookup — Cython truth-tests
+/// empty `EncodedString` calling conventions at parse time.
+unsafe extern "C" fn str_dunder_len_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 1 {
+        return raise_typed(
+            ExceptionKind::TypeError,
+            &format!("str.__len__() takes no arguments ({} given)", argc.saturating_sub(1)),
+        );
+    }
+    let receiver = crate::tag::untag_arg(unsafe { *argv });
+    match expect_str(receiver) {
+        Ok(text) => {
+            let len = str_type::codepoint_len(&text) as i64;
+            // SAFETY: Integer allocation helper follows the NULL-sentinel contract.
+            unsafe { super::pon_const_int(len) }
+        }
+        Err(message) => raise_typed(ExceptionKind::TypeError, &message),
     }
 }
 
@@ -834,6 +945,21 @@ unsafe extern "C" fn bytes_len_slot(object: *mut PyObject) -> isize {
     }
 }
 
+/// `bytes.__len__(self)` native entry for bytes-subclass payload instances.
+unsafe extern "C" fn bytes_dunder_len_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 1 {
+        return raise_typed(
+            ExceptionKind::TypeError,
+            &format!("bytes.__len__() takes no arguments ({} given)", argc.saturating_sub(1)),
+        );
+    }
+    let receiver = crate::tag::untag_arg(unsafe { *argv });
+    match expect_bytes_like(receiver) {
+        Ok(bytes) => unsafe { super::pon_const_int(bytes.len() as i64) },
+        Err(message) => raise_typed(ExceptionKind::TypeError, &message),
+    }
+}
+
 /// Byte-sequence OOB messages that must surface as typed `IndexError` so
 /// Python-level `except IndexError` works (re's `_optimize_charset` relies on
 /// catching the bytearray store failure to grow its charmap).
@@ -887,6 +1013,59 @@ unsafe extern "C" fn bytes_subscript_slot(object: *mut PyObject, key: *mut PyObj
             Err(message) => return_null_with_byte_index_error(message),
         }
     }
+}
+
+/// `bytes.__getitem__(self, index_or_slice)` native entry for payload subclasses.
+unsafe extern "C" fn bytes_dunder_getitem_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 2 {
+        return raise_typed(
+            ExceptionKind::TypeError,
+            &format!("bytes.__getitem__() takes exactly one argument ({} given)", argc.saturating_sub(1)),
+        );
+    }
+    let args = unsafe { core::slice::from_raw_parts(argv, argc) };
+    let receiver = crate::tag::untag_arg(args[0]);
+    let key = crate::tag::untag_arg(args[1]);
+    unsafe { bytes_subscript_slot(receiver, key) }
+}
+
+/// `bytes.__iter__(self)` native entry that iterates the embedded exact payload.
+unsafe extern "C" fn bytes_dunder_iter_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 1 {
+        return raise_typed(
+            ExceptionKind::TypeError,
+            &format!("bytes.__iter__() takes no arguments ({} given)", argc.saturating_sub(1)),
+        );
+    }
+    let receiver = crate::tag::untag_arg(unsafe { *argv });
+    unsafe { bytes_iter_slot(receiver) }
+}
+
+/// `bytearray.__getitem__(self, index_or_slice)` native entry; bytearray slices
+/// preserve mutability, unlike bytes slices.
+unsafe extern "C" fn bytearray_dunder_getitem_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 2 {
+        return raise_typed(
+            ExceptionKind::TypeError,
+            &format!("bytearray.__getitem__() takes exactly one argument ({} given)", argc.saturating_sub(1)),
+        );
+    }
+    let args = unsafe { core::slice::from_raw_parts(argv, argc) };
+    let receiver = crate::tag::untag_arg(args[0]);
+    let key = crate::tag::untag_arg(args[1]);
+    unsafe { bytearray_subscript_slot(receiver, key) }
+}
+
+/// `bytearray.__iter__(self)` native entry.
+unsafe extern "C" fn bytearray_dunder_iter_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 1 {
+        return raise_typed(
+            ExceptionKind::TypeError,
+            &format!("bytearray.__iter__() takes no arguments ({} given)", argc.saturating_sub(1)),
+        );
+    }
+    let receiver = crate::tag::untag_arg(unsafe { *argv });
+    unsafe { bytearray_iter_slot(receiver) }
 }
 
 unsafe extern "C" fn str_repeat_slot(object: *mut PyObject, count_object: *mut PyObject) -> *mut PyObject {
@@ -1196,6 +1375,10 @@ pub(crate) fn ensure_str_type_methods_installed(ty: *mut PyType) {
         ("swapcase", str_swapcase_entry),
         ("center", str_center_entry),
         ("ljust", str_ljust_entry),
+        ("__len__", str_dunder_len_entry),
+        ("__contains__", str_dunder_contains_entry),
+        ("__iter__", str_dunder_iter_entry),
+        ("__getitem__", str_dunder_getitem_entry),
         ("rjust", str_rjust_entry),
         ("zfill", str_zfill_entry),
         ("expandtabs", str_expandtabs_entry),
@@ -1364,11 +1547,12 @@ fn install_binary_type_methods(
 /// The instance-method names served type-level for `bytes`; every name must
 /// resolve through [`bytes_method_entry_for_name`].
 const BYTES_TYPE_METHOD_NAMES: &[&str] = &[
-    "split", "rsplit", "splitlines", "join", "replace", "find", "rfind", "index", "rindex", "count",
-    "startswith", "endswith", "decode", "strip", "lstrip", "rstrip", "upper", "lower", "title",
-    "capitalize", "swapcase", "center", "ljust", "rjust", "zfill", "expandtabs", "partition",
-    "rpartition", "removeprefix", "removesuffix", "isalpha", "isalnum", "isdigit", "isspace",
-    "isupper", "islower", "istitle", "isascii", "hex", "translate",
+    "__len__", "__contains__", "__getitem__", "__iter__", "split", "rsplit", "splitlines", "join",
+    "replace", "find", "rfind", "index", "rindex", "count", "startswith", "endswith", "decode",
+    "strip", "lstrip", "rstrip", "upper", "lower", "title", "capitalize", "swapcase", "center",
+    "ljust", "rjust", "zfill", "expandtabs", "partition", "rpartition", "removeprefix",
+    "removesuffix", "isalpha", "isalnum", "isdigit", "isspace", "isupper", "islower", "istitle",
+    "isascii", "hex", "translate",
 ];
 
 /// One-shot installer for the builtin `bytes` type object's `tp_dict` surface
@@ -3560,6 +3744,10 @@ fn str_slice_object(object: *mut PyObject, key: *mut PyObject) -> Result<*mut Py
 pub(crate) fn expect_bytes_like(value: *mut PyObject) -> Result<Vec<u8>, String> {
     if value.is_null() {
         return Err("expected bytes-like object, got NULL".to_owned());
+    }
+    let value = unsafe { crate::types::type_::payload_subclass_value(value) }.unwrap_or(value);
+    if !crate::tag::is_heap(value) {
+        return Err("expected bytes-like object".to_owned());
     }
     let ty = unsafe { (*value).ob_type };
     if bytes_type::is_bytes_type(ty) {

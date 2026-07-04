@@ -2180,8 +2180,8 @@ fn register_builtin_type_globals(runtime: &mut Runtime) {
             Some(builtin_frozenset_new),
             object_type,
         );
-        // Real `__new__`/`__repr__` (+`__str__`) entries for the data types
-        // enum mixes with; must run after the int/str globals exist.
+        // Real `__new__`/`__repr__` (+`__str__` for str) entries for the data
+        // types enum/Cython mix with; must run after int/str/bytes globals exist.
         install_data_type_dunders(runtime);
     }
 }
@@ -6049,8 +6049,8 @@ mod tests {
     }
 }
 
-/// Allocates a payload-subclass heap instance (`str`/`int`-derived class)
-/// with the extended layout: heap-instance prefix plus the canonical
+/// Allocates a payload-subclass heap instance (`str`/`int`/`bytes`-derived
+/// class) with the extended layout: heap-instance prefix plus the canonical
 /// builtin payload slot.
 pub(crate) unsafe fn alloc_payload_subclass_instance(
     cls: *mut PyType,
@@ -6086,10 +6086,10 @@ pub(crate) unsafe fn alloc_payload_subclass_instance(
     .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
 }
 
-/// Core of the Python-visible `int.__new__`/`str.__new__` staticmethod
-/// carriers: validate the class argument, build the canonical value with the
-/// builtin constructor, and wrap it in the payload-subclass layout when the
-/// class is a Python subclass of the owner.
+/// Core of the Python-visible `int.__new__`/`str.__new__`/`bytes.__new__`
+/// staticmethod carriers: validate the class argument, build the canonical
+/// value with the builtin constructor, and wrap it in the payload-subclass
+/// layout when the class is a Python subclass of the owner.
 unsafe fn data_type_dunder_new_common(
     owner: &'static str,
     constructor: BuiltinConstructor,
@@ -6144,6 +6144,10 @@ unsafe extern "C" fn str_dunder_new_native(argv: *mut *mut PyObject, argc: usize
     unsafe { data_type_dunder_new_common("str", crate::native::builtins_mod::builtin_str, argv, argc) }
 }
 
+unsafe extern "C" fn bytes_dunder_new_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { data_type_dunder_new_common("bytes", crate::native::builtins_mod::builtin_bytes, argv, argc) }
+}
+
 /// `<data type>.__repr__(self)` — repr of the receiver's canonical value
 /// (payload-subclass receivers read through their payload).
 unsafe extern "C" fn data_type_dunder_repr_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -6167,16 +6171,18 @@ unsafe extern "C" fn data_type_dunder_str_native(argv: *mut *mut PyObject, argc:
     unsafe { pon_const_str(text.as_ptr(), text.len()) }
 }
 
-/// Data-type dunder surface for `int` and `str`: a real `__new__`
+/// Data-type dunder surface for `int`, `str`, and `bytes`: a real `__new__`
 /// (staticmethod carrier, payload-subclass aware) plus `__repr__` (and
-/// `__str__` on `str` only — CPython dict containment), so enum's
+/// `__str__` on `str` only — CPython dict containment), so enum/Cython
 /// `_find_data_type_`/`_find_data_repr_`/`_find_new_` probes hold.
 fn install_data_type_dunders(runtime: &mut Runtime) {
     let long_type = runtime.long_type;
     let unicode_type = runtime.unicode_type;
-    let entries: [(*mut PyType, *const u8, bool); 2] = [
+    let bytes_type = bytes_::bytes_type();
+    let entries: [(*mut PyType, *const u8, bool); 3] = [
         (long_type, int_dunder_new_native as *const u8, false),
         (unicode_type, str_dunder_new_native as *const u8, true),
+        (bytes_type, bytes_dunder_new_native as *const u8, false),
     ];
     for (ty, new_entry, with_str) in entries {
         if ty.is_null() {

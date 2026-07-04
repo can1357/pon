@@ -243,9 +243,13 @@ unsafe fn construct_with_base(object: *mut PyObject, base_object: *mut PyObject)
     }
 }
 
-/// Borrows the payload of an exact bytes or bytearray object.
+/// Borrows the payload of an exact bytes/bytearray object or bytes payload subclass.
 unsafe fn bytes_like_slice<'a>(object: *mut PyObject) -> Option<&'a [u8]> {
     if object.is_null() {
+        return None;
+    }
+    let object = unsafe { crate::types::type_::payload_subclass_value(object) }.unwrap_or(object);
+    if !crate::tag::is_heap(object) {
         return None;
     }
     let ty = unsafe { (*object).ob_type };
@@ -473,6 +477,7 @@ pub(crate) fn ensure_int_type_methods_installed(ty: *mut PyType) {
         ("__floor__", int_identity_method),
         ("__ceil__", int_identity_method),
         ("__add__", int_dunder_add_entry),
+        ("__bool__", int_dunder_bool_entry),
         ("__format__", int_dunder_format_entry),
     ];
     for (name, entry) in natives {
@@ -562,6 +567,20 @@ unsafe fn int_method_receiver(argv: *mut *mut PyObject, argc: usize, name: &str)
         return Err(raise_type_error(&format!("int.{name}() takes no arguments ({} given)", argc - 1)));
     }
     Ok(value)
+}
+
+/// `int.__bool__(self)`: nonzero test.  The tp_dict seam lets payload int
+/// SUBCLASS instances (heap layout, no `nb_bool` slot of their own)
+/// truth-test through MRO lookup — `bool(IntSubclass(0))` must be False.
+unsafe extern "C" fn int_dunder_bool_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    match unsafe { int_method_receiver(argv, argc, "__bool__") } {
+        Ok(value) => {
+            use num_traits::Zero;
+            // SAFETY: Bool constructor returns the shared singletons.
+            unsafe { crate::abi::number::pon_const_bool(i32::from(!value.is_zero())) }
+        }
+        Err(raised) => raised,
+    }
 }
 
 /// `int.__format__(self, format_spec)` — the real formatting method CPython

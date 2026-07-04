@@ -167,28 +167,27 @@ pub fn new_namespace() -> *mut PyClassDict {
 }
 
 /// GC type id for heap instances embedding a builtin data-type payload
-/// (`str`/`int` subclasses); class-instance family next to
+/// (`str`/`int`/`bytes` subclasses); class-instance family next to
 /// [`TYPE_ID_HEAP_INSTANCE`].
 pub const TYPE_ID_PAYLOAD_SUBCLASS_INSTANCE: TypeId = TypeId(108);
 
-/// Heap-class instance carrying a canonical builtin payload (`str`/`int`
-/// subclasses). Mirrors `PyDictSubclassInstance`: the generic heap-instance
-/// prefix keeps every instance-attribute, slot, and weakref path working
-/// unchanged, while `value` holds the canonical builtin object the native
-/// protocol reads through.
+/// Heap-class instance carrying a canonical builtin payload (`str`/`int`/
+/// `bytes` subclasses). Mirrors `PyDictSubclassInstance`: the generic
+/// heap-instance prefix keeps every instance-attribute, slot, and weakref path
+/// working unchanged, while `value` holds the canonical builtin object the
+/// native protocol reads through.
 #[repr(C)]
 #[derive(Debug)]
 pub struct PyPayloadSubclassInstance {
     /// Generic heap-instance prefix; must remain first.
     pub base: PyHeapInstance,
-    /// Canonical builtin payload: a heap `str`, or a tagged/heap `int`.
+    /// Canonical builtin payload: heap `str`, exact `bytes`, or a tagged/heap `int`.
     pub value: *mut PyObject,
 }
 
 /// Names of builtin data types whose Python subclasses embed a canonical
-/// payload ([`PyPayloadSubclassInstance`] layout).  Deliberately narrow:
-/// widening to float/bytes/tuple must first audit their subclass users.
-const PAYLOAD_BASE_NAMES: [&str; 2] = ["str", "int"];
+/// payload ([`PyPayloadSubclassInstance`] layout).
+const PAYLOAD_BASE_NAMES: [&str; 3] = ["str", "int", "bytes"];
 
 /// Returns whether `ty` is a heap class using the payload-subclass layout.
 #[must_use]
@@ -210,7 +209,7 @@ pub unsafe fn is_payload_subclass_instance(object: *mut PyObject) -> bool {
         && unsafe { type_is_payload_subclass((*object).ob_type.cast_mut()) }
 }
 
-/// Embedded canonical payload of a `str`/`int`-subclass instance, when set.
+/// Embedded canonical payload of a `str`/`int`/`bytes`-subclass instance, when set.
 #[must_use]
 pub unsafe fn payload_subclass_value(object: *mut PyObject) -> Option<*mut PyObject> {
     if unsafe { !is_payload_subclass_instance(object) } {
@@ -221,7 +220,7 @@ pub unsafe fn payload_subclass_value(object: *mut PyObject) -> Option<*mut PyObj
 }
 
 /// Returns whether a class built over `bases` embeds a builtin data-type
-/// payload: some base linearizes over `str` or `int`.  Mirrors
+/// payload: some base linearizes over `str`, `int`, or `bytes`.  Mirrors
 /// `dict::class_bases_embed_dict` (non-heap name match).
 #[must_use]
 pub unsafe fn class_bases_embed_payload(bases: &[*mut PyType]) -> bool {
@@ -237,8 +236,8 @@ pub unsafe fn class_bases_embed_payload(bases: &[*mut PyType]) -> bool {
 }
 
 /// Traces GC references of a payload-subclass instance: the heap-instance
-/// prefix plus the embedded payload (heap payloads only; tagged ints carry
-/// no allocation).
+/// prefix plus the embedded payload (heap payloads only; tagged ints and
+/// non-GC boxed bytes carry no allocation in the managed heap).
 pub unsafe extern "C" fn trace_payload_subclass_instance(object: *mut u8, visitor: &mut dyn FnMut(*mut u8)) {
     if object.is_null() {
         return;
@@ -664,7 +663,7 @@ unsafe fn metaclass_construction_hooks(meta: *mut PyType) -> MetaclassHooks {
     let new_id = intern::intern("__new__");
     let init_id = intern::intern("__init__");
     for cls in unsafe { mro::mro_entries(meta) } {
-        if cls == type_type {
+        if cls == type_type || unsafe { !cls.is_null() && (*cls).gc_type_id != TYPE_ID_HEAP_INSTANCE.0 as usize && (*cls).name() == "type" } {
             break;
         }
         if cls.is_null() {
@@ -929,7 +928,7 @@ unsafe fn find_prepare_hook(meta: *mut PyType) -> *mut PyObject {
     }
     let prepare_id = intern::intern("__prepare__");
     for cls in unsafe { mro::mro_entries(meta) } {
-        if cls == type_type {
+        if cls == type_type || unsafe { !cls.is_null() && (*cls).gc_type_id != TYPE_ID_HEAP_INSTANCE.0 as usize && (*cls).name() == "type" } {
             break;
         }
         if cls.is_null() {
@@ -1391,6 +1390,18 @@ unsafe fn construct_class(
         return ptr::null_mut();
     }
 
+    // Every builtin ancestor's native tp_dict method surface must exist
+    // before MRO lookups on the new class resolve through it: truth-testing
+    // an empty `str` subclass needs `str.__len__` visible even when the
+    // builtin type was never touched at type level in this process.
+    for &base in base_types {
+        for entry in unsafe { crate::mro::mro_entries(base) } {
+            if !entry.is_null() && unsafe { (*entry).gc_type_id != TYPE_ID_HEAP_INSTANCE.0 as usize } {
+                unsafe { crate::descr::ensure_builtin_type_surface(entry) };
+            }
+        }
+    }
+
     let static_name = leak_type_name(name);
     // Classes linearizing over the builtin `dict` embed native dict storage in
     // their instances; the distinct basicsize doubles as the layout marker
@@ -1434,8 +1445,8 @@ unsafe fn construct_class(
         crate::types::weakref::ensure_weakref_subclass_surface();
         mem::size_of::<PyPayloadSubclassInstance>()
     } else if unsafe { class_bases_embed_payload(base_types) } {
-        // Classes linearizing over `str`/`int` embed a canonical payload
-        // slot; the distinct basicsize is the layout marker
+        // Classes linearizing over `str`/`int`/`bytes` embed a canonical
+        // payload slot; the distinct basicsize is the layout marker
         // (`type_is_payload_subclass`).
         mem::size_of::<PyPayloadSubclassInstance>()
     } else if derives_exception_group {
@@ -1729,7 +1740,7 @@ pub unsafe extern "C" fn type_new(cls: *mut PyType, args: *mut PyObject, _kwargs
     }
     if unsafe { type_is_payload_subclass(cls) } {
         // Payload-derived classes allocate the extended layout; the payload
-        // slot starts empty and is filled by `str.__new__`/`int.__new__`.
+        // slot starts empty and is filled by `str.__new__`/`int.__new__`/`bytes.__new__`.
         return match unsafe { abi::alloc_payload_subclass_instance(cls, dict, slots, ptr::null_mut()) } {
             Ok(object) => object,
             Err(message) => raise_object(message),

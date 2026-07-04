@@ -617,6 +617,17 @@ pub unsafe fn object_equal(left: *mut PyObject, right: *mut PyObject) -> Result<
     }
 }
 
+unsafe fn bytes_payload_slice<'a>(object: *mut PyObject) -> Option<&'a [u8]> {
+    let object = unsafe { crate::types::type_::payload_subclass_value(object) }.unwrap_or(object);
+    if object.is_null() || !crate::tag::is_heap(object) {
+        return None;
+    }
+    if unsafe { type_name(object) } != Some("bytes") {
+        return None;
+    }
+    Some(unsafe { (*object.cast::<crate::types::bytes_::PyBytes>()).as_slice() })
+}
+
 /// Structural-only equality: `None` means the pair needs Python-level
 /// `__eq__` dispatch, which the caller must run WITHOUT holding a storage
 /// borrow or the runtime lock.
@@ -656,6 +667,13 @@ unsafe fn object_equal_structural(left: *mut PyObject, right: *mut PyObject) -> 
         unsafe { crate::types::type_::unicode_text(right) },
     ) {
         return Some(Ok(left_text.as_bytes() == right_text.as_bytes()));
+    }
+
+    if let (Some(left_bytes), Some(right_bytes)) = (
+        unsafe { bytes_payload_slice(left) },
+        unsafe { bytes_payload_slice(right) },
+    ) {
+        return Some(Ok(left_bytes == right_bytes));
     }
 
     // Tuple-storage keying parity across layouts: an exact tuple and a
@@ -919,7 +937,7 @@ fn hash_object_non_numeric(object: *mut PyObject) -> Result<isize, String> {
         }
     }
     if let Some(value) = unsafe { crate::types::type_::payload_subclass_value(object) } {
-        if unsafe { type_name(value) } == Some("str") {
+        if matches!(unsafe { type_name(value) }, Some("str" | "bytes")) {
             return unsafe { hash_object(value) };
         }
     }

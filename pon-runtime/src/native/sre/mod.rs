@@ -351,13 +351,17 @@ enum Subject {
 impl Subject {
     fn from_object(object: *mut PyObject) -> Option<Subject> {
         let object = untag(object);
+        // str/bytes-subclass instances (payload layout — Cython's
+        // `EncodedString`/`BytesLiteral` subjects) read through their embedded
+        // canonical payload.
+        let object = unsafe { crate::types::type_::payload_subclass_value(object) }.unwrap_or(object);
         // SAFETY: heap-or-NULL after untagging; accessors reject NULL.
         if let Some(text) = unsafe { unicode_text(object) } {
             let mut offsets: Vec<usize> = text.char_indices().map(|(index, _)| index).collect();
             offsets.push(text.len());
             return Some(Subject::Str { text: text.to_owned(), offsets });
         }
-        if !object.is_null() && bytes_::is_bytes_type(unsafe { (*object).ob_type }) {
+        if !object.is_null() && crate::tag::is_heap(object) && bytes_::is_bytes_type(unsafe { (*object).ob_type }) {
             // SAFETY: The type check above guarantees a live `PyBytes`.
             let data = unsafe { (*object.cast::<bytes_::PyBytes>()).as_slice() }.to_vec();
             return Some(Subject::Bytes { data });
@@ -683,7 +687,8 @@ unsafe fn pattern_method_prelude<'a>(
         return None;
     };
     let Some(subject) = Subject::from_object(args[subject_index]) else {
-        pon_err_set(format!("{name}() expected a str or bytes subject"));
+        let got = unsafe { crate::types::dict::type_name(untag(args[subject_index])) }.unwrap_or("object");
+        pon_err_set(format!("{name}() expected a str or bytes subject, got '{got}'"));
         return None;
     };
     Some((pattern, subject, args))
