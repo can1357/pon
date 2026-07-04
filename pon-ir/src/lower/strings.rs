@@ -10,7 +10,27 @@ pub(super) fn lower_f_string(
     scope: &mut BodyScope,
     expr: &ruff_python_ast::ExprFString,
 ) -> Result<Value, LowerError> {
-    let parts = lower_f_string_parts(driver, scope, expr.value.elements())?;
+    // Walk the implicit-concatenation PARTS, not `value.elements()`: ruff's
+    // `FStringValue::elements()` yields only the f-string parts' elements,
+    // silently dropping plain string literals mixed into the concatenation
+    // (`"#define X {" f"{cname};" "%s" "}"` — Cython's ModuleNode builds C
+    // macros exactly this way).
+    let mut parts = Vec::new();
+    for part in expr.value.iter() {
+        match part {
+            ruff_python_ast::FStringPart::Literal(literal) => {
+                let value = scope.emit(InstKind::Const(PyConst::Str(literal.value.to_string())))?;
+                parts.push(FStrPart::Interp {
+                    value,
+                    conversion: 0,
+                    format_spec: None,
+                });
+            }
+            ruff_python_ast::FStringPart::FString(fstring) => {
+                parts.extend(lower_f_string_parts(driver, scope, fstring.elements.iter())?);
+            }
+        }
+    }
     scope.emit(InstKind::BuildString { parts })
 }
 
