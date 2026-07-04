@@ -25,6 +25,7 @@ num-integer.workspace = true
 num-traits.workspace = true
 openssl.workspace = true
 bzip2.workspace = true
+flate2.workspace = true
 blake2.workspace = true
 md-5.workspace = true
 sha1.workspace = true
