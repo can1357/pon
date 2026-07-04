@@ -1880,6 +1880,44 @@ mod tests {
     }
 
     #[test]
+    fn prefixed_diagnostic_text_installs_catchable_exception() {
+        let _guard = test_state_lock();
+        unsafe {
+            reset_exception_state();
+            let types = exception_types();
+
+            assert!(raise_prefixed_diagnostic_text("FileNotFoundError: [Errno 2] No such file or directory"));
+            let current = thread_state_lock().current_exc;
+            assert!(!current.is_null());
+            assert!(!is_diagnostic_sentinel(current));
+            assert_eq!(pon_exc_matches(types.file_not_found_error.cast::<PyObject>()), 1);
+            assert_eq!(pon_exc_matches(types.os_error.cast::<PyObject>()), 1);
+            assert_eq!(
+                pon_err_message().as_deref(),
+                Some("FileNotFoundError: [Errno 2] No such file or directory"),
+            );
+            reset_exception_state();
+        }
+    }
+
+    #[test]
+    fn pon_raise_preserves_message_only_sentinel() {
+        let _guard = test_state_lock();
+        unsafe {
+            reset_exception_state();
+            ensure_runtime_for_exc().unwrap();
+            pon_err_set("legacy diagnostic");
+            let sentinel = thread_state_lock().current_exc;
+            assert!(is_diagnostic_sentinel(sentinel));
+
+            assert!(pon_raise(sentinel, ptr::null_mut()).is_null());
+            assert_eq!(thread_state_lock().current_exc, sentinel);
+            assert_eq!(pon_err_message().as_deref(), Some("legacy diagnostic"));
+            reset_exception_state();
+        }
+    }
+
+    #[test]
     fn object_safe_match_and_current_exception_helpers_return_none_on_miss() {
         let _guard = test_state_lock();
         unsafe {
