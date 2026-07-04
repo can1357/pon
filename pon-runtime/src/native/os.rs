@@ -54,6 +54,11 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
         return Err(format!("failed to allocate {module}.stat"));
     }
     attrs.push((intern("stat"), stat));
+    let mut listdir_defaults = unsafe { [pon_const_str(b".".as_ptr(), 1)] };
+    if listdir_defaults.iter().any(|value| value.is_null()) {
+        return Err(format!("failed to allocate {module}.listdir defaults"));
+    }
+    attrs.push(phase_b_function_attr("listdir", os_listdir, &["path"], &mut listdir_defaults)?);
     // `random` imports `urandom` at module top for its default seeding path.
     let urandom = unsafe { crate::abi::pon_make_function(os_urandom as *const u8, 1, intern("urandom")) };
     if urandom.is_null() {
@@ -1174,11 +1179,53 @@ fn call_walk_onerror(walk: &PyWalk, error: WalkIoError) -> Result<(), *mut PyObj
     };
     let mut args = [exception];
     let result = unsafe { crate::abi::pon_call(walk.onerror, args.as_mut_ptr(), args.len()) };
+
     if result.is_null() {
         Err(std::ptr::null_mut())
     } else {
         Ok(())
     }
+}
+
+/// `os.listdir(path='.')`: names in directory iteration order, excluding
+/// the synthetic `.` and `..` entries.
+unsafe extern "C" fn os_listdir(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() > 1 {
+        return crate::abi::return_null_with_error("os.listdir expected at most one argument");
+    }
+    let path = if args.first().copied().is_none_or(is_none_value) {
+        ".".to_owned()
+    } else {
+        match path_arg(args[0], "listdir") {
+            Ok(path) => path,
+            Err(error) => return error,
+        }
+    };
+    if let Err(error) = c_path(&path) {
+        return error;
+    }
+    let entries = match std::fs::read_dir(&path) {
+        Ok(entries) => entries,
+        Err(error) => return raise_errno(error.raw_os_error().unwrap_or(libc::EIO), Some(&path)),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => return raise_errno(error.raw_os_error().unwrap_or(libc::EIO), Some(&path)),
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let object = unsafe { pon_const_str(name.as_ptr(), name.len()) };
+        if object.is_null() {
+            return std::ptr::null_mut();
+        }
+        names.push(object);
+    }
+    unsafe { crate::abi::seq::pon_build_list(names.as_mut_ptr(), names.len()) }
 }
 
 fn walk_join(top: &str, name: &str) -> String {
