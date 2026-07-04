@@ -50,7 +50,7 @@
 //! that only catch `UnicodeDecodeError` (documented divergence: CPython
 //! would succeed with lone surrogates; see [`utf8_decode_core`]).
 //! Exotic codec functions (`utf_16_*`, `utf_32_*`, `utf_7_*`,
-//! `charmap_*`, `*_escape_*`, `readbuffer_encode`) are exported so
+//! `charmap_*`, `escape_*`, `readbuffer_encode`) are exported so
 //! `from _codecs import *` succeeds, and raise `NotImplementedError` when
 //! called.
 //!
@@ -59,6 +59,7 @@
 //! the collector cannot trace; [`gc_held_roots`] reports them, mirroring
 //! `_contextvars`.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ptr;
 use std::sync::Mutex;
@@ -87,7 +88,7 @@ struct State {
     error_handlers: HashMap<String, usize>,
     /// The module's own codec function objects, reused when constructing
     /// builtin `CodecInfo`s (index by [`BuiltinCodec`]).
-    builtin_fns: Option<[usize; 6]>,
+    builtin_fns: Option<[usize; 10]>,
     /// Whether the lazy one-shot `import encodings` ran (or failed) already.
     encodings_probed: bool,
 }
@@ -105,7 +106,7 @@ fn state() -> std::sync::MutexGuard<'static, State> {
 pub(crate) fn gc_held_roots() -> Vec<*mut PyObject> {
     let state = state();
     let mut roots = Vec::with_capacity(
-        state.search_functions.len() + state.cache.len() + state.error_handlers.len() + 6,
+        state.search_functions.len() + state.cache.len() + state.error_handlers.len() + 10,
     );
     roots.extend(state.search_functions.iter().map(|&p| p as *mut PyObject));
     roots.extend(state.cache.values().map(|&p| p as *mut PyObject));
@@ -125,6 +126,8 @@ enum BuiltinCodec {
     Utf8 = 0,
     Ascii = 1,
     Latin1 = 2,
+    UnicodeEscape = 3,
+    RawUnicodeEscape = 4,
 }
 
 impl BuiltinCodec {
@@ -134,6 +137,8 @@ impl BuiltinCodec {
             BuiltinCodec::Utf8 => "utf-8",
             BuiltinCodec::Ascii => "ascii",
             BuiltinCodec::Latin1 => "iso8859-1",
+            BuiltinCodec::UnicodeEscape => "unicode-escape",
+            BuiltinCodec::RawUnicodeEscape => "raw-unicode-escape",
         }
     }
 
@@ -144,6 +149,8 @@ impl BuiltinCodec {
             BuiltinCodec::Utf8 => "encodings.utf_8",
             BuiltinCodec::Ascii => "encodings.ascii",
             BuiltinCodec::Latin1 => "encodings.latin_1",
+            BuiltinCodec::UnicodeEscape => "encodings.unicode_escape",
+            BuiltinCodec::RawUnicodeEscape => "encodings.raw_unicode_escape",
         }
     }
 
@@ -153,12 +160,14 @@ impl BuiltinCodec {
             BuiltinCodec::Utf8 => "utf-8",
             BuiltinCodec::Ascii => "ascii",
             BuiltinCodec::Latin1 => "latin-1",
+            BuiltinCodec::UnicodeEscape => "unicodeescape",
+            BuiltinCodec::RawUnicodeEscape => "rawunicodeescape",
         }
     }
 }
 
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
-    let mut attrs: Vec<(u32, *mut PyObject)> = Vec::with_capacity(48);
+    let mut attrs: Vec<(u32, *mut PyObject)> = Vec::with_capacity(52);
     // SAFETY: Runtime allocation helper; NULL is checked below.
     let name_obj = unsafe { abi::pon_const_str(b"_codecs".as_ptr(), 7) };
     if name_obj.is_null() {
@@ -192,6 +201,11 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
     let ascii_decode = module_fn("ascii_decode", ascii_decode_entry)?;
     let latin_1_encode = module_fn("latin_1_encode", latin_1_encode_entry)?;
     let latin_1_decode = module_fn("latin_1_decode", latin_1_decode_entry)?;
+    let unicode_escape_encode = module_fn("unicode_escape_encode", unicode_escape_encode_entry)?;
+    let unicode_escape_decode = module_fn("unicode_escape_decode", unicode_escape_decode_entry)?;
+    let raw_unicode_escape_encode = module_fn("raw_unicode_escape_encode", raw_unicode_escape_encode_entry)?;
+    let raw_unicode_escape_decode = module_fn("raw_unicode_escape_decode", raw_unicode_escape_decode_entry)?;
+
 
     for (name, entry) in STUB_CODEC_FNS {
         module_fn(name, *entry)?;
@@ -227,6 +241,10 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
             ascii_decode as usize,
             latin_1_encode as usize,
             latin_1_decode as usize,
+            unicode_escape_encode as usize,
+            unicode_escape_decode as usize,
+            raw_unicode_escape_encode as usize,
+            raw_unicode_escape_decode as usize,
         ]);
         for (name, handler) in handlers {
             state.error_handlers.entry(name.to_owned()).or_insert(handler as usize);
@@ -272,10 +290,6 @@ stub_codec_fns!(
     ("utf_32_le_decode", utf_32_le_decode_entry),
     ("utf_32_be_decode", utf_32_be_decode_entry),
     ("utf_32_ex_decode", utf_32_ex_decode_entry),
-    ("unicode_escape_encode", unicode_escape_encode_entry),
-    ("unicode_escape_decode", unicode_escape_decode_entry),
-    ("raw_unicode_escape_encode", raw_unicode_escape_encode_entry),
-    ("raw_unicode_escape_decode", raw_unicode_escape_decode_entry),
     ("charmap_encode", charmap_encode_entry),
     ("charmap_decode", charmap_decode_entry),
     ("charmap_build", charmap_build_entry),
@@ -360,6 +374,32 @@ fn bytes_arg<'a>(object: *mut PyObject, what: &str) -> Result<&'a [u8], String> 
     if bytearray_type::is_bytearray_type(ty) {
         // SAFETY: Type check above proved the layout.
         return Ok(unsafe { (*object.cast::<bytearray_type::PyByteArray>()).as_slice() });
+    }
+    Err(format!("{what} must be a bytes-like object, not {}", value_type_name(object)))
+}
+
+/// Borrows codec input accepted by CPython's escape decoders: bytes,
+/// bytearray, or a str reinterpreted as its UTF-8 bytes.
+fn bytes_or_str_arg<'a>(object: *mut PyObject, what: &str) -> Result<Cow<'a, [u8]>, String> {
+    let object = untag(object);
+    if object.is_null() {
+        return Err(format!("{what} must be a bytes-like object, not NULL"));
+    }
+    // SAFETY: `untag` normalized the pointer; `unicode_text` type-checks.
+    if let Some(text) = unsafe { type_mod::unicode_text(object) } {
+        return Ok(Cow::Borrowed(text.as_bytes()));
+    }
+    // SAFETY: A non-NULL heap object carries a live header.
+    let ty = unsafe { (*object).ob_type };
+    if bytes_type::is_bytes_type(ty) {
+        // SAFETY: Type check above proved the layout.
+        return Ok(Cow::Borrowed(unsafe { (*object.cast::<bytes_type::PyBytes>()).as_slice() }));
+    }
+    if bytearray_type::is_bytearray_type(ty) {
+        // SAFETY: Type check above proved the layout.
+        return Ok(Cow::Borrowed(unsafe {
+            (*object.cast::<bytearray_type::PyByteArray>()).as_slice()
+        }));
     }
     Err(format!("{what} must be a bytes-like object, not {}", value_type_name(object)))
 }
@@ -632,6 +672,386 @@ pub(crate) fn latin1_decode_core(bytes: &[u8]) -> String {
     bytes.iter().map(|&byte| char::from(byte)).collect()
 }
 
+#[derive(Clone, Copy)]
+enum EscapeCodec {
+    Unicode,
+    RawUnicode,
+}
+
+impl EscapeCodec {
+    fn error_name(self) -> &'static str {
+        match self {
+            EscapeCodec::Unicode => "unicodeescape",
+            EscapeCodec::RawUnicode => "rawunicodeescape",
+        }
+    }
+
+    fn out_of_range_reason(self) -> &'static str {
+        match self {
+            EscapeCodec::Unicode => "illegal Unicode character",
+            EscapeCodec::RawUnicode => "\\Uxxxxxxxx out of range",
+        }
+    }
+}
+
+fn escape_decode_error_message(codec: EscapeCodec, bytes: &[u8], start: usize, end: usize, reason: &str) -> String {
+    if end == start + 1 {
+        format!(
+            "'{}' codec can't decode byte 0x{:02x} in position {}: {}",
+            codec.error_name(),
+            bytes[start],
+            start,
+            reason,
+        )
+    } else {
+        format!(
+            "'{}' codec can't decode bytes in position {}-{}: {}",
+            codec.error_name(),
+            start,
+            end - 1,
+            reason,
+        )
+    }
+}
+
+fn handle_escape_decode_error(
+    out: &mut String,
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    errors: &str,
+    message: String,
+) -> Result<(), CoreError> {
+    match errors {
+        "strict" => Err(CoreError::Decode(message)),
+        "ignore" => Ok(()),
+        "replace" => {
+            out.push('\u{FFFD}');
+            Ok(())
+        }
+        "backslashreplace" => {
+            for byte in &bytes[start..end] {
+                out.push_str(&format!("\\x{byte:02x}"));
+            }
+            Ok(())
+        }
+        "surrogateescape" => Err(CoreError::Decode(message)),
+        _ => Err(unknown_handler(errors)),
+    }
+}
+
+fn hex_value(byte: u8) -> Option<u32> {
+    match byte {
+        b'0'..=b'9' => Some(u32::from(byte - b'0')),
+        b'a'..=b'f' => Some(u32::from(byte - b'a') + 10),
+        b'A'..=b'F' => Some(u32::from(byte - b'A') + 10),
+        _ => None,
+    }
+}
+
+fn parse_hex_escape(
+    bytes: &[u8],
+    start: usize,
+    digits: usize,
+    final_: bool,
+    codec: EscapeCodec,
+    truncated_reason: &'static str,
+) -> Result<Option<(u32, usize)>, CoreError> {
+    let mut value = 0u32;
+    let mut cursor = start + 2;
+    let end = start + 2 + digits;
+    while cursor < bytes.len() && cursor < end {
+        let Some(digit) = hex_value(bytes[cursor]) else {
+            break;
+        };
+        value = (value << 4) | digit;
+        cursor += 1;
+    }
+    if cursor == end {
+        return Ok(Some((value, cursor)));
+    }
+    if cursor == bytes.len() && !final_ {
+        return Ok(None);
+    }
+    let error_end = cursor.max(start + 2);
+    Err(CoreError::Decode(escape_decode_error_message(
+        codec,
+        bytes,
+        start,
+        error_end,
+        truncated_reason,
+    )))
+}
+
+fn push_unicode_codepoint(
+    out: &mut String,
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    value: u32,
+    codec: EscapeCodec,
+    errors: &str,
+) -> Result<(), CoreError> {
+    if let Some(ch) = char::from_u32(value) {
+        out.push(ch);
+        return Ok(());
+    }
+    let message = escape_decode_error_message(codec, bytes, start, end, codec.out_of_range_reason());
+    handle_escape_decode_error(out, bytes, start, end, errors, message)
+}
+
+fn unicode_name_lookup(name: &str) -> Option<char> {
+    match name {
+        "BULLET" => Some('\u{2022}'),
+        _ => None,
+    }
+}
+
+fn decode_unicode_name_escape(
+    out: &mut String,
+    bytes: &[u8],
+    start: usize,
+    final_: bool,
+    errors: &str,
+) -> Result<Option<usize>, CoreError> {
+    if start + 2 >= bytes.len() {
+        if final_ {
+            let end = bytes.len();
+            let message = escape_decode_error_message(EscapeCodec::Unicode, bytes, start, end, "malformed \\N character escape");
+            handle_escape_decode_error(out, bytes, start, end, errors, message)?;
+            return Ok(Some(end));
+        }
+        return Ok(None);
+    }
+    if bytes[start + 2] != b'{' {
+        let end = start + 2;
+        let message = escape_decode_error_message(EscapeCodec::Unicode, bytes, start, end, "malformed \\N character escape");
+        handle_escape_decode_error(out, bytes, start, end, errors, message)?;
+        return Ok(Some(end));
+    }
+    let mut cursor = start + 3;
+    while cursor < bytes.len() && bytes[cursor] != b'}' {
+        cursor += 1;
+    }
+    if cursor == bytes.len() {
+        if !final_ {
+            return Ok(None);
+        }
+        let message = escape_decode_error_message(EscapeCodec::Unicode, bytes, start, bytes.len(), "malformed \\N character escape");
+        handle_escape_decode_error(out, bytes, start, bytes.len(), errors, message)?;
+        return Ok(Some(bytes.len()));
+    }
+    let name = core::str::from_utf8(&bytes[start + 3..cursor]).unwrap_or("");
+    if let Some(ch) = unicode_name_lookup(name) {
+        out.push(ch);
+        return Ok(Some(cursor + 1));
+    }
+    let message = escape_decode_error_message(EscapeCodec::Unicode, bytes, start, cursor + 1, "unknown Unicode character name");
+    handle_escape_decode_error(out, bytes, start, cursor + 1, errors, message)?;
+    Ok(Some(cursor + 1))
+}
+
+fn decode_unicode_escape_core(
+    bytes: &[u8],
+    errors: &str,
+    final_: bool,
+    codec: EscapeCodec,
+) -> Result<(String, usize), CoreError> {
+    let mut out = String::with_capacity(bytes.len());
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let byte = bytes[pos];
+        if byte != b'\\' {
+            out.push(char::from(byte));
+            pos += 1;
+            continue;
+        }
+        let start = pos;
+        if pos + 1 >= bytes.len() {
+            if !final_ {
+                return Ok((out, start));
+            }
+            if matches!(codec, EscapeCodec::RawUnicode) {
+                out.push('\\');
+                pos = start + 1;
+                continue;
+            }
+            let message = escape_decode_error_message(codec, bytes, start, start + 1, "\\ at end of string");
+            handle_escape_decode_error(&mut out, bytes, start, start + 1, errors, message)?;
+            pos = start + 1;
+            continue;
+        }
+        let escaped = bytes[pos + 1];
+        if matches!(codec, EscapeCodec::RawUnicode) {
+            match escaped {
+                b'u' | b'U' => {}
+                _ => {
+                    out.push('\\');
+                    out.push(char::from(escaped));
+                    pos += 2;
+                    continue;
+                }
+            }
+        }
+        match escaped {
+            b'\n' if matches!(codec, EscapeCodec::Unicode) => {
+                pos += 2;
+            }
+            b'\'' if matches!(codec, EscapeCodec::Unicode) => {
+                out.push('\'');
+                pos += 2;
+            }
+            b'"' if matches!(codec, EscapeCodec::Unicode) => {
+                out.push('"');
+                pos += 2;
+            }
+            b'\\' if matches!(codec, EscapeCodec::Unicode) => {
+                out.push('\\');
+                pos += 2;
+            }
+            b'a' if matches!(codec, EscapeCodec::Unicode) => {
+                out.push('\u{0007}');
+                pos += 2;
+            }
+            b'b' if matches!(codec, EscapeCodec::Unicode) => {
+                out.push('\u{0008}');
+                pos += 2;
+            }
+            b'f' if matches!(codec, EscapeCodec::Unicode) => {
+                out.push('\u{000C}');
+                pos += 2;
+            }
+            b'n' if matches!(codec, EscapeCodec::Unicode) => {
+                out.push('\n');
+                pos += 2;
+            }
+            b'r' if matches!(codec, EscapeCodec::Unicode) => {
+                out.push('\r');
+                pos += 2;
+            }
+            b't' if matches!(codec, EscapeCodec::Unicode) => {
+                out.push('\t');
+                pos += 2;
+            }
+            b'v' if matches!(codec, EscapeCodec::Unicode) => {
+                out.push('\u{000B}');
+                pos += 2;
+            }
+            b'0'..=b'7' if matches!(codec, EscapeCodec::Unicode) => {
+                let mut value = u32::from(escaped - b'0');
+                let mut cursor = pos + 2;
+                let limit = bytes.len().min(pos + 4);
+                while cursor < limit {
+                    match bytes[cursor] {
+                        b'0'..=b'7' => {
+                            value = (value << 3) | u32::from(bytes[cursor] - b'0');
+                            cursor += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                out.push(char::from_u32(value).unwrap_or('\u{FFFD}'));
+                pos = cursor;
+            }
+            b'x' if matches!(codec, EscapeCodec::Unicode) => match parse_hex_escape(
+                bytes,
+                start,
+                2,
+                final_,
+                codec,
+                "truncated \\xXX escape",
+            )? {
+                Some((value, end)) => {
+                    out.push(char::from_u32(value).unwrap_or('\u{FFFD}'));
+                    pos = end;
+                }
+                None => return Ok((out, start)),
+            },
+            b'u' => match parse_hex_escape(bytes, start, 4, final_, codec, "truncated \\uXXXX escape")? {
+                Some((value, end)) => {
+                    push_unicode_codepoint(&mut out, bytes, start, end, value, codec, errors)?;
+                    pos = end;
+                }
+                None => return Ok((out, start)),
+            },
+            b'U' => match parse_hex_escape(bytes, start, 8, final_, codec, "truncated \\UXXXXXXXX escape")? {
+                Some((value, end)) => {
+                    push_unicode_codepoint(&mut out, bytes, start, end, value, codec, errors)?;
+                    pos = end;
+                }
+                None => return Ok((out, start)),
+            },
+            b'N' if matches!(codec, EscapeCodec::Unicode) => match decode_unicode_name_escape(
+                &mut out,
+                bytes,
+                start,
+                final_,
+                errors,
+            )? {
+                Some(end) => pos = end,
+                None => return Ok((out, start)),
+            },
+            _ => {
+                out.push('\\');
+                out.push(char::from(escaped));
+                pos += 2;
+            }
+        }
+    }
+    Ok((out, pos))
+}
+
+pub(crate) fn unicode_escape_decode_core(bytes: &[u8], errors: &str, final_: bool) -> Result<(String, usize), CoreError> {
+    decode_unicode_escape_core(bytes, errors, final_, EscapeCodec::Unicode)
+}
+
+pub(crate) fn raw_unicode_escape_decode_core(
+    bytes: &[u8],
+    errors: &str,
+    final_: bool,
+) -> Result<(String, usize), CoreError> {
+    decode_unicode_escape_core(bytes, errors, final_, EscapeCodec::RawUnicode)
+}
+
+fn push_unicode_escape(out: &mut Vec<u8>, code: u32) {
+    if code < 0x100 {
+        out.extend_from_slice(format!("\\x{code:02x}").as_bytes());
+    } else if code < 0x1_0000 {
+        out.extend_from_slice(format!("\\u{code:04x}").as_bytes());
+    } else {
+        out.extend_from_slice(format!("\\U{code:08x}").as_bytes());
+    }
+}
+
+pub(crate) fn unicode_escape_encode_core(text: &str, _errors: &str) -> Result<Vec<u8>, CoreError> {
+    let mut out = Vec::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.extend_from_slice(b"\\\\"),
+            '\t' => out.extend_from_slice(b"\\t"),
+            '\n' => out.extend_from_slice(b"\\n"),
+            '\r' => out.extend_from_slice(b"\\r"),
+            ' '..='~' => out.push(ch as u8),
+            _ => push_unicode_escape(&mut out, ch as u32),
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn raw_unicode_escape_encode_core(text: &str, _errors: &str) -> Result<Vec<u8>, CoreError> {
+    let mut out = Vec::with_capacity(text.len());
+    for ch in text.chars() {
+        let code = ch as u32;
+        if code <= 0xFF {
+            out.push(code as u8);
+        } else {
+            push_unicode_escape(&mut out, code);
+        }
+    }
+    Ok(out)
+}
+
+
 // ---------------------------------------------------------------------------
 // Name normalization and the builtin table
 
@@ -672,6 +1092,8 @@ fn builtin_codec(collapsed: &str) -> Option<BuiltinCodec> {
         | "iso_646_irv_1991" | "iso_ir_6" | "us" | "us_ascii" => Some(BuiltinCodec::Ascii),
         "latin_1" | "8859" | "cp819" | "csisolatin1" | "ibm819" | "iso8859" | "iso8859_1" | "iso_8859_1"
         | "iso_8859_1_1987" | "iso_ir_100" | "l1" | "latin" | "latin1" => Some(BuiltinCodec::Latin1),
+        "unicode_escape" | "unicodeescape" => Some(BuiltinCodec::UnicodeEscape),
+        "raw_unicode_escape" | "rawunicodeescape" => Some(BuiltinCodec::RawUnicodeEscape),
         _ => None,
     }
 }
@@ -691,6 +1113,8 @@ fn build_builtin_codec_info(codec: BuiltinCodec) -> *mut PyObject {
         BuiltinCodec::Utf8 => (builtin_fns[0], builtin_fns[1]),
         BuiltinCodec::Ascii => (builtin_fns[2], builtin_fns[3]),
         BuiltinCodec::Latin1 => (builtin_fns[4], builtin_fns[5]),
+        BuiltinCodec::UnicodeEscape => (builtin_fns[6], builtin_fns[7]),
+        BuiltinCodec::RawUnicodeEscape => (builtin_fns[8], builtin_fns[9]),
     };
 
     // `codecs` may not be imported yet when `_codecs.lookup` is called
@@ -1000,6 +1424,8 @@ unsafe extern "C" fn encode_entry(argv: *mut *mut PyObject, argc: usize) -> *mut
                 BuiltinCodec::Utf8 => Ok(utf8_encode_core(text)),
                 BuiltinCodec::Ascii => ascii_encode_core(text, errors),
                 BuiltinCodec::Latin1 => latin1_encode_core(text, errors),
+                BuiltinCodec::UnicodeEscape => unicode_escape_encode_core(text, errors),
+                BuiltinCodec::RawUnicodeEscape => raw_unicode_escape_encode_core(text, errors),
             };
             return match encoded {
                 Ok(bytes) => alloc_bytes_object(&bytes),
@@ -1035,16 +1461,36 @@ unsafe extern "C" fn decode_entry(argv: *mut *mut PyObject, argc: usize) -> *mut
     };
 
     if let Some(codec) = builtin_codec(&collapse_normalize(encoding)) {
-        if let Ok(bytes) = bytes_arg(object, "argument") {
-            let decoded = match codec {
-                BuiltinCodec::Utf8 => utf8_decode_core(bytes, errors, true).map(|(text, _)| text),
-                BuiltinCodec::Ascii => ascii_decode_core(bytes, errors),
-                BuiltinCodec::Latin1 => Ok(latin1_decode_core(bytes)),
-            };
-            return match decoded {
-                Ok(text) => alloc_str_object(&text),
-                Err(error) => error.raise(),
-            };
+        match codec {
+            BuiltinCodec::UnicodeEscape | BuiltinCodec::RawUnicodeEscape => {
+                if let Ok(data) = bytes_or_str_arg(object, "argument") {
+                    let decoded = match codec {
+                        BuiltinCodec::UnicodeEscape => unicode_escape_decode_core(&data, errors, true).map(|(text, _)| text),
+                        BuiltinCodec::RawUnicodeEscape => {
+                            raw_unicode_escape_decode_core(&data, errors, true).map(|(text, _)| text)
+                        }
+                        _ => unreachable!(),
+                    };
+                    return match decoded {
+                        Ok(text) => alloc_str_object(&text),
+                        Err(error) => error.raise(),
+                    };
+                }
+            }
+            BuiltinCodec::Utf8 | BuiltinCodec::Ascii | BuiltinCodec::Latin1 => {
+                if let Ok(bytes) = bytes_arg(object, "argument") {
+                    let decoded = match codec {
+                        BuiltinCodec::Utf8 => utf8_decode_core(bytes, errors, true).map(|(text, _)| text),
+                        BuiltinCodec::Ascii => ascii_decode_core(bytes, errors),
+                        BuiltinCodec::Latin1 => Ok(latin1_decode_core(bytes)),
+                        _ => unreachable!(),
+                    };
+                    return match decoded {
+                        Ok(text) => alloc_str_object(&text),
+                        Err(error) => error.raise(),
+                    };
+                }
+            }
         }
     }
     let info = lookup_object(encoding);
@@ -1102,6 +1548,87 @@ unsafe extern "C" fn utf_8_decode_entry(argv: *mut *mut PyObject, argc: usize) -
         Ok((text, consumed)) => codec_result(alloc_str_object(&text), consumed),
         Err(error) => error.raise(),
     }
+}
+
+fn escape_encode_entry_impl(
+    args: &[*mut PyObject],
+    pyname: &str,
+    core: fn(&str, &str) -> Result<Vec<u8>, CoreError>,
+) -> *mut PyObject {
+    if args.is_empty() || args.len() > 2 {
+        return raise_type_error(&format!("{pyname}_encode() takes 1 or 2 arguments"));
+    }
+    let text = match str_arg(args[0], "argument") {
+        Ok(text) => text,
+        Err(message) => return raise_type_error(&message),
+    };
+    let errors = match errors_arg(args, 1) {
+        Ok(errors) => errors,
+        Err(message) => return raise_type_error(&message),
+    };
+    match core(text, errors) {
+        Ok(bytes) => codec_result(alloc_bytes_object(&bytes), text.chars().count()),
+        Err(error) => error.raise(),
+    }
+}
+
+fn escape_decode_entry_impl(
+    args: &[*mut PyObject],
+    pyname: &str,
+    core: fn(&[u8], &str, bool) -> Result<(String, usize), CoreError>,
+) -> *mut PyObject {
+    if args.is_empty() || args.len() > 3 {
+        return raise_type_error(&format!("{pyname}_decode() takes from 1 to 3 arguments"));
+    }
+    let data = match bytes_or_str_arg(args[0], "argument") {
+        Ok(data) => data,
+        Err(message) => return raise_type_error(&message),
+    };
+    let errors = match errors_arg(args, 1) {
+        Ok(errors) => errors,
+        Err(message) => return raise_type_error(&message),
+    };
+    let final_ = match args.get(2).copied() {
+        None => true,
+        // SAFETY: Truthiness helper follows the error-sentinel contract.
+        Some(value) => match unsafe { abi::pon_is_true(value) } {
+            0 => false,
+            1 => true,
+            _ => return ptr::null_mut(),
+        },
+    };
+    match core(&data, errors, final_) {
+        Ok((text, consumed)) => codec_result(alloc_str_object(&text), consumed),
+        Err(error) => error.raise(),
+    }
+}
+
+unsafe extern "C" fn unicode_escape_encode_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+        return fail("_codecs.unicode_escape_encode received a NULL argv pointer");
+    };
+    escape_encode_entry_impl(args, "unicode_escape", unicode_escape_encode_core)
+}
+
+unsafe extern "C" fn unicode_escape_decode_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+        return fail("_codecs.unicode_escape_decode received a NULL argv pointer");
+    };
+    escape_decode_entry_impl(args, "unicode_escape", unicode_escape_decode_core)
+}
+
+unsafe extern "C" fn raw_unicode_escape_encode_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+        return fail("_codecs.raw_unicode_escape_encode received a NULL argv pointer");
+    };
+    escape_encode_entry_impl(args, "raw_unicode_escape", raw_unicode_escape_encode_core)
+}
+
+unsafe extern "C" fn raw_unicode_escape_decode_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+        return fail("_codecs.raw_unicode_escape_decode received a NULL argv pointer");
+    };
+    escape_decode_entry_impl(args, "raw_unicode_escape", raw_unicode_escape_decode_core)
 }
 
 macro_rules! fixed_codec_entries {
@@ -1290,6 +1817,8 @@ pub(crate) fn encode_str_to_vec(text: &str, encoding: &str, errors: &str) -> Res
             BuiltinCodec::Utf8 => Ok(utf8_encode_core(text)),
             BuiltinCodec::Ascii => ascii_encode_core(text, errors),
             BuiltinCodec::Latin1 => latin1_encode_core(text, errors),
+            BuiltinCodec::UnicodeEscape => unicode_escape_encode_core(text, errors),
+            BuiltinCodec::RawUnicodeEscape => raw_unicode_escape_encode_core(text, errors),
         };
         return encoded.map_err(|error| {
             error.raise();
@@ -1327,6 +1856,8 @@ pub(crate) fn decode_bytes_to_string(data: &[u8], encoding: &str, errors: &str) 
             BuiltinCodec::Utf8 => utf8_decode_core(data, errors, true).map(|(text, _)| text),
             BuiltinCodec::Ascii => ascii_decode_core(data, errors),
             BuiltinCodec::Latin1 => Ok(latin1_decode_core(data)),
+            BuiltinCodec::UnicodeEscape => unicode_escape_decode_core(data, errors, true).map(|(text, _)| text),
+            BuiltinCodec::RawUnicodeEscape => raw_unicode_escape_decode_core(data, errors, true).map(|(text, _)| text),
         };
         return decoded.map_err(|error| {
             error.raise();
@@ -1406,6 +1937,9 @@ mod tests {
         assert!(builtin_codec("utf_8").is_some());
         assert!(builtin_codec("us_ascii").is_some());
         assert!(builtin_codec("iso8859_1").is_some());
+        assert!(builtin_codec("unicode_escape").is_some());
+        assert!(builtin_codec("raw_unicode_escape").is_some());
+        assert!(builtin_codec("unicodeescape").is_some());
         assert!(builtin_codec("utf_16").is_none());
     }
 
@@ -1436,6 +1970,47 @@ mod tests {
         assert!(matches!(utf8_decode_core(b"\xff", "bogus", true), Err(CoreError::Handler(_))));
         // Unknown handlers are resolved lazily: clean input never fails.
         assert_eq!(utf8_decode_core(b"ok", "bogus", true).unwrap().0, "ok");
+    }
+
+    #[test]
+    fn unicode_escape_codecs_match_cpython_samples() {
+        let data = b"a\\n\\x41\\u00e9\\N{BULLET}\\q";
+        assert_eq!(
+            unicode_escape_decode_core(data, "strict", true).unwrap(),
+            ("a\nAé•\\q".to_owned(), data.len())
+        );
+        let raw_data = b"a\\n\\x41\\u00e9\\U0001f600";
+        assert_eq!(
+            raw_unicode_escape_decode_core(raw_data, "strict", true).unwrap(),
+            ("a\\n\\x41é😀".to_owned(), raw_data.len())
+        );
+
+        assert_eq!(
+            unicode_escape_encode_core("abc\nAé•\\q😀", "strict").unwrap(),
+            b"abc\\nA\\xe9\\u2022\\\\q\\U0001f600"
+        );
+        assert_eq!(
+            raw_unicode_escape_encode_core("abc\nAé•\\q😀", "strict").unwrap(),
+            b"abc\nA\xe9\\u2022\\q\\U0001f600"
+        );
+
+        let error = unicode_escape_decode_core(b"\\u00", "strict", true).unwrap_err();
+        let CoreError::Decode(message) = error else { panic!("expected decode error") };
+        assert_eq!(
+            message,
+            "'unicodeescape' codec can't decode bytes in position 0-3: truncated \\uXXXX escape"
+        );
+        assert_eq!(
+            unicode_escape_decode_core(b"a\\u00", "strict", false).unwrap(),
+            ("a".to_owned(), 1)
+        );
+
+        let error = raw_unicode_escape_decode_core(b"\\U00110000", "strict", true).unwrap_err();
+        let CoreError::Decode(message) = error else { panic!("expected decode error") };
+        assert_eq!(
+            message,
+            "'rawunicodeescape' codec can't decode bytes in position 0-9: \\Uxxxxxxxx out of range"
+        );
     }
 
     #[test]

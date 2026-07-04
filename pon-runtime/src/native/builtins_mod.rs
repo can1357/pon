@@ -1728,53 +1728,8 @@ pub unsafe extern "C" fn builtin_dict(argv: *mut *mut PyObject, argc: usize) -> 
 /// an iterable of length-2 iterables. On failure the CPython-shaped
 /// TypeError/ValueError is already raised and `Err(())` is returned.
 pub(crate) unsafe fn collect_dict_update_pairs(source: *mut PyObject, pairs: &mut Vec<*mut PyObject>) -> Result<(), ()> {
-    // Dict-layout sources (exact dicts AND dict-subclass instances) copy
-    // concrete storage in insertion order, mirroring CPython's
-    // `PyDict_Merge` which reads `ma_keys` directly for dict subclasses.
-    if unsafe { crate::types::dict::has_dict_storage(source) } {
-        let entries = match unsafe { crate::types::dict::dict_entries_snapshot(source) } {
-            Ok(entries) => entries,
-            Err(message) => {
-                let _ = fail(message);
-                return Err(());
-            }
-        };
-        pairs.reserve(entries.len() * 2);
-        for entry in entries {
-            pairs.push(entry.key);
-            pairs.push(entry.value);
-        }
+    if unsafe { collect_mapping_pairs(source, pairs) }? {
         return Ok(());
-    }
-    // Mapping protocol (CPython `PyDict_Merge` non-dict leg): any source with
-    // a `keys` attribute merges via `for key in source.keys(): d[key] = source[key]`.
-    match unsafe { mapping_keys_attr(source) } {
-        Err(()) => return Err(()),
-        Ok(Some(keys_method)) => {
-            let keys_iterable = unsafe { abi::pon_call(keys_method, ptr::null_mut(), 0) };
-            if keys_iterable.is_null() {
-                return Err(());
-            }
-            let keys = match collect_iterable(keys_iterable) {
-                Ok(keys) => keys,
-                Err(message) => {
-                    let _ = fail(message);
-                    return Err(());
-                }
-            };
-            pairs.reserve(keys.len() * 2);
-            for key in keys {
-                // SAFETY: Subscript dispatch follows the NULL-sentinel error contract.
-                let value = unsafe { crate::abstract_op::subscript_get(source, key) };
-                if value.is_null() {
-                    return Err(());
-                }
-                pairs.push(key);
-                pairs.push(value);
-            }
-            return Ok(());
-        }
-        Ok(None) => {}
     }
     let Ok(elements) = collect_iterable(source) else {
         let name = unsafe { crate::types::dict::type_name(source) }.unwrap_or("object");
@@ -1802,6 +1757,62 @@ pub(crate) unsafe fn collect_dict_update_pairs(source: *mut PyObject, pairs: &mu
         pairs.extend(pair);
     }
     Ok(())
+}
+
+/// Mapping-only pair collection, the first two legs of the dict-update
+/// protocol: dict-layout storage snapshot, then the `keys()` mapping
+/// protocol (`for key in source.keys(): source[key]`).  `Ok(true)` means
+/// `pairs` was filled; `Ok(false)` means `source` is not a mapping — the
+/// caller picks its own diagnostic (`dict.update` falls through to the
+/// pairs-iterable leg, `f(**x)` raises CPython's "argument after ** must be
+/// a mapping").  `Err(())` propagates with the error already raised.
+pub(crate) unsafe fn collect_mapping_pairs(source: *mut PyObject, pairs: &mut Vec<*mut PyObject>) -> Result<bool, ()> {
+    // Dict-layout sources (exact dicts AND dict-subclass instances) copy
+    // concrete storage in insertion order, mirroring CPython's
+    // `PyDict_Merge` which reads `ma_keys` directly for dict subclasses.
+    if unsafe { crate::types::dict::has_dict_storage(source) } {
+        let entries = match unsafe { crate::types::dict::dict_entries_snapshot(source) } {
+            Ok(entries) => entries,
+            Err(message) => {
+                let _ = fail(message);
+                return Err(());
+            }
+        };
+        pairs.reserve(entries.len() * 2);
+        for entry in entries {
+            pairs.push(entry.key);
+            pairs.push(entry.value);
+        }
+        return Ok(true);
+    }
+    match unsafe { mapping_keys_attr(source) } {
+        Err(()) => Err(()),
+        Ok(Some(keys_method)) => {
+            let keys_iterable = unsafe { abi::pon_call(keys_method, ptr::null_mut(), 0) };
+            if keys_iterable.is_null() {
+                return Err(());
+            }
+            let keys = match collect_iterable(keys_iterable) {
+                Ok(keys) => keys,
+                Err(message) => {
+                    let _ = fail(message);
+                    return Err(());
+                }
+            };
+            pairs.reserve(keys.len() * 2);
+            for key in keys {
+                // SAFETY: Subscript dispatch follows the NULL-sentinel error contract.
+                let value = unsafe { crate::abstract_op::subscript_get(source, key) };
+                if value.is_null() {
+                    return Err(());
+                }
+                pairs.push(key);
+                pairs.push(value);
+            }
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+    }
 }
 
 /// Fetches `source.keys` when present: `Ok(Some)` is the bound attribute,

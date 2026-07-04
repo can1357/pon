@@ -79,8 +79,14 @@ pub(crate) struct PyNativeFile {
     append: bool,
     /// Text encoding name. `None` for binary files; text files default to UTF-8.
     encoding: Option<String>,
+    /// Text encode/decode error handler. Empty for binary files.
+    errors: String,
     /// Text newline handling policy.
     newline: NewlineMode,
+    /// Whether text writes flush after a newline.
+    line_buffering: bool,
+    /// Whether every text write flushes immediately.
+    write_through: bool,
     /// Bitset of newline spellings seen by universal-newline text reads.
     newline_seen: u8,
     /// Per-instance dynamic attributes set from Python.
@@ -212,8 +218,11 @@ unsafe extern "C" fn text_file_new(_cls: *mut PyType, args: *mut PyObject, _kwar
         writable: buffer.writable,
         append: buffer.append,
         encoding: Some("utf-8".to_owned()),
+        errors: "strict".to_owned(),
         newline: NewlineMode::UniversalTranslate,
         newline_seen: 0,
+        line_buffering: false,
+        write_through: false,
         attrs: HashMap::new(),
     })
 }
@@ -256,7 +265,8 @@ unsafe extern "C" fn file_setattro(object: *mut PyObject, name: *mut PyObject, v
 }
 
 fn readonly_file_state_attr(file: &PyNativeFile, attr: &str) -> bool {
-    matches!(attr, "closed" | "name") || (!file.binary && matches!(attr, "encoding" | "errors" | "newlines"))
+    matches!(attr, "closed" | "name")
+        || (!file.binary && matches!(attr, "encoding" | "errors" | "newlines" | "line_buffering" | "write_through"))
 }
 
 fn raise_file_readonly_attr_status(object: *mut PyObject, attr: &str) -> core::ffi::c_int {
@@ -2172,20 +2182,20 @@ fn open_from_args(args: &[*mut PyObject]) -> Result<*mut PyObject, OpenError> {
         Some("utf-8".to_owned())
     };
 
-    if let Some(&errors) = args.get(4) {
-        if !is_none(errors) {
-            let text = expect_str(errors, "open() errors must be str or None")?;
-            if mode.binary {
-                return Err(OpenError::Value("binary mode doesn't take an errors argument".to_owned()));
-            }
-            // The native text stream decodes strict UTF-8: 'strict' is the
-            // one handler that machinery honors; every other policy is
-            // refused honestly instead of decoding with the wrong behavior.
-            if text != "strict" {
-                return Err(OpenError::Value(format!("open() errors='{text}' is not implemented")));
-            }
+    let errors = if mode.binary {
+        if args.get(4).copied().is_some_and(|value| !is_none(value)) {
+            return Err(OpenError::Value("binary mode doesn't take an errors argument".to_owned()));
         }
-    }
+        String::new()
+    } else if let Some(&errors) = args.get(4) {
+        if is_none(errors) {
+            "strict".to_owned()
+        } else {
+            expect_str(errors, "open() errors must be str or None")?.to_owned()
+        }
+    } else {
+        "strict".to_owned()
+    };
 
     let newline = if mode.binary {
         if args.get(5).copied().is_some_and(|value| !is_none(value)) {
@@ -2226,7 +2236,7 @@ fn open_from_args(args: &[*mut PyObject]) -> Result<*mut PyObject, OpenError> {
             (unsafe { File::from_raw_fd(fd) }, fd.to_string())
         }
     };
-    Ok(alloc_file(file, name, mode, encoding, newline))
+    Ok(alloc_file(file, name, mode, encoding, errors, newline))
 }
 
 fn open_host_file(path: &str, mode: &OpenMode) -> Result<File, OpenError> {
@@ -2251,7 +2261,7 @@ fn open_host_file(path: &str, mode: &OpenMode) -> Result<File, OpenError> {
     })
 }
 
-fn alloc_file(file: File, name: String, mode: OpenMode, encoding: Option<String>, newline: NewlineMode) -> *mut PyObject {
+fn alloc_file(file: File, name: String, mode: OpenMode, encoding: Option<String>, errors: String, newline: NewlineMode) -> *mut PyObject {
     let ty = if mode.binary { binary_file_type() } else { text_file_type() };
     alloc_native_file(PyNativeFile {
         ob_base: PyObjectHeader::new(ty),
@@ -2263,8 +2273,11 @@ fn alloc_file(file: File, name: String, mode: OpenMode, encoding: Option<String>
         writable: mode.writable,
         append: mode.append,
         encoding,
+        errors,
         newline,
         newline_seen: 0,
+        line_buffering: false,
+        write_through: false,
         attrs: HashMap::new(),
     })
 }
@@ -2291,8 +2304,11 @@ pub(super) fn std_stream_object(fd: i32, name: &str, readable: bool) -> *mut PyO
         writable: !readable,
         append: false,
         encoding: Some("utf-8".to_owned()),
+        errors: "strict".to_owned(),
         newline: NewlineMode::LineFeed,
         newline_seen: 0,
+        line_buffering: false,
+        write_through: false,
         attrs: HashMap::new(),
     })
 }
@@ -2391,6 +2407,7 @@ fn file_method_entry(attr: &str, binary: bool) -> Option<FileMethodEntry> {
         "tell" => Some(file_tell_method),
         "close" => Some(file_close_method),
         "flush" => Some(file_flush_method),
+        "reconfigure" if !binary => Some(file_reconfigure_method),
         "readable" => Some(file_readable_method),
         "writable" => Some(file_writable_method),
         "seekable" => Some(file_seekable_method),
@@ -2425,8 +2442,10 @@ unsafe extern "C" fn file_getattro(object: *mut PyObject, name: *mut PyObject) -
         "name" => alloc_str(&file.name),
         "mode" => alloc_str(&file.mode),
         "encoding" if !file.binary => file.encoding.as_deref().map_or_else(|| unsafe { abi::pon_none() }, alloc_str),
-        "errors" if !file.binary => alloc_str("strict"),
+        "errors" if !file.binary => alloc_str(&file.errors),
         "newlines" if !file.binary => newline_seen_object(file),
+        "line_buffering" if !file.binary => unsafe { abi::number::pon_const_bool(i32::from(file.line_buffering)) },
+        "write_through" if !file.binary => unsafe { abi::number::pon_const_bool(i32::from(file.write_through)) },
         _ => raise_file_attribute_error(object, attr),
     }
 }
@@ -2745,6 +2764,70 @@ unsafe extern "C" fn file_flush_method(argv: *mut *mut PyObject, argc: usize) ->
     };
     if handle.flush().is_err() {
         return raise_io_error("failed to flush file");
+    }
+    unsafe { abi::pon_none() }
+}
+
+unsafe extern "C" fn file_reconfigure_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { method_args(argv, argc, "reconfigure") } {
+        Ok(args) => args,
+        Err(message) => return raise_type_error(&message),
+    };
+    if args.len() != 1 && args.len() != 6 {
+        return raise_type_error("reconfigure() takes no positional arguments");
+    }
+    let Some(file) = (unsafe { as_file(args[0]) }) else {
+        return raise_type_error("reconfigure() receiver is not a native file");
+    };
+    if file.binary {
+        return raise_type_error("reconfigure() receiver is not a text file");
+    }
+    if file.file.is_none() {
+        return raise_value_error("I/O operation on closed file.");
+    }
+    if args.len() == 1 {
+        return unsafe { abi::pon_none() };
+    }
+
+    if let Some(encoding) = match reconfigure_str_option(args[1], "encoding") {
+        Ok(value) => value,
+        Err(error) => return error,
+    } {
+        let current = file.encoding.as_deref().unwrap_or("utf-8");
+        if !same_text_encoding(current, encoding) {
+            return abi::exc::raise_kind_error_text(
+                ExceptionKind::NotImplementedError,
+                &format!("reconfigure() encoding '{encoding}' is not implemented in pon; only UTF-8 text streams can be reconfigured"),
+            );
+        }
+        file.encoding = Some(encoding.to_owned());
+    }
+    if let Some(errors) = match reconfigure_str_option(args[2], "errors") {
+        Ok(value) => value,
+        Err(error) => return error,
+    } {
+        file.errors = errors.to_owned();
+    }
+    if let Some(newline) = match reconfigure_str_option(args[3], "newline") {
+        Ok(value) => value,
+        Err(error) => return error,
+    } {
+        file.newline = match reconfigure_newline_mode(newline) {
+            Ok(mode) => mode,
+            Err(error) => return error,
+        };
+    }
+    if !is_none(args[4]) {
+        file.line_buffering = match object_truth(args[4]) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+    }
+    if !is_none(args[5]) {
+        file.write_through = match object_truth(args[5]) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
     }
     unsafe { abi::pon_none() }
 }
@@ -3076,9 +3159,10 @@ fn bytes_to_python(file: &PyNativeFile, bytes: Vec<u8>) -> *mut PyObject {
         } else {
             bytes
         };
-        match String::from_utf8(bytes) {
+        let encoding = file.encoding.as_deref().unwrap_or("utf-8");
+        match super::codecs::decode_bytes_to_string(&bytes, encoding, &file.errors) {
             Ok(text) => alloc_str(&text),
-            Err(_) => raise_value_error("file contents are not valid UTF-8"),
+            Err(()) => ptr::null_mut(),
         }
     }
 }
@@ -3095,8 +3179,13 @@ fn write_object(file: &mut PyNativeFile, object: *mut PyObject) -> Result<i64, F
         let text = unsafe { type_::unicode_text(object) }
             .ok_or_else(|| FileOpError::Type("write() argument must be str, not bytes".to_owned()))?;
         let payload = translate_write_newlines(file.newline, text);
+        let bytes = encode_write_payload(&payload, file.encoding.as_deref().unwrap_or("utf-8"), &file.errors)?;
+        let should_flush = file.write_through || (file.line_buffering && bytes.iter().any(|byte| matches!(*byte, b'\n' | b'\r')));
         let handle = file.file.as_mut().ok_or_else(closed_error)?;
-        handle.write_all(payload.as_bytes()).map_err(io_op_error)?;
+        handle.write_all(bytes.as_ref()).map_err(io_op_error)?;
+        if should_flush {
+            handle.flush().map_err(io_op_error)?;
+        }
         Ok(text.chars().count() as i64)
     }
 }
@@ -3252,6 +3341,84 @@ fn translate_write_newlines<'a>(mode: NewlineMode, text: &'a str) -> std::borrow
     }
 }
 
+fn encode_write_payload<'a>(
+    text: &'a str,
+    encoding: &str,
+    errors: &str,
+) -> Result<std::borrow::Cow<'a, [u8]>, FileOpError> {
+    if is_utf8_encoding(encoding) {
+        if errors == "replace" && text.contains('\u{FFFD}') {
+            return Ok(std::borrow::Cow::Owned(utf8_replace_error_bytes(text)));
+        }
+        return Ok(std::borrow::Cow::Borrowed(text.as_bytes()));
+    }
+    super::codecs::encode_str_to_vec(text, encoding, errors)
+        .map(std::borrow::Cow::Owned)
+        .map_err(|()| FileOpError::Pending)
+}
+
+fn utf8_replace_error_bytes(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '\u{FFFD}' {
+            out.push(b'?');
+        } else {
+            let mut buffer = [0_u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
+        }
+    }
+    out
+}
+
+fn is_utf8_encoding(encoding: &str) -> bool {
+    encoding.eq_ignore_ascii_case("utf-8") || encoding.eq_ignore_ascii_case("utf8")
+}
+
+fn same_text_encoding(current: &str, requested: &str) -> bool {
+    is_utf8_encoding(current) && is_utf8_encoding(requested)
+}
+
+fn reconfigure_str_option<'a>(object: *mut PyObject, name: &str) -> Result<Option<&'a str>, *mut PyObject> {
+    let object = crate::tag::untag_arg(object);
+    if is_none(object) {
+        return Ok(None);
+    }
+    unsafe { type_::unicode_text(object) }.map(Some).ok_or_else(|| {
+        raise_type_error(&format!(
+            "reconfigure() argument '{name}' must be str or None, not {}",
+            object_type_name(object)
+        ))
+    })
+}
+
+fn reconfigure_newline_mode(text: &str) -> Result<NewlineMode, *mut PyObject> {
+    match text {
+        "" => Ok(NewlineMode::UniversalPreserve),
+        "\n" => Ok(NewlineMode::LineFeed),
+        "\r" => Ok(NewlineMode::CarriageReturn),
+        "\r\n" => Ok(NewlineMode::CarriageReturnLineFeed),
+        _ => Err(raise_value_error(&format!("illegal newline value: {text}"))),
+    }
+}
+
+fn object_truth(object: *mut PyObject) -> Result<bool, *mut PyObject> {
+    match unsafe { abi::pon_is_true(object) } {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(ptr::null_mut()),
+    }
+}
+
+fn object_type_name(object: *mut PyObject) -> &'static str {
+    if crate::tag::is_small_int(object) {
+        return "int";
+    }
+    if object.is_null() {
+        return "NULL";
+    }
+    unsafe { crate::types::dict::type_name(object) }.unwrap_or("object")
+}
+
 unsafe fn argv_slice<'a>(argv: *mut *mut PyObject, argc: usize) -> Result<&'a [*mut PyObject], String> {
     if argv.is_null() && argc != 0 {
         return Err("argv pointer is null".to_owned());
@@ -3384,6 +3551,7 @@ fn raise_file_op_error(error: FileOpError) -> *mut PyObject {
         FileOpError::Value(message) => raise_value_error(&message),
         FileOpError::Unsupported(message) => raise_unsupported_error(&message),
         FileOpError::Io(message) => raise_io_error(&message),
+        FileOpError::Pending => ptr::null_mut(),
     }
 }
 
@@ -3417,6 +3585,7 @@ enum FileOpError {
     Value(String),
     Unsupported(String),
     Io(String),
+    Pending,
 }
 
 #[cfg(test)]
