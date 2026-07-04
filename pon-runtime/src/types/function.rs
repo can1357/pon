@@ -100,34 +100,39 @@ impl FunctionRecord {
     }
 }
 
-/// Reports the GC-managed objects held by `function`'s side-table record
-/// (positional defaults, keyword-only defaults, and closure cells) to a GC
-/// trace visitor.
+/// Reports the GC-managed objects held by `function`'s side-table records to a
+/// GC trace visitor.
 ///
-/// The record itself is malloc'd side storage keyed by object address, so the
+/// The records are malloc'd side storage keyed by object address, so the
 /// collector cannot reach these values through the `PyFunction` allocation;
 /// `abi::trace_function` forwards here.  Reported pointers may be tagged
 /// immediates or NULL — the GC's pointer classification filters those.
 pub fn visit_function_gc_refs(function: *mut PyObject, visitor: &mut dyn FnMut(*mut u8)) {
     let records = FUNCTION_RECORDS.lock().unwrap_or_else(|poison| poison.into_inner());
-    let Some(record) = records.get(&(function as usize)) else {
-        return;
-    };
-    for value in record
-        .defaults
-        .iter()
-        .chain(record.kwdefaults.values())
-        .chain(record.closure.iter())
-    {
-        let object = *value as *mut u8;
-        if !object.is_null() {
-            visitor(object);
+    if let Some(record) = records.get(&(function as usize)) {
+        for value in record
+            .defaults
+            .iter()
+            .chain(record.kwdefaults.values())
+            .chain(record.closure.iter())
+        {
+            let object = *value as *mut u8;
+            if !object.is_null() {
+                visitor(object);
+            }
         }
     }
     drop(records);
     let override_ = defaults_override(function);
     for stored in [override_.defaults, override_.kwdefaults].into_iter().flatten() {
         visitor(stored as *mut u8);
+    }
+    if let Some(module_object) = function_module_object(function)
+        && let Some(values) = crate::import::module_object_attr_values(module_object)
+    {
+        for value in values {
+            visitor(value.cast::<u8>());
+        }
     }
 }
 
@@ -724,6 +729,14 @@ fn function_attr_by_id(function: *mut PyObject, name_id: u32) -> Option<*mut PyO
         return Some(builtins);
     }
     if name_id == intern("__globals__") {
+        if let Some(module_object) = function_module_object(function)
+            && let Some(namespace) = crate::import::module_namespace_for_object(module_object)
+        {
+            return namespace.ok();
+        }
+        if let Some(module_name) = function_module(function) {
+            return crate::dynexec::module_namespace_dict(module_name).ok();
+        }
         return Some(unsafe { crate::dynexec::builtin_globals(ptr::null_mut(), 0) });
     }
     if name_id == intern("__defaults__") {
@@ -1061,39 +1074,71 @@ pub fn function_annotate(function: *mut PyObject) -> Option<*mut PyObject> {
         .map(|address| address as *mut PyObject)
 }
 
-/// Defining-module side table: function object address -> interned module
-/// name.  Recorded at `pon_make_function`/`pon_make_function_full` time from
-/// the creation context (enclosing function's module, else the actively
-/// executing module), so `pon_load_global`/`pon_store_global` can scope a
-/// function body's global namespace to its defining module (CPython
-/// `__globals__` semantics) instead of the caller's active module.  Entries
-/// are raw unrooted addresses, the same accepted pattern as
-/// `FUNCTION_RECORDS` and `ANNOTATE_FUNCTIONS`; the GC dealloc hook clears
-/// entries so a reused allocation address can never resurrect a stale
-/// module binding.
-static FUNCTION_MODULES: LazyLock<Mutex<HashMap<usize, u32>>> =
+/// Defining-module side table: function object address -> original module
+/// namespace context.
+///
+/// `name` backs Python-visible `function.__module__`. `module_object` keeps
+/// `function.__globals__` / `LOAD_GLOBAL` tied to the module object that
+/// created the function, even if user code later rebinds `sys.modules[name]`
+/// to a compatibility wrapper.  Raw object addresses are stored as integers so
+/// the global mutex remains `Send`; module boxes are process-lifetime import
+/// objects, and the GC dealloc hook clears function entries before an address
+/// can be reused.
+#[derive(Clone, Copy, Debug)]
+struct FunctionModuleRecord {
+    name: u32,
+    module_object: usize,
+}
+
+static FUNCTION_MODULES: LazyLock<Mutex<HashMap<usize, FunctionModuleRecord>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Record `module` (interned name) as `function`'s defining module.
 pub fn set_function_module(function: *mut PyObject, module: u32) {
+    set_function_module_context(function, module, ptr::null_mut());
+}
+
+/// Record the defining module name and original module object for `function`.
+pub fn set_function_module_context(function: *mut PyObject, module: u32, module_object: *mut PyObject) {
     if function.is_null() {
         return;
     }
     if let Ok(mut table) = FUNCTION_MODULES.lock() {
-        table.insert(function as usize, module);
+        table.insert(
+            function as usize,
+            FunctionModuleRecord {
+                name: module,
+                module_object: module_object as usize,
+            },
+        );
     }
+}
+
+/// Return the defining-module context recorded for `function`, if any.
+#[must_use]
+pub fn function_module_context(function: *mut PyObject) -> Option<(u32, *mut PyObject)> {
+    if function.is_null() {
+        return None;
+    }
+    FUNCTION_MODULES.lock().ok().and_then(|table| {
+        table
+            .get(&(function as usize))
+            .map(|record| (record.name, record.module_object as *mut PyObject))
+    })
 }
 
 /// Return the interned defining-module name recorded for `function`, if any.
 #[must_use]
 pub fn function_module(function: *mut PyObject) -> Option<u32> {
-    if function.is_null() {
-        return None;
-    }
-    FUNCTION_MODULES
-        .lock()
-        .ok()
-        .and_then(|table| table.get(&(function as usize)).copied())
+    function_module_context(function).map(|(module, _)| module)
+}
+
+/// Return the original defining-module object recorded for `function`, if any.
+#[must_use]
+pub fn function_module_object(function: *mut PyObject) -> Option<*mut PyObject> {
+    function_module_context(function)
+        .map(|(_, module_object)| module_object)
+        .filter(|module_object| !module_object.is_null())
 }
 
 /// Drop the defining-module record for a freed `function` allocation.
