@@ -581,7 +581,26 @@ fn object_type_name(object: *mut PyObject) -> String {
     }
 }
 fn is_sequence_index_error(message: &str) -> bool {
-    message == "sequence index out of range"
+    matches!(
+        message,
+        "sequence index out of range"
+            | "list index out of range"
+            | "list assignment index out of range"
+            | "tuple index out of range"
+            | "pop from empty list"
+            | "pop index out of range"
+    )
+}
+
+/// Remaps the generic out-of-range sentinel from the shared [`normalize_index`]
+/// to CPython's type/operation-specific text at the boundary that knows the
+/// receiver.  Non-index diagnostics (receiver/type mismatches) pass through.
+fn retype_index_error(message: String, specific: &str) -> String {
+    if message == "sequence index out of range" {
+        specific.to_owned()
+    } else {
+        message
+    }
 }
 
 /// Sequence subscript/store funnels: out-of-range sentinels become typed
@@ -828,7 +847,7 @@ fn list_item_object(object: *mut PyObject, index: isize) -> Result<*mut PyObject
             return Err(format!("list indexing expected list, got {}", object_type_name(object)));
         };
         let list = &*cells;
-        let index = normalize_index(index, list.len)?;
+        let index = normalize_index(index, list.len).map_err(|m| retype_index_error(m, "list index out of range"))?;
         Ok(*list.items.add(index))
     }
 }
@@ -837,7 +856,7 @@ fn tuple_item_object(object: *mut PyObject, index: isize) -> Result<*mut PyObjec
     let Some(items) = (unsafe { tuple_storage_slice(object) }) else {
         return Err(format!("tuple indexing expected tuple, got {}", object_type_name(object)));
     };
-    let index = normalize_index(index, items.len())?;
+    let index = normalize_index(index, items.len()).map_err(|m| retype_index_error(m, "tuple index out of range"))?;
     Ok(items[index])
 }
 
@@ -1086,7 +1105,7 @@ fn list_delete_index_raw(list_object: *mut PyObject, index: isize) -> Result<(),
         return Err(format!("list deletion expected list, got {}", object_type_name(list_object)));
     };
     let _guard = crate::sync::begin_critical_section(list_object);
-    let index = normalize_index(index, list.len)?;
+    let index = normalize_index(index, list.len).map_err(|m| retype_index_error(m, "list assignment index out of range"))?;
     unsafe {
         for pos in index..list.len - 1 {
             let shifted = *list.items.add(pos + 1);
@@ -1106,7 +1125,7 @@ fn list_set_index_raw(list_object: *mut PyObject, index: isize, value: *mut PyOb
         return Err(format!("list assignment expected list, got {}", object_type_name(list_object)));
     };
     let _guard = crate::sync::begin_critical_section(list_object);
-    let index = normalize_index(index, list.len)?;
+    let index = normalize_index(index, list.len).map_err(|m| retype_index_error(m, "list assignment index out of range"))?;
     unsafe { crate::sync::store_heap_pointer(list.items.add(index), value) };
     Ok(())
 }
@@ -1195,7 +1214,10 @@ fn list_pop_raw(list_object: *mut PyObject, index: isize) -> Result<*mut PyObjec
         return Err(format!("list pop expected list, got {}", object_type_name(list_object)));
     };
     let _guard = crate::sync::begin_critical_section(list_object);
-    let index = normalize_index(index, list.len)?;
+    if list.len == 0 {
+        return Err("pop from empty list".to_owned());
+    }
+    let index = normalize_index(index, list.len).map_err(|m| retype_index_error(m, "pop index out of range"))?;
     let value = unsafe { *list.items.add(index) };
     unsafe {
         for pos in index..list.len - 1 {

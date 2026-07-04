@@ -2207,6 +2207,12 @@ pub(crate) fn repr_text_no_dispatch(object: *mut PyObject) -> Result<String, ()>
     if let Some((real, imag)) = unsafe { crate::types::complex_::to_f64s(object) } {
         return Ok(crate::types::complex_::repr_complex(real, imag));
     }
+    // `BaseException.__repr__`: `Name(repr(arg))` for a single argument, else
+    // `Name` followed by the args-tuple repr (`Name()`, `Name('a', 'b')`).  Runs
+    // before the `object_to_string` fallback below, which returns `str(exc)`.
+    if crate::abi::exc::type_derives_base_exception(unsafe { (*object).ob_type }) {
+        return unsafe { exception_repr_text(object) };
+    }
     if let Some(text) = object_to_string(object) {
         return Ok(crate::types::str_::repr(&text));
     }
@@ -2478,12 +2484,34 @@ unsafe fn exception_message_text(object: *mut PyObject, mut ty: *const PyType) -
             if original_name == "KeyError" {
                 return Some(repr_text(message));
             }
-            return object_to_string(message);
+            return Some(str_text(message));
         }
         // SAFETY: `ty` is a live type object from an object header.
         ty = unsafe { (*ty).tp_base.cast_const() };
     }
     None
+}
+
+/// `BaseException.__repr__`: the exception's type name followed by its argument
+/// reprs — `KeyError('k')` for a single argument, otherwise the name plus the
+/// args-tuple repr (`KeyError()`, `RuntimeError('a', 'b')`), matching CPython's
+/// `%s(%R)` / `%s%R`.  Args are synthesized like [`exception_message_text`]: a
+/// non-NULL `args` tuple wins, else the lone `message`, else empty.
+unsafe fn exception_repr_text(object: *mut PyObject) -> Result<String, ()> {
+    let ty = unsafe { (*object).ob_type };
+    let name = if ty.is_null() { "BaseException" } else { unsafe { (*ty).name() } };
+    let exception = unsafe { &*object.cast::<PyBaseException>() };
+    let args: Vec<*mut PyObject> = if !exception.args.is_null() {
+        unsafe { exact_tuple_entries(exception.args) }.map_or_else(Vec::new, <[_]>::to_vec)
+    } else if !exception.message.is_null() {
+        vec![exception.message]
+    } else {
+        Vec::new()
+    };
+    if args.len() == 1 {
+        return Ok(format!("{name}({})", try_repr_text(args[0])?));
+    }
+    Ok(format!("{name}{}", format_sequence(SequenceKind::Tuple, &args)?))
 }
 
 /// CPython `OSError.__str__` for errno-carrying constructions: 2..=5

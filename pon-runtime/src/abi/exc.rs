@@ -8,6 +8,7 @@ use core::ffi::c_int;
 use core::mem::size_of;
 use core::ptr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 use pon_gc::GcTypeInfo;
 
@@ -16,8 +17,9 @@ use crate::object::{PyObject, PyType, as_object_ptr, is_exact_type};
 use crate::thread_state::{ExcStarFrame, pon_err_clear, pon_err_occurred, pon_err_set_object, thread_state_lock};
 use crate::traceback::{PyTraceback, TYPE_ID_TRACEBACK, ensure_traceback_type, trace_traceback};
 use crate::types::exc::{
-    EXC_GROUP_METHOD_DERIVE, EXC_GROUP_METHOD_SPLIT, EXC_GROUP_METHOD_SUBGROUP, ExceptionKind, PyBaseException,
-    PyExceptionGroup, as_exception_group, is_exception_group_instance, is_exception_instance, is_exception_subclass,
+    EXC_GROUP_METHOD_DERIVE, EXC_GROUP_METHOD_SPLIT, EXC_GROUP_METHOD_SUBGROUP, ExceptionKind, ExceptionTypeSet,
+    PyBaseException, PyExceptionGroup, as_exception_group, is_exception_group_instance, is_exception_instance,
+    is_exception_subclass,
 };
 use crate::types::frame::{TYPE_ID_FRAME, ensure_frame_type, finalize_frame, trace_frame};
 use crate::types::function::KeywordArgs;
@@ -54,6 +56,9 @@ fn diagnostic_sentinel() -> *mut PyObject {
     core::ptr::NonNull::<PyObject>::dangling().as_ptr()
 }
 
+static BASE_EXCEPTION_TYPE: AtomicPtr<PyType> = AtomicPtr::new(ptr::null_mut());
+static BASE_EXCEPTION_GROUP_TYPE: AtomicPtr<PyType> = AtomicPtr::new(ptr::null_mut());
+
 pub(crate) fn is_diagnostic_sentinel(value: *mut PyObject) -> bool {
     value == diagnostic_sentinel()
 }
@@ -83,18 +88,33 @@ pub(crate) fn pending_exception_is(name: &str) -> bool {
     unsafe { crate::types::exc::exception_type_named((*exception).ob_type, name) }
 }
 
+/// Publishes process-lifetime builtin exception roots for lock-free subtype checks.
+pub(super) fn publish_exception_type_roots(types: ExceptionTypeSet) {
+    BASE_EXCEPTION_TYPE.store(types.base_exception, Ordering::Release);
+    BASE_EXCEPTION_GROUP_TYPE.store(types.base_exception_group, Ordering::Release);
+}
+
 /// Returns true when `ty` derives `BaseException` (raw-MRO walk against the
 /// runtime's builtin hierarchy); false when the runtime is not initialized.
 pub(crate) fn type_derives_base_exception(ty: *const PyType) -> bool {
-    super::with_runtime(|runtime| unsafe {
-        is_exception_subclass(ty, runtime.exception_types.base_exception.cast_const())
-    })
-    .unwrap_or(false)
+    let base = BASE_EXCEPTION_TYPE.load(Ordering::Acquire);
+    if base.is_null() {
+        return false;
+    }
+    // SAFETY: `base` is a process-lifetime builtin type published after
+    // runtime construction; callers pass NULL or a live type descriptor.
+    unsafe { is_exception_subclass(ty, base.cast_const()) }
 }
 
 /// Returns true when `ty` derives `BaseExceptionGroup`.
 pub(crate) fn type_derives_exception_group(ty: *const PyType) -> bool {
-    super::with_runtime(|runtime| unsafe { runtime.exception_types.is_exception_group_type(ty) }).unwrap_or(false)
+    let base = BASE_EXCEPTION_GROUP_TYPE.load(Ordering::Acquire);
+    if base.is_null() {
+        return false;
+    }
+    // SAFETY: `base` is a process-lifetime builtin type published after
+    // runtime construction; callers pass NULL or a live type descriptor.
+    unsafe { is_exception_subclass(ty, base.cast_const()) }
 }
 
 /// Allocates an exception-layout instance of `cls` with constructor argument
@@ -1744,6 +1764,21 @@ mod tests {
     fn exception_types() -> crate::types::exc::ExceptionTypeSet {
         super::ensure_runtime_for_exc().unwrap();
         super::super::with_runtime(|runtime| runtime.exception_types).unwrap()
+    }
+
+    #[test]
+    fn type_derives_base_exception_runs_while_runtime_mutex_is_held() {
+        let _guard = test_state_lock();
+        reset_exception_state();
+        super::ensure_runtime_for_exc().unwrap();
+
+        let derives_base = super::super::with_runtime(|runtime| {
+            type_derives_base_exception(runtime.exception_types.value_error.cast_const())
+        })
+        .unwrap();
+
+        assert!(derives_base);
+        reset_exception_state();
     }
 
     #[test]

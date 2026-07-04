@@ -3502,8 +3502,19 @@ fn normalize_byte_index(index: isize, len: usize) -> Result<usize, String> {
 
 fn bytes_item_object(object: *mut PyObject, index: isize) -> Result<*mut PyObject, String> {
     let bytes = expect_bytes_like(object)?;
-    let index = normalize_byte_index(index, bytes.len())?;
+    let index = normalize_byte_index(index, bytes.len()).map_err(|m| retype_byte_index_error(m, object))?;
     Ok(unsafe { super::pon_const_int(i64::from(bytes[index])) })
+}
+
+/// bytearray reads report `bytearray index out of range`; bytes keep the bare
+/// `index out of range` (CPython distinguishes the two at the C level).  Only
+/// the generic sentinel is rewritten, so slice/type diagnostics pass through.
+fn retype_byte_index_error(message: String, object: *mut PyObject) -> String {
+    if message == "index out of range" && bytearray_type::is_bytearray_type(unsafe { (*object).ob_type }) {
+        "bytearray index out of range".to_owned()
+    } else {
+        message
+    }
 }
 
 fn bytes_slice_object(object: *mut PyObject, key: *mut PyObject, mutable: bool) -> Result<*mut PyObject, String> {
