@@ -1045,6 +1045,9 @@ fn lower_primary_terminator(
                 current_block,
                 *target,
             )?;
+            sync_locals_leaving_region(
+                builder, helpers, state, ptr_ty, exception_exit, region, current_block, &[*target],
+            )?;
             control::lower_terminator_with_blocks(
                 builder,
                 &state.boxed,
@@ -1059,6 +1062,9 @@ fn lower_primary_terminator(
             )
         }
         Terminator::ForLoop { body, done, .. } => {
+            sync_locals_leaving_region(
+                builder, helpers, state, ptr_ty, exception_exit, region, current_block, &[*body, *done],
+            )?;
             if let Some(fast_next) = state.last_fast_for_next.take() {
                 let body = find_clif_block(block_map, *body)?;
                 let done = find_clif_block(block_map, *done)?;
@@ -1121,6 +1127,9 @@ fn lower_primary_terminator(
                 current_block,
                 *else_blk,
             )?;
+            sync_locals_leaving_region(
+                builder, helpers, state, ptr_ty, exception_exit, region, current_block, &[*then_blk, *else_blk],
+            )?;
             if let Some(cond) = state.unboxed(*cond).filter(|value| value.ty == Type::IntI64).map(|value| value.value) {
                 lower_unboxed_branch(builder, cond, *then_blk, *else_blk, block_map)
             } else {
@@ -1170,6 +1179,9 @@ fn lower_primary_terminator(
                 int_type,
                 current_block,
                 *else_,
+            )?;
+            sync_locals_leaving_region(
+                builder, helpers, state, ptr_ty, exception_exit, region, current_block, &[*then_, *else_],
             )?;
             if let Some(cond) = state.unboxed(*cond).filter(|value| value.ty == Type::IntI64).map(|value| value.value) {
                 lower_unboxed_branch(builder, cond, *then_, *else_, block_map)
@@ -1389,6 +1401,31 @@ fn sync_all_dirty_locals(
 ) -> Result<(), CodegenError> {
     for slot in 0..state.int_local_dirty.len() {
         sync_dirty_local(builder, helpers, state, ptr_ty, exception_exit, slot as u32)?;
+    }
+    Ok(())
+}
+
+/// Rebox dirty unboxed locals into their boxed slots before control leaves the
+/// typed region for a boxed continuation block.
+///
+/// Fast-path `StoreLocal`s keep a local only in its unboxed `int_locals`
+/// variable (marked dirty); a block outside the region reads the boxed slot via
+/// `use_var`, so without this flush it observes a stale/undefined (zero) value.
+fn sync_locals_leaving_region(
+    builder: &mut FunctionBuilder<'_>,
+    helpers: &HelperFuncRefs,
+    state: &mut FastLowerState,
+    ptr_ty: ir::Type,
+    exception_exit: ir::Block,
+    region: &TypedRegion,
+    current_block: BlockId,
+    successors: &[BlockId],
+) -> Result<(), CodegenError> {
+    if !region.blocks.contains(&current_block) {
+        return Ok(());
+    }
+    if successors.iter().any(|successor| !region.blocks.contains(successor)) {
+        sync_all_dirty_locals(builder, helpers, state, ptr_ty, exception_exit)?;
     }
     Ok(())
 }
@@ -1952,5 +1989,93 @@ def mix(seed):
             .expect("PyLong payload offset fits CLIF offset");
         assert!(clif.contains(&format!("+{payload_offset}")));
         assert!(clif.contains("brif"));
+    }
+
+    #[test]
+    fn typed_region_exit_reboxes_stored_local() {
+        let mut ir = pon_ir::lower_source(
+            "def fib(n):\n    return n if n < 2 else fib(n - 1) + fib(n - 2)\n",
+        )
+        .expect("fib lowers");
+        crate::infer_module_types(&mut ir, &crate::ModuleAnnotations::default());
+        let function_index = ir
+            .functions
+            .iter()
+            .position(|function| function.name == "fib")
+            .expect("fib function");
+
+        let clif = compiled_optimized_clif(&ir, function_index);
+        let lines = clif.lines().map(str::trim).collect::<Vec<_>>();
+
+        let payload_offset = pylong_value_offset_i32(jit_module().target_config().pointer_type().bytes() as usize)
+            .expect("PyLong payload offset fits CLIF offset");
+        let payload_load = lines
+            .iter()
+            .find_map(|line| {
+                if !line.contains(" = load.i64 ") || !line.contains(&format!("+{payload_offset}")) {
+                    return None;
+                }
+                line.split_once(" = load.i64 ").map(|(result, _)| result.to_owned())
+            })
+            .expect("fib base case should load n's unboxed PyLong payload");
+        let mut unboxed_n_values = vec![payload_load.clone()];
+        unboxed_n_values.extend(lines.iter().filter_map(|line| {
+            let (alias, value) = line.split_once(" -> ")?;
+            (value == payload_load).then(|| alias.to_owned())
+        }));
+
+        let (call_index, boxed_n, unboxed_n) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(index, line)| {
+                unboxed_n_values.iter().find_map(|unboxed| {
+                    line.split_once(&format!(" = call fn0({unboxed})"))
+                        .map(|(boxed, _)| (index, boxed.to_owned(), unboxed.to_owned()))
+                })
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected the n < 2 arm to box the loaded local {payload_load} before the ternary merge, got:\n{clif}"
+                )
+            });
+        let true_side_block = lines[..call_index]
+            .iter()
+            .rev()
+            .find_map(|line| {
+                line.strip_prefix("block")
+                    .and_then(|rest| rest.strip_suffix(':'))
+                    .map(|rest| format!("block{rest}"))
+            })
+            .expect("boxing call should be inside a CLIF block");
+        assert!(
+            lines[..call_index]
+                .iter()
+                .any(|line| line.starts_with("brif ") && line.contains(&format!(", {true_side_block},"))),
+            "expected the boxing call fn0({unboxed_n}) to be in the true successor of the n < 2 branch, got:\n{clif}"
+        );
+
+        let guard_successor = lines[call_index + 1..]
+            .iter()
+            .take_while(|line| !line.starts_with("block"))
+            .find_map(|line| {
+                let successors = line.strip_prefix("brif ")?.split_once(", ")?.1;
+                successors.split_once(',').map(|(successor, _)| successor.to_owned())
+            })
+            .expect("boxed local should be checked before flowing to the merge");
+        let guard_start = lines
+            .iter()
+            .position(|line| *line == format!("{guard_successor}:"))
+            .expect("boxing guard successor block should exist");
+        let guard_end = lines[guard_start + 1..]
+            .iter()
+            .position(|line| line.starts_with("block"))
+            .map_or(lines.len(), |offset| guard_start + 1 + offset);
+        let guard_body = &lines[guard_start + 1..guard_end];
+        assert!(
+            guard_body
+                .iter()
+                .any(|line| line.starts_with("jump ") && line.ends_with(&format!("({boxed_n})"))),
+            "expected the base-case arm to carry boxed n {boxed_n} from call fn0({unboxed_n}) to the ternary merge, not a bare iconst.i64 0, got:\n{clif}"
+        );
     }
 }
