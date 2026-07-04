@@ -173,11 +173,10 @@ fn unsupported_operation_class() -> Result<*mut PyObject, String> {
 }
 
 /// `tp_new` for `_io.TextIOWrapper(buffer, encoding=None, ...)`: wraps an
-/// open native binary stream by duplicating its host handle (dup semantics:
-/// shared offset, exactly what `tokenize.open`'s `buffer.seek(0)` +
-/// wrap-then-readlines sequence expects).  Extra positional/keyword options
-/// beyond `encoding` are accepted and ignored: pon's native text stream is
-/// always line-translating UTF-8.
+/// open native binary stream by taking ownership of its host handle, matching
+/// CPython's wrapper-owned buffer lifetime closely enough for pipe EOF.
+/// Extra positional/keyword options beyond `encoding` are accepted and
+/// ignored: pon's native text stream is always line-translating UTF-8.
 unsafe extern "C" fn text_file_new(_cls: *mut PyType, args: *mut PyObject, _kwargs: *mut PyObject) -> *mut PyObject {
     let positional = match unsafe { type_::positional_args_from_object(args) } {
         Ok(args) => args,
@@ -202,15 +201,12 @@ unsafe extern "C" fn text_file_new(_cls: *mut PyType, args: *mut PyObject, _kwar
     let Some(buffer) = (unsafe { as_file(positional[0]) }) else {
         return raise_type_error("TextIOWrapper() buffer must be an open native file");
     };
-    let Some(handle) = buffer.file.as_ref() else {
+    let Some(handle) = buffer.file.take() else {
         return raise_value_error("I/O operation on closed file.");
-    };
-    let Ok(clone) = handle.try_clone() else {
-        return raise_io_error("failed to duplicate stream handle");
     };
     alloc_native_file(PyNativeFile {
         ob_base: PyObjectHeader::new(text_file_type()),
-        file: Some(clone),
+        file: Some(handle),
         name: buffer.name.clone(),
         mode: "r".to_owned(),
         binary: false,
