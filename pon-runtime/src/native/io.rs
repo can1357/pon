@@ -20,9 +20,29 @@ use super::install_module;
 enum NewlineMode {
     /// `newline=None`: recognize `\n`, `\r\n`, and `\r`, returning `\n` in text mode.
     UniversalTranslate,
-    /// Any explicit newline value: keep bytes as they appear on disk for this phase.
-    Preserve,
+    /// `newline=""`: recognize every line ending but return bytes exactly as stored.
+    UniversalPreserve,
+    /// `newline="\n"` or binary mode: only LF terminates a line; no translation.
+    LineFeed,
+    /// `newline="\r"`: only CR terminates a line; writes map `\n` to `\r`.
+    CarriageReturn,
+    /// `newline="\r\n"`: only CRLF terminates a line; writes map `\n` to `\r\n`.
+    CarriageReturnLineFeed,
 }
+
+impl NewlineMode {
+    fn detects_universal(self) -> bool {
+        matches!(self, Self::UniversalTranslate | Self::UniversalPreserve)
+    }
+
+    fn translates_on_read(self) -> bool {
+        matches!(self, Self::UniversalTranslate)
+    }
+}
+
+const NEWLINE_SEEN_CR: u8 = 0b001;
+const NEWLINE_SEEN_LF: u8 = 0b010;
+const NEWLINE_SEEN_CRLF: u8 = 0b100;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct OpenMode {
@@ -59,6 +79,8 @@ pub(crate) struct PyNativeFile {
     encoding: Option<String>,
     /// Text newline handling policy.
     newline: NewlineMode,
+    /// Bitset of newline spellings seen by universal-newline text reads.
+    newline_seen: u8,
 }
 
 unsafe impl Send for PyNativeFile {}
@@ -89,6 +111,17 @@ static BINARY_FILE_TYPE: LazyLock<usize> = LazyLock::new(|| {
     ty.tp_iternext = Some(file_iternext_slot);
     Box::into_raw(ty) as usize
 });
+
+fn unsupported_operation_class() -> Result<*mut PyObject, String> {
+    let os_error = builtin_class("OSError")?;
+    let value_error = builtin_class("ValueError")?;
+    heap_class(
+        "UnsupportedOperation",
+        &[os_error, value_error],
+        "The stream does not support this operation.",
+        &[],
+    )
+}
 
 /// `tp_new` for `_io.TextIOWrapper(buffer, encoding=None, ...)`: wraps an
 /// open native binary stream by duplicating its host handle (dup semantics:
@@ -137,6 +170,7 @@ unsafe extern "C" fn text_file_new(_cls: *mut PyType, args: *mut PyObject, _kwar
         append: buffer.append,
         encoding: Some("utf-8".to_owned()),
         newline: NewlineMode::UniversalTranslate,
+        newline_seen: 0,
     }))
     .cast::<PyObject>()
 }
@@ -1685,8 +1719,7 @@ const STREAM_METHOD_STUBS: &[&str] = &[
 ];
 
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
-    let os_error = builtin_class("OSError")?;
-    let value_error = builtin_class("ValueError")?;
+    let unsupported_operation = unsupported_operation_class()?;
     let io_base = heap_class(
         "_IOBase",
         &[],
@@ -1729,15 +1762,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         function_attr("open_code", open_code_entry, 1)?,
         function_attr("text_encoding", text_encoding_entry, VARIADIC_ARITY)?,
         (intern("BlockingIOError"), builtin_class("BlockingIOError")?),
-        (
-            intern("UnsupportedOperation"),
-            heap_class(
-                "UnsupportedOperation",
-                &[os_error, value_error],
-                "The stream does not support this operation.",
-                &[],
-            )?,
-        ),
+        (intern("UnsupportedOperation"), unsupported_operation as *mut PyObject),
         (intern("_IOBase"), io_base),
         (intern("_RawIOBase"), raw_io_base),
         (intern("_BufferedIOBase"), buffered_io_base),
@@ -1972,11 +1997,60 @@ pub(super) unsafe extern "C" fn builtin_input(argv: *mut *mut PyObject, argc: us
     finish_input_read(std::io::stdin().read_line(&mut line), &mut line)
 }
 
+/// `open()`'s first argument: a filesystem path or an existing file descriptor
+/// (CPython accepts both; `os.fdopen` and `subprocess` pass raw fds).
+enum FileSource {
+    Path(String),
+    Fd(i32),
+}
+
+/// Coerce `open()`'s `file` argument to a path string: a `str` directly, or an
+/// `os.PathLike` via its `__fspath__` hook (so `pathlib.Path` works, matching
+/// CPython).  Returns `None` for anything else — notably an integer fd, or a
+/// `bytes` / `__fspath__`-returns-`bytes` path pon's file layer does not accept
+/// — so the caller falls through to the file-descriptor form.
+fn fspath_coerce(obj: *mut PyObject) -> Option<String> {
+    let raw = crate::tag::untag_arg(obj);
+    if raw.is_null() || crate::tag::is_small_int(raw) {
+        return None;
+    }
+    if let Some(text) = unsafe { type_::unicode_text(raw) } {
+        return Some(text.to_owned());
+    }
+    let ty = unsafe { (*raw).ob_type.cast_mut() };
+    let hook = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern("__fspath__")) };
+    if hook.is_null() {
+        return None;
+    }
+    let bound = unsafe { crate::descr::descriptor_get(hook, raw, ty) };
+    if bound.is_null() {
+        return None;
+    }
+    let result = crate::tag::untag_arg(unsafe { crate::abi::pon_call(bound, std::ptr::null_mut(), 0) });
+    if result.is_null() {
+        return None;
+    }
+    unsafe { type_::unicode_text(result) }.map(str::to_owned)
+}
+
 fn open_from_args(args: &[*mut PyObject]) -> Result<*mut PyObject, OpenError> {
     if args.is_empty() || args.len() > 8 {
         return Err(OpenError::Type(format!("open() expected 1 to 8 arguments, got {}", args.len())));
     }
-    let path = expect_str(args[0], "open() file must be str")?.to_owned();
+    // `file` is a path (str) or an existing file descriptor (int), matching
+    // CPython `open(file, ...)` and `os.fdopen`.
+    let source = match fspath_coerce(args[0]) {
+        Some(path) => FileSource::Path(path),
+        None => {
+            let fd = expect_int(args[0], "open() argument must be a str, os.PathLike, or integer file descriptor").map_err(OpenError::Type)?;
+            if fd < 0 {
+                return Err(OpenError::Value("negative file descriptor".to_owned()));
+            }
+            let fd = i32::try_from(fd)
+                .map_err(|_| OpenError::Value(format!("open() invalid file descriptor: {fd}")))?;
+            FileSource::Fd(fd)
+        }
+    };
     // The keyword binder flattens the full `open(file, mode='r',
     // buffering=-1, encoding=None, errors=None, newline=None, closefd=True,
     // opener=None)` signature into eight positional slots with None filling
@@ -2032,14 +2106,17 @@ fn open_from_args(args: &[*mut PyObject]) -> Result<*mut PyObject, OpenError> {
         if args.get(5).copied().is_some_and(|value| !is_none(value)) {
             return Err(OpenError::Value("binary mode doesn't take a newline argument".to_owned()));
         }
-        NewlineMode::Preserve
+        NewlineMode::LineFeed
     } else if let Some(&newline) = args.get(5) {
         if is_none(newline) {
             NewlineMode::UniversalTranslate
         } else {
             let text = expect_str(newline, "open() newline must be str or None")?;
             match text {
-                "" | "\n" | "\r" | "\r\n" => NewlineMode::Preserve,
+                "" => NewlineMode::UniversalPreserve,
+                "\n" => NewlineMode::LineFeed,
+                "\r" => NewlineMode::CarriageReturn,
+                "\r\n" => NewlineMode::CarriageReturnLineFeed,
                 _ => return Err(OpenError::Value("illegal newline value".to_owned())),
             }
         }
@@ -2054,8 +2131,17 @@ fn open_from_args(args: &[*mut PyObject]) -> Result<*mut PyObject, OpenError> {
         return Err(OpenError::Value("open() opener argument is not supported".to_owned()));
     }
 
-    let file = open_host_file(&path, &mode)?;
-    Ok(alloc_file(file, path, mode, encoding, newline))
+    let (file, name) = match source {
+        FileSource::Path(path) => (open_host_file(&path, &mode)?, path),
+        FileSource::Fd(fd) => {
+            use std::os::fd::FromRawFd;
+            // SAFETY: the caller transfers ownership of `fd` (CPython
+            // `closefd=True`, the default — `closefd=False` is rejected above);
+            // the file object closes it on drop.
+            (unsafe { File::from_raw_fd(fd) }, fd.to_string())
+        }
+    };
+    Ok(alloc_file(file, name, mode, encoding, newline))
 }
 
 fn open_host_file(path: &str, mode: &OpenMode) -> Result<File, OpenError> {
@@ -2093,6 +2179,7 @@ fn alloc_file(file: File, name: String, mode: OpenMode, encoding: Option<String>
         append: mode.append,
         encoding,
         newline,
+        newline_seen: 0,
     }))
     .cast::<PyObject>()
 }
@@ -2119,7 +2206,8 @@ pub(super) fn std_stream_object(fd: i32, name: &str, readable: bool) -> *mut PyO
         writable: !readable,
         append: false,
         encoding: Some("utf-8".to_owned()),
-        newline: NewlineMode::Preserve,
+        newline: NewlineMode::LineFeed,
+        newline_seen: 0,
     }))
     .cast::<PyObject>()
 }
@@ -2213,9 +2301,13 @@ unsafe extern "C" fn file_getattro(object: *mut PyObject, name: *mut PyObject) -
         "closed" => unsafe { abi::number::pon_const_bool(i32::from(file.file.is_none())) },
         "name" => alloc_str(&file.name),
         "mode" => alloc_str(&file.mode),
-        "encoding" => file.encoding.as_deref().map_or_else(|| unsafe { abi::pon_none() }, alloc_str),
-        "newlines" => unsafe { abi::pon_none() },
+        "encoding" if !file.binary => file.encoding.as_deref().map_or_else(|| unsafe { abi::pon_none() }, alloc_str),
+        "errors" if !file.binary => alloc_str("strict"),
+        "newlines" if !file.binary => newline_seen_object(file),
         "read" => bound_file_method(object, "read", file_read_method),
+        "read1" if file.binary => bound_file_method(object, "read1", file_read1_method),
+        "readinto" if file.binary => bound_file_method(object, "readinto", file_readinto_method),
+        "readinto1" if file.binary => bound_file_method(object, "readinto1", file_readinto_method),
         "readline" => bound_file_method(object, "readline", file_readline_method),
         "readlines" => bound_file_method(object, "readlines", file_readlines_method),
         "write" => bound_file_method(object, "write", file_write_method),
@@ -2227,6 +2319,7 @@ unsafe extern "C" fn file_getattro(object: *mut PyObject, name: *mut PyObject) -
         "readable" => bound_file_method(object, "readable", file_readable_method),
         "writable" => bound_file_method(object, "writable", file_writable_method),
         "seekable" => bound_file_method(object, "seekable", file_seekable_method),
+        "isatty" => bound_file_method(object, "isatty", file_isatty_method),
         "fileno" => bound_file_method(object, "fileno", file_fileno_method),
         "__enter__" => bound_file_method(object, "__enter__", file_enter_method),
         "__exit__" => bound_file_method(object, "__exit__", file_exit_method),
@@ -2259,7 +2352,7 @@ unsafe extern "C" fn file_iter_slot(object: *mut PyObject) -> *mut PyObject {
         return raise_value_error("I/O operation on closed file.");
     }
     if !file.readable {
-        return raise_value_error("not readable");
+        return raise_unsupported_error("not readable");
     }
     object
 }
@@ -2271,8 +2364,7 @@ unsafe extern "C" fn file_iternext_slot(object: *mut PyObject) -> *mut PyObject 
     match read_line_raw(file, None) {
         Ok(bytes) if bytes.is_empty() => unsafe { abi::pon_raise_stop_iteration(ptr::null_mut()) },
         Ok(bytes) => bytes_to_python(file, bytes),
-        Err(FileOpError::Value(message)) => raise_value_error(&message),
-        Err(FileOpError::Io(message)) => raise_io_error(&message),
+        Err(error) => raise_file_op_error(error),
     }
 }
 
@@ -2299,8 +2391,68 @@ unsafe extern "C" fn file_read_method(argv: *mut *mut PyObject, argc: usize) -> 
     };
     match result {
         Ok(bytes) => bytes_to_python(file, bytes),
-        Err(FileOpError::Value(message)) => raise_value_error(&message),
-        Err(FileOpError::Io(message)) => raise_io_error(&message),
+        Err(error) => raise_file_op_error(error),
+    }
+}
+
+unsafe extern "C" fn file_read1_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { method_args(argv, argc, "read1") } {
+        Ok(args) => args,
+        Err(message) => return raise_type_error(&message),
+    };
+    if args.len() > 2 {
+        return raise_type_error(&format!("read1() expected at most 1 argument, got {}", args.len().saturating_sub(1)));
+    }
+    let size = match optional_size(args.get(1).copied(), "read1") {
+        Ok(size) => size,
+        Err(message) => return raise_type_error(&message),
+    };
+    let Some(file) = (unsafe { as_file(args[0]) }) else {
+        return raise_type_error("read1() receiver is not a native file");
+    };
+    match read_raw(file, size) {
+        Ok(bytes) => bytes_to_python(file, bytes),
+        Err(error) => raise_file_op_error(error),
+    }
+}
+
+unsafe extern "C" fn file_readinto_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { method_args(argv, argc, "readinto") } {
+        Ok(args) => args,
+        Err(message) => return raise_type_error(&message),
+    };
+    if args.len() != 2 {
+        return raise_type_error(&format!("readinto() expected 1 argument, got {}", args.len().saturating_sub(1)));
+    }
+    let Some(file) = (unsafe { as_file(args[0]) }) else {
+        return raise_type_error("readinto() receiver is not a native file");
+    };
+    let target = crate::tag::untag_arg(args[1]);
+    if target.is_null() {
+        return raise_type_error("readinto() argument must be read-write bytes-like object, not 'NoneType'");
+    }
+    let ty = unsafe { (*target).ob_type };
+    let (dst, dst_len) = if bytearray_::is_bytearray_type(ty) {
+        let bytearray = unsafe { &mut *target.cast::<bytearray_::PyByteArray>() };
+        (bytearray.bytes.as_mut_ptr(), bytearray.bytes.len())
+    } else if memoryview::is_memoryview_type(ty) {
+        let view = unsafe { &mut *target.cast::<memoryview::PyMemoryView>() };
+        if view.released {
+            return raise_value_error(memoryview::RELEASED_ERROR);
+        }
+        if view.readonly {
+            return raise_type_error("readinto() argument must be read-write bytes-like object, not memoryview");
+        }
+        (view.data, view.len)
+    } else {
+        let type_name = unsafe { crate::types::dict::type_name(target) }.unwrap_or("object");
+        return raise_type_error(&format!(
+            "readinto() argument must be read-write bytes-like object, not {type_name}"
+        ));
+    };
+    match read_into_file(file, dst, dst_len) {
+        Ok(count) => unsafe { abi::pon_const_int(count as i64) },
+        Err(error) => raise_file_op_error(error),
     }
 }
 
@@ -2321,8 +2473,7 @@ unsafe extern "C" fn file_readline_method(argv: *mut *mut PyObject, argc: usize)
     };
     match read_line_raw(file, size) {
         Ok(bytes) => bytes_to_python(file, bytes),
-        Err(FileOpError::Value(message)) => raise_value_error(&message),
-        Err(FileOpError::Io(message)) => raise_io_error(&message),
+        Err(error) => raise_file_op_error(error),
     }
 }
 
@@ -2334,22 +2485,30 @@ unsafe extern "C" fn file_readlines_method(argv: *mut *mut PyObject, argc: usize
     if args.len() > 2 {
         return raise_type_error(&format!("readlines() expected at most 1 argument, got {}", args.len().saturating_sub(1)));
     }
+    let hint = match optional_size(args.get(1).copied(), "readlines") {
+        Ok(size) => size,
+        Err(message) => return raise_type_error(&message),
+    };
     let Some(file) = (unsafe { as_file(args[0]) }) else {
         return raise_type_error("readlines() receiver is not a native file");
     };
     let mut lines = Vec::new();
+    let mut total = 0_usize;
     loop {
         match read_line_raw(file, None) {
             Ok(bytes) if bytes.is_empty() => break,
             Ok(bytes) => {
+                total = total.saturating_add(bytes.len());
                 let line = bytes_to_python(file, bytes);
                 if line.is_null() {
                     return ptr::null_mut();
                 }
                 lines.push(line);
+                if hint.is_some_and(|limit| limit > 0 && total >= limit) {
+                    break;
+                }
             }
-            Err(FileOpError::Value(message)) => return raise_value_error(&message),
-            Err(FileOpError::Io(message)) => return raise_io_error(&message),
+            Err(error) => return raise_file_op_error(error),
         }
     }
     super::builtins_mod::alloc_list(lines)
@@ -2368,8 +2527,7 @@ unsafe extern "C" fn file_write_method(argv: *mut *mut PyObject, argc: usize) ->
     };
     match write_object(file, args[1]) {
         Ok(count) => unsafe { abi::pon_const_int(count) },
-        Err(FileOpError::Value(message)) => raise_value_error(&message),
-        Err(FileOpError::Io(message)) => raise_io_error(&message),
+        Err(error) => raise_file_op_error(error),
     }
 }
 
@@ -2398,10 +2556,7 @@ unsafe extern "C" fn file_writelines_method(argv: *mut *mut PyObject, argc: usiz
             return ptr::null_mut();
         }
         if let Err(error) = write_object(file, item) {
-            return match error {
-                FileOpError::Value(message) => raise_value_error(&message),
-                FileOpError::Io(message) => raise_io_error(&message),
-            };
+            return raise_file_op_error(error);
         }
     }
     unsafe { abi::pon_none() }
@@ -2432,8 +2587,7 @@ unsafe extern "C" fn file_seek_method(argv: *mut *mut PyObject, argc: usize) -> 
     };
     match seek_file(file, offset, whence) {
         Ok(position) => unsafe { abi::pon_const_int(position as i64) },
-        Err(FileOpError::Value(message)) => raise_value_error(&message),
-        Err(FileOpError::Io(message)) => raise_io_error(&message),
+        Err(error) => raise_file_op_error(error),
     }
 }
 
@@ -2450,8 +2604,7 @@ unsafe extern "C" fn file_tell_method(argv: *mut *mut PyObject, argc: usize) -> 
     };
     match seek_file(file, 0, 1) {
         Ok(position) => unsafe { abi::pon_const_int(position as i64) },
-        Err(FileOpError::Value(message)) => raise_value_error(&message),
-        Err(FileOpError::Io(message)) => raise_io_error(&message),
+        Err(error) => raise_file_op_error(error),
     }
 }
 
@@ -2525,6 +2678,9 @@ unsafe extern "C" fn file_readable_method(argv: *mut *mut PyObject, argc: usize)
         Ok(file) => file,
         Err(error) => return error,
     };
+    if file.file.is_none() && file.readable {
+        return raise_value_error("I/O operation on closed file");
+    }
     // SAFETY: Boolean boxing helper follows the NULL-sentinel contract.
     unsafe { abi::number::pon_const_bool(i32::from(file.readable)) }
 }
@@ -2536,6 +2692,9 @@ unsafe extern "C" fn file_writable_method(argv: *mut *mut PyObject, argc: usize)
         Ok(file) => file,
         Err(error) => return error,
     };
+    if file.file.is_none() && file.writable {
+        return raise_value_error("I/O operation on closed file");
+    }
     // SAFETY: Boolean boxing helper follows the NULL-sentinel contract.
     unsafe { abi::number::pon_const_bool(i32::from(file.writable)) }
 }
@@ -2551,7 +2710,7 @@ unsafe extern "C" fn file_seekable_method(argv: *mut *mut PyObject, argc: usize)
         Err(error) => return error,
     };
     let Some(handle) = file.file.as_mut() else {
-        return raise_value_error("I/O operation on closed file.");
+        return raise_value_error("I/O operation on closed file");
     };
     let seekable = handle.seek(SeekFrom::Current(0)).is_ok();
     // SAFETY: Boolean boxing helper follows the NULL-sentinel contract.
@@ -2567,10 +2726,24 @@ unsafe extern "C" fn file_fileno_method(argv: *mut *mut PyObject, argc: usize) -
         Err(error) => return error,
     };
     let Some(handle) = file.file.as_ref() else {
-        return raise_value_error("I/O operation on closed file.");
+        return raise_value_error("I/O operation on closed file");
     };
     // SAFETY: Integer boxing helper follows the NULL-sentinel contract.
     unsafe { abi::pon_const_int(i64::from(handle.as_raw_fd())) }
+}
+
+/// `file.isatty()`: CPython asks the wrapped descriptor directly and raises on closed files.
+unsafe extern "C" fn file_isatty_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    use std::os::fd::AsRawFd;
+    let file = match unsafe { file_flag_receiver(argv, argc, "isatty") } {
+        Ok(file) => file,
+        Err(error) => return error,
+    };
+    let Some(handle) = file.file.as_ref() else {
+        return raise_value_error("I/O operation on closed file");
+    };
+    let is_tty = unsafe { libc::isatty(handle.as_raw_fd()) == 1 };
+    unsafe { abi::number::pon_const_bool(i32::from(is_tty)) }
 }
 
 unsafe extern "C" fn file_enter_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -2633,123 +2806,170 @@ unsafe extern "C" fn file_next_method(argv: *mut *mut PyObject, argc: usize) -> 
 
 fn read_raw(file: &mut PyNativeFile, size: Option<usize>) -> Result<Vec<u8>, FileOpError> {
     ensure_readable(file)?;
-    let handle = file.file.as_mut().ok_or_else(closed_error)?;
-    let mut out = Vec::new();
-    match size {
-        Some(size) => {
-            out.resize(size, 0);
-            let n = handle.read(&mut out).map_err(io_op_error)?;
-            out.truncate(n);
+    let out = {
+        let handle = file.file.as_mut().ok_or_else(closed_error)?;
+        let mut out = Vec::new();
+        match size {
+            Some(size) => {
+                out.resize(size, 0);
+                let n = handle.read(&mut out).map_err(io_op_error)?;
+                out.truncate(n);
+            }
+            None => {
+                handle.read_to_end(&mut out).map_err(io_op_error)?;
+            }
         }
-        None => {
-            handle.read_to_end(&mut out).map_err(io_op_error)?;
-        }
+        out
+    };
+    if !file.binary && file.newline.detects_universal() {
+        update_newlines(file, &out);
     }
     Ok(out)
 }
 
 fn read_line_raw(file: &mut PyNativeFile, size: Option<usize>) -> Result<Vec<u8>, FileOpError> {
     ensure_readable(file)?;
-    let handle = file.file.as_mut().ok_or_else(closed_error)?;
-    let mut out = Vec::new();
-    let limit = size.unwrap_or(usize::MAX);
-    if limit == 0 {
-        return Ok(out);
-    }
-    while out.len() < limit {
-        let mut byte = [0_u8; 1];
-        let n = handle.read(&mut byte).map_err(io_op_error)?;
-        if n == 0 {
-            break;
+    let newline = file.newline;
+    let out = {
+        let handle = file.file.as_mut().ok_or_else(closed_error)?;
+        let mut out = Vec::new();
+        let limit = size.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(out);
         }
-        out.push(byte[0]);
-        if byte[0] == b'\n' {
-            break;
-        }
-        if !file.binary && file.newline == NewlineMode::UniversalTranslate && byte[0] == b'\r' {
-            if out.len() >= limit {
-                break;
-            }
-            let mut next = [0_u8; 1];
-            let n = handle.read(&mut next).map_err(io_op_error)?;
+        let mut previous_was_cr = false;
+        while out.len() < limit {
+            let mut byte = [0_u8; 1];
+            let n = handle.read(&mut byte).map_err(io_op_error)?;
             if n == 0 {
                 break;
             }
-            if next[0] == b'\n' {
-                out.push(next[0]);
-            } else {
-                handle.seek(SeekFrom::Current(-1)).map_err(io_op_error)?;
+            out.push(byte[0]);
+            match newline {
+                NewlineMode::UniversalTranslate | NewlineMode::UniversalPreserve => {
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                    if byte[0] == b'\r' {
+                        if out.len() >= limit {
+                            break;
+                        }
+                        let mut next = [0_u8; 1];
+                        let n = handle.read(&mut next).map_err(io_op_error)?;
+                        if n != 0 {
+                            if next[0] == b'\n' {
+                                out.push(next[0]);
+                            } else {
+                                handle.seek(SeekFrom::Current(-1)).map_err(io_op_error)?;
+                            }
+                        }
+                        break;
+                    }
+                }
+                NewlineMode::LineFeed => {
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                }
+                NewlineMode::CarriageReturn => {
+                    if byte[0] == b'\r' {
+                        break;
+                    }
+                }
+                NewlineMode::CarriageReturnLineFeed => {
+                    if previous_was_cr && byte[0] == b'\n' {
+                        break;
+                    }
+                    previous_was_cr = byte[0] == b'\r';
+                }
             }
-            break;
         }
+        out
+    };
+    if newline.detects_universal() {
+        update_newlines(file, &out);
     }
     Ok(out)
 }
 
 /// Text-mode `read(size)`: `size` counts CHARACTERS, not bytes.  Reads one
 /// UTF-8 sequence at a time so a multibyte character is never split at the
-/// requested boundary (the old byte-counted slice ValueError'd mid-codepoint
-/// on e.g. `read(1)` over `'¡'`).  In universal-translate mode a `\r\n` pair
-/// counts as ONE character (it collapses to `\n` downstream) and a bare `\r`
-/// uses the same peek/seek-back idiom as `read_line_raw`.  Invalid leading
-/// bytes are passed through one byte at a time; `bytes_to_python`'s UTF-8
-/// validation stays the single point that rejects them.
+/// requested boundary.  In `newline=None` mode a `\r\n` pair counts as one
+/// translated `\n` character; every other newline mode preserves bytes and
+/// therefore counts CR and LF separately just like CPython `TextIOWrapper`.
 fn read_chars_raw(file: &mut PyNativeFile, count: usize) -> Result<Vec<u8>, FileOpError> {
     ensure_readable(file)?;
-    let translate = file.newline == NewlineMode::UniversalTranslate;
-    let handle = file.file.as_mut().ok_or_else(closed_error)?;
-    let mut out = Vec::with_capacity(count);
-    let mut chars = 0_usize;
-    while chars < count {
-        let mut byte = [0_u8; 1];
-        if handle.read(&mut byte).map_err(io_op_error)? == 0 {
-            break;
-        }
-        out.push(byte[0]);
-        // Continuation bytes owed for this UTF-8 sequence (0 for ASCII and
-        // for invalid leading bytes, which count as one unit each).
-        let mut pending = match byte[0] {
-            0xC0..=0xDF => 1_usize,
-            0xE0..=0xEF => 2,
-            0xF0..=0xF7 => 3,
-            _ => 0,
-        };
-        while pending > 0 {
-            let mut cont = [0_u8; 1];
-            if handle.read(&mut cont).map_err(io_op_error)? == 0 {
-                // EOF mid-sequence: downstream validation reports it.
-                return Ok(out);
-            }
-            out.push(cont[0]);
-            if cont[0] & 0xC0 != 0x80 {
-                // Not a continuation byte: the sequence is broken; leave the
-                // byte in the buffer for downstream validation to reject.
+    let newline = file.newline;
+    let translate = newline.translates_on_read();
+    let out = {
+        let handle = file.file.as_mut().ok_or_else(closed_error)?;
+        let mut out = Vec::with_capacity(count);
+        let mut chars = 0_usize;
+        while chars < count {
+            let mut byte = [0_u8; 1];
+            if handle.read(&mut byte).map_err(io_op_error)? == 0 {
                 break;
             }
-            pending -= 1;
-        }
-        if translate && byte[0] == b'\r' {
-            // `\r\n` collapses to one `\n` downstream: consume the pair as a
-            // single character; a bare `\r` seeks back like `read_line_raw`.
-            let mut next = [0_u8; 1];
-            if handle.read(&mut next).map_err(io_op_error)? != 0 {
-                if next[0] == b'\n' {
-                    out.push(next[0]);
-                } else {
-                    handle.seek(SeekFrom::Current(-1)).map_err(io_op_error)?;
+            out.push(byte[0]);
+            // Continuation bytes owed for this UTF-8 sequence (0 for ASCII and
+            // for invalid leading bytes, which count as one unit each).
+            let mut pending = match byte[0] {
+                0xC0..=0xDF => 1_usize,
+                0xE0..=0xEF => 2,
+                0xF0..=0xF7 => 3,
+                _ => 0,
+            };
+            while pending > 0 {
+                let mut cont = [0_u8; 1];
+                if handle.read(&mut cont).map_err(io_op_error)? == 0 {
+                    // EOF mid-sequence: downstream validation reports it.
+                    return Ok(out);
+                }
+                out.push(cont[0]);
+                if cont[0] & 0xC0 != 0x80 {
+                    // Not a continuation byte: the sequence is broken; leave
+                    // validation to `bytes_to_python`.
+                    break;
+                }
+                pending -= 1;
+            }
+            if translate && byte[0] == b'\r' {
+                // `\r\n` collapses to one `\n` downstream: consume the pair as a
+                // single character; a bare `\r` seeks back like `read_line_raw`.
+                let mut next = [0_u8; 1];
+                if handle.read(&mut next).map_err(io_op_error)? != 0 {
+                    if next[0] == b'\n' {
+                        out.push(next[0]);
+                    } else {
+                        handle.seek(SeekFrom::Current(-1)).map_err(io_op_error)?;
+                    }
                 }
             }
+            chars += 1;
         }
-        chars += 1;
+        out
+    };
+    if newline.detects_universal() {
+        update_newlines(file, &out);
     }
     Ok(out)
+}
+
+fn read_into_file(file: &mut PyNativeFile, dst: *mut u8, dst_len: usize) -> Result<usize, FileOpError> {
+    ensure_readable(file)?;
+    if !file.binary {
+        return Err(FileOpError::Unsupported("readinto() not available in text mode".to_owned()));
+    }
+    let handle = file.file.as_mut().ok_or_else(closed_error)?;
+    let dst = unsafe { std::slice::from_raw_parts_mut(dst, dst_len) };
+    handle.read(dst).map_err(io_op_error)
 }
 
 fn bytes_to_python(file: &PyNativeFile, bytes: Vec<u8>) -> *mut PyObject {
     if file.binary {
         unsafe { abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) }
     } else {
-        let bytes = if file.newline == NewlineMode::UniversalTranslate {
+        let bytes = if file.newline.translates_on_read() {
             translate_universal_newlines(&bytes)
         } else {
             bytes
@@ -2763,22 +2983,33 @@ fn bytes_to_python(file: &PyNativeFile, bytes: Vec<u8>) -> *mut PyObject {
 
 fn write_object(file: &mut PyNativeFile, object: *mut PyObject) -> Result<i64, FileOpError> {
     ensure_writable(file)?;
-    let binary = file.binary;
-    let handle = file.file.as_mut().ok_or_else(closed_error)?;
-    if binary {
-        let bytes = object_bytes(object).ok_or_else(|| FileOpError::Value("a bytes-like object is required, not 'str'".to_owned()))?;
+    if file.binary {
+        let bytes = object_bytes(object)
+            .ok_or_else(|| FileOpError::Type("a bytes-like object is required, not 'str'".to_owned()))?;
+        let handle = file.file.as_mut().ok_or_else(closed_error)?;
         handle.write_all(&bytes).map_err(io_op_error)?;
         Ok(bytes.len() as i64)
     } else {
         let text = unsafe { type_::unicode_text(object) }
-            .ok_or_else(|| FileOpError::Value("write() argument must be str, not bytes".to_owned()))?;
-        handle.write_all(text.as_bytes()).map_err(io_op_error)?;
+            .ok_or_else(|| FileOpError::Type("write() argument must be str, not bytes".to_owned()))?;
+        let payload = translate_write_newlines(file.newline, text);
+        let handle = file.file.as_mut().ok_or_else(closed_error)?;
+        handle.write_all(payload.as_bytes()).map_err(io_op_error)?;
         Ok(text.chars().count() as i64)
     }
 }
 
 fn seek_file(file: &mut PyNativeFile, offset: i64, whence: i64) -> Result<u64, FileOpError> {
+    let binary = file.binary;
     let handle = file.file.as_mut().ok_or_else(closed_error)?;
+    if !binary {
+        match (whence, offset) {
+            (1, 0) | (2, 0) | (0, _) => {}
+            (1, _) => return Err(FileOpError::Unsupported("can't do nonzero cur-relative seeks".to_owned())),
+            (2, _) => return Err(FileOpError::Unsupported("can't do nonzero end-relative seeks".to_owned())),
+            _ => {}
+        }
+    }
     let seek_from = match whence {
         0 => {
             if offset < 0 {
@@ -2797,7 +3028,7 @@ fn ensure_readable(file: &PyNativeFile) -> Result<(), FileOpError> {
     if file.file.is_none() {
         Err(closed_error())
     } else if !file.readable {
-        Err(FileOpError::Value("not readable".to_owned()))
+        Err(FileOpError::Unsupported("not readable".to_owned()))
     } else {
         Ok(())
     }
@@ -2807,7 +3038,7 @@ fn ensure_writable(file: &PyNativeFile) -> Result<(), FileOpError> {
     if file.file.is_none() {
         Err(closed_error())
     } else if !file.writable {
-        Err(FileOpError::Value("not writable".to_owned()))
+        Err(FileOpError::Unsupported("not writable".to_owned()))
     } else {
         Ok(())
     }
@@ -2826,6 +3057,61 @@ fn object_bytes(object: *mut PyObject) -> Option<Vec<u8>> {
         Some(bytes.as_slice().to_vec())
     } else {
         None
+    }
+}
+
+fn update_newlines(file: &mut PyNativeFile, bytes: &[u8]) {
+    if file.newline.detects_universal() {
+        file.newline_seen |= detect_newline_bits(bytes);
+    }
+}
+
+fn detect_newline_bits(bytes: &[u8]) -> u8 {
+    let mut bits = 0_u8;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' => {
+                if bytes.get(index + 1) == Some(&b'\n') {
+                    bits |= NEWLINE_SEEN_CRLF;
+                    index += 2;
+                } else {
+                    bits |= NEWLINE_SEEN_CR;
+                    index += 1;
+                }
+            }
+            b'\n' => {
+                bits |= NEWLINE_SEEN_LF;
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    bits
+}
+
+fn newline_seen_object(file: &PyNativeFile) -> *mut PyObject {
+    let bits = file.newline_seen;
+    if bits == 0 {
+        return unsafe { abi::pon_none() };
+    }
+    let mut items = Vec::new();
+    if bits & NEWLINE_SEEN_CR != 0 {
+        items.push(alloc_str("\r"));
+    }
+    if bits & NEWLINE_SEEN_LF != 0 {
+        items.push(alloc_str("\n"));
+    }
+    if bits & NEWLINE_SEEN_CRLF != 0 {
+        items.push(alloc_str("\r\n"));
+    }
+    if items.iter().any(|item| item.is_null()) {
+        return ptr::null_mut();
+    }
+    if items.len() == 1 {
+        items[0]
+    } else {
+        super::builtins_mod::alloc_tuple(items)
     }
 }
 
@@ -2848,6 +3134,20 @@ fn translate_universal_newlines(bytes: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+fn translate_write_newlines<'a>(mode: NewlineMode, text: &'a str) -> std::borrow::Cow<'a, str> {
+    let replacement = match mode {
+        NewlineMode::CarriageReturn => "\r",
+        NewlineMode::CarriageReturnLineFeed => "\r\n",
+        NewlineMode::UniversalTranslate if cfg!(windows) => "\r\n",
+        _ => return std::borrow::Cow::Borrowed(text),
+    };
+    if text.contains('\n') {
+        std::borrow::Cow::Owned(text.replace('\n', replacement))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
 }
 
 unsafe fn argv_slice<'a>(argv: *mut *mut PyObject, argc: usize) -> Result<&'a [*mut PyObject], String> {
@@ -2954,6 +3254,33 @@ fn raise_io_error(message: &str) -> *mut PyObject {
     abi::return_null_with_error(message.to_owned())
 }
 
+fn raise_unsupported_error(message: &str) -> *mut PyObject {
+    let class = crate::import::module_attr(intern("_io"), intern("UnsupportedOperation"))
+        .or_else(|| unsupported_operation_class().ok());
+    let Some(class) = class else {
+        return raise_value_error(message);
+    };
+    let message = alloc_str(message);
+    if message.is_null() {
+        return ptr::null_mut();
+    }
+    let mut argv = [message];
+    let instance = unsafe { abi::pon_call(class, argv.as_mut_ptr(), argv.len()) };
+    if instance.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { abi::exc::pon_raise(instance, ptr::null_mut()) }
+}
+
+fn raise_file_op_error(error: FileOpError) -> *mut PyObject {
+    match error {
+        FileOpError::Type(message) => raise_type_error(&message),
+        FileOpError::Value(message) => raise_value_error(&message),
+        FileOpError::Unsupported(message) => raise_unsupported_error(&message),
+        FileOpError::Io(message) => raise_io_error(&message),
+    }
+}
+
 fn raise_eof_error(message: &str) -> *mut PyObject {
     let eof_type = unsafe { abi::pon_load_global(intern("EOFError"), ptr::null_mut()) };
     if !eof_type.is_null() {
@@ -2979,9 +3306,10 @@ enum OpenError {
     Io(String),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 enum FileOpError {
+    Type(String),
     Value(String),
+    Unsupported(String),
     Io(String),
 }
 
