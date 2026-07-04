@@ -1881,6 +1881,8 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("getpid", os_getpid, 0),
     ("getuid", os_getuid, 0),
     ("isatty", os_isatty, 1),
+    ("kill", os_kill, 2),
+    ("killpg", os_killpg, 2),
     ("lseek", os_lseek, 3),
     ("lstat", os_lstat, crate::native::builtins_mod::VARIADIC_ARITY),
     ("mkdir", os_mkdir, crate::native::builtins_mod::VARIADIC_ARITY),
@@ -1943,6 +1945,52 @@ unsafe extern "C" fn os_getcwd(_argv: *mut *mut PyObject, _argc: usize) -> *mut 
 unsafe extern "C" fn os_getpid(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
     // SAFETY: Integer boxing helper follows the NULL-sentinel error contract.
     unsafe { crate::abi::pon_const_int(i64::from(std::process::id())) }
+}
+
+/// `os.kill(pid, sig)` over `kill(2)`, raising the PEP 3151 errno subclass.
+unsafe extern "C" fn os_kill(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.kill expected two arguments");
+    }
+    let pid = match int_arg(args[0], "kill pid") {
+        Ok(pid) => pid,
+        Err(error) => return error,
+    };
+    let sig = match int_arg(args[1], "kill sig") {
+        Ok(sig) => sig,
+        Err(error) => return error,
+    };
+    // SAFETY: Plain syscall; the kernel validates pid and signal.
+    if unsafe { libc::kill(pid as libc::pid_t, sig as libc::c_int) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    // SAFETY: Singleton accessor.
+    unsafe { crate::abi::pon_none() }
+}
+
+/// `os.killpg(pgid, sig)` over `killpg(2)`, raising the PEP 3151 errno subclass.
+unsafe extern "C" fn os_killpg(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.killpg expected two arguments");
+    }
+    let pgid = match int_arg(args[0], "killpg pgid") {
+        Ok(pgid) => pgid,
+        Err(error) => return error,
+    };
+    let sig = match int_arg(args[1], "killpg sig") {
+        Ok(sig) => sig,
+        Err(error) => return error,
+    };
+    // SAFETY: Plain syscall; the kernel validates process group and signal.
+    if unsafe { libc::killpg(pgid as libc::pid_t, sig as libc::c_int) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    // SAFETY: Singleton accessor.
+    unsafe { crate::abi::pon_none() }
 }
 
 /// `os.readlink(path)` over `std::fs::read_link` (`posixpath.realpath`'s
@@ -2365,11 +2413,9 @@ unsafe extern "C" fn os_write(argv: *mut *mut PyObject, argc: usize) -> *mut PyO
         Err(error) => return error,
     };
     let data = crate::tag::untag_arg(args[1]);
-    let Some(payload) = bytes_payload(data) else {
-        return crate::abi::exc::raise_kind_error_text(
-            ExceptionKind::TypeError,
-            "a bytes-like object is required",
-        );
+    let payload = match readable_bytes_payload(data) {
+        Ok(payload) => payload,
+        Err(error) => return error,
     };
     // SAFETY: `payload` borrows live object bytes for the syscall to read.
     let count = unsafe { libc::write(fd as libc::c_int, payload.as_ptr().cast(), payload.len()) };
@@ -2428,6 +2474,39 @@ fn bytes_payload<'a>(object: *mut PyObject) -> Option<&'a [u8]> {
         None
     }
 }
+
+/// Borrows a readable bytes/bytearray/memoryview payload for `os.write`.
+fn readable_bytes_payload<'a>(object: *mut PyObject) -> Result<&'a [u8], *mut PyObject> {
+    if let Some(payload) = bytes_payload(object) {
+        return Ok(payload);
+    }
+    if object.is_null() || crate::tag::is_small_int(object) {
+        return Err(crate::abi::exc::raise_kind_error_text(
+            ExceptionKind::TypeError,
+            "a bytes-like object is required",
+        ));
+    }
+    // SAFETY: Heap pointer with a live header after the tag checks.
+    let ty = unsafe { (*object).ob_type };
+    if crate::types::memoryview::is_memoryview_type(ty) {
+        let view = unsafe { &*object.cast::<crate::types::memoryview::PyMemoryView>() };
+        if view.released {
+            return Err(unsafe {
+                crate::abi::exc::pon_raise_value_error(
+                    crate::types::memoryview::RELEASED_ERROR.as_ptr(),
+                    crate::types::memoryview::RELEASED_ERROR.len(),
+                )
+            });
+        }
+        // SAFETY: The live memoryview pins a contiguous byte window.
+        return Ok(unsafe { view.as_slice() });
+    }
+    Err(crate::abi::exc::raise_kind_error_text(
+        ExceptionKind::TypeError,
+        "a bytes-like object is required",
+    ))
+}
+
 /// Borrows a writable bytearray/memoryview target for `os.readinto`.
 fn writable_bytes_target(object: *mut PyObject) -> Result<(*mut u8, usize), *mut PyObject> {
     if object.is_null() {
