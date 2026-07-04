@@ -714,6 +714,12 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
         if !meta_descr.is_null() {
             return unsafe { descriptor_get(meta_descr, object, obj_ty) };
         }
+        // `type.mro` lives at the END of resolution like a metatype
+        // non-data method: a class-dict or metaclass binding above wins,
+        // exactly CPython's precedence (`class C: mro = 5` serves 5).
+        if name_id == intern::intern("mro") {
+            return unsafe { type_mro_method(object) };
+        }
         let fallback = unsafe { object_slot_method_fallback(object.cast::<PyType>(), name_id) };
         if !fallback.is_null() {
             return fallback;
@@ -1049,6 +1055,46 @@ unsafe fn type_subclasses_method(cls: *mut PyObject) -> *mut PyObject {
     match crate::types::method::new_bound_method(function, cls) {
         Ok(method) => method.cast::<PyObject>(),
         Err(message) => raise_attr_error(message),
+    }
+}
+
+/// `cls.mro()` support: the `type.mro` non-data method, returning the C3
+/// linearization as a fresh LIST (CPython returns a list; `__mro__` is the
+/// tuple).  meson's `interpreterbase.baseobjects` walks `cls.mro()[1:]`.
+unsafe fn type_mro_method(cls: *mut PyObject) -> *mut PyObject {
+    let function = unsafe {
+        abi::pon_make_function(
+            type_mro_native as *const u8,
+            crate::builtins::variadic_arity(),
+            intern::intern("mro"),
+        )
+    };
+    if function.is_null() {
+        return ptr::null_mut();
+    }
+    match crate::types::method::new_bound_method(function, cls) {
+        Ok(method) => method.cast::<PyObject>(),
+        Err(message) => raise_attr_error(message),
+    }
+}
+
+unsafe extern "C" fn type_mro_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 1 {
+        return raise_attr_error("mro() takes no arguments");
+    }
+    let cls = unsafe { *argv };
+    if cls.is_null() || unsafe { !is_type_object(cls) } {
+        return raise_attr_error("mro receiver must be a class");
+    }
+    let mut entries = unsafe { mro::mro_entries(cls.cast::<PyType>()) }
+        .into_iter()
+        .map(|ty| ty.cast::<PyObject>())
+        .collect::<Vec<_>>();
+    unsafe {
+        abi::seq::pon_build_list(
+            if entries.is_empty() { ptr::null_mut() } else { entries.as_mut_ptr() },
+            entries.len(),
+        )
     }
 }
 
