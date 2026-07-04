@@ -127,4 +127,15 @@ mod tests {
             drop_bound_method(method);
         }
     }
+
+    #[test]
+    fn method_type_inherits_object_when_unbased() {
+        let object_type = crate::native::builtins_mod::builtin_native_type("object").unwrap();
+        let ty = method_type();
+        unsafe {
+            assert!(crate::mro::is_subtype(ty, object_type));
+            let names: Vec<_> = crate::mro::mro_entries(ty).iter().map(|ty| (**ty).name()).collect();
+            assert_eq!(names, ["method", "object"]);
+        }
+    }
 }

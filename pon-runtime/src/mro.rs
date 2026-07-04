@@ -69,7 +69,7 @@ pub unsafe fn set_c3_mro(ty: *mut PyType, bases: &[*mut PyType]) -> i32 {
 }
 
 /// Borrow MRO entries from a type.  Static/bootstrap types without `tp_mro`
-/// fall back to their `tp_base` chain.
+/// fall back to their `tp_base` chain plus the runtime `object` terminus.
 #[must_use]
 pub unsafe fn mro_entries(ty: *mut PyType) -> Vec<*mut PyType> {
     if ty.is_null() {
@@ -87,7 +87,23 @@ pub unsafe fn mro_entries(ty: *mut PyType) -> Vec<*mut PyType> {
         out.push(current);
         current = unsafe { (*current).tp_base };
     }
+    if let Some(object_type) = implicit_object_base(out.last().copied()) {
+        out.push(object_type);
+    }
     out
+}
+
+fn implicit_object_base(terminal: Option<*mut PyType>) -> Option<*mut PyType> {
+    let terminal = terminal?;
+    if terminal.is_null() || unsafe { (*terminal).name() == "object" } {
+        return None;
+    }
+    let object_type = crate::native::builtins_mod::builtin_native_type("object")?;
+    if object_type.is_null() || object_type == terminal {
+        None
+    } else {
+        Some(object_type)
+    }
 }
 
 /// Record the declared (direct) bases on `ty` — the `cls.__bases__` surface.
