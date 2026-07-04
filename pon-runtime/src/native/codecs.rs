@@ -1098,6 +1098,14 @@ fn builtin_codec(collapsed: &str) -> Option<BuiltinCodec> {
     }
 }
 
+/// Canonical name for a natively-served text encoding, or `None` for names
+/// the builtin table cannot resolve.  Consumed by `native::io` so `open()` /
+/// `TextIOWrapper` accept every encoding the read/write paths can actually
+/// decode/encode (Cython opens sources with `encoding='ASCII'`).
+pub(crate) fn canonical_text_encoding(name: &str) -> Option<&'static str> {
+    builtin_codec(&collapse_normalize(name)).map(BuiltinCodec::canonical_name)
+}
+
 // ---------------------------------------------------------------------------
 // Registry: lookup
 

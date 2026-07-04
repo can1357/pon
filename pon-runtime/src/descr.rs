@@ -258,15 +258,18 @@ unsafe fn type_dict_object(ty: *mut PyType) -> *mut PyObject {
     out
 }
 
-unsafe fn synthetic_type_attr(ty: *mut PyType, name_id: u32) -> *mut PyObject {
+/// Materializes a builtin type's native tp_dict method surface on demand.
+///
+/// Consulted lazily by [`synthetic_type_attr`] on type-level attribute
+/// access AND eagerly by class construction for every builtin base, so a
+/// subclass MRO lookup (`__len__` truth-testing an empty `str` subclass,
+/// unbound `dict.__setitem__` patterns) resolves through the base's dict
+/// even when the builtin type was never touched at type level before.
+pub(crate) unsafe fn ensure_builtin_type_surface(ty: *mut PyType) {
     if ty.is_null() {
-        return ptr::null_mut();
+        return;
     }
     let type_name = unsafe { (*ty).name() };
-    // Builtin type receivers materialize their native tp_dict method surface
-    // on first type-level access: the unbound `dict.__setitem__(d, k, v)` /
-    // `list.append(lst, x)` patterns (collections.OrderedDict default args)
-    // then resolve through the regular MRO lookup below.
     if type_name == "dict" {
         dict::ensure_dict_subclass_methods_installed();
     } else if type_name == "list" {
@@ -287,6 +290,18 @@ unsafe fn synthetic_type_attr(ty: *mut PyType, name_id: u32) -> *mut PyObject {
         // CPython's `bool.bit_length is int.bit_length` identity.
         crate::types::int::ensure_int_surface_on_global();
     }
+}
+
+unsafe fn synthetic_type_attr(ty: *mut PyType, name_id: u32) -> *mut PyObject {
+    if ty.is_null() {
+        return ptr::null_mut();
+    }
+    let type_name = unsafe { (*ty).name() };
+    // Builtin type receivers materialize their native tp_dict method surface
+    // on first type-level access: the unbound `dict.__setitem__(d, k, v)` /
+    // `list.append(lst, x)` patterns (collections.OrderedDict default args)
+    // then resolve through the regular MRO lookup below.
+    unsafe { ensure_builtin_type_surface(ty) };
     if (type_name == "dict" || unsafe { dict::type_is_dict_subclass(ty) }) && name_id == intern::intern("fromkeys") {
         return crate::native::builtins_mod::dict_fromkeys_function();
     }

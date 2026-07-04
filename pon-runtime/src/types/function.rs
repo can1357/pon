@@ -1850,6 +1850,10 @@ pub(crate) fn bind_native_keywords_for_name(
         "max" => bind_minmax_keywords(positional, keywords, "max"),
         "zip" => bind_zip_keywords(positional, keywords),
         "enumerate" => bind_single_keyword(positional, keywords, "enumerate", "start", 1, 2),
+        // `str.splitlines(keepends=False)`: the bound receiver is the sole
+        // required positional; `keepends` may arrive positionally or by
+        // keyword (Cython's Code.py passes `keepends=True`).
+        "splitlines" => bind_single_keyword(positional, keywords, "splitlines", "keepends", 1, 2),
         // `dict(*args, **kwargs)`: arbitrary keyword names become entries;
         // the raw pairs ride a trailing marker that `builtin_dict` merges
         // after the positional mapping/iterable (argparse's

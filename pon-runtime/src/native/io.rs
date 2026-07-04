@@ -188,14 +188,18 @@ unsafe extern "C" fn text_file_new(_cls: *mut PyType, args: *mut PyObject, _kwar
     if positional.is_empty() {
         return raise_type_error("TextIOWrapper() missing required argument 'buffer'");
     }
-    if let Some(&encoding) = positional.get(1) {
-        if !is_none(encoding) {
-            let Some(text) = (unsafe { type_::unicode_text(encoding) }) else {
+    let mut encoding = "utf-8";
+    if let Some(&value) = positional.get(1) {
+        if !is_none(value) {
+            let Some(text) = (unsafe { type_::unicode_text(value) }) else {
                 return raise_type_error("TextIOWrapper() encoding must be str or None");
             };
-            if !text.eq_ignore_ascii_case("utf-8") && !text.eq_ignore_ascii_case("utf8") {
+            if super::codecs::canonical_text_encoding(text).is_none() {
                 return raise_io_error(&format!("unsupported encoding: {text}"));
             }
+            // Preserve the caller's SPELLING (`f.encoding` reads it back);
+            // the codec paths normalize per use.
+            encoding = text;
         }
     }
     let Some(buffer) = (unsafe { as_file(positional[0]) }) else {
@@ -213,7 +217,7 @@ unsafe extern "C" fn text_file_new(_cls: *mut PyType, args: *mut PyObject, _kwar
         readable: buffer.readable,
         writable: buffer.writable,
         append: buffer.append,
-        encoding: Some("utf-8".to_owned()),
+        encoding: Some(encoding.to_owned()),
         errors: "strict".to_owned(),
         newline: NewlineMode::UniversalTranslate,
         newline_seen: 0,
@@ -2169,10 +2173,11 @@ fn open_from_args(args: &[*mut PyObject]) -> Result<*mut PyObject, OpenError> {
             Some("utf-8".to_owned())
         } else {
             let text = expect_str(encoding, "open() encoding must be str")?;
-            if !text.eq_ignore_ascii_case("utf-8") && !text.eq_ignore_ascii_case("utf8") {
+            if super::codecs::canonical_text_encoding(text).is_none() {
                 return Err(OpenError::Value(format!("unsupported encoding: {text}")));
             }
-            Some("utf-8".to_owned())
+            // Preserve the caller's SPELLING (`f.encoding` reads it back).
+            Some(text.to_owned())
         }
     } else {
         Some("utf-8".to_owned())
@@ -3353,6 +3358,11 @@ fn encode_write_payload<'a>(
         .map_err(|()| FileOpError::Pending)
 }
 
+/// Fast-path predicate for the zero-copy UTF-8 write leg above.
+fn is_utf8_encoding(encoding: &str) -> bool {
+    encoding.eq_ignore_ascii_case("utf-8") || encoding.eq_ignore_ascii_case("utf8")
+}
+
 fn utf8_replace_error_bytes(text: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len());
     for ch in text.chars() {
@@ -3366,12 +3376,17 @@ fn utf8_replace_error_bytes(text: &str) -> Vec<u8> {
     out
 }
 
-fn is_utf8_encoding(encoding: &str) -> bool {
-    encoding.eq_ignore_ascii_case("utf-8") || encoding.eq_ignore_ascii_case("utf8")
-}
-
+/// True when two encoding spellings resolve to the SAME native codec, so
+/// `reconfigure(encoding=...)` accepts alias re-spellings without a decoder
+/// swap mid-stream.
 fn same_text_encoding(current: &str, requested: &str) -> bool {
-    is_utf8_encoding(current) && is_utf8_encoding(requested)
+    match (
+        super::codecs::canonical_text_encoding(current),
+        super::codecs::canonical_text_encoding(requested),
+    ) {
+        (Some(current), Some(requested)) => current == requested,
+        _ => false,
+    }
 }
 
 fn reconfigure_str_option<'a>(object: *mut PyObject, name: &str) -> Result<Option<&'a str>, *mut PyObject> {
