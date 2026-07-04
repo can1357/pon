@@ -52,6 +52,7 @@
     "pon-conformance/corpus/cpython/dict_methods.py",
     "pon-conformance/corpus/cpython/dict_subclass_attrs.py",
     "pon-conformance/corpus/cpython/dict_union.py",
+    "pon-conformance/corpus/cpython/dict_update_protocol.py",
     "pon-conformance/corpus/cpython/dict_views_unpack.py",
     "pon-conformance/corpus/cpython/dynexec.py",
     "pon-conformance/corpus/cpython/except_multibase.py",
@@ -60,6 +61,7 @@
     "pon-conformance/corpus/cpython/exception_subclass_attrs.py",
     "pon-conformance/corpus/cpython/exceptions_finally_else.py",
     "pon-conformance/corpus/cpython/exceptions_raise_from.py",
+    "pon-conformance/corpus/cpython/fcntl_flock_basic.py",
     "pon-conformance/corpus/cpython/file_io.py",
     "pon-conformance/corpus/cpython/float_arithmetic_formatting.py",
     "pon-conformance/corpus/cpython/float_format_impl.py",
@@ -84,6 +86,7 @@
     "pon-conformance/corpus/cpython/isinstance_abc.py",
     "pon-conformance/corpus/cpython/iterator_protocol.py",
     "pon-conformance/corpus/cpython/itertools_basic.py",
+    "pon-conformance/corpus/cpython/itertools_tee_lazy.py",
     "pon-conformance/corpus/cpython/keyword_arguments_defaults.py",
     "pon-conformance/corpus/cpython/kwargs_recordless.py",
     "pon-conformance/corpus/cpython/kwonly_args.py",
@@ -129,6 +132,7 @@
     "pon-conformance/corpus/cpython/re_match_subscript.py",
     "pon-conformance/corpus/cpython/re_pos_endpos.py",
     "pon-conformance/corpus/cpython/re_possessive_atomic.py",
+    "pon-conformance/corpus/cpython/relative_import_function_scope.py",
     "pon-conformance/corpus/cpython/richcmp.py",
     "pon-conformance/corpus/cpython/seq_ordering.py",
     "pon-conformance/corpus/cpython/seq_repeat.py",
@@ -182,6 +186,7 @@
     "pon-conformance/corpus/cpython/type_alias_pep695.py",
     "pon-conformance/corpus/cpython/type_annotations_descr.py",
     "pon-conformance/corpus/cpython/type_dict_descriptors.py",
+    "pon-conformance/corpus/cpython/type_mro_method.py",
     "pon-conformance/corpus/cpython/type_name_attrs.py",
     "pon-conformance/corpus/cpython/type_unbound_methods.py",
     "pon-conformance/corpus/cpython/typing_namedtuple_construct.py",
@@ -199,5 +204,5 @@
     "pon-conformance/corpus/cpython/yield_from_list.py",
     "pon-conformance/corpus/cpython/yield_shapes.py"
   ],
-  "min_pass_count": 197
+  "min_pass_count": 202
 }
