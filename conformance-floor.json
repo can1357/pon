@@ -61,6 +61,7 @@
     "pon-conformance/corpus/cpython/exception_ctor_kwargs.py",
     "pon-conformance/corpus/cpython/exception_subclass_attrs.py",
     "pon-conformance/corpus/cpython/exceptions_finally_else.py",
+    "pon-conformance/corpus/cpython/exceptions_index_messages.py",
     "pon-conformance/corpus/cpython/exceptions_raise_from.py",
     "pon-conformance/corpus/cpython/fcntl_flock_basic.py",
     "pon-conformance/corpus/cpython/file_io.py",
@@ -210,5 +211,5 @@
     "pon-conformance/corpus/cpython/yield_from_list.py",
     "pon-conformance/corpus/cpython/yield_shapes.py"
   ],
-  "min_pass_count": 208
+  "min_pass_count": 209
 }
