@@ -1,0 +1,6 @@
+g = globals()
+print('type:', type(g))
+g.update((('A', 1), ('B', 2)))
+print('A', A, 'B', B)
+g.update((name, i) for i, name in enumerate(['C','D']))
+print('C', C, 'D', D)

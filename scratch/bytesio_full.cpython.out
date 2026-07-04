@@ -1,0 +1,79 @@
+b'' 0
+b'abc' 0 3
+b'kw'
+b'ba'
+b'mv'
+b''
+type BytesIO _io
+True True
+TypeError: a bytes-like object is required, not 'str'
+5 5
+0 6 11
+1
+b'hello world!'
+0 b'hello' 5
+b'' b' world!' b'' b''
+2 4 9 9
+b'ld!'
+ValueError: negative seek value -1
+0 0
+ValueError: invalid whence (3, should be 0, 1 or 2)
+TypeError: 'float' object cannot be interpreted as an integer
+TypeError: a bytes-like object is required, not 'str'
+5 5 b'' b'ab'
+1 b'ab\x00\x00\x00z'
+2 b'abXYef' 4
+b'one\n' b'tw' b'o\n' b'three' b''
+[b'one\n', b'two\n', b'three']
+[b'one\n']
+[b'one\n', b'two\n', b'three']
+b'one\n' b'two\nthree' b''
+4 bytearray(b'payl')
+3 bytearray(b'oad\x00\x00\x00\x00\x00\x00\x00')
+0
+3 b'pay'
+2 2 b'ab' 2
+1 b'a' 2
+100 b'abc' 0
+ValueError: negative size value -1
+True True True False False
+memoryview 6 False 6 b'abcdef'
+b'Xbcdef'
+b'XYZdef'
+b'XY'
+BufferError: Existing exports of data: object cannot be re-sized
+BufferError: Existing exports of data: object cannot be re-sized
+BufferError: Existing exports of data: object cannot be re-sized
+2 0 b'XYZdef'
+2 b'okZdef'
+BufferError: Existing exports of data: object cannot be re-sized
+1 b'o'
+True
+getvalue ValueError: I/O operation on closed file.
+read ValueError: I/O operation on closed file.
+write ValueError: I/O operation on closed file.
+seek ValueError: I/O operation on closed file.
+tell ValueError: I/O operation on closed file.
+truncate ValueError: I/O operation on closed file.
+readline ValueError: I/O operation on closed file.
+readlines ValueError: I/O operation on closed file.
+getbuffer ValueError: I/O operation on closed file.
+read1 ValueError: I/O operation on closed file.
+flush ValueError: I/O operation on closed file.
+readable ValueError: I/O operation on closed file.
+writable ValueError: I/O operation on closed file.
+seekable ValueError: I/O operation on closed file.
+isatty ValueError: I/O operation on closed file.
+b'ctx'
+True
+None
+1 bytes True
+2 bytes True
+3 bytes True
+4 bytes True
+5 bytes True
+True True
+[1, 'two', b'three']
+1 True
+memoryview b'outofband-payload' 7
+PickleBuffer b'readonly-payload'

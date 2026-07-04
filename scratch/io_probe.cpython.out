@@ -1,0 +1,62 @@
+text_meta True w utf-8 strict False True True False False None
+text_write 6
+text_writelines None
+text_tell_after_write True
+text_flush None
+text_closed_after_with True
+text_read_flags True False True False False None
+text_read_chars alpha 5
+text_seek_start 0 0
+text_readline_limit 'alp' 3
+text_readline_rest 'ha\n'
+text_read_rest 'beta\ngamma\ndelta'
+text_readlines ['alpha\n', 'beta\n', 'gamma\n', 'delta']
+text_readlines_hint ['alpha\n', 'beta\n']
+text_iter ['alpha\n', 'beta\n', 'gamma\n', 'delta']
+text_next alpha
+ beta
+
+text_seek_end True True
+nl_none 'a\nb\nc\n' ('\r', '\n', '\r\n')
+nl_empty 'a\r\nb\rc\n' ('\r', '\n', '\r\n')
+nl_cr_lines 'a\r' '\nb\r'
+nl_write_count 4
+nl_write_bytes b'x\r\ny\r\n'
+append_write 5 True
+append_result base+tail
+bin_meta True wb False False True True False False
+bin_write 13
+bin_writelines None
+bin_flush None
+bin_read b'one' 3
+bin_seek 0 0
+bin_readline b'one\n' b'tw' b'o\n'
+bin_read1 b'thre' b'e\nfour\nfive'
+bin_readinto 5 b'one\nt' 5
+bin_readinto_eof True b'wo\n'
+bin_readlines [b'one\n', b'two\n', b'three\n', b'four\n', b'five']
+bin_iter [b'one\n', b'two\n', b'three\n', b'four\n', b'five']
+err_read_writeonly UnsupportedOperation True not readable
+err_write_readonly UnsupportedOperation True not writable
+err_bytes_to_text TypeError False write() argument must be str, not bytes
+err_str_to_binary TypeError False a bytes-like object is required, not 'str'
+text_has_binary_methods False False
+closed_double True
+closed_read ValueError False I/O operation on closed file.
+closed_write ValueError False I/O operation on closed file.
+closed_seek ValueError False I/O operation on closed file.
+closed_tell ValueError False I/O operation on closed file.
+closed_flush ValueError False I/O operation on closed file.
+closed_readable ValueError False I/O operation on closed file
+closed_writable OK False
+closed_seekable ValueError False I/O operation on closed file
+closed_fileno ValueError False I/O operation on closed file
+closed_isatty ValueError False I/O operation on closed file
+closed_next ValueError False I/O operation on closed file.
+pipe_write_flags True False False
+pipe_write 11
+pipe_read_flags True False False
+pipe_read b'pipe-bytes\n'
+pipe_text line1
+ line2
+
