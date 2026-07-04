@@ -1,0 +1,13 @@
+import tempfile
+p=tempfile.mktemp()
+f=open(p,'w+',encoding='utf-8')
+f.reconfigure(errors='replace')
+print('after errors', f.encoding, f.errors)
+f.reconfigure(encoding='ascii')
+print('after encoding only', f.encoding, f.errors)
+f.reconfigure(errors='ignore')
+print('after errors only', f.encoding, f.errors)
+f.reconfigure(encoding='latin-1')
+print('after latin only', f.encoding, f.errors)
+f.reconfigure(encoding=None, errors='replace')
+print('after none+errors', f.encoding, f.errors)
