@@ -1443,6 +1443,33 @@ unsafe extern "C" fn list_clear_method(argv: *mut *mut PyObject, argc: usize) ->
         seq_none()
     })
 }
+/// `list.copy()`: a shallow copy as a fresh exact list.
+unsafe extern "C" fn list_copy_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.copy") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_list_method_receiver(args, "copy") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        if args.len() != 1 {
+            return raise_seq_type_error(format!("list.copy() takes no arguments ({} given)", args.len().saturating_sub(1)));
+        }
+        let Some(list) = (unsafe { list_cells(receiver) }) else {
+            return raise_seq_type_error(format!("list.copy expected list, got {}", object_type_name(receiver)));
+        };
+        let mut items = {
+            let _guard = crate::sync::begin_critical_section(receiver);
+            unsafe { list.as_mut_slice() }.to_vec()
+        };
+        let argv = if items.is_empty() { ptr::null_mut() } else { items.as_mut_ptr() };
+        // SAFETY: List builder reads exactly `len` live slots.
+        unsafe { pon_build_list(argv, items.len()) }
+    })
+}
+
 
 unsafe extern "C" fn list_pop_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     catch_object_helper(|| {
@@ -1832,6 +1859,7 @@ unsafe extern "C" fn list_getattro_slot(object: *mut PyObject, name: *mut PyObje
         "sort" => bound_seq_method(object, &name, list_sort_method),
         "reverse" => bound_seq_method(object, &name, list_reverse_method),
         "clear" => bound_seq_method(object, &name, list_clear_method),
+        "copy" => bound_seq_method(object, &name, list_copy_method),
         "pop" => bound_seq_method(object, &name, list_pop_method),
         "index" => bound_seq_method(object, &name, list_index_method),
         "count" => bound_seq_method(object, &name, list_count_method),
@@ -1892,6 +1920,7 @@ pub(crate) fn ensure_list_type_methods_installed(ty: *mut PyType) {
         ("sort", list_sort_method as *const u8),
         ("reverse", list_reverse_method as *const u8),
         ("clear", list_clear_method as *const u8),
+        ("copy", list_copy_method as *const u8),
         ("pop", list_pop_method as *const u8),
         ("index", list_index_method as *const u8),
         ("count", list_count_method as *const u8),

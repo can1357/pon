@@ -482,6 +482,31 @@ pub(crate) fn raise_kind_error_text(kind: ExceptionKind, text: &str) -> *mut PyO
         Err(message) => super::return_null_with_error(message),
     }
 }
+/// Converts a legacy `"BuiltinException: message"` diagnostic into a boxed,
+/// catchable builtin exception when the prefix names a known exception type.
+pub(crate) fn raise_prefixed_diagnostic_text(text: &str) -> bool {
+    if pending_exception_object().is_some() {
+        return true;
+    }
+    let Some((kind, payload)) = prefixed_exception_payload(text) else {
+        return false;
+    };
+    let Ok(()) = ensure_runtime_for_exc() else {
+        return false;
+    };
+    super::with_runtime(|runtime| {
+        raise_builtin_text(runtime, kind, payload);
+        true
+    })
+    .unwrap_or(false)
+}
+
+fn prefixed_exception_payload(text: &str) -> Option<(ExceptionKind, &str)> {
+    let (name, payload) = text.split_once(':')?;
+    let kind = exception_kind_from_name(name)?;
+    Some((kind, payload.strip_prefix(' ').unwrap_or(payload)))
+}
+
 
 /// Raises a typed builtin exception with NO argument payload (`args == ()`),
 /// e.g. native `_signal.default_int_handler`'s bare `KeyboardInterrupt`.
@@ -653,6 +678,80 @@ fn exception_kind_name(kind: ExceptionKind) -> &'static str {
         ExceptionKind::ExceptionGroup => "ExceptionGroup",
     }
 }
+fn exception_kind_from_name(name: &str) -> Option<ExceptionKind> {
+    Some(match name {
+        "BaseException" => ExceptionKind::BaseException,
+        "BaseExceptionGroup" => ExceptionKind::BaseExceptionGroup,
+        "GeneratorExit" => ExceptionKind::GeneratorExit,
+        "KeyboardInterrupt" => ExceptionKind::KeyboardInterrupt,
+        "SystemExit" => ExceptionKind::SystemExit,
+        "Exception" => ExceptionKind::Exception,
+        "ArithmeticError" => ExceptionKind::ArithmeticError,
+        "FloatingPointError" => ExceptionKind::FloatingPointError,
+        "OverflowError" => ExceptionKind::OverflowError,
+        "ZeroDivisionError" => ExceptionKind::ZeroDivisionError,
+        "AssertionError" => ExceptionKind::AssertionError,
+        "AttributeError" => ExceptionKind::AttributeError,
+        "BufferError" => ExceptionKind::BufferError,
+        "EOFError" => ExceptionKind::EOFError,
+        "ImportError" => ExceptionKind::ImportError,
+        "ModuleNotFoundError" => ExceptionKind::ModuleNotFoundError,
+        "LookupError" => ExceptionKind::LookupError,
+        "IndexError" => ExceptionKind::IndexError,
+        "KeyError" => ExceptionKind::KeyError,
+        "MemoryError" => ExceptionKind::MemoryError,
+        "NameError" => ExceptionKind::NameError,
+        "UnboundLocalError" => ExceptionKind::UnboundLocalError,
+        "OSError" => ExceptionKind::OSError,
+        "BlockingIOError" => ExceptionKind::BlockingIOError,
+        "ChildProcessError" => ExceptionKind::ChildProcessError,
+        "ConnectionError" => ExceptionKind::ConnectionError,
+        "BrokenPipeError" => ExceptionKind::BrokenPipeError,
+        "ConnectionAbortedError" => ExceptionKind::ConnectionAbortedError,
+        "ConnectionRefusedError" => ExceptionKind::ConnectionRefusedError,
+        "ConnectionResetError" => ExceptionKind::ConnectionResetError,
+        "FileExistsError" => ExceptionKind::FileExistsError,
+        "FileNotFoundError" => ExceptionKind::FileNotFoundError,
+        "InterruptedError" => ExceptionKind::InterruptedError,
+        "IsADirectoryError" => ExceptionKind::IsADirectoryError,
+        "NotADirectoryError" => ExceptionKind::NotADirectoryError,
+        "PermissionError" => ExceptionKind::PermissionError,
+        "ProcessLookupError" => ExceptionKind::ProcessLookupError,
+        "TimeoutError" => ExceptionKind::TimeoutError,
+        "ReferenceError" => ExceptionKind::ReferenceError,
+        "RuntimeError" => ExceptionKind::RuntimeError,
+        "NotImplementedError" => ExceptionKind::NotImplementedError,
+        "PythonFinalizationError" => ExceptionKind::PythonFinalizationError,
+        "RecursionError" => ExceptionKind::RecursionError,
+        "StopAsyncIteration" => ExceptionKind::StopAsyncIteration,
+        "StopIteration" => ExceptionKind::StopIteration,
+        "SyntaxError" => ExceptionKind::SyntaxError,
+        "IndentationError" => ExceptionKind::IndentationError,
+        "TabError" => ExceptionKind::TabError,
+        "SystemError" => ExceptionKind::SystemError,
+        "TypeError" => ExceptionKind::TypeError,
+        "ValueError" => ExceptionKind::ValueError,
+        "UnicodeError" => ExceptionKind::UnicodeError,
+        "UnicodeDecodeError" => ExceptionKind::UnicodeDecodeError,
+        "UnicodeEncodeError" => ExceptionKind::UnicodeEncodeError,
+        "UnicodeTranslateError" => ExceptionKind::UnicodeTranslateError,
+        "Warning" => ExceptionKind::Warning,
+        "BytesWarning" => ExceptionKind::BytesWarning,
+        "DeprecationWarning" => ExceptionKind::DeprecationWarning,
+        "EncodingWarning" => ExceptionKind::EncodingWarning,
+        "FutureWarning" => ExceptionKind::FutureWarning,
+        "ImportWarning" => ExceptionKind::ImportWarning,
+        "PendingDeprecationWarning" => ExceptionKind::PendingDeprecationWarning,
+        "ResourceWarning" => ExceptionKind::ResourceWarning,
+        "RuntimeWarning" => ExceptionKind::RuntimeWarning,
+        "SyntaxWarning" => ExceptionKind::SyntaxWarning,
+        "UnicodeWarning" => ExceptionKind::UnicodeWarning,
+        "UserWarning" => ExceptionKind::UserWarning,
+        "ExceptionGroup" => ExceptionKind::ExceptionGroup,
+        _ => return None,
+    })
+}
+
 
 fn exception_diagnostic_from_unicode(runtime: &Runtime, kind: ExceptionKind, value: *mut PyObject) -> String {
     let name = exception_kind_name(kind);
@@ -731,6 +830,12 @@ pub unsafe extern "C" fn pon_raise(exc: *mut PyObject, cause: *mut PyObject) -> 
                 return ptr::null_mut();
             }
             return raise_type_error_text("exceptions must derive from BaseException");
+        }
+        if is_diagnostic_sentinel(exc) {
+            // The compiler's cleanup/reraise path may hand back the current
+            // message-only sentinel. It is not a Python object; keep reporting
+            // the original diagnostic instead of morphing it into TypeError.
+            return ptr::null_mut();
         }
         if let Err(message) = ensure_runtime_for_exc() {
             return super::return_null_with_error(message);
@@ -1626,7 +1731,7 @@ pub unsafe extern "C" fn pon_build_exc_group(excs: *mut *mut PyObject, len: usiz
 mod tests {
     use super::*;
     use crate::intern::intern;
-    use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set, test_state_lock};
+    use crate::thread_state::{pon_err_clear, pon_err_message, pon_err_occurred, pon_err_set, test_state_lock};
 
     fn reset_exception_state() {
         pon_err_clear();
