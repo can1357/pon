@@ -1133,6 +1133,10 @@ unsafe extern "C" fn match_repr(object: *mut PyObject) -> *mut PyObject {
     ))
 }
 
+fn raise_match_index_error(message: &str) -> *mut PyObject {
+    unsafe { abi::pon_raise_index_error(message.as_ptr(), message.len()) }
+}
+
 fn resolve_group_selector(matched: &vm::Match, selector: *mut PyObject) -> Result<usize, String> {
     let selector = untag(selector);
     // SAFETY: heap-or-NULL after untagging; accessors reject NULL.
@@ -1149,7 +1153,7 @@ fn resolve_group_selector(matched: &vm::Match, selector: *mut PyObject) -> Resul
 
 fn group_value(matched: &vm::Match, index: usize) -> *mut PyObject {
     match matched.span(index) {
-        None => fail("no such group"),
+        None => raise_match_index_error("no such group"),
         Some(None) => none(),
         Some(Some(_)) => matched
             .group(index)
@@ -1166,7 +1170,7 @@ unsafe extern "C" fn match_subscript(object: *mut PyObject, key: *mut PyObject) 
     };
     match resolve_group_selector(&matched.matched, key) {
         Ok(index) => group_value(&matched.matched, index),
-        Err(message) => fail(message),
+        Err(message) => raise_match_index_error(&message),
     }
 }
 
@@ -1202,7 +1206,7 @@ unsafe extern "C" fn match_group_method(argv: *mut *mut PyObject, argc: usize) -
     for &selector in selectors {
         let index = match resolve_group_selector(&matched.matched, selector) {
             Ok(index) => index,
-            Err(message) => return fail(message),
+            Err(message) => return raise_match_index_error(&message),
         };
         let value = group_value(&matched.matched, index);
         if value.is_null() {
@@ -1268,13 +1272,13 @@ unsafe fn match_span_index(argv: *mut *mut PyObject, argc: usize, name: &str) ->
         Some(&selector) => match resolve_group_selector(&matched.matched, selector) {
             Ok(index) => index,
             Err(message) => {
-                pon_err_set(message);
+                raise_match_index_error(&message);
                 return None;
             }
         },
     };
     if matched.matched.span(index).is_none() {
-        pon_err_set("no such group");
+        raise_match_index_error("no such group");
         return None;
     }
     Some((matched, index))

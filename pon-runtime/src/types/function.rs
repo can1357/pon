@@ -1254,34 +1254,36 @@ unsafe extern "C" fn function_dunder_get_native(argv: *mut *mut PyObject, argc: 
     }
 }
 
-pub(crate) unsafe fn positional_args_from_star(object: *mut PyObject) -> Result<Vec<*mut PyObject>, String> { match unsafe { dict::type_name(object) } {
-    Some("tuple") => Ok(unsafe { (&*object.cast::<PyTuple>()).as_slice() }.to_vec()),
-    Some("list") => Ok(unsafe { (&*object.cast::<PyList>()).as_slice() }.to_vec()),
-    Some(name) => Err(format!("argument after * must be an iterable, not {name}")),
-    None => Err("argument after * is invalid".to_owned()),
-} }
+pub(crate) unsafe fn positional_args_from_star(object: *mut PyObject) -> Result<Vec<*mut PyObject>, String> {
+    match unsafe { dict::type_name(object) } {
+        Some("tuple") => Ok(unsafe { (&*object.cast::<PyTuple>()).as_slice() }.to_vec()),
+        Some("list") => Ok(unsafe { (&*object.cast::<PyList>()).as_slice() }.to_vec()),
+        Some(name) => Err(raise_boxed_type_error(format!("argument after * must be an iterable, not {name}"))),
+        None => Err("argument after * is invalid".to_owned()),
+    }
+}
 
 pub(crate) unsafe fn extend_keywords_from_mapping(function: *mut PyObject,
 mapping: *mut PyObject,
 names: &mut Vec<u32>,
 values: &mut Vec<*mut PyObject>,) -> Result<(), String> { if unsafe { dict::type_name(mapping) } != Some("dict") {
     let type_name = unsafe { dict::type_name(mapping) }.unwrap_or("object");
-    return Err(format!("argument after ** must be a mapping, not {type_name}"));
+    return Err(raise_boxed_type_error(format!("argument after ** must be a mapping, not {type_name}")));
 }
 for entry in unsafe { dict::dict_entries_snapshot(mapping)? } {
     if unsafe { dict::type_name(entry.key) } != Some("str") {
-        return Err("keywords must be strings".to_owned());
+        return Err(raise_boxed_type_error("keywords must be strings".to_owned()));
     }
     let Some(name_text) = (unsafe { (&*entry.key.cast::<PyUnicode>()).as_str() }) else {
         return Err("keyword name is not valid UTF-8".to_owned());
     };
     let name = intern::intern(name_text);
     if names.contains(&name) {
-        return Err(format!(
+        return Err(raise_boxed_type_error(format!(
             "{} got multiple values for keyword argument '{}'",
             function_call_name(function),
             name_text
-        ));
+        )));
     }
     names.push(name);
     values.push(entry.value);
@@ -1291,6 +1293,46 @@ Ok(()) }
 fn function_call_name(function: *mut PyObject) -> String {
     let name = function_name(function).unwrap_or_else(|| "function".to_owned());
     format!("__main__.{name}()")
+}
+
+fn function_short_call_name(function: *mut PyObject) -> String {
+    let name = function_name(function).unwrap_or_else(|| "function".to_owned());
+    format!("{name}()")
+}
+
+fn format_too_many_positional_arguments(function: *mut PyObject, expected: usize, got: usize) -> String {
+    let argument = if expected == 1 { "argument" } else { "arguments" };
+    let given = if got == 1 { "was" } else { "were" };
+    format!(
+        "{} takes {expected} positional {argument} but {got} {given} given",
+        function_short_call_name(function)
+    )
+}
+
+fn quoted_argument_names(names: &[u32]) -> String {
+    let quoted = names
+        .iter()
+        .map(|name| format!("'{}'", keyword_name(*name)))
+        .collect::<Vec<_>>();
+    match quoted.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        _ => {
+            let (head, tail) = quoted.split_at(quoted.len() - 1);
+            format!("{}, and {}", head.join(", "), tail[0])
+        }
+    }
+}
+
+fn format_missing_required_arguments(function: *mut PyObject, names: &[u32], kind: &str) -> String {
+    let count = names.len();
+    let argument = if count == 1 { "argument" } else { "arguments" };
+    format!(
+        "{} missing {count} required {kind} {argument}: {}",
+        function_short_call_name(function),
+        quoted_argument_names(names)
+    )
 }
 
 fn function_name(function: *mut PyObject) -> Option<String> {
@@ -1420,7 +1462,11 @@ pub fn fill_positional_defaults(
 /// peels them.  Treat the carrier as its wrapped callable so keyword binding
 /// and direct call dispatch see the real function object.
 fn unwrap_staticmethod_callable(function: *mut PyObject) -> *mut PyObject {
+    let function = crate::tag::untag_arg(function);
     if function.is_null() || !crate::tag::is_heap(function) {
+        return function;
+    }
+    if function_record(function).is_some() {
         return function;
     }
     let ty = unsafe { (*function).ob_type.cast_mut() };
@@ -1474,10 +1520,11 @@ pub fn bind_arguments(
     let mut bound = vec![ptr::null_mut(); params.total_slots()];
     if positional.len() > positional_arity {
         if params.varargs_name.is_none() {
-            return Err(format!(
-                "function expected at most {positional_arity} positional arguments, got {}",
-                positional.len()
-            ));
+            return Err(raise_boxed_type_error(format_too_many_positional_arguments(
+                function,
+                positional_arity,
+                positional.len(),
+            )));
         }
     }
 
@@ -1502,20 +1549,25 @@ pub fn bind_arguments(
                 varkw_pairs.push((name, value));
                 continue;
             }
-            return Err(format!("unexpected keyword argument {}", keyword_name(name)));
+            return Err(raise_boxed_type_error(format!(
+                "{} got an unexpected keyword argument '{}'",
+                function_short_call_name(function),
+                keyword_name(name)
+            )));
         };
         if index < params.positional_only_count {
-            return Err(format!(
-                "positional-only parameter {} passed as keyword",
+            return Err(raise_boxed_type_error(format!(
+                "{} got some positional-only arguments passed as keyword arguments: '{}'",
+                function_short_call_name(function),
                 keyword_name(name)
-            ));
+            )));
         }
         if !bound[index].is_null() {
-            return Err(format!(
-                "{} got multiple values for keyword argument '{}'",
-                function_call_name(function),
+            return Err(raise_boxed_type_error(format!(
+                "{} got multiple values for argument '{}'",
+                function_short_call_name(function),
                 keyword_name(name)
-            ));
+            )));
         }
         bound[index] = value;
     }
@@ -1530,6 +1582,7 @@ pub fn bind_arguments(
     // CPython tail alignment: defaults cover the LAST `defaults.len()`
     // positional parameters; an over-long live tuple leaves its head unused.
     let default_start = positional_arity as isize - defaults.len() as isize;
+    let mut missing_positional = Vec::new();
     for index in 0..positional_arity {
         if bound[index].is_null() {
             let default_index = index as isize - default_start;
@@ -1539,32 +1592,39 @@ pub fn bind_arguments(
                 }
             }
             if bound[index].is_null() {
-                let name = params.names.get(index).copied().unwrap_or(0);
-                return Err(format!(
-                    "{} missing required positional argument: '{}'",
-                    function_call_name(function),
-                    keyword_name(name)
-                ));
+                missing_positional.push(params.names.get(index).copied().unwrap_or(0));
             }
         }
+    }
+    if !missing_positional.is_empty() {
+        return Err(raise_boxed_type_error(format_missing_required_arguments(
+            function,
+            &missing_positional,
+            "positional",
+        )));
     }
 
     let kwdefaults_override = kwdefaults_override_map(function)?;
     let kwdefaults: &BTreeMap<u32, usize> = kwdefaults_override.as_ref().unwrap_or(&record.kwdefaults);
     let keyword_start = positional_arity;
     let keyword_end = keyword_start + params.keyword_only_count;
+    let mut missing_keyword_only = Vec::new();
     for index in keyword_start..keyword_end {
         if bound[index].is_null() {
             let name = params.names.get(index).copied().unwrap_or(0);
             if let Some(default) = kwdefaults.get(&name) {
                 bound[index] = *default as *mut PyObject;
             } else {
-                return Err(format!(
-                    "missing 1 required keyword-only argument: '{}'",
-                    keyword_name(name)
-                ));
+                missing_keyword_only.push(name);
             }
         }
+    }
+    if !missing_keyword_only.is_empty() {
+        return Err(raise_boxed_type_error(format_missing_required_arguments(
+            function,
+            &missing_keyword_only,
+            "keyword-only",
+        )));
     }
 
     Ok(bound)
@@ -1641,7 +1701,7 @@ fn bind_phase_a_arguments(
             }
             return Ok(filled);
         }
-        return Err(format!("function expected {arity} arguments, got {}", positional.len()));
+        return Err(raise_boxed_type_error(format!("function expected {arity} arguments, got {}", positional.len())));
     }
     for (index, value) in positional.iter().enumerate() {
         if value.is_null() {
@@ -1716,19 +1776,14 @@ pub(crate) fn bind_native_keywords_for_name(
         // 3.14 keyword-only signature, dispatched on the bound receiver so
         // other natives named `replace` (`str.replace`) keep their current
         // no-keyword path.  Keywords ride a trailing marker that
-        // `function_code_replace_trampoline` peels; binder failures are boxed
-        // as real TypeErrors (`replace() got an unexpected keyword argument`
-        // must match `except TypeError:` legs like every clinic rejection).
+        // `function_code_replace_trampoline` peels.
         "replace" if positional.first().copied().is_some_and(is_function_code_object) => {
             bind_trailing_marker_keywords(positional, keywords, "replace", CODE_REPLACE_KEYWORDS)
-                .map_err(raise_boxed_type_error)
         }
         // `print(*objects, sep=' ', end='\n', file=None, flush=False)`: the
         // keyword-only quartet rides a trailing marker that `builtin_print`
-        // peels (test.support.captured_output passes `file=`).  Binder
-        // failures are boxed as real TypeErrors like every clinic rejection.
-        "print" => bind_trailing_marker_keywords(positional, keywords, "print", &["sep", "end", "file", "flush"])
-            .map_err(raise_boxed_type_error),
+        // peels (test.support.captured_output passes `file=`).
+        "print" => bind_trailing_marker_keywords(positional, keywords, "print", &["sep", "end", "file", "flush"]),
         // `__import__(name, globals=None, locals=None, fromlist=(), level=0)`:
         // the vendored `encodings` package search function calls it with
         // `fromlist=`/`level=` keywords; absent optionals arrive as None and
@@ -1795,6 +1850,65 @@ pub(crate) fn bind_native_keywords_for_name(
         "property" => {
             bind_optional_named_keywords(positional, keywords, "property", &["fget", "fset", "fdel", "doc"], 4)
         }
+        // Native hashlib constructors: data is the only positional payload;
+        // `usedforsecurity` is accepted and ignored like pon's existing `_sha2`.
+        "md5" => bind_optional_named_keywords(positional, keywords, "md5", &["data", "usedforsecurity"], 1),
+        "sha1" => bind_optional_named_keywords(positional, keywords, "sha1", &["data", "usedforsecurity"], 1),
+        "sha224" => bind_optional_named_keywords(positional, keywords, "sha224", &["data", "usedforsecurity"], 1),
+        "sha256" => bind_optional_named_keywords(positional, keywords, "sha256", &["data", "usedforsecurity"], 1),
+        "sha384" => bind_optional_named_keywords(positional, keywords, "sha384", &["data", "usedforsecurity"], 1),
+        "sha512" => bind_optional_named_keywords(positional, keywords, "sha512", &["data", "usedforsecurity"], 1),
+        "sha3_224" => bind_optional_named_keywords(positional, keywords, "sha3_224", &["data", "usedforsecurity"], 1),
+        "sha3_256" => bind_optional_named_keywords(positional, keywords, "sha3_256", &["data", "usedforsecurity"], 1),
+        "sha3_384" => bind_optional_named_keywords(positional, keywords, "sha3_384", &["data", "usedforsecurity"], 1),
+        "sha3_512" => bind_optional_named_keywords(positional, keywords, "sha3_512", &["data", "usedforsecurity"], 1),
+        "shake_128" => bind_optional_named_keywords(positional, keywords, "shake_128", &["data", "usedforsecurity"], 1),
+        "shake_256" => bind_optional_named_keywords(positional, keywords, "shake_256", &["data", "usedforsecurity"], 1),
+        // Native `_blake2` constructors: CPython makes every parameter after
+        // the initial data keyword-only; unsupported tree-mode knobs are
+        // validated by the native entry so they fail loudly, never silently.
+        "blake2b" => bind_optional_named_keywords(
+            positional,
+            keywords,
+            "blake2b",
+            &[
+                "data",
+                "digest_size",
+                "key",
+                "salt",
+                "person",
+                "fanout",
+                "depth",
+                "leaf_size",
+                "node_offset",
+                "node_depth",
+                "inner_size",
+                "last_node",
+                "usedforsecurity",
+            ],
+            1,
+        ),
+        "blake2s" => bind_optional_named_keywords(
+            positional,
+            keywords,
+            "blake2s",
+            &[
+                "data",
+                "digest_size",
+                "key",
+                "salt",
+                "person",
+                "fanout",
+                "depth",
+                "leaf_size",
+                "node_offset",
+                "node_depth",
+                "inner_size",
+                "last_node",
+                "usedforsecurity",
+            ],
+            1,
+        ),
         // Native `binascii` keyword signatures (email/base64/quopri chain).
         // Fixed shapes flatten keywords into positional slots; absent
         // optionals arrive as None and the entries apply their defaults.
@@ -1870,17 +1984,13 @@ pub(crate) fn bind_native_keywords_for_name(
         // keywords; absent optionals arrive as None and the io entry applies
         // its defaults.  `_io.open` shares this row: both spellings are the
         // same native entry registered under the function name `open`.
-        // Binder failures are boxed as real TypeErrors so CPython-parity
-        // `except TypeError:` legs match instead of seeing an uncatchable
-        // sentinel diagnostic.
         "open" => bind_optional_named_keywords(
             positional,
             keywords,
             "open",
             &["file", "mode", "buffering", "encoding", "errors", "newline", "closefd", "opener"],
             8,
-        )
-        .map_err(raise_boxed_type_error),
+        ),
         _ => Err(format!("keyword arguments require Phase-B function metadata ('{name}')")),
     }
 }
@@ -1906,10 +2016,10 @@ fn bind_optional_named_keywords(
     max_positional: usize,
 ) -> Result<Vec<*mut PyObject>, String> {
     if positional.len() > max_positional {
-        return Err(format!(
+        return Err(raise_boxed_type_error(format!(
             "{function_name}() expected at most {max_positional} positional arguments, got {}",
             positional.len()
-        ));
+        )));
     }
     let mut argv = positional.to_vec();
     argv.resize(names.len(), ptr::null_mut());
@@ -1919,10 +2029,10 @@ fn bind_optional_named_keywords(
         }
         let actual = keyword_name(name);
         let Some(index) = names.iter().position(|expected| *expected == actual) else {
-            return Err(format!("{function_name}() got an unexpected keyword argument '{actual}'"));
+            return Err(raise_boxed_type_error(format!("{function_name}() got an unexpected keyword argument '{actual}'")));
         };
         if index < positional.len() || !argv[index].is_null() {
-            return Err(format!("{function_name}() got multiple values for argument '{actual}'"));
+            return Err(raise_boxed_type_error(format!("{function_name}() got multiple values for argument '{actual}'")));
         }
         argv[index] = value;
     }
@@ -1953,10 +2063,10 @@ fn bind_trailing_marker_keywords(
         }
         let actual = keyword_name(name);
         if !allowed.contains(&actual.as_str()) {
-            return Err(format!("{function_name}() got an unexpected keyword argument '{actual}'"));
+            return Err(raise_boxed_type_error(format!("{function_name}() got an unexpected keyword argument '{actual}'")));
         }
         if pairs.iter().any(|&(existing, _)| existing == name) {
-            return Err(format!("{function_name}() got multiple values for argument '{actual}'"));
+            return Err(raise_boxed_type_error(format!("{function_name}() got multiple values for argument '{actual}'")));
         }
         pairs.push((name, value));
     }
@@ -1980,7 +2090,7 @@ fn bind_any_keywords(
             return Err(format!("keyword argument {} is NULL", keyword_name(name)));
         }
         if pairs.iter().any(|&(existing, _)| existing == name) {
-            return Err(format!("{function_name}() got multiple values for argument '{}'", keyword_name(name)));
+            return Err(raise_boxed_type_error(format!("{function_name}() got multiple values for argument '{}'", keyword_name(name))));
         }
         pairs.push((name, value));
     }
@@ -1991,7 +2101,7 @@ fn bind_any_keywords(
 
 fn bind_sorted_keywords(positional: &[*mut PyObject], keywords: KeywordArgs<'_>) -> Result<Vec<*mut PyObject>, String> {
     if positional.len() != 1 {
-        return Err(format!("sorted expected 1 argument, got {}", positional.len()));
+        return Err(raise_boxed_type_error(format!("sorted expected 1 argument, got {}", positional.len())));
     }
     let mut key = unsafe { crate::abi::pon_none() };
     if key.is_null() {
@@ -2011,7 +2121,7 @@ fn bind_sorted_keywords(positional: &[*mut PyObject], keywords: KeywordArgs<'_>)
                     _ => return Err("reverse truth-value testing failed".to_owned()),
                 };
             }
-            other => return Err(format!("sort() got an unexpected keyword argument '{other}'")),
+            other => return Err(raise_boxed_type_error(format!("sort() got an unexpected keyword argument '{other}'"))),
         }
     }
     Ok(vec![positional[0], crate::types::lazy_iter::new_sort_options(key, reverse)])
@@ -2019,7 +2129,7 @@ fn bind_sorted_keywords(positional: &[*mut PyObject], keywords: KeywordArgs<'_>)
 
 fn bind_minmax_keywords(positional: &[*mut PyObject], keywords: KeywordArgs<'_>, function_name: &str) -> Result<Vec<*mut PyObject>, String> {
     if positional.is_empty() {
-        return Err(format!("{function_name} expected at least 1 argument, got 0"));
+        return Err(raise_boxed_type_error(format!("{function_name} expected at least 1 argument, got 0")));
     }
     let mut key = unsafe { crate::abi::pon_none() };
     if key.is_null() {
@@ -2040,7 +2150,7 @@ fn bind_minmax_keywords(positional: &[*mut PyObject], keywords: KeywordArgs<'_>,
                 default = value;
                 has_default = true;
             }
-            other => return Err(format!("{function_name}() got an unexpected keyword argument '{other}'")),
+            other => return Err(raise_boxed_type_error(format!("{function_name}() got an unexpected keyword argument '{other}'"))),
         }
     }
     let mut argv = positional.to_vec();
@@ -2062,7 +2172,7 @@ fn bind_zip_keywords(positional: &[*mut PyObject], keywords: KeywordArgs<'_>) ->
                     _ => return Err("strict truth-value testing failed".to_owned()),
                 };
             }
-            other => return Err(format!("zip() got an unexpected keyword argument '{other}'")),
+            other => return Err(raise_boxed_type_error(format!("zip() got an unexpected keyword argument '{other}'"))),
         }
     }
     let mut argv = positional.to_vec();
@@ -2079,7 +2189,7 @@ fn bind_named_positional_keywords(
     max_positional: usize,
 ) -> Result<Vec<*mut PyObject>, String> {
     if positional.len() > max_positional {
-        return Err(format!("{function_name}() expected at most {max_positional} positional arguments, got {}", positional.len()));
+        return Err(raise_boxed_type_error(format!("{function_name}() expected at most {max_positional} positional arguments, got {}", positional.len())));
     }
     let mut argv = positional.to_vec();
     argv.resize(max_positional, ptr::null_mut());
@@ -2089,10 +2199,10 @@ fn bind_named_positional_keywords(
         }
         let actual = keyword_name(name);
         let Some(index) = names.iter().position(|expected| *expected == actual) else {
-            return Err(format!("{function_name}() got an unexpected keyword argument '{actual}'"));
+            return Err(raise_boxed_type_error(format!("{function_name}() got an unexpected keyword argument '{actual}'")));
         };
         if index < positional.len() || !argv[index].is_null() {
-            return Err(format!("{function_name}() got multiple values for argument '{actual}'"));
+            return Err(raise_boxed_type_error(format!("{function_name}() got multiple values for argument '{actual}'")));
         }
         argv[index] = value;
     }
@@ -2100,10 +2210,10 @@ fn bind_named_positional_keywords(
         argv.pop();
     }
     if argv.iter().any(|value| value.is_null()) {
-        return Err(format!("{function_name}() missing required argument"));
+        return Err(raise_boxed_type_error(format!("{function_name}() missing required argument")));
     }
     if argv.len() < min_positional {
-        return Err(format!("{function_name}() expected at least {min_positional} arguments, got {}", argv.len()));
+        return Err(raise_boxed_type_error(format!("{function_name}() expected at least {min_positional} arguments, got {}", argv.len())));
     }
     Ok(argv)
 }
@@ -2117,10 +2227,10 @@ fn bind_single_keyword(
     max_positional: usize,
 ) -> Result<Vec<*mut PyObject>, String> {
     if positional.len() < min_positional || positional.len() > max_positional {
-        return Err(format!(
+        return Err(raise_boxed_type_error(format!(
             "{function_name}() expected {min_positional} to {max_positional} positional arguments, got {}",
             positional.len()
-        ));
+        )));
     }
     let mut argv = positional.to_vec();
     for (name, value) in keywords.names.iter().copied().zip(keywords.values.iter().copied()) {
@@ -2129,10 +2239,10 @@ fn bind_single_keyword(
         }
         let actual = keyword_name(name);
         if actual != keyword {
-            return Err(format!("{function_name}() got an unexpected keyword argument '{actual}'"));
+            return Err(raise_boxed_type_error(format!("{function_name}() got an unexpected keyword argument '{actual}'")));
         }
         if argv.len() == max_positional {
-            return Err(format!("{function_name}() got multiple values for keyword argument '{keyword}'"));
+            return Err(raise_boxed_type_error(format!("{function_name}() got multiple values for keyword argument '{keyword}'")));
         }
         argv.push(value);
     }
@@ -2318,7 +2428,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             err,
-            "missing 1 required keyword-only argument: 'required_kwonly'"
+            "kwonly_binding_case() missing 1 required keyword-only argument: 'required_kwonly'"
         );
 
         let bound = bind_arguments(
@@ -2455,7 +2565,7 @@ mod tests {
                 None,
             )
             .unwrap_err();
-            assert!(err.contains("missing required positional argument"), "got {err:?}");
+            assert!(err.contains("missing 2 required positional arguments"), "got {err:?}");
             unregister_function_record(function);
         }
     }
@@ -2537,7 +2647,7 @@ mod tests {
                 None,
             )
             .unwrap_err();
-            assert!(err.contains("missing required positional argument"), "got {err:?}");
+            assert!(err.contains("missing 1 required positional argument"), "got {err:?}");
             unregister_function_record(function);
         }
     }
@@ -2614,7 +2724,7 @@ mod tests {
                 None,
             )
             .unwrap_err();
-            assert!(err.contains("missing required positional argument"), "got {err:?}");
+            assert!(err.contains("missing 2 required positional arguments"), "got {err:?}");
             assert_eq!(function_getattro(function, defaults_name), empty);
 
             // `None` clears: binding still fails, reads report None.
@@ -2629,7 +2739,7 @@ mod tests {
                 None,
             )
             .unwrap_err();
-            assert!(err.contains("missing required positional argument"), "got {err:?}");
+            assert!(err.contains("missing 2 required positional arguments"), "got {err:?}");
             assert_eq!(function_getattro(function, defaults_name), none);
             unregister_function_record(function);
         }
