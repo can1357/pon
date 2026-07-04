@@ -1,0 +1,17 @@
+round 'ascii' True True
+round 'line\nnext' True True
+round 'quotes \' " \\' True True
+round 'high é • Ā' True True
+round 'emoji 😀' True True
+unicode-decode 'a\nAé•\\q'
+direct-str-decode ('é', 6) ('é', 6)
+unicode-vs-raw 'a\nAé😀' 'a\\n\\x41é😀'
+encode-unicode b'line\\nA\\xe9\\u2022\\\\q\\U0001f600'
+encode-raw b'line\nA\xe9\\u2022\\q\\U0001f600'
+encode-unicode b'quotes \' " \\\\'
+encode-raw b'quotes \' " \\'
+encode-unicode b'latin1 \\xff and high \\u0100'
+encode-raw b'latin1 \xff and high \\u0100'
+alias-encode b'\\xe9\\u2022'
+alias-decode 'é'
+truncated UnicodeDecodeError 'unicodeescape' codec can't decode bytes in position 0-3: truncated \uXXXX escape
