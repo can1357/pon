@@ -91,12 +91,15 @@ pub unsafe extern "C" fn staticmethod_descr_get(descr: *mut PyObject, _obj: *mut
 
 /// Shared `tp_getattro` for classmethod/staticmethod descriptors: both carry
 /// the wrapped callable at the same offset and expose it as `__func__` (and
-/// the functools-facing `__wrapped__` alias, CPython parity).
+/// the functools-facing `__wrapped__` alias, CPython parity).  Their
+/// descriptor protocol must also be visible as an attribute: enum's
+/// `_is_descriptor` probes class-body values with `hasattr(value, '__get__')`.
 unsafe extern "C" fn method_descriptor_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
     let Some(name) = (unsafe { crate::types::type_::unicode_text(name) }) else {
         return raise_method("attribute name must be str");
     };
     match name {
+        "__get__" => bound_entry(object, name, method_descriptor_dunder_get_entry),
         "__func__" | "__wrapped__" => {
             let callable = unsafe { (*object.cast::<PyStaticMethod>()).callable };
             if callable.is_null() {
@@ -107,6 +110,62 @@ unsafe extern "C" fn method_descriptor_getattro(object: *mut PyObject, name: *mu
         }
         _ => raise_method(&format!("attribute '{name}' was not found")),
     }
+}
+
+fn bound_entry(
+    receiver: *mut PyObject,
+    name: &str,
+    entry: unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject,
+) -> *mut PyObject {
+    let function = unsafe {
+        crate::abi::pon_make_function(entry as *const u8, crate::builtins::variadic_arity(), crate::intern::intern(name))
+    };
+    if function.is_null() {
+        return ptr::null_mut();
+    }
+    match crate::types::method::new_bound_method(function, receiver) {
+        Ok(method) => method.cast::<PyObject>(),
+        Err(message) => raise_method(&message),
+    }
+}
+
+unsafe fn entry_args<'a>(argv: *mut *mut PyObject, argc: usize) -> Option<&'a [*mut PyObject]> {
+    if argv.is_null() {
+        return (argc == 0).then_some(&[]);
+    }
+    Some(unsafe { core::slice::from_raw_parts(argv.cast_const(), argc) })
+}
+
+fn is_none_arg(object: *mut PyObject) -> bool {
+    crate::tag::untag_arg(object) == unsafe { crate::abi::pon_none() }
+}
+
+/// Python-visible `classmethod.__get__`/`staticmethod.__get__`.
+unsafe extern "C" fn method_descriptor_dunder_get_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { entry_args(argv, argc) }) else {
+        return raise_method("__get__ received a NULL argv pointer");
+    };
+    let (&receiver, rest) = args.split_first().unwrap_or((&ptr::null_mut(), &[]));
+    if rest.is_empty() || rest.len() > 2 {
+        return raise_method("__get__(instance, owner=None) takes 1 or 2 arguments");
+    }
+    if receiver.is_null() {
+        return raise_method("__get__ receiver is NULL");
+    }
+    let ty = unsafe { (*receiver).ob_type.cast_mut() };
+    if ty.is_null() {
+        return raise_method("__get__ receiver has no type");
+    }
+    let Some(get) = (unsafe { (*ty).tp_descr_get }) else {
+        return raise_method("__get__ receiver is not a descriptor");
+    };
+    let obj = if is_none_arg(rest[0]) { ptr::null_mut() } else { rest[0] };
+    let owner = rest
+        .get(1)
+        .copied()
+        .filter(|owner| !is_none_arg(*owner))
+        .unwrap_or(ptr::null_mut());
+    unsafe { get(receiver, obj, owner.cast::<PyObject>()) }
 }
 
 
