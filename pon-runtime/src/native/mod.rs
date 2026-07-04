@@ -38,7 +38,7 @@ mod lsprof;
 mod math;
 mod opcode_;
 mod packaging_compat;
-mod os;
+pub(crate) mod os;
 pub(crate) mod pickle;
 mod posix;
 mod posixsubprocess;

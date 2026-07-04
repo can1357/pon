@@ -150,6 +150,26 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
             return Err(format!("failed to allocate {module}.get_exec_path"));
         }
         attrs.push((intern("get_exec_path"), get_exec_path));
+        // `os.walk` is an os.py-level generator in CPython.  Build backends
+        // prune `dirnames` in place, so the iterator below yields before
+        // enqueuing top-down children and reads the same list on resume.
+        let mut walk_defaults = unsafe {
+            [
+                crate::abi::pon_const_bool(1),
+                crate::abi::pon_none(),
+                crate::abi::pon_const_bool(0),
+            ]
+        };
+        if walk_defaults.iter().any(|value| value.is_null()) {
+            return Err(format!("failed to allocate {module}.walk defaults"));
+        }
+        attrs.push(phase_b_function_attr(
+            "walk",
+            os_walk,
+            &["top", "topdown", "onerror", "followlinks"],
+            &mut walk_defaults,
+        )?);
+        attrs.push((intern("_walk_symlinks_as_files"), walk_symlinks_as_files()));
         let mut makedirs_defaults = unsafe { [crate::abi::pon_const_int(0o777), crate::abi::pon_const_bool(0)] };
         if makedirs_defaults.iter().any(|value| value.is_null()) {
             return Err(format!("failed to allocate {module}.makedirs defaults"));
@@ -869,6 +889,312 @@ fn environ_snapshot(module: &str) -> Result<*mut PyObject, String> {
 
 type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
 
+static WALK_REGISTRY: crate::gcroot::RootRegistry = crate::gcroot::RootRegistry::new();
+
+/// Python objects held by live `os.walk` iterators.
+pub(crate) fn gc_held_roots() -> Vec<*mut PyObject> {
+    WALK_REGISTRY.held_roots()
+}
+
+fn walk_symlinks_as_files() -> *mut PyObject {
+    static SENTINEL: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        Box::into_raw(Box::new(crate::object::PyObjectHeader::new(runtime_object_type()))).cast::<PyObject>() as usize
+    });
+    *SENTINEL as *mut PyObject
+}
+
+fn runtime_object_type() -> *mut crate::object::PyType {
+    crate::abi::runtime_global(intern("object")).map_or(std::ptr::null_mut(), |object| object.cast::<crate::object::PyType>())
+}
+
+#[repr(C)]
+struct PyWalk {
+    ob_base: crate::object::PyObjectHeader,
+    stack: Vec<WalkStackEntry>,
+    pending_topdown: Option<PendingTopDown>,
+    topdown: bool,
+    followlinks: bool,
+    symlinks_as_files: bool,
+    onerror: *mut PyObject,
+}
+
+enum WalkStackEntry {
+    Path(String),
+    Yield {
+        top: String,
+        dirs: Vec<String>,
+        files: Vec<String>,
+    },
+}
+
+struct PendingTopDown {
+    top: String,
+    dirnames: *mut PyObject,
+}
+
+struct WalkScan {
+    dirs: Vec<String>,
+    files: Vec<String>,
+    walk_dirs: Vec<String>,
+}
+
+struct WalkIoError {
+    errno: i32,
+    path: String,
+}
+
+impl crate::gcroot::HeldRoots for PyWalk {
+    unsafe fn held_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        push(self.onerror);
+        if let Some(pending) = &self.pending_topdown {
+            push(pending.dirnames);
+        }
+    }
+}
+
+fn walk_type() -> *mut crate::object::PyType {
+    static WALK_TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let mut ty = crate::object::PyType::new(
+            crate::abi::runtime_type_type().cast_const(),
+            "os.walk",
+            std::mem::size_of::<PyWalk>(),
+        );
+        ty.tp_iter = Some(walk_iter);
+        ty.tp_iternext = Some(walk_next);
+        ty.tp_getattro = Some(crate::abstract_op::iterator_dunder_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *WALK_TYPE as *mut crate::object::PyType
+}
+
+unsafe extern "C" fn walk_iter(object: *mut PyObject) -> *mut PyObject {
+    object
+}
+
+unsafe fn walk_receiver<'a>(object: *mut PyObject) -> Option<&'a mut PyWalk> {
+    let object = crate::tag::untag_arg(object);
+    if object.is_null() || crate::tag::is_small_int(object) {
+        return None;
+    }
+    if unsafe { (*object).ob_type } == walk_type().cast_const() {
+        Some(unsafe { &mut *object.cast::<PyWalk>() })
+    } else {
+        None
+    }
+}
+
+fn alloc_walk(top: String, topdown: bool, onerror: *mut PyObject, followlinks: bool, symlinks_as_files: bool) -> *mut PyObject {
+    let object = Box::into_raw(Box::new(PyWalk {
+        ob_base: crate::object::PyObjectHeader::new(walk_type()),
+        stack: vec![WalkStackEntry::Path(top)],
+        pending_topdown: None,
+        topdown,
+        followlinks,
+        symlinks_as_files,
+        onerror,
+    }))
+    .cast::<PyObject>();
+    WALK_REGISTRY.register::<PyWalk>(object)
+}
+
+/// `os.walk(top, topdown=True, onerror=None, followlinks=False)`.
+unsafe extern "C" fn os_walk(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 4 {
+        return crate::abi::return_null_with_error("os.walk expected 1 to 4 arguments");
+    }
+    let top = match path_arg(args[0], "walk") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let topdown = match truth_arg(args[1]) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let onerror = if is_none_value(args[2]) {
+        std::ptr::null_mut()
+    } else {
+        args[2]
+    };
+    let follow_arg = crate::tag::untag_arg(args[3]);
+    let (followlinks, symlinks_as_files) = if follow_arg == walk_symlinks_as_files() {
+        (false, true)
+    } else {
+        match truth_arg(args[3]) {
+            Ok(value) => (value, false),
+            Err(error) => return error,
+        }
+    };
+    alloc_walk(top, topdown, onerror, followlinks, symlinks_as_files)
+}
+
+fn truth_arg(object: *mut PyObject) -> Result<bool, *mut PyObject> {
+    match unsafe { crate::abi::pon_is_true(object) } {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(std::ptr::null_mut()),
+    }
+}
+
+unsafe extern "C" fn walk_next(object: *mut PyObject) -> *mut PyObject {
+    let Some(walk) = (unsafe { walk_receiver(object) }) else {
+        return crate::abi::return_null_with_error("os.walk iterator receiver is invalid");
+    };
+    if let Err(error) = enqueue_pending_topdown(walk) {
+        return error;
+    }
+    loop {
+        let Some(entry) = walk.stack.pop() else {
+            return unsafe { crate::abi::exc::pon_raise_stop_iteration(std::ptr::null_mut()) };
+        };
+        match entry {
+            WalkStackEntry::Yield { top, dirs, files } => return build_walk_tuple(&top, dirs, files),
+            WalkStackEntry::Path(top) => {
+                let scan = match scan_walk_dir(&top, walk.topdown, walk.followlinks, walk.symlinks_as_files) {
+                    Ok(scan) => scan,
+                    Err(error) => {
+                        if let Err(raised) = call_walk_onerror(walk, error) {
+                            return raised;
+                        }
+                        continue;
+                    }
+                };
+                if walk.topdown {
+                    return yield_topdown(walk, top, scan);
+                }
+                walk.stack.push(WalkStackEntry::Yield {
+                    top,
+                    dirs: scan.dirs,
+                    files: scan.files,
+                });
+                for child in scan.walk_dirs.into_iter().rev() {
+                    walk.stack.push(WalkStackEntry::Path(child));
+                }
+            }
+        }
+    }
+}
+
+fn enqueue_pending_topdown(walk: &mut PyWalk) -> Result<(), *mut PyObject> {
+    let Some(pending) = walk.pending_topdown.take() else {
+        return Ok(());
+    };
+    let names = match crate::abi::seq::sequence_to_vec(pending.dirnames) {
+        Ok(names) => names,
+        Err(message) => return Err(crate::abi::return_null_with_error(message)),
+    };
+    for name_object in names.into_iter().rev() {
+        let name = match path_arg(name_object, "walk") {
+            Ok(name) => name,
+            Err(error) => return Err(error),
+        };
+        let child = walk_join(&pending.top, &name);
+        if walk.followlinks || walk.symlinks_as_files || !path_is_symlink(&child) {
+            walk.stack.push(WalkStackEntry::Path(child));
+        }
+    }
+    Ok(())
+}
+
+fn yield_topdown(walk: &mut PyWalk, top: String, scan: WalkScan) -> *mut PyObject {
+    let top_object = walk_str(&top);
+    let dirnames = super::builtins_batch::build_str_list(scan.dirs);
+    let filenames = super::builtins_batch::build_str_list(scan.files);
+    if top_object.is_null() || dirnames.is_null() || filenames.is_null() {
+        return std::ptr::null_mut();
+    }
+    walk.pending_topdown = Some(PendingTopDown { top, dirnames });
+    build_walk_tuple_objects(top_object, dirnames, filenames)
+}
+
+fn build_walk_tuple(top: &str, dirs: Vec<String>, files: Vec<String>) -> *mut PyObject {
+    let top_object = walk_str(top);
+    let dirnames = super::builtins_batch::build_str_list(dirs);
+    let filenames = super::builtins_batch::build_str_list(files);
+    build_walk_tuple_objects(top_object, dirnames, filenames)
+}
+
+fn build_walk_tuple_objects(top: *mut PyObject, dirs: *mut PyObject, files: *mut PyObject) -> *mut PyObject {
+    if top.is_null() || dirs.is_null() || files.is_null() {
+        return std::ptr::null_mut();
+    }
+    let mut items = [top, dirs, files];
+    unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) }
+}
+
+fn walk_str(text: &str) -> *mut PyObject {
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+fn scan_walk_dir(top: &str, topdown: bool, followlinks: bool, symlinks_as_files: bool) -> Result<WalkScan, WalkIoError> {
+    let entries = std::fs::read_dir(top).map_err(|error| walk_io_error(error, top))?;
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    let mut walk_dirs = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| walk_io_error(error, top))?;
+        let file_type = entry.file_type();
+        let is_dir = match &file_type {
+            Ok(file_type) if file_type.is_dir() => true,
+            Ok(file_type) if file_type.is_symlink() && !symlinks_as_files => {
+                std::fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_dir())
+            }
+            Ok(_) | Err(_) => false,
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_dir {
+            dirs.push(name);
+            if !topdown {
+                let is_symlink = file_type.as_ref().is_ok_and(|file_type| file_type.is_symlink());
+                if followlinks || !is_symlink {
+                    walk_dirs.push(entry.path().to_string_lossy().into_owned());
+                }
+            }
+        } else {
+            files.push(name);
+        }
+    }
+    Ok(WalkScan { dirs, files, walk_dirs })
+}
+
+fn walk_io_error(error: std::io::Error, path: &str) -> WalkIoError {
+    WalkIoError {
+        errno: error.raw_os_error().unwrap_or(libc::EIO),
+        path: path.to_owned(),
+    }
+}
+
+fn call_walk_onerror(walk: &PyWalk, error: WalkIoError) -> Result<(), *mut PyObject> {
+    if walk.onerror.is_null() {
+        return Ok(());
+    }
+    let exception = match alloc_errno_exception(error.errno, Some(&error.path)) {
+        Ok(exception) => exception,
+        Err(raised) => return Err(raised),
+    };
+    let mut args = [exception];
+    let result = unsafe { crate::abi::pon_call(walk.onerror, args.as_mut_ptr(), args.len()) };
+    if result.is_null() {
+        Err(std::ptr::null_mut())
+    } else {
+        Ok(())
+    }
+}
+
+fn walk_join(top: &str, name: &str) -> String {
+    if name.starts_with('/') {
+        name.to_owned()
+    } else if top.is_empty() || top.ends_with('/') {
+        format!("{top}{name}")
+    } else {
+        format!("{top}/{name}")
+    }
+}
+
+fn path_is_symlink(path: &str) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
 /// Name / entry / arity rows consumed by [`build_attrs`].  `fdopen`, `dup2`,
 /// `open`, and `lstat` are variadic: `fdopen`/`dup2` have optional trailing
 /// positionals, `open` has optional `mode`, and path functions may accept a
@@ -1078,7 +1404,45 @@ fn optional_arg(args: &[*mut PyObject], index: usize) -> Option<*mut PyObject> {
 /// `[Errno N] strerror` message shape and optional filename context.
 /// Shared with sibling fd-syscall modules (`fcntl`).
 pub(crate) fn raise_errno(errno: i32, path: Option<&str>) -> *mut PyObject {
-    let (kind, class_name) = match errno {
+    match alloc_errno_exception(errno, path) {
+        Ok(exception) => unsafe { crate::abi::exc::pon_raise(exception, std::ptr::null_mut()) },
+        Err(error) => error,
+    }
+}
+
+fn alloc_errno_exception(errno: i32, path: Option<&str>) -> Result<*mut PyObject, *mut PyObject> {
+    let (kind, class_name) = errno_exception(errno);
+    let detail = errno_detail(errno);
+    let message = errno_message(errno, &detail, path);
+    let errno_obj = unsafe { crate::abi::pon_const_int(i64::from(errno)) };
+    if errno_obj.is_null() {
+        return Err(crate::abi::exc::raise_kind_error_text(kind, &message));
+    }
+    let detail_obj = unsafe { pon_const_str(detail.as_ptr(), detail.len()) };
+    if detail_obj.is_null() {
+        return Err(crate::abi::exc::raise_kind_error_text(kind, &message));
+    }
+    let mut args = vec![errno_obj, detail_obj];
+    if let Some(path) = path {
+        let path_obj = unsafe { pon_const_str(path.as_ptr(), path.len()) };
+        if path_obj.is_null() {
+            return Err(crate::abi::exc::raise_kind_error_text(kind, &message));
+        }
+        args.push(path_obj);
+    }
+    let Some(class) = crate::abi::runtime_global(intern(class_name)) else {
+        return Err(crate::abi::exc::raise_kind_error_text(kind, &message));
+    };
+    let exception = crate::abi::exc::alloc_exception_instance(class.cast::<crate::object::PyType>(), &args);
+    if exception.is_null() {
+        Err(std::ptr::null_mut())
+    } else {
+        Ok(exception)
+    }
+}
+
+fn errno_exception(errno: i32) -> (ExceptionKind, &'static str) {
+    match errno {
         libc::EEXIST => (ExceptionKind::FileExistsError, "FileExistsError"),
         libc::ENOENT => (ExceptionKind::FileNotFoundError, "FileNotFoundError"),
         libc::EISDIR => (ExceptionKind::IsADirectoryError, "IsADirectoryError"),
@@ -1094,42 +1458,20 @@ pub(crate) fn raise_errno(errno: i32, path: Option<&str>) -> *mut PyObject {
         libc::ECONNREFUSED => (ExceptionKind::ConnectionRefusedError, "ConnectionRefusedError"),
         libc::ECONNRESET => (ExceptionKind::ConnectionResetError, "ConnectionResetError"),
         _ => (ExceptionKind::OSError, "OSError"),
-    };
-    // SAFETY: `strerror` returns a NUL-terminated entry of the static
-    // message table; the text is copied before any other libc call.
-    let detail = unsafe { std::ffi::CStr::from_ptr(libc::strerror(errno)) }
+    }
+}
+
+fn errno_detail(errno: i32) -> String {
+    unsafe { std::ffi::CStr::from_ptr(libc::strerror(errno)) }
         .to_string_lossy()
-        .into_owned();
-    let message = match path {
+        .into_owned()
+}
+
+fn errno_message(errno: i32, detail: &str, path: Option<&str>) -> String {
+    match path {
         Some(path) => format!("[Errno {errno}] {detail}: '{path}'"),
         None => format!("[Errno {errno}] {detail}"),
-    };
-    // Prefer a real errno-carrying exception instance so `.errno` /
-    // `.strerror` / `.filename` match CPython's fixed OSError members.
-    let errno_obj = unsafe { crate::abi::pon_const_int(i64::from(errno)) };
-    if errno_obj.is_null() {
-        return crate::abi::exc::raise_kind_error_text(kind, &message);
     }
-    let detail_obj = unsafe { pon_const_str(detail.as_ptr(), detail.len()) };
-    if detail_obj.is_null() {
-        return crate::abi::exc::raise_kind_error_text(kind, &message);
-    }
-    let mut args = vec![errno_obj, detail_obj];
-    if let Some(path) = path {
-        let path_obj = unsafe { pon_const_str(path.as_ptr(), path.len()) };
-        if path_obj.is_null() {
-            return crate::abi::exc::raise_kind_error_text(kind, &message);
-        }
-        args.push(path_obj);
-    }
-    let Some(class) = crate::abi::runtime_global(intern(class_name)) else {
-        return crate::abi::exc::raise_kind_error_text(kind, &message);
-    };
-    let exception = crate::abi::exc::alloc_exception_instance(class.cast::<crate::object::PyType>(), &args);
-    if exception.is_null() {
-        return std::ptr::null_mut();
-    }
-    unsafe { crate::abi::exc::pon_raise(exception, std::ptr::null_mut()) }
 }
 
 fn last_errno() -> i32 {
