@@ -11,7 +11,7 @@ use pon_ir::lower_source;
 use pon_jit::JitEngine;
 use pon_runtime::dynexec::{DynCodeMode, DynCompileRequest, DynExecuteRequest, set_ast_parse_hook, set_dynamic_code_hooks};
 use pon_runtime::import::{SourceModuleRequest, active_module_attr, begin_module_execution, cached_module, end_module_execution, install_module, set_source_module_loader};
-use pon_runtime::{PyObject, intern, pon_none, pon_runtime_init, pon_sys_set_argv};
+use pon_runtime::{PyObject, intern, pon_const_str, pon_none, pon_runtime_init, pon_sys_set_argv};
 
 mod astconv;
 pub mod build;
@@ -80,6 +80,21 @@ pub fn run_file(path: impl AsRef<Path>) -> Result<()> {
     run_file_with_env(path, std::iter::empty::<(OsString, OsString)>(), &argv)
 }
 
+fn script_module_attrs(path: &Path) -> Result<Vec<(u32, *mut PyObject)>> {
+    let file_path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let file_text = file_path.to_string_lossy();
+    let file_object = unsafe { pon_const_str(file_text.as_ptr(), file_text.len()) };
+    if file_object.is_null() {
+        let detail = pon_runtime::pon_err_message().unwrap_or_else(|| format!("failed to allocate __file__ for `{}`", path.display()));
+        bail!(detail);
+    }
+    let cached = unsafe { pon_none() };
+    if cached.is_null() {
+        bail!("failed to allocate None for __cached__");
+    }
+    Ok(vec![(intern("__file__"), file_object), (intern("__cached__"), cached)])
+}
+
 fn run_file_inner(path: &Path, argv: &[String]) -> Result<()> {
     let source = fs::read_to_string(path)
         .with_context(|| format!("failed to read UTF-8 source `{}`", path.display()))?;
@@ -122,7 +137,7 @@ fn run_file_inner(path: &Path, argv: &[String]) -> Result<()> {
     if unsafe { pon_sys_set_argv(argv_ptrs.len() as i32, argv_ptrs.as_ptr()) } != 0 {
         bail!("runtime initialization failed");
     }
-    install_module("__main__", []).map_err(anyhow::Error::msg)?;
+    install_module("__main__", script_module_attrs(path)?).map_err(anyhow::Error::msg)?;
     let mut engine = JitEngine::new();
     begin_module_execution("__main__").map_err(anyhow::Error::msg)?;
     let result = engine.run(&module).context("JIT execution failed");

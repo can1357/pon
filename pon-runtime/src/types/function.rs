@@ -1308,32 +1308,49 @@ pub(crate) unsafe fn positional_args_from_star(object: *mut PyObject) -> Result<
     }
 }
 
+/// Collects `f(**mapping)` keywords: any mapping is accepted (dict-layout
+/// storage or a `keys()` carrier, per CPython's `PyDict_Merge` duck typing —
+/// pon's live `instance_dict` view included); non-mappings raise CPython's
+/// "argument after ** must be a mapping" TypeError.
 pub(crate) unsafe fn extend_keywords_from_mapping(function: *mut PyObject,
 mapping: *mut PyObject,
 names: &mut Vec<u32>,
-values: &mut Vec<*mut PyObject>,) -> Result<(), String> { if unsafe { dict::type_name(mapping) } != Some("dict") {
-    let type_name = unsafe { dict::type_name(mapping) }.unwrap_or("object");
-    return Err(raise_boxed_type_error(format!("argument after ** must be a mapping, not {type_name}")));
-}
-for entry in unsafe { dict::dict_entries_snapshot(mapping)? } {
-    if unsafe { dict::type_name(entry.key) } != Some("str") {
-        return Err(raise_boxed_type_error("keywords must be strings".to_owned()));
+values: &mut Vec<*mut PyObject>,) -> Result<(), String> {
+    let mut pairs = Vec::new();
+    match unsafe { crate::native::builtins_mod::collect_mapping_pairs(mapping, &mut pairs) } {
+        // The collection legs raised (keys()/subscript failure); the boxed
+        // exception is pending, so the message channel stays generic.
+        Err(()) => return Err("argument after ** could not be collected".to_owned()),
+        Ok(false) => {
+            let type_name = unsafe { dict::type_name(mapping) }.unwrap_or("object");
+            return Err(raise_boxed_type_error(format!(
+                "{} argument after ** must be a mapping, not {type_name}",
+                function_call_name(function)
+            )));
+        }
+        Ok(true) => {}
     }
-    let Some(name_text) = (unsafe { (&*entry.key.cast::<PyUnicode>()).as_str() }) else {
-        return Err("keyword name is not valid UTF-8".to_owned());
-    };
-    let name = intern::intern(name_text);
-    if names.contains(&name) {
-        return Err(raise_boxed_type_error(format!(
-            "{} got multiple values for keyword argument '{}'",
-            function_call_name(function),
-            name_text
-        )));
+    for pair in pairs.chunks_exact(2) {
+        let (key, value) = (pair[0], pair[1]);
+        if unsafe { dict::type_name(key) } != Some("str") {
+            return Err(raise_boxed_type_error("keywords must be strings".to_owned()));
+        }
+        let Some(name_text) = (unsafe { (&*key.cast::<PyUnicode>()).as_str() }) else {
+            return Err("keyword name is not valid UTF-8".to_owned());
+        };
+        let name = intern::intern(name_text);
+        if names.contains(&name) {
+            return Err(raise_boxed_type_error(format!(
+                "{} got multiple values for keyword argument '{}'",
+                function_call_name(function),
+                name_text
+            )));
+        }
+        names.push(name);
+        values.push(value);
     }
-    names.push(name);
-    values.push(entry.value);
+    Ok(())
 }
-Ok(()) }
 
 fn function_call_name(function: *mut PyObject) -> String {
     let name = function_name(function).unwrap_or_else(|| "function".to_owned());
@@ -2023,6 +2040,17 @@ pub(crate) fn bind_native_keywords_for_name(
         "rsplit" => {
             bind_optional_named_keywords(positional, keywords, "rsplit", &["self", "sep", "maxsplit"], 3)
         }
+        // `TextIOWrapper.reconfigure(*, encoding=None, errors=None,
+        // newline=None, line_buffering=None, write_through=None)`: the bound
+        // receiver is the only positional slot; absent keyword-only options
+        // arrive as None and the native method keeps the current setting.
+        "reconfigure" => bind_optional_named_keywords(
+            positional,
+            keywords,
+            "reconfigure",
+            &["self", "encoding", "errors", "newline", "line_buffering", "write_through"],
+            1,
+        ),
         // `open(file, mode='r', buffering=-1, encoding=None, errors=None,
         // newline=None, closefd=True, opener=None)`: `_osx_support` and the
         // sysconfig/platform chain pass `encoding=` (and friends) as
