@@ -55,7 +55,7 @@ use crate::object::{
 };
 use crate::types::{bool_, bytearray_, bytes_, classmethod, complex_, float, function, int, memoryview, type_, typealias};
 use crate::types::exc::{ExceptionTypeSet, PyBaseException, is_exception_subclass, trace_base_exception, trace_exception_group};
-use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set, thread_state_lock};
+use crate::thread_state::{pon_err_clear, pon_err_message, pon_err_occurred, pon_err_set, thread_state_lock};
 
 const TYPE_ID_TYPE: TypeId = TypeId(1);
 
@@ -2014,6 +2014,7 @@ fn register_builtins(runtime: &mut Runtime) -> Result<(), String> {
     runtime_builtins::for_each_builtin(|builtin_name, arity, code| {
         let name = crate::intern::intern(builtin_name);
         if let Ok(function) = alloc_function(runtime, code, arity, name) {
+            crate::types::function::mark_native_function(function);
             runtime.globals.insert(name, function);
         }
     });
@@ -2195,6 +2196,7 @@ fn install_type_dunder_new(runtime: &mut Runtime) {
     ) else {
         return;
     };
+    crate::types::function::mark_native_function(function);
     // A staticmethod carrier keeps `super().__new__` and `cls.__new__`
     // lookups from binding the receiver (CPython: `__new__` is implicitly
     // static).
@@ -2230,6 +2232,7 @@ fn install_type_dunder_prepare(runtime: &mut Runtime) {
     ) else {
         return;
     };
+    crate::types::function::mark_native_function(function);
     let descriptor = unsafe { classmethod::new_classmethod(classmethod_builtin_type(), function) };
     if descriptor.is_null() {
         return;
@@ -2280,6 +2283,9 @@ unsafe extern "C" fn none_getattro(object: *mut PyObject, name: *mut PyObject) -
     let ty = unsafe { (*object).ob_type.cast_mut() };
     let descr = unsafe { crate::descr::lookup_in_type(ty, name_id) };
     if descr.is_null() {
+        if name_id == crate::intern::intern("__doc__") {
+            return unsafe { pon_none() };
+        }
         return unsafe { pon_raise_attribute_error(object, name_id) };
     }
     unsafe { crate::descr::descriptor_get(descr, object, ty) }
@@ -2361,6 +2367,7 @@ fn install_type_check_dunders(runtime: &mut Runtime) {
         let Ok(function) = alloc_function(runtime, entry as *const u8, 2, name) else {
             continue;
         };
+        crate::types::function::mark_native_function(function);
         unsafe {
             let type_type = runtime._type_type;
             let mut dict = (*type_type).tp_dict.cast::<type_::PyClassDict>();
@@ -2418,6 +2425,7 @@ fn install_object_subclasshook(runtime: &mut Runtime, object_type: *mut PyType) 
     ) else {
         return;
     };
+    crate::types::function::mark_native_function(function);
     let descriptor = unsafe { classmethod::new_classmethod(classmethod_builtin_type(), function) };
     if descriptor.is_null() {
         return;
@@ -2827,6 +2835,8 @@ fn install_object_dunders(runtime: &mut Runtime, object_type: *mut PyType) {
         let Ok(function) = alloc_function(runtime, entry, crate::builtins::variadic_arity(), name) else {
             continue;
         };
+        crate::types::function::mark_native_function(function);
+        crate::types::function::mark_native_method_descriptor(function);
         unsafe {
             let mut dict = (*object_type).tp_dict.cast::<type_::PyClassDict>();
             if dict.is_null() {
@@ -2849,6 +2859,7 @@ fn install_object_dunders(runtime: &mut Runtime, object_type: *mut PyType) {
     if let Ok(function) =
         alloc_function(runtime, object_dunder_new_native as *const u8, crate::builtins::variadic_arity(), new_name)
     {
+        crate::types::function::mark_native_function(function);
         let descriptor = unsafe { classmethod::new_staticmethod(staticmethod_builtin_type(), function) };
         if !descriptor.is_null() {
             unsafe {
@@ -2887,6 +2898,7 @@ fn install_int_dunder_format(runtime: &Runtime, long_type: *mut PyType) {
     ) else {
         return;
     };
+    crate::types::function::mark_native_function(function);
     unsafe {
         let mut dict = (*long_type).tp_dict.cast::<type_::PyClassDict>();
         if dict.is_null() {
@@ -3103,6 +3115,28 @@ fn builtin_constructor_for_name(name: &str) -> Option<BuiltinConstructor> {
         _ => None,
     }
 }
+unsafe fn metaclass_dunder_call_override(callee: *mut PyObject) -> Result<Option<*mut PyObject>, ()> {
+    let Some(type_type) = with_runtime(|runtime| runtime._type_type) else {
+        return Ok(None);
+    };
+    if callee.is_null() {
+        return Ok(None);
+    }
+    let meta = unsafe { (*callee).ob_type.cast_mut() };
+    if meta.is_null() || meta == type_type {
+        return Ok(None);
+    }
+    let dunder = unsafe { crate::descr::lookup_in_type(meta, crate::intern::intern(crate::intern::DUNDER_CALL)) };
+    if dunder.is_null() {
+        return Ok(None);
+    }
+    let bound = unsafe { crate::descr::descriptor_get(dunder, callee, meta) };
+    if bound.is_null() {
+        Err(())
+    } else {
+        Ok(Some(bound))
+    }
+}
 
 /// Instantiates a class callee whose call site carries keyword arguments:
 /// the keyword-aware sibling of `call_type_from_argv`.  A Python-level
@@ -3114,6 +3148,27 @@ pub(super) unsafe fn call_type_with_keywords(
     args: &[*mut PyObject],
     keywords: function::KeywordArgs<'_>,
 ) -> *mut PyObject {
+    match unsafe { metaclass_dunder_call_override(callee) } {
+        Ok(Some(bound)) => {
+            let mut positional = args.to_vec();
+            let mut keyword_values = keywords.values.to_vec();
+            return unsafe {
+                call::pon_call_ex(
+                    bound,
+                    if positional.is_empty() { ptr::null_mut() } else { positional.as_mut_ptr() },
+                    positional.len(),
+                    ptr::null_mut(),
+                    if keywords.names.is_empty() { ptr::null() } else { keywords.names.as_ptr() },
+                    if keyword_values.is_empty() { ptr::null_mut() } else { keyword_values.as_mut_ptr() },
+                    keywords.names.len(),
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            };
+        }
+        Ok(None) => {}
+        Err(()) => return ptr::null_mut(),
+    }
     let cls = callee.cast::<PyType>();
     // Exception classes never take the generic heap-instance path:
     // `BaseException.__new__` is keyword-blind and construction must end in
@@ -4192,6 +4247,11 @@ unsafe fn call_type_from_argv(callee: *mut PyObject, argv: *mut *mut PyObject, a
         Ok(args) => args,
         Err(message) => return return_null_with_error(message),
     };
+    match unsafe { metaclass_dunder_call_override(callee) } {
+        Ok(Some(bound)) => return unsafe { pon_call(bound, argv, argc) },
+        Ok(None) => {}
+        Err(()) => return ptr::null_mut(),
+    }
     let cls = callee.cast::<PyType>();
     let is_exception_type = with_runtime(|runtime| unsafe {
         is_exception_subclass(cls.cast_const(), runtime.exception_types.base_exception.cast_const())
@@ -5209,7 +5269,8 @@ pub fn format_object_for_print(value: *mut PyObject) -> Result<String, String> {
         Some(Some(result)) => result,
         // `__str__` dispatch runs OUTSIDE the `with_runtime` closure: the
         // hook is arbitrary Python and must not re-enter a held runtime.
-        Some(None) => crate::native::builtins_mod::try_str_text(value).map_err(|()| "str() raised".to_owned()),
+        Some(None) => crate::native::builtins_mod::try_str_text(value)
+            .map_err(|()| pon_err_message().unwrap_or_else(|| "str() raised".to_owned())),
     }
 }
 
@@ -5518,6 +5579,11 @@ fn collect_impl() -> Result<(), String> {
     // Audit hooks registered through `sys.addaudithook`, mirroring
     // `_contextvars`.
     for value in crate::native::sys::gc_held_roots() {
+        push_namespace_value_roots(value, &mut roots);
+    }
+    // Comparison callables and wrapped keys held by `_functools.cmp_to_key`,
+    // mirroring `_contextvars`.
+    for value in crate::native::stdlib_small::gc_held_roots() {
         push_namespace_value_roots(value, &mut roots);
     }
     extend_tierup_roots(&mut roots);
@@ -6120,6 +6186,7 @@ fn install_data_type_dunders(runtime: &mut Runtime) {
         let Ok(function) = alloc_function(runtime, new_entry, crate::builtins::variadic_arity(), new_name) else {
             continue;
         };
+        crate::types::function::mark_native_function(function);
         let descriptor = unsafe { classmethod::new_staticmethod(staticmethod_builtin_type(), function) };
         if descriptor.is_null() {
             continue;
@@ -6135,6 +6202,8 @@ fn install_data_type_dunders(runtime: &mut Runtime) {
             if let Ok(function) =
                 alloc_function(runtime, data_type_dunder_repr_native as *const u8, crate::builtins::variadic_arity(), repr_name)
             {
+                crate::types::function::mark_native_function(function);
+                crate::types::function::mark_native_method_descriptor(function);
                 (&mut *dict).set(repr_name, function.cast::<PyObject>());
             }
             if with_str {
@@ -6142,6 +6211,8 @@ fn install_data_type_dunders(runtime: &mut Runtime) {
                 if let Ok(function) =
                     alloc_function(runtime, data_type_dunder_str_native as *const u8, crate::builtins::variadic_arity(), str_name)
                 {
+                    crate::types::function::mark_native_function(function);
+                    crate::types::function::mark_native_method_descriptor(function);
                     (&mut *dict).set(str_name, function.cast::<PyObject>());
                 }
             }
