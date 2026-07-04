@@ -30,6 +30,7 @@ random sample of combining sequences before writing the .rs file.
 
 import random
 import sys
+import urllib.request
 import unicodedata as u
 
 MAX_CP = 0x110000
@@ -49,6 +50,42 @@ SENTINEL = object()
 decimal = {cp: v for cp in range(MAX_CP) if (v := u.decimal(chr(cp), SENTINEL)) is not SENTINEL}
 digit = {cp: v for cp in range(MAX_CP) if (v := u.digit(chr(cp), SENTINEL)) is not SENTINEL}
 numeric = {cp: v for cp in range(MAX_CP) if (v := u.numeric(chr(cp), SENTINEL)) is not SENTINEL}
+bidi = [u.bidirectional(chr(cp)) for cp in range(MAX_CP)]
+mirrored = {cp for cp in range(MAX_CP) if u.mirrored(chr(cp))}
+raw_decomp = {cp: text for cp in range(MAX_CP) if (text := u.decomposition(chr(cp)))}
+
+names = {}
+for cp in range(MAX_CP):
+    try:
+        names[cp] = u.name(chr(cp))
+    except ValueError:
+        pass
+
+def ucd_lines(filename):
+    url = f"https://www.unicode.org/Public/{u.unidata_version}/ucd/{filename}"
+    print(f"fetching {url}", file=sys.stderr)
+    with urllib.request.urlopen(url, timeout=30) as response:
+        return response.read().decode("utf-8").splitlines()
+
+def data_lines(filename):
+    for line in ucd_lines(filename):
+        line = line.split("#", 1)[0].strip()
+        if line:
+            yield line
+
+name_aliases = []
+for line in data_lines("NameAliases.txt"):
+    cp_hex, alias, _kind = [field.strip() for field in line.split(";")]
+    cp = int(cp_hex, 16)
+    assert u.lookup(alias) == chr(cp), alias
+    name_aliases.append((alias, cp))
+
+named_sequences = []
+for line in data_lines("NamedSequences.txt"):
+    name, seq = [field.strip() for field in line.split(";", 1)]
+    cps = [int(part, 16) for part in seq.split()]
+    assert u.lookup(name) == "".join(chr(cp) for cp in cps), name
+    named_sequences.append((name, cps))
 
 def is_hangul_syllable(cp):
     return HANGUL_S_BASE <= cp < HANGUL_S_BASE + HANGUL_S_COUNT
@@ -189,8 +226,31 @@ def runs_incrementing(mapping, cast):
             runs.append((cp, cp, v))
     return runs
 
+def ranges_bool(values):
+    runs = []
+    for cp in sorted(values):
+        if runs and cp == runs[-1][1] + 1:
+            runs[-1] = (runs[-1][0], cp)
+        else:
+            runs.append((cp, cp))
+    return runs
+
+def string_pool(items):
+    pool = []
+    pool_text = ""
+    for _key, value in items:
+        off = len(pool_text)
+        pool_text += value
+        pool.append((off << 8) | len(value))
+    return pool_text, pool
+
+def rust_string(text):
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
 cat_starts, cat_idx, cat_names = runs_full(category)
 eaw_starts, eaw_idx, eaw_names = runs_full(eaw)
+bidi_starts, bidi_idx, bidi_names = runs_full(bidi)
 
 ccc_runs = []
 for cp, c in enumerate(ccc):
@@ -206,6 +266,29 @@ dig_runs = runs_incrementing(digit, int)
 num_runs = runs_incrementing(numeric, float)
 import struct
 num_runs = [(s, e, struct.unpack("<Q", struct.pack("<d", float(v)))[0]) for s, e, v in num_runs]
+bidi_runs = [(start, end - 1, index) for start, end, index in zip(bidi_starts, bidi_starts[1:] + [MAX_CP], bidi_idx)]
+mirrored_runs = ranges_bool(mirrored)
+
+name_items = sorted(names.items())
+name_pool, name_slices = string_pool(name_items)
+name_cps = [cp for cp, _name in name_items]
+
+decomp_text_items = sorted(raw_decomp.items())
+decomp_text_pool, decomp_text_slices = string_pool(decomp_text_items)
+decomp_text_cps = [cp for cp, _text in decomp_text_items]
+
+alias_items = sorted(name_aliases)
+alias_pool, alias_slices = string_pool((name, name) for name, _cp in alias_items)
+alias_cps = [cp for _name, cp in alias_items]
+
+sequence_items = sorted(named_sequences)
+sequence_name_pool, sequence_name_slices = string_pool((name, name) for name, _seq in sequence_items)
+sequence_data_pool = []
+sequence_slices = []
+for _name, seq in sequence_items:
+    off = len(sequence_data_pool)
+    sequence_data_pool.extend(seq)
+    sequence_slices.append((off << 8) | len(seq))
 
 # Shared decomposition pool with exact-sequence dedup.
 pool = []
@@ -242,13 +325,26 @@ def fmt_triples(triples, fmt, per_line=4):
         lines.append("    " + " ".join(fmt.format(*t) for t in triples[i:i + per_line]))
     return "\n".join(lines)
 
+def fmt_pairs(pairs, fmt, per_line=4):
+    lines = []
+    for i in range(0, len(pairs), per_line):
+        lines.append("    " + " ".join(fmt.format(*pair) for pair in pairs[i:i + per_line]))
+    return "\n".join(lines)
+
+
 sizes = {
     "category": len(cat_starts) * 5,
     "east_asian_width": len(eaw_starts) * 5,
+    "bidirectional": len(bidi_runs) * 9,
+    "mirrored": len(mirrored_runs) * 8,
     "combining": len(ccc_runs) * 9,
     "decimal+digit": (len(dec_runs) + len(dig_runs)) * 9,
     "numeric": len(num_runs) * 16,
     "decomp pool": len(pool) * 4,
+    "decomp text": len(decomp_text_pool) + len(decomp_text_cps) * 8,
+    "names": len(name_pool) + len(name_cps) * 8,
+    "name aliases": len(alias_pool) + len(alias_cps) * 8,
+    "named sequences": len(sequence_name_pool) + len(sequence_data_pool) * 4 + len(sequence_slices) * 8,
     "nfd index": len(nfd_cps) * 8,
     "nfkd index": len(nfkd_cps) * 8,
     "compose": len(compose_keys) * 12,
@@ -289,6 +385,58 @@ pub(super) static EAW_STARTS: [u32; {len(eaw_starts)}] = [
 pub(super) static EAW_INDEX: [u8; {len(eaw_idx)}] = [
 {fmt_ints(eaw_idx)}
 ];
+
+/// Bidirectional-class names indexed by `BIDI_INDEX` entries.
+pub(super) static BIDI_NAMES: [&str; {len(bidi_names)}] = [{", ".join(f'"{n}"' for n in bidi_names)}];
+
+/// (start, end inclusive, bidirectional-class index).
+pub(super) static BIDI_RANGES: [(u32, u32, u8); {len(bidi_runs)}] = [
+{fmt_triples(bidi_runs, "({}, {}, {}),")}
+];
+
+/// Codepoint ranges whose `mirrored` property is 1.
+pub(super) static MIRRORED_RANGES: [(u32, u32); {len(mirrored_runs)}] = [
+{fmt_pairs(mirrored_runs, "({}, {}),")}
+];
+
+/// (codepoint -> packed string slice) table for `unicodedata.name`.
+pub(super) static NAME_CPS: [u32; {len(name_cps)}] = [
+{fmt_ints(name_cps)}
+];
+pub(super) static NAME_SLICES: [u32; {len(name_slices)}] = [
+{fmt_ints(name_slices)}
+];
+pub(super) static NAME_POOL: &str = "{rust_string(name_pool)}";
+
+/// Formal Unicode name aliases accepted by `unicodedata.lookup`.
+pub(super) static NAME_ALIAS_SLICES: [u32; {len(alias_slices)}] = [
+{fmt_ints(alias_slices)}
+];
+pub(super) static NAME_ALIAS_CPS: [u32; {len(alias_cps)}] = [
+{fmt_ints(alias_cps)}
+];
+pub(super) static NAME_ALIAS_POOL: &str = "{rust_string(alias_pool)}";
+
+/// Unicode named character sequences accepted by `unicodedata.lookup`.
+pub(super) static NAMED_SEQUENCE_NAME_SLICES: [u32; {len(sequence_name_slices)}] = [
+{fmt_ints(sequence_name_slices)}
+];
+pub(super) static NAMED_SEQUENCE_DATA_SLICES: [u32; {len(sequence_slices)}] = [
+{fmt_ints(sequence_slices)}
+];
+pub(super) static NAMED_SEQUENCE_NAME_POOL: &str = "{rust_string(sequence_name_pool)}";
+pub(super) static NAMED_SEQUENCE_DATA_POOL: [u32; {len(sequence_data_pool)}] = [
+{fmt_ints(sequence_data_pool)}
+];
+
+/// Raw decomposition strings returned by `unicodedata.decomposition`.
+pub(super) static DECOMP_TEXT_CPS: [u32; {len(decomp_text_cps)}] = [
+{fmt_ints(decomp_text_cps)}
+];
+pub(super) static DECOMP_TEXT_SLICES: [u32; {len(decomp_text_slices)}] = [
+{fmt_ints(decomp_text_slices)}
+];
+pub(super) static DECOMP_TEXT_POOL: &str = "{rust_string(decomp_text_pool)}";
 
 /// (start, end inclusive, canonical combining class); 0 for anything absent.
 pub(super) static COMBINING_RANGES: [(u32, u32, u8); {len(ccc_runs)}] = [

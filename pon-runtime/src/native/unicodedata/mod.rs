@@ -3,23 +3,14 @@
 //! derived from the HOST oracle by `scratch/gen_unicodedata_tables.py` —
 //! zero new deps, the K2 in-tree-table precedent scaled up).
 //!
-//! Served: module-level `normalize` (UAX #15 `NFC`/`NFD`/`NFKC`/`NFKD` —
-//! algorithmic Hangul plus table-driven decomposition/canonical ordering/
-//! composition), `category`, `combining`, `east_asian_width`, `decimal`,
-//! `digit`, `numeric`, and `unidata_version`; plus `ucd_3_2_0` for
-//! IDNA/stringprep (`category`, `bidirectional`, `decomposition`, `normalize`,
-//! `unidata_version`).  The at-import consumer is
-//! `test.support.os_helper:30-31` (`normalize('NFD', …)` under `is_apple`);
-//! lazy consumers on the current walks: `traceback`/`_pyrepl`
-//! (`east_asian_width`, `category`), `urllib.parse` (`normalize('NFKC', …)`),
-//! and `encodings.idna` through `stringprep`'s Unicode 3.2 view.
-//!
-//! Deliberately unserved (absent attribute -> loud `AttributeError`, the
-//! `sys.flags` idiom): `name`/`lookup` — their only stdlib consumer is
-//! `re._parser`'s lazily-imported `\N{…}` escape and the ~30k-entry name
-//! table would triple the payload; `is_normalized`, module-level
-//! `bidirectional`, `mirrored`, and module-level `decomposition`.  Grow the
-//! generator + this file when a walk consumes one.
+//! Served: module-level `normalize`/`is_normalized` (UAX #15
+//! `NFC`/`NFD`/`NFKC`/`NFKD` — algorithmic Hangul plus table-driven
+//! decomposition/canonical ordering/composition), `category`, `bidirectional`,
+//! `combining`, `east_asian_width`, `decomposition`, `decimal`, `digit`,
+//! `numeric`, `mirrored`, `name`, `lookup`, and `unidata_version`; plus the
+//! `UCD` type and `ucd_3_2_0` object for IDNA/stringprep.  Name lookup covers
+//! generated Unicode names, formal name aliases, and named character sequences
+//! from the Unicode 16.0.0 UCD files.
 //!
 //! Divergence (documented): CPython's normalization quickcheck returns the
 //! *argument itself* for already-normalized input; pon returns the argument
@@ -35,20 +26,38 @@
 
 mod tables;
 
+use core::ptr;
+use std::sync::LazyLock;
+
 use crate::abi;
 use crate::intern::intern;
-use crate::object::{PyObject, PyUnicode};
+use crate::object::{PyObject, PyObjectHeader, PyType, PyUnicode};
 
+use crate::types::exc::ExceptionKind;
 use super::builtins_mod::VARIADIC_ARITY;
 use super::install_module;
 
 use tables::{
-    CATEGORY_INDEX, CATEGORY_NAMES, CATEGORY_STARTS, COMBINING_RANGES, COMPOSE_KEYS, COMPOSE_VALUES, DECIMAL_RANGES,
-    DECOMP_POOL, DIGIT_RANGES, EAW_INDEX, EAW_NAMES, EAW_STARTS, NFD_CPS, NFD_SLICES, NFKD_CPS, NFKD_SLICES,
-    NUMERIC_RANGES, UNIDATA_VERSION,
+    BIDI_NAMES, BIDI_RANGES, CATEGORY_INDEX, CATEGORY_NAMES, CATEGORY_STARTS, COMBINING_RANGES, COMPOSE_KEYS,
+    COMPOSE_VALUES, DECIMAL_RANGES, DECOMP_POOL, DECOMP_TEXT_CPS, DECOMP_TEXT_POOL, DECOMP_TEXT_SLICES, DIGIT_RANGES,
+    EAW_INDEX, EAW_NAMES, EAW_STARTS, MIRRORED_RANGES, NAME_ALIAS_CPS, NAME_ALIAS_POOL, NAME_ALIAS_SLICES, NAME_CPS,
+    NAME_POOL, NAME_SLICES, NAMED_SEQUENCE_DATA_POOL, NAMED_SEQUENCE_DATA_SLICES, NAMED_SEQUENCE_NAME_POOL,
+    NAMED_SEQUENCE_NAME_SLICES, NFD_CPS, NFD_SLICES, NFKD_CPS, NFKD_SLICES, NUMERIC_RANGES, UNIDATA_VERSION,
 };
 
 type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
+
+#[repr(C)]
+struct PyUcd {
+    ob_base: PyObjectHeader,
+    version: UcdVersion,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum UcdVersion {
+    Ucd3_2,
+}
+
 
 // ---------------------------------------------------------------------------
 // Small helpers (string_mod idioms, local so the module stays self-contained)
@@ -65,6 +74,10 @@ fn raise_type_error(message: &str) -> *mut PyObject {
 fn raise_value_error(message: &str) -> *mut PyObject {
     // SAFETY: Message bytes are a live UTF-8 slice for the duration of the call.
     unsafe { abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) }
+}
+
+fn raise_kind(kind: ExceptionKind, message: &str) -> *mut PyObject {
+    abi::exc::raise_kind_error_text(kind, message)
 }
 
 fn str_object(text: &str) -> *mut PyObject {
@@ -202,6 +215,63 @@ fn east_asian_width_of(cp: u32) -> &'static str {
     EAW_NAMES[EAW_INDEX[run] as usize]
 }
 
+/// Bidirectional class for `cp`; unassigned/default codepoints use CPython's
+/// empty-string result.
+fn bidirectional_of(cp: u32) -> &'static str {
+    range_search(&BIDI_RANGES, cp).map_or("", |(_, index)| BIDI_NAMES[index as usize])
+}
+
+/// Unicode `Bidi_Mirrored` property as CPython's integer 0/1 result.
+fn mirrored_of(cp: u32) -> bool {
+    pair_range_contains(&MIRRORED_RANGES, cp)
+}
+
+fn packed_str(pool: &'static str, slices: &[u32], index: usize) -> &'static str {
+    let packed = slices[index] as usize;
+    let start = packed >> 8;
+    let end = start + (packed & 0xFF);
+    &pool[start..end]
+}
+
+fn sparse_text(cps: &[u32], slices: &[u32], pool: &'static str, cp: u32) -> Option<&'static str> {
+    let index = cps.binary_search(&cp).ok()?;
+    Some(packed_str(pool, slices, index))
+}
+
+fn name_of(cp: u32) -> Option<&'static str> {
+    sparse_text(&NAME_CPS, &NAME_SLICES, NAME_POOL, cp)
+}
+
+fn raw_decomposition_of(cp: u32) -> &'static str {
+    sparse_text(&DECOMP_TEXT_CPS, &DECOMP_TEXT_SLICES, DECOMP_TEXT_POOL, cp).unwrap_or("")
+}
+
+fn lookup_unicode_name(name: &str) -> Option<String> {
+    for (index, &cp) in NAME_CPS.iter().enumerate() {
+        if packed_str(NAME_POOL, &NAME_SLICES, index) == name {
+            return char::from_u32(cp).map(|ch| ch.to_string());
+        }
+    }
+    for (index, &cp) in NAME_ALIAS_CPS.iter().enumerate() {
+        if packed_str(NAME_ALIAS_POOL, &NAME_ALIAS_SLICES, index) == name {
+            return char::from_u32(cp).map(|ch| ch.to_string());
+        }
+    }
+    for (index, &packed) in NAMED_SEQUENCE_DATA_SLICES.iter().enumerate() {
+        if packed_str(NAMED_SEQUENCE_NAME_POOL, &NAMED_SEQUENCE_NAME_SLICES, index) == name {
+            let packed = packed as usize;
+            let start = packed >> 8;
+            let end = start + (packed & 0xFF);
+            let mut out = String::new();
+            for cp in &NAMED_SEQUENCE_DATA_POOL[start..end] {
+                out.push(char::from_u32(*cp)?);
+            }
+            return Some(out);
+        }
+    }
+    None
+}
+
 /// Canonical combining class; 0 for anything outside the sparse ranges.
 fn combining_class(cp: u32) -> u8 {
     range_search(&COMBINING_RANGES, cp).map_or(0, |(_, ccc)| ccc)
@@ -223,6 +293,20 @@ fn range_search<T: Copy>(ranges: &[(u32, u32, T)], cp: u32) -> Option<(u32, T)> 
         .ok()?;
     let (start, _, payload) = ranges[index];
     Some((cp - start, payload))
+}
+
+fn pair_range_contains(ranges: &[(u32, u32)], cp: u32) -> bool {
+    ranges
+        .binary_search_by(|&(start, end)| {
+            if end < cp {
+                core::cmp::Ordering::Less
+            } else if start > cp {
+                core::cmp::Ordering::Greater
+            } else {
+                core::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 /// Decimal/digit table value: run value increments by 1 per codepoint.
@@ -678,6 +762,29 @@ fn compose_buffer(buf: &[u32]) -> Vec<u32> {
     out
 }
 
+fn normalize_to_string(form: &str, text: &str) -> Result<String, *mut PyObject> {
+    let compat = match form {
+        "NFC" | "NFD" => false,
+        "NFKC" | "NFKD" => true,
+        _ => return Err(raise_value_error("invalid normalization form")),
+    };
+    if text.is_ascii() {
+        return Ok(text.to_owned());
+    }
+    let mut buf = decompose(text, compat);
+    if matches!(form, "NFC" | "NFKC") {
+        buf = compose_buffer(&buf);
+    }
+    let mut result = String::with_capacity(text.len());
+    for cp in buf {
+        match char::from_u32(cp) {
+            Some(ch) => result.push(ch),
+            None => return Err(raise_value_error("unicodedata: generated table produced an invalid code point")),
+        }
+    }
+    Ok(result)
+}
+
 // ---------------------------------------------------------------------------
 // Entry points
 
@@ -698,30 +805,18 @@ unsafe extern "C" fn normalize_entry(argv: *mut *mut PyObject, argc: usize) -> *
     let Some(text) = (unsafe { text_argument(text_obj) }) else {
         return raise_type_error(&format!("normalize() argument 2 must be str, not {}", type_name(text_obj)));
     };
-    let compat = match form.as_str() {
-        "NFC" | "NFD" => false,
-        "NFKC" | "NFKD" => true,
-        _ => return raise_value_error("invalid normalization form"),
-    };
+    if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
+        return raise_value_error("invalid normalization form");
+    }
     if text.is_ascii() {
         // ASCII is closed under all four forms; return the argument itself
         // (matching CPython's quickcheck fast path for this subset).
         return text_obj;
     }
-    let mut buf = decompose(&text, compat);
-    if matches!(form.as_str(), "NFC" | "NFKC") {
-        buf = compose_buffer(&buf);
+    match normalize_to_string(&form, &text) {
+        Ok(result) => str_object(&result),
+        Err(raised) => raised,
     }
-    let mut result = String::with_capacity(text.len());
-    for cp in buf {
-        match char::from_u32(cp) {
-            Some(ch) => result.push(ch),
-            // Unreachable with intact tables: inputs come from a &str and
-            // every table codepoint is a valid scalar value.
-            None => return raise_value_error("unicodedata: generated table produced an invalid code point"),
-        }
-    }
-    str_object(&result)
 }
 
 /// `unicodedata.category(chr)`.
@@ -799,6 +894,81 @@ unsafe extern "C" fn numeric_entry(argv: *mut *mut PyObject, argc: usize) -> *mu
     }
 }
 
+/// `unicodedata.bidirectional(chr)`.
+unsafe extern "C" fn bidirectional_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    match unsafe { char_argument(argv, argc, "bidirectional") } {
+        Ok(ch) => str_object(bidirectional_of(ch as u32)),
+        Err(error) => error,
+    }
+}
+
+/// `unicodedata.decomposition(chr)`.
+unsafe extern "C" fn decomposition_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    match unsafe { char_argument(argv, argc, "decomposition") } {
+        Ok(ch) => str_object(raw_decomposition_of(ch as u32)),
+        Err(error) => error,
+    }
+}
+
+/// `unicodedata.mirrored(chr)`.
+unsafe extern "C" fn mirrored_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    match unsafe { char_argument(argv, argc, "mirrored") } {
+        Ok(ch) => int_object(i64::from(mirrored_of(ch as u32))),
+        Err(error) => error,
+    }
+}
+
+/// `unicodedata.name(chr[, default])`.
+unsafe extern "C" fn name_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (ch, default) = match unsafe { char_and_default(argv, argc, "name") } {
+        Ok(parsed) => parsed,
+        Err(error) => return error,
+    };
+    match name_of(ch as u32) {
+        Some(name) => str_object(name),
+        None => match default {
+            Some(default) => untag(default),
+            None => raise_value_error("no such name"),
+        },
+    }
+}
+
+/// `unicodedata.lookup(name)`.
+unsafe extern "C" fn lookup_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { arg_slice(argv, argc) };
+    if args.len() != 1 {
+        return raise_type_error(&format!("unicodedata.lookup() takes exactly one argument ({} given)", args.len()));
+    }
+    let name_obj = untag(args[0]);
+    let Some(name) = (unsafe { text_argument(name_obj) }) else {
+        return raise_type_error(&format!("lookup() argument must be str, not {}", type_name(name_obj)));
+    };
+    match lookup_unicode_name(&name) {
+        Some(text) => str_object(&text),
+        None => raise_kind(ExceptionKind::KeyError, &format!("undefined character name '{name}'")),
+    }
+}
+
+/// `unicodedata.is_normalized(form, unistr)`.
+unsafe extern "C" fn is_normalized_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { arg_slice(argv, argc) };
+    if args.len() != 2 {
+        return raise_type_error(&format!("is_normalized expected 2 arguments, got {}", args.len()));
+    }
+    let form_obj = untag(args[0]);
+    let Some(form) = (unsafe { text_argument(form_obj) }) else {
+        return raise_type_error(&format!("is_normalized() argument 1 must be str, not {}", type_name(form_obj)));
+    };
+    let text_obj = untag(args[1]);
+    let Some(text) = (unsafe { text_argument(text_obj) }) else {
+        return raise_type_error(&format!("is_normalized() argument 2 must be str, not {}", type_name(text_obj)));
+    };
+    match normalize_to_string(&form, &text) {
+        Ok(normalized) => crate::types::bool_::from_bool(normalized == text),
+        Err(raised) => raised,
+    }
+}
+
 /// `unicodedata.ucd_3_2_0.category(chr)`.
 unsafe extern "C" fn ucd_3_2_category_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     // SAFETY: The runtime call ABI passed `argc` live argument slots.
@@ -839,31 +1009,213 @@ fn builtin_function(module: &str, name: &str, entry: BuiltinFn) -> Result<*mut P
     }
 }
 
-fn make_ucd_3_2_0_module() -> Result<*mut PyObject, String> {
-    let mut attrs = Vec::new();
-    for (name, value) in [
-        ("__doc__", "Unicode 3.2.0 database view for IDNA/stringprep"),
-        ("unidata_version", UCD_3_2_VERSION),
-    ] {
-        let object = str_object(value);
-        if object.is_null() {
-            return Err(format!("failed to allocate unicodedata.ucd_3_2_0.{name}"));
+static UCD_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let mut ty = PyType::new(
+        abi::runtime_type_type().cast_const(),
+        "unicodedata.UCD",
+        core::mem::size_of::<PyUcd>(),
+    );
+    ty.tp_getattro = Some(ucd_getattro);
+    Box::into_raw(Box::new(ty)) as usize
+});
+
+fn ucd_type() -> *mut PyType {
+    *UCD_TYPE as *mut PyType
+}
+
+fn make_ucd_object(version: UcdVersion) -> *mut PyObject {
+    Box::into_raw(Box::new(PyUcd {
+        ob_base: PyObjectHeader::new(ucd_type()),
+        version,
+    }))
+    .cast::<PyObject>()
+}
+
+unsafe extern "C" fn ucd_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name_text) = (unsafe { text_argument(untag(name)) }) else {
+        return raise_type_error("attribute name must be str");
+    };
+    match name_text.as_str() {
+        "unidata_version" => {
+            if ucd_from_object(object).is_none() {
+                return raise_type_error("invalid unicodedata.UCD receiver");
+            }
+            str_object(UCD_3_2_VERSION)
         }
-        attrs.push((intern(name), object));
+        "bidirectional" => ucd_bound_method(object, "bidirectional", ucd_bidirectional_method),
+        "category" => ucd_bound_method(object, "category", ucd_category_method),
+        "combining" => ucd_bound_method(object, "combining", ucd_combining_method),
+        "decimal" => ucd_bound_method(object, "decimal", ucd_decimal_method),
+        "decomposition" => ucd_bound_method(object, "decomposition", ucd_decomposition_method),
+        "digit" => ucd_bound_method(object, "digit", ucd_digit_method),
+        "east_asian_width" => ucd_bound_method(object, "east_asian_width", ucd_east_asian_width_method),
+        "is_normalized" => ucd_bound_method(object, "is_normalized", ucd_is_normalized_method),
+        "lookup" => ucd_bound_method(object, "lookup", ucd_lookup_method),
+        "mirrored" => ucd_bound_method(object, "mirrored", ucd_mirrored_method),
+        "name" => ucd_bound_method(object, "name", ucd_name_method),
+        "normalize" => ucd_bound_method(object, "normalize", ucd_normalize_method),
+        "numeric" => ucd_bound_method(object, "numeric", ucd_numeric_method),
+        _ => unsafe { abi::exc::pon_raise_attribute_error(object, intern(&name_text)) },
     }
-    for (name, entry) in [
-        ("bidirectional", ucd_3_2_bidirectional_entry as BuiltinFn),
-        ("category", ucd_3_2_category_entry),
-        ("decomposition", ucd_3_2_decomposition_entry),
-        ("normalize", normalize_entry),
-    ] {
-        attrs.push((intern(name), builtin_function("unicodedata.ucd_3_2_0", name, entry)?));
+}
+
+fn ucd_from_object(object: *mut PyObject) -> Option<&'static PyUcd> {
+    if object.is_null() || crate::tag::is_small_int(object) {
+        return None;
     }
-    install_module("unicodedata.ucd_3_2_0", attrs)
+    if unsafe { (*object).ob_type } == ucd_type().cast_const() {
+        Some(unsafe { &*object.cast::<PyUcd>() })
+    } else {
+        None
+    }
+}
+
+fn ucd_bound_method(receiver: *mut PyObject, name: &str, entry: BuiltinFn) -> *mut PyObject {
+    let function = unsafe { abi::pon_make_function(entry as *const u8, VARIADIC_ARITY, intern(name)) };
+    if function.is_null() {
+        return ptr::null_mut();
+    }
+    match crate::types::method::new_bound_method(function, receiver) {
+        Ok(method) => method.cast::<PyObject>(),
+        Err(message) => raise_type_error(&message),
+    }
+}
+
+unsafe fn ucd_receiver_and_args<'a>(
+    argv: *mut *mut PyObject,
+    argc: usize,
+    method: &str,
+) -> Result<(&'static PyUcd, &'a [*mut PyObject]), *mut PyObject> {
+    let args = unsafe { arg_slice(argv, argc) };
+    let Some((receiver, rest)) = args.split_first() else {
+        return Err(raise_type_error(&format!("unicodedata.UCD.{method}() missing receiver")));
+    };
+    let receiver = untag(*receiver);
+    match ucd_from_object(receiver) {
+        Some(ucd) => Ok((ucd, rest)),
+        None => Err(raise_type_error(&format!("descriptor '{method}' for 'unicodedata.UCD' objects doesn't apply"))),
+    }
+}
+
+fn call_unbound(entry: BuiltinFn, args: &[*mut PyObject]) -> *mut PyObject {
+    unsafe { entry(args.as_ptr().cast_mut(), args.len()) }
+}
+
+unsafe extern "C" fn ucd_category_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (ucd, rest) = match unsafe { ucd_receiver_and_args(argv, argc, "category") } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    if ucd.version == UcdVersion::Ucd3_2 {
+        return call_unbound(ucd_3_2_category_entry, rest);
+    }
+    call_unbound(category_entry, rest)
+}
+
+unsafe extern "C" fn ucd_bidirectional_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (ucd, rest) = match unsafe { ucd_receiver_and_args(argv, argc, "bidirectional") } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    if ucd.version == UcdVersion::Ucd3_2 {
+        return call_unbound(ucd_3_2_bidirectional_entry, rest);
+    }
+    call_unbound(bidirectional_entry, rest)
+}
+
+unsafe extern "C" fn ucd_decomposition_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (ucd, rest) = match unsafe { ucd_receiver_and_args(argv, argc, "decomposition") } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    if ucd.version == UcdVersion::Ucd3_2 {
+        return call_unbound(ucd_3_2_decomposition_entry, rest);
+    }
+    call_unbound(decomposition_entry, rest)
+}
+
+unsafe extern "C" fn ucd_combining_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (_, rest) = match unsafe { ucd_receiver_and_args(argv, argc, "combining") } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    call_unbound(combining_entry, rest)
+}
+
+unsafe extern "C" fn ucd_decimal_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (_, rest) = match unsafe { ucd_receiver_and_args(argv, argc, "decimal") } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    call_unbound(decimal_entry, rest)
+}
+
+unsafe extern "C" fn ucd_digit_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (_, rest) = match unsafe { ucd_receiver_and_args(argv, argc, "digit") } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    call_unbound(digit_entry, rest)
+}
+
+unsafe extern "C" fn ucd_east_asian_width_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (_, rest) = match unsafe { ucd_receiver_and_args(argv, argc, "east_asian_width") } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    call_unbound(east_asian_width_entry, rest)
+}
+
+unsafe extern "C" fn ucd_is_normalized_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (_, rest) = match unsafe { ucd_receiver_and_args(argv, argc, "is_normalized") } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    call_unbound(is_normalized_entry, rest)
+}
+
+unsafe extern "C" fn ucd_lookup_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (_, rest) = match unsafe { ucd_receiver_and_args(argv, argc, "lookup") } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    call_unbound(lookup_entry, rest)
+}
+
+unsafe extern "C" fn ucd_mirrored_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (_, rest) = match unsafe { ucd_receiver_and_args(argv, argc, "mirrored") } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    call_unbound(mirrored_entry, rest)
+}
+
+unsafe extern "C" fn ucd_name_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (_, rest) = match unsafe { ucd_receiver_and_args(argv, argc, "name") } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    call_unbound(name_entry, rest)
+}
+
+unsafe extern "C" fn ucd_normalize_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (_, rest) = match unsafe { ucd_receiver_and_args(argv, argc, "normalize") } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    call_unbound(normalize_entry, rest)
+}
+
+unsafe extern "C" fn ucd_numeric_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (_, rest) = match unsafe { ucd_receiver_and_args(argv, argc, "numeric") } {
+        Ok(parts) => parts,
+        Err(raised) => return raised,
+    };
+    call_unbound(numeric_entry, rest)
 }
 
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
-    let ucd_3_2_0 = make_ucd_3_2_0_module()?;
+    let ucd_3_2_0 = make_ucd_object(UcdVersion::Ucd3_2);
     let mut attrs = Vec::new();
     for (name, value) in [
         ("__name__", "unicodedata"),
@@ -877,12 +1229,20 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         attrs.push((intern(name), object));
     }
     attrs.push((intern("ucd_3_2_0"), ucd_3_2_0));
+    attrs.push((intern("UCD"), ucd_type().cast::<PyObject>()));
+    attrs.push((intern("_ucnhash_CAPI"), unsafe { abi::pon_none() }));
     for (name, entry) in [
-        ("category", category_entry as BuiltinFn),
+        ("bidirectional", bidirectional_entry as BuiltinFn),
+        ("category", category_entry),
         ("combining", combining_entry),
         ("decimal", decimal_entry),
+        ("decomposition", decomposition_entry),
         ("digit", digit_entry),
         ("east_asian_width", east_asian_width_entry),
+        ("is_normalized", is_normalized_entry),
+        ("lookup", lookup_entry),
+        ("mirrored", mirrored_entry),
+        ("name", name_entry),
         ("normalize", normalize_entry),
         ("numeric", numeric_entry),
     ] {
