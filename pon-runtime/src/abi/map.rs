@@ -494,11 +494,13 @@ pub unsafe extern "C" fn pon_dict_merge_unique(map: *mut PyObject, other: *mut P
     })
 }
 
-/// `dict.update` exact-dict helper. Returns the receiver.
+/// `dict.update` helper: CPython `dict_update_arg` semantics — an exact dict
+/// copies storage, a mapping (any `keys()` carrier) merges by key, and any
+/// other iterable must yield key/value pairs.  Returns the receiver.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_dict_update(map: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
     crate::untag_prelude!(map, other);
-    unsafe { pon_dict_merge(map, other) }
+    super::catch_object_helper(|| unsafe { crate::types::dict::dict_inplace_union(map, other) })
 }
 
 /// `dict.get(key, default=None)` helper.
@@ -731,10 +733,13 @@ let receiver = match ensure_dict_method_receiver(args, "update") {
     Ok(receiver) => receiver,
     Err(raised) => return raised,
 };
-if args.len() != 2 {
-    return raise_map_type_error(format!("dict.update() expected 1 argument, got {}", args.len().saturating_sub(1)));
+if args.len() > 2 {
+    return raise_map_type_error(format!("update expected at most 1 argument, got {}", args.len().saturating_sub(1)));
 }
-let updated = unsafe { pon_dict_update(receiver, args[1]) };
+let updated = match args.get(1) {
+    Some(&other) => unsafe { pon_dict_update(receiver, other) },
+    None => receiver,
+};
 if updated.is_null() {
     updated
 } else {

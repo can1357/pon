@@ -1360,11 +1360,13 @@ unsafe fn dict_union(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject
     unsafe { crate::abi::map::pon_build_map(pairs.as_mut_ptr(), pairs.len() / 2) }
 }
 
-/// PEP 584 `|=` core: `dict.update` semantics over any mapping or iterable of
-/// key-value pairs, mutating `receiver` and returning the SAME object (NULL
-/// with the update error raised on failure — `d |= 5` reports CPython's
-/// "'int' object is not iterable", not an unsupported-operand TypeError).
-unsafe fn dict_inplace_union(receiver: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+/// PEP 584 `|=` and `dict.update` core: update semantics over any mapping or
+/// iterable of key-value pairs, mutating `receiver` and returning the SAME
+/// object (NULL with the update error raised on failure — `d |= 5` reports
+/// CPython's "'int' object is not iterable", not an unsupported-operand
+/// TypeError).  No outer critical section: pair collection can re-enter
+/// Python (`keys()`, `__getitem__`), so inserts lock per item.
+pub(crate) unsafe fn dict_inplace_union(receiver: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
     let mut pairs = Vec::new();
     if unsafe { crate::native::builtins_mod::collect_dict_update_pairs(other, &mut pairs) }.is_err() {
         return ptr::null_mut();

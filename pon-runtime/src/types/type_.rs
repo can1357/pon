@@ -1601,8 +1601,12 @@ unsafe extern "C" fn member_descriptor_get(descr: *mut PyObject, obj: *mut PyObj
         PyMemberKind::Slot => {
             let value = unsafe { instance_get_slot(instance, descr.name) };
             if value.is_null() {
-                let spelling = intern::resolve(descr.name).unwrap_or_else(|| format!("<interned:{}>", descr.name));
-                return raise_object(format!("'{}' object has no attribute '{spelling}'", unsafe { (*obj_ty).name() }));
+                // Unset `__slots__` slot: raise a catchable `AttributeError`
+                // (CPython parity).  The lazy `try: self._x except AttributeError`
+                // cache pattern — e.g. pathlib's `PurePath.__str__` caching
+                // `_str` — depends on catching this, so it must NOT be an
+                // uncatchable runtime error.
+                return unsafe { crate::abi::exc::pon_raise_attribute_error(obj, descr.name) };
             }
             value
         }
