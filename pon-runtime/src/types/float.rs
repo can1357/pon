@@ -236,8 +236,9 @@ fn raise_type_error(message: &str) -> *mut PyObject {
 // ---------------------------------------------------------------------------
 
 /// One-shot installer for the builtin `float` type object's `tp_dict`
-/// surface — currently `__getformat__`, a classmethod in CPython, carried
-/// static-style around a receiverless entry exactly like `bytes.fromhex`
+/// surface.  CPython exposes `__getformat__` and `fromhex` as type-level
+/// callables; pon carries both as staticmethod descriptors around
+/// receiverless native entries exactly like `bytes.fromhex`
 /// (`abi::str_::install_binary_type_methods`).  `ty` is the GLOBAL `float`
 /// type object ([`FLOAT_TYPE`], registered by
 /// `abi::register_builtin_type_globals`); `descr::synthetic_type_attr`
@@ -259,24 +260,31 @@ pub(crate) fn ensure_float_type_methods_installed(ty: *mut PyType) {
     }
     let namespace = unsafe { (*ty).tp_dict.cast::<crate::types::type_::PyClassDict>() };
     let namespace = if namespace.is_null() { crate::types::type_::new_namespace() } else { namespace };
-    let interned = crate::intern::intern("__getformat__");
-    if unsafe { (&*namespace).get(interned) }.is_none() {
+    for (method_name, entry) in [
+        ("__getformat__", float_getformat_entry as unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject),
+        ("fromhex", float_fromhex_entry as unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject),
+    ] {
+        let interned = crate::intern::intern(method_name);
+        if unsafe { (&*namespace).get(interned) }.is_some() {
+            continue;
+        }
         // SAFETY: Live builtin entry point with the runtime calling convention.
         let function = unsafe {
             crate::abi::pon_make_function(
-                float_getformat_entry as *const u8,
+                entry as *const u8,
                 crate::builtins::variadic_arity(),
                 interned,
             )
         };
-        if !function.is_null() {
-            // SAFETY: Staticmethod carrier over the fresh receiverless entry.
-            let descriptor = unsafe {
-                crate::types::classmethod::new_staticmethod(crate::abi::staticmethod_builtin_type(), function)
-            };
-            if !descriptor.is_null() {
-                unsafe { (&mut *namespace).set(interned, descriptor) };
-            }
+        if function.is_null() {
+            continue;
+        }
+        // SAFETY: Staticmethod carrier over the fresh receiverless entry.
+        let descriptor = unsafe {
+            crate::types::classmethod::new_staticmethod(crate::abi::staticmethod_builtin_type(), function)
+        };
+        if !descriptor.is_null() {
+            unsafe { (&mut *namespace).set(interned, descriptor) };
         }
     }
     unsafe {
@@ -316,4 +324,82 @@ unsafe extern "C" fn float_getformat_entry(argv: *mut *mut PyObject, argc: usize
     const FORMAT: &str = if cfg!(target_endian = "little") { "IEEE, little-endian" } else { "IEEE, big-endian" };
     // SAFETY: Runtime string allocation helper; NULL on failure with the error set.
     unsafe { crate::abi::pon_const_str(FORMAT.as_ptr(), FORMAT.len()) }
+}
+
+/// `float.fromhex(text)`: hexadecimal float parser covering CPython's public
+/// grammar (`[sign]0xH[.H]p[sign]D`, plus infinities and NaNs).  Rust's
+/// standard parser deliberately omits C99 hex floats, so this routine performs
+/// the exact base-16 mantissa / base-2 exponent composition itself.
+unsafe extern "C" fn float_fromhex_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argv.is_null() || argc != 1 {
+        return raise_type_error(&format!("float.fromhex() takes exactly one argument ({argc} given)"));
+    }
+    // SAFETY: One live argument slot per the check above.
+    let argument = crate::tag::untag_arg(unsafe { *argv });
+    let Some(text) = (unsafe { crate::types::type_::unicode_text(argument) }) else {
+        let got = unsafe { crate::types::dict::type_name(argument) }.unwrap_or("object");
+        return raise_type_error(&format!("fromhex() argument must be str, not {got}"));
+    };
+    match parse_hex_float(text) {
+        Ok(value) => from_f64(value),
+        Err(()) => {
+            const MESSAGE: &str = "invalid hexadecimal floating-point string";
+            // SAFETY: Raise helper with a static message.
+            unsafe { crate::abi::exc::pon_raise_value_error(MESSAGE.as_ptr(), MESSAGE.len()) }
+        }
+    }
+}
+
+fn parse_hex_float(text: &str) -> Result<f64, ()> {
+    let mut s = text.trim();
+    let sign = if let Some(rest) = s.strip_prefix('-') {
+        s = rest;
+        -1.0
+    } else {
+        if let Some(rest) = s.strip_prefix('+') {
+            s = rest;
+        }
+        1.0
+    };
+    let lower = s.to_ascii_lowercase();
+    return match lower.as_str() {
+        "inf" | "infinity" => Ok(sign * f64::INFINITY),
+        "nan" => Ok(f64::NAN),
+        _ => parse_finite_hex_float(s).map(|value| sign * value),
+    };
+}
+
+fn parse_finite_hex_float(s: &str) -> Result<f64, ()> {
+    let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) else {
+        return Err(());
+    };
+    let (mantissa_text, exponent_text) = rest.split_once('p').or_else(|| rest.split_once('P')).ok_or(())?;
+    if mantissa_text.is_empty() || exponent_text.is_empty() {
+        return Err(());
+    }
+    let exponent: i32 = exponent_text.parse().map_err(|_| ())?;
+    let mut value = 0.0f64;
+    let mut seen_digit = false;
+    let mut seen_point = false;
+    let mut fractional_digits = 0i32;
+    for ch in mantissa_text.chars() {
+        if ch == '.' {
+            if seen_point {
+                return Err(());
+            }
+            seen_point = true;
+            continue;
+        }
+        let digit = ch.to_digit(16).ok_or(())?;
+        seen_digit = true;
+        value = value * 16.0 + f64::from(digit);
+        if seen_point {
+            fractional_digits = fractional_digits.saturating_add(1);
+        }
+    }
+    if !seen_digit {
+        return Err(());
+    }
+    let binary_exponent = exponent.saturating_sub(fractional_digits.saturating_mul(4));
+    Ok(value * 2.0f64.powi(binary_exponent))
 }

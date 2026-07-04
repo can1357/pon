@@ -651,6 +651,13 @@ unsafe fn object_equal_structural(left: *mut PyObject, right: *mut PyObject) -> 
         return unsafe { object_equal_structural(left_referent, right_referent) };
     }
 
+    if let (Some(left_text), Some(right_text)) = (
+        unsafe { crate::types::type_::unicode_text(left) },
+        unsafe { crate::types::type_::unicode_text(right) },
+    ) {
+        return Some(Ok(left_text.as_bytes() == right_text.as_bytes()));
+    }
+
     // Tuple-storage keying parity across layouts: an exact tuple and a
     // tuple-subclass instance (namedtuple) with equal contents are the same
     // dict key, matching CPython's inherited `tuple.__eq__`.  The
@@ -909,6 +916,11 @@ fn hash_object_non_numeric(object: *mut PyObject) -> Result<isize, String> {
     if unsafe { crate::types::tuple::is_tuple_subclass_instance(object) } {
         if let Some(items) = unsafe { crate::abi::seq::tuple_storage_slice(object) } {
             return structural_tuple_hash(items);
+        }
+    }
+    if let Some(value) = unsafe { crate::types::type_::payload_subclass_value(object) } {
+        if unsafe { type_name(value) } == Some("str") {
+            return unsafe { hash_object(value) };
         }
     }
     let hash = match unsafe { type_name(object) } {
