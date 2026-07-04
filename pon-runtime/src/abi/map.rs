@@ -1915,6 +1915,33 @@ unsafe extern "C" fn set_discard_method_trampoline(argv: *mut *mut PyObject, arg
     unsafe { pon_set_discard(args[0], args[1]) }
 }
 
+fn set_method_binary_result(receiver: *mut PyObject, other: *mut PyObject, op: DictViewSetOp) -> *mut PyObject {
+    let left_values = match unsafe { set_::entries_snapshot(receiver) } {
+        Ok(entries) => entries,
+        Err(message) => return null_error(message),
+    };
+    let right_values = match set_argument_entries(other) {
+        Ok(entries) => entries,
+        Err(message) => return null_error(message),
+    };
+    let left_entries = match unsafe { frozenset::unique_entries(&left_values) } {
+        Ok(entries) => entries,
+        Err(message) => return null_error(message),
+    };
+    let right_entries = match unsafe { frozenset::unique_entries(&right_values) } {
+        Ok(entries) => entries,
+        Err(message) => return null_error(message),
+    };
+    let entries = match set_op_entries(&left_entries, &right_entries, op) {
+        Ok(entries) => entries,
+        Err(message) => return null_error(message),
+    };
+    match super::with_runtime(|runtime| build_set_from_entries(runtime, receiver, entries)) {
+        Some(object) => object,
+        None => null_error("runtime is not initialized"),
+    }
+}
+
 unsafe extern "C" fn set_union_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let args = match map_method_args(argv, argc, "set.union") {
         Ok(args) => args,
@@ -1923,7 +1950,7 @@ unsafe extern "C" fn set_union_method_trampoline(argv: *mut *mut PyObject, argc:
     if args.len() != 2 {
         return raise_map_type_error(format!("set.union() expected 1 argument, got {}", args.len().saturating_sub(1)));
     }
-    unsafe { pon_set_union(args[0], args[1]) }
+    set_method_binary_result(args[0], args[1], DictViewSetOp::Union)
 }
 
 unsafe extern "C" fn set_intersection_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -1934,7 +1961,7 @@ unsafe extern "C" fn set_intersection_method_trampoline(argv: *mut *mut PyObject
     if args.len() != 2 {
         return raise_map_type_error(format!("set.intersection() expected 1 argument, got {}", args.len().saturating_sub(1)));
     }
-    unsafe { pon_set_intersection(args[0], args[1]) }
+    set_method_binary_result(args[0], args[1], DictViewSetOp::Intersection)
 }
 
 unsafe extern "C" fn set_difference_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -1945,7 +1972,7 @@ unsafe extern "C" fn set_difference_method_trampoline(argv: *mut *mut PyObject, 
     if args.len() != 2 {
         return raise_map_type_error(format!("set.difference() expected 1 argument, got {}", args.len().saturating_sub(1)));
     }
-    unsafe { pon_set_difference(args[0], args[1]) }
+    set_method_binary_result(args[0], args[1], DictViewSetOp::Difference)
 }
 
 unsafe extern "C" fn set_symmetric_difference_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {

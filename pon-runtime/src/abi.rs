@@ -4527,18 +4527,25 @@ pub unsafe extern "C" fn pon_delete_global(name_interned: u32) -> *mut PyObject 
             return return_null_with_error(message);
         }
         // Defining-module scoping, mirrored from `pon_store_global`.
-        let target_module = current_defining_module().or_else(crate::import::active_module_name_id);
+        let target_module = current_global_module_context();
         let removed = match target_module {
             // CPython rule: `del name` unbinds the module global only.  The
             // flat pool is the builtins table and is never touched — deleting
             // an unbound global raises NameError even when a builtin of the
             // same name exists, and deleting a module-local shadow re-exposes
             // the builtin instead of evicting it process-wide.
-            // `delete_module_attr` bumps the namespace version (J0.3).
-            Some(module) => {
-                let removed = crate::import::delete_module_attr(module, name_interned);
+            // The module attr delete bumps the namespace version (J0.3).
+            Some((module_name, module_object)) => {
+                let removed = if module_object.is_null() {
+                    crate::import::delete_module_attr(module_name, name_interned)
+                } else {
+                    crate::import::delete_module_object_attr(module_object, name_interned)
+                };
                 if removed {
-                    crate::dynexec::sync_global_delete_for_module(module, name_interned);
+                    crate::dynexec::sync_global_delete_for_module(
+                        module_context_registry_key(module_name, module_object),
+                        name_interned,
+                    );
                 }
                 removed
             }
@@ -4747,15 +4754,22 @@ pub unsafe extern "C" fn pon_store_global(name_interned: u32, value: *mut PyObje
         // is NEVER written here — it is the builtins table, and a module-
         // scope write would leak the binding process-wide (reprlib's
         // module-level `repr = aRepr.repr` must not clobber builtin `repr`).
-        // `store_module_attr` bumps the namespace version (J0.3 GlobalIC
+        // The module attr store bumps the namespace version (J0.3 GlobalIC
         // site), so recorded ICs re-resolve after the visibility change.
-        let target_module = current_defining_module().or_else(crate::import::active_module_name_id);
+        let target_module = current_global_module_context();
         let stored_in_module = match target_module {
-            Some(module) => crate::import::store_module_attr(module, name_interned, value),
+            Some((module_name, module_object)) if module_object.is_null() => {
+                crate::import::store_module_attr(module_name, name_interned, value)
+            }
+            Some((_, module_object)) => crate::import::store_module_object_attr(module_object, name_interned, value),
             None => false,
         };
-        if let Some(module) = target_module {
-            crate::dynexec::sync_global_store_for_module(module, name_interned, value);
+        if let Some((module_name, module_object)) = target_module {
+            crate::dynexec::sync_global_store_for_module(
+                module_context_registry_key(module_name, module_object),
+                name_interned,
+                value,
+            );
         }
         if !stored_in_module {
             // No module context (embedding/unit tests) or the defining module
@@ -5171,6 +5185,11 @@ fn collect_impl() -> Result<(), String> {
     for value in crate::native::itertools::gc_held_roots() {
         push_namespace_value_roots(value, &mut roots);
     }
+    // `os.walk` iterators hold the onerror callback and the yielded
+    // top-down dirnames list until the next resume, mirroring `_contextvars`.
+    for value in crate::native::os::gc_held_roots() {
+        push_namespace_value_roots(value, &mut roots);
+    }
     // Sources and options held by the lazy builtins (`map`/`filter`/`zip`/
     // `reversed`, legacy seq-iter, binder option carriers), mirroring
     // `_contextvars`.
@@ -5253,16 +5272,41 @@ pub(crate) fn current_function_stack_depth() -> usize {
 /// Consumed here for `__globals__`-scoped loads/stores and by the import
 /// system to resolve a function-body relative import against the function's
 /// defining module (CPython's calling-frame-globals rule).
-pub(crate) fn current_defining_module() -> Option<u32> {
+fn current_defining_module_context() -> Option<(u32, *mut PyObject)> {
     let floor = crate::import::active_module_call_floor();
     CURRENT_FUNCTION_STACK.with(|stack| {
         let stack = stack.borrow();
         let floor = floor.min(stack.len());
-        stack[floor..]
-            .iter()
-            .rev()
-            .find_map(|call| crate::types::function::function_module(call.function.cast::<PyObject>()))
+        stack[floor..].iter().rev().find_map(|call| {
+            crate::types::function::function_module_context(call.function.cast::<PyObject>())
+        })
     })
+}
+
+/// Defining module name of the innermost visible compiled function.
+#[must_use]
+pub(crate) fn current_defining_module() -> Option<u32> {
+    current_defining_module_context().map(|(module, _)| module)
+}
+
+/// Original defining module object of the innermost visible compiled function.
+#[must_use]
+pub(crate) fn current_defining_module_object() -> Option<*mut PyObject> {
+    current_defining_module_context()
+        .map(|(_, module_object)| module_object)
+        .filter(|module_object| !module_object.is_null())
+}
+
+fn current_global_module_context() -> Option<(u32, *mut PyObject)> {
+    current_defining_module_context().or_else(crate::import::active_module_context)
+}
+
+fn module_context_registry_key(module_name: u32, module_object: *mut PyObject) -> u32 {
+    if module_object.is_null() {
+        module_name
+    } else {
+        crate::import::module_object_registry_key(module_object).unwrap_or(module_name)
+    }
 }
 
 /// Resolve `name` in the executing function's defining-module namespace.
@@ -5270,8 +5314,12 @@ pub(crate) fn current_defining_module() -> Option<u32> {
 /// when the module does not bind the name — callers then fall back to the
 /// active-module / flat-pool layers.
 fn defining_module_attr(name: u32) -> Option<*mut PyObject> {
-    let module = current_defining_module()?;
-    crate::import::module_attr(module, name)
+    let (module_name, module_object) = current_defining_module_context()?;
+    if module_object.is_null() {
+        crate::import::module_attr(module_name, name)
+    } else {
+        crate::import::module_object_attr(module_object, name)
+    }
 }
 
 /// Call chain captured for `sys._getframe(depth)`: `chain[0]` describes the
@@ -5340,8 +5388,8 @@ pub(super) fn record_new_function_module(function: *mut PyObject) {
     if function.is_null() {
         return;
     }
-    if let Some(module) = current_defining_module().or_else(crate::import::active_module_name_id) {
-        crate::types::function::set_function_module(function, module);
+    if let Some((module, module_object)) = current_global_module_context() {
+        crate::types::function::set_function_module_context(function, module, module_object);
     }
 }
 
@@ -5589,6 +5637,33 @@ mod tests {
             pon_err_clear();
             // Builtins keep resolving through the flat pool.
             assert!(!pon_load_global(intern("print"), ptr::null_mut()).is_null());
+        }
+    }
+
+    #[test]
+    fn load_global_uses_original_module_object_after_reinstall() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+            let module_name = "scope_rebound";
+            let name = intern("_PathParents");
+
+            let original = crate::import::install_module(module_name, []).unwrap();
+            crate::import::begin_module_execution(module_name).unwrap();
+            let function = pon_make_function(return_none as *const u8, 0, intern("parents_getter"));
+            assert!(!function.is_null());
+            let value = pon_const_int(101);
+            assert_eq!(pon_store_global(name, value), value);
+            crate::import::end_module_execution(module_name);
+            assert_eq!(crate::types::function::function_module(function), Some(intern(module_name)));
+            assert_eq!(crate::types::function::function_module_object(function), Some(original));
+
+            let replacement = crate::import::install_module(module_name, []).unwrap();
+            assert_ne!(replacement, original);
+            assert!(crate::import::module_attr(intern(module_name), name).is_none());
+
+            let _call = push_current_call(function.cast::<PyFunction>(), ptr::null_mut(), 0);
+            assert_eq!(pon_load_global(name, ptr::null_mut()), value);
         }
     }
 
