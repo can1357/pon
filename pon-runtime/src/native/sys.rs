@@ -71,14 +71,23 @@ fn sys_executable_path() -> String {
 
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
     let attrs = [
+        // Shape must satisfy `platform._sys_version`'s parser
+        // (`version (buildno, builddate, buildtime) [compiler]`): meson's
+        // CommandLineParser calls `platform.python_version()` while building
+        // argparse subcommands.  The build fields are fixed strings — pon has
+        // no build number — and the oracle check is
+        // `platform._sys_version('3.14.6 (pon, Jan  1 2026, 00:00:00) [pon]')`.
         string_attr(
             "version",
-            &format!("{VERSION_INFO_MAJOR}.{VERSION_INFO_MINOR}.{VERSION_INFO_MICRO} (pon)"),
+            &format!("{VERSION_INFO_MAJOR}.{VERSION_INFO_MINOR}.{VERSION_INFO_MICRO} (pon, Jan  1 2026, 00:00:00) [pon]"),
         ),
         version_info_attr(),
         implementation_attr(),
         int_attr("hexversion", HEXVERSION),
         int_attr("maxsize", i64::MAX),
+        // Wide-Unicode max codepoint; CPython has shipped only wide builds
+        // since 3.3 (`mesonbuild.mtest` branches on it at import).
+        int_attr("maxunicode", 0x0010_FFFF),
         string_attr("platform", PLATFORM),
         string_attr("byteorder", if cfg!(target_endian = "little") { "little" } else { "big" }),
         string_attr("executable", &sys_executable_path()),
@@ -108,6 +117,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         monitoring_attr(),
         warnoptions_attr(),
         meta_path_attr(),
+        path_importer_cache_attr(),
         path_attr(),
         modules_attr(),
         builtin_module_names_attr(),
@@ -216,6 +226,25 @@ fn warnoptions_attr() -> Result<(u32, *mut PyObject), String> {
 /// `_bootstrap_external`, whose file-loading machinery pon does not run.
 fn meta_path_attr() -> Result<(u32, *mut PyObject), String> {
     empty_list_attr("meta_path")
+}
+
+/// `sys.path_importer_cache`: the path-entry finder cache `runpy`'s
+/// `_get_code_from_file` machinery reads and writes.  pon's native importer
+/// never consults it (documented divergence, like `meta_path`), so the
+/// honest surface is one identity-stable empty dict that Python code may
+/// populate freely.
+fn path_importer_cache_attr() -> Result<(u32, *mut PyObject), String> {
+    static CACHE: std::sync::LazyLock<Result<usize, String>> = std::sync::LazyLock::new(|| {
+        // SAFETY: Map builder allocates an empty runtime dict.
+        let dict = unsafe { crate::abi::map::pon_build_map(std::ptr::null_mut(), 0) };
+        if dict.is_null() {
+            return Err("failed to allocate sys.path_importer_cache".to_owned());
+        }
+        Ok(dict as usize)
+    });
+    CACHE
+        .clone()
+        .map(|object| (intern("path_importer_cache"), object as *mut PyObject))
 }
 
 /// A freshly-allocated empty runtime list bound as `sys.<name>`.
@@ -1783,17 +1812,15 @@ unsafe extern "C" fn sys_getsizeof(argv: *mut *mut PyObject, argc: usize) -> *mu
 //
 // A REAL mutable list (stdlib mutates it: test modules append fixture
 // directories, `pkgutil`/`zipimport` walk it), seeded once per process
-// with the runtime's actual source-import search order —
-// `crate::import::source_search_roots()`: cwd, installed packages, the
-// conformance corpus, `PONPATH`/`PON_IMPORT_PATH` entries, the vendored
-// stdlib — the honest answer to "where does pon import from".
-// DOCUMENTED DIVERGENCE: pon's importer derives its roots from the
-// process environment on each import and never re-reads this list, so
-// mutations are visible to every Python reader but do NOT steer pon's
-// import resolution.  CPython seeds `path[0]` with the script directory;
-// pon's leading cwd entry plays that role.  The singleton list lives for
-// the process (identity stable across `import sys` re-registration),
-// exactly like the version_info instance above.
+// with the runtime's actual source-import search order.  The CLI prepends
+// the script directory to `PONPATH` before runtime init, so script execution
+// starts with that directory first like CPython; embedded/AoT runs expose the
+// environment roots they actually search.  Later user insertions are visible
+// to both Python readers and pon's source resolver, which snapshots this list
+// before each source-module lookup and merges non-default entries ahead of
+// installed-package roots.  The singleton list lives for the process
+// (identity stable across `import sys` re-registration), exactly like the
+// version_info instance above.
 // ---------------------------------------------------------------------------
 
 /// The `sys.path` singleton list over the runtime's search roots.

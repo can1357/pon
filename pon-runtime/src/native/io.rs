@@ -1,10 +1,12 @@
 //! Native `_io` module seed plus the `open()` file-object backing store.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ptr;
 use std::sync::LazyLock;
 
+use pon_gc::{GcTypeInfo, TypeId};
 use crate::abi::{self, pon_const_str};
 use crate::builtins;
 use crate::intern::intern;
@@ -81,9 +83,50 @@ pub(crate) struct PyNativeFile {
     newline: NewlineMode,
     /// Bitset of newline spellings seen by universal-newline text reads.
     newline_seen: u8,
+    /// Per-instance dynamic attributes set from Python.
+    attrs: HashMap<u32, *mut PyObject>,
 }
 
 unsafe impl Send for PyNativeFile {}
+
+const TYPE_ID_NATIVE_FILE: TypeId = TypeId(120);
+
+unsafe extern "C" fn trace_file(object: *mut u8, visitor: &mut dyn FnMut(*mut u8)) {
+    if object.is_null() {
+        return;
+    }
+    let file = unsafe { &*object.cast::<PyNativeFile>() };
+    for &value in file.attrs.values() {
+        if !value.is_null() {
+            visitor(value.cast::<u8>());
+        }
+    }
+}
+
+unsafe extern "C" fn finalize_file(object: *mut u8) {
+    if object.is_null() {
+        return;
+    }
+    unsafe { ptr::drop_in_place(object.cast::<PyNativeFile>()) };
+}
+
+fn alloc_native_file(value: PyNativeFile) -> *mut PyObject {
+    let info = GcTypeInfo {
+        size: std::mem::size_of::<PyNativeFile>(),
+        trace: trace_file,
+        finalize: Some(finalize_file),
+    };
+    match abi::alloc_gc_object(TYPE_ID_NATIVE_FILE, info) {
+        Ok(object) => unsafe {
+            ptr::write(object.cast::<PyNativeFile>(), value);
+            object.cast::<PyObject>()
+        },
+        Err(message) => {
+            std::mem::forget(value);
+            abi::return_null_with_error(message)
+        }
+    }
+}
 
 static TEXT_FILE_TYPE: LazyLock<usize> = LazyLock::new(|| {
     let mut ty = Box::new(PyType::new(
@@ -159,7 +202,7 @@ unsafe extern "C" fn text_file_new(_cls: *mut PyType, args: *mut PyObject, _kwar
     let Ok(clone) = handle.try_clone() else {
         return raise_io_error("failed to duplicate stream handle");
     };
-    Box::into_raw(Box::new(PyNativeFile {
+    alloc_native_file(PyNativeFile {
         ob_base: PyObjectHeader::new(text_file_type()),
         file: Some(clone),
         name: buffer.name.clone(),
@@ -171,13 +214,13 @@ unsafe extern "C" fn text_file_new(_cls: *mut PyType, args: *mut PyObject, _kwar
         encoding: Some("utf-8".to_owned()),
         newline: NewlineMode::UniversalTranslate,
         newline_seen: 0,
-    }))
-    .cast::<PyObject>()
+        attrs: HashMap::new(),
+    })
 }
 
-/// `tp_setattro` for native files: only the Python-visible `mode` label is
-/// assignable (`tokenize.open` stamps `text.mode = 'r'`); everything else
-/// raises AttributeError to keep the frontier loud.
+/// `tp_setattro` for native files: `mode` keeps its historical writable label
+/// slot, read-only state attributes stay protected, and every other name is
+/// stored in the per-file instance dict.
 unsafe extern "C" fn file_setattro(object: *mut PyObject, name: *mut PyObject, value: *mut PyObject) -> core::ffi::c_int {
     let Some(attr) = (unsafe { type_::unicode_text(name) }) else {
         pon_err_set("file attribute name must be str");
@@ -187,6 +230,16 @@ unsafe extern "C" fn file_setattro(object: *mut PyObject, name: *mut PyObject, v
         pon_err_set("file attribute receiver is not a native file");
         return -1;
     };
+    let name_id = intern(attr);
+    if value.is_null() {
+        if file.attrs.remove(&name_id).is_some() {
+            return 0;
+        }
+        if attr == "mode" || readonly_file_state_attr(file, attr) {
+            return raise_file_readonly_attr_status(object, attr);
+        }
+        return raise_file_missing_attr_status(object, attr);
+    }
     if attr == "mode" {
         let Some(text) = (unsafe { type_::unicode_text(crate::tag::untag_arg(value)) }) else {
             pon_err_set("file mode must be str");
@@ -195,10 +248,42 @@ unsafe extern "C" fn file_setattro(object: *mut PyObject, name: *mut PyObject, v
         file.mode = text.to_owned();
         return 0;
     }
-    let message = format!("'{}' object attribute '{attr}' is read-only", unsafe { (*(*object).ob_type).name() });
-    // SAFETY-free typed raise: catchable AttributeError with the CPython text.
-    let _ = crate::abi::exc::raise_attribute_error_text(&message);
+    if readonly_file_state_attr(file, attr) {
+        return raise_file_readonly_attr_status(object, attr);
+    }
+    file.attrs.insert(name_id, value);
+    0
+}
+
+fn readonly_file_state_attr(file: &PyNativeFile, attr: &str) -> bool {
+    matches!(attr, "closed" | "name") || (!file.binary && matches!(attr, "encoding" | "errors" | "newlines"))
+}
+
+fn raise_file_readonly_attr_status(object: *mut PyObject, attr: &str) -> core::ffi::c_int {
+    let message = format!("'{}' object attribute '{attr}' is read-only", file_type_name(object));
+    raise_file_attribute_status(&message)
+}
+
+fn raise_file_missing_attr_status(object: *mut PyObject, attr: &str) -> core::ffi::c_int {
+    let message = format!("'{}' object has no attribute '{attr}'", file_type_name(object));
+    raise_file_attribute_status(&message)
+}
+
+fn raise_file_attribute_status(message: &str) -> core::ffi::c_int {
+    let _ = abi::exc::raise_attribute_error_text(message);
     -1
+}
+
+fn file_type_name(object: *mut PyObject) -> String {
+    if object.is_null() {
+        return "file".to_owned();
+    }
+    let ty = unsafe { (*object).ob_type };
+    if ty.is_null() {
+        "file".to_owned()
+    } else {
+        unsafe { (*ty).name().to_owned() }
+    }
 }
 
 fn text_file_type() -> *mut PyType {
@@ -2168,7 +2253,7 @@ fn open_host_file(path: &str, mode: &OpenMode) -> Result<File, OpenError> {
 
 fn alloc_file(file: File, name: String, mode: OpenMode, encoding: Option<String>, newline: NewlineMode) -> *mut PyObject {
     let ty = if mode.binary { binary_file_type() } else { text_file_type() };
-    Box::into_raw(Box::new(PyNativeFile {
+    alloc_native_file(PyNativeFile {
         ob_base: PyObjectHeader::new(ty),
         file: Some(file),
         name,
@@ -2180,8 +2265,8 @@ fn alloc_file(file: File, name: String, mode: OpenMode, encoding: Option<String>
         encoding,
         newline,
         newline_seen: 0,
-    }))
-    .cast::<PyObject>()
+        attrs: HashMap::new(),
+    })
 }
 
 /// Process-level std stream (`sys.stdin`/`sys.stdout`/`sys.stderr`) as a
@@ -2196,7 +2281,7 @@ pub(super) fn std_stream_object(fd: i32, name: &str, readable: bool) -> *mut PyO
     // SAFETY: fds 0/1/2 are open for the process lifetime; ownership is
     // parked in a static module attribute, never dropped.
     let file = unsafe { File::from_raw_fd(fd) };
-    Box::into_raw(Box::new(PyNativeFile {
+    alloc_native_file(PyNativeFile {
         ob_base: PyObjectHeader::new(text_file_type()),
         file: Some(file),
         name: name.to_owned(),
@@ -2208,8 +2293,8 @@ pub(super) fn std_stream_object(fd: i32, name: &str, readable: bool) -> *mut PyO
         encoding: Some("utf-8".to_owned()),
         newline: NewlineMode::LineFeed,
         newline_seen: 0,
-    }))
-    .cast::<PyObject>()
+        attrs: HashMap::new(),
+    })
 }
 
 fn parse_mode(mode: &str) -> Result<OpenMode, OpenError> {
@@ -2290,6 +2375,35 @@ unsafe fn as_file<'a>(object: *mut PyObject) -> Option<&'a mut PyNativeFile> {
     }
 }
 
+type FileMethodEntry = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
+
+fn file_method_entry(attr: &str, binary: bool) -> Option<FileMethodEntry> {
+    match attr {
+        "read" => Some(file_read_method),
+        "read1" if binary => Some(file_read1_method),
+        "readinto" if binary => Some(file_readinto_method),
+        "readinto1" if binary => Some(file_readinto_method),
+        "readline" => Some(file_readline_method),
+        "readlines" => Some(file_readlines_method),
+        "write" => Some(file_write_method),
+        "writelines" => Some(file_writelines_method),
+        "seek" => Some(file_seek_method),
+        "tell" => Some(file_tell_method),
+        "close" => Some(file_close_method),
+        "flush" => Some(file_flush_method),
+        "readable" => Some(file_readable_method),
+        "writable" => Some(file_writable_method),
+        "seekable" => Some(file_seekable_method),
+        "isatty" => Some(file_isatty_method),
+        "fileno" => Some(file_fileno_method),
+        "__enter__" => Some(file_enter_method),
+        "__exit__" => Some(file_exit_method),
+        "__iter__" => Some(file_iter_method),
+        "__next__" => Some(file_next_method),
+        _ => None,
+    }
+}
+
 unsafe extern "C" fn file_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
     let Some(attr) = (unsafe { type_::unicode_text(name) }) else {
         return raise_type_error("file attribute name must be str");
@@ -2297,6 +2411,15 @@ unsafe extern "C" fn file_getattro(object: *mut PyObject, name: *mut PyObject) -
     let Some(file) = (unsafe { as_file(object) }) else {
         return raise_type_error("file method receiver is not a native file");
     };
+    if let Some(entry) = file_method_entry(attr, file.binary) {
+        // Pon's native file methods are served from this slot rather than a
+        // class descriptor table. Preserve that established method surface even
+        // if user code stores an instance attribute with the same name.
+        return bound_file_method(object, attr, entry);
+    }
+    if let Some(value) = file.attrs.get(&intern(attr)).copied() {
+        return value;
+    }
     match attr {
         "closed" => unsafe { abi::number::pon_const_bool(i32::from(file.file.is_none())) },
         "name" => alloc_str(&file.name),
@@ -2304,28 +2427,7 @@ unsafe extern "C" fn file_getattro(object: *mut PyObject, name: *mut PyObject) -
         "encoding" if !file.binary => file.encoding.as_deref().map_or_else(|| unsafe { abi::pon_none() }, alloc_str),
         "errors" if !file.binary => alloc_str("strict"),
         "newlines" if !file.binary => newline_seen_object(file),
-        "read" => bound_file_method(object, "read", file_read_method),
-        "read1" if file.binary => bound_file_method(object, "read1", file_read1_method),
-        "readinto" if file.binary => bound_file_method(object, "readinto", file_readinto_method),
-        "readinto1" if file.binary => bound_file_method(object, "readinto1", file_readinto_method),
-        "readline" => bound_file_method(object, "readline", file_readline_method),
-        "readlines" => bound_file_method(object, "readlines", file_readlines_method),
-        "write" => bound_file_method(object, "write", file_write_method),
-        "writelines" => bound_file_method(object, "writelines", file_writelines_method),
-        "seek" => bound_file_method(object, "seek", file_seek_method),
-        "tell" => bound_file_method(object, "tell", file_tell_method),
-        "close" => bound_file_method(object, "close", file_close_method),
-        "flush" => bound_file_method(object, "flush", file_flush_method),
-        "readable" => bound_file_method(object, "readable", file_readable_method),
-        "writable" => bound_file_method(object, "writable", file_writable_method),
-        "seekable" => bound_file_method(object, "seekable", file_seekable_method),
-        "isatty" => bound_file_method(object, "isatty", file_isatty_method),
-        "fileno" => bound_file_method(object, "fileno", file_fileno_method),
-        "__enter__" => bound_file_method(object, "__enter__", file_enter_method),
-        "__exit__" => bound_file_method(object, "__exit__", file_exit_method),
-        "__iter__" => bound_file_method(object, "__iter__", file_iter_method),
-        "__next__" => bound_file_method(object, "__next__", file_next_method),
-        _ => raise_attribute_error(attr),
+        _ => raise_file_attribute_error(object, attr),
     }
 }
 
@@ -3247,7 +3349,11 @@ fn raise_value_error(message: &str) -> *mut PyObject {
 }
 
 fn raise_attribute_error(name: &str) -> *mut PyObject {
-    abi::return_null_with_error(format!("AttributeError: attribute '{name}' was not found"))
+    abi::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found"))
+}
+
+fn raise_file_attribute_error(object: *mut PyObject, name: &str) -> *mut PyObject {
+    unsafe { abi::pon_raise_attribute_error(object, intern(name)) }
 }
 
 fn raise_io_error(message: &str) -> *mut PyObject {

@@ -1,6 +1,6 @@
 //! Native `os` module seed for WS-IMPORT.
 
-use crate::abi::pon_const_str;
+use crate::abi::{CodeInfo, ParamSpec, pon_const_str};
 use crate::intern::intern;
 use crate::object::PyObject;
 use crate::types::exc::ExceptionKind;
@@ -150,6 +150,16 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
             return Err(format!("failed to allocate {module}.get_exec_path"));
         }
         attrs.push((intern("get_exec_path"), get_exec_path));
+        let mut makedirs_defaults = unsafe { [crate::abi::pon_const_int(0o777), crate::abi::pon_const_bool(0)] };
+        if makedirs_defaults.iter().any(|value| value.is_null()) {
+            return Err(format!("failed to allocate {module}.makedirs defaults"));
+        }
+        attrs.push(phase_b_function_attr(
+            "makedirs",
+            os_makedirs,
+            &["name", "mode", "exist_ok"],
+            &mut makedirs_defaults,
+        )?);
         // `importlib.resources._common` keeps a direct `_os_remove=os.remove`
         // reference for late finalization cleanup, so publish the CPython
         // alias alongside the underlying `unlink` syscall wrapper.
@@ -175,6 +185,56 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
         attrs.push((intern("PathLike"), pathlike_class()?));
     }
     Ok(attrs)
+}
+
+fn phase_b_function_attr(
+    name: &str,
+    entry: BuiltinFn,
+    names: &[&str],
+    defaults: &mut [*mut PyObject],
+) -> Result<(u32, *mut PyObject), String> {
+    let interned_names: Vec<u32> = names.iter().map(|name| intern(name)).collect();
+    let params = ParamSpec {
+        names: if interned_names.is_empty() {
+            std::ptr::null()
+        } else {
+            interned_names.as_ptr()
+        },
+        total_param_count: interned_names.len() as u32,
+        positional_only_count: 0,
+        positional_count: interned_names.len() as u32,
+        keyword_only_count: 0,
+        varargs_name: 0,
+        varkw_name: 0,
+    };
+    let code = CodeInfo {
+        entry: entry as *const u8,
+        params: &params,
+        name_interned: intern(name),
+        n_locals: 0,
+        n_feedback: 0,
+        flags: 0,
+    };
+    let function = unsafe {
+        crate::abi::call::pon_make_function_full(
+            &code,
+            if defaults.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                defaults.as_mut_ptr()
+            },
+            defaults.len(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (!function.is_null())
+        .then_some((intern(name), function))
+        .ok_or_else(|| format!("failed to allocate os.{name}"))
 }
 
 /// `os._get_exports_list(module)`: CPython os.py's own helper, served
@@ -369,18 +429,24 @@ unsafe extern "C" fn os_urandom(argv: *mut *mut PyObject, argc: usize) -> *mut P
     unsafe { crate::abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) }
 }
 
-/// `os.stat_result` shape: only the fields the vendored stdlib consumes are
-/// served (`linecache` reads `st_size`/`st_mtime`; `netrc`'s security check
-/// reads `st_mode`/`st_uid`); unknown attributes raise AttributeError so the
-/// next frontier is loud, not silently wrong (`_pyio` reads `st_blksize`
-/// through `getattr(..., 0)`, which that AttributeError serves correctly).
+/// `os.stat_result` shape: serve the POSIX fields consumed by the vendored
+/// stdlib and Meson (`st_size`/`st_mtime`, permission/owner bits, and stable
+/// file identity). Unknown attributes still raise AttributeError so the next
+/// frontier is loud, not silently wrong (`_pyio` reads `st_blksize` through
+/// `getattr(..., 0)`, which that AttributeError serves correctly).
 #[repr(C)]
 struct PyStatResult {
     ob_base: crate::object::PyObjectHeader,
     st_size: i64,
+    st_atime: f64,
     st_mtime: f64,
-    st_mode: u32,
-    st_uid: u32,
+    st_ctime: f64,
+    st_mode: i64,
+    st_ino: i64,
+    st_dev: i64,
+    st_nlink: i64,
+    st_uid: i64,
+    st_gid: i64,
 }
 
 fn stat_result_type() -> *mut crate::object::PyType {
@@ -406,9 +472,15 @@ unsafe extern "C" fn stat_result_getattro(object: *mut PyObject, name: *mut PyOb
     match name_text {
         // SAFETY: Receivers of this getattro are PyStatResult allocations.
         "st_size" => unsafe { crate::abi::pon_const_int((*stat).st_size) },
+        "st_atime" => unsafe { crate::abi::number::pon_const_float((*stat).st_atime) },
         "st_mtime" => unsafe { crate::abi::number::pon_const_float((*stat).st_mtime) },
-        "st_mode" => unsafe { crate::abi::pon_const_int(i64::from((*stat).st_mode)) },
-        "st_uid" => unsafe { crate::abi::pon_const_int(i64::from((*stat).st_uid)) },
+        "st_ctime" => unsafe { crate::abi::number::pon_const_float((*stat).st_ctime) },
+        "st_mode" => unsafe { crate::abi::pon_const_int((*stat).st_mode) },
+        "st_ino" => unsafe { crate::abi::pon_const_int((*stat).st_ino) },
+        "st_dev" => unsafe { crate::abi::pon_const_int((*stat).st_dev) },
+        "st_nlink" => unsafe { crate::abi::pon_const_int((*stat).st_nlink) },
+        "st_uid" => unsafe { crate::abi::pon_const_int((*stat).st_uid) },
+        "st_gid" => unsafe { crate::abi::pon_const_int((*stat).st_gid) },
         _ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
     }
 }
@@ -433,30 +505,91 @@ unsafe extern "C" fn os_stat(argv: *mut *mut PyObject, argc: usize) -> *mut PyOb
 /// Boxes host metadata as the `os.stat_result` shape shared by `os.stat`
 /// and `os.lstat`.
 fn stat_result_object(metadata: &std::fs::Metadata) -> *mut PyObject {
-    let mtime = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0.0, |duration| duration.as_secs_f64());
     #[cfg(unix)]
-    let (mode, uid) = {
+    let fields = {
         use std::os::unix::fs::MetadataExt;
-        (metadata.mode(), metadata.uid())
+        StatFields {
+            st_size: stat_i64(metadata.len()),
+            st_atime: stat_timestamp(metadata.atime(), metadata.atime_nsec()),
+            st_mtime: stat_timestamp(metadata.mtime(), metadata.mtime_nsec()),
+            st_ctime: stat_timestamp(metadata.ctime(), metadata.ctime_nsec()),
+            st_mode: stat_i64(metadata.mode()),
+            st_ino: stat_i64(metadata.ino()),
+            st_dev: stat_i64(metadata.dev()),
+            st_nlink: stat_i64(metadata.nlink()),
+            st_uid: stat_i64(metadata.uid()),
+            st_gid: stat_i64(metadata.gid()),
+        }
     };
     #[cfg(not(unix))]
-    let (mode, uid) = (0u32, 0u32);
-    stat_result_from_fields(i64::try_from(metadata.len()).unwrap_or(i64::MAX), mtime, mode, uid)
+    let fields = StatFields {
+        st_size: stat_i64(metadata.len()),
+        st_atime: metadata
+            .accessed()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0.0, |duration| duration.as_secs_f64()),
+        st_mtime: metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0.0, |duration| duration.as_secs_f64()),
+        st_ctime: metadata
+            .created()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0.0, |duration| duration.as_secs_f64()),
+        st_mode: 0,
+        st_ino: 0,
+        st_dev: 0,
+        st_nlink: 0,
+        st_uid: 0,
+        st_gid: 0,
+    };
+    stat_result_from_fields(fields)
+}
+
+#[derive(Clone, Copy)]
+struct StatFields {
+    st_size: i64,
+    st_atime: f64,
+    st_mtime: f64,
+    st_ctime: f64,
+    st_mode: i64,
+    st_ino: i64,
+    st_dev: i64,
+    st_nlink: i64,
+    st_uid: i64,
+    st_gid: i64,
+}
+
+fn stat_i64<T>(value: T) -> i64
+where
+    i64: TryFrom<T>,
+{
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn stat_timestamp(seconds: i64, nanoseconds: i64) -> f64 {
+    seconds as f64 + nanoseconds as f64 * 1e-9
 }
 
 /// Boxes explicit field values as an `os.stat_result`; shared by the
 /// metadata path above and the raw `fstat(2)` path below.
-fn stat_result_from_fields(st_size: i64, st_mtime: f64, st_mode: u32, st_uid: u32) -> *mut PyObject {
+fn stat_result_from_fields(fields: StatFields) -> *mut PyObject {
     Box::into_raw(Box::new(PyStatResult {
         ob_base: crate::object::PyObjectHeader::new(stat_result_type()),
-        st_size,
-        st_mtime,
-        st_mode,
-        st_uid,
+        st_size: fields.st_size,
+        st_atime: fields.st_atime,
+        st_mtime: fields.st_mtime,
+        st_ctime: fields.st_ctime,
+        st_mode: fields.st_mode,
+        st_ino: fields.st_ino,
+        st_dev: fields.st_dev,
+        st_nlink: fields.st_nlink,
+        st_uid: fields.st_uid,
+        st_gid: fields.st_gid,
     }))
     .cast::<PyObject>()
 }
@@ -481,9 +614,19 @@ unsafe extern "C" fn os_fstat(argv: *mut *mut PyObject, argc: usize) -> *mut PyO
     }
     // SAFETY: fstat(2) success fills the whole struct.
     let raw = unsafe { raw.assume_init() };
-    #[allow(clippy::cast_precision_loss)]
-    let mtime = raw.st_mtime as f64 + raw.st_mtime_nsec as f64 * 1e-9;
-    stat_result_from_fields(raw.st_size, mtime, u32::from(raw.st_mode), raw.st_uid)
+    let fields = StatFields {
+        st_size: stat_i64(raw.st_size),
+        st_atime: stat_timestamp(raw.st_atime, raw.st_atime_nsec),
+        st_mtime: stat_timestamp(raw.st_mtime, raw.st_mtime_nsec),
+        st_ctime: stat_timestamp(raw.st_ctime, raw.st_ctime_nsec),
+        st_mode: stat_i64(raw.st_mode),
+        st_ino: stat_i64(raw.st_ino),
+        st_dev: stat_i64(raw.st_dev),
+        st_nlink: stat_i64(raw.st_nlink),
+        st_uid: stat_i64(raw.st_uid),
+        st_gid: stat_i64(raw.st_gid),
+    };
+    stat_result_from_fields(fields)
 }
 
 /// `os.chmod(path, mode)` over `chmod(2)` (`test.support.os_helper.can_chmod`
@@ -512,6 +655,22 @@ unsafe extern "C" fn os_chmod(argv: *mut *mut PyObject, argc: usize) -> *mut PyO
     }
     // SAFETY: Singleton accessor.
     unsafe { crate::abi::pon_none() }
+}
+
+/// `os.umask(mask)` sets the process umask and returns the previous mask.
+unsafe extern "C" fn os_umask(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return crate::abi::return_null_with_error("os.umask expected one argument");
+    }
+    let mask = match int_arg(args[0], "umask mask") {
+        Ok(mask) => mask,
+        Err(error) => return error,
+    };
+    // SAFETY: umask(2) cannot fail; it returns the previous process mask.
+    let previous = unsafe { libc::umask(mask as libc::mode_t) };
+    unsafe { crate::abi::pon_const_int(i64::from(previous)) }
 }
 
 /// `os.access(path, mode)` over `access(2)`: reports whether the process can
@@ -747,6 +906,7 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("rmdir", os_rmdir, 1),
     ("scandir", os_scandir, 1),
     ("strerror", os_strerror, 1),
+    ("umask", os_umask, 1),
     ("unlink", os_unlink, 1),
     ("unsetenv", os_unsetenv, 1),
     ("waitpid", os_waitpid, 2),
@@ -1358,6 +1518,103 @@ unsafe extern "C" fn os_pipe(_argv: *mut *mut PyObject, _argc: usize) -> *mut Py
     };
     // SAFETY: `items` holds two live boxed ints.
     unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) }
+}
+
+struct MakedirsFailure {
+    errno: i32,
+    path: String,
+}
+
+/// `os.makedirs(name, mode=0o777, exist_ok=False)`; creates missing parents
+/// with the default directory mode and applies `mode` only to the leaf.
+unsafe extern "C" fn os_makedirs(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if !(1..=3).contains(&args.len()) {
+        return crate::abi::return_null_with_error("os.makedirs expected 1 to 3 arguments (name, mode=0o777, exist_ok=False)");
+    }
+    let path = match path_arg(args[0], "makedirs") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    if let Err(error) = c_path(&path) {
+        return error;
+    }
+    let mode = match optional_arg(args, 1).map(|object| int_arg(object, "makedirs mode")) {
+        None => 0o777,
+        Some(Ok(mode)) => mode,
+        Some(Err(error)) => return error,
+    };
+    let exist_ok = match optional_arg(args, 2) {
+        None => false,
+        Some(object) => match unsafe { crate::abi::pon_is_true(object) } {
+            0 => false,
+            1 => true,
+            _ => return std::ptr::null_mut(),
+        },
+    };
+    match makedirs_impl(&path, mode as libc::mode_t, exist_ok) {
+        Ok(()) => unsafe { crate::abi::pon_none() },
+        Err(error) => raise_errno(error.errno, Some(error.path.as_str())),
+    }
+}
+
+fn makedirs_impl(path: &str, mode: libc::mode_t, exist_ok: bool) -> Result<(), MakedirsFailure> {
+    let (mut head, mut tail) = split_posix_path(path);
+    if tail.is_empty() {
+        let split = split_posix_path(&head);
+        head = split.0;
+        tail = split.1;
+    }
+    if !head.is_empty() && !tail.is_empty() && !path_exists(&head) {
+        if let Err(error) = makedirs_impl(&head, 0o777 as libc::mode_t, exist_ok) {
+            if error.errno != libc::EEXIST {
+                return Err(error);
+            }
+        }
+        if tail == "." {
+            return Ok(());
+        }
+    }
+    match mkdir_errno(path, mode) {
+        Ok(()) => Ok(()),
+        Err(_) if exist_ok && path_is_dir(path) => Ok(()),
+        Err(errno) => Err(MakedirsFailure {
+            errno,
+            path: path.to_owned(),
+        }),
+    }
+}
+
+fn split_posix_path(path: &str) -> (String, String) {
+    let Some(last_sep) = path.rfind('/') else {
+        return (String::new(), path.to_owned());
+    };
+    let split_at = last_sep + 1;
+    let mut head = &path[..split_at];
+    let tail = &path[split_at..];
+    if !head.is_empty() && !head.bytes().all(|byte| byte == b'/') {
+        head = head.trim_end_matches('/');
+    }
+    (head.to_owned(), tail.to_owned())
+}
+
+fn path_exists(path: &str) -> bool {
+    std::fs::metadata(path).is_ok()
+}
+
+fn path_is_dir(path: &str) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_dir())
+}
+
+fn mkdir_errno(path: &str, mode: libc::mode_t) -> Result<(), i32> {
+    let c_path = std::ffi::CString::new(path).expect("makedirs path was prechecked for NUL");
+    // SAFETY: `c_path` is NUL-terminated.
+    if unsafe { libc::mkdir(c_path.as_ptr(), mode) } < 0 {
+        Err(last_errno())
+    } else {
+        Ok(())
+    }
 }
 
 /// `os.mkdir(path, mode=0o777, *, dir_fd=None)` over `mkdir(2)`; the mode is
