@@ -1,12 +1,13 @@
 //! Native `sys` module seed for WS-IMPORT.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use num_traits::ToPrimitive;
 
 use crate::abi::{pon_const_bool, pon_const_int, pon_const_str, pon_make_function, return_null_with_error};
 use crate::intern::intern;
 use crate::object::{PyObject, PyType};
+use crate::types::exc::ExceptionKind;
 use crate::types::type_::PyHeapInstance;
 use super::install_module;
 
@@ -49,6 +50,9 @@ const HEXVERSION: i64 = (VERSION_INFO_MAJOR << 24)
     | (VERSION_INFO_MICRO << 8)
     | (0xF << 4)
     | VERSION_INFO_SERIAL;
+
+static SWITCH_INTERVAL_BITS: AtomicU64 = AtomicU64::new(0.005f64.to_bits());
+static DLOPEN_FLAGS: AtomicUsize = AtomicUsize::new(2);
 
 /// The CPython structseq repr shared by the `version_info.__repr__` slot and
 /// the `sys.implementation` seed text.
@@ -99,6 +103,10 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         string_attr("platform", PLATFORM),
         string_attr("byteorder", if cfg!(target_endian = "little") { "little" } else { "big" }),
         string_attr("executable", &sys_executable_path()),
+        string_attr("_base_executable", &sys_executable_path()),
+        string_attr("_stdlib_dir", &stdlib_dir_path()),
+        none_attr("_home"),
+        git_attr(),
         string_attr("prefix", ""),
         string_attr("base_prefix", ""),
         string_attr("exec_prefix", ""),
@@ -111,6 +119,10 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         // `sysconfig._init_config_vars` reads it while populating config
         // vars (`_CONFIG_VARS['platlibdir'] = sys.platlibdir`).
         string_attr("platlibdir", "lib"),
+        int_attr("api_version", 1013),
+        bool_attr("dont_write_bytecode", false),
+        none_attr("pycache_prefix"),
+        empty_dict_attr("_xoptions"),
         flags_attr(),
         hash_info_attr(),
         float_info_attr(),
@@ -135,6 +147,23 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         function_attr("exception", sys_exception),
         function_attr("exc_info", sys_exc_info),
         function_attr("excepthook", sys_excepthook),
+        function_attr("__excepthook__", sys_excepthook),
+        function_attr("displayhook", sys_displayhook),
+        function_attr("__displayhook__", sys_displayhook),
+        function_attr("breakpointhook", sys_breakpointhook),
+        function_attr("__breakpointhook__", sys_breakpointhook),
+        function_attr("call_tracing", sys_call_tracing),
+        function_attr("getdefaultencoding", sys_getdefaultencoding),
+        function_attr("getdlopenflags", sys_getdlopenflags),
+        function_attr("setdlopenflags", sys_setdlopenflags),
+        function_attr("getswitchinterval", sys_getswitchinterval),
+        function_attr("setswitchinterval", sys_setswitchinterval),
+        function_attr("is_finalizing", sys_is_finalizing),
+        function_attr("_is_gil_enabled", sys_is_gil_enabled),
+        function_attr("_is_interned", sys_is_interned),
+        function_attr("_is_immortal", sys_is_immortal),
+        function_attr("_clear_internal_caches", sys_clear_noop),
+        function_attr("_clear_type_cache", sys_clear_noop),
         function_attr("getrecursionlimit", sys_getrecursionlimit),
         function_attr("setrecursionlimit", sys_setrecursionlimit),
         function_attr("getfilesystemencoding", sys_getfilesystemencoding),
@@ -146,6 +175,9 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         std_stream_attr("stdin", 0),
         std_stream_attr("stdout", 1),
         std_stream_attr("stderr", 2),
+        std_stream_attr("__stdin__", 0),
+        std_stream_attr("__stdout__", 1),
+        std_stream_attr("__stderr__", 2),
     ];
     let mut attrs = attrs.into_iter().collect::<Result<Vec<_>, _>>()?;
     if cfg!(target_os = "macos") {
@@ -1371,6 +1403,45 @@ fn int_attr(name: &str, value: i64) -> Result<(u32, *mut PyObject), String> {
         .ok_or_else(|| format!("failed to allocate sys.{name}"))
 }
 
+fn bool_attr(name: &str, value: bool) -> Result<(u32, *mut PyObject), String> {
+    let object = unsafe { pon_const_bool(i32::from(value)) };
+    (!object.is_null())
+        .then_some((intern(name), object))
+        .ok_or_else(|| format!("failed to allocate sys.{name}"))
+}
+
+fn none_attr(name: &str) -> Result<(u32, *mut PyObject), String> {
+    let object = unsafe { crate::abi::pon_none() };
+    (!object.is_null())
+        .then_some((intern(name), object))
+        .ok_or_else(|| format!("failed to allocate sys.{name}"))
+}
+
+fn empty_dict_attr(name: &str) -> Result<(u32, *mut PyObject), String> {
+    let dict = unsafe { crate::abi::map::pon_build_map(std::ptr::null_mut(), 0) };
+    (!dict.is_null())
+        .then_some((intern(name), dict))
+        .ok_or_else(|| format!("failed to allocate sys.{name}"))
+}
+
+fn git_attr() -> Result<(u32, *mut PyObject), String> {
+    let mut values = ["CPython", "", ""]
+        .into_iter()
+        .map(|value| unsafe { pon_const_str(value.as_ptr(), value.len()) })
+        .collect::<Vec<_>>();
+    if values.iter().any(|value| value.is_null()) {
+        return Err("failed to allocate sys._git".to_owned());
+    }
+    let tuple = unsafe { crate::abi::seq::pon_build_tuple(values.as_mut_ptr(), values.len()) };
+    (!tuple.is_null())
+        .then_some((intern("_git"), tuple))
+        .ok_or_else(|| "failed to allocate sys._git".to_owned())
+}
+
+fn stdlib_dir_path() -> String {
+    std::env::var("PON_STDLIB_PATH").unwrap_or_default()
+}
+
 fn function_attr(
     name: &str,
     entry: unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject,
@@ -1420,7 +1491,7 @@ unsafe extern "C" fn sys_getframe(argv: *mut *mut PyObject, argc: usize) -> *mut
 /// `sys.exit([status])`: raise `SystemExit(status)`.  Accepts zero or one
 /// argument; `status` defaults to `None` (exit code 0).  The top-level runner
 /// maps the `SystemExit` payload to the process exit status.
-unsafe extern "C" fn sys_exit(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+pub(super) unsafe extern "C" fn sys_exit(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     if argc > 1 {
         return return_null_with_error(format!("exit() takes at most 1 argument ({argc} given)"));
     }
@@ -1889,6 +1960,138 @@ unsafe extern "C" fn sys_clear_type_descriptors(argv: *mut *mut PyObject, argc: 
     unsafe { crate::abi::pon_none() }
 }
 
+
+unsafe extern "C" fn sys_getdefaultencoding(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return raise_type_error(&format!("getdefaultencoding() takes no arguments ({argc} given)"));
+    }
+    unsafe { pon_const_str(b"utf-8".as_ptr(), 5) }
+}
+
+unsafe extern "C" fn sys_getdlopenflags(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return raise_type_error(&format!("getdlopenflags() takes no arguments ({argc} given)"));
+    }
+    unsafe { pon_const_int(DLOPEN_FLAGS.load(Ordering::Relaxed) as i64) }
+}
+
+unsafe extern "C" fn sys_setdlopenflags(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return raise_type_error(&format!("setdlopenflags() takes exactly one argument ({argc} given)"));
+    }
+    let Some(value) = (unsafe { crate::types::int::to_bigint_including_bool(crate::tag::untag_arg(args[0])) })
+        .and_then(|value| value.to_usize())
+    else {
+        return raise_type_error("setdlopenflags() argument must be int");
+    };
+    DLOPEN_FLAGS.store(value, Ordering::Relaxed);
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn sys_getswitchinterval(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return raise_type_error(&format!("getswitchinterval() takes no arguments ({argc} given)"));
+    }
+    unsafe { crate::abi::number::pon_const_float(f64::from_bits(SWITCH_INTERVAL_BITS.load(Ordering::Relaxed))) }
+}
+
+unsafe extern "C" fn sys_setswitchinterval(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return raise_type_error(&format!("setswitchinterval() takes exactly one argument ({argc} given)"));
+    }
+    let raw = crate::tag::untag_arg(args[0]);
+    let value = if let Some(value) = unsafe { crate::types::float::to_f64(raw) } {
+        value
+    } else {
+        match unsafe { crate::types::int::to_bigint_including_bool(raw) }.and_then(|value| value.to_f64()) {
+            Some(value) => value,
+            None => return raise_type_error("setswitchinterval() argument must be real number"),
+        }
+    };
+    if value <= 0.0 || !value.is_finite() {
+        return raise_value_error("switch interval must be strictly positive");
+    }
+    SWITCH_INTERVAL_BITS.store(value.to_bits(), Ordering::Relaxed);
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn sys_is_finalizing(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return raise_type_error(&format!("is_finalizing() takes no arguments ({argc} given)"));
+    }
+    unsafe { pon_const_bool(0) }
+}
+
+unsafe extern "C" fn sys_is_gil_enabled(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return raise_type_error(&format!("_is_gil_enabled() takes no arguments ({argc} given)"));
+    }
+    unsafe { pon_const_bool(1) }
+}
+
+unsafe extern "C" fn sys_is_interned(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return raise_type_error(&format!("_is_interned() takes exactly one argument ({argc} given)"));
+    }
+    let raw = crate::tag::untag_arg(args[0]);
+    if raw.is_null() || crate::tag::is_small_int(raw) || unsafe { crate::types::type_::unicode_text(raw) }.is_none() {
+        return raise_type_error("_is_interned() argument must be str");
+    }
+    unsafe { pon_const_bool(0) }
+}
+
+unsafe extern "C" fn sys_is_immortal(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 1 {
+        return raise_type_error(&format!("_is_immortal() takes exactly one argument ({argc} given)"));
+    }
+    unsafe { pon_const_bool(0) }
+}
+
+unsafe extern "C" fn sys_clear_noop(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return raise_type_error(&format!("clear cache function takes no arguments ({argc} given)"));
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn sys_displayhook(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return raise_type_error(&format!("displayhook() takes exactly one argument ({argc} given)"));
+    }
+    let value = crate::tag::untag_arg(args[0]);
+    if value == unsafe { crate::abi::pon_none() } {
+        return unsafe { crate::abi::pon_none() };
+    }
+    crate::import::store_module_attr(intern("builtins"), intern("_"), value);
+    println!("{}", super::builtins_mod::repr_text(value));
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn sys_breakpointhook(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+    if std::env::var("PYTHONBREAKPOINT").ok().as_deref() == Some("0") {
+        return unsafe { crate::abi::pon_none() };
+    }
+    crate::abi::exc::raise_kind_error_text(
+        ExceptionKind::RuntimeError,
+        "breakpointhook is not wired to pdb in the pon runtime; set PYTHONBREAKPOINT=0 to disable",
+    )
+}
+
+unsafe extern "C" fn sys_call_tracing(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return raise_type_error(&format!("call_tracing() takes exactly 2 arguments ({argc} given)"));
+    }
+    let mut call_args = match crate::abi::seq::sequence_to_vec(args[1]) {
+        Ok(values) => values,
+        Err(message) => return return_null_with_error(message),
+    };
+    unsafe { crate::abi::pon_call(args[0], call_args.as_mut_ptr(), call_args.len()) }
+}
 
 fn raise_type_error(message: &str) -> *mut PyObject {
     // SAFETY: Message bytes are a live UTF-8 slice for the duration of the call.
