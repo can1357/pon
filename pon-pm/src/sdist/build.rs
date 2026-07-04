@@ -393,11 +393,21 @@ fn build_runtime_env(build_env: &EnvLayout, source_root: &Path, backend_path: &[
         (OsString::from("PONPATH"), import_path.clone()),
         (OsString::from("PON_IMPORT_PATH"), import_path),
         (OsString::from("PON_SYS_EXECUTABLE"), pon_sys_executable()),
+        (OsString::from("PATH"), build_hook_path(build_env)),
         (
             OsString::from("PON_NATIVE_MODULE_REGISTRY"),
             build_env.native_registry_path.clone().into_os_string(),
         ),
     ]
+}
+
+fn build_hook_path(build_env: &EnvLayout) -> OsString {
+    let mut path = build_env.scripts_dir.clone().into_os_string();
+    if let Some(existing) = std::env::var_os("PATH").filter(|value| !value.is_empty()) {
+        path.push(if cfg!(windows) { ";" } else { ":" });
+        path.push(existing);
+    }
+    path
 }
 
 /// Spawnable Python-runner path advertised to build hooks as

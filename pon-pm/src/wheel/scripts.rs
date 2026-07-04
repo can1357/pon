@@ -174,16 +174,20 @@ demo = demo.cli:main\n",
     }
 
     #[test]
-    fn ignores_extras_suffix() {
+    fn ignores_extras_suffixes() {
         let parsed = parse_entry_points(
             "\
 [console_scripts]\n\
-demo = demo.cli:main ; extra == 'cli'\n",
+demo = demo.cli:main [cli]\n\
+legacy = legacy.cli:main ; extra == 'cli'\n",
             "entry_points.txt",
         )
         .expect("entry points parse");
 
-        assert_eq!(parsed.console_scripts, vec![entry("demo", "demo.cli", "main")]);
+        assert_eq!(
+            parsed.console_scripts,
+            vec![entry("demo", "demo.cli", "main"), entry("legacy", "legacy.cli", "main")]
+        );
     }
 
     #[test]
