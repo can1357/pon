@@ -1,10 +1,11 @@
-//! Minimal native `zlib` shim for stdlib imports.
+//! Native `zlib` shim for stdlib imports.
 //!
 //! The vendored `gzip` module imports `zlib` at module load and binds a small
-//! constant/function surface into class definitions. Pon serves that import with
-//! a native module so pure-Python packages such as `mesonpy` can import their
-//! stdlib helpers. Only `crc32` is implemented today; compression entry points
-//! stay loud `NotImplementedError`s until a concrete caller needs them.
+//! constant/function surface into class definitions.  `crc32`/`adler32` are
+//! pure-Rust; `compress`/`decompress` run on `flate2` (Cython's Code.py
+//! compresses its C string tables with `zlib.compress(..., level=9)`).  The
+//! streaming `compressobj`/`decompressobj` surface stays a loud
+//! `NotImplementedError` until a concrete caller needs it.
 
 use core::mem;
 use std::sync::LazyLock;
@@ -104,8 +105,10 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
     if name_object.is_null() {
         return Err("failed to allocate zlib.__name__".to_owned());
     }
-    let error = crate::import::module_attr(intern("builtins"), intern("RuntimeError"))
-        .ok_or_else(|| "builtins.RuntimeError is not available for zlib.error".to_owned())?;
+    let error = zlib_error_class();
+    if error.is_null() {
+        return Err("failed to build zlib.error".to_owned());
+    }
     let mut attrs = vec![
         (intern("__name__"), name_object),
         (intern("error"), error),
@@ -252,16 +255,186 @@ unsafe extern "C" fn adler32_entry(argv: *mut *mut PyObject, argc: usize) -> *mu
     unsafe { crate::abi::pon_const_int(i64::from(adler32_core(data, seed))) }
 }
 
-unsafe extern "C" fn compress_entry(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
-    raise_not_implemented("compress")
+/// `zlib.compress(data, /, level=-1, wbits=MAX_WBITS)` — the keyword binder
+/// delivers the canonical `[data, level, wbits]` layout (absent slots None).
+unsafe extern "C" fn compress_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+        return raise_type_error("compress received an invalid argument window");
+    };
+    if args.is_empty() {
+        return raise_type_error("compress() missing required argument 'data' (pos 1)");
+    }
+    let Ok(data) = crate::abi::str_::expect_bytes_like(crate::tag::untag_arg(args[0])) else {
+        let got = unsafe { crate::types::dict::type_name(crate::tag::untag_arg(args[0])) }.unwrap_or("object");
+        return raise_type_error(&format!("a bytes-like object is required, not '{got}'"));
+    };
+    let level = match optional_i64(args.get(1).copied(), "level") {
+        Ok(value) => value.unwrap_or(Z_DEFAULT_COMPRESSION),
+        Err(raised) => return raised,
+    };
+    if !(level == Z_DEFAULT_COMPRESSION || (0..=9).contains(&level)) {
+        return raise_zlib_error("Bad compression level");
+    }
+    let wbits = match optional_i64(args.get(2).copied(), "wbits") {
+        Ok(value) => value.unwrap_or(MAX_WBITS),
+        Err(raised) => return raised,
+    };
+    let level = if level == Z_DEFAULT_COMPRESSION {
+        flate2::Compression::default()
+    } else {
+        flate2::Compression::new(level as u32)
+    };
+    use std::io::Write;
+    let out = match wbits {
+        9..=15 => {
+            let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), level);
+            encoder.write_all(&data).and_then(|()| encoder.finish())
+        }
+        -15..=-9 => {
+            let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), level);
+            encoder.write_all(&data).and_then(|()| encoder.finish())
+        }
+        25..=31 => {
+            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), level);
+            encoder.write_all(&data).and_then(|()| encoder.finish())
+        }
+        _ => return raise_zlib_error(&format!("Invalid initialization option: wbits={wbits}")),
+    };
+    match out {
+        Ok(bytes) => alloc_bytes(&bytes),
+        Err(error) => raise_zlib_error(&format!("Error {error} while compressing data")),
+    }
 }
 
 unsafe extern "C" fn compressobj_entry(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
     raise_not_implemented("compressobj")
 }
 
-unsafe extern "C" fn decompress_entry(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
-    raise_not_implemented("decompress")
+/// `zlib.decompress(data, /, wbits=MAX_WBITS, bufsize=DEF_BUF_SIZE)` — the
+/// keyword binder delivers `[data, wbits, bufsize]` (absent slots None).
+/// `bufsize` is a hint CPython uses for the initial output allocation; the
+/// streaming decoder here needs no hint, so it is validated and ignored.
+unsafe extern "C" fn decompress_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+        return raise_type_error("decompress received an invalid argument window");
+    };
+    if args.is_empty() {
+        return raise_type_error("decompress() missing required argument 'data' (pos 1)");
+    }
+    let Ok(data) = crate::abi::str_::expect_bytes_like(crate::tag::untag_arg(args[0])) else {
+        let got = unsafe { crate::types::dict::type_name(crate::tag::untag_arg(args[0])) }.unwrap_or("object");
+        return raise_type_error(&format!("a bytes-like object is required, not '{got}'"));
+    };
+    let wbits = match optional_i64(args.get(1).copied(), "wbits") {
+        Ok(value) => value.unwrap_or(MAX_WBITS),
+        Err(raised) => return raised,
+    };
+    if let Err(raised) = optional_i64(args.get(2).copied(), "bufsize") {
+        return raised;
+    }
+    use std::io::Read;
+    let mut out = Vec::new();
+    let result = match wbits {
+        // 32+n: zlib-or-gzip auto-detection (CPython accepts 32..=47).
+        9..=15 | 32..=47 => flate2::read::ZlibDecoder::new(data.as_slice()).read_to_end(&mut out).map(|_| ()),
+        -15..=-9 => flate2::read::DeflateDecoder::new(data.as_slice()).read_to_end(&mut out).map(|_| ()),
+        25..=31 => flate2::read::GzDecoder::new(data.as_slice()).read_to_end(&mut out).map(|_| ()),
+        _ => return raise_zlib_error(&format!("Invalid initialization option: wbits={wbits}")),
+    };
+    match result {
+        Ok(()) => alloc_bytes(&out),
+        Err(error) => raise_zlib_error(&format!("Error {error} while decompressing data")),
+    }
+}
+
+/// Optional trailing argument as i64: absent slot or None reads as `None`.
+fn optional_i64(value: Option<*mut PyObject>, what: &str) -> Result<Option<i64>, *mut PyObject> {
+    let Some(value) = value else { return Ok(None) };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let raw = crate::tag::untag_arg(value);
+    if !raw.is_null() && unsafe { crate::types::dict::type_name(raw) } == Some("NoneType") {
+        return Ok(None);
+    }
+    match unsafe { crate::types::int::to_bigint_including_bool(raw) }.and_then(|v| v.to_i64()) {
+        Some(number) => Ok(Some(number)),
+        None => Err(crate::abi::exc::raise_kind_error_text(
+            ExceptionKind::TypeError,
+            &format!("{what} must be an integer"),
+        )),
+    }
+}
+
+fn alloc_bytes(payload: &[u8]) -> *mut PyObject {
+    crate::types::bytes_::boxed_bytes(payload).cast::<PyObject>()
+}
+
+/// The `zlib.error` heap class (`class error(Exception)`, `__module__` =
+/// 'zlib'), built once — the binascii exception-class recipe.
+static ERROR_CLASS: LazyLock<usize> = LazyLock::new(|| {
+    // SAFETY: `pon_load_global` returns NULL with a raised NameError on miss.
+    let base = unsafe { crate::abi::pon_load_global(intern("Exception"), core::ptr::null_mut()) };
+    if base.is_null() {
+        crate::thread_state::pon_err_clear();
+        return 0;
+    }
+    let namespace = crate::types::type_::new_namespace();
+    if namespace.is_null() {
+        return 0;
+    }
+    let module_name = "zlib";
+    // SAFETY: String allocation helper follows the NULL-sentinel contract.
+    let module_object = unsafe { crate::abi::pon_const_str(module_name.as_ptr(), module_name.len()) };
+    if module_object.is_null() {
+        return 0;
+    }
+    // SAFETY: `new_namespace` returned a live namespace box.
+    unsafe { (*namespace).set(intern("__module__"), module_object) };
+    // SAFETY: The base is a live class object owned by the runtime.
+    let class = unsafe { crate::types::type_::build_class_from_namespace("error", &[base], namespace, &[]) };
+    if class.is_null() {
+        crate::thread_state::pon_err_clear();
+        return 0;
+    }
+    // SAFETY: Freshly built class object; mirror `pon_build_class`'s ob_type fix.
+    unsafe {
+        if (*class).ob_type.is_null() {
+            (*class).ob_type = crate::abi::runtime_type_type().cast_const();
+        }
+    }
+    class as usize
+});
+
+fn zlib_error_class() -> *mut PyObject {
+    *ERROR_CLASS as *mut PyObject
+}
+
+/// Raises `zlib.error(text)` (ValueError fallback while the heap class is
+/// unavailable, e.g. pre-runtime tests).
+fn raise_zlib_error(message: &str) -> *mut PyObject {
+    let class = zlib_error_class();
+    if class.is_null() {
+        return crate::abi::exc::raise_kind_error_text(ExceptionKind::ValueError, message);
+    }
+    // SAFETY: String allocation helper follows the NULL-sentinel contract.
+    let text = unsafe { crate::abi::pon_const_str(message.as_ptr(), message.len()) };
+    if text.is_null() {
+        return core::ptr::null_mut();
+    }
+    let mut argv = [text];
+    // SAFETY: The class object is live and callable; argv holds one live slot.
+    let instance = unsafe { crate::abi::pon_call(class, argv.as_mut_ptr(), argv.len()) };
+    if instance.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: `instance` is a live exception instance.
+    unsafe { crate::abi::exc::pon_raise(instance, core::ptr::null_mut()) }
+}
+
+/// TypeError raise with the module's exception plumbing.
+fn raise_type_error(message: &str) -> *mut PyObject {
+    crate::abi::exc::raise_kind_error_text(ExceptionKind::TypeError, message)
 }
 
 unsafe extern "C" fn decompressobj_entry(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
