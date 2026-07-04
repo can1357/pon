@@ -49,11 +49,16 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
         return Err(format!("failed to allocate {module}.fspath"));
     }
     attrs.push((intern("fspath"), fspath));
-    let stat = unsafe { crate::abi::pon_make_function(os_stat as *const u8, 1, intern("stat")) };
-    if stat.is_null() {
-        return Err(format!("failed to allocate {module}.stat"));
+    let mut stat_defaults = unsafe { [crate::abi::pon_none(), crate::abi::pon_const_bool(1)] };
+    if stat_defaults.iter().any(|value| value.is_null()) {
+        return Err(format!("failed to allocate {module}.stat defaults"));
     }
-    attrs.push((intern("stat"), stat));
+    attrs.push(phase_b_function_attr(
+        "stat",
+        os_stat,
+        &["path", "dir_fd", "follow_symlinks"],
+        &mut stat_defaults,
+    )?);
     let mut listdir_defaults = unsafe { [pon_const_str(b".".as_ptr(), 1)] };
     if listdir_defaults.iter().any(|value| value.is_null()) {
         return Err(format!("failed to allocate {module}.listdir defaults"));
@@ -69,6 +74,18 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
     // time (`hasattr(os.stat_result, 'st_file_attributes')`), so the native
     // result type is published like CPython's structseq class.
     attrs.push((intern("stat_result"), stat_result_type().cast::<PyObject>()));
+    ensure_direntry_type_dict()?;
+    attrs.push((intern("DirEntry"), direntry_type().cast::<PyObject>()));
+    let mut scandir_defaults = unsafe { [pon_const_str(b".".as_ptr(), 1)] };
+    if scandir_defaults.iter().any(|value| value.is_null()) {
+        return Err(format!("failed to allocate {module}.scandir defaults"));
+    }
+    attrs.push(phase_b_function_attr("scandir", os_scandir, &["path"], &mut scandir_defaults)?);
+    let mut chmod_defaults = unsafe { [crate::abi::pon_const_bool(1)] };
+    if chmod_defaults.iter().any(|value| value.is_null()) {
+        return Err(format!("failed to allocate {module}.chmod defaults"));
+    }
+    attrs.push(phase_b_function_attr("chmod", os_chmod, &["path", "mode", "follow_symlinks"], &mut chmod_defaults)?);
     // POSIX fd/path syscall surface shared with `posix` (CPython's `os.py`
     // re-exports these names from the C `posix` module wholesale).
     for &(name, entry, arity) in SYSCALL_FUNCTIONS {
@@ -466,6 +483,9 @@ struct PyStatResult {
     st_atime: f64,
     st_mtime: f64,
     st_ctime: f64,
+    st_atime_ns: i64,
+    st_mtime_ns: i64,
+    st_ctime_ns: i64,
     st_mode: i64,
     st_ino: i64,
     st_dev: i64,
@@ -500,6 +520,9 @@ unsafe extern "C" fn stat_result_getattro(object: *mut PyObject, name: *mut PyOb
         "st_atime" => unsafe { crate::abi::number::pon_const_float((*stat).st_atime) },
         "st_mtime" => unsafe { crate::abi::number::pon_const_float((*stat).st_mtime) },
         "st_ctime" => unsafe { crate::abi::number::pon_const_float((*stat).st_ctime) },
+        "st_atime_ns" => unsafe { crate::abi::pon_const_int((*stat).st_atime_ns) },
+        "st_mtime_ns" => unsafe { crate::abi::pon_const_int((*stat).st_mtime_ns) },
+        "st_ctime_ns" => unsafe { crate::abi::pon_const_int((*stat).st_ctime_ns) },
         "st_mode" => unsafe { crate::abi::pon_const_int((*stat).st_mode) },
         "st_ino" => unsafe { crate::abi::pon_const_int((*stat).st_ino) },
         "st_dev" => unsafe { crate::abi::pon_const_int((*stat).st_dev) },
@@ -510,18 +533,34 @@ unsafe extern "C" fn stat_result_getattro(object: *mut PyObject, name: *mut PyOb
     }
 }
 
-/// `os.stat(path)` over `std::fs::metadata`: follows symlinks like CPython's
-/// default. Missing/unreadable paths raise OSError (`linecache` catches it).
+/// `os.stat(path, *, dir_fd=None, follow_symlinks=True)`: follows symlinks by
+/// default and honors the portable no-follow spelling through `lstat` metadata.
+/// fd-relative lookup is not in pon's advertised capability set.
 unsafe extern "C" fn os_stat(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    if argc != 1 || argv.is_null() {
+    let args = unsafe { call_args(argv, argc) };
+    if !(1..=3).contains(&args.len()) {
         return crate::abi::return_null_with_error("os.stat expected one argument");
     }
-    // SAFETY: One live argument slot per the check above.
-    let path_text = match path_arg(unsafe { *argv }, "stat") {
+    let path_text = match path_arg(args[0], "stat") {
         Ok(path) => path,
         Err(error) => return error,
     };
-    match std::fs::metadata(&path_text) {
+    if let Err(error) = reject_dir_fd(args, 1, "stat") {
+        return error;
+    }
+    let follow_symlinks = match optional_arg(args, 2) {
+        Some(value) => match truth_arg(value) {
+            Ok(value) => value,
+            Err(error) => return error,
+        },
+        None => true,
+    };
+    let result = if follow_symlinks {
+        std::fs::metadata(&path_text)
+    } else {
+        std::fs::symlink_metadata(&path_text)
+    };
+    match result {
         Ok(metadata) => stat_result_object(&metadata),
         Err(error) => raise_errno(error.raw_os_error().unwrap_or(libc::EIO), Some(path_text.as_str())),
     }
@@ -530,14 +569,21 @@ unsafe extern "C" fn os_stat(argv: *mut *mut PyObject, argc: usize) -> *mut PyOb
 /// Boxes host metadata as the `os.stat_result` shape shared by `os.stat`
 /// and `os.lstat`.
 fn stat_result_object(metadata: &std::fs::Metadata) -> *mut PyObject {
+    stat_result_from_fields(stat_fields_from_metadata(metadata))
+}
+
+fn stat_fields_from_metadata(metadata: &std::fs::Metadata) -> StatFields {
     #[cfg(unix)]
-    let fields = {
+    {
         use std::os::unix::fs::MetadataExt;
         StatFields {
             st_size: stat_i64(metadata.len()),
             st_atime: stat_timestamp(metadata.atime(), metadata.atime_nsec()),
             st_mtime: stat_timestamp(metadata.mtime(), metadata.mtime_nsec()),
             st_ctime: stat_timestamp(metadata.ctime(), metadata.ctime_nsec()),
+            st_atime_ns: stat_timestamp_ns(metadata.atime(), metadata.atime_nsec()),
+            st_mtime_ns: stat_timestamp_ns(metadata.mtime(), metadata.mtime_nsec()),
+            st_ctime_ns: stat_timestamp_ns(metadata.ctime(), metadata.ctime_nsec()),
             st_mode: stat_i64(metadata.mode()),
             st_ino: stat_i64(metadata.ino()),
             st_dev: stat_i64(metadata.dev()),
@@ -545,33 +591,37 @@ fn stat_result_object(metadata: &std::fs::Metadata) -> *mut PyObject {
             st_uid: stat_i64(metadata.uid()),
             st_gid: stat_i64(metadata.gid()),
         }
-    };
+    }
     #[cfg(not(unix))]
-    let fields = StatFields {
-        st_size: stat_i64(metadata.len()),
-        st_atime: metadata
-            .accessed()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0.0, |duration| duration.as_secs_f64()),
-        st_mtime: metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0.0, |duration| duration.as_secs_f64()),
-        st_ctime: metadata
-            .created()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0.0, |duration| duration.as_secs_f64()),
-        st_mode: 0,
-        st_ino: 0,
-        st_dev: 0,
-        st_nlink: 0,
-        st_uid: 0,
-        st_gid: 0,
-    };
-    stat_result_from_fields(fields)
+    {
+        StatFields {
+            st_size: stat_i64(metadata.len()),
+            st_atime: metadata
+                .accessed()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0.0, |duration| duration.as_secs_f64()),
+            st_mtime: metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0.0, |duration| duration.as_secs_f64()),
+            st_ctime: metadata
+                .created()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0.0, |duration| duration.as_secs_f64()),
+            st_atime_ns: metadata.accessed().ok().map_or(0, system_time_ns),
+            st_mtime_ns: metadata.modified().ok().map_or(0, system_time_ns),
+            st_ctime_ns: metadata.created().ok().map_or(0, system_time_ns),
+            st_mode: 0,
+            st_ino: 0,
+            st_dev: 0,
+            st_nlink: 0,
+            st_uid: 0,
+            st_gid: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -580,6 +630,9 @@ struct StatFields {
     st_atime: f64,
     st_mtime: f64,
     st_ctime: f64,
+    st_atime_ns: i64,
+    st_mtime_ns: i64,
+    st_ctime_ns: i64,
     st_mode: i64,
     st_ino: i64,
     st_dev: i64,
@@ -600,6 +653,18 @@ fn stat_timestamp(seconds: i64, nanoseconds: i64) -> f64 {
     seconds as f64 + nanoseconds as f64 * 1e-9
 }
 
+fn stat_timestamp_ns(seconds: i64, nanoseconds: i64) -> i64 {
+    seconds.saturating_mul(1_000_000_000).saturating_add(nanoseconds)
+}
+
+#[cfg(not(unix))]
+fn system_time_ns(time: std::time::SystemTime) -> i64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(0)
+}
+
 /// Boxes explicit field values as an `os.stat_result`; shared by the
 /// metadata path above and the raw `fstat(2)` path below.
 fn stat_result_from_fields(fields: StatFields) -> *mut PyObject {
@@ -609,6 +674,9 @@ fn stat_result_from_fields(fields: StatFields) -> *mut PyObject {
         st_atime: fields.st_atime,
         st_mtime: fields.st_mtime,
         st_ctime: fields.st_ctime,
+        st_atime_ns: fields.st_atime_ns,
+        st_mtime_ns: fields.st_mtime_ns,
+        st_ctime_ns: fields.st_ctime_ns,
         st_mode: fields.st_mode,
         st_ino: fields.st_ino,
         st_dev: fields.st_dev,
@@ -644,6 +712,9 @@ unsafe extern "C" fn os_fstat(argv: *mut *mut PyObject, argc: usize) -> *mut PyO
         st_atime: stat_timestamp(raw.st_atime, raw.st_atime_nsec),
         st_mtime: stat_timestamp(raw.st_mtime, raw.st_mtime_nsec),
         st_ctime: stat_timestamp(raw.st_ctime, raw.st_ctime_nsec),
+        st_atime_ns: stat_timestamp_ns(raw.st_atime, raw.st_atime_nsec),
+        st_mtime_ns: stat_timestamp_ns(raw.st_mtime, raw.st_mtime_nsec),
+        st_ctime_ns: stat_timestamp_ns(raw.st_ctime, raw.st_ctime_nsec),
         st_mode: stat_i64(raw.st_mode),
         st_ino: stat_i64(raw.st_ino),
         st_dev: stat_i64(raw.st_dev),
@@ -654,12 +725,14 @@ unsafe extern "C" fn os_fstat(argv: *mut *mut PyObject, argc: usize) -> *mut PyO
     stat_result_from_fields(fields)
 }
 
-/// `os.chmod(path, mode)` over `chmod(2)` (`test.support.os_helper.can_chmod`
-/// round-trips it against `os.stat().st_mode`).
+/// `os.chmod(path, mode, follow_symlinks=True)` over `chmod(2)`
+/// (`test.support.os_helper.can_chmod` round-trips it against
+/// `os.stat().st_mode`).  The no-follow variant is not in pon's advertised
+/// capability set, so direct false requests fail loudly.
 unsafe extern "C" fn os_chmod(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     // SAFETY: Live argument slots per the runtime calling convention.
     let args = unsafe { call_args(argv, argc) };
-    if args.len() != 2 {
+    if !(2..=3).contains(&args.len()) {
         return crate::abi::return_null_with_error("os.chmod expected two arguments (path, mode)");
     }
     let path = match path_arg(args[0], "chmod") {
@@ -670,6 +743,18 @@ unsafe extern "C" fn os_chmod(argv: *mut *mut PyObject, argc: usize) -> *mut PyO
         Ok(mode) => mode,
         Err(error) => return error,
     };
+    if let Some(follow_arg) = optional_arg(args, 2) {
+        let follow = match truth_arg(follow_arg) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        if !follow {
+            return crate::abi::exc::raise_kind_error_text(
+                ExceptionKind::NotImplementedError,
+                "chmod: follow_symlinks unavailable on this platform",
+            );
+        }
+    }
     let c_path = match c_path(&path) {
         Ok(c_path) => c_path,
         Err(error) => return error,
@@ -910,6 +995,536 @@ fn walk_symlinks_as_files() -> *mut PyObject {
 
 fn runtime_object_type() -> *mut crate::object::PyType {
     crate::abi::runtime_global(intern("object")).map_or(std::ptr::null_mut(), |object| object.cast::<crate::object::PyType>())
+}
+
+#[repr(C)]
+struct PyScandirIterator {
+    ob_base: crate::object::PyObjectHeader,
+    path: String,
+    entries: Option<std::fs::ReadDir>,
+}
+
+#[repr(C)]
+struct PyDirEntry {
+    ob_base: crate::object::PyObjectHeader,
+    name: String,
+    path: String,
+    inode: Option<i64>,
+    stat_follow: Option<CachedStat>,
+    stat_nofollow: Option<CachedStat>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedStat {
+    fields: StatFields,
+    kind: CachedFileKind,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CachedFileKind {
+    Directory,
+    File,
+    Symlink,
+    Other,
+}
+
+fn scandir_iterator_type() -> *mut crate::object::PyType {
+    static SCANDIR_ITER_TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let mut ty = crate::object::PyType::new(
+            crate::abi::runtime_type_type().cast_const(),
+            "posix.ScandirIterator",
+            std::mem::size_of::<PyScandirIterator>(),
+        );
+        ty.tp_iter = Some(scandir_iter);
+        ty.tp_iternext = Some(scandir_next);
+        ty.tp_getattro = Some(scandir_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *SCANDIR_ITER_TYPE as *mut crate::object::PyType
+}
+
+fn direntry_type() -> *mut crate::object::PyType {
+    static DIRENTRY_TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let mut ty = crate::object::PyType::new(
+            crate::abi::runtime_type_type().cast_const(),
+            "posix.DirEntry",
+            std::mem::size_of::<PyDirEntry>(),
+        );
+        ty.tp_getattro = Some(direntry_getattro);
+        ty.tp_repr = Some(direntry_repr);
+        ty.tp_str = Some(direntry_repr);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *DIRENTRY_TYPE as *mut crate::object::PyType
+}
+
+fn ensure_direntry_type_dict() -> Result<(), String> {
+    let ty = direntry_type();
+    if unsafe { !(*ty).tp_dict.is_null() } {
+        return Ok(());
+    }
+    let namespace = crate::types::type_::new_namespace();
+    if namespace.is_null() {
+        return Err("failed to allocate os.DirEntry namespace".to_owned());
+    }
+    let function = unsafe {
+        crate::abi::pon_make_function(
+            direntry_fspath_method as *const u8,
+            crate::native::builtins_mod::VARIADIC_ARITY,
+            intern("__fspath__"),
+        )
+    };
+    if function.is_null() {
+        return Err("failed to allocate os.DirEntry.__fspath__".to_owned());
+    }
+    unsafe {
+        (*namespace).set(intern("__fspath__"), function);
+        (*ty).tp_dict = namespace.cast::<PyObject>();
+    }
+    crate::sync::register_namespaced_type(ty);
+    Ok(())
+}
+
+unsafe fn scandir_receiver<'a>(object: *mut PyObject) -> Option<&'a mut PyScandirIterator> {
+    let object = crate::tag::untag_arg(object);
+    if object.is_null() || crate::tag::is_small_int(object) {
+        return None;
+    }
+    if unsafe { (*object).ob_type } == scandir_iterator_type().cast_const() {
+        Some(unsafe { &mut *object.cast::<PyScandirIterator>() })
+    } else {
+        None
+    }
+}
+
+unsafe fn direntry_receiver<'a>(object: *mut PyObject) -> Option<&'a mut PyDirEntry> {
+    let object = crate::tag::untag_arg(object);
+    if object.is_null() || crate::tag::is_small_int(object) {
+        return None;
+    }
+    if unsafe { (*object).ob_type } == direntry_type().cast_const() {
+        Some(unsafe { &mut *object.cast::<PyDirEntry>() })
+    } else {
+        None
+    }
+}
+
+fn alloc_scandir_iterator(path: String, entries: std::fs::ReadDir) -> *mut PyObject {
+    Box::into_raw(Box::new(PyScandirIterator {
+        ob_base: crate::object::PyObjectHeader::new(scandir_iterator_type()),
+        path,
+        entries: Some(entries),
+    }))
+    .cast::<PyObject>()
+}
+
+fn alloc_direntry(parent: &str, entry: std::fs::DirEntry) -> *mut PyObject {
+    let name = entry.file_name().to_string_lossy().into_owned();
+    let path = walk_join(parent, &name);
+    Box::into_raw(Box::new(PyDirEntry {
+        ob_base: crate::object::PyObjectHeader::new(direntry_type()),
+        name,
+        path,
+        inode: direntry_inode(&entry),
+        stat_follow: None,
+        stat_nofollow: None,
+    }))
+    .cast::<PyObject>()
+}
+
+fn direntry_inode(entry: &std::fs::DirEntry) -> Option<i64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirEntryExt;
+        Some(stat_i64(entry.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = entry;
+        None
+    }
+}
+
+unsafe extern "C" fn scandir_iter(object: *mut PyObject) -> *mut PyObject {
+    object
+}
+
+unsafe extern "C" fn scandir_next(object: *mut PyObject) -> *mut PyObject {
+    let Some(iterator) = (unsafe { scandir_receiver(object) }) else {
+        return raise_type_error("os.scandir iterator receiver is invalid");
+    };
+    let Some(entries) = iterator.entries.as_mut() else {
+        return unsafe { crate::abi::exc::pon_raise_stop_iteration(std::ptr::null_mut()) };
+    };
+    match entries.next() {
+        Some(Ok(entry)) => alloc_direntry(&iterator.path, entry),
+        Some(Err(error)) => raise_errno(error.raw_os_error().unwrap_or(libc::EIO), Some(&iterator.path)),
+        None => {
+            iterator.entries = None;
+            unsafe { crate::abi::exc::pon_raise_stop_iteration(std::ptr::null_mut()) }
+        }
+    }
+}
+
+unsafe extern "C" fn scandir_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let name = crate::tag::untag_arg(name);
+    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        return raise_type_error("attribute name must be str");
+    };
+    match name_text {
+        "close" => bound_os_method(object, "close", scandir_close_method),
+        "__enter__" => bound_os_method(object, "__enter__", scandir_enter_method),
+        "__exit__" => bound_os_method(object, "__exit__", scandir_exit_method),
+        "__iter__" => bound_os_method(object, "__iter__", scandir_iter_method),
+        "__next__" => bound_os_method(object, "__next__", scandir_next_method),
+        _ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
+    }
+}
+
+unsafe extern "C" fn direntry_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let name = crate::tag::untag_arg(name);
+    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        return raise_type_error("attribute name must be str");
+    };
+    let Some(entry) = (unsafe { direntry_receiver(object) }) else {
+        return raise_type_error("os.DirEntry receiver is invalid");
+    };
+    match name_text {
+        "name" => walk_str(&entry.name),
+        "path" => walk_str(&entry.path),
+        "inode" => bound_os_method(object, "inode", direntry_inode_method),
+        "is_dir" => bound_direntry_follow_method(object, "is_dir", direntry_is_dir_method),
+        "is_file" => bound_direntry_follow_method(object, "is_file", direntry_is_file_method),
+        "is_symlink" => bound_os_method(object, "is_symlink", direntry_is_symlink_method),
+        "stat" => bound_direntry_follow_method(object, "stat", direntry_stat_method),
+        "__fspath__" => bound_os_method(object, "__fspath__", direntry_fspath_method),
+        "__repr__" => bound_os_method(object, "__repr__", direntry_repr_method),
+        _ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
+    }
+}
+
+fn bound_os_method(receiver: *mut PyObject, name: &str, entry: BuiltinFn) -> *mut PyObject {
+    let function = unsafe {
+        crate::abi::pon_make_function(
+            entry as *const u8,
+            crate::native::builtins_mod::VARIADIC_ARITY,
+            intern(name),
+        )
+    };
+    if function.is_null() {
+        return std::ptr::null_mut();
+    }
+    match crate::types::method::new_bound_method(function, receiver) {
+        Ok(method) => method.cast::<PyObject>(),
+        Err(message) => crate::abi::return_null_with_error(message),
+    }
+}
+
+fn bound_direntry_follow_method(receiver: *mut PyObject, name: &str, entry: BuiltinFn) -> *mut PyObject {
+    let default = bool_object(true);
+    if default.is_null() {
+        return std::ptr::null_mut();
+    }
+    let names = [intern("self"), intern("follow_symlinks")];
+    let params = ParamSpec {
+        names: names.as_ptr(),
+        total_param_count: names.len() as u32,
+        positional_only_count: 0,
+        positional_count: 1,
+        keyword_only_count: 1,
+        varargs_name: 0,
+        varkw_name: 0,
+    };
+    let code = CodeInfo {
+        entry: entry as *const u8,
+        params: &params,
+        name_interned: intern(name),
+        n_locals: 0,
+        n_feedback: 0,
+        flags: 0,
+    };
+    let kwdefault_names = [intern("follow_symlinks")];
+    let mut kwdefaults = [default];
+    let function = unsafe {
+        crate::abi::call::pon_make_function_full(
+            &code,
+            std::ptr::null_mut(),
+            0,
+            kwdefault_names.as_ptr(),
+            kwdefaults.as_mut_ptr(),
+            kwdefaults.len(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if function.is_null() {
+        return std::ptr::null_mut();
+    }
+    match crate::types::method::new_bound_method(function, receiver) {
+        Ok(method) => method.cast::<PyObject>(),
+        Err(message) => crate::abi::return_null_with_error(message),
+    }
+}
+
+unsafe fn method_arg_slice<'a>(argv: *mut *mut PyObject, argc: usize, name: &str) -> Result<&'a [*mut PyObject], *mut PyObject> {
+    if argv.is_null() && argc != 0 {
+        return Err(raise_type_error(&format!("{name}() argv pointer is null")));
+    }
+    let args = if argc == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(argv, argc) }
+    };
+    if args.is_empty() {
+        return Err(raise_type_error(&format!("{name}() missing receiver")));
+    }
+    Ok(args)
+}
+
+unsafe fn scandir_method_receiver<'a>(
+    argv: *mut *mut PyObject,
+    argc: usize,
+    name: &str,
+) -> Result<(&'a mut PyScandirIterator, &'a [*mut PyObject]), *mut PyObject> {
+    let args = unsafe { method_arg_slice(argv, argc, name) }?;
+    let Some(iterator) = (unsafe { scandir_receiver(args[0]) }) else {
+        return Err(raise_type_error(&format!("{name}() receiver is not a ScandirIterator")));
+    };
+    Ok((iterator, &args[1..]))
+}
+
+unsafe fn direntry_method_receiver<'a>(
+    argv: *mut *mut PyObject,
+    argc: usize,
+    name: &str,
+) -> Result<(&'a mut PyDirEntry, &'a [*mut PyObject]), *mut PyObject> {
+    let args = unsafe { method_arg_slice(argv, argc, name) }?;
+    let Some(entry) = (unsafe { direntry_receiver(args[0]) }) else {
+        return Err(raise_type_error(&format!("{name}() receiver is not a DirEntry")));
+    };
+    Ok((entry, &args[1..]))
+}
+
+unsafe extern "C" fn scandir_close_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (iterator, args) = match unsafe { scandir_method_receiver(argv, argc, "close") } {
+        Ok(parts) => parts,
+        Err(error) => return error,
+    };
+    if !args.is_empty() {
+        return raise_type_error("close() takes no arguments");
+    }
+    iterator.entries = None;
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn scandir_enter_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { method_arg_slice(argv, argc, "__enter__") } {
+        Ok(args) => args,
+        Err(error) => return error,
+    };
+    if args.len() != 1 {
+        return raise_type_error("__enter__() takes no arguments");
+    }
+    if unsafe { scandir_receiver(args[0]) }.is_none() {
+        return raise_type_error("__enter__() receiver is not a ScandirIterator");
+    }
+    args[0]
+}
+
+unsafe extern "C" fn scandir_exit_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (iterator, args) = match unsafe { scandir_method_receiver(argv, argc, "__exit__") } {
+        Ok(parts) => parts,
+        Err(error) => return error,
+    };
+    if args.len() > 3 {
+        return raise_type_error("__exit__() expected at most 3 arguments");
+    }
+    iterator.entries = None;
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn scandir_iter_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { method_arg_slice(argv, argc, "__iter__") } {
+        Ok(args) => args,
+        Err(error) => return error,
+    };
+    if args.len() != 1 {
+        return raise_type_error("__iter__() takes no arguments");
+    }
+    unsafe { scandir_iter(args[0]) }
+}
+
+unsafe extern "C" fn scandir_next_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { method_arg_slice(argv, argc, "__next__") } {
+        Ok(args) => args,
+        Err(error) => return error,
+    };
+    if args.len() != 1 {
+        return raise_type_error("__next__() takes no arguments");
+    }
+    unsafe { scandir_next(args[0]) }
+}
+
+impl PyDirEntry {
+    fn cached_stat(&mut self, follow_symlinks: bool) -> Result<CachedStat, std::io::Error> {
+        let slot = if follow_symlinks {
+            &mut self.stat_follow
+        } else {
+            &mut self.stat_nofollow
+        };
+        if let Some(cached) = *slot {
+            return Ok(cached);
+        }
+        let metadata = if follow_symlinks {
+            std::fs::metadata(&self.path)
+        } else {
+            std::fs::symlink_metadata(&self.path)
+        }?;
+        let cached = cached_stat_from_metadata(&metadata);
+        *slot = Some(cached);
+        Ok(cached)
+    }
+}
+
+fn cached_stat_from_metadata(metadata: &std::fs::Metadata) -> CachedStat {
+    let file_type = metadata.file_type();
+    let kind = if file_type.is_dir() {
+        CachedFileKind::Directory
+    } else if file_type.is_file() {
+        CachedFileKind::File
+    } else if file_type.is_symlink() {
+        CachedFileKind::Symlink
+    } else {
+        CachedFileKind::Other
+    };
+    CachedStat {
+        fields: stat_fields_from_metadata(metadata),
+        kind,
+    }
+}
+
+fn follow_symlinks_arg(args: &[*mut PyObject]) -> Result<bool, *mut PyObject> {
+    match args {
+        [] => Ok(true),
+        [value] => truth_arg(*value),
+        _ => Err(raise_type_error("follow_symlinks is a keyword-only argument")),
+    }
+}
+
+fn is_missing_entry_error(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(errno) if errno == libc::ENOENT || errno == libc::ENOTDIR)
+}
+
+unsafe extern "C" fn direntry_inode_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (entry, args) = match unsafe { direntry_method_receiver(argv, argc, "inode") } {
+        Ok(parts) => parts,
+        Err(error) => return error,
+    };
+    if !args.is_empty() {
+        return raise_type_error("inode() takes no arguments");
+    }
+    let inode = match entry.inode {
+        Some(inode) => inode,
+        None => match entry.cached_stat(false) {
+            Ok(stat) => stat.fields.st_ino,
+            Err(error) => return raise_errno(error.raw_os_error().unwrap_or(libc::EIO), Some(&entry.path)),
+        },
+    };
+    unsafe { crate::abi::pon_const_int(inode) }
+}
+
+unsafe extern "C" fn direntry_is_dir_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    direntry_kind_predicate(argv, argc, "is_dir", CachedFileKind::Directory)
+}
+
+unsafe extern "C" fn direntry_is_file_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    direntry_kind_predicate(argv, argc, "is_file", CachedFileKind::File)
+}
+
+fn direntry_kind_predicate(
+    argv: *mut *mut PyObject,
+    argc: usize,
+    name: &str,
+    expected: CachedFileKind,
+) -> *mut PyObject {
+    let (entry, args) = match unsafe { direntry_method_receiver(argv, argc, name) } {
+        Ok(parts) => parts,
+        Err(error) => return error,
+    };
+    let follow_symlinks = match follow_symlinks_arg(args) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    match entry.cached_stat(follow_symlinks) {
+        Ok(stat) => bool_object(stat.kind == expected),
+        Err(error) if is_missing_entry_error(&error) => bool_object(false),
+        Err(error) => raise_errno(error.raw_os_error().unwrap_or(libc::EIO), Some(&entry.path)),
+    }
+}
+
+unsafe extern "C" fn direntry_is_symlink_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (entry, args) = match unsafe { direntry_method_receiver(argv, argc, "is_symlink") } {
+        Ok(parts) => parts,
+        Err(error) => return error,
+    };
+    if !args.is_empty() {
+        return raise_type_error("is_symlink() takes no arguments");
+    }
+    match entry.cached_stat(false) {
+        Ok(stat) => bool_object(stat.kind == CachedFileKind::Symlink),
+        Err(error) if is_missing_entry_error(&error) => bool_object(false),
+        Err(error) => raise_errno(error.raw_os_error().unwrap_or(libc::EIO), Some(&entry.path)),
+    }
+}
+
+unsafe extern "C" fn direntry_stat_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (entry, args) = match unsafe { direntry_method_receiver(argv, argc, "stat") } {
+        Ok(parts) => parts,
+        Err(error) => return error,
+    };
+    let follow_symlinks = match follow_symlinks_arg(args) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    match entry.cached_stat(follow_symlinks) {
+        Ok(stat) => stat_result_from_fields(stat.fields),
+        Err(error) => raise_errno(error.raw_os_error().unwrap_or(libc::EIO), Some(&entry.path)),
+    }
+}
+
+unsafe extern "C" fn direntry_fspath_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let (entry, args) = match unsafe { direntry_method_receiver(argv, argc, "__fspath__") } {
+        Ok(parts) => parts,
+        Err(error) => return error,
+    };
+    if !args.is_empty() {
+        return raise_type_error("__fspath__() takes no arguments");
+    }
+    walk_str(&entry.path)
+}
+
+unsafe extern "C" fn direntry_repr_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match unsafe { method_arg_slice(argv, argc, "__repr__") } {
+        Ok(args) => args,
+        Err(error) => return error,
+    };
+    if args.len() != 1 {
+        return raise_type_error("__repr__() takes no arguments");
+    }
+    unsafe { direntry_repr(args[0]) }
+}
+
+unsafe extern "C" fn direntry_repr(object: *mut PyObject) -> *mut PyObject {
+    let Some(entry) = (unsafe { direntry_receiver(object) }) else {
+        return raise_type_error("os.DirEntry receiver is invalid");
+    };
+    let text = format!("<DirEntry '{}'>", entry.name);
+    walk_str(&text)
+}
+
+fn raise_type_error(message: &str) -> *mut PyObject {
+    crate::abi::exc::raise_kind_error_text(ExceptionKind::TypeError, message)
 }
 
 #[repr(C)]
@@ -1257,7 +1872,6 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("WTERMSIG", os_wtermsig, 1),
     ("access", os_access, 2),
     ("chdir", os_chdir, 1),
-    ("chmod", os_chmod, 2),
     ("close", os_close, 1),
     ("dup", os_dup, 1),
     ("dup2", os_dup2, crate::native::builtins_mod::VARIADIC_ARITY),
@@ -1277,7 +1891,6 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("readinto", os_readinto, 2),
     ("readlink", os_readlink, 1),
     ("rmdir", os_rmdir, 1),
-    ("scandir", os_scandir, 1),
     ("strerror", os_strerror, 1),
     ("umask", os_umask, 1),
     ("unlink", os_unlink, 1),
@@ -2084,15 +2697,28 @@ unsafe extern "C" fn os_lstat(argv: *mut *mut PyObject, argc: usize) -> *mut PyO
     }
 }
 
-/// `os.scandir` frontier stub.  Deliberately a loud NotImplementedError, not
-/// the OSError the successor spec sketched: `glob`/`shutil` wrap scandir in
-/// `except OSError` and would silently degrade to wrong (empty) listings —
-/// the module's discipline is a loud frontier, never silently wrong.
-unsafe extern "C" fn os_scandir(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
-    crate::abi::exc::raise_kind_error_text(
-        ExceptionKind::NotImplementedError,
-        "os.scandir is not implemented in pon",
-    )
+/// `os.scandir(path='.')`: lazy directory iterator yielding `os.DirEntry`
+/// objects with CPython's context-manager and cached-stat surface.
+unsafe extern "C" fn os_scandir(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() > 1 {
+        return crate::abi::return_null_with_error("os.scandir expected at most one argument");
+    }
+    let path = if args.first().copied().is_none_or(is_none_value) {
+        ".".to_owned()
+    } else {
+        match path_arg(args[0], "scandir") {
+            Ok(path) => path,
+            Err(error) => return error,
+        }
+    };
+    if let Err(error) = c_path(&path) {
+        return error;
+    }
+    match std::fs::read_dir(&path) {
+        Ok(entries) => alloc_scandir_iterator(path, entries),
+        Err(error) => raise_errno(error.raw_os_error().unwrap_or(libc::EIO), Some(&path)),
+    }
 }
 
 /// `os.strerror(errno)`: host strerror table exposed as a Python string.
