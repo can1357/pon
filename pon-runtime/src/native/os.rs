@@ -136,6 +136,20 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
             return Err(format!("failed to allocate {module}.getenv"));
         }
         attrs.push((intern("getenv"), getenv));
+        // `os.get_exec_path(env=None)`: subprocess uses this to build the
+        // `_posixsubprocess.fork_exec` executable candidate tuple when the
+        // requested program name has no directory component.
+        let get_exec_path = unsafe {
+            crate::abi::pon_make_function(
+                os_get_exec_path as *const u8,
+                crate::native::builtins_mod::VARIADIC_ARITY,
+                intern("get_exec_path"),
+            )
+        };
+        if get_exec_path.is_null() {
+            return Err(format!("failed to allocate {module}.get_exec_path"));
+        }
+        attrs.push((intern("get_exec_path"), get_exec_path));
         // `importlib.resources._common` keeps a direct `_os_remove=os.remove`
         // reference for late finalization cleanup, so publish the CPython
         // alias alongside the underlying `unlink` syscall wrapper.
@@ -156,6 +170,7 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
             }
             attrs.push((intern(name), boxed));
         }
+        attrs.push(string_attr(module, "defpath", if cfg!(windows) { ".;C:\\\\bin" } else { "/bin:/usr/bin" })?);
         attrs.push(string_attr(module, "devnull", if cfg!(windows) { "nul" } else { "/dev/null" })?);
         attrs.push((intern("PathLike"), pathlike_class()?));
     }
@@ -405,15 +420,13 @@ unsafe extern "C" fn os_stat(argv: *mut *mut PyObject, argc: usize) -> *mut PyOb
         return crate::abi::return_null_with_error("os.stat expected one argument");
     }
     // SAFETY: One live argument slot per the check above.
-    let path = crate::tag::untag_arg(unsafe { *argv });
-    let Some(path_text) = (unsafe { crate::types::type_::unicode_text(path) }) else {
-        let message = "os.stat() path must be str";
-        // SAFETY: Typed raise helper.
-        return unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+    let path_text = match path_arg(unsafe { *argv }, "stat") {
+        Ok(path) => path,
+        Err(error) => return error,
     };
-    match std::fs::metadata(path_text) {
+    match std::fs::metadata(&path_text) {
         Ok(metadata) => stat_result_object(&metadata),
-        Err(error) => raise_errno(error.raw_os_error().unwrap_or(libc::EIO), Some(path_text)),
+        Err(error) => raise_errno(error.raw_os_error().unwrap_or(libc::EIO), Some(path_text.as_str())),
     }
 }
 
@@ -645,24 +658,20 @@ const SEEK_POSITIONS: &[(&str, i32)] = &[
 
 /// Snapshot of the process environment as a plain str->str dict.
 ///
-/// DECISION (deferred surface, resolved by consumer evidence): the dict
-/// stays; `os._Environ` is not modelled.  CPython's `os.environ` is a live
-/// `MutableMapping` whose `__setitem__`/`__delitem__` write through to
-/// `putenv`/`unsetenv`, but the only observer that could distinguish pon's
-/// plain dict is a spawned child inheriting the mutated real environment,
-/// and pon does not wire process spawning yet (`_posixsubprocess.fork_exec`
-/// raises NotImplementedError).  Every in-cohort consumer works over dict
-/// semantics: `tempfile` reads through `os.getenv`, `subprocess` only calls
-/// `os.environ.get`, and `test.support.os_helper.EnvironmentVarGuard` uses
-/// plain mapping ops (`[]=`, `del`, `keys`, iteration — all served by dict,
-/// `setdefault` included) plus an `os.environ = ...` rebinding that the
-/// live module-attr read in [`os_getenv`] honors.  The observable
-/// `putenv`/`getenv` contract matches CPython exactly BECAUSE the dict is
-/// not written back: CPython's `putenv` bypasses `os.environ` too, so
-/// `putenv(k, v); getenv(k)` returns None on both.
+/// DECISION: the dict stays; `os._Environ` is not modelled.  CPython's
+/// `os.environ` is a live `MutableMapping` whose item writes update the real
+/// process environment; pon's snapshot intentionally does not.  Callers that
+/// need child-environment parity must pass an explicit `env` mapping to
+/// `subprocess` or use the native `putenv`/`unsetenv` write-through helpers.
+/// In-cohort consumers still work over dict semantics: `tempfile` reads
+/// through `os.getenv`, `subprocess` can pass explicit env dicts, and
+/// `test.support.os_helper.EnvironmentVarGuard` uses plain mapping ops
+/// (`[]=`, `del`, `keys`, iteration — all served by dict, `setdefault`
+/// included) plus an `os.environ = ...` rebinding that the live module-attr
+/// read in [`os_getenv`] honors.
 ///
 /// Remaining documented divergences: mutating `os.environ` never reaches
-/// the real process environment (visible only to native env readers);
+/// the real process environment (visible to native env readers and spawned children);
 /// `repr(os.environ)` is a dict repr, not `environ({...})`; `os.environb`,
 /// the `_Environ.encodekey` family, and non-str-key TypeErrors on item ops
 /// are absent; `posix.environ` is a second str->str snapshot rather than
@@ -701,16 +710,26 @@ fn environ_snapshot(module: &str) -> Result<*mut PyObject, String> {
 
 type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
 
-/// Name / entry / arity rows consumed by [`build_attrs`].  `open` and `lstat`
-/// are variadic: `open` has an optional `mode` positional, and both accept a
+/// Name / entry / arity rows consumed by [`build_attrs`].  `fdopen`, `dup2`,
+/// `open`, and `lstat` are variadic: `fdopen`/`dup2` have optional trailing
+/// positionals, `open` has optional `mode`, and path functions may accept a
 /// keyword-only `dir_fd` that the native keyword binder flattens into a
 /// trailing positional None slot.
 const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
+    ("WEXITSTATUS", os_wexitstatus, 1),
+    ("WIFCONTINUED", os_wifcontinued, 1),
+    ("WIFEXITED", os_wifexited, 1),
+    ("WIFSIGNALED", os_wifsignaled, 1),
     ("WIFSTOPPED", os_wifstopped, 1),
     ("WSTOPSIG", os_wstopsig, 1),
+    ("WTERMSIG", os_wtermsig, 1),
     ("access", os_access, 2),
+    ("chdir", os_chdir, 1),
     ("chmod", os_chmod, 2),
     ("close", os_close, 1),
+    ("dup", os_dup, 1),
+    ("dup2", os_dup2, crate::native::builtins_mod::VARIADIC_ARITY),
+    ("fdopen", os_fdopen, crate::native::builtins_mod::VARIADIC_ARITY),
     ("fstat", os_fstat, 1),
     ("getcwd", os_getcwd, 0),
     ("getpid", os_getpid, 0),
@@ -727,12 +746,36 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("readlink", os_readlink, 1),
     ("rmdir", os_rmdir, 1),
     ("scandir", os_scandir, 1),
+    ("strerror", os_strerror, 1),
     ("unlink", os_unlink, 1),
     ("unsetenv", os_unsetenv, 1),
     ("waitpid", os_waitpid, 2),
     ("waitstatus_to_exitcode", os_waitstatus_to_exitcode, 1),
     ("write", os_write, 2),
 ];
+
+/// `os.chdir(path)` over `chdir(2)`.
+unsafe extern "C" fn os_chdir(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return crate::abi::return_null_with_error("os.chdir expected one argument");
+    }
+    let path = match path_arg(args[0], "chdir") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let c_path = match c_path(&path) {
+        Ok(c_path) => c_path,
+        Err(error) => return error,
+    };
+    // SAFETY: `c_path` is NUL-terminated.
+    if unsafe { libc::chdir(c_path.as_ptr()) } < 0 {
+        return raise_errno(last_errno(), Some(&path));
+    }
+    // SAFETY: Singleton accessor.
+    unsafe { crate::abi::pon_none() }
+}
 
 /// `os.getcwd()` over `std::env::current_dir` (`sysconfig` calls it at
 /// module scope via `_safe_realpath(os.getcwd())`).  Non-UTF-8 components
@@ -873,7 +916,8 @@ fn optional_arg(args: &[*mut PyObject], index: usize) -> Option<*mut PyObject> {
 
 /// Raises the CPython OSError subclass for `errno` (PEP 3151) with the
 /// `[Errno N] strerror` message shape and optional filename context.
-fn raise_errno(errno: i32, path: Option<&str>) -> *mut PyObject {
+/// Shared with sibling fd-syscall modules (`fcntl`).
+pub(crate) fn raise_errno(errno: i32, path: Option<&str>) -> *mut PyObject {
     let (kind, class_name) = match errno {
         libc::EEXIST => (ExceptionKind::FileExistsError, "FileExistsError"),
         libc::ENOENT => (ExceptionKind::FileNotFoundError, "FileNotFoundError"),
@@ -930,6 +974,25 @@ fn raise_errno(errno: i32, path: Option<&str>) -> *mut PyObject {
 
 fn last_errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+}
+
+fn set_fd_cloexec(fd: libc::c_int, cloexec: bool) -> Result<(), i32> {
+    // SAFETY: Plain fcntl query; the fd is validated by the kernel.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(last_errno());
+    }
+    let new_flags = if cloexec {
+        flags | libc::FD_CLOEXEC
+    } else {
+        flags & !libc::FD_CLOEXEC
+    };
+    // SAFETY: Plain fcntl update; the fd is validated by the kernel.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, new_flags) } < 0 {
+        Err(last_errno())
+    } else {
+        Ok(())
+    }
 }
 
 /// Honest refusal for the keyword-only fd-relative parameters: CPython
@@ -1001,6 +1064,75 @@ unsafe extern "C" fn os_close(argv: *mut *mut PyObject, argc: usize) -> *mut PyO
     }
     // SAFETY: Singleton accessor.
     unsafe { crate::abi::pon_none() }
+}
+
+/// `os.dup(fd)` over `dup(2)`, matching CPython's non-inheritable default.
+unsafe extern "C" fn os_dup(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return crate::abi::return_null_with_error("os.dup expected one argument");
+    }
+    let fd = match int_arg(args[0], "dup fd") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    // SAFETY: Plain syscall; the fd is validated by the kernel.
+    let duplicated = unsafe { libc::dup(fd as libc::c_int) };
+    if duplicated < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    if let Err(errno) = set_fd_cloexec(duplicated, true) {
+        // SAFETY: Best-effort cleanup for the just-created descriptor.
+        unsafe { libc::close(duplicated) };
+        return raise_errno(errno, None);
+    }
+    // SAFETY: Integer boxing helper follows the NULL-sentinel error contract.
+    unsafe { crate::abi::pon_const_int(i64::from(duplicated)) }
+}
+
+/// `os.dup2(fd, fd2, inheritable=True)` over `dup2(2)`.
+unsafe extern "C" fn os_dup2(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if !(2..=3).contains(&args.len()) {
+        return crate::abi::return_null_with_error("os.dup2 expected two or three arguments");
+    }
+    let fd = match int_arg(args[0], "dup2 fd") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    let fd2 = match int_arg(args[1], "dup2 fd2") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    let inheritable = if let Some(&value) = args.get(2) {
+        match int_arg(value, "dup2 inheritable") {
+            Ok(value) => value != 0,
+            Err(error) => return error,
+        }
+    } else {
+        true
+    };
+    // SAFETY: Plain syscall; descriptors are validated by the kernel.
+    let duplicated = unsafe { libc::dup2(fd as libc::c_int, fd2 as libc::c_int) };
+    if duplicated < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    if let Err(errno) = set_fd_cloexec(duplicated, !inheritable) {
+        return raise_errno(errno, None);
+    }
+    // SAFETY: Integer boxing helper follows the NULL-sentinel error contract.
+    unsafe { crate::abi::pon_const_int(i64::from(duplicated)) }
+}
+
+/// `os.fdopen(fd, ...)`: CPython's thin alias for `open(fd, ...)`.
+unsafe extern "C" fn os_fdopen(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc == 0 {
+        return crate::abi::return_null_with_error("os.fdopen expected at least one argument");
+    }
+    // SAFETY: Same argv/argc contract as builtin `open`.
+    unsafe { super::io::builtin_open(argv, argc) }
 }
 
 /// `os.read(fd, n)` over `read(2)`: at most `n` bytes as a bytes object.
@@ -1209,6 +1341,14 @@ unsafe extern "C" fn os_pipe(_argv: *mut *mut PyObject, _argc: usize) -> *mut Py
     if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
         return raise_errno(last_errno(), None);
     }
+    if let Err(errno) = set_fd_cloexec(fds[0], true).and_then(|()| set_fd_cloexec(fds[1], true)) {
+        // SAFETY: Best-effort cleanup for the just-created descriptors.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return raise_errno(errno, None);
+    }
     // SAFETY: Singleton/boxing accessors follow the NULL-sentinel contract.
     let mut items = unsafe {
         [
@@ -1309,6 +1449,25 @@ unsafe extern "C" fn os_scandir(_argv: *mut *mut PyObject, _argc: usize) -> *mut
     )
 }
 
+/// `os.strerror(errno)`: host strerror table exposed as a Python string.
+unsafe extern "C" fn os_strerror(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return crate::abi::return_null_with_error("os.strerror expected one argument");
+    }
+    let errno = match int_arg(args[0], "strerror code") {
+        Ok(errno) => errno,
+        Err(error) => return error,
+    };
+    // SAFETY: `strerror` returns a NUL-terminated static message.
+    let detail = unsafe { std::ffi::CStr::from_ptr(libc::strerror(errno as libc::c_int)) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: String allocation helper follows the NULL-sentinel contract.
+    unsafe { pon_const_str(detail.as_ptr(), detail.len()) }
+}
+
 /// Single int `status` word shared by the wait-status inspectors.
 fn status_arg(argv: *mut *mut PyObject, argc: usize, what: &str) -> Result<libc::c_int, *mut PyObject> {
     // SAFETY: Live argument slots per the runtime calling convention.
@@ -1352,6 +1511,52 @@ unsafe extern "C" fn os_waitpid(argv: *mut *mut PyObject, argc: usize) -> *mut P
     }
     // SAFETY: `items` is a live window for the duration of the call.
     unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) }
+}
+
+/// `os.WIFEXITED(status)`: true when the child exited normally.
+unsafe extern "C" fn os_wifexited(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    match status_arg(argv, argc, "WIFEXITED") {
+        Ok(status) => bool_object(libc::WIFEXITED(status)),
+        Err(error) => error,
+    }
+}
+
+/// `os.WEXITSTATUS(status)`: the low 8-bit exit status from a normal exit.
+unsafe extern "C" fn os_wexitstatus(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    match status_arg(argv, argc, "WEXITSTATUS") {
+        Ok(status) => {
+            // SAFETY: Integer boxing helper follows the NULL-sentinel error contract.
+            unsafe { crate::abi::pon_const_int(i64::from(libc::WEXITSTATUS(status))) }
+        }
+        Err(error) => error,
+    }
+}
+
+/// `os.WIFSIGNALED(status)`: true when the child was terminated by a signal.
+unsafe extern "C" fn os_wifsignaled(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    match status_arg(argv, argc, "WIFSIGNALED") {
+        Ok(status) => bool_object(libc::WIFSIGNALED(status)),
+        Err(error) => error,
+    }
+}
+
+/// `os.WTERMSIG(status)`: the signal that terminated the child.
+unsafe extern "C" fn os_wtermsig(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    match status_arg(argv, argc, "WTERMSIG") {
+        Ok(status) => {
+            // SAFETY: Integer boxing helper follows the NULL-sentinel error contract.
+            unsafe { crate::abi::pon_const_int(i64::from(libc::WTERMSIG(status))) }
+        }
+        Err(error) => error,
+    }
+}
+
+/// `os.WIFCONTINUED(status)`: true when the child resumed after job-control stop.
+unsafe extern "C" fn os_wifcontinued(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    match status_arg(argv, argc, "WIFCONTINUED") {
+        Ok(status) => bool_object(libc::WIFCONTINUED(status)),
+        Err(error) => error,
+    }
 }
 
 /// `os.waitstatus_to_exitcode(status)`: pure status-word math, exactly
@@ -1908,6 +2113,100 @@ unsafe extern "C" fn os_unsetenv(argv: *mut *mut PyObject, argc: usize) -> *mut 
     unsafe { std::env::remove_var(std::ffi::OsStr::from_bytes(&name)) };
     // SAFETY: Singleton accessor.
     unsafe { crate::abi::pon_none() }
+}
+
+/// `os.get_exec_path(env=None)`: returns the PATH search directories used
+/// by `subprocess` when the executable name has no directory component.
+unsafe extern "C" fn os_get_exec_path(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    // SAFETY: Live argument slots per the runtime calling convention.
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() > 1 {
+        return crate::abi::return_null_with_error("get_exec_path() takes at most 1 argument");
+    }
+    let path = if args.first().copied().is_none_or(is_none_value) {
+        std::env::var("PATH").ok()
+    } else {
+        match env_mapping_path(args[0]) {
+            Ok(path) => path,
+            Err(error) => return error,
+        }
+    }
+    .unwrap_or_else(default_exec_path);
+    super::builtins_batch::build_str_list(path.split(':').map(str::to_owned).collect())
+}
+
+fn default_exec_path() -> String {
+    if cfg!(windows) {
+        ".;C:\\\\bin".to_owned()
+    } else {
+        "/bin:/usr/bin".to_owned()
+    }
+}
+
+fn env_mapping_path(env: *mut PyObject) -> Result<Option<String>, *mut PyObject> {
+    let key = unsafe { pon_const_str(b"PATH".as_ptr(), 4) };
+    if key.is_null() {
+        return Err(std::ptr::null_mut());
+    }
+    let default = unsafe { crate::abi::pon_none() };
+    if default.is_null() {
+        return Err(std::ptr::null_mut());
+    }
+    // SAFETY: Live mapping object; missing/failing `.get` propagates like
+    // `os.py`'s `env.get('PATH')` expression.
+    let get = unsafe { crate::abi::pon_get_attr(env, intern("get"), std::ptr::null_mut()) };
+    if get.is_null() {
+        return Err(std::ptr::null_mut());
+    }
+    let mut call_argv = [key, default];
+    // SAFETY: Live bound method and two live argument slots.
+    let value = unsafe { crate::abi::pon_call(get, call_argv.as_mut_ptr(), call_argv.len()) };
+    if value.is_null() {
+        return Err(std::ptr::null_mut());
+    }
+    path_string_from_value(value).map(Some)
+}
+
+fn path_string_from_value(value: *mut PyObject) -> Result<String, *mut PyObject> {
+    if is_none_value(value) {
+        return Ok(default_exec_path());
+    }
+    let raw = crate::tag::untag_arg(value);
+    if raw.is_null() || crate::tag::is_small_int(raw) {
+        return Err(crate::abi::exc::raise_kind_error_text(
+            ExceptionKind::TypeError,
+            "PATH must be str or bytes",
+        ));
+    }
+    // SAFETY: Heap pointer with a live header after the checks above.
+    if let Some(text) = unsafe { crate::types::type_::unicode_text(raw) } {
+        return Ok(text.to_owned());
+    }
+    if let Some(payload) = bytes_payload(raw) {
+        return match std::str::from_utf8(payload) {
+            Ok(text) => Ok(text.to_owned()),
+            Err(_) => Err(crate::abi::exc::raise_kind_error_text(
+                ExceptionKind::UnicodeDecodeError,
+                "PATH bytes are not valid UTF-8",
+            )),
+        };
+    }
+    Err(crate::abi::exc::raise_kind_error_text(
+        ExceptionKind::TypeError,
+        "PATH must be str or bytes",
+    ))
+}
+
+fn is_none_value(object: *mut PyObject) -> bool {
+    if object.is_null() {
+        return true;
+    }
+    let raw = crate::tag::untag_arg(object);
+    if raw.is_null() || crate::tag::is_small_int(raw) {
+        return false;
+    }
+    // SAFETY: Heap pointer with a live header after the checks above.
+    unsafe { crate::types::dict::type_name(raw) == Some("NoneType") }
 }
 
 /// `os.getenv(key, default=None)`: `os.py`'s Python-level helper, served
