@@ -241,9 +241,11 @@ fn phase_b_function_attr(
             0,
         )
     };
-    (!function.is_null())
-        .then_some((intern(name), function))
-        .ok_or_else(|| format!("failed to allocate _csv.{name}"))
+    if function.is_null() {
+        return Err(format!("failed to allocate _csv.{name}"));
+    }
+    crate::types::function::mark_native_function(function);
+    Ok((intern(name), function))
 }
 
 // ---------------------------------------------------------------------------

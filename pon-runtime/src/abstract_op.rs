@@ -103,10 +103,16 @@ pub(crate) unsafe fn binary_op_flavored(op: u8, a: *mut PyObject, b: *mut PyObje
         return raise_type_error("right operand is NULL or has no type");
     };
 
-    // `str % args` — CPython unicode `nb_remainder` (%-formatting).  Keyed by
-    // the exact type name, matching the str rich-compare fast path below.
-    if op == BINARY_MOD && unsafe { (*left_type).name() == "str" } {
-        return unsafe { abi::format::percent_format(a, b) };
+    // `str % args`, `bytes % args`, and `bytearray % args` — CPython wires
+    // these as remainder slots; pon routes them before generic numeric dispatch
+    // so payload subclasses reach the canonical builtin formatter.
+    if op == BINARY_MOD {
+        if unsafe { (*left_type).name() == "str" } {
+            return unsafe { abi::format::percent_format(a, b) };
+        }
+        if unsafe { abi::format::bytes_percent_receiver_kind(a).is_some() } {
+            return unsafe { abi::format::bytes_percent_format(a, b) };
+        }
     }
 
     if op == BINARY_MUL {

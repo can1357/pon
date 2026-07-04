@@ -1176,14 +1176,19 @@ fn create_module(
             let attr = resolve(key).unwrap_or_else(|| format!("<interned:{key}>"));
             return Err(format!("module attribute '{attr}' for '{name}' is NULL"));
         }
-        // Function-valued attrs at module-creation time exist only for native
-        // (Rust-built) modules — user functions reach module namespaces via
-        // `store_module_attr` while the compiled body executes, never through
-        // this constructor.  Record them as CPython
-        // `builtin_function_or_method` equivalents: non-descriptors that read
-        // back bare off class attributes (see
-        // `types::function::mark_native_function`).
-        crate::types::function::mark_native_function(value);
+        // Native module factories may also re-export pure-Python functions
+        // imported from source modules (`_colorize.dataclass` is one example).
+        // Only Rust carriers lack Phase-B function metadata; mark and stamp
+        // those as CPython `builtin_function_or_method` equivalents without
+        // stealing user functions from their defining module.
+        if crate::types::function::is_function_object(value)
+            && crate::types::function::function_record(value).is_none()
+        {
+            crate::types::function::mark_native_function(value);
+        }
+        if crate::types::function::is_native_function(value) {
+            crate::types::function::set_function_module(value, name_id);
+        }
         attr_map.insert(key, value);
     }
 
@@ -1955,6 +1960,97 @@ mod tests {
         assert!(!getattr.is_null(), "creating __getattr__ function failed: {:?}", pon_err_message());
         install_module(module_name, [(intern("__getattr__"), getattr)])
             .unwrap_or_else(|message| panic!("installing {module_name} failed: {message}"))
+    }
+
+    unsafe extern "C" fn import_stamp_return_none(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+        unsafe { pon_none() }
+    }
+
+    #[test]
+    fn install_module_stamps_only_native_function_carriers() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+        pon_err_clear();
+        reset_import_state_for_tests();
+
+        let source_module = format!(
+            "pon_source_stamp_{}_{}",
+            process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let installed_module = format!(
+            "pon_native_stamp_{}_{}",
+            process::id(),
+            NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        );
+
+        install_module(&source_module, [])
+            .unwrap_or_else(|message| panic!("installing source context module failed: {message}"));
+        super::begin_module_execution(&source_module).unwrap();
+        let code = crate::abi::CodeInfo {
+            entry: import_stamp_return_none as *const u8,
+            params: ptr::null(),
+            name_interned: intern("source_like_fn"),
+            n_locals: 0,
+            n_feedback: 0,
+            flags: 0,
+        };
+        let source_function = unsafe {
+            crate::call::pon_make_function_full(
+                &code,
+                ptr::null_mut(),
+                0,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+            )
+        };
+        super::end_module_execution(&source_module);
+        assert!(
+            !source_function.is_null(),
+            "creating source-like function failed: {:?}",
+            pon_err_message()
+        );
+        assert_eq!(
+            crate::types::function::function_module(source_function),
+            Some(intern(&source_module))
+        );
+
+        let native_function =
+            unsafe { crate::abi::pon_make_function(import_stamp_return_none as *const u8, 0, intern("native_carrier")) };
+        assert!(
+            !native_function.is_null(),
+            "creating native function carrier failed: {:?}",
+            pon_err_message()
+        );
+        assert!(!crate::types::function::is_native_function(native_function));
+        assert_eq!(crate::types::function::function_module(native_function), None);
+
+        install_module(
+            &installed_module,
+            [
+                (intern("dataclass"), source_function),
+                (intern("native_carrier"), native_function),
+            ],
+        )
+        .unwrap_or_else(|message| panic!("installing native module failed: {message}"));
+
+        assert!(!crate::types::function::is_native_function(source_function));
+        assert_eq!(
+            crate::types::function::function_module(source_function),
+            Some(intern(&source_module))
+        );
+        assert!(crate::types::function::is_native_function(native_function));
+        assert_eq!(
+            crate::types::function::function_module(native_function),
+            Some(intern(&installed_module))
+        );
     }
 
     #[test]

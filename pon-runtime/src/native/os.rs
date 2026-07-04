@@ -382,9 +382,11 @@ fn phase_b_function_attr(
             0,
         )
     };
-    (!function.is_null())
-        .then_some((intern(name), function))
-        .ok_or_else(|| format!("failed to allocate os.{name}"))
+    if function.is_null() {
+        return Err(format!("failed to allocate os.{name}"));
+    }
+    crate::types::function::mark_native_function(function);
+    Ok((intern(name), function))
 }
 
 fn register_at_fork_attr(module: &str) -> Result<(u32, *mut PyObject), String> {
@@ -423,9 +425,11 @@ fn register_at_fork_attr(module: &str) -> Result<(u32, *mut PyObject), String> {
             0,
         )
     };
-    (!function.is_null())
-        .then_some((intern("register_at_fork"), function))
-        .ok_or_else(|| format!("failed to allocate {module}.register_at_fork"))
+    if function.is_null() {
+        return Err(format!("failed to allocate {module}.register_at_fork"));
+    }
+    crate::types::function::mark_native_function(function);
+    Ok((intern("register_at_fork"), function))
 }
 
 /// `os._get_exports_list(module)`: CPython os.py's own helper, served
@@ -1787,6 +1791,7 @@ fn bound_direntry_follow_method(receiver: *mut PyObject, name: &str, entry: Buil
     if function.is_null() {
         return std::ptr::null_mut();
     }
+    crate::types::function::mark_native_function(function);
     match crate::types::method::new_bound_method(function, receiver) {
         Ok(method) => method.cast::<PyObject>(),
         Err(message) => crate::abi::return_null_with_error(message),

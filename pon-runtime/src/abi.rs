@@ -1838,6 +1838,7 @@ fn perform_runtime_init() -> Result<(), String> {
             };
 
             register_builtins(&mut runtime)?;
+            exc::publish_exception_type_roots(exception_types);
             *slot = Some(runtime);
             true
         }
@@ -5634,6 +5635,7 @@ pub(crate) fn current_function_stack_depth() -> usize {
     CURRENT_FUNCTION_STACK.with(|stack| stack.borrow().len())
 }
 
+
 /// Defining module of the innermost compiled function that (a) was pushed
 /// while the innermost active module body ran — entries below that floor
 /// belong to frames suspended behind the module import and must not leak
@@ -5647,7 +5649,17 @@ fn current_defining_module_context() -> Option<(u32, *mut PyObject)> {
         let stack = stack.borrow();
         let floor = floor.min(stack.len());
         stack[floor..].iter().rev().find_map(|call| {
-            crate::types::function::function_module_context(call.function.cast::<PyObject>())
+            let function = call.function.cast::<PyObject>();
+            // Native (builtin) frames are transparent to `__globals__`
+            // scoping, exactly like CPython C frames: their install-time
+            // module record exists for `__module__` and keyword-binder
+            // qualification, never for global resolution — a native carrier
+            // invoking Python code must not retarget that code's globals to
+            // the native module's namespace.
+            if crate::types::function::is_native_function(function) {
+                return None;
+            }
+            crate::types::function::function_module_context(function)
         })
     })
 }

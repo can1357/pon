@@ -1054,6 +1054,35 @@ fn exact_str(value: *mut PyObject) -> Result<Option<String>, String> {
     .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BytesPercentReceiver {
+    Bytes,
+    ByteArray,
+}
+
+unsafe fn bytes_percent_payload(format: *mut PyObject) -> Option<(&'static [u8], BytesPercentReceiver)> {
+    let object = unsafe { type_::payload_subclass_value(format) }
+        .map(crate::tag::untag_arg)
+        .unwrap_or(format);
+    if object.is_null() || !crate::tag::is_heap(object) {
+        return None;
+    }
+    let ty = unsafe { (*object).ob_type };
+    if bytes_type::is_bytes_type(ty) {
+        let bytes = unsafe { &*object.cast::<bytes_type::PyBytes>() };
+        return Some((unsafe { bytes.as_slice() }, BytesPercentReceiver::Bytes));
+    }
+    if bytearray_type::is_bytearray_type(ty) {
+        let bytearray = unsafe { &*object.cast::<bytearray_type::PyByteArray>() };
+        return Some((bytearray.as_slice(), BytesPercentReceiver::ByteArray));
+    }
+    None
+}
+
+pub(crate) unsafe fn bytes_percent_receiver_kind(format: *mut PyObject) -> Option<BytesPercentReceiver> {
+    unsafe { bytes_percent_payload(format).map(|(_, kind)| kind) }
+}
+
 fn object_to_str(value: *mut PyObject) -> Result<String, String> {
     if value.is_null() {
         return Err("cannot format NULL object".to_owned());
@@ -1206,6 +1235,55 @@ fn raise_percent_value_error(message: &str) -> *mut PyObject {
     unsafe { super::exc::pon_raise_value_error(message.as_ptr(), message.len()) }
 }
 
+fn raise_percent_overflow_error(message: &str) -> *mut PyObject {
+    super::exc::raise_kind_error_text(crate::types::exc::ExceptionKind::OverflowError, message)
+}
+
+enum PercentOperandError {
+    Message(String),
+    Overflow(String),
+    Propagated,
+}
+
+fn raise_percent_operand_error(error: PercentOperandError) -> *mut PyObject {
+    match error {
+        PercentOperandError::Message(message) => raise_percent_type_error(&message),
+        PercentOperandError::Overflow(message) => raise_percent_overflow_error(&message),
+        PercentOperandError::Propagated => ptr::null_mut(),
+    }
+}
+
+fn pad_percent_bytes(bytes: &[u8], width: Option<usize>, left: bool) -> Vec<u8> {
+    let Some(width) = width else {
+        return bytes.to_vec();
+    };
+    if bytes.len() >= width {
+        return bytes.to_vec();
+    }
+    let pad = vec![b' '; width - bytes.len()];
+    if left {
+        let mut out = Vec::with_capacity(width);
+        out.extend_from_slice(bytes);
+        out.extend_from_slice(&pad);
+        out
+    } else {
+        let mut out = Vec::with_capacity(width);
+        out.extend_from_slice(&pad);
+        out.extend_from_slice(bytes);
+        out
+    }
+}
+
+fn percent_bytes_mapping_exempt(args: *mut PyObject) -> bool {
+    if type_name(args) == "str" {
+        return false;
+    }
+    if unsafe { bytes_percent_payload(args).is_some() } {
+        return false;
+    }
+    percent_args_is_mapping(args)
+}
+
 fn pad_percent_text(text: &str, width: Option<usize>, left: bool) -> String {
     let Some(width) = width else {
         return text.to_owned();
@@ -1309,6 +1387,398 @@ unsafe fn percent_float_operand(arg: *mut PyObject) -> Result<f64, String> {
         return value.to_f64().ok_or_else(|| "int too large to convert to float".to_owned());
     }
     Err(format!("must be real number, not {}", type_name(arg)))
+}
+
+unsafe fn call_zero_arg_dunder(object: *mut PyObject, name: &'static str) -> Result<Option<*mut PyObject>, PercentOperandError> {
+    let method = unsafe { crate::abstract_op::get_attr(object, intern(name)) };
+    if method.is_null() {
+        if crate::thread_state::pon_err_occurred() {
+            pon_err_clear();
+        }
+        return Ok(None);
+    }
+    let result = unsafe { super::pon_call(method, ptr::null_mut(), 0) };
+    if result.is_null() {
+        return Err(PercentOperandError::Propagated);
+    }
+    Ok(Some(crate::tag::untag_arg(result)))
+}
+
+unsafe fn percent_index_bigint(arg: *mut PyObject, report_bad_result: bool) -> Result<Option<BigInt>, PercentOperandError> {
+    let ty = unsafe { arg.as_ref().and_then(|object| object.ob_type.as_ref()) };
+    if let Some(slot) = ty.and_then(|ty| unsafe { ty.tp_as_number.as_ref().and_then(|methods| methods.nb_index) }) {
+        let result = unsafe { slot(arg) };
+        if result.is_null() {
+            return Err(PercentOperandError::Propagated);
+        }
+        let result = crate::tag::untag_arg(result);
+        if let Some(value) = unsafe { int_type::to_bigint_including_bool(result) } {
+            return Ok(Some(value));
+        }
+        if report_bad_result {
+            return Err(PercentOperandError::Message(format!(
+                "__index__ returned non-int (type {})",
+                type_name(result)
+            )));
+        }
+        return Ok(None);
+    }
+    if let Some(result) = unsafe { call_zero_arg_dunder(arg, "__index__")? } {
+        if let Some(value) = unsafe { int_type::to_bigint_including_bool(result) } {
+            return Ok(Some(value));
+        }
+        if report_bad_result {
+            return Err(PercentOperandError::Message(format!(
+                "__index__ returned non-int (type {})",
+                type_name(result)
+            )));
+        }
+    }
+    Ok(None)
+}
+
+unsafe fn percent_long_bigint(arg: *mut PyObject) -> Result<Option<BigInt>, PercentOperandError> {
+    if let Some(result) = unsafe { call_zero_arg_dunder(arg, "__int__")? } {
+        if let Some(value) = unsafe { int_type::to_bigint_including_bool(result) } {
+            return Ok(Some(value));
+        }
+        return Ok(None);
+    }
+    unsafe { percent_index_bigint(arg, false) }
+}
+
+unsafe fn bytes_percent_int_operand(arg: *mut PyObject, allow_float: bool, ty: u8) -> Result<BigInt, PercentOperandError> {
+    if let Some(value) = unsafe { int_type::to_bigint_including_bool(arg) } {
+        return Ok(value);
+    }
+    if allow_float {
+        if let Some(value) = unsafe { float_type::to_f64(arg) } {
+            return BigInt::from_f64(value.trunc())
+                .ok_or_else(|| PercentOperandError::Message("cannot convert float infinity or NaN to integer".to_owned()));
+        }
+        if let Some(value) = unsafe { percent_long_bigint(arg)? } {
+            return Ok(value);
+        }
+        return Err(PercentOperandError::Message(format!(
+            "%{} format: a real number is required, not {}",
+            char::from(ty),
+            type_name(arg)
+        )));
+    }
+    if let Some(value) = unsafe { percent_index_bigint(arg, false)? } {
+        return Ok(value);
+    }
+    Err(PercentOperandError::Message(format!(
+        "%{} format: an integer is required, not {}",
+        char::from(ty),
+        type_name(arg)
+    )))
+}
+
+unsafe fn percent_dunder_bytes(arg: *mut PyObject) -> Result<Option<Vec<u8>>, PercentOperandError> {
+    let Some(result) = (unsafe { call_zero_arg_dunder(arg, "__bytes__")? }) else {
+        return Ok(None);
+    };
+    if let Some((bytes, BytesPercentReceiver::Bytes)) = unsafe { bytes_percent_payload(result) } {
+        return Ok(Some(bytes.to_vec()));
+    }
+    Err(PercentOperandError::Message(format!(
+        "__bytes__ returned non-bytes (type {})",
+        type_name(result)
+    )))
+}
+
+unsafe fn bytes_percent_bytes_operand(arg: *mut PyObject) -> Result<Vec<u8>, PercentOperandError> {
+    if let Ok(bytes) = super::str_::expect_bytes_like(arg) {
+        return Ok(bytes);
+    }
+    if let Some(bytes) = unsafe { percent_dunder_bytes(arg)? } {
+        return Ok(bytes);
+    }
+    Err(PercentOperandError::Message(format!(
+        "%b requires a bytes-like object, or an object that implements __bytes__, not '{}'",
+        type_name(arg)
+    )))
+}
+
+unsafe fn bytes_percent_char_operand(arg: *mut PyObject) -> Result<u8, PercentOperandError> {
+    if let Some((bytes, kind)) = unsafe { bytes_percent_payload(arg) } {
+        if bytes.len() == 1 {
+            return Ok(bytes[0]);
+        }
+        let name = match kind {
+            BytesPercentReceiver::Bytes => "bytes",
+            BytesPercentReceiver::ByteArray => "bytearray",
+        };
+        return Err(PercentOperandError::Message(format!(
+            "%c requires an integer in range(256) or a single byte, not a {name} object of length {}",
+            bytes.len()
+        )));
+    }
+    let value = if let Some(value) = unsafe { int_type::to_bigint_including_bool(arg) } {
+        value
+    } else if let Some(value) = unsafe { percent_index_bigint(arg, true)? } {
+        value
+    } else {
+        return Err(PercentOperandError::Message(format!(
+            "%c requires an integer in range(256) or a single byte, not {}",
+            type_name(arg)
+        )));
+    };
+    let Some(value) = value.to_i64() else {
+        return Err(PercentOperandError::Overflow("%c arg not in range(256)".to_owned()));
+    };
+    if !(0..=255).contains(&value) {
+        return Err(PercentOperandError::Overflow("%c arg not in range(256)".to_owned()));
+    }
+    Ok(value as u8)
+}
+
+/// CPython `bytes.__mod__` / `bytearray.__mod__` (%-formatting).
+///
+/// The parser is the byte-oriented sibling of [`percent_format`]: mapping keys
+/// are raw bytes, `%b`/`%s` consume bytes-like operands, `%a`/`%r` emit ASCII
+/// repr text, and a bytearray receiver produces a bytearray result.
+pub(crate) unsafe fn bytes_percent_format(format: *mut PyObject, args: *mut PyObject) -> *mut PyObject {
+    let (template, receiver_kind) = match unsafe { bytes_percent_payload(format) } {
+        Some(parts) => parts,
+        None => return raise_percent_type_error("descriptor '__mod__' requires a 'bytes' object"),
+    };
+    let items = unsafe { crate::abi::seq::tuple_storage_slice(args) };
+    let (arglen, argidx) = match items {
+        Some(items) => (items.len() as isize, 0),
+        None => (-1, -2),
+    };
+    let mut state = PercentArgs { args, items, arglen, argidx };
+    let arg_is_mapping = items.is_none() && percent_bytes_mapping_exempt(args);
+
+    let mut out = Vec::with_capacity(template.len());
+    let mut i = 0usize;
+    while i < template.len() {
+        let ch = template[i];
+        if ch != b'%' {
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= template.len() {
+            return raise_percent_value_error("incomplete format");
+        }
+        if template[i] == b'%' {
+            out.push(b'%');
+            i += 1;
+            continue;
+        }
+        let mut key = None;
+        if template[i] == b'(' {
+            let start = i + 1;
+            let mut depth = 1usize;
+            let mut j = start;
+            while j < template.len() && depth > 0 {
+                match template[j] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                return raise_percent_value_error("incomplete format key");
+            }
+            key = Some(template[start..j - 1].to_vec());
+            i = j;
+        }
+        let mut left = false;
+        let mut plus = false;
+        let mut space = false;
+        let mut alternate = false;
+        let mut zero = false;
+        loop {
+            match template.get(i).copied() {
+                Some(b'-') => left = true,
+                Some(b'+') => plus = true,
+                Some(b' ') => space = true,
+                Some(b'#') => alternate = true,
+                Some(b'0') => zero = true,
+                _ => break,
+            }
+            i += 1;
+        }
+        let mut width = None;
+        if template.get(i) == Some(&b'*') {
+            i += 1;
+            let value = match state.next() {
+                Ok(value) => value,
+                Err(message) => return raise_percent_type_error(&message),
+            };
+            let Some(value) = (unsafe { int_type::to_bigint_including_bool(value) }) else {
+                return raise_percent_type_error("* wants int");
+            };
+            let Some(value) = value.to_isize() else {
+                return raise_percent_value_error("width too big");
+            };
+            if value < 0 {
+                left = true;
+            }
+            width = Some(value.unsigned_abs());
+        } else {
+            let mut value = 0usize;
+            let mut any = false;
+            while let Some(digit) = template.get(i).copied().and_then(|ch| ch.is_ascii_digit().then(|| ch - b'0')) {
+                value = value.saturating_mul(10).saturating_add(digit as usize);
+                any = true;
+                i += 1;
+            }
+            if any {
+                width = Some(value);
+            }
+        }
+        let mut precision = None;
+        if template.get(i) == Some(&b'.') {
+            i += 1;
+            if template.get(i) == Some(&b'*') {
+                i += 1;
+                let value = match state.next() {
+                    Ok(value) => value,
+                    Err(message) => return raise_percent_type_error(&message),
+                };
+                let Some(value) = (unsafe { int_type::to_bigint_including_bool(value) }) else {
+                    return raise_percent_type_error("* wants int");
+                };
+                let Some(value) = value.to_isize() else {
+                    return raise_percent_value_error("precision too big");
+                };
+                precision = Some(value.max(0).unsigned_abs());
+            } else {
+                let mut value = 0usize;
+                while let Some(digit) = template.get(i).copied().and_then(|ch| ch.is_ascii_digit().then(|| ch - b'0')) {
+                    value = value.saturating_mul(10).saturating_add(digit as usize);
+                    i += 1;
+                }
+                precision = Some(value);
+            }
+        }
+        while matches!(template.get(i), Some(b'h') | Some(b'l') | Some(b'L')) {
+            i += 1;
+        }
+        let Some(&ty) = template.get(i) else {
+            return raise_percent_value_error("incomplete format");
+        };
+        let ty_index = i;
+        i += 1;
+        let arg = if let Some(key) = key {
+            if !arg_is_mapping {
+                return raise_percent_type_error("format requires a mapping");
+            }
+            let key_object = as_object_ptr(bytes_type::boxed_bytes(&key));
+            let value = unsafe { super::object::pon_subscript_get(args, key_object, ptr::null_mut()) };
+            if value.is_null() {
+                return ptr::null_mut();
+            }
+            value
+        } else {
+            match state.next() {
+                Ok(value) => value,
+                Err(message) => return raise_percent_type_error(&message),
+            }
+        };
+        let rendered = match ty {
+            b'b' | b's' => {
+                let mut bytes = match unsafe { bytes_percent_bytes_operand(arg) } {
+                    Ok(bytes) => bytes,
+                    Err(error) => return raise_percent_operand_error(error),
+                };
+                if let Some(precision) = precision {
+                    bytes.truncate(precision);
+                }
+                pad_percent_bytes(&bytes, width, left)
+            }
+            b'a' | b'r' => {
+                let text = match object_to_repr(arg).map(|text| str_type::escape_non_ascii(&text)) {
+                    Ok(text) => text,
+                    Err(message) => return raise_percent_type_error(&message),
+                };
+                let mut bytes = text.into_bytes();
+                if let Some(precision) = precision {
+                    bytes.truncate(precision);
+                }
+                pad_percent_bytes(&bytes, width, left)
+            }
+            b'd' | b'i' | b'u' => {
+                let value = match unsafe { bytes_percent_int_operand(arg, true, ty) } {
+                    Ok(value) => value,
+                    Err(error) => return raise_percent_operand_error(error),
+                };
+                render_percent_int(&value, 10, false, false, plus, space, zero, left, width, precision).into_bytes()
+            }
+            b'o' | b'x' | b'X' => {
+                let value = match unsafe { bytes_percent_int_operand(arg, false, ty) } {
+                    Ok(value) => value,
+                    Err(error) => return raise_percent_operand_error(error),
+                };
+                render_percent_int(
+                    &value,
+                    if ty == b'o' { 8 } else { 16 },
+                    ty == b'X',
+                    alternate,
+                    plus,
+                    space,
+                    zero,
+                    left,
+                    width,
+                    precision,
+                )
+                .into_bytes()
+            }
+            b'e' | b'E' | b'f' | b'F' | b'g' | b'G' => {
+                let value = match unsafe { percent_float_operand(arg) } {
+                    Ok(value) => value,
+                    Err(message) => return raise_percent_type_error(&message),
+                };
+                let ty = char::from(ty);
+                let sign = if plus {
+                    "+"
+                } else if space {
+                    " "
+                } else {
+                    ""
+                };
+                let hash = if alternate { "#" } else { "" };
+                let prec = precision.unwrap_or(6);
+                let spec = match width {
+                    Some(w) if left => format!("<{sign}{hash}{w}.{prec}{ty}"),
+                    Some(w) if zero => format!("{sign}{hash}0{w}.{prec}{ty}"),
+                    Some(w) => format!("{sign}{hash}{w}.{prec}{ty}"),
+                    None => format!("{sign}{hash}.{prec}{ty}"),
+                };
+                match format_float(value, &spec) {
+                    Ok(text) => text.into_bytes(),
+                    Err(message) => return raise_percent_value_error(&message),
+                }
+            }
+            b'c' => match unsafe { bytes_percent_char_operand(arg) } {
+                Ok(byte) => pad_percent_bytes(&[byte], width, left),
+                Err(error) => return raise_percent_operand_error(error),
+            },
+            other if other <= 0x7f => {
+                let other = char::from(other);
+                return raise_percent_value_error(&format!(
+                    "unsupported format character '{other}' (0x{:x}) at index {ty_index}",
+                    other as u32
+                ));
+            }
+            _ => return raise_percent_overflow_error("character argument not in range(0x110000)"),
+        };
+        out.extend_from_slice(&rendered);
+    }
+    if !arg_is_mapping && state.leftover() {
+        return raise_percent_type_error("not all arguments converted during bytes formatting");
+    }
+    match receiver_kind {
+        BytesPercentReceiver::Bytes => as_object_ptr(bytes_type::boxed_bytes(&out)),
+        BytesPercentReceiver::ByteArray => as_object_ptr(bytearray_type::boxed_bytearray(&out)),
+    }
 }
 
 /// CPython `str.__mod__` (%-formatting): renders `format % args`.  Raises the
@@ -1570,6 +2040,72 @@ mod tests {
             assert_eq!(super::super::pon_runtime_init(), 0);
         }
         guard
+    }
+
+    fn bytes_object(bytes: &[u8]) -> *mut PyObject {
+        as_object_ptr(bytes_type::boxed_bytes(bytes))
+    }
+
+    fn bytearray_object(bytes: &[u8]) -> *mut PyObject {
+        as_object_ptr(bytearray_type::boxed_bytearray(bytes))
+    }
+
+    unsafe fn empty_tuple() -> *mut PyObject {
+        unsafe { super::super::seq::pon_build_tuple(core::ptr::null_mut(), 0) }
+    }
+
+    unsafe fn tuple_from(items: &mut [*mut PyObject]) -> *mut PyObject {
+        unsafe { super::super::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) }
+    }
+
+    unsafe fn bytes_result(object: *mut PyObject) -> Vec<u8> {
+        let Some((bytes, BytesPercentReceiver::Bytes)) = (unsafe { bytes_percent_payload(object) }) else {
+            panic!("expected bytes result");
+        };
+        bytes.to_vec()
+    }
+
+    unsafe fn bytearray_result(object: *mut PyObject) -> Vec<u8> {
+        let Some((bytes, BytesPercentReceiver::ByteArray)) = (unsafe { bytes_percent_payload(object) }) else {
+            panic!("expected bytearray result");
+        };
+        bytes.to_vec()
+    }
+
+    #[test]
+    fn bytes_percent_handles_empty_format_literals_and_bytearray_result() {
+        let _guard = init();
+        unsafe {
+            let args = empty_tuple();
+            assert_eq!(bytes_result(bytes_percent_format(bytes_object(b""), args)), b"");
+            assert_eq!(bytes_result(bytes_percent_format(bytes_object(b"%%"), args)), b"%");
+            assert_eq!(
+                bytearray_result(bytes_percent_format(bytearray_object(b"%c"), super::super::pon_const_int(65))),
+                b"A"
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_percent_formats_b_and_s_bytes_operands() {
+        let _guard = init();
+        unsafe {
+            let mut args = [bytes_object(b"alpha"), bytearray_object(b"beta")];
+            let args = tuple_from(&mut args);
+            let result = bytes_percent_format(bytes_object(b"%b:%s"), args);
+            assert_eq!(bytes_result(result), b"alpha:beta");
+        }
+    }
+
+    #[test]
+    fn bytes_percent_mapping_uses_bytes_keys() {
+        let _guard = init();
+        unsafe {
+            let mut pairs = [bytes_object(b"name"), bytes_object(b"pon")];
+            let mapping = super::super::map::pon_build_map(pairs.as_mut_ptr(), 1);
+            let result = bytes_percent_format(bytes_object(b"%(name)b"), mapping);
+            assert_eq!(bytes_result(result), b"pon");
+        }
     }
 
     #[test]

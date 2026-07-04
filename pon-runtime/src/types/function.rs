@@ -1830,7 +1830,40 @@ fn bind_native_keywords(
     let Some(name) = function_name(function) else {
         return Err("keyword arguments require Phase-B function metadata".to_owned());
     };
+    // Same-named natives differ by DEFINING MODULE (`zlib.compress(level=)`
+    // vs bz2's `compresslevel=` vs the zstd method shape): qualify first,
+    // then fall back to the name-only table.
+    let module = function_module(function).and_then(crate::intern::resolve);
+    if let Some(bound) = bind_module_qualified_keywords(module.as_deref(), &name, positional, keywords) {
+        return bound;
+    }
     bind_native_keywords_for_name(&name, positional, keywords)
+}
+
+/// Keyword shapes for native functions whose bare NAME collides across
+/// modules.  `None` falls through to [`bind_native_keywords_for_name`].
+fn bind_module_qualified_keywords(
+    module: Option<&str>,
+    name: &str,
+    positional: &[*mut PyObject],
+    keywords: KeywordArgs<'_>,
+) -> Option<Result<Vec<*mut PyObject>, String>> {
+    match (module?, name) {
+        // `zlib.compress(data, /, level=-1, wbits=MAX_WBITS)` (Cython's
+        // Code.py partials `level=9`).
+        ("zlib", "compress") => {
+            Some(bind_optional_named_keywords(positional, keywords, "compress", &["data", "level", "wbits"], 1))
+        }
+        // `zlib.decompress(data, /, wbits=MAX_WBITS, bufsize=DEF_BUF_SIZE)`.
+        ("zlib", "decompress") => {
+            Some(bind_optional_named_keywords(positional, keywords, "decompress", &["data", "wbits", "bufsize"], 1))
+        }
+        // `bz2.compress(data, compresslevel=9)` (Cython's Code.py partial).
+        ("bz2" | "_bz2", "compress") => {
+            Some(bind_optional_named_keywords(positional, keywords, "compress", &["data", "compresslevel"], 1))
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn bind_native_keywords_for_name(
