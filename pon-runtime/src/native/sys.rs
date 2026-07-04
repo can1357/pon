@@ -58,6 +58,17 @@ fn format_version_info(major: i64, minor: i64, micro: i64, releaselevel: &str, s
     )
 }
 
+/// Absolute path to the running interpreter for `sys.executable`.  CPython
+/// code (notably `mesonpy`/`subprocess` spawning `[sys.executable, script]`)
+/// requires a spawnable path, not a bare name; fall back to `"pon"` only when
+/// the OS cannot report the current executable.
+fn sys_executable_path() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_owned))
+        .unwrap_or_else(|| "pon".to_owned())
+}
+
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
     let attrs = [
         string_attr(
@@ -70,7 +81,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         int_attr("maxsize", i64::MAX),
         string_attr("platform", PLATFORM),
         string_attr("byteorder", if cfg!(target_endian = "little") { "little" } else { "big" }),
-        string_attr("executable", "pon"),
+        string_attr("executable", &sys_executable_path()),
         string_attr("prefix", ""),
         string_attr("base_prefix", ""),
         string_attr("exec_prefix", ""),
@@ -101,6 +112,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         modules_attr(),
         builtin_module_names_attr(),
         function_attr("_getframe", sys_getframe),
+        function_attr("exit", sys_exit),
         function_attr("intern", sys_intern),
         function_attr("exception", sys_exception),
         function_attr("exc_info", sys_exc_info),
@@ -1366,6 +1378,22 @@ unsafe extern "C" fn sys_getframe(argv: *mut *mut PyObject, argc: usize) -> *mut
         depth = value.to_usize().unwrap_or(0);
     }
     crate::types::frame::synthesize_frame_object(crate::abi::frame_chain_for_depth(depth, sys_getframe as *const u8))
+}
+
+/// `sys.exit([status])`: raise `SystemExit(status)`.  Accepts zero or one
+/// argument; `status` defaults to `None` (exit code 0).  The top-level runner
+/// maps the `SystemExit` payload to the process exit status.
+unsafe extern "C" fn sys_exit(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc > 1 {
+        return return_null_with_error(format!("exit() takes at most 1 argument ({argc} given)"));
+    }
+    let code = if argc == 1 && !argv.is_null() {
+        // SAFETY: One live argument slot per the arity check.
+        unsafe { *argv }
+    } else {
+        std::ptr::null_mut()
+    };
+    crate::abi::exc::raise_system_exit(code)
 }
 
 /// `sys.intern(string)`.

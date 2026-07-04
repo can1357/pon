@@ -12,7 +12,7 @@ pub mod exc;
 pub use exc::{
     pon_exc_fetch, pon_exc_group_split, pon_exc_matches, pon_exc_restore, pon_raise, pon_raise_attribute_error,
     pon_raise_index_error, pon_raise_key_error, pon_raise_stop_iteration, pon_raise_type_error, pon_raise_value_error,
-    pon_reraise, raise_import_error_text,
+    pon_reraise, raise_import_error_text, raise_system_exit, take_pending_system_exit,
 };
 pub mod format;
 pub mod r#gen;
@@ -5244,7 +5244,10 @@ pub(crate) fn current_function_stack_depth() -> usize {
 /// while the innermost active module body ran — entries below that floor
 /// belong to frames suspended behind the module import and must not leak
 /// their namespace into it — and (b) carries a defining-module record.
-fn current_defining_module() -> Option<u32> {
+/// Consumed here for `__globals__`-scoped loads/stores and by the import
+/// system to resolve a function-body relative import against the function's
+/// defining module (CPython's calling-frame-globals rule).
+pub(crate) fn current_defining_module() -> Option<u32> {
     let floor = crate::import::active_module_call_floor();
     CURRENT_FUNCTION_STACK.with(|stack| {
         let stack = stack.borrow();

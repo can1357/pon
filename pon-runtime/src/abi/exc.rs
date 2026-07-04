@@ -495,6 +495,56 @@ pub(crate) fn raise_kind_error_no_args(kind: ExceptionKind) -> *mut PyObject {
     }
 }
 
+/// Raises `SystemExit(code)` for native `sys.exit`.  `code` is the `.code`
+/// payload carried in `args`: NULL yields `args == ()` (`.code` is `None`,
+/// exit status 0); an int gives that status; any other object is printed by
+/// the top-level handler before exiting with status 1.
+pub fn raise_system_exit(code: *mut PyObject) -> *mut PyObject {
+    match ensure_runtime_for_exc() {
+        Ok(()) => match super::with_runtime(|runtime| {
+            raise_builtin_value(runtime, ExceptionKind::SystemExit, code, "SystemExit".to_owned())
+        }) {
+            Some(result) => result,
+            None => super::return_null_with_error("runtime is not initialized"),
+        },
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
+/// Consume a pending `SystemExit` and map it to a process exit status
+/// (CPython `sys.exit` semantics): a `None`/absent `.code` → 0, an int → that
+/// value, any other object → 1 after printing its `str()` to stderr.  Returns
+/// `None` when the pending exception is not a `SystemExit`, leaving it in place
+/// for the normal uncaught-error report.
+pub fn take_pending_system_exit() -> Option<i32> {
+    if !pending_exception_is("SystemExit") {
+        return None;
+    }
+    let code = pending_exception_object()
+        .map(|exc| unsafe { (*exc.cast::<PyBaseException>()).message })
+        .unwrap_or(ptr::null_mut());
+    let status = system_exit_status(code);
+    pon_err_clear();
+    Some(status)
+}
+
+/// Maps a `SystemExit.code` payload to a process exit status.
+fn system_exit_status(code: *mut PyObject) -> i32 {
+    let raw = crate::tag::untag_arg(code);
+    if raw.is_null() || unsafe { crate::types::dict::type_name(raw) } == Some("NoneType") {
+        return 0;
+    }
+    use num_traits::ToPrimitive;
+    if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(raw) }.and_then(|v| v.to_i64()) {
+        return value as i32;
+    }
+    let text = unsafe { crate::types::type_::unicode_text(raw) }
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::native::builtins_mod::repr_text(raw));
+    eprintln!("{text}");
+    1
+}
+
 fn raise_message_exception(kind: ExceptionKind, ptr: *const u8, len: usize) -> *mut PyObject {
     let bytes = match bytes_from_raw(ptr, len) {
         Ok(bytes) => bytes,
