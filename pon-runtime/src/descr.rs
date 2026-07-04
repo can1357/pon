@@ -1061,6 +1061,9 @@ unsafe fn type_subclasses_method(cls: *mut PyObject) -> *mut PyObject {
 /// `cls.mro()` support: the `type.mro` non-data method, returning the C3
 /// linearization as a fresh LIST (CPython returns a list; `__mro__` is the
 /// tuple).  meson's `interpreterbase.baseobjects` walks `cls.mro()[1:]`.
+/// On the metatype itself the UNBOUND function is served so `type.mro(A)`
+/// passes `A` as the receiver argument, matching CPython's descriptor
+/// protocol for methods accessed on their defining class.
 unsafe fn type_mro_method(cls: *mut PyObject) -> *mut PyObject {
     let function = unsafe {
         abi::pon_make_function(
@@ -1072,6 +1075,9 @@ unsafe fn type_mro_method(cls: *mut PyObject) -> *mut PyObject {
     if function.is_null() {
         return ptr::null_mut();
     }
+    if cls.cast::<PyType>() == abi::runtime_type_type() {
+        return function;
+    }
     match crate::types::method::new_bound_method(function, cls) {
         Ok(method) => method.cast::<PyObject>(),
         Err(message) => raise_attr_error(message),
@@ -1079,12 +1085,15 @@ unsafe fn type_mro_method(cls: *mut PyObject) -> *mut PyObject {
 }
 
 unsafe extern "C" fn type_mro_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    if argv.is_null() || argc != 1 {
-        return raise_attr_error("mro() takes no arguments");
+    if argv.is_null() || argc == 0 {
+        return raise_attr_error("unbound method type.mro() needs an argument");
     }
-    let cls = unsafe { *argv };
+    if argc != 1 {
+        return raise_attr_error(&format!("mro() takes no arguments ({} given)", argc - 1));
+    }
+    let cls = crate::tag::untag_arg(unsafe { *argv });
     if cls.is_null() || unsafe { !is_type_object(cls) } {
-        return raise_attr_error("mro receiver must be a class");
+        return raise_attr_error("descriptor 'mro' requires a 'type' object");
     }
     let mut entries = unsafe { mro::mro_entries(cls.cast::<PyType>()) }
         .into_iter()

@@ -925,28 +925,69 @@ pub const STDLIB_PATH_ENV_VAR: &str = "PON_STDLIB_PATH";
 const VENDORED_STDLIB_SUFFIX: &str = "pon-conformance/vendor/cpython-3.14/Lib";
 
 fn search_roots() -> Vec<PathBuf> {
+    let defaults = default_search_roots();
+    let mut roots = Vec::with_capacity(defaults.len());
+    append_unique_roots(&mut roots, live_sys_path_extra_roots(&defaults));
+    append_unique_roots(&mut roots, defaults);
+    roots
+}
+
+fn default_search_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    let mut push_root = |root: PathBuf| {
-        if !roots.contains(&root) {
-            roots.push(root);
-        }
-    };
-    if let Ok(cwd) = env::current_dir() {
-        push_root(cwd.clone());
-        push_root(cwd.join(".pon").join("packages").join("site-packages"));
-        push_root(cwd.join("pon-conformance").join("corpus"));
-    }
     for var in ["PONPATH", "PON_IMPORT_PATH"] {
         if let Ok(extra) = env::var(var) {
-            for root in env::split_paths(&extra) {
-                push_root(root);
-            }
+            append_unique_roots(&mut roots, env::split_paths(&extra));
         }
     }
+    if let Ok(cwd) = env::current_dir() {
+        append_unique_root(&mut roots, cwd.clone());
+        append_unique_root(&mut roots, cwd.join(".pon").join("packages").join("site-packages"));
+        append_unique_root(&mut roots, cwd.join("pon-conformance").join("corpus"));
+    }
     if let Some(stdlib) = vendored_stdlib_root() {
-        push_root(stdlib);
+        append_unique_root(&mut roots, stdlib);
     }
     roots
+}
+
+fn live_sys_path_extra_roots(default_roots: &[PathBuf]) -> Vec<PathBuf> {
+    let Some(path) = module_attr(intern("sys"), intern("path")) else {
+        return Vec::new();
+    };
+    let Some(items) = sequence_items(path) else {
+        return Vec::new();
+    };
+
+    let mut roots = Vec::new();
+    for item in items {
+        // SAFETY: The snapshot contains live list/tuple elements; non-exact
+        // strings are ignored rather than dispatched through Python code while
+        // resolving imports.
+        let Some(text) = (unsafe { exact_str_text(item) }) else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        let root = PathBuf::from(text);
+        if default_roots.contains(&root) {
+            continue;
+        }
+        append_unique_root(&mut roots, root);
+    }
+    roots
+}
+
+fn append_unique_roots(roots: &mut Vec<PathBuf>, candidates: impl IntoIterator<Item = PathBuf>) {
+    for root in candidates {
+        append_unique_root(roots, root);
+    }
+}
+
+fn append_unique_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
+    if !roots.contains(&root) {
+        roots.push(root);
+    }
 }
 
 /// Resolves the vendored-stdlib root, always LAST in import resolution order
@@ -976,8 +1017,9 @@ fn vendored_stdlib_root() -> Option<PathBuf> {
 }
 
 /// Ordered source-import roots the runtime consults for pure-Python modules:
-/// current directory, installed packages, the conformance corpus,
-/// `PONPATH`/`PON_IMPORT_PATH` entries, then the vendored stdlib last.
+/// live `sys.path` insertions, `PONPATH`/`PON_IMPORT_PATH` entries (the CLI
+/// prepends the script directory), current directory, installed packages, the
+/// conformance corpus, then the vendored stdlib last.
 /// Exposed so AoT reachability resolves static imports with exactly the
 /// runtime's search order and embeds what the runtime would otherwise have to
 /// source-load.
