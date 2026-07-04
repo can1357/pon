@@ -1057,6 +1057,16 @@ pub(crate) unsafe fn try_inplace_binary(op: u8, a: *mut PyObject, b: *mut PyObje
         SlotOutcome::Error => return Some(ptr::null_mut()),
         SlotOutcome::Missing | SlotOutcome::NotImplemented => {}
     }
+    // CPython `binary_iop1`'s sequence leg: `+=` consults
+    // `sq_inplace_concat` (list extend-in-place) after the numeric slot.
+    if op == BINARY_ADD {
+        let slot = unsafe { (*ty).tp_as_sequence.as_ref().and_then(|methods| methods.sq_inplace_concat) };
+        match unsafe { call_binary_slot(slot, a, b) } {
+            SlotOutcome::Value(value) => return Some(value),
+            SlotOutcome::Error => return Some(ptr::null_mut()),
+            SlotOutcome::Missing | SlotOutcome::NotImplemented => {}
+        }
+    }
     if let Some(name) = inplace_dunder_name(op) {
         match unsafe { call_binary_dunder(ty, name, a, b) } {
             SlotOutcome::Value(value) => return Some(value),

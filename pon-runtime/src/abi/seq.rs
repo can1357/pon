@@ -59,7 +59,7 @@ fn list_type() -> *mut PyType {
             sq_item: Some(list_item_slot),
             sq_ass_item: Some(list_ass_item_slot),
             sq_contains: Some(list_contains_slot),
-            sq_inplace_concat: None,
+            sq_inplace_concat: Some(list_inplace_concat_slot),
             sq_inplace_repeat: None,
             sq_iter: Some(seq_iter_slot),
             sq_iternext: None,
@@ -1350,6 +1350,23 @@ unsafe extern "C" fn list_extend_method(argv: *mut *mut PyObject, argc: usize) -
     })
 }
 
+/// `sq_inplace_concat`: CPython `list_inplace_concat` — extend the receiver
+/// with ANY iterable and return the SAME object (`x += (2,)` works where
+/// binary `+` demands a list operand).  Consulted by `try_inplace_binary`
+/// before the plain binary path, mirroring `binary_iop1`.
+unsafe extern "C" fn list_inplace_concat_slot(receiver: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    let values = match sequence_to_vec(other) {
+        Ok(values) => values,
+        Err(message) => return raise_seq_type_error(message),
+    };
+    for value in values {
+        if let Err(message) = list_append_raw(receiver, value) {
+            return raise_seq_stream_error(message);
+        }
+    }
+    receiver
+}
+
 unsafe extern "C" fn list_sort_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let args = match method_args(argv, argc, "list.sort") {
         Ok(args) => args,
@@ -1766,14 +1783,27 @@ unsafe extern "C" fn tuple_concat_slot(left: *mut PyObject, right: *mut PyObject
 }
 
 unsafe extern "C" fn list_concat_slot(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    if !is_list(left) || !is_list(right) {
-        return raise_seq_type_error("can only concatenate list to list");
+    // CPython `list_concat` accepts any list-layout operand (subclass
+    // instances included, via `PyList_Check`); the result is an exact list.
+    let Some(left_cells) = (unsafe { list_cells_ptr(left) }) else {
+        let name = unsafe { crate::types::dict::type_name(left) }.unwrap_or("object");
+        return raise_seq_type_error(format!("can only concatenate list (not \"{name}\") to list"));
+    };
+    let Some(right_cells) = (unsafe { list_cells_ptr(right) }) else {
+        let name = unsafe { crate::types::dict::type_name(right) }.unwrap_or("object");
+        return raise_seq_type_error(format!("can only concatenate list (not \"{name}\") to list"));
+    };
+    // Sequential shared reads: `left is right` (`a + a`) must not alias two
+    // mutable borrows of the same storage.
+    let mut values;
+    {
+        // SAFETY: `list_cells_ptr` proved the storage layout.
+        let left_items = unsafe { (*left_cells).as_slice() };
+        values = Vec::with_capacity(left_items.len().saturating_add(unsafe { (*right_cells).as_slice() }.len()));
+        values.extend_from_slice(left_items);
     }
-    let left_items = unsafe { (&*left.cast::<PyList>()).as_slice() };
-    let right_items = unsafe { (&*right.cast::<PyList>()).as_slice() };
-    let mut values = Vec::with_capacity(left_items.len().saturating_add(right_items.len()));
-    values.extend_from_slice(left_items);
-    values.extend_from_slice(right_items);
+    // SAFETY: `list_cells_ptr` proved the storage layout.
+    values.extend_from_slice(unsafe { (*right_cells).as_slice() });
     match with_runtime(|runtime| alloc_list_from_slice(runtime, &values)) {
         Some(Ok(object)) => object,
         Some(Err(message)) => return_null_with_error(message),
@@ -1933,6 +1963,8 @@ pub(crate) fn ensure_list_type_methods_installed(ty: *mut PyType) {
         ("__delitem__", list_dunder_delitem as *const u8),
         ("__iter__", list_dunder_iter as *const u8),
         ("__contains__", list_dunder_contains as *const u8),
+        ("__add__", list_dunder_add as *const u8),
+        ("__iadd__", list_dunder_iadd as *const u8),
         ("__eq__", list_dunder_eq as *const u8),
         ("__ne__", list_dunder_ne as *const u8),
         ("__lt__", list_dunder_lt as *const u8),
@@ -2581,6 +2613,54 @@ unsafe extern "C" fn list_dunder_gt(argv: *mut *mut PyObject, argc: usize) -> *m
 
 unsafe extern "C" fn list_dunder_ge(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     unsafe { list_dunder_compare(argv, argc, "list.__ge__", RICH_GE) }
+}
+
+/// `list.__add__(self, other)`: dunder seam for the concat slot, so
+/// list-SUBCLASS instances (whose heap types carry no `sq_concat`) resolve
+/// `+` through MRO lookup exactly like CPython's inherited `list.__add__`.
+unsafe extern "C" fn list_dunder_add(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.__add__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_list_method_receiver(args, "__add__") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        if args.len() != 2 {
+            return raise_seq_type_error(format!("list.__add__ expected 1 argument, got {}", args.len().saturating_sub(1)));
+        }
+        let other = crate::tag::untag_arg(args[1]);
+        if other.is_null() {
+            return ptr::null_mut();
+        }
+        unsafe { list_concat_slot(receiver, other) }
+    })
+}
+
+/// `list.__iadd__(self, iterable)`: in-place extend with ANY iterable and
+/// return the receiver (CPython `list_inplace_concat`); the dunder seam
+/// gives list-subclass instances `+=` through MRO lookup.
+unsafe extern "C" fn list_dunder_iadd(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    catch_object_helper(|| {
+        let args = match method_args(argv, argc, "list.__iadd__") {
+            Ok(args) => args,
+            Err(message) => return return_null_with_error(message),
+        };
+        let receiver = match ensure_list_method_receiver(args, "__iadd__") {
+            Ok(receiver) => receiver,
+            Err(raised) => return raised,
+        };
+        if args.len() != 2 {
+            return raise_seq_type_error(format!("list.__iadd__ expected 1 argument, got {}", args.len().saturating_sub(1)));
+        }
+        let extended = unsafe { list_extend_method(argv, argc) };
+        if extended.is_null() {
+            return ptr::null_mut();
+        }
+        receiver
+    })
 }
 
 /// `list.__repr__(self)`: Python list display over the embedded storage.
