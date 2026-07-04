@@ -30,9 +30,11 @@ mod csv_;
 mod errno;
 mod fcntl_;
 mod gc;
+mod hashes;
 pub(crate) mod imp;
 pub(crate) mod io;
 pub(crate) mod itertools;
+mod lsprof;
 mod math;
 mod opcode_;
 mod packaging_compat;
@@ -41,6 +43,8 @@ pub(crate) mod pickle;
 mod posix;
 mod posixsubprocess;
 mod random_;
+#[cfg(target_os = "macos")]
+mod scproxy;
 mod select;
 mod sha2;
 pub(crate) mod signal;
@@ -65,6 +69,7 @@ mod zlib;
 /// factories must be self-contained and never rely on another row having run.
 pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>)] = &[
     ("_ast", ast_::make_module),
+    ("_blake2", hashes::make_blake2_module),
     ("_codecs", codecs::make_module),
     ("_collections", collections::make_module),
     ("_colorize", colorize::make_module),
@@ -72,11 +77,17 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
     ("_csv", csv_::make_module),
     ("_imp", imp::make_module),
     ("_io", io::make_module),
+    ("_lsprof", lsprof::make_module),
+    ("_md5", hashes::make_md5_module),
     ("_opcode", opcode_::make_module),
     ("_pickle", pickle::make_module),
     ("_posixsubprocess", posixsubprocess::make_module),
     ("_random", random_::make_module),
+    #[cfg(target_os = "macos")]
+    ("_scproxy", scproxy::make_module),
+    ("_sha1", hashes::make_sha1_module),
     ("_sha2", sha2::make_module),
+    ("_sha3", hashes::make_sha3_module),
     ("_signal", signal::make_module),
     ("_socket", socket_::make_module),
     ("_sre", sre::make_module),
