@@ -28,6 +28,7 @@ mod colorize;
 pub(crate) mod contextvars;
 mod csv_;
 mod errno;
+mod fcntl_;
 mod gc;
 pub(crate) mod imp;
 pub(crate) mod io;
@@ -95,6 +96,7 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
     ("binascii", binascii::make_module),
     ("builtins", builtins_mod::make_module),
     ("errno", errno::make_module),
+    ("fcntl", fcntl_::make_module),
     ("gc", gc::make_module),
     ("itertools", itertools::make_module),
     ("marshal", imp::make_marshal_module),
