@@ -1,0 +1,7 @@
+def f(a, b=0, *args, **kw): return (a, b, args, kw)
+print(f(1, b=2))
+print(f(1))
+print(f(1, 2, 3, 4, x=5))
+def g(a, *args): return (a, args)
+print(g(1))
+print(g(a=1))

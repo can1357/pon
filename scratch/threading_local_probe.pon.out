@@ -1,0 +1,11 @@
+start_hasattr False
+getattr_default fallback
+plain_set first
+plain_overwrite second
+thread_results [('alpha', False, 'alpha'), ('beta', False, 'beta')]
+main_after_threads second
+after_del_hasattr False
+after_del_getattr fallback_after_del
+after_del AttributeError
+del_missing AttributeError
+fresh_thread_hasattr False

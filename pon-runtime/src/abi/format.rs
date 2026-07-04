@@ -1551,14 +1551,6 @@ pub(crate) unsafe fn percent_format(format: *mut PyObject, args: *mut PyObject) 
         out.push_str(&rendered);
     }
     if !arg_is_mapping && state.leftover() {
-        // TEMP-DBG: remove before finishing.
-        eprintln!(
-            "PON-DBG percent leftover: fmt={:?} args_type={} argidx={} arglen={}",
-            chars.iter().collect::<String>(),
-            type_name(args),
-            state.argidx,
-            state.arglen
-        );
         return raise_percent_type_error("not all arguments converted during string formatting");
     }
     match boxed_str(&out) {

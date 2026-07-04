@@ -1,0 +1,13 @@
+import subprocess
+r = subprocess.run(['cat'], input=b'hello', capture_output=True)
+print(r.returncode, r.stdout)
+r2 = subprocess.run(['tr', 'a-z', 'A-Z'], input='abc', capture_output=True, text=True)
+print(r2.returncode, r2.stdout)
+p3 = subprocess.Popen(['cat'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+out, _ = p3.communicate(b'xyz')
+print(p3.returncode, out)
+big = b'x' * (70 * 1024 + 3)
+r4 = subprocess.run(['cat'], input=big, capture_output=True)
+print(r4.returncode, len(r4.stdout), r4.stdout == big)
+r5 = subprocess.run(['cat'], input='a\r\nb\rc\n', capture_output=True, text=True)
+print(r5.returncode, repr(r5.stdout))
