@@ -44,6 +44,7 @@ use std::sync::{Condvar, LazyLock, Mutex, MutexGuard};
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 
 use pon_gc::{GcTypeInfo, Heap, RootSource, TypeId};
+use num_traits::ToPrimitive;
 
 use crate::builtins as runtime_builtins;
 use crate::intern::resolve;
@@ -2488,24 +2489,267 @@ unsafe extern "C" fn object_dunder_format_native(argv: *mut *mut PyObject, argc:
     unsafe { pon_const_str(text.as_ptr(), text.len()) }
 }
 
-/// `object.__reduce_ex__(self, protocol)` — placeholder terminus so class
-/// machinery (enum) can identity-compare and reassign it; pickling itself is
-/// not implemented.
-unsafe extern "C" fn object_dunder_reduce_ex_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    let receiver = match unsafe { native_receiver_arg(argv, argc, "__reduce_ex__") } {
-        Ok(receiver) => receiver,
-        Err(error) => return error,
-    };
-    let message = format!("cannot pickle '{}' object", unsafe { object_type_name_for_error(receiver) });
-    unsafe { exc::pon_raise_type_error(message.as_ptr(), message.len()) }
-}
-
 unsafe fn object_type_name_for_error(object: *mut PyObject) -> &'static str {
     if object.is_null() {
         return "object";
     }
     let ty = unsafe { (*object).ob_type };
     if ty.is_null() { "object" } else { unsafe { (*ty).name() } }
+}
+
+/// `object.__reduce_ex__(self, protocol)` — CPython's protocol-2+ default
+/// reducer for Python heap instances.  The pure-Python `pickle.py` pickler is
+/// authoritative in pon; this method supplies the object-level reduce tuple it
+/// expects for ordinary user classes.
+unsafe extern "C" fn object_dunder_reduce_ex_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let receiver = match unsafe { native_receiver_arg(argv, argc, "__reduce_ex__") } {
+        Ok(receiver) => receiver,
+        Err(error) => return error,
+    };
+    if argc < 2 {
+        return return_null_with_type_error("object.__reduce_ex__() takes exactly one argument");
+    }
+    let protocol = match unsafe { protocol_number(*argv.add(1)) } {
+        Ok(protocol) => protocol,
+        Err(error) => return error,
+    };
+    unsafe { object_reduce_ex(receiver, *argv.add(1), protocol) }
+}
+
+/// `object.__getstate__(self)` — default instance state for pickle/copy.
+unsafe extern "C" fn object_dunder_getstate_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let receiver = match unsafe { native_receiver_arg(argv, argc, "__getstate__") } {
+        Ok(receiver) => receiver,
+        Err(error) => return error,
+    };
+    unsafe { object_default_getstate(receiver) }
+}
+
+unsafe fn protocol_number(object: *mut PyObject) -> Result<i64, *mut PyObject> {
+    let Some(value) = (unsafe { int::to_bigint_including_bool(object) }) else {
+        return Err(return_null_with_type_error("protocol must be an integer"));
+    };
+    value
+        .to_i64()
+        .ok_or_else(|| return_null_with_type_error("protocol must fit in a C integer"))
+}
+
+unsafe fn object_reduce_ex(receiver: *mut PyObject, protocol_object: *mut PyObject, protocol: i64) -> *mut PyObject {
+    if protocol < 2 {
+        return unsafe { call_copyreg_reduce_ex(receiver, protocol_object) };
+    }
+    if let Some(result) = unsafe { call_reduce_override(receiver) } {
+        return result;
+    }
+    let Some(newobj) = (unsafe { copyreg_attr("__newobj__") }) else {
+        return ptr::null_mut();
+    };
+    let Some(newobj_ex) = (unsafe { copyreg_attr("__newobj_ex__") }) else {
+        return ptr::null_mut();
+    };
+    let cls = unsafe { (*receiver).ob_type.cast_mut().cast::<PyObject>() };
+    let (func, newargs) = match unsafe { reduce_newargs(receiver, cls, newobj, newobj_ex) } {
+        Ok(parts) => parts,
+        Err(error) => return error,
+    };
+    let state = match unsafe { call_getstate(receiver) } {
+        Ok(state) => state,
+        Err(error) => return error,
+    };
+    let none = unsafe { pon_none() };
+    if none.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { tuple_or_error(&[func, newargs, state, none, none]) }
+}
+
+unsafe fn call_copyreg_reduce_ex(receiver: *mut PyObject, protocol_object: *mut PyObject) -> *mut PyObject {
+    let Some(reduce_ex) = (unsafe { copyreg_attr("_reduce_ex") }) else {
+        return ptr::null_mut();
+    };
+    let mut args = [receiver, protocol_object];
+    unsafe { pon_call(reduce_ex, args.as_mut_ptr(), args.len()) }
+}
+
+unsafe fn call_reduce_override(receiver: *mut PyObject) -> Option<*mut PyObject> {
+    let name = crate::intern::intern("__reduce__");
+    let cls = unsafe { (*receiver).ob_type.cast_mut() };
+    let descriptor = unsafe { crate::descr::lookup_in_type(cls, name) };
+    if descriptor.is_null() {
+        return None;
+    }
+    let method = unsafe { pon_get_attr(receiver, name, ptr::null_mut()) };
+    if method.is_null() {
+        return Some(ptr::null_mut());
+    }
+    Some(unsafe { pon_call(method, ptr::null_mut(), 0) })
+}
+
+unsafe fn reduce_newargs(
+    receiver: *mut PyObject,
+    cls: *mut PyObject,
+    newobj: *mut PyObject,
+    newobj_ex: *mut PyObject,
+) -> Result<(*mut PyObject, *mut PyObject), *mut PyObject> {
+    if let Some(method) = unsafe { optional_attr(receiver, "__getnewargs_ex__") }? {
+        let pair = unsafe { pon_call(method, ptr::null_mut(), 0) };
+        if pair.is_null() {
+            return Err(ptr::null_mut());
+        }
+        let Some(items) = (unsafe { seq::exact_tuple_slice(pair) }) else {
+            return Err(return_null_with_type_error("__getnewargs_ex__ should return a tuple, not a non-tuple"));
+        };
+        if items.len() != 2 {
+            return Err(return_null_with_type_error("__getnewargs_ex__ should return a tuple of length 2"));
+        }
+        if unsafe { seq::exact_tuple_slice(items[0]) }.is_none() {
+            return Err(return_null_with_type_error("first item of the tuple returned by __getnewargs_ex__ must be a tuple"));
+        }
+        if unsafe { !crate::types::dict::is_dict(items[1]) } {
+            return Err(return_null_with_type_error("second item of the tuple returned by __getnewargs_ex__ must be a dict"));
+        }
+        let args = unsafe { tuple_or_error(&[cls, items[0], items[1]]) };
+        if args.is_null() {
+            return Err(ptr::null_mut());
+        }
+        return Ok((newobj_ex, args));
+    }
+    if let Some(method) = unsafe { optional_attr(receiver, "__getnewargs__") }? {
+        let args_object = unsafe { pon_call(method, ptr::null_mut(), 0) };
+        if args_object.is_null() {
+            return Err(ptr::null_mut());
+        }
+        let Some(items) = (unsafe { seq::exact_tuple_slice(args_object) }) else {
+            return Err(return_null_with_type_error("__getnewargs__ should return a tuple"));
+        };
+        let mut values = Vec::with_capacity(items.len() + 1);
+        values.push(cls);
+        values.extend_from_slice(items);
+        let args = unsafe { tuple_or_error(&values) };
+        if args.is_null() {
+            return Err(ptr::null_mut());
+        }
+        return Ok((newobj, args));
+    }
+    let args = unsafe { tuple_or_error(&[cls]) };
+    if args.is_null() {
+        return Err(ptr::null_mut());
+    }
+    Ok((newobj, args))
+}
+
+unsafe fn call_getstate(receiver: *mut PyObject) -> Result<*mut PyObject, *mut PyObject> {
+    let Some(method) = (unsafe { optional_attr(receiver, "__getstate__") })? else {
+        let state = unsafe { object_default_getstate(receiver) };
+        return if state.is_null() { Err(ptr::null_mut()) } else { Ok(state) };
+    };
+    let state = unsafe { pon_call(method, ptr::null_mut(), 0) };
+    if state.is_null() { Err(ptr::null_mut()) } else { Ok(state) }
+}
+
+unsafe fn optional_attr(object: *mut PyObject, name: &str) -> Result<Option<*mut PyObject>, *mut PyObject> {
+    let name = crate::intern::intern(name);
+    let value = unsafe { pon_get_attr(object, name, ptr::null_mut()) };
+    if !value.is_null() {
+        return Ok(Some(value));
+    }
+    if exc::pending_exception_is("AttributeError") {
+        pon_err_clear();
+        Ok(None)
+    } else {
+        Err(ptr::null_mut())
+    }
+}
+
+unsafe fn object_default_getstate(receiver: *mut PyObject) -> *mut PyObject {
+    let none = unsafe { pon_none() };
+    if none.is_null() {
+        return ptr::null_mut();
+    }
+    let Some(instance) = (unsafe { heap_instance_prefix(receiver) }) else {
+        return none;
+    };
+    let dict_state = unsafe { instance_dict_state(instance, none) };
+    if dict_state.is_null() {
+        return ptr::null_mut();
+    }
+    let slot_state = unsafe { instance_slot_state(instance, none) };
+    if slot_state.is_null() {
+        return ptr::null_mut();
+    }
+    if slot_state != none {
+        return unsafe { tuple_or_error(&[dict_state, slot_state]) };
+    }
+    dict_state
+}
+
+unsafe fn heap_instance_prefix(object: *mut PyObject) -> Option<*mut type_::PyHeapInstance> {
+    if object.is_null() || !crate::tag::is_heap(object) {
+        return None;
+    }
+    let ty = unsafe { (*object).ob_type.cast_mut() };
+    if ty.is_null() || unsafe { (*ty).gc_type_id != type_::TYPE_ID_HEAP_INSTANCE.0 as usize } {
+        return None;
+    }
+    Some(object.cast::<type_::PyHeapInstance>())
+}
+
+unsafe fn instance_dict_state(instance: *mut type_::PyHeapInstance, none: *mut PyObject) -> *mut PyObject {
+    let dict = unsafe { (*instance).dict };
+    if dict.is_null() {
+        return none;
+    }
+    unsafe { namespace_entries_state((&*dict).iter(), none) }
+}
+
+unsafe fn instance_slot_state(instance: *mut type_::PyHeapInstance, none: *mut PyObject) -> *mut PyObject {
+    let pairs = unsafe {
+        (*instance)
+            .slots
+            .iter()
+            .filter_map(|slot| (!slot.value.is_null()).then_some((slot.name, slot.value)))
+    };
+    unsafe { namespace_entries_state(pairs, none) }
+}
+
+unsafe fn namespace_entries_state<I>(entries: I, none: *mut PyObject) -> *mut PyObject
+where
+    I: IntoIterator<Item = (u32, *mut PyObject)>,
+{
+    let mut items = Vec::new();
+    for (name, value) in entries {
+        let Some(spelling) = resolve(name) else {
+            return return_null_with_error(format!("instance state name id {name} is not interned"));
+        };
+        let key = unsafe { pon_const_str(spelling.as_ptr(), spelling.len()) };
+        if key.is_null() {
+            return ptr::null_mut();
+        }
+        items.push(key);
+        items.push(value);
+    }
+    if items.is_empty() {
+        return none;
+    }
+    unsafe { crate::abi::map::pon_build_map(items.as_mut_ptr(), items.len() / 2) }
+}
+
+unsafe fn copyreg_attr(name: &str) -> Option<*mut PyObject> {
+    let module_name = crate::intern::intern("copyreg");
+    let module = unsafe { crate::import::pon_import_name(module_name, ptr::null(), 0, 0) };
+    if module.is_null() {
+        return None;
+    }
+    let value = unsafe { pon_get_attr(module, crate::intern::intern(name), ptr::null_mut()) };
+    (!value.is_null()).then_some(value)
+}
+
+unsafe fn tuple_or_error(values: &[*mut PyObject]) -> *mut PyObject {
+    match with_runtime(|runtime| seq::alloc_tuple_from_slice(runtime, values)) {
+        Some(Ok(tuple)) => tuple,
+        Some(Err(message)) => return_null_with_error(message),
+        None => return_null_with_error("runtime is not initialized"),
+    }
 }
 
 unsafe extern "C" fn object_dunder_setattr_native(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -2551,16 +2795,17 @@ unsafe extern "C" fn object_dunder_delattr_native(argv: *mut *mut PyObject, argc
 }
 
 /// Default dunder surface on `object`'s dict: `__repr__`/`__str__`/
-/// `__format__`/`__reduce_ex__`/`__init__` as plain functions (unbound on
-/// class access, bound on instance access), plus a staticmethod-wrapped
-/// `__new__` allocator, the MRO terminus class machinery like enum's
-/// `EnumType.__new__`/`_find_new_` identity-compares against.
+/// `__format__`/`__reduce_ex__`/`__getstate__`/`__init__` as plain functions
+/// (unbound on class access, bound on instance access), plus a
+/// staticmethod-wrapped `__new__` allocator, the MRO terminus class machinery
+/// like enum's `EnumType.__new__`/`_find_new_` identity-compares against.
 fn install_object_dunders(runtime: &mut Runtime, object_type: *mut PyType) {
-    let entries: [(&str, *const u8); 7] = [
+    let entries: [(&str, *const u8); 8] = [
         ("__repr__", object_dunder_repr_native as *const u8),
         ("__str__", object_dunder_str_native as *const u8),
         ("__format__", object_dunder_format_native as *const u8),
         ("__reduce_ex__", object_dunder_reduce_ex_native as *const u8),
+        ("__getstate__", object_dunder_getstate_native as *const u8),
         ("__init__", object_dunder_init_native as *const u8),
         ("__setattr__", object_dunder_setattr_native as *const u8),
         ("__delattr__", object_dunder_delattr_native as *const u8),
@@ -3313,7 +3558,10 @@ fn ensure_runtime_initialized() -> Result<(), String> {
 /// instead of panicking or returning a non-NULL placeholder.
 #[inline]
 pub fn return_null_with_error(message: impl Into<String>) -> *mut PyObject {
-    pon_err_set(message);
+    let message = message.into();
+    if !exc::raise_prefixed_diagnostic_text(&message) {
+        pon_err_set(message);
+    }
     ptr::null_mut()
 }
 #[inline]
@@ -3327,7 +3575,10 @@ pub fn return_null_with_type_error(message: impl AsRef<str>) -> *mut PyObject {
 /// distinguish errors from ordinary `0`/positive results.
 #[inline]
 pub fn return_minus_one_with_error(message: impl Into<String>) -> i32 {
-    pon_err_set(message);
+    let message = message.into();
+    if !exc::raise_prefixed_diagnostic_text(&message) {
+        pon_err_set(message);
+    }
     -1
 }
 
@@ -4268,6 +4519,9 @@ unsafe fn build_class_with_body(
             orig_bases: scope.orig_bases,
         }
     };
+    if unsafe { seed_class_body_module(frame) }.is_null() {
+        return ptr::null_mut();
+    }
     if with_runtime(|runtime| runtime.class_namespace_stack.push(frame)).is_none() {
         return return_null_with_error("runtime is not initialized");
     }
@@ -4339,6 +4593,43 @@ unsafe fn class_mapping_key(name_interned: u32) -> *mut PyObject {
         return return_null_with_error(format!("name id {name_interned} is not interned"));
     };
     unsafe { pon_const_str(spelling.as_ptr(), spelling.len()) }
+}
+
+/// Seed the compiler-provided `__module__ = __name__` class-body binding.
+unsafe fn seed_class_body_module(frame: ClassBodyFrame) -> *mut PyObject {
+    let name = current_class_module_name();
+    let value = unsafe { pon_const_str(name.as_ptr(), name.len()) };
+    if value.is_null() {
+        return ptr::null_mut();
+    }
+    let module_id = crate::intern::intern("__module__");
+    if frame.mapping.is_null() {
+        unsafe { (&mut *frame.namespace).set(module_id, value) };
+        value
+    } else {
+        let key = unsafe { class_mapping_key(module_id) };
+        if key.is_null() {
+            return ptr::null_mut();
+        }
+        unsafe { map::pon_subscript_set(frame.mapping, key, value) }
+    }
+}
+
+fn current_class_module_name() -> String {
+    let name_id = crate::intern::intern("__name__");
+    if let Some((module_name, module_object)) = current_global_module_context() {
+        if !module_object.is_null() {
+            if let Some(name) = crate::import::module_object_attr(module_object, name_id)
+                .and_then(|value| unsafe { type_::unicode_text(value).map(str::to_owned) })
+            {
+                return name;
+            }
+        }
+        if let Some(name) = resolve(module_name) {
+            return name;
+        }
+    }
+    "__main__".to_owned()
 }
 
 /// True when the pending exception state allows a name-lookup fallthrough:
