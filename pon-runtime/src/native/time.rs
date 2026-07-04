@@ -2,9 +2,22 @@
 
 use crate::abi::{pon_const_int, pon_const_str, pon_make_function, return_null_with_error};
 use crate::intern::intern;
-use crate::object::PyObject;
+use crate::object::{PyObject, PyObjectHeader, PyType};
 
 use super::install_module;
+unsafe extern "C" {
+    fn tzset();
+}
+
+
+const CLOCK_REALTIME_ID: i64 = 0;
+const CLOCK_MONOTONIC_RAW_ID: i64 = 4;
+const CLOCK_MONOTONIC_RAW_APPROX_ID: i64 = 5;
+const CLOCK_MONOTONIC_ID: i64 = 6;
+const CLOCK_UPTIME_RAW_ID: i64 = 8;
+const CLOCK_UPTIME_RAW_APPROX_ID: i64 = 9;
+const CLOCK_PROCESS_CPUTIME_ID_VALUE: i64 = 12;
+const CLOCK_THREAD_CPUTIME_ID_VALUE: i64 = 16;
 
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
     let attrs = [
@@ -13,18 +26,40 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         tzname_attr(),
         int_attr("daylight", 0),
         int_attr("altzone", 0),
+        int_attr("CLOCK_REALTIME", CLOCK_REALTIME_ID),
+        int_attr("CLOCK_MONOTONIC", CLOCK_MONOTONIC_ID),
+        int_attr("CLOCK_MONOTONIC_RAW", CLOCK_MONOTONIC_RAW_ID),
+        int_attr("CLOCK_MONOTONIC_RAW_APPROX", CLOCK_MONOTONIC_RAW_APPROX_ID),
+        int_attr("CLOCK_PROCESS_CPUTIME_ID", CLOCK_PROCESS_CPUTIME_ID_VALUE),
+        int_attr("CLOCK_THREAD_CPUTIME_ID", CLOCK_THREAD_CPUTIME_ID_VALUE),
+        int_attr("CLOCK_UPTIME_RAW", CLOCK_UPTIME_RAW_ID),
+        int_attr("CLOCK_UPTIME_RAW_APPROX", CLOCK_UPTIME_RAW_APPROX_ID),
+        int_attr("_STRUCT_TM_ITEMS", STRUCT_TIME_FIELDS.len() as i64),
         function_attr("time", time_time),
         function_attr("time_ns", time_time_ns),
         function_attr("sleep", time_sleep),
         function_attr("gmtime", time_gmtime),
         function_attr("localtime", time_localtime),
         function_attr("asctime", time_asctime),
+        function_attr("ctime", time_ctime),
         function_attr("mktime", time_mktime),
         function_attr("strftime", time_strftime),
+        function_attr("strptime", time_strptime),
         function_attr("perf_counter", time_perf_counter),
         function_attr("perf_counter_ns", time_perf_counter_ns),
         function_attr("monotonic", time_monotonic),
         function_attr("monotonic_ns", time_monotonic_ns),
+        function_attr("clock_getres", time_clock_getres),
+        function_attr("clock_gettime", time_clock_gettime),
+        function_attr("clock_gettime_ns", time_clock_gettime_ns),
+        function_attr("clock_settime", time_clock_settime),
+        function_attr("clock_settime_ns", time_clock_settime_ns),
+        function_attr("get_clock_info", time_get_clock_info),
+        function_attr("process_time", time_process_time),
+        function_attr("process_time_ns", time_process_time_ns),
+        function_attr("thread_time", time_thread_time),
+        function_attr("thread_time_ns", time_thread_time_ns),
+        function_attr("tzset", time_tzset),
     ];
     let mut attrs = attrs.into_iter().collect::<Result<Vec<_>, _>>()?;
     // `gmtime`/`localtime` construct instances of this class, so a failure
@@ -126,6 +161,367 @@ unsafe extern "C" fn time_sleep(argv: *mut *mut PyObject, argc: usize) -> *mut P
     std::thread::sleep(std::time::Duration::from_secs_f64(seconds));
     // SAFETY: Singleton accessor.
     unsafe { crate::abi::pon_none() }
+}
+
+fn last_errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+}
+
+fn raise_errno(errno: i32) -> *mut PyObject {
+    super::os::raise_errno(errno, None)
+}
+
+fn integer_arg(object: *mut PyObject, what: &str) -> Result<i64, *mut PyObject> {
+    if crate::tag::is_small_int(object) {
+        return Ok(crate::tag::untag_small_int(object));
+    }
+    match unsafe { crate::types::int::to_bigint_including_bool(crate::tag::untag_arg(object)) } {
+        Some(value) => num_traits::ToPrimitive::to_i64(&value).ok_or_else(|| raise_overflow_error(&format!("{what} is too large"))),
+        None => Err(raise_type_error(&format!("{what} must be an integer"))),
+    }
+}
+
+fn number_arg(object: *mut PyObject, what: &str) -> Result<f64, *mut PyObject> {
+    let value = crate::tag::untag_arg(object);
+    if value.is_null() {
+        return Err(core::ptr::null_mut());
+    }
+    if let Some(seconds) = unsafe { crate::types::float::to_f64(value) } {
+        return Ok(seconds);
+    }
+    unsafe { crate::types::int::to_bigint_including_bool(value) }
+        .and_then(|value| num_traits::ToPrimitive::to_f64(&value))
+        .ok_or_else(|| raise_type_error(&format!("{what} must be a number")))
+}
+
+fn clock_id_arg(object: *mut PyObject) -> Result<libc::clockid_t, *mut PyObject> {
+    integer_arg(object, "clock_id").map(|value| value as libc::clockid_t)
+}
+
+fn timespec_ns(spec: libc::timespec) -> i64 {
+    (spec.tv_sec as i64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(spec.tv_nsec as i64)
+}
+
+fn timespec_seconds(spec: libc::timespec) -> f64 {
+    spec.tv_sec as f64 + spec.tv_nsec as f64 * 1e-9
+}
+
+fn timespec_from_ns(ns: i64) -> libc::timespec {
+    libc::timespec {
+        tv_sec: (ns / 1_000_000_000) as libc::time_t,
+        tv_nsec: (ns % 1_000_000_000) as libc::c_long,
+    }
+}
+
+fn timespec_from_seconds(seconds: f64) -> Result<libc::timespec, *mut PyObject> {
+    if !seconds.is_finite() {
+        return Err(raise_overflow_error("timestamp out of range for platform time_t"));
+    }
+    let whole = seconds.floor();
+    let nanos = ((seconds - whole) * 1e9).round();
+    Ok(libc::timespec {
+        tv_sec: whole as libc::time_t,
+        tv_nsec: nanos as libc::c_long,
+    })
+}
+
+fn clock_gettime_raw(clock_id: libc::clockid_t) -> Result<libc::timespec, *mut PyObject> {
+    let mut spec = std::mem::MaybeUninit::<libc::timespec>::zeroed();
+    if unsafe { libc::clock_gettime(clock_id, spec.as_mut_ptr()) } < 0 {
+        return Err(raise_errno(last_errno()));
+    }
+    Ok(unsafe { spec.assume_init() })
+}
+
+fn clock_getres_raw(clock_id: libc::clockid_t) -> Result<libc::timespec, *mut PyObject> {
+    let mut spec = std::mem::MaybeUninit::<libc::timespec>::zeroed();
+    if unsafe { libc::clock_getres(clock_id, spec.as_mut_ptr()) } < 0 {
+        return Err(raise_errno(last_errno()));
+    }
+    Ok(unsafe { spec.assume_init() })
+}
+
+unsafe extern "C" fn time_clock_gettime(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return raise_type_error(&format!("clock_gettime() takes exactly 1 argument ({argc} given)"));
+    }
+    let clock_id = match clock_id_arg(args[0]) {
+        Ok(clock_id) => clock_id,
+        Err(error) => return error,
+    };
+    match clock_gettime_raw(clock_id) {
+        Ok(spec) => unsafe { crate::abi::number::pon_const_float(timespec_seconds(spec)) },
+        Err(error) => error,
+    }
+}
+
+unsafe extern "C" fn time_clock_gettime_ns(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return raise_type_error(&format!("clock_gettime_ns() takes exactly 1 argument ({argc} given)"));
+    }
+    let clock_id = match clock_id_arg(args[0]) {
+        Ok(clock_id) => clock_id,
+        Err(error) => return error,
+    };
+    match clock_gettime_raw(clock_id) {
+        Ok(spec) => unsafe { pon_const_int(timespec_ns(spec)) },
+        Err(error) => error,
+    }
+}
+
+unsafe extern "C" fn time_clock_getres(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return raise_type_error(&format!("clock_getres() takes exactly 1 argument ({argc} given)"));
+    }
+    let clock_id = match clock_id_arg(args[0]) {
+        Ok(clock_id) => clock_id,
+        Err(error) => return error,
+    };
+    match clock_getres_raw(clock_id) {
+        Ok(spec) => unsafe { crate::abi::number::pon_const_float(timespec_seconds(spec)) },
+        Err(error) => error,
+    }
+}
+
+unsafe extern "C" fn time_clock_settime(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return raise_type_error(&format!("clock_settime() takes exactly 2 arguments ({argc} given)"));
+    }
+    let clock_id = match clock_id_arg(args[0]) {
+        Ok(clock_id) => clock_id,
+        Err(error) => return error,
+    };
+    let seconds = match number_arg(args[1], "time") {
+        Ok(seconds) => seconds,
+        Err(error) => return error,
+    };
+    let spec = match timespec_from_seconds(seconds) {
+        Ok(spec) => spec,
+        Err(error) => return error,
+    };
+    if unsafe { libc::clock_settime(clock_id, &spec) } < 0 {
+        return raise_errno(last_errno());
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn time_clock_settime_ns(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return raise_type_error(&format!("clock_settime_ns() takes exactly 2 arguments ({argc} given)"));
+    }
+    let clock_id = match clock_id_arg(args[0]) {
+        Ok(clock_id) => clock_id,
+        Err(error) => return error,
+    };
+    let ns = match integer_arg(args[1], "time") {
+        Ok(ns) => ns,
+        Err(error) => return error,
+    };
+    let spec = timespec_from_ns(ns);
+    if unsafe { libc::clock_settime(clock_id, &spec) } < 0 {
+        return raise_errno(last_errno());
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn time_process_time(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return raise_type_error(&format!("process_time() takes no arguments ({argc} given)"));
+    }
+    match clock_gettime_raw(CLOCK_PROCESS_CPUTIME_ID_VALUE as libc::clockid_t) {
+        Ok(spec) => unsafe { crate::abi::number::pon_const_float(timespec_seconds(spec)) },
+        Err(error) => error,
+    }
+}
+
+unsafe extern "C" fn time_process_time_ns(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return raise_type_error(&format!("process_time_ns() takes no arguments ({argc} given)"));
+    }
+    match clock_gettime_raw(CLOCK_PROCESS_CPUTIME_ID_VALUE as libc::clockid_t) {
+        Ok(spec) => unsafe { pon_const_int(timespec_ns(spec)) },
+        Err(error) => error,
+    }
+}
+
+unsafe extern "C" fn time_thread_time(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return raise_type_error(&format!("thread_time() takes no arguments ({argc} given)"));
+    }
+    match clock_gettime_raw(CLOCK_THREAD_CPUTIME_ID_VALUE as libc::clockid_t) {
+        Ok(spec) => unsafe { crate::abi::number::pon_const_float(timespec_seconds(spec)) },
+        Err(error) => error,
+    }
+}
+
+unsafe extern "C" fn time_thread_time_ns(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return raise_type_error(&format!("thread_time_ns() takes no arguments ({argc} given)"));
+    }
+    match clock_gettime_raw(CLOCK_THREAD_CPUTIME_ID_VALUE as libc::clockid_t) {
+        Ok(spec) => unsafe { pon_const_int(timespec_ns(spec)) },
+        Err(error) => error,
+    }
+}
+
+unsafe extern "C" fn time_ctime(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() > 1 {
+        return raise_type_error(&format!("ctime() takes at most 1 argument ({argc} given)"));
+    }
+    let seconds = if let Some(&arg) = args.first() {
+        match number_arg(arg, "ctime") {
+            Ok(value) => value,
+            Err(error) => return error,
+        }
+    } else {
+        since_epoch().as_secs_f64()
+    };
+    let fields = utc_fields(seconds);
+    match asctime_text(fields) {
+        Ok(text) => unsafe { pon_const_str(text.as_ptr(), text.len()) },
+        Err(error) => error,
+    }
+}
+
+unsafe extern "C" fn time_tzset(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if argc != 0 {
+        return raise_type_error(&format!("tzset() takes no arguments ({argc} given)"));
+    }
+    unsafe { tzset() };
+    unsafe { crate::abi::pon_none() }
+}
+
+unsafe extern "C" fn time_strptime(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    if !(1..=2).contains(&argc) {
+        return raise_type_error(&format!("strptime() takes 1 or 2 arguments ({argc} given)"));
+    }
+    let module = unsafe { crate::import::pon_import_name(intern("_strptime"), core::ptr::null(), 0, 0) };
+    if module.is_null() {
+        return core::ptr::null_mut();
+    }
+    let entry = unsafe { crate::abi::pon_get_attr(module, intern("_strptime_time"), core::ptr::null_mut()) };
+    if entry.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe { crate::abi::pon_call(entry, argv, argc) }
+}
+
+fn asctime_text(fields: [i64; 9]) -> Result<String, *mut PyObject> {
+    if let Err(error) = check_year_range(fields[0]) {
+        return Err(error);
+    }
+    let tm = tm_from_fields(fields)?;
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(24);
+    let _ = write!(
+        text,
+        "{} {} {:>2} {:02}:{:02}:{:02} {}",
+        DAYS_ABBR[tm.c_wday as usize],
+        MONTHS_ABBR[tm.mon0 as usize],
+        tm.mday,
+        tm.hour,
+        tm.min,
+        tm.sec,
+        tm.year
+    );
+    Ok(text)
+}
+
+#[repr(C)]
+struct PyClockInfo {
+    ob_base: PyObjectHeader,
+    adjustable: bool,
+    implementation: &'static str,
+    monotonic: bool,
+    resolution: f64,
+}
+
+fn clock_info_type() -> *mut PyType {
+    static TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let mut ty = PyType::new(
+            crate::abi::runtime_type_type().cast_const(),
+            "time.ClockInfo",
+            std::mem::size_of::<PyClockInfo>(),
+        );
+        ty.tp_getattro = Some(clock_info_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *TYPE as *mut PyType
+}
+
+unsafe extern "C" fn clock_info_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let name = crate::tag::untag_arg(name);
+    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        return raise_type_error("attribute name must be str");
+    };
+    let info = object.cast::<PyClockInfo>();
+    match name_text {
+        "adjustable" => unsafe { crate::abi::pon_const_bool(i32::from((*info).adjustable)) },
+        "implementation" => unsafe {
+            let implementation = (*info).implementation;
+            pon_const_str(implementation.as_ptr(), implementation.len())
+        },
+        "monotonic" => unsafe { crate::abi::pon_const_bool(i32::from((*info).monotonic)) },
+        "resolution" => unsafe { crate::abi::number::pon_const_float((*info).resolution) },
+        _ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
+    }
+}
+
+fn clock_info_object(
+    adjustable: bool,
+    implementation: &'static str,
+    monotonic: bool,
+    clock_id: libc::clockid_t,
+) -> *mut PyObject {
+    let resolution = match clock_getres_raw(clock_id) {
+        Ok(spec) => timespec_seconds(spec),
+        Err(_) => 0.0,
+    };
+    Box::into_raw(Box::new(PyClockInfo {
+        ob_base: PyObjectHeader::new(clock_info_type()),
+        adjustable,
+        implementation,
+        monotonic,
+        resolution,
+    }))
+    .cast::<PyObject>()
+}
+
+unsafe extern "C" fn time_get_clock_info(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return raise_type_error(&format!("get_clock_info() takes exactly 1 argument ({argc} given)"));
+    }
+    let raw = crate::tag::untag_arg(args[0]);
+    let Some(name) = (unsafe { text_argument(raw) }) else {
+        return raise_type_error("get_clock_info() argument 1 must be str");
+    };
+    match name.as_str() {
+        "time" => clock_info_object(true, "clock_gettime(CLOCK_REALTIME)", false, CLOCK_REALTIME_ID as libc::clockid_t),
+        "monotonic" => clock_info_object(false, "std::time::Instant", true, CLOCK_MONOTONIC_ID as libc::clockid_t),
+        "perf_counter" => clock_info_object(false, "std::time::Instant", true, CLOCK_MONOTONIC_ID as libc::clockid_t),
+        "process_time" => clock_info_object(
+            false,
+            "clock_gettime(CLOCK_PROCESS_CPUTIME_ID)",
+            true,
+            CLOCK_PROCESS_CPUTIME_ID_VALUE as libc::clockid_t,
+        ),
+        "thread_time" => clock_info_object(
+            false,
+            "clock_gettime(CLOCK_THREAD_CPUTIME_ID)",
+            true,
+            CLOCK_THREAD_CPUTIME_ID_VALUE as libc::clockid_t,
+        ),
+        _ => raise_value_error("unknown clock"),
+    }
 }
 
 fn function_attr(

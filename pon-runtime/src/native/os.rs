@@ -12,6 +12,15 @@ unsafe extern "C" {
     fn ctermid(s: *mut libc::c_char) -> *mut libc::c_char;
     fn lchflags(path: *const libc::c_char, flags: libc::c_uint) -> libc::c_int;
     fn lchmod(path: *const libc::c_char, mode: libc::mode_t) -> libc::c_int;
+    fn fstatvfs(fd: libc::c_int, buf: *mut libc::statvfs) -> libc::c_int;
+    fn statvfs(path: *const libc::c_char, buf: *mut libc::statvfs) -> libc::c_int;
+    fn wait3(status: *mut libc::c_int, options: libc::c_int, rusage: *mut libc::rusage) -> libc::pid_t;
+    fn wait4(
+        pid: libc::pid_t,
+        status: *mut libc::c_int,
+        options: libc::c_int,
+        rusage: *mut libc::rusage,
+    ) -> libc::pid_t;
 }
 
 
@@ -68,6 +77,7 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
         return Err(format!("failed to allocate {module}.fspath"));
     }
     attrs.push((intern("fspath"), fspath));
+    attrs.push(register_at_fork_attr(module)?);
     let mut stat_defaults = unsafe { [crate::abi::pon_none(), crate::abi::pon_const_bool(1)] };
     if stat_defaults.iter().any(|value| value.is_null()) {
         return Err(format!("failed to allocate {module}.stat defaults"));
@@ -93,6 +103,10 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
     // time (`hasattr(os.stat_result, 'st_file_attributes')`), so the native
     // result type is published like CPython's structseq class.
     attrs.push((intern("stat_result"), stat_result_type().cast::<PyObject>()));
+    attrs.push((intern("statvfs_result"), statvfs_result_type().cast::<PyObject>()));
+    attrs.push((intern("waitid_result"), waitid_result_type().cast::<PyObject>()));
+    attrs.push((intern("times_result"), times_result_type().cast::<PyObject>()));
+    attrs.push((intern("uname_result"), uname_result_type().cast::<PyObject>()));
     ensure_direntry_type_dict()?;
     attrs.push((intern("DirEntry"), direntry_type().cast::<PyObject>()));
     let mut scandir_defaults = unsafe { [pon_const_str(b".".as_ptr(), 1)] };
@@ -288,6 +302,31 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
         attrs.push(string_attr(module, "defpath", if cfg!(windows) { ".;C:\\\\bin" } else { "/bin:/usr/bin" })?);
         attrs.push(string_attr(module, "devnull", if cfg!(windows) { "nul" } else { "/dev/null" })?);
         attrs.push(string_attr(module, "extsep", ".")?);
+        for &(name, value) in &[("P_WAIT", 0i32), ("P_NOWAIT", 1i32), ("P_NOWAITO", 1i32)] {
+            let boxed = unsafe { crate::abi::pon_const_int(i64::from(value)) };
+            if boxed.is_null() {
+                return Err(format!("failed to allocate {module}.{name}"));
+            }
+            attrs.push((intern(name), boxed));
+        }
+        for &(name, entry) in &[
+            ("spawnv", os_spawnv as BuiltinFn),
+            ("spawnve", os_spawnve as BuiltinFn),
+            ("spawnvp", os_spawnvp as BuiltinFn),
+            ("spawnvpe", os_spawnvpe as BuiltinFn),
+            ("spawnl", os_spawnl as BuiltinFn),
+            ("spawnle", os_spawnle as BuiltinFn),
+            ("spawnlp", os_spawnlp as BuiltinFn),
+            ("spawnlpe", os_spawnlpe as BuiltinFn),
+        ] {
+            let function = unsafe {
+                crate::abi::pon_make_function(entry as *const u8, crate::native::builtins_mod::VARIADIC_ARITY, intern(name))
+            };
+            if function.is_null() {
+                return Err(format!("failed to allocate {module}.{name}"));
+            }
+            attrs.push((intern(name), function));
+        }
         attrs.push((intern("PathLike"), pathlike_class()?));
         let process_cpu_count = unsafe { crate::abi::pon_make_function(os_cpu_count as *const u8, 0, intern("process_cpu_count")) };
         if process_cpu_count.is_null() {
@@ -346,6 +385,47 @@ fn phase_b_function_attr(
     (!function.is_null())
         .then_some((intern(name), function))
         .ok_or_else(|| format!("failed to allocate os.{name}"))
+}
+
+fn register_at_fork_attr(module: &str) -> Result<(u32, *mut PyObject), String> {
+    let names = [intern("before"), intern("after_in_child"), intern("after_in_parent")];
+    let params = ParamSpec {
+        names: names.as_ptr(),
+        total_param_count: names.len() as u32,
+        positional_only_count: 0,
+        positional_count: 0,
+        keyword_only_count: names.len() as u32,
+        varargs_name: 0,
+        varkw_name: 0,
+    };
+    let code = CodeInfo {
+        entry: os_register_at_fork as *const u8,
+        params: &params,
+        name_interned: intern("register_at_fork"),
+        n_locals: 0,
+        n_feedback: 0,
+        flags: 0,
+    };
+    let mut kwdefaults = unsafe { [crate::abi::pon_none(), crate::abi::pon_none(), crate::abi::pon_none()] };
+    if kwdefaults.iter().any(|value| value.is_null()) {
+        return Err(format!("failed to allocate {module}.register_at_fork defaults"));
+    }
+    let function = unsafe {
+        crate::abi::call::pon_make_function_full(
+            &code,
+            std::ptr::null_mut(),
+            0,
+            names.as_ptr(),
+            kwdefaults.as_mut_ptr(),
+            kwdefaults.len(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (!function.is_null())
+        .then_some((intern("register_at_fork"), function))
+        .ok_or_else(|| format!("failed to allocate {module}.register_at_fork"))
 }
 
 /// `os._get_exports_list(module)`: CPython os.py's own helper, served
@@ -1316,10 +1396,120 @@ fn environb_snapshot(module: &str) -> Result<*mut PyObject, String> {
 type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
 
 static WALK_REGISTRY: crate::gcroot::RootRegistry = crate::gcroot::RootRegistry::new();
+#[derive(Clone, Default)]
+struct AtForkCallbacks {
+    before: Vec<usize>,
+    after_in_child: Vec<usize>,
+    after_in_parent: Vec<usize>,
+}
 
-/// Python objects held by live `os.walk` iterators.
+static AT_FORK_CALLBACKS: std::sync::LazyLock<std::sync::Mutex<AtForkCallbacks>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(AtForkCallbacks::default()));
+
+
+/// Python objects held by live `os.walk` iterators and registered fork hooks.
 pub(crate) fn gc_held_roots() -> Vec<*mut PyObject> {
-    WALK_REGISTRY.held_roots()
+    let mut roots = WALK_REGISTRY.held_roots();
+    let callbacks = AT_FORK_CALLBACKS.lock().unwrap_or_else(|poison| poison.into_inner());
+    for callback in callbacks
+        .before
+        .iter()
+        .chain(callbacks.after_in_child.iter())
+        .chain(callbacks.after_in_parent.iter())
+    {
+        let object = *callback as *mut PyObject;
+        if !object.is_null() && crate::tag::is_heap(object) {
+            roots.push(object);
+        }
+    }
+    roots
+}
+
+unsafe extern "C" fn os_register_at_fork(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 3 {
+        return crate::abi::return_null_with_error("os.register_at_fork expected keyword-only before/after_in_child/after_in_parent");
+    }
+    let before = match at_fork_callback_arg(args[0], "before") {
+        Ok(callback) => callback,
+        Err(error) => return error,
+    };
+    let after_in_child = match at_fork_callback_arg(args[1], "after_in_child") {
+        Ok(callback) => callback,
+        Err(error) => return error,
+    };
+    let after_in_parent = match at_fork_callback_arg(args[2], "after_in_parent") {
+        Ok(callback) => callback,
+        Err(error) => return error,
+    };
+    let mut callbacks = AT_FORK_CALLBACKS.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(callback) = before {
+        callbacks.before.push(callback as usize);
+    }
+    if let Some(callback) = after_in_child {
+        callbacks.after_in_child.push(callback as usize);
+    }
+    if let Some(callback) = after_in_parent {
+        callbacks.after_in_parent.push(callback as usize);
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+fn at_fork_callback_arg(value: *mut PyObject, name: &str) -> Result<Option<*mut PyObject>, *mut PyObject> {
+    if is_none_value(value) {
+        return Ok(None);
+    }
+    let callback = crate::tag::untag_arg(value);
+    if is_callable_object(callback) {
+        Ok(Some(callback))
+    } else {
+        Err(raise_type_error(&format!("os.register_at_fork() argument '{name}' must be callable")))
+    }
+}
+
+fn is_callable_object(object: *mut PyObject) -> bool {
+    if object.is_null() || crate::tag::is_small_int(object) {
+        return false;
+    }
+    if matches!(
+        unsafe { crate::types::dict::type_name(object) },
+        Some("function" | "method" | "type")
+    ) {
+        return true;
+    }
+    let ty = unsafe { (*object).ob_type.cast_mut() };
+    !ty.is_null()
+        && (unsafe { (*ty).tp_call.is_some() }
+            || !unsafe { crate::descr::lookup_in_type(ty, intern(crate::intern::DUNDER_CALL)) }.is_null())
+}
+
+fn at_fork_snapshot() -> AtForkCallbacks {
+    AT_FORK_CALLBACKS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+}
+
+fn call_at_fork_callbacks(callbacks: &[usize], reverse: bool) -> Result<(), *mut PyObject> {
+    if reverse {
+        for &callback in callbacks.iter().rev() {
+            call_at_fork_callback(callback)?;
+        }
+    } else {
+        for &callback in callbacks {
+            call_at_fork_callback(callback)?;
+        }
+    }
+    Ok(())
+}
+
+fn call_at_fork_callback(callback: usize) -> Result<(), *mut PyObject> {
+    let result = unsafe { crate::abi::pon_call(callback as *mut PyObject, std::ptr::null_mut(), 0) };
+    if result.is_null() {
+        Err(std::ptr::null_mut())
+    } else {
+        Ok(())
+    }
 }
 
 fn walk_symlinks_as_files() -> *mut PyObject {
@@ -2224,6 +2414,7 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("fchown", os_fchown, 3),
     ("fdopen", os_fdopen, crate::native::builtins_mod::VARIADIC_ARITY),
     ("fstat", os_fstat, 1),
+    ("fstatvfs", os_fstatvfs, 1),
     ("fork", os_fork, 0),
     ("forkpty", os_forkpty, 0),
     ("fsync", os_fsync, 1),
@@ -2256,6 +2447,8 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("lchown", os_lchown, 3),
     ("link", os_link, crate::native::builtins_mod::VARIADIC_ARITY),
     ("lseek", os_lseek, 3),
+    ("execv", os_execv, 2),
+    ("execve", os_execve, 3),
     ("lstat", os_lstat, crate::native::builtins_mod::VARIADIC_ARITY),
     ("major", os_major, 1),
     ("makedev", os_makedev, 2),
@@ -2267,19 +2460,26 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("open", os_open, crate::native::builtins_mod::VARIADIC_ARITY),
     ("pipe", os_pipe, 0),
     ("posix_openpt", os_posix_openpt, 1),
+    ("posix_spawn", os_posix_spawn, crate::native::builtins_mod::VARIADIC_ARITY),
+    ("posix_spawnp", os_posix_spawnp, crate::native::builtins_mod::VARIADIC_ARITY),
     ("pread", os_pread, 3),
     ("putenv", os_putenv, 2),
     ("pwrite", os_pwrite, 3),
+    ("preadv", os_preadv, crate::native::builtins_mod::VARIADIC_ARITY),
+    ("pwritev", os_pwritev, crate::native::builtins_mod::VARIADIC_ARITY),
     ("ptsname", os_ptsname, 1),
     ("read", os_read, 2),
     ("readinto", os_readinto, 2),
+    ("readv", os_readv, 2),
     ("readlink", os_readlink, 1),
     ("rename", os_rename, crate::native::builtins_mod::VARIADIC_ARITY),
     ("replace", os_replace, crate::native::builtins_mod::VARIADIC_ARITY),
+    ("remove", os_unlink, 1),
     ("rmdir", os_rmdir, 1),
     ("sched_get_priority_max", os_sched_get_priority_max, 1),
     ("sched_get_priority_min", os_sched_get_priority_min, 1),
     ("sched_yield", os_sched_yield, 0),
+    ("sendfile", os_sendfile, crate::native::builtins_mod::VARIADIC_ARITY),
     ("set_blocking", os_set_blocking, 2),
     ("set_inheritable", os_set_inheritable, 2),
     ("setegid", os_setegid, 1),
@@ -2300,10 +2500,15 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("tcgetpgrp", os_tcgetpgrp, 1),
     ("tcsetpgrp", os_tcsetpgrp, 2),
     ("times", os_times, 0),
+    ("statvfs", os_statvfs, 1),
     ("truncate", os_truncate, 2),
     ("ttyname", os_ttyname, 1),
     ("umask", os_umask, 1),
     ("uname", os_uname, 0),
+    ("utime", os_utime, crate::native::builtins_mod::VARIADIC_ARITY),
+    ("wait3", os_wait3, 1),
+    ("wait4", os_wait4, 2),
+    ("waitid", os_waitid, 3),
     ("unlink", os_unlink, 1),
     ("unlockpt", os_unlockpt, 1),
     ("unsetenv", os_unsetenv, 1),
@@ -2311,7 +2516,1053 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
     ("waitpid", os_waitpid, 2),
     ("waitstatus_to_exitcode", os_waitstatus_to_exitcode, 1),
     ("write", os_write, 2),
+    ("writev", os_writev, 2),
 ];
+
+const STATVFS_FIELDS: [&str; 10] = [
+    "f_bsize",
+    "f_frsize",
+    "f_blocks",
+    "f_bfree",
+    "f_bavail",
+    "f_files",
+    "f_ffree",
+    "f_favail",
+    "f_flag",
+    "f_namemax",
+];
+
+#[repr(C)]
+struct PyStatVfsResult {
+    ob_base: crate::object::PyObjectHeader,
+    values: [i64; 10],
+}
+
+static STATVFS_SEQUENCE: std::sync::LazyLock<crate::object::PySequenceMethods> =
+    std::sync::LazyLock::new(|| crate::object::PySequenceMethods {
+        sq_length: Some(statvfs_result_len),
+        sq_item: Some(statvfs_result_item),
+        ..crate::object::PySequenceMethods::EMPTY
+    });
+
+fn statvfs_result_type() -> *mut crate::object::PyType {
+    static TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let mut ty = crate::object::PyType::new(
+            crate::abi::runtime_type_type().cast_const(),
+            "os.statvfs_result",
+            std::mem::size_of::<PyStatVfsResult>(),
+        );
+        ty.tp_as_sequence = &*STATVFS_SEQUENCE as *const crate::object::PySequenceMethods
+            as *mut crate::object::PySequenceMethods;
+        ty.tp_getattro = Some(statvfs_result_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *TYPE as *mut crate::object::PyType
+}
+
+unsafe extern "C" fn statvfs_result_len(_object: *mut PyObject) -> isize {
+    STATVFS_FIELDS.len() as isize
+}
+
+unsafe extern "C" fn statvfs_result_item(object: *mut PyObject, index: isize) -> *mut PyObject {
+    if index < 0 || index as usize >= STATVFS_FIELDS.len() {
+        return crate::abi::exc::raise_kind_error_text(ExceptionKind::IndexError, "statvfs_result index out of range");
+    }
+    let result = object.cast::<PyStatVfsResult>();
+    unsafe { crate::abi::pon_const_int((*result).values[index as usize]) }
+}
+
+unsafe extern "C" fn statvfs_result_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let name = crate::tag::untag_arg(name);
+    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        return crate::abi::exc::raise_kind_error_text(ExceptionKind::TypeError, "attribute name must be str");
+    };
+    if let Some(index) = STATVFS_FIELDS.iter().position(|field| *field == name_text) {
+        return unsafe { statvfs_result_item(object, index as isize) };
+    }
+    unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) }
+}
+
+fn statvfs_values(raw: &libc::statvfs) -> [i64; 10] {
+    [
+        stat_i64(raw.f_bsize),
+        stat_i64(raw.f_frsize),
+        stat_i64(raw.f_blocks),
+        stat_i64(raw.f_bfree),
+        stat_i64(raw.f_bavail),
+        stat_i64(raw.f_files),
+        stat_i64(raw.f_ffree),
+        stat_i64(raw.f_favail),
+        stat_i64(raw.f_flag),
+        stat_i64(raw.f_namemax),
+    ]
+}
+
+fn statvfs_result_object(raw: &libc::statvfs) -> *mut PyObject {
+    Box::into_raw(Box::new(PyStatVfsResult {
+        ob_base: crate::object::PyObjectHeader::new(statvfs_result_type()),
+        values: statvfs_values(raw),
+    }))
+    .cast::<PyObject>()
+}
+
+const TIMES_FIELDS: [&str; 5] = ["user", "system", "children_user", "children_system", "elapsed"];
+
+#[repr(C)]
+struct PyTimesResult {
+    ob_base: crate::object::PyObjectHeader,
+    values: [f64; 5],
+}
+
+static TIMES_SEQUENCE: std::sync::LazyLock<crate::object::PySequenceMethods> =
+    std::sync::LazyLock::new(|| crate::object::PySequenceMethods {
+        sq_length: Some(times_result_len),
+        sq_item: Some(times_result_item),
+        ..crate::object::PySequenceMethods::EMPTY
+    });
+
+fn times_result_type() -> *mut crate::object::PyType {
+    static TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let mut ty = crate::object::PyType::new(
+            crate::abi::runtime_type_type().cast_const(),
+            "posix.times_result",
+            std::mem::size_of::<PyTimesResult>(),
+        );
+        ty.tp_as_sequence = &*TIMES_SEQUENCE as *const crate::object::PySequenceMethods
+            as *mut crate::object::PySequenceMethods;
+        ty.tp_getattro = Some(times_result_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *TYPE as *mut crate::object::PyType
+}
+
+unsafe extern "C" fn times_result_len(_object: *mut PyObject) -> isize {
+    TIMES_FIELDS.len() as isize
+}
+
+unsafe extern "C" fn times_result_item(object: *mut PyObject, index: isize) -> *mut PyObject {
+    if index < 0 || index as usize >= TIMES_FIELDS.len() {
+        return crate::abi::exc::raise_kind_error_text(ExceptionKind::IndexError, "times_result index out of range");
+    }
+    let result = object.cast::<PyTimesResult>();
+    unsafe { crate::abi::number::pon_const_float((*result).values[index as usize]) }
+}
+
+unsafe extern "C" fn times_result_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let name = crate::tag::untag_arg(name);
+    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        return crate::abi::exc::raise_kind_error_text(ExceptionKind::TypeError, "attribute name must be str");
+    };
+    if let Some(index) = TIMES_FIELDS.iter().position(|field| *field == name_text) {
+        return unsafe { times_result_item(object, index as isize) };
+    }
+    unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) }
+}
+
+fn times_result_object(values: [f64; 5]) -> *mut PyObject {
+    Box::into_raw(Box::new(PyTimesResult {
+        ob_base: crate::object::PyObjectHeader::new(times_result_type()),
+        values,
+    }))
+    .cast::<PyObject>()
+}
+
+const UNAME_FIELDS: [&str; 5] = ["sysname", "nodename", "release", "version", "machine"];
+
+#[repr(C)]
+struct PyUnameResult {
+    ob_base: crate::object::PyObjectHeader,
+    values: [String; 5],
+}
+
+static UNAME_SEQUENCE: std::sync::LazyLock<crate::object::PySequenceMethods> =
+    std::sync::LazyLock::new(|| crate::object::PySequenceMethods {
+        sq_length: Some(uname_result_len),
+        sq_item: Some(uname_result_item),
+        ..crate::object::PySequenceMethods::EMPTY
+    });
+
+fn uname_result_type() -> *mut crate::object::PyType {
+    static TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let mut ty = crate::object::PyType::new(
+            crate::abi::runtime_type_type().cast_const(),
+            "posix.uname_result",
+            std::mem::size_of::<PyUnameResult>(),
+        );
+        ty.tp_as_sequence = &*UNAME_SEQUENCE as *const crate::object::PySequenceMethods
+            as *mut crate::object::PySequenceMethods;
+        ty.tp_getattro = Some(uname_result_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *TYPE as *mut crate::object::PyType
+}
+
+unsafe extern "C" fn uname_result_len(_object: *mut PyObject) -> isize {
+    UNAME_FIELDS.len() as isize
+}
+
+unsafe extern "C" fn uname_result_item(object: *mut PyObject, index: isize) -> *mut PyObject {
+    if index < 0 || index as usize >= UNAME_FIELDS.len() {
+        return crate::abi::exc::raise_kind_error_text(ExceptionKind::IndexError, "uname_result index out of range");
+    }
+    let result = object.cast::<PyUnameResult>();
+    let text = unsafe { &(*result).values[index as usize] };
+    unsafe { pon_const_str(text.as_ptr(), text.len()) }
+}
+
+unsafe extern "C" fn uname_result_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let name = crate::tag::untag_arg(name);
+    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        return crate::abi::exc::raise_kind_error_text(ExceptionKind::TypeError, "attribute name must be str");
+    };
+    if let Some(index) = UNAME_FIELDS.iter().position(|field| *field == name_text) {
+        return unsafe { uname_result_item(object, index as isize) };
+    }
+    unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) }
+}
+
+fn uname_result_object(values: [String; 5]) -> *mut PyObject {
+    Box::into_raw(Box::new(PyUnameResult {
+        ob_base: crate::object::PyObjectHeader::new(uname_result_type()),
+        values,
+    }))
+    .cast::<PyObject>()
+}
+
+const WAITID_FIELDS: [&str; 5] = ["si_pid", "si_uid", "si_signo", "si_status", "si_code"];
+
+#[repr(C)]
+struct PyWaitIdResult {
+    ob_base: crate::object::PyObjectHeader,
+    values: [i64; 5],
+}
+
+static WAITID_SEQUENCE: std::sync::LazyLock<crate::object::PySequenceMethods> =
+    std::sync::LazyLock::new(|| crate::object::PySequenceMethods {
+        sq_length: Some(waitid_result_len),
+        sq_item: Some(waitid_result_item),
+        ..crate::object::PySequenceMethods::EMPTY
+    });
+
+fn waitid_result_type() -> *mut crate::object::PyType {
+    static TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let mut ty = crate::object::PyType::new(
+            crate::abi::runtime_type_type().cast_const(),
+            "posix.waitid_result",
+            std::mem::size_of::<PyWaitIdResult>(),
+        );
+        ty.tp_as_sequence = &*WAITID_SEQUENCE as *const crate::object::PySequenceMethods
+            as *mut crate::object::PySequenceMethods;
+        ty.tp_getattro = Some(waitid_result_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *TYPE as *mut crate::object::PyType
+}
+
+unsafe extern "C" fn waitid_result_len(_object: *mut PyObject) -> isize {
+    WAITID_FIELDS.len() as isize
+}
+
+unsafe extern "C" fn waitid_result_item(object: *mut PyObject, index: isize) -> *mut PyObject {
+    if index < 0 || index as usize >= WAITID_FIELDS.len() {
+        return crate::abi::exc::raise_kind_error_text(ExceptionKind::IndexError, "waitid_result index out of range");
+    }
+    let result = object.cast::<PyWaitIdResult>();
+    unsafe { crate::abi::pon_const_int((*result).values[index as usize]) }
+}
+
+unsafe extern "C" fn waitid_result_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let name = crate::tag::untag_arg(name);
+    let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        return crate::abi::exc::raise_kind_error_text(ExceptionKind::TypeError, "attribute name must be str");
+    };
+    if let Some(index) = WAITID_FIELDS.iter().position(|field| *field == name_text) {
+        return unsafe { waitid_result_item(object, index as isize) };
+    }
+    unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) }
+}
+
+fn waitid_result_object(info: &libc::siginfo_t) -> *mut PyObject {
+    let values = [
+        unsafe { info.si_pid() } as i64,
+        unsafe { info.si_uid() } as i64,
+        i64::from(info.si_signo),
+        unsafe { info.si_status() } as i64,
+        i64::from(info.si_code),
+    ];
+    Box::into_raw(Box::new(PyWaitIdResult {
+        ob_base: crate::object::PyObjectHeader::new(waitid_result_type()),
+        values,
+    }))
+    .cast::<PyObject>()
+}
+
+unsafe extern "C" fn os_statvfs(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return crate::abi::return_null_with_error("os.statvfs expected one argument");
+    }
+    let path = match path_arg(args[0], "statvfs") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let c_path = match c_path(&path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let mut raw = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    if unsafe { statvfs(c_path.as_ptr(), raw.as_mut_ptr()) } < 0 {
+        return raise_errno(last_errno(), Some(&path));
+    }
+    statvfs_result_object(&unsafe { raw.assume_init() })
+}
+
+unsafe extern "C" fn os_fstatvfs(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let fd = match one_fd_arg(argv, argc, "fstatvfs") {
+        Ok(fd) => fd,
+        Err(error) => return error,
+    };
+    let mut raw = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    if unsafe { fstatvfs(fd, raw.as_mut_ptr()) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    statvfs_result_object(&unsafe { raw.assume_init() })
+}
+
+fn iov_max() -> usize {
+    let value = unsafe { libc::sysconf(libc::_SC_IOV_MAX) };
+    if value > 0 { value as usize } else { 16 }
+}
+
+fn iov_count_arg(len: usize) -> Result<libc::c_int, *mut PyObject> {
+    if len > iov_max() || len > libc::c_int::MAX as usize {
+        return Err(crate::abi::exc::raise_kind_error_text(
+            ExceptionKind::ValueError,
+            "too many buffers",
+        ));
+    }
+    Ok(len as libc::c_int)
+}
+
+fn readable_iovecs(object: *mut PyObject) -> Result<Vec<libc::iovec>, *mut PyObject> {
+    let buffers = crate::abi::seq::sequence_to_vec(object).map_err(crate::abi::return_null_with_error)?;
+    let _ = iov_count_arg(buffers.len())?;
+    let mut iovecs = Vec::with_capacity(buffers.len());
+    for buffer in buffers {
+        let payload = readable_bytes_payload(crate::tag::untag_arg(buffer))?;
+        iovecs.push(libc::iovec {
+            iov_base: payload.as_ptr() as *mut libc::c_void,
+            iov_len: payload.len(),
+        });
+    }
+    Ok(iovecs)
+}
+
+fn writable_iovecs(object: *mut PyObject) -> Result<Vec<libc::iovec>, *mut PyObject> {
+    let buffers = crate::abi::seq::sequence_to_vec(object).map_err(crate::abi::return_null_with_error)?;
+    let _ = iov_count_arg(buffers.len())?;
+    let mut iovecs = Vec::with_capacity(buffers.len());
+    for buffer in buffers {
+        let (ptr, len) = writable_bytes_target(crate::tag::untag_arg(buffer))?;
+        iovecs.push(libc::iovec {
+            iov_base: ptr.cast::<libc::c_void>(),
+            iov_len: len,
+        });
+    }
+    Ok(iovecs)
+}
+
+unsafe extern "C" fn os_readv(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.readv expected two arguments");
+    }
+    let fd = match int_arg(args[0], "readv fd") {
+        Ok(fd) => fd as libc::c_int,
+        Err(error) => return error,
+    };
+    let mut iovecs = match writable_iovecs(args[1]) {
+        Ok(iovecs) => iovecs,
+        Err(error) => return error,
+    };
+    let count = unsafe { libc::readv(fd, iovecs.as_mut_ptr(), iovecs.len() as libc::c_int) };
+    if count < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_const_int(count as i64) }
+}
+
+unsafe extern "C" fn os_writev(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.writev expected two arguments");
+    }
+    let fd = match int_arg(args[0], "writev fd") {
+        Ok(fd) => fd as libc::c_int,
+        Err(error) => return error,
+    };
+    let iovecs = match readable_iovecs(args[1]) {
+        Ok(iovecs) => iovecs,
+        Err(error) => return error,
+    };
+    let count = unsafe { libc::writev(fd, iovecs.as_ptr(), iovecs.len() as libc::c_int) };
+    if count < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_const_int(count as i64) }
+}
+
+unsafe extern "C" fn os_preadv(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if !(3..=4).contains(&args.len()) {
+        return crate::abi::return_null_with_error("os.preadv expected three or four arguments");
+    }
+    if let Some(flags) = args.get(3) {
+        match int_arg(*flags, "preadv flags") {
+            Ok(0) => {}
+            Ok(_) => {
+                return crate::abi::exc::raise_kind_error_text(
+                    ExceptionKind::NotImplementedError,
+                    "os.preadv flags are not supported by this platform",
+                )
+            }
+            Err(error) => return error,
+        }
+    }
+    let fd = match int_arg(args[0], "preadv fd") {
+        Ok(fd) => fd as libc::c_int,
+        Err(error) => return error,
+    };
+    let mut iovecs = match writable_iovecs(args[1]) {
+        Ok(iovecs) => iovecs,
+        Err(error) => return error,
+    };
+    let offset = match int_arg(args[2], "preadv offset") {
+        Ok(offset) => offset as libc::off_t,
+        Err(error) => return error,
+    };
+    let count = unsafe { libc::preadv(fd, iovecs.as_mut_ptr(), iovecs.len() as libc::c_int, offset) };
+    if count < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_const_int(count as i64) }
+}
+
+unsafe extern "C" fn os_pwritev(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if !(3..=4).contains(&args.len()) {
+        return crate::abi::return_null_with_error("os.pwritev expected three or four arguments");
+    }
+    if let Some(flags) = args.get(3) {
+        match int_arg(*flags, "pwritev flags") {
+            Ok(0) => {}
+            Ok(_) => {
+                return crate::abi::exc::raise_kind_error_text(
+                    ExceptionKind::NotImplementedError,
+                    "os.pwritev flags are not supported by this platform",
+                )
+            }
+            Err(error) => return error,
+        }
+    }
+    let fd = match int_arg(args[0], "pwritev fd") {
+        Ok(fd) => fd as libc::c_int,
+        Err(error) => return error,
+    };
+    let iovecs = match readable_iovecs(args[1]) {
+        Ok(iovecs) => iovecs,
+        Err(error) => return error,
+    };
+    let offset = match int_arg(args[2], "pwritev offset") {
+        Ok(offset) => offset as libc::off_t,
+        Err(error) => return error,
+    };
+    let count = unsafe { libc::pwritev(fd, iovecs.as_ptr(), iovecs.len() as libc::c_int, offset) };
+    if count < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_const_int(count as i64) }
+}
+
+fn ensure_empty_sequence(object: *mut PyObject, what: &str) -> Result<(), *mut PyObject> {
+    let values = crate::abi::seq::sequence_to_vec(object).map_err(crate::abi::return_null_with_error)?;
+    if values.is_empty() {
+        Ok(())
+    } else {
+        Err(crate::abi::exc::raise_kind_error_text(
+            ExceptionKind::NotImplementedError,
+            &format!("os.sendfile {what} are not supported"),
+        ))
+    }
+}
+
+unsafe extern "C" fn os_sendfile(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if !(4..=7).contains(&args.len()) {
+        return crate::abi::return_null_with_error("os.sendfile expected between four and seven arguments");
+    }
+    let out_fd = match int_arg(args[0], "sendfile out_fd") {
+        Ok(fd) => fd as libc::c_int,
+        Err(error) => return error,
+    };
+    let in_fd = match int_arg(args[1], "sendfile in_fd") {
+        Ok(fd) => fd as libc::c_int,
+        Err(error) => return error,
+    };
+    let offset = match int_arg(args[2], "sendfile offset") {
+        Ok(offset) => offset as libc::off_t,
+        Err(error) => return error,
+    };
+    let mut count = match int_arg(args[3], "sendfile count") {
+        Ok(count) if count >= 0 => count as libc::off_t,
+        Ok(_) => return crate::abi::exc::raise_kind_error_text(ExceptionKind::ValueError, "count must be non-negative"),
+        Err(error) => return error,
+    };
+    if let Some(headers) = args.get(4) {
+        if let Err(error) = ensure_empty_sequence(*headers, "headers") {
+            return error;
+        }
+    }
+    if let Some(trailers) = args.get(5) {
+        if let Err(error) = ensure_empty_sequence(*trailers, "trailers") {
+            return error;
+        }
+    }
+    let flags = match args.get(6) {
+        Some(flags) => match int_arg(*flags, "sendfile flags") {
+            Ok(flags) => flags as libc::c_int,
+            Err(error) => return error,
+        },
+        None => 0,
+    };
+    let result = unsafe { libc::sendfile(in_fd, out_fd, offset, &mut count, std::ptr::null_mut(), flags) };
+    if result < 0 && count == 0 {
+        return raise_errno(last_errno(), None);
+    }
+    unsafe { crate::abi::pon_const_int(count as i64) }
+}
+
+unsafe extern "C" fn os_wait3(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 1 {
+        return crate::abi::return_null_with_error("os.wait3 expected one argument");
+    }
+    let options = match int_arg(args[0], "wait3 options") {
+        Ok(options) => options as libc::c_int,
+        Err(error) => return error,
+    };
+    let mut status: libc::c_int = 0;
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    let pid = unsafe { wait3(&mut status, options, usage.as_mut_ptr()) };
+    if pid < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    wait_with_rusage_tuple(pid, status, unsafe { usage.assume_init() })
+}
+
+unsafe extern "C" fn os_wait4(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.wait4 expected two arguments");
+    }
+    let pid = match int_arg(args[0], "wait4 pid") {
+        Ok(pid) => pid as libc::pid_t,
+        Err(error) => return error,
+    };
+    let options = match int_arg(args[1], "wait4 options") {
+        Ok(options) => options as libc::c_int,
+        Err(error) => return error,
+    };
+    let mut status: libc::c_int = 0;
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    let reaped = unsafe { wait4(pid, &mut status, options, usage.as_mut_ptr()) };
+    if reaped < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    wait_with_rusage_tuple(reaped, status, unsafe { usage.assume_init() })
+}
+
+fn wait_with_rusage_tuple(pid: libc::pid_t, status: libc::c_int, usage: libc::rusage) -> *mut PyObject {
+    let rusage = super::resource::rusage_object(super::resource::rusage_record(&usage));
+    let mut items = [
+        unsafe { crate::abi::pon_const_int(i64::from(pid)) },
+        unsafe { crate::abi::pon_const_int(i64::from(status)) },
+        rusage,
+    ];
+    if items.iter().any(|item| item.is_null()) {
+        return std::ptr::null_mut();
+    }
+    unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) }
+}
+
+unsafe extern "C" fn os_waitid(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 3 {
+        return crate::abi::return_null_with_error("os.waitid expected three arguments");
+    }
+    let idtype = match int_arg(args[0], "waitid idtype") {
+        Ok(idtype) => idtype as libc::idtype_t,
+        Err(error) => return error,
+    };
+    let id = match int_arg(args[1], "waitid id") {
+        Ok(id) => id as libc::id_t,
+        Err(error) => return error,
+    };
+    let options = match int_arg(args[2], "waitid options") {
+        Ok(options) => options as libc::c_int,
+        Err(error) => return error,
+    };
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    if unsafe { libc::waitid(idtype, id, info.as_mut_ptr(), options) } < 0 {
+        return raise_errno(last_errno(), None);
+    }
+    let info = unsafe { info.assume_init() };
+    if unsafe { info.si_pid() } == 0 {
+        return unsafe { crate::abi::pon_none() };
+    }
+    waitid_result_object(&info)
+}
+
+unsafe extern "C" fn os_execv(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 2 {
+        return crate::abi::return_null_with_error("os.execv expected two arguments");
+    }
+    let path = match path_arg(args[0], "execv") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let c_path = match c_path(&path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let (argv_store, argv_ptrs) = match argv_cstrings(args[1]) {
+        Ok(argv) => argv,
+        Err(error) => return error,
+    };
+    let _keepalive = argv_store;
+    unsafe { libc::execv(c_path.as_ptr(), argv_ptrs.as_ptr().cast::<*const libc::c_char>()) };
+    raise_errno(last_errno(), Some(&path))
+}
+
+unsafe extern "C" fn os_execve(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 3 {
+        return crate::abi::return_null_with_error("os.execve expected three arguments");
+    }
+    let path = match path_arg(args[0], "execve") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let c_path = match c_path(&path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let (argv_store, argv_ptrs) = match argv_cstrings(args[1]) {
+        Ok(argv) => argv,
+        Err(error) => return error,
+    };
+    let (env_store, env_ptrs) = match env_cstrings(args[2]) {
+        Ok(env) => env,
+        Err(error) => return error,
+    };
+    let (_argv_keepalive, _env_keepalive) = (argv_store, env_store);
+    unsafe {
+        libc::execve(
+            c_path.as_ptr(),
+            argv_ptrs.as_ptr().cast::<*const libc::c_char>(),
+            env_ptrs.as_ptr().cast::<*const libc::c_char>(),
+        )
+    };
+    raise_errno(last_errno(), Some(&path))
+}
+
+unsafe extern "C" fn os_spawnv(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { spawnv_common(argv, argc, SpawnFlavor::Path, false) }
+}
+
+unsafe extern "C" fn os_spawnve(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { spawnv_common(argv, argc, SpawnFlavor::Path, true) }
+}
+
+unsafe extern "C" fn os_spawnvp(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { spawnv_common(argv, argc, SpawnFlavor::SearchPath, false) }
+}
+
+unsafe extern "C" fn os_spawnvpe(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { spawnv_common(argv, argc, SpawnFlavor::SearchPath, true) }
+}
+
+unsafe extern "C" fn os_spawnl(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { spawnl_common(argv, argc, SpawnFlavor::Path, false) }
+}
+
+unsafe extern "C" fn os_spawnle(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { spawnl_common(argv, argc, SpawnFlavor::Path, true) }
+}
+
+unsafe extern "C" fn os_spawnlp(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { spawnl_common(argv, argc, SpawnFlavor::SearchPath, false) }
+}
+
+unsafe extern "C" fn os_spawnlpe(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { spawnl_common(argv, argc, SpawnFlavor::SearchPath, true) }
+}
+
+#[derive(Clone, Copy)]
+enum SpawnFlavor {
+    Path,
+    SearchPath,
+}
+
+unsafe fn spawnv_common(argv: *mut *mut PyObject, argc: usize, flavor: SpawnFlavor, has_env: bool) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != if has_env { 4 } else { 3 } {
+        return crate::abi::return_null_with_error("spawnv-family expected mode, path, argv[, env]");
+    }
+    let mode = match int_arg(args[0], "spawn mode") {
+        Ok(mode) => mode,
+        Err(error) => return error,
+    };
+    let path = match path_arg(args[1], "spawn path") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let (argv_store, argv_ptrs) = match argv_cstrings(args[2]) {
+        Ok(argv) => argv,
+        Err(error) => return error,
+    };
+    let env_data = if has_env {
+        match env_cstrings(args[3]) {
+            Ok(env) => Some(env),
+            Err(error) => return error,
+        }
+    } else {
+        None
+    };
+    spawn_mode_dispatch(mode, &path, flavor, argv_store, argv_ptrs, env_data)
+}
+
+unsafe fn spawnl_common(argv: *mut *mut PyObject, argc: usize, flavor: SpawnFlavor, has_env: bool) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    let minimum = if has_env { 4 } else { 3 };
+    if args.len() < minimum {
+        return crate::abi::return_null_with_error("spawnl-family expected mode, path, arg0, ...");
+    }
+    let mode = match int_arg(args[0], "spawn mode") {
+        Ok(mode) => mode,
+        Err(error) => return error,
+    };
+    let path = match path_arg(args[1], "spawn path") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let argv_object = build_tuple_from_slice(if has_env { &args[2..args.len() - 1] } else { &args[2..] });
+    if argv_object.is_null() {
+        return std::ptr::null_mut();
+    }
+    let (argv_store, argv_ptrs) = match argv_cstrings(argv_object) {
+        Ok(argv) => argv,
+        Err(error) => return error,
+    };
+    let env_data = if has_env {
+        match env_cstrings(*args.last().expect("minimum length checked")) {
+            Ok(env) => Some(env),
+            Err(error) => return error,
+        }
+    } else {
+        None
+    };
+    spawn_mode_dispatch(mode, &path, flavor, argv_store, argv_ptrs, env_data)
+}
+
+fn build_tuple_from_slice(values: &[*mut PyObject]) -> *mut PyObject {
+    let mut owned = values.to_vec();
+    unsafe { crate::abi::seq::pon_build_tuple(owned.as_mut_ptr(), owned.len()) }
+}
+
+fn current_env_cstrings() -> Result<(Vec<std::ffi::CString>, Vec<*mut libc::c_char>), *mut PyObject> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut strings = Vec::new();
+    for (key, value) in std::env::vars_os() {
+        let mut bytes = key.as_os_str().as_bytes().to_vec();
+        bytes.push(b'=');
+        bytes.extend_from_slice(value.as_os_str().as_bytes());
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| crate::abi::exc::raise_kind_error_text(ExceptionKind::UnicodeDecodeError, "environment contains non-UTF-8 entry"))?;
+        strings.push(c_path(text)?);
+    }
+    let mut ptrs = strings
+        .iter()
+        .map(|value| value.as_ptr() as *mut libc::c_char)
+        .collect::<Vec<_>>();
+    ptrs.push(std::ptr::null_mut());
+    Ok((strings, ptrs))
+}
+
+fn spawn_mode_dispatch(
+    mode: i64,
+    path: &str,
+    flavor: SpawnFlavor,
+    argv_store: Vec<std::ffi::CString>,
+    argv_ptrs: Vec<*mut libc::c_char>,
+    env_data: Option<(Vec<std::ffi::CString>, Vec<*mut libc::c_char>)>,
+) -> *mut PyObject {
+    let child = match mode {
+        0 | 1 => spawn_process(path, flavor, argv_store, argv_ptrs, env_data),
+        _ => {
+            return crate::abi::exc::raise_kind_error_text(
+                ExceptionKind::ValueError,
+                "mode must be P_WAIT, P_NOWAIT, or P_NOWAITO",
+            )
+        }
+    };
+    let pid = match child {
+        Ok(pid) => pid,
+        Err(error) => return error,
+    };
+    if mode == 0 {
+        let mut status = 0 as libc::c_int;
+        if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+            return raise_errno(last_errno(), None);
+        }
+        unsafe { crate::abi::pon_const_int(i64::from(libc::WEXITSTATUS(status))) }
+    } else {
+        unsafe { crate::abi::pon_const_int(i64::from(pid)) }
+    }
+}
+
+fn spawn_process(
+    path: &str,
+    flavor: SpawnFlavor,
+    argv_store: Vec<std::ffi::CString>,
+    argv_ptrs: Vec<*mut libc::c_char>,
+    env_data: Option<(Vec<std::ffi::CString>, Vec<*mut libc::c_char>)>,
+) -> Result<libc::pid_t, *mut PyObject> {
+    let c_path = c_path(path)?;
+    let (env_store, env_ptrs) = match env_data {
+        Some((store, ptrs)) => (store, ptrs),
+        None => current_env_cstrings()?,
+    };
+    let (_argv_keepalive, _env_keepalive) = (argv_store, env_store);
+    let mut pid: libc::pid_t = 0;
+    let rc = match flavor {
+        SpawnFlavor::Path => unsafe {
+            libc::posix_spawn(
+                &mut pid,
+                c_path.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                argv_ptrs.as_ptr(),
+                env_ptrs.as_ptr(),
+            )
+        },
+        SpawnFlavor::SearchPath => unsafe {
+            libc::posix_spawnp(
+                &mut pid,
+                c_path.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                argv_ptrs.as_ptr(),
+                env_ptrs.as_ptr(),
+            )
+        },
+    };
+    if rc != 0 {
+        Err(raise_errno(rc, Some(path)))
+    } else {
+        Ok(pid)
+    }
+}
+
+unsafe extern "C" fn os_posix_spawn(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { posix_spawn_common(argv, argc, false) }
+}
+
+unsafe extern "C" fn os_posix_spawnp(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { posix_spawn_common(argv, argc, true) }
+}
+
+unsafe fn posix_spawn_common(argv: *mut *mut PyObject, argc: usize, search_path: bool) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if args.len() != 3 {
+        return crate::abi::return_null_with_error("os.posix_spawn expected path, argv, and env");
+    }
+    let path = match path_arg(args[0], "posix_spawn") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let c_path = match c_path(&path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let (argv_store, argv_ptrs) = match argv_cstrings(args[1]) {
+        Ok(argv) => argv,
+        Err(error) => return error,
+    };
+    let (env_store, env_ptrs) = match env_cstrings(args[2]) {
+        Ok(env) => env,
+        Err(error) => return error,
+    };
+    let (_argv_keepalive, _env_keepalive) = (argv_store, env_store);
+    let mut pid: libc::pid_t = 0;
+    let result = if search_path {
+        unsafe {
+            libc::posix_spawnp(
+                &mut pid,
+                c_path.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                argv_ptrs.as_ptr(),
+                env_ptrs.as_ptr(),
+            )
+        }
+    } else {
+        unsafe {
+            libc::posix_spawn(
+                &mut pid,
+                c_path.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                argv_ptrs.as_ptr(),
+                env_ptrs.as_ptr(),
+            )
+        }
+    };
+    if result != 0 {
+        return raise_errno(result, Some(&path));
+    }
+    unsafe { crate::abi::pon_const_int(i64::from(pid)) }
+}
+
+fn text_or_bytes_string(object: *mut PyObject, what: &str) -> Result<String, *mut PyObject> {
+    let raw = crate::tag::untag_arg(object);
+    if raw.is_null() || crate::tag::is_small_int(raw) {
+        return Err(crate::abi::exc::raise_kind_error_text(
+            ExceptionKind::TypeError,
+            &format!("{what} must be str or bytes"),
+        ));
+    }
+    if let Some(text) = unsafe { crate::types::type_::unicode_text(raw) } {
+        return Ok(text.to_owned());
+    }
+    if let Some(bytes) = bytes_payload(raw) {
+        return std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| crate::abi::exc::raise_kind_error_text(ExceptionKind::UnicodeDecodeError, what));
+    }
+    Err(crate::abi::exc::raise_kind_error_text(
+        ExceptionKind::TypeError,
+        &format!("{what} must be str or bytes"),
+    ))
+}
+
+fn argv_cstrings(object: *mut PyObject) -> Result<(Vec<std::ffi::CString>, Vec<*mut libc::c_char>), *mut PyObject> {
+    let items = crate::abi::seq::sequence_to_vec(object).map_err(crate::abi::return_null_with_error)?;
+    if items.is_empty() {
+        return Err(crate::abi::exc::raise_kind_error_text(ExceptionKind::ValueError, "argv must not be empty"));
+    }
+    let mut strings = Vec::with_capacity(items.len());
+    for item in items {
+        let text = text_or_bytes_string(item, "argv item")?;
+        strings.push(c_path(&text)?);
+    }
+    let mut ptrs = strings
+        .iter()
+        .map(|value| value.as_ptr() as *mut libc::c_char)
+        .collect::<Vec<_>>();
+    ptrs.push(std::ptr::null_mut());
+    Ok((strings, ptrs))
+}
+
+fn env_cstrings(object: *mut PyObject) -> Result<(Vec<std::ffi::CString>, Vec<*mut libc::c_char>), *mut PyObject> {
+    let items_method = unsafe { crate::abi::pon_get_attr(object, intern("items"), std::ptr::null_mut()) };
+    if items_method.is_null() {
+        return Err(std::ptr::null_mut());
+    }
+    let pairs_object = unsafe { crate::abi::pon_call(items_method, std::ptr::null_mut(), 0) };
+    if pairs_object.is_null() {
+        return Err(std::ptr::null_mut());
+    }
+    let pairs = crate::abi::seq::sequence_to_vec(pairs_object).map_err(crate::abi::return_null_with_error)?;
+    let mut strings = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        let kv = crate::abi::seq::sequence_to_vec(pair).map_err(crate::abi::return_null_with_error)?;
+        if kv.len() != 2 {
+            return Err(crate::abi::exc::raise_kind_error_text(
+                ExceptionKind::ValueError,
+                "env items must be 2-item sequences",
+            ));
+        }
+        let key = text_or_bytes_string(kv[0], "env key")?;
+        let value = text_or_bytes_string(kv[1], "env value")?;
+        strings.push(c_path(&format!("{key}={value}"))?);
+    }
+    let mut ptrs = strings
+        .iter()
+        .map(|value| value.as_ptr() as *mut libc::c_char)
+        .collect::<Vec<_>>();
+    ptrs.push(std::ptr::null_mut());
+    Ok((strings, ptrs))
+}
+
+unsafe extern "C" fn os_utime(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { call_args(argv, argc) };
+    if !(1..=2).contains(&args.len()) {
+        return crate::abi::return_null_with_error("os.utime expected path and optional times");
+    }
+    let path = match path_arg(args[0], "utime") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let c_path = match c_path(&path) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    let mut times = [libc::timespec { tv_sec: 0, tv_nsec: 0 }; 2];
+    let times_ptr = if args.get(1).copied().is_none_or(is_none_value) {
+        std::ptr::null()
+    } else {
+        let values = match crate::abi::seq::sequence_to_vec(args[1]) {
+            Ok(values) if values.len() == 2 => values,
+            Ok(_) => {
+                return crate::abi::exc::raise_kind_error_text(
+                    ExceptionKind::TypeError,
+                    "utime: 'times' must be either a tuple of two ints or None",
+                )
+            }
+            Err(message) => return crate::abi::return_null_with_error(message),
+        };
+        for (slot, value) in times.iter_mut().zip(values) {
+            let seconds = match seconds_float(value, "utime") {
+                Ok(seconds) => seconds,
+                Err(error) => return error,
+            };
+            let whole = seconds.floor();
+            let nanos = ((seconds - whole) * 1e9).round();
+            slot.tv_sec = whole as libc::time_t;
+            slot.tv_nsec = nanos as libc::c_long;
+        }
+        times.as_ptr()
+    };
+    if unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times_ptr, 0) } < 0 {
+        return raise_errno(last_errno(), Some(&path));
+    }
+    unsafe { crate::abi::pon_none() }
+}
+
+fn seconds_float(object: *mut PyObject, what: &str) -> Result<f64, *mut PyObject> {
+    let raw = crate::tag::untag_arg(object);
+    if raw.is_null() {
+        return Err(std::ptr::null_mut());
+    }
+    if let Some(value) = unsafe { crate::types::float::to_f64(raw) } {
+        return Ok(value);
+    }
+    unsafe { crate::types::int::to_bigint_including_bool(raw) }
+        .and_then(|value| num_traits::ToPrimitive::to_f64(&value))
+        .ok_or_else(|| crate::abi::exc::raise_kind_error_text(ExceptionKind::TypeError, &format!("{what}: numeric value required")))
+}
 
 /// `os.chdir(path)` over `chdir(2)`.
 unsafe extern "C" fn os_chdir(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -2587,9 +3838,23 @@ unsafe extern "C" fn os_fork(_argv: *mut *mut PyObject, argc: usize) -> *mut PyO
     if argc != 0 {
         return crate::abi::return_null_with_error("os.fork expected no arguments");
     }
+    let callbacks = at_fork_snapshot();
+    if let Err(error) = call_at_fork_callbacks(&callbacks.before, true) {
+        return error;
+    }
     let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return raise_errno(last_errno(), None);
+    if pid == 0 {
+        if let Err(error) = call_at_fork_callbacks(&callbacks.after_in_child, false) {
+            return error;
+        }
+    } else {
+        let fork_errno = (pid < 0).then(last_errno);
+        if let Err(error) = call_at_fork_callbacks(&callbacks.after_in_parent, false) {
+            return error;
+        }
+        if let Some(errno) = fork_errno {
+            return raise_errno(errno, None);
+        }
     }
     unsafe { crate::abi::pon_const_int(i64::from(pid)) }
 }
@@ -3422,15 +4687,7 @@ unsafe extern "C" fn os_uname(_argv: *mut *mut PyObject, argc: usize) -> *mut Py
         c_array_string(&uts.version),
         c_array_string(&uts.machine),
     ];
-    let mut objects = Vec::with_capacity(fields.len());
-    for field in fields {
-        let object = unsafe { pon_const_str(field.as_ptr(), field.len()) };
-        if object.is_null() {
-            return std::ptr::null_mut();
-        }
-        objects.push(object);
-    }
-    unsafe { crate::abi::seq::pon_build_tuple(objects.as_mut_ptr(), objects.len()) }
+    uname_result_object(fields)
 }
 
 fn c_array_string(buffer: &[libc::c_char]) -> String {
@@ -3456,17 +4713,7 @@ unsafe extern "C" fn os_times(_argv: *mut *mut PyObject, argc: usize) -> *mut Py
         tms.tms_cstime as f64 / ticks,
         elapsed as f64 / ticks,
     ];
-    let mut objects = [
-        unsafe { crate::abi::number::pon_const_float(values[0]) },
-        unsafe { crate::abi::number::pon_const_float(values[1]) },
-        unsafe { crate::abi::number::pon_const_float(values[2]) },
-        unsafe { crate::abi::number::pon_const_float(values[3]) },
-        unsafe { crate::abi::number::pon_const_float(values[4]) },
-    ];
-    if objects.iter().any(|object| object.is_null()) {
-        return std::ptr::null_mut();
-    }
-    unsafe { crate::abi::seq::pon_build_tuple(objects.as_mut_ptr(), objects.len()) }
+    times_result_object(values)
 }
 
 unsafe extern "C" fn os_wait(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -3578,6 +4825,10 @@ unsafe extern "C" fn os_forkpty(_argv: *mut *mut PyObject, argc: usize) -> *mut 
     if argc != 0 {
         return crate::abi::return_null_with_error("os.forkpty expected no arguments");
     }
+    let callbacks = at_fork_snapshot();
+    if let Err(error) = call_at_fork_callbacks(&callbacks.before, true) {
+        return error;
+    }
     let mut master = 0 as libc::c_int;
     let pid = unsafe {
         libc::forkpty(
@@ -3587,8 +4838,21 @@ unsafe extern "C" fn os_forkpty(_argv: *mut *mut PyObject, argc: usize) -> *mut 
             std::ptr::null_mut(),
         )
     };
-    if pid < 0 {
-        return raise_errno(last_errno(), None);
+    if pid == 0 {
+        if let Err(error) = call_at_fork_callbacks(&callbacks.after_in_child, false) {
+            return error;
+        }
+    } else {
+        let fork_errno = (pid < 0).then(last_errno);
+        if let Err(error) = call_at_fork_callbacks(&callbacks.after_in_parent, false) {
+            if pid > 0 {
+                unsafe { libc::close(master) };
+            }
+            return error;
+        }
+        if let Some(errno) = fork_errno {
+            return raise_errno(errno, None);
+        }
     }
     if pid > 0 {
         if let Err(errno) = set_fd_cloexec(master, true) {

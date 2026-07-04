@@ -68,7 +68,7 @@ const CONSTANTS: &[(&str, i64)] = &[
 ];
 
 #[derive(Clone, Copy)]
-struct RUsageRecord {
+pub(crate) struct RUsageRecord {
     values: [RUsageValue; 16],
 }
 
@@ -225,7 +225,7 @@ unsafe extern "C" fn resource_getrusage(argv: *mut *mut PyObject, argc: usize) -
     rusage_object(rusage_record(&usage))
 }
 
-fn rusage_record(usage: &libc::rusage) -> RUsageRecord {
+pub(crate) fn rusage_record(usage: &libc::rusage) -> RUsageRecord {
     RUsageRecord {
         values: [
             RUsageValue::Float(timeval_seconds(usage.ru_utime)),
@@ -252,7 +252,7 @@ fn timeval_seconds(value: libc::timeval) -> f64 {
     value.tv_sec as f64 + value.tv_usec as f64 * 1e-6
 }
 
-fn rusage_object(record: RUsageRecord) -> *mut PyObject {
+pub(crate) fn rusage_object(record: RUsageRecord) -> *mut PyObject {
     Box::into_raw(Box::new(PyRUsage {
         ob_base: PyObjectHeader::new(rusage_type()),
         record,

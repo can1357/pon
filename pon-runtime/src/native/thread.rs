@@ -29,7 +29,7 @@ use crate::abi::{
 };
 use crate::intern::intern;
 use crate::native::builtins_mod::VARIADIC_ARITY;
-use crate::object::{PyObject, PyObjectHeader, PyType};
+use crate::object::{PyObject, PyObjectHeader, PySequenceMethods, PyType};
 use crate::thread_state::pon_err_set;
 use crate::types::exc::ExceptionKind;
 use crate::types::{method, type_};
@@ -88,6 +88,8 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
             (intern("LockType"), lock_type().cast::<PyObject>()),
             (intern("lock"), lock_type().cast::<PyObject>()),
             (intern("_ThreadHandle"), thread_handle_type().cast::<PyObject>()),
+            (intern("_ExceptHookArgs"), except_hook_args_type().cast::<PyObject>()),
+            (intern("_excepthook"), module_function("_excepthook", native_excepthook)?),
             (intern("_local"), local_type().cast::<PyObject>()),
             (intern("error"), error_type),
             (intern("TIMEOUT_MAX"), timeout_max),
@@ -124,6 +126,214 @@ fn bound_method(receiver: *mut PyObject, name: &str, entry: BuiltinFn) -> *mut P
             pon_err_set(message);
             ptr::null_mut()
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Thread excepthook arguments
+
+const EXCEPT_HOOK_FIELDS: [&str; 4] = ["exc_type", "exc_value", "exc_traceback", "thread"];
+
+#[repr(C)]
+struct PyExceptHookArgs {
+    ob_base: PyObjectHeader,
+    fields: [*mut PyObject; 4],
+}
+
+static EXCEPT_HOOK_ARGS_SEQUENCE: LazyLock<PySequenceMethods> = LazyLock::new(|| PySequenceMethods {
+    sq_length: Some(except_hook_args_len),
+    sq_item: Some(except_hook_args_item),
+    ..PySequenceMethods::EMPTY
+});
+
+static EXCEPT_HOOK_ARGS_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let mut ty = PyType::new(
+        abi::runtime_type_type().cast_const(),
+        "_thread._ExceptHookArgs",
+        std::mem::size_of::<PyExceptHookArgs>(),
+    );
+    ty.tp_base = runtime_object_type();
+    ty.tp_new = Some(except_hook_args_new);
+    ty.tp_getattro = Some(except_hook_args_getattro);
+    ty.tp_repr = Some(except_hook_args_repr);
+    ty.tp_as_sequence = &*EXCEPT_HOOK_ARGS_SEQUENCE as *const PySequenceMethods as *mut PySequenceMethods;
+    Box::into_raw(Box::new(ty)) as usize
+});
+
+static EXCEPT_HOOK_ARGS_REGISTRY: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn except_hook_args_type() -> *mut PyType {
+    *EXCEPT_HOOK_ARGS_TYPE as *mut PyType
+}
+
+fn alloc_except_hook_args(fields: [*mut PyObject; 4]) -> *mut PyObject {
+    let object = Box::into_raw(Box::new(PyExceptHookArgs {
+        ob_base: PyObjectHeader::new(except_hook_args_type()),
+        fields,
+    }));
+    EXCEPT_HOOK_ARGS_REGISTRY
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .push(object as usize);
+    object.cast::<PyObject>()
+}
+
+unsafe fn as_except_hook_args<'a>(object: *mut PyObject) -> Option<&'a PyExceptHookArgs> {
+    let object = crate::tag::untag_arg(object);
+    if object.is_null() || unsafe { (*object).ob_type } != except_hook_args_type().cast_const() {
+        return None;
+    }
+    Some(unsafe { &*object.cast::<PyExceptHookArgs>() })
+}
+
+fn thread_type_error(message: &str) -> *mut PyObject {
+    abi::exc::raise_kind_error_text(ExceptionKind::TypeError, message)
+}
+
+unsafe extern "C" fn except_hook_args_new(
+    _cls: *mut PyType,
+    args: *mut PyObject,
+    kwargs: *mut PyObject,
+) -> *mut PyObject {
+    if !kwargs.is_null() {
+        return thread_type_error("_thread._ExceptHookArgs() takes no keyword arguments");
+    }
+    let positional = match unsafe { type_::positional_args_from_object(args) } {
+        Ok(positional) => positional,
+        Err(message) => return thread_type_error(&message),
+    };
+    let values = match positional.as_slice() {
+        [] => Vec::new(),
+        [iterable] => match crate::abi::seq::sequence_to_vec(*iterable) {
+            Ok(values) => values,
+            Err(message) => return thread_type_error(&message),
+        },
+        _ => {
+            return thread_type_error(&format!(
+                "_thread._ExceptHookArgs() takes at most 1 argument ({} given)",
+                positional.len()
+            ));
+        }
+    };
+    if values.len() != EXCEPT_HOOK_FIELDS.len() {
+        return thread_type_error(&format!(
+            "_thread._ExceptHookArgs() takes a 4-sequence ({}-sequence given)",
+            values.len()
+        ));
+    }
+    alloc_except_hook_args([values[0], values[1], values[2], values[3]])
+}
+
+unsafe extern "C" fn except_hook_args_len(_object: *mut PyObject) -> isize {
+    EXCEPT_HOOK_FIELDS.len() as isize
+}
+
+unsafe extern "C" fn except_hook_args_item(object: *mut PyObject, index: isize) -> *mut PyObject {
+    let Ok(index) = usize::try_from(index) else {
+        return abi::exc::raise_kind_error_text(ExceptionKind::IndexError, "tuple index out of range");
+    };
+    let Some(args) = (unsafe { as_except_hook_args(object) }) else {
+        return thread_type_error("_ExceptHookArgs receiver is invalid");
+    };
+    args.fields
+        .get(index)
+        .copied()
+        .unwrap_or_else(|| abi::exc::raise_kind_error_text(ExceptionKind::IndexError, "tuple index out of range"))
+}
+
+unsafe extern "C" fn except_hook_args_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name_text) = (unsafe { type_::unicode_text(crate::tag::untag_arg(name)) }) else {
+        return abi::exc::raise_kind_error_text(ExceptionKind::TypeError, "attribute name must be str");
+    };
+    if name_text == "n_fields" || name_text == "n_sequence_fields" {
+        return unsafe { pon_const_int(EXCEPT_HOOK_FIELDS.len() as i64) };
+    }
+    if name_text == "n_unnamed_fields" {
+        return unsafe { pon_const_int(0) };
+    }
+    let Some(args) = (unsafe { as_except_hook_args(object) }) else {
+        return thread_type_error("_ExceptHookArgs receiver is invalid");
+    };
+    if let Some(index) = EXCEPT_HOOK_FIELDS.iter().position(|&field| field == name_text) {
+        return args.fields[index];
+    }
+    unsafe { pon_raise_attribute_error(object, intern(name_text)) }
+}
+
+unsafe extern "C" fn except_hook_args_repr(object: *mut PyObject) -> *mut PyObject {
+    let Some(args) = (unsafe { as_except_hook_args(object) }) else {
+        return thread_type_error("_ExceptHookArgs receiver is invalid");
+    };
+    let text = format!(
+        "_thread._ExceptHookArgs(exc_type={}, exc_value={}, exc_traceback={}, thread={})",
+        super::builtins_mod::repr_text(args.fields[0]),
+        super::builtins_mod::repr_text(args.fields[1]),
+        super::builtins_mod::repr_text(args.fields[2]),
+        super::builtins_mod::repr_text(args.fields[3]),
+    );
+    unsafe { crate::abi::pon_const_str(text.as_ptr(), text.len()) }
+}
+
+unsafe extern "C" fn native_excepthook(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    use std::io::Write;
+
+    if argc != 1 || argv.is_null() {
+        return thread_type_error(&format!("_thread._excepthook() takes exactly one argument ({argc} given)"));
+    }
+    let Some(args) = (unsafe { as_except_hook_args(*argv) }) else {
+        return thread_type_error("_thread.excepthook argument type must be ExceptHookArgs");
+    };
+    if Some(args.fields[0]) == crate::import::module_attr(intern("builtins"), intern("SystemExit")) {
+        return unsafe { pon_none() };
+    }
+    let thread = args.fields[3];
+    let name = if !is_none_object(thread) {
+        let attr = unsafe { abi::object::pon_get_attr(thread, intern("name"), ptr::null_mut()) };
+        if attr.is_null() {
+            crate::thread_state::pon_err_clear();
+            current_ident().to_string()
+        } else {
+            super::builtins_mod::str_text(attr)
+        }
+    } else {
+        current_ident().to_string()
+    };
+    let value = args.fields[1];
+    let type_name = exception_type_name(args.fields[0], value);
+    let message = super::builtins_mod::str_text(value);
+    let mut stderr = std::io::stderr().lock();
+    let outcome = writeln!(stderr, "Exception in thread {name}:").and_then(|()| {
+        if message.is_empty() {
+            writeln!(stderr, "{type_name}")
+        } else {
+            writeln!(stderr, "{type_name}: {message}")
+        }
+    });
+    if let Err(error) = outcome.and_then(|()| stderr.flush()) {
+        pon_err_set(format!("_thread._excepthook() failed to write stderr: {error}"));
+        return ptr::null_mut();
+    }
+    unsafe { pon_none() }
+}
+
+fn is_none_object(object: *mut PyObject) -> bool {
+    crate::tag::untag_arg(object) == unsafe { pon_none() }
+}
+
+fn exception_type_name(exc_type: *mut PyObject, value: *mut PyObject) -> String {
+    let exc_type = crate::tag::untag_arg(exc_type);
+    if !exc_type.is_null() && unsafe { (*exc_type).ob_type } == abi::runtime_type_type().cast_const() {
+        return unsafe { (*exc_type.cast::<PyType>()).name() }.to_owned();
+    }
+    let value = crate::tag::untag_arg(value);
+    if value.is_null() {
+        return "<unknown>".to_owned();
+    }
+    let ty = unsafe { (*value).ob_type };
+    if ty.is_null() {
+        "<unknown>".to_owned()
+    } else {
+        unsafe { (*ty).name() }.to_owned()
     }
 }
 
@@ -731,6 +941,15 @@ impl LockState {
         self.available.notify_one();
         Ok(())
     }
+
+    /// CPython `lock._at_fork_reinit()`: reset to a fresh unlocked lock in
+    /// the child after `fork` (post-fork the parent's holder is gone, so
+    /// waiters must not inherit a locked state).
+    fn at_fork_reinit(&self) {
+        let mut locked = self.lock();
+        *locked = false;
+        self.available.notify_all();
+    }
 }
 
 static LOCK_TYPE: LazyLock<usize> = LazyLock::new(|| {
@@ -779,6 +998,7 @@ unsafe extern "C" fn lock_getattro(object: *mut PyObject, name: *mut PyObject) -
         "release" => lock_release_entry,
         "__exit__" => lock_exit_entry,
         "locked" => lock_locked_entry,
+        "_at_fork_reinit" => lock_at_fork_reinit_entry,
         // SAFETY: Raise helper with the interned attribute name (Condition's
         // `_release_save`/`_acquire_restore`/`_is_owned` probes must see
         // AttributeError to engage their Python fallbacks).
@@ -895,6 +1115,21 @@ unsafe extern "C" fn lock_locked_entry(argv: *mut *mut PyObject, argc: usize) ->
         return ptr::null_mut();
     };
     unsafe { pon_const_bool(i32::from((*lock).state.is_locked())) }
+}
+
+/// Bound `lock._at_fork_reinit()`: resets the lock to unlocked (fork-child
+/// hygiene; `concurrent.futures.thread` registers it via
+/// `os.register_at_fork`).
+unsafe extern "C" fn lock_at_fork_reinit_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let Some(lock) = lock_receiver(argv, argc) else {
+        return ptr::null_mut();
+    };
+    if argc != 1 {
+        pon_err_set(format!("_at_fork_reinit() takes no arguments ({} given)", argc - 1));
+        return ptr::null_mut();
+    }
+    unsafe { (*lock).state.at_fork_reinit() };
+    unsafe { pon_none() }
 }
 
 fn lock_receiver(argv: *mut *mut PyObject, argc: usize) -> Option<*mut PyLock> {

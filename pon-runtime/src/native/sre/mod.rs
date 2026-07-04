@@ -37,6 +37,7 @@ type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObjec
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
     let mut attrs = vec![
         string_attr("__name__", "_sre")?,
+        string_attr("copyright", " SRE 2.2.2 Copyright (c) 1997-2002 by Secret Labs AB ")?,
         int_attr("MAGIC", i64::from(vm::MAGIC))?,
         int_attr("CODESIZE", vm::CODESIZE as i64)?,
         int_attr("MAXREPEAT", i64::from(vm::MAXREPEAT))?,
