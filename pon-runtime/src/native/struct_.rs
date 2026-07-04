@@ -349,6 +349,8 @@ enum Kind {
     Pascal,
     /// `e f d`: IEEE 754 binary16/32/64 (distinguished by size).
     Float,
+    /// `F D`: IEEE 754 complex binary32/binary64 pairs.
+    Complex,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -408,6 +410,8 @@ fn code_spec(code: u8, native: bool) -> Option<(Kind, usize, usize)> {
         b'e' => (Kind::Float, 2, 1),
         b'f' => (Kind::Float, 4, 1),
         b'd' => (Kind::Float, 8, 1),
+        b'F' => (Kind::Complex, 8, 1),
+        b'D' => (Kind::Complex, 16, 1),
         _ => return None,
     })
 }
@@ -702,6 +706,31 @@ fn pack_element(dest: &mut [u8], value: *mut PyObject, item: &Item, little: bool
                 _ => write_uint(dest, u128::from(float.to_bits()), little),
             }
         }
+        Kind::Complex => {
+            let (real, imag) = match unsafe { crate::types::complex_::to_f64s(value) } {
+                Some(parts) => parts,
+                None => {
+                    raise_struct_error("required argument is not a complex");
+                    return Err(());
+                }
+            };
+            match item.size {
+                8 => {
+                    let real_single = real as f32;
+                    let imag_single = imag as f32;
+                    if (real_single.is_infinite() && real.is_finite()) || (imag_single.is_infinite() && imag.is_finite()) {
+                        raise_overflow_error("complex component too large to pack with F format");
+                        return Err(());
+                    }
+                    write_uint(&mut dest[..4], u128::from(real_single.to_bits()), little);
+                    write_uint(&mut dest[4..8], u128::from(imag_single.to_bits()), little);
+                }
+                _ => {
+                    write_uint(&mut dest[..8], u128::from(real.to_bits()), little);
+                    write_uint(&mut dest[8..16], u128::from(imag.to_bits()), little);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -773,6 +802,19 @@ fn unpack_element(src: &[u8], item: &Item, little: bool) -> *mut PyObject {
             };
             // SAFETY: Runtime allocation helper; NULL on failure with the error set.
             unsafe { abi::number::pon_const_float(float) }
+        }
+        Kind::Complex => {
+            let (real, imag) = match item.size {
+                8 => (
+                    f64::from(f32::from_bits(read_uint(&src[..4], little) as u32)),
+                    f64::from(f32::from_bits(read_uint(&src[4..8], little) as u32)),
+                ),
+                _ => (
+                    f64::from_bits(read_uint(&src[..8], little) as u64),
+                    f64::from_bits(read_uint(&src[8..16], little) as u64),
+                ),
+            };
+            crate::types::complex_::from_f64s(real, imag)
         }
     }
 }

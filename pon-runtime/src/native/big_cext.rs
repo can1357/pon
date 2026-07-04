@@ -32,6 +32,11 @@ use super::builtins_mod::{alloc_list, alloc_tuple, VARIADIC_ARITY};
 use super::install_module;
 
 type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn _dyld_shared_cache_contains_path(path: *const c_char) -> bool;
+}
+
 
 fn raise(kind: ExceptionKind, message: &str) -> *mut PyObject {
     abi::exc::raise_kind_error_text(kind, message)
@@ -3805,6 +3810,31 @@ unsafe extern "C" fn ctypes_dlclose_entry(argv: *mut *mut PyObject, argc: usize)
     }
 }
 
+unsafe extern "C" fn ctypes_dyld_shared_cache_contains_path_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match args_or_type_error(argv, argc, "_dyld_shared_cache_contains_path") {
+        Ok([path]) => [*path],
+        Ok(args) => return type_error(&format!("_dyld_shared_cache_contains_path() expected 1 argument, got {}", args.len())),
+        Err(error) => return error,
+    };
+    let path = match str_arg(args[0], "path") {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    #[cfg(target_os = "macos")]
+    {
+        let c_path = match CString::new(path) {
+            Ok(path) => path,
+            Err(_) => return value_error("embedded null character"),
+        };
+        return py_bool(unsafe { _dyld_shared_cache_contains_path(c_path.as_ptr()) });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        raise(ExceptionKind::NotImplementedError, "_dyld_shared_cache_contains_path is only available on Darwin")
+    }
+}
+
 unsafe extern "C" fn ctypes_resize_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let args = match args_or_type_error(argv, argc, "resize") {
         Ok([object, size]) => [*object, *size],
@@ -3950,6 +3980,11 @@ fn ctypes_attrs(name: &str) -> Result<Vec<(u32, *mut PyObject)>, String> {
         function_attr("buffer_info", "buffer_info", ctypes_buffer_info_entry)?,
         function_attr("get_errno", "get_errno", ctypes_get_errno_entry)?,
         function_attr("set_errno", "set_errno", ctypes_set_errno_entry)?,
+        function_attr(
+            "_dyld_shared_cache_contains_path",
+            "_dyld_shared_cache_contains_path",
+            ctypes_dyld_shared_cache_contains_path_entry,
+        )?,
     ];
     let argument_error = exception_class("ctypes", "ArgumentError", "Exception")?;
     attrs.push((intern("ArgumentError"), argument_error));
