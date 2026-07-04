@@ -22,6 +22,7 @@ mod ast_;
 pub use ast_::{AstNode, AstValue, NodeSpan, build_ast_object};
 mod asyncio;
 pub mod atexit;
+mod big_cext;
 mod binascii;
 mod cext;
 pub(crate) mod codecs;
@@ -29,6 +30,7 @@ pub(crate) mod collections;
 mod colorize;
 pub(crate) mod contextvars;
 mod csv_;
+mod curses_;
 mod errno;
 mod faulthandler;
 mod fcntl_;
@@ -42,6 +44,7 @@ mod lsprof;
 mod mmap;
 mod math;
 mod multibyte_codecs;
+mod multiprocessing;
 mod opcode_;
 mod packaging_compat;
 pub(crate) mod os;
@@ -61,6 +64,7 @@ pub(crate) mod signal;
 mod socket_;
 mod sre;
 mod statistics;
+pub(crate) mod stdlib_small;
 mod string_mod;
 mod struct_;
 mod suggestions;
@@ -100,13 +104,22 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
     ("_colorize", colorize::make_module),
     ("_contextvars", contextvars::make_module),
     ("_csv", csv_::make_module),
+    ("_curses", curses_::make_curses_module),
+    ("_curses_panel", curses_::make_curses_panel_module),
+    ("_ctypes", big_cext::make_ctypes_underscore_module),
+    ("_dbm", big_cext::make_dbm_underscore_module),
+    ("_datetime", stdlib_small::make_datetime_module),
+    ("_functools", stdlib_small::make_functools_module),
     ("_hashlib", cext::make_hashlib_module),
     ("_hmac", cext::make_hmac_module),
     ("_imp", imp::make_module),
     ("_io", io::make_module),
+    ("_json", stdlib_small::make_json_module),
+    ("_locale", stdlib_small::make_locale_module),
     ("_lsprof", lsprof::make_module),
     ("_lzma", cext::make_lzma_module),
     ("_md5", hashes::make_md5_module),
+    ("_multiprocessing", multiprocessing::make_module),
     ("_opcode", opcode_::make_module),
     ("_pickle", pickle::make_module),
     ("_posixshmem", posixshmem::make_module),
@@ -119,6 +132,8 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
     ("_sha3", hashes::make_sha3_module),
     ("_signal", signal::make_module),
     ("_socket", socket_::make_module),
+    ("_sqlite3", big_cext::make_sqlite3_underscore_module),
+    ("_ssl", big_cext::make_ssl_underscore_module),
     ("_sre", sre::make_module),
     ("_statistics", statistics::make_module),
     ("_string", string_mod::make_module),
