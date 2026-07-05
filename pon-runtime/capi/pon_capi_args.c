@@ -1120,6 +1120,10 @@ static PyObject *pypon_build_one(const char **format, va_list *vargs) {
                 PyErr_SetString(PyExc_TypeError, "NULL object passed to Py_BuildValue");
                 return NULL;
             }
+            /* Registered foreign type statics (e.g. PyExc_* twins, &Some_Type)
+             * must not leak into pon structures: translate to the native
+             * class before the value is stored. */
+            object = PyPon_Capi()->core->normalize_foreign(object);
             /* Pon's GC owns object lifetimes.  O and N both pin the object here:
              * CPython's borrow/steal distinction is not observable in this shim. */
             Py_INCREF(object);

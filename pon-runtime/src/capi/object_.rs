@@ -272,7 +272,9 @@ unsafe fn file_descriptor_from_required_integer(object: *mut PyObject, type_erro
     file_descriptor_from_bigint(&value)
 }
 
-fn normalize_object_arg(object: *mut PyObject) -> *mut PyObject {
+// C-side stores and call-arg unpacking must translate foreign PyTypeObject
+// twins into runtime-native classes before values enter Pon data structures.
+pub(crate) fn normalize_object_arg(object: *mut PyObject) -> *mut PyObject {
     twin::registered_native_of_foreign(object.cast::<ForeignTypeObject>())
         .map_or(object, |native| native.cast::<PyObject>())
 }

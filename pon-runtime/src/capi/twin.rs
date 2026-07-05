@@ -226,21 +226,26 @@ pub(crate) fn register_foreign_twin(foreign: *mut ForeignTypeObject, native: *mu
     }
 }
 
-/// Translates a foreign type pointer back to the runtime-native type.
+/// Translates a known C-facing type object back to the runtime-native type.
+///
+/// The registry is the source of truth.  Do not trust `tp_pon_twin` on a
+/// registry miss: callers sometimes use this helper while validating boundary
+/// class arguments, and a native `PyType` or arbitrary object at the same
+/// address shape must fail loudly instead of being reinterpreted as a foreign
+/// struct.  A raw native type is accepted only when the registry already knows
+/// that exact address as a native key.
 pub(crate) fn native_of_foreign(foreign: *mut ForeignTypeObject) -> Option<*mut PyType> {
     if foreign.is_null() {
         return None;
     }
-    {
-        let registry = REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
-        if let Some(&native) = registry.native_by_foreign.get(&(foreign as usize)) {
-            return Some(native as *mut PyType);
-        }
+    let registry = REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(&native) = registry.native_by_foreign.get(&(foreign as usize)) {
+        return Some(native as *mut PyType);
     }
-    // Unregistered: trust a filled twin's own back pointer.
-    // SAFETY: caller hands a live foreign type object.
-    let twin = unsafe { (*foreign).tp_pon_twin };
-    (!twin.is_null()).then_some(twin)
+    registry
+        .foreign_by_native
+        .contains_key(&(foreign as usize))
+        .then_some(foreign.cast::<PyType>())
 }
 
 /// Registry-only foreign -> native translation for generic `PyObject *`
@@ -258,6 +263,18 @@ pub(crate) fn registered_native_of_foreign(foreign: *mut ForeignTypeObject) -> O
         .map(|&native| native as *mut PyType)
 }
 
+fn normalize_native_type_arg(native: *mut PyType) -> *mut PyType {
+    if native.is_null() {
+        return ptr::null_mut();
+    }
+    if let Some(registered) = registered_native_of_foreign(native.cast::<ForeignTypeObject>()) {
+        return registered;
+    }
+    // SAFETY: registry probing above has ruled out every known foreign face;
+    // remaining callers must provide a live runtime type object.
+    unsafe { crate::types::type_::canonical_type_object(native) }
+}
+
 /// Registry-only native -> foreign translation (no fabrication): the
 /// registered face of a `PyType_Ready`'d C type or an already-published
 /// twin. Used by slot trampolines and the instance finalizer, which must
@@ -266,8 +283,7 @@ pub(crate) fn registered_foreign_of_native(native: *mut PyType) -> Option<*mut F
     if native.is_null() {
         return None;
     }
-    // SAFETY: live type object; lookups key off the canonical pointer.
-    let canonical = unsafe { crate::types::type_::canonical_type_object(native) };
+    let canonical = normalize_native_type_arg(native);
     lookup_foreign(canonical)
 }
 
@@ -278,9 +294,7 @@ pub(crate) fn foreign_of_native(native: *mut PyType) -> *mut ForeignTypeObject {
     if native.is_null() {
         return ptr::null_mut();
     }
-    // SAFETY: live type object; collapses helper-family shadows onto the
-    // installed builtin global so identity never splits.
-    let native = unsafe { crate::types::type_::canonical_type_object(native) };
+    let native = normalize_native_type_arg(native);
     if let Some(foreign) = lookup_foreign(native) {
         return foreign;
     }
@@ -331,8 +345,7 @@ fn resolve_in_batch(native: *mut PyType, batch: &mut HashMap<usize, *mut Foreign
     if native.is_null() {
         return ptr::null_mut();
     }
-    // SAFETY: live type object (see `foreign_of_native`).
-    let native = unsafe { crate::types::type_::canonical_type_object(native) };
+    let native = normalize_native_type_arg(native);
     fabricate_into_batch(native, batch)
 }
 

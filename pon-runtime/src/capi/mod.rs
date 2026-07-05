@@ -134,6 +134,7 @@ struct PyPonCapiCore {
     builtin_type_id: unsafe extern "C" fn(*mut PyObject) -> c_int,
     foreign_of: unsafe extern "C" fn(*mut PyObject) -> *mut twin::ForeignTypeObject,
     ellipsis: unsafe extern "C" fn() -> *mut PyObject,
+    normalize_foreign: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
 }
 
 unsafe impl Sync for PyPonCapiCore {}
@@ -217,6 +218,7 @@ fn capi_table() -> *const PyPonCapi {
             builtin_type_id: twin::capi_builtin_type_id,
             foreign_of: twin::capi_foreign_of,
             ellipsis: py_ellipsis,
+            normalize_foreign: py_normalize_foreign,
         },
         err: err::build(),
         numbers: numbers::build(),
@@ -564,6 +566,14 @@ unsafe extern "C" fn py_none() -> *mut PyObject {
 
 unsafe extern "C" fn py_ellipsis() -> *mut PyObject {
     unsafe { abi::pon_ellipsis() }
+}
+
+/// Foreign-face -> native translation for C code that stores objects into
+/// pon structures (`Py_BuildValue` "O"/"S"/"N"): registered foreign type
+/// statics collapse onto their native class; everything else passes through.
+unsafe extern "C" fn py_normalize_foreign(object: *mut PyObject) -> *mut PyObject {
+    twin::registered_native_of_foreign(object.cast::<twin::ForeignTypeObject>())
+        .map_or(object, |native| native.cast::<PyObject>())
 }
 
 

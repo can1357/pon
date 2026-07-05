@@ -18,7 +18,7 @@ use crate::types::dict::DictEntry;
 use crate::types::exc::ExceptionKind;
 use crate::types::{dict, frozenset, list, set_, tuple, type_};
 
-use super::{c_string, twin::ForeignTypeObject};
+use super::{c_string, object_::normalize_object_arg, twin::ForeignTypeObject};
 
 /// C mirror: `include/pon_capi/containers.h` `PyPonCapiContainers`.
 #[repr(C)]
@@ -380,7 +380,7 @@ unsafe extern "C" fn capi_tuple_get_item(tuple: *mut PyObject, index: isize) -> 
 unsafe extern "C" fn capi_tuple_set_item(tuple: *mut PyObject, index: isize, item: *mut PyObject) -> c_int {
     catch_status(|| {
         let tuple = crate::tag::untag_arg(tuple);
-        let item = crate::tag::untag_arg(item);
+        let item = crate::tag::untag_arg(normalize_object_arg(item));
         if item.is_null() {
             return status_type_error("tuple item must not be NULL");
         }
@@ -408,7 +408,7 @@ unsafe extern "C" fn capi_tuple_pack(items: *mut *mut PyObject, size: isize) -> 
         }
         let mut values = Vec::with_capacity(size);
         for index in 0..size {
-            let value = crate::tag::untag_arg(unsafe { *items.add(index) });
+            let value = crate::tag::untag_arg(normalize_object_arg(unsafe { *items.add(index) }));
             if value.is_null() {
                 return type_error("tuple item must not be NULL");
             }
@@ -476,7 +476,7 @@ unsafe extern "C" fn capi_list_get_item(list: *mut PyObject, index: isize) -> *m
 unsafe extern "C" fn capi_list_set_item(list: *mut PyObject, index: isize, item: *mut PyObject) -> c_int {
     catch_status(|| {
         let list = crate::tag::untag_arg(list);
-        let item = crate::tag::untag_arg(item);
+        let item = crate::tag::untag_arg(normalize_object_arg(item));
         if item.is_null() {
             return status_type_error("list item must not be NULL");
         }
@@ -496,7 +496,7 @@ unsafe extern "C" fn capi_list_set_item(list: *mut PyObject, index: isize, item:
 unsafe extern "C" fn capi_list_append(list: *mut PyObject, item: *mut PyObject) -> c_int {
     catch_status(|| {
         let list = crate::tag::untag_arg(list);
-        let item = crate::tag::untag_arg(item);
+        let item = crate::tag::untag_arg(normalize_object_arg(item));
         if item.is_null() {
             return status_type_error("list item must not be NULL");
         }
@@ -508,7 +508,7 @@ unsafe extern "C" fn capi_list_append(list: *mut PyObject, item: *mut PyObject) 
 unsafe extern "C" fn capi_list_insert(list: *mut PyObject, index: isize, item: *mut PyObject) -> c_int {
     catch_status(|| {
         let list = crate::tag::untag_arg(list);
-        let item = crate::tag::untag_arg(item);
+        let item = crate::tag::untag_arg(normalize_object_arg(item));
         if item.is_null() {
             return status_type_error("list item must not be NULL");
         }
@@ -569,8 +569,8 @@ unsafe extern "C" fn capi_dict_new() -> *mut PyObject {
 unsafe extern "C" fn capi_dict_set_item(dict: *mut PyObject, key: *mut PyObject, value: *mut PyObject) -> c_int {
     catch_status(|| {
         let dict = crate::tag::untag_arg(dict);
-        let key = crate::tag::untag_arg(key);
-        let value = crate::tag::untag_arg(value);
+        let key = crate::tag::untag_arg(normalize_object_arg(key));
+        let value = crate::tag::untag_arg(normalize_object_arg(value));
         dict_set_item_capi(dict, key, value)
     })
 }
@@ -656,6 +656,8 @@ fn dict_get_result(dict: *mut PyObject, key: *mut PyObject) -> Result<Option<*mu
 }
 
 fn dict_set_item_capi(dict: *mut PyObject, key: *mut PyObject, value: *mut PyObject) -> c_int {
+    let key = crate::tag::untag_arg(normalize_object_arg(key));
+    let value = crate::tag::untag_arg(normalize_object_arg(value));
     if unsafe { type_::is_class_dict_view(dict) } {
         match unsafe { type_::class_dict_view_set_item(dict, key, value) } {
             Ok(()) => 0,
@@ -849,14 +851,16 @@ unsafe extern "C" fn capi_dict_merge(dict: *mut PyObject, other: *mut PyObject, 
             Err(message) => return status_error(message),
         };
         for key in keys {
-            if override_flag == 0 && dict_contains_capi(dict, key).unwrap_or(false) {
+            let stored_key = crate::tag::untag_arg(normalize_object_arg(key));
+            if override_flag == 0 && dict_contains_capi(dict, stored_key).unwrap_or(false) {
                 continue;
             }
             let value = unsafe { abi::pon_subscript_get(other, key, ptr::null_mut()) };
             if value.is_null() {
                 return -1;
             }
-            if dict_set_item_capi(dict, key, value) < 0 {
+            let value = crate::tag::untag_arg(normalize_object_arg(value));
+            if dict_set_item_capi(dict, stored_key, value) < 0 {
                 return -1;
             }
         }
@@ -870,14 +874,16 @@ fn merge_entries(dict: *mut PyObject, entries: Result<Vec<DictEntry>, String>, o
         Err(message) => return status_error(message),
     };
     for entry in entries {
+        let key = crate::tag::untag_arg(normalize_object_arg(entry.key));
+        let value = crate::tag::untag_arg(normalize_object_arg(entry.value));
         if !override_existing {
-            match dict_contains_capi(dict, entry.key) {
+            match dict_contains_capi(dict, key) {
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(message) => return status_error(message),
             }
         }
-        if dict_set_item_capi(dict, entry.key, entry.value) < 0 {
+        if dict_set_item_capi(dict, key, value) < 0 {
             return -1;
         }
     }
@@ -888,11 +894,7 @@ unsafe extern "C" fn capi_dict_update(dict: *mut PyObject, other: *mut PyObject)
     catch_status(|| {
         let dict = crate::tag::untag_arg(dict);
         let other = crate::tag::untag_arg(other);
-        if unsafe { type_::is_class_dict_view(dict) } || unsafe { type_::is_class_dict_view(other) } {
-            return merge_entries(dict, dict_entries_snapshot_capi(other), true);
-        }
-        let result = unsafe { abi::map::pon_dict_update(dict, other) };
-        if result.is_null() { -1 } else { 0 }
+        unsafe { capi_dict_merge(dict, other, 1) }
     })
 }
 
@@ -958,6 +960,7 @@ unsafe extern "C" fn capi_dict_set_default_ref(
         if default_value.is_null() {
             return status_type_error("PyDict_SetDefaultRef default value must not be NULL");
         }
+        let key = crate::tag::untag_arg(normalize_object_arg(key));
         match dict_get_result(dict, key) {
             Ok(Some(value)) => {
                 if !result.is_null() {
@@ -971,8 +974,7 @@ unsafe extern "C" fn capi_dict_set_default_ref(
                     pon_err_clear();
                 }
                 let dict = crate::tag::untag_arg(dict);
-                let key = crate::tag::untag_arg(key);
-                let default_value = crate::tag::untag_arg(default_value);
+                let default_value = crate::tag::untag_arg(normalize_object_arg(default_value));
                 let status = dict_set_item_capi(dict, key, default_value);
                 if status < 0 {
                     return -1;
@@ -1067,7 +1069,7 @@ unsafe extern "C" fn dict_proxy_ass_subscript_slot(
 
 unsafe extern "C" fn capi_dict_proxy_new(mapping: *mut PyObject) -> *mut PyObject {
     catch_object(|| {
-        let mapping = crate::tag::untag_arg(mapping);
+        let mapping = crate::tag::untag_arg(normalize_object_arg(mapping));
         if mapping.is_null() {
             return type_error("PyDictProxy_New received NULL mapping");
         }
@@ -1107,6 +1109,9 @@ unsafe extern "C" fn capi_set_new(iterable: *mut PyObject) -> *mut PyObject {
             Ok(values) => values,
             Err(message) => return abi::return_null_with_error(message),
         };
+        for value in &mut values {
+            *value = crate::tag::untag_arg(normalize_object_arg(*value));
+        }
         unsafe { abi::map::pon_build_set(values.as_mut_ptr(), values.len()) }
     })
 }
@@ -1114,7 +1119,7 @@ unsafe extern "C" fn capi_set_new(iterable: *mut PyObject) -> *mut PyObject {
 unsafe extern "C" fn capi_set_add(set: *mut PyObject, item: *mut PyObject) -> c_int {
     catch_status(|| {
         let set = crate::tag::untag_arg(set);
-        let item = crate::tag::untag_arg(item);
+        let item = crate::tag::untag_arg(normalize_object_arg(item));
         let result = unsafe { abi::map::pon_set_add(set, item) };
         if result.is_null() { -1 } else { 0 }
     })
@@ -1144,9 +1149,9 @@ unsafe extern "C" fn capi_set_size(set: *mut PyObject) -> isize {
 
 unsafe extern "C" fn capi_slice_new(start: *mut PyObject, stop: *mut PyObject, step: *mut PyObject) -> *mut PyObject {
     catch_object(|| {
-        let start = crate::tag::untag_arg(start);
-        let stop = crate::tag::untag_arg(stop);
-        let step = crate::tag::untag_arg(step);
+        let start = crate::tag::untag_arg(normalize_object_arg(start));
+        let stop = crate::tag::untag_arg(normalize_object_arg(stop));
+        let step = crate::tag::untag_arg(normalize_object_arg(step));
         unsafe { abi::seq::pon_build_slice(start, stop, step) }
     })
 }
@@ -1284,7 +1289,7 @@ unsafe extern "C" fn capi_sequence_get_item(object: *mut PyObject, index: isize)
 unsafe extern "C" fn capi_sequence_set_item(object: *mut PyObject, index: isize, value: *mut PyObject) -> c_int {
     catch_status(|| {
         let object = crate::tag::untag_arg(object);
-        let value = crate::tag::untag_arg(value);
+        let value = crate::tag::untag_arg(normalize_object_arg(value));
         let index = unsafe { abi::pon_const_int(index as i64) };
         if index.is_null() {
             return -1;
@@ -1444,7 +1449,7 @@ unsafe extern "C" fn capi_mapping_get_item_string(object: *mut PyObject, key: *c
 unsafe extern "C" fn capi_mapping_set_item_string(object: *mut PyObject, key: *const c_char, value: *mut PyObject) -> c_int {
     catch_status(|| {
         let object = crate::tag::untag_arg(object);
-        let value = crate::tag::untag_arg(value);
+        let value = crate::tag::untag_arg(normalize_object_arg(value));
         let Some(key) = string_key(key) else {
             return -1;
         };
