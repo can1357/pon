@@ -13,7 +13,7 @@ use crate::object::{PyObject, PyObjectHeader, PyType};
 use crate::thread_state::pon_err_clear;
 use crate::types::exc::ExceptionKind;
 
-use super::c_string;
+use super::{PyModuleDef, c_string};
 
 pub(crate) type PyCapsuleDestructor = Option<unsafe extern "C" fn(*mut PyObject)>;
 
@@ -34,6 +34,15 @@ pub(crate) struct PyPonCapiRuntime {
     module_get_state: unsafe extern "C" fn(*mut PyObject) -> *mut c_void,
     module_get_name: unsafe extern "C" fn(*mut PyObject) -> *const c_char,
     sys_get_object: unsafe extern "C" fn(*const c_char) -> *mut PyObject,
+    module_def_init: unsafe extern "C" fn(*mut PyModuleDef) -> *mut PyObject,
+    thread_state_get: unsafe extern "C" fn() -> *mut c_void,
+    thread_state_get_frame: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+    interpreter_state_main: unsafe extern "C" fn() -> *mut c_void,
+    eval_get_builtins: unsafe extern "C" fn() -> *mut PyObject,
+    frame_get_back: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+    frame_get_code: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+    contextvar_new: unsafe extern "C" fn(*const c_char, *mut PyObject) -> *mut PyObject,
+    contextvar_get: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut *mut PyObject) -> c_int,
 }
 
 unsafe impl Send for PyPonCapiRuntime {}
@@ -51,6 +60,29 @@ struct PyCapsule {
 unsafe impl Send for PyCapsule {}
 unsafe impl Sync for PyCapsule {}
 
+#[repr(C)]
+struct PyInterpreterState {
+    _private: u8,
+}
+
+unsafe impl Send for PyInterpreterState {}
+unsafe impl Sync for PyInterpreterState {}
+
+#[repr(C)]
+struct PyThreadState {
+    interp: *mut PyInterpreterState,
+}
+
+unsafe impl Send for PyThreadState {}
+unsafe impl Sync for PyThreadState {}
+
+static MAIN_INTERPRETER_STATE: LazyLock<PyInterpreterState> = LazyLock::new(|| PyInterpreterState { _private: 0 });
+static MAIN_THREAD_STATE: LazyLock<PyThreadState> = LazyLock::new(|| PyThreadState {
+    interp: interpreter_state_main(),
+});
+static MODULE_STATES: LazyLock<Mutex<HashMap<usize, Box<[u8]>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+
 pub(crate) fn build() -> PyPonCapiRuntime {
     PyPonCapiRuntime {
         eval_save_thread: capi_eval_save_thread,
@@ -67,6 +99,15 @@ pub(crate) fn build() -> PyPonCapiRuntime {
         module_get_state: capi_module_get_state,
         module_get_name: capi_module_get_name,
         sys_get_object: capi_sys_get_object,
+        module_def_init: super::py_module_def_init,
+        thread_state_get: capi_thread_state_get,
+        thread_state_get_frame: capi_thread_state_get_frame,
+        interpreter_state_main: capi_interpreter_state_main,
+        eval_get_builtins: capi_eval_get_builtins,
+        frame_get_back: capi_frame_get_back,
+        frame_get_code: capi_frame_get_code,
+        contextvar_new: capi_contextvar_new,
+        contextvar_get: capi_contextvar_get,
     }
 }
 
@@ -79,12 +120,91 @@ pub(crate) fn capsule_type() -> *mut PyType {
     *CAPSULE_TYPE as *mut PyType
 }
 
+fn interpreter_state_main() -> *mut PyInterpreterState {
+    ptr::from_ref(&*MAIN_INTERPRETER_STATE).cast_mut()
+}
+
+fn thread_state_singleton() -> *mut PyThreadState {
+    ptr::from_ref(&*MAIN_THREAD_STATE).cast_mut()
+}
+pub(super) fn register_module_state(module: *mut PyObject, size: usize) -> Result<(), String> {
+    if module.is_null() {
+        return Err("cannot allocate module state for NULL module".to_owned());
+    }
+    let allocation_len = size.max(1);
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(allocation_len)
+        .map_err(|_| format!("failed to allocate {size} bytes of module state"))?;
+    bytes.resize(allocation_len, 0);
+    MODULE_STATES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(module as usize, bytes.into_boxed_slice());
+    Ok(())
+}
+
+pub(super) fn unregister_module_state(module: *mut PyObject) {
+    MODULE_STATES
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(&(module as usize));
+}
+
+
 unsafe extern "C" fn capi_eval_save_thread() -> *mut c_void {
-    static THREAD_STATE_SENTINEL: u8 = 0;
-    (&THREAD_STATE_SENTINEL as *const u8).cast_mut().cast::<c_void>()
+    thread_state_singleton().cast::<c_void>()
 }
 
 unsafe extern "C" fn capi_eval_restore_thread(_state: *mut c_void) {}
+
+unsafe extern "C" fn capi_thread_state_get() -> *mut c_void {
+    thread_state_singleton().cast::<c_void>()
+}
+
+/// Pon does not expose materialized frame objects through the C API yet.
+/// CPython documents a NULL return here when no current frame is available, so
+/// this is a semantically valid degenerate result rather than a fake frame.
+unsafe extern "C" fn capi_thread_state_get_frame(_state: *mut c_void) -> *mut c_void {
+    ptr::null_mut()
+}
+
+unsafe extern "C" fn capi_interpreter_state_main() -> *mut c_void {
+    interpreter_state_main().cast::<c_void>()
+}
+
+unsafe extern "C" fn capi_eval_get_builtins() -> *mut PyObject {
+    let builtins = import_module_text("builtins");
+    if builtins.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { capi_module_get_dict(builtins) }
+}
+
+unsafe extern "C" fn capi_frame_get_back(_frame: *mut c_void) -> *mut c_void {
+    raise_system_error("PyFrame_GetBack is not implemented: Pon exposes no C-visible frame objects");
+    ptr::null_mut()
+}
+
+unsafe extern "C" fn capi_frame_get_code(_frame: *mut c_void) -> *mut c_void {
+    raise_system_error("PyFrame_GetCode is not implemented: Pon exposes no C-visible frame objects");
+    ptr::null_mut()
+}
+
+unsafe extern "C" fn capi_contextvar_new(name: *const c_char, default: *mut PyObject) -> *mut PyObject {
+    let Some(name) = c_string(name) else {
+        return raise_system_error_null("PyContextVar_New called with invalid name");
+    };
+    crate::native::contextvars::capi_contextvar_new(&name, default)
+}
+
+unsafe extern "C" fn capi_contextvar_get(
+    var: *mut PyObject,
+    default: *mut PyObject,
+    value: *mut *mut PyObject,
+) -> c_int {
+    unsafe { crate::native::contextvars::capi_contextvar_get(var, default, value) }
+}
 
 unsafe extern "C" fn capi_capsule_new(
     pointer: *mut c_void,
@@ -189,7 +309,16 @@ unsafe extern "C" fn capi_module_get_dict(module: *mut PyObject) -> *mut PyObjec
     }
 }
 
-unsafe extern "C" fn capi_module_get_state(_module: *mut PyObject) -> *mut c_void {
+unsafe extern "C" fn capi_module_get_state(module: *mut PyObject) -> *mut c_void {
+    {
+        let mut states = MODULE_STATES.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(state) = states.get_mut(&(module as usize)) {
+            return state.as_mut_ptr().cast::<c_void>();
+        }
+    }
+    if module.is_null() || !crate::tag::is_heap(module) || crate::import::module_object_registry_key(module).is_none() {
+        raise_system_error("PyModule_GetState called with non-module object");
+    }
     ptr::null_mut()
 }
 
@@ -489,6 +618,157 @@ PyMODINIT_FUNC PyInit_capi_runtime_test_ext(void) {
         let value = call_noargs(module_name, "format_error_value");
         let message = unsafe { (*value.cast::<PyBaseException>()).message };
         assert_eq!(format_object_for_print(message).as_deref(), Ok("bad thing -7 8 9 X %"));
+
+        reset_import_state_for_tests();
+    }
+
+    #[test]
+    fn runtime_structural_c_api_test() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+
+        let temp = TempExtensionRoot::new();
+        let module_path = compile_extension(
+            &temp,
+            "capi_runtime_structural_ext",
+            r#"
+#include <Python.h>
+
+enum {
+    THREAD_STATE_STABLE = 1L << 0,
+    THREAD_STATE_INTERP_MAIN = 1L << 1,
+    THREAD_STATE_FRAME_NULL_NO_ERROR = 1L << 2,
+    EVAL_SAVE_RESTORE = 1L << 3,
+    MUTEX_SEQUENCE = 1L << 4,
+    VECTORCALL_NARGS_MASK = 1L << 5,
+    CONTEXTVAR_CONSTRUCTOR_DEFAULT = 1L << 6,
+    CONTEXTVAR_EXPLICIT_DEFAULT = 1L << 7,
+    CONTEXTVAR_NULL_DEFAULT = 1L << 8,
+    BUILTINS_LEN = 1L << 9,
+    FRAME_BACK_SYSTEM_ERROR = 1L << 10,
+    FRAME_CODE_SYSTEM_ERROR = 1L << 11
+};
+
+static PyObject *runtime_structural_mask(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+
+    long mask = 0;
+
+    PyThreadState *first = PyThreadState_Get();
+    PyThreadState *second = PyThreadState_Get();
+    if (first != NULL && first == second) {
+        mask |= THREAD_STATE_STABLE;
+    }
+    if (first != NULL && first->interp == PyInterpreterState_Main()) {
+        mask |= THREAD_STATE_INTERP_MAIN;
+    }
+
+    PyFrameObject *current_frame = PyThreadState_GetFrame(first);
+    if (current_frame == NULL && PyErr_Occurred() == NULL) {
+        mask |= THREAD_STATE_FRAME_NULL_NO_ERROR;
+    } else if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+
+    PyThreadState *saved = PyEval_SaveThread();
+    if (saved != NULL) {
+        mask |= EVAL_SAVE_RESTORE;
+        PyEval_RestoreThread(saved);
+    }
+
+    PyMutex mutex = {0};
+    PyMutex_Lock(&mutex);
+    PyMutex_Unlock(&mutex);
+    PyMutex_Lock(&mutex);
+    PyMutex_Unlock(&mutex);
+    mask |= MUTEX_SEQUENCE;
+
+    if (PyVectorcall_NARGS(PY_VECTORCALL_ARGUMENTS_OFFSET | (size_t)37) == 37) {
+        mask |= VECTORCALL_NARGS_MASK;
+    }
+
+    PyObject *constructor_default = PyLong_FromLong(17);
+    if (constructor_default == NULL) {
+        return NULL;
+    }
+    PyObject *with_constructor_default = PyContextVar_New("with_constructor_default", constructor_default);
+    if (with_constructor_default == NULL) {
+        return NULL;
+    }
+    PyObject *value = NULL;
+    if (PyContextVar_Get(with_constructor_default, NULL, &value) == 0 && value == constructor_default) {
+        mask |= CONTEXTVAR_CONSTRUCTOR_DEFAULT;
+    }
+
+    PyObject *without_default = PyContextVar_New("without_default", NULL);
+    if (without_default == NULL) {
+        return NULL;
+    }
+    PyObject *explicit_default = PyLong_FromLong(29);
+    if (explicit_default == NULL) {
+        return NULL;
+    }
+    value = NULL;
+    if (PyContextVar_Get(without_default, explicit_default, &value) == 0 && value == explicit_default) {
+        mask |= CONTEXTVAR_EXPLICIT_DEFAULT;
+    }
+    value = constructor_default;
+    if (PyContextVar_Get(without_default, NULL, &value) == 0 && value == NULL) {
+        mask |= CONTEXTVAR_NULL_DEFAULT;
+    }
+
+    PyObject *builtins = PyEval_GetBuiltins();
+    if (builtins != NULL && PyDict_Check(builtins) && PyDict_GetItemString(builtins, "len") != NULL) {
+        mask |= BUILTINS_LEN;
+    }
+
+    PyFrameObject *back = PyFrame_GetBack(NULL);
+    if (back == NULL && PyErr_ExceptionMatches(PyExc_SystemError)) {
+        mask |= FRAME_BACK_SYSTEM_ERROR;
+    }
+    PyErr_Clear();
+
+    PyCodeObject *code = PyFrame_GetCode(NULL);
+    if (code == NULL && PyErr_ExceptionMatches(PyExc_SystemError)) {
+        mask |= FRAME_CODE_SYSTEM_ERROR;
+    }
+    PyErr_Clear();
+
+    if (PyErr_Occurred() != NULL) {
+        return NULL;
+    }
+    return PyLong_FromLong(mask);
+}
+
+static PyMethodDef methods[] = {
+    {"runtime_structural_mask", runtime_structural_mask, METH_NOARGS, "exercise structural runtime C-API helpers"},
+    {NULL, NULL, 0, NULL}
+};
+
+static struct PyModuleDef module = {
+    PyModuleDef_HEAD_INIT,
+    "capi_runtime_structural_ext",
+    "Pon structural runtime C-API test extension",
+    -1,
+    methods
+};
+
+PyMODINIT_FUNC PyInit_capi_runtime_structural_ext(void) {
+    return PyModule_Create(&module);
+}
+"#,
+        );
+
+        let module = load_extension_module("capi_runtime_structural_ext", &module_path)
+            .unwrap_or_else(|message| panic!("failed to load structural runtime C extension: {message}"));
+        assert!(!module.is_null(), "extension loader returned NULL module");
+
+        let module_name = intern("capi_runtime_structural_ext");
+        assert_noargs_text(module_name, "runtime_structural_mask", "4095");
 
         reset_import_state_for_tests();
     }

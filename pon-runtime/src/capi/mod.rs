@@ -24,7 +24,7 @@ pub(crate) use typeobj::is_capi_class;
 use core::ffi::{c_char, c_int, c_void};
 use core::mem;
 use core::ptr;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::path::Path;
 use std::sync::{LazyLock, Mutex, OnceLock};
@@ -43,6 +43,11 @@ const METH_STATIC: c_int = 0x0020;
 const METH_FASTCALL: c_int = 0x0080;
 
 const PYTHON_API_VERSION: c_int = 1013;
+const PY_MOD_CREATE: c_int = 1;
+const PY_MOD_EXEC: c_int = 2;
+const PY_MOD_MULTIPLE_INTERPRETERS: c_int = 3;
+const PY_MOD_GIL: c_int = 4;
+
 
 /// C signature used by classic `PyMethodDef` function entries.
 pub type PyCFunction = unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject;
@@ -71,8 +76,15 @@ pub struct PyModuleDefBase {
     m_index: isize,
     m_copy: *mut PyObject,
 }
+/// CPython multi-phase module slot descriptor (`moduleobject.h`).
+#[repr(C)]
+pub struct PyModuleDefSlot {
+    slot: c_int,
+    value: *mut c_void,
+}
 
-/// Minimal single-phase module definition accepted by `PyModule_Create2`.
+
+/// Minimal module definition accepted by `PyModule_Create2`/`PyModuleDef_Init`.
 #[repr(C)]
 pub struct PyModuleDef {
     base: PyModuleDefBase,
@@ -80,7 +92,7 @@ pub struct PyModuleDef {
     m_doc: *const c_char,
     m_size: isize,
     m_methods: *const PyMethodDef,
-    m_slots: *mut c_void,
+    m_slots: *mut PyModuleDefSlot,
     m_traverse: *mut c_void,
     m_clear: *mut c_void,
     m_free: *mut c_void,
@@ -121,6 +133,7 @@ struct PyPonCapiCore {
     register_local_twins: unsafe extern "C" fn(*const *mut twin::ForeignTypeObject, c_int) -> c_int,
     builtin_type_id: unsafe extern "C" fn(*mut PyObject) -> c_int,
     foreign_of: unsafe extern "C" fn(*mut PyObject) -> *mut twin::ForeignTypeObject,
+    ellipsis: unsafe extern "C" fn() -> *mut PyObject,
 }
 
 unsafe impl Sync for PyPonCapiCore {}
@@ -168,6 +181,8 @@ static C_FUNCTION_TYPE: LazyLock<usize> = LazyLock::new(|| {
 
 static CAPI_PINS: LazyLock<Mutex<HashMap<usize, usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static EXTENSION_HANDLES: LazyLock<Mutex<Vec<usize>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+static MODULE_DEF_REGISTRY: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
 
 /// Owns every family table. Built on first extension load: the err family
 /// fabricates `PyExc_*` twins and therefore requires an initialized runtime
@@ -201,6 +216,7 @@ fn capi_table() -> *const PyPonCapi {
             register_local_twins: twin::capi_register_local_twins,
             builtin_type_id: twin::capi_builtin_type_id,
             foreign_of: twin::capi_foreign_of,
+            ellipsis: py_ellipsis,
         },
         err: err::build(),
         numbers: numbers::build(),
@@ -279,8 +295,8 @@ pub(crate) fn load_extension_module(name: &str, path: &Path) -> Result<*mut PyOb
     let short_name = name.rsplit('.').next().unwrap_or(name);
     let init_symbol = format!("PyInit_{short_name}");
     let init = unsafe { symbol::<PyInitFunc>(handle, &init_symbol) }?;
-    let module = unsafe { init() };
-    if module.is_null() {
+    let init_result = unsafe { init() };
+    if init_result.is_null() {
         let message = if pon_err_occurred() {
             pon_err_message().unwrap_or_else(|| "extension init failed".to_owned())
         } else {
@@ -289,6 +305,18 @@ pub(crate) fn load_extension_module(name: &str, path: &Path) -> Result<*mut PyOb
         unsafe { libc::dlclose(handle) };
         return Err(message);
     }
+
+    let module = if let Some(def) = registered_module_def(init_result) {
+        match unsafe { load_multi_phase_extension_module(def) } {
+            Ok(module) => module,
+            Err(message) => {
+                unsafe { libc::dlclose(handle) };
+                return Err(message);
+            }
+        }
+    } else {
+        init_result
+    };
 
     EXTENSION_HANDLES
         .lock()
@@ -315,12 +343,62 @@ fn dlerror_text() -> String {
     }
 }
 
+pub(super) unsafe extern "C" fn py_module_def_init(def: *mut PyModuleDef) -> *mut PyObject {
+    if def.is_null() {
+        return abi::return_null_with_error("PyModuleDef_Init received NULL PyModuleDef");
+    }
+    MODULE_DEF_REGISTRY
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(def as usize);
+    def.cast::<PyObject>()
+}
+
+fn registered_module_def(object: *mut PyObject) -> Option<*mut PyModuleDef> {
+    if object.is_null() {
+        return None;
+    }
+    MODULE_DEF_REGISTRY
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .contains(&(object as usize))
+        .then_some(object.cast::<PyModuleDef>())
+}
+
+unsafe fn load_multi_phase_extension_module(def: *mut PyModuleDef) -> Result<*mut PyObject, String> {
+    let def_ref = unsafe { &*def };
+    let Some(name) = c_string(def_ref.m_name) else {
+        let message = "module definition has no name".to_owned();
+        pon_err_set(message.clone());
+        return Err(message);
+    };
+    let module = unsafe { create_module_from_def(def_ref, false) };
+    if module.is_null() {
+        return Err(pending_error_message("multi-phase module creation failed".to_owned()));
+    }
+    if def_ref.m_size >= 0
+        && let Err(message) = runtime_::register_module_state(module, def_ref.m_size as usize)
+    {
+        pon_err_set(message.clone());
+        return Err(message);
+    }
+    if let Err(message) = unsafe { run_module_slots(module, def_ref, &name) } {
+        runtime_::unregister_module_state(module);
+        return Err(message);
+    }
+    Ok(module)
+}
+
 unsafe extern "C" fn py_module_create2(def: *mut PyModuleDef, api_version: c_int) -> *mut PyObject {
     if api_version != PYTHON_API_VERSION || def.is_null() {
         return abi::return_null_with_error("invalid PyModuleDef");
     }
     let def_ref = unsafe { &*def };
-    if !def_ref.m_slots.is_null() {
+    unsafe { create_module_from_def(def_ref, true) }
+}
+
+unsafe fn create_module_from_def(def_ref: &PyModuleDef, reject_slots: bool) -> *mut PyObject {
+    if reject_slots && !def_ref.m_slots.is_null() {
         return abi::return_null_with_error("multi-phase extension modules are not supported yet");
     }
     let Some(name) = c_string(def_ref.m_name) else {
@@ -355,6 +433,62 @@ unsafe extern "C" fn py_module_create2(def: *mut PyModuleDef, api_version: c_int
     match crate::import::install_module(&name, attrs) {
         Ok(module) => module,
         Err(message) => abi::return_null_with_error(message),
+    }
+}
+
+unsafe fn run_module_slots(module: *mut PyObject, def_ref: &PyModuleDef, module_name: &str) -> Result<(), String> {
+    if def_ref.m_slots.is_null() {
+        return Ok(());
+    }
+    let mut cursor = def_ref.m_slots;
+    loop {
+        let slot = unsafe { &*cursor };
+        match slot.slot {
+            0 => return Ok(()),
+            PY_MOD_CREATE => {
+                return module_load_error(format!(
+                    "module '{module_name}' uses unsupported Py_mod_create slot"
+                ));
+            }
+            PY_MOD_EXEC => {
+                if slot.value.is_null() {
+                    return module_load_error(format!("module '{module_name}' has NULL Py_mod_exec slot"));
+                }
+                let exec: unsafe extern "C" fn(*mut PyObject) -> c_int = unsafe { mem::transmute(slot.value) };
+                if unsafe { exec(module) } != 0 {
+                    if pon_err_occurred() {
+                        return Err(pon_err_message().unwrap_or_else(|| format!("Py_mod_exec slot for module '{module_name}' failed")));
+                    }
+                    return module_load_error(format!(
+                        "Py_mod_exec slot for module '{module_name}' failed without setting an exception"
+                    ));
+                }
+            }
+            PY_MOD_MULTIPLE_INTERPRETERS | PY_MOD_GIL => {
+                // Pon currently has one interpreter and no GIL. These CPython
+                // declarations are accepted for source compatibility and need
+                // no runtime work under Pon's execution model.
+            }
+            other => {
+                return module_load_error(format!(
+                    "module '{module_name}' has unsupported PyModuleDef slot {other}"
+                ));
+            }
+        }
+        cursor = unsafe { cursor.add(1) };
+    }
+}
+
+fn module_load_error<T>(message: String) -> Result<T, String> {
+    pon_err_set(message.clone());
+    Err(message)
+}
+
+fn pending_error_message(default: String) -> String {
+    if pon_err_occurred() {
+        pon_err_message().unwrap_or(default)
+    } else {
+        default
     }
 }
 
@@ -426,6 +560,10 @@ unsafe extern "C" fn py_dec_ref(object: *mut PyObject) {
 
 unsafe extern "C" fn py_none() -> *mut PyObject {
     unsafe { abi::pon_none() }
+}
+
+unsafe extern "C" fn py_ellipsis() -> *mut PyObject {
+    unsafe { abi::pon_ellipsis() }
 }
 
 
@@ -565,7 +703,7 @@ mod tests {
     use crate::abi::{format_object_for_print, pon_call, pon_const_int, pon_none, pon_runtime_init};
     use crate::import::{module_attr, reset_import_state_for_tests};
     use crate::intern::intern;
-    use crate::thread_state::{pon_err_message, test_state_lock};
+    use crate::thread_state::{pon_err_clear, pon_err_message, test_state_lock};
 
     static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -754,6 +892,130 @@ PyMODINIT_FUNC PyInit_capi_test_ext(void) {
         );
         assert_eq!(format_object_for_print(echoed).as_deref(), Ok("99"));
     }
+    #[test]
+    fn capi_multiphase_module_def_init_executes_slots_and_rejects_create() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+
+        let temp = TempExtensionRoot::new();
+        let module_path = compile_extension(
+            &temp,
+            "capi_multiphase_ext",
+            r#"
+#include <Python.h>
+
+static long probe_mask = 0;
+
+static PyObject *probe(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    probe_mask |= 1L << 2;
+    return PyLong_FromLong(probe_mask);
+}
+
+static int multiphase_exec(PyObject *m) {
+    long *state = (long *)PyModule_GetState(m);
+    if (state == NULL) {
+        return -1;
+    }
+    if (*state == 0) {
+        probe_mask |= 1L << 0;
+    }
+    *state = 99;
+    if (PyModule_AddObject(m, "token", PyLong_FromLong(42)) < 0) {
+        return -1;
+    }
+    probe_mask |= 1L << 1;
+    return 0;
+}
+
+static PyMethodDef methods[] = {
+    {"probe", probe, METH_NOARGS, 0},
+    {0, 0, 0, 0},
+};
+
+static PyModuleDef_Slot slots[] = {
+    {Py_mod_exec, multiphase_exec},
+    {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED},
+    {Py_mod_gil, Py_MOD_GIL_NOT_USED},
+    {0, 0},
+};
+
+static struct PyModuleDef module = {
+    PyModuleDef_HEAD_INIT,
+    "capi_multiphase_ext",
+    "multi-phase fixture",
+    sizeof(long),
+    methods,
+    slots,
+    0,
+    0,
+    0,
+};
+
+PyMODINIT_FUNC PyInit_capi_multiphase_ext(void) {
+    return PyModuleDef_Init(&module);
+}
+"#,
+        );
+
+        let module = load_extension_module("capi_multiphase_ext", &module_path)
+            .unwrap_or_else(|message| panic!("failed to load multi-phase C extension: {message}"));
+        assert!(!module.is_null(), "multi-phase loader returned NULL module");
+
+        let module_name = intern("capi_multiphase_ext");
+        let token = module_attr(module_name, intern("token")).expect("Py_mod_exec added token");
+        assert_eq!(format_object_for_print(token).as_deref(), Ok("42"));
+
+        let probe = module_attr(module_name, intern("probe")).expect("probe method registered");
+        let result = unsafe { pon_call(probe, ptr::null_mut(), 0) };
+        assert!(!result.is_null(), "probe() returned NULL: {:?}", pon_err_message());
+        assert_eq!(format_object_for_print(result).as_deref(), Ok("7"), "multi-phase probe bitmask mismatch");
+
+        let create_path = compile_extension(
+            &temp,
+            "capi_multiphase_create_ext",
+            r#"
+#include <Python.h>
+
+static PyObject *make_module(PyObject *spec, PyModuleDef *def) {
+    (void)spec;
+    (void)def;
+    Py_RETURN_NONE;
+}
+
+static PyModuleDef_Slot slots[] = {
+    {Py_mod_create, make_module},
+    {0, 0},
+};
+
+static struct PyModuleDef module = {
+    PyModuleDef_HEAD_INIT,
+    "capi_multiphase_create_ext",
+    0,
+    -1,
+    0,
+    slots,
+    0,
+    0,
+    0,
+};
+
+PyMODINIT_FUNC PyInit_capi_multiphase_create_ext(void) {
+    return PyModuleDef_Init(&module);
+}
+"#,
+        );
+        let error = load_extension_module("capi_multiphase_create_ext", &create_path)
+            .expect_err("Py_mod_create slot should be rejected");
+        assert!(error.contains("capi_multiphase_create_ext"), "error did not name module: {error}");
+        assert!(error.contains("Py_mod_create"), "error did not name slot: {error}");
+        pon_err_clear();
+    }
+
     #[test]
     fn capi_type_and_error_identity_holds_across_the_boundary() {
         let _guard = test_state_lock();

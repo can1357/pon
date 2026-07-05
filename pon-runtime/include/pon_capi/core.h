@@ -48,6 +48,7 @@ typedef struct PyPonCapiCore {
     int (*register_local_twins)(PyTypeObject *const *, int);
     int (*builtin_type_id)(PyObject *);
     PyTypeObject *(*foreign_of)(PyObject *);
+    PyObject *(*ellipsis)(void);
 } PyPonCapiCore;
 
 #endif /* PON_CAPI_CORE_H */

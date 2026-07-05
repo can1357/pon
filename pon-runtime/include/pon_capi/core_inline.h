@@ -154,6 +154,10 @@ static inline int PyModule_AddStringConstant(PyObject *module, const char *name,
 #define PyExc_RuntimeWarning (PyPon_Capi()->err->exc_runtime_warning)
 #define PyExc_UserWarning (PyPon_Capi()->err->exc_user_warning)
 #define PyExc_LookupError (PyPon_Capi()->err->exc_lookup_error)
+/* CPython aliases OSError as IOError for legacy spellings. */
+#define PyExc_IOError PyExc_OSError
+
+#define Py_Ellipsis (PyPon_Capi()->core->ellipsis())
 
 static inline void PyErr_SetString(PyObject *exception, const char *message) {
     PyPon_Capi()->err->set_string(exception, message);

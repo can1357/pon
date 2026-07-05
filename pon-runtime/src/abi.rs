@@ -5300,6 +5300,17 @@ pub unsafe extern "C" fn pon_not_implemented() -> *mut PyObject {
     })
 }
 
+/// Returns the immortal `Ellipsis` singleton.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_ellipsis() -> *mut PyObject {
+    catch_object_helper(|| {
+        if let Err(message) = ensure_runtime_initialized() {
+            return return_null_with_error(message);
+        }
+        with_runtime(|runtime| as_object_ptr(runtime.ellipsis)).unwrap_or_else(|| return_null_with_error("runtime is not initialized"))
+    })
+}
+
 /// Idempotently initializes the runtime heap, type table, singletons, and builtins.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_runtime_init() -> i32 {

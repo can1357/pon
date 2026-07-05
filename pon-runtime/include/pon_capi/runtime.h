@@ -11,7 +11,14 @@
  * not called; capsule objects are process-lifetime in this shim.
  */
 
-typedef struct _ts PyThreadState;
+typedef struct _is PyInterpreterState;
+/* Minimal thread-state facade: NumPy still reads `tstate->interp`, while the
+ * interpreter object and all other thread state remain opaque process
+ * singletons owned by Pon.
+ */
+typedef struct _ts {
+    PyInterpreterState *interp;
+} PyThreadState;
 typedef int PyGILState_STATE;
 #define PyGILState_LOCKED 0
 #define PyGILState_UNLOCKED 1
@@ -33,6 +40,15 @@ typedef struct PyPonCapiRuntime {
     void *(*module_get_state)(PyObject *);
     const char *(*module_get_name)(PyObject *);
     PyObject *(*sys_get_object)(const char *);
+    PyObject *(*module_def_init)(PyModuleDef *);
+    PyThreadState *(*thread_state_get)(void);
+    PyFrameObject *(*thread_state_get_frame)(PyThreadState *);
+    PyInterpreterState *(*interpreter_state_main)(void);
+    PyObject *(*eval_get_builtins)(void);
+    PyFrameObject *(*frame_get_back)(PyFrameObject *);
+    PyCodeObject *(*frame_get_code)(PyFrameObject *);
+    PyObject *(*contextvar_new)(const char *, PyObject *);
+    int (*contextvar_get)(PyObject *, PyObject *, PyObject **);
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiRuntime;
 

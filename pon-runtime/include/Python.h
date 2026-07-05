@@ -20,6 +20,7 @@
  * `ob_type` directly.
  */
 
+#include <assert.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -37,6 +38,16 @@ typedef size_t Py_uhash_t;
 typedef uint32_t Py_UCS4;
 typedef uint16_t Py_UCS2;
 typedef uint8_t Py_UCS1;
+
+/* Extension code (pythoncapi-compat) spells declarations through these;
+ * recompiled extensions have no DLL surface, so they are identity macros. */
+#define PyAPI_FUNC(RTYPE) RTYPE
+#define PyAPI_DATA(RTYPE) extern RTYPE
+#if defined(__GNUC__) || defined(__clang__)
+#  define Py_GCC_ATTRIBUTE(x) __attribute__(x)
+#else
+#  define Py_GCC_ATTRIBUTE(x)
+#endif
 #define PY_SSIZE_T_MAX ((Py_ssize_t)(((size_t)-1) >> 1))
 #define PY_SSIZE_T_MIN (-PY_SSIZE_T_MAX - 1)
 
@@ -69,6 +80,43 @@ typedef struct {
 
 #define Py_SIZE(ob) (((PyVarObject *)(ob))->ob_size)
 #define Py_SET_SIZE(ob, size) (((PyVarObject *)(ob))->ob_size = (size))
+
+/* ---- CPython 3.14 str object layout (compile surface ONLY) ----
+ * numpy embeds PyUnicodeObject as the base of its unicode scalar struct
+ * (arrayscalars.h) and pythoncapi-compat's PyUnstable_Unicode_GET_CACHED_HASH
+ * (which numpy never calls) reads PyASCIIObject.hash. These mirror CPython
+ * 3.14's field layout for sizeof/offsetof purposes. Pon str objects do NOT
+ * use this layout: reading these fields from a live str yields garbage.
+ * Use PyUnicode_DATA/KIND/GET_LENGTH/READ (table-backed) for real access. */
+typedef struct {
+    PyObject ob_base;
+    Py_ssize_t length;
+    Py_hash_t hash;
+    struct {
+        unsigned int interned:2;
+        unsigned int kind:3;
+        unsigned int compact:1;
+        unsigned int ascii:1;
+        unsigned int statically_allocated:1;
+        unsigned int :24;
+    } state;
+} PyASCIIObject;
+
+typedef struct {
+    PyASCIIObject _base;
+    Py_ssize_t utf8_length;
+    char *utf8;
+} PyCompactUnicodeObject;
+
+typedef struct {
+    PyCompactUnicodeObject _base;
+    union {
+        void *any;
+        Py_UCS1 *latin1;
+        Py_UCS2 *ucs2;
+        Py_UCS4 *ucs4;
+    } data;
+} PyUnicodeObject;
 
 /* ---- calling conventions ---- */
 
@@ -386,9 +434,201 @@ typedef struct PyModuleDef {
 
 #define PyModuleDef_HEAD_INIT { PyObject_HEAD_INIT(NULL) NULL, 0, NULL }
 
+/* ---- multi-phase module initialization (CPython 3.14) ----
+ * Body is in pon_capi/runtime_inline.h, after PyPonCapi is declared.
+ */
+static inline PyObject *PyModuleDef_Init(PyModuleDef *def);
+
 #ifndef PyMODINIT_FUNC
 #define PyMODINIT_FUNC PyObject *
 #endif
+
+/* ---- structural runtime compatibility (NumPy C-API surface) ----
+ *
+ * This block is intentionally local and contiguous: it supplies small CPython
+ * structural helpers that do not belong to a dispatch family, while leaving
+ * real behavior (thread state, frames, contextvars, builtins) in runtime.h.
+ */
+typedef intptr_t Py_intptr_t;
+typedef uintptr_t Py_uintptr_t;
+
+typedef struct _frame PyFrameObject;
+typedef struct PyCodeObject PyCodeObject;
+
+typedef struct {
+    uint8_t _bits;
+} PyMutex;
+
+/* Single-interpreter Pon rarely contends here; this is still a correct C11
+ * acquire/release spin lock for extension code that keeps CPython's mutex
+ * bracketing.
+ */
+static inline void PyMutex_Lock(PyMutex *mutex) {
+    while (__atomic_exchange_n(&mutex->_bits, (uint8_t)1, __ATOMIC_ACQUIRE) != 0) {
+    }
+}
+
+static inline void PyMutex_Unlock(PyMutex *mutex) {
+    __atomic_store_n(&mutex->_bits, (uint8_t)0, __ATOMIC_RELEASE);
+}
+
+/* vectorcallfunc itself is declared with the calling-convention typedefs above
+ * because PyTypeObject embeds it; these are the matching flag helpers.
+ */
+#define PY_VECTORCALL_ARGUMENTS_OFFSET ((size_t)1 << (8 * sizeof(size_t) - 1))
+
+static inline Py_ssize_t PyVectorcall_NARGS(size_t n) {
+    return (Py_ssize_t)(n & ~PY_VECTORCALL_ARGUMENTS_OFFSET);
+}
+
+static inline void Py_SET_TYPE(PyObject *ob, PyTypeObject *type) {
+    ob->ob_type = type;
+}
+
+/* All Pon objects are GC-managed; CPython-style immortality has no meaning. */
+static inline void _Py_SetImmortal(PyObject *op) {
+    (void)op;
+}
+
+/* Conservative answer: refcounts do not exist, and callers use this only as an
+ * optimization hint.
+ */
+static inline int PyUnstable_Object_IsUniquelyReferenced(PyObject *op) {
+    (void)op;
+    return 0;
+}
+
+/* ---- PyType_FromSpec heap-type compatibility (CPython 3.14) ---- */
+
+typedef struct {
+    int slot;
+    void *pfunc;
+} PyType_Slot;
+
+typedef struct {
+    const char *name;
+    int basicsize;
+    int itemsize;
+    unsigned int flags;
+    PyType_Slot *slots;
+} PyType_Spec;
+
+/* Stable-ABI type slot ids: keep in exact sync with CPython 3.14 typeslots.h. */
+#define Py_bf_getbuffer 1
+#define Py_bf_releasebuffer 2
+#define Py_mp_ass_subscript 3
+#define Py_mp_length 4
+#define Py_mp_subscript 5
+#define Py_nb_absolute 6
+#define Py_nb_add 7
+#define Py_nb_and 8
+#define Py_nb_bool 9
+#define Py_nb_divmod 10
+#define Py_nb_float 11
+#define Py_nb_floor_divide 12
+#define Py_nb_index 13
+#define Py_nb_inplace_add 14
+#define Py_nb_inplace_and 15
+#define Py_nb_inplace_floor_divide 16
+#define Py_nb_inplace_lshift 17
+#define Py_nb_inplace_multiply 18
+#define Py_nb_inplace_or 19
+#define Py_nb_inplace_power 20
+#define Py_nb_inplace_remainder 21
+#define Py_nb_inplace_rshift 22
+#define Py_nb_inplace_subtract 23
+#define Py_nb_inplace_true_divide 24
+#define Py_nb_inplace_xor 25
+#define Py_nb_int 26
+#define Py_nb_invert 27
+#define Py_nb_lshift 28
+#define Py_nb_multiply 29
+#define Py_nb_negative 30
+#define Py_nb_or 31
+#define Py_nb_positive 32
+#define Py_nb_power 33
+#define Py_nb_remainder 34
+#define Py_nb_rshift 35
+#define Py_nb_subtract 36
+#define Py_nb_true_divide 37
+#define Py_nb_xor 38
+#define Py_sq_ass_item 39
+#define Py_sq_concat 40
+#define Py_sq_contains 41
+#define Py_sq_inplace_concat 42
+#define Py_sq_inplace_repeat 43
+#define Py_sq_item 44
+#define Py_sq_length 45
+#define Py_sq_repeat 46
+#define Py_tp_alloc 47
+#define Py_tp_base 48
+#define Py_tp_bases 49
+#define Py_tp_call 50
+#define Py_tp_clear 51
+#define Py_tp_dealloc 52
+#define Py_tp_del 53
+#define Py_tp_descr_get 54
+#define Py_tp_descr_set 55
+#define Py_tp_doc 56
+#define Py_tp_getattr 57
+#define Py_tp_getattro 58
+#define Py_tp_hash 59
+#define Py_tp_init 60
+#define Py_tp_is_gc 61
+#define Py_tp_iter 62
+#define Py_tp_iternext 63
+#define Py_tp_methods 64
+#define Py_tp_new 65
+#define Py_tp_repr 66
+#define Py_tp_richcompare 67
+#define Py_tp_setattr 68
+#define Py_tp_setattro 69
+#define Py_tp_str 70
+#define Py_tp_traverse 71
+#define Py_tp_members 72
+#define Py_tp_getset 73
+#define Py_tp_free 74
+#define Py_nb_matrix_multiply 75
+#define Py_nb_inplace_matrix_multiply 76
+#define Py_am_await 77
+#define Py_am_aiter 78
+#define Py_am_anext 79
+#define Py_tp_finalize 80
+#define Py_am_send 81
+#define Py_tp_vectorcall 82
+#define Py_tp_token 83
+
+struct _dictkeysobject;
+
+struct _specialization_cache {
+    PyObject *getitem;
+    uint32_t getitem_version;
+    PyObject *init;
+};
+
+typedef struct _heaptypeobject {
+    PyTypeObject ht_type;
+    PyAsyncMethods as_async;
+    PyNumberMethods as_number;
+    PyMappingMethods as_mapping;
+    PySequenceMethods as_sequence;
+    PyBufferProcs as_buffer;
+    PyObject *ht_name;
+    PyObject *ht_slots;
+    PyObject *ht_qualname;
+    struct _dictkeysobject *ht_cached_keys;
+    PyObject *ht_module;
+    char *_ht_tpname;
+    void *ht_token;
+    struct _specialization_cache _spec_cache;
+#ifdef Py_GIL_DISABLED
+    Py_ssize_t unique_id;
+#endif
+} PyHeapTypeObject;
+
+static inline PyObject *PyType_FromSpec(PyType_Spec *spec);
+static inline PyObject *PyType_FromSpecWithBases(PyType_Spec *spec, PyObject *bases);
+static inline PyObject *PyType_FromModuleAndSpec(PyObject *module, PyType_Spec *spec, PyObject *bases);
 
 /* ---- family tables ---- */
 
