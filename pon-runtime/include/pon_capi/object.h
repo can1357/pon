@@ -34,6 +34,8 @@ typedef struct PyPonCapiObject {
     int (*is_subclass)(PyObject *, PyObject *);
     PyObject *(*type)(PyObject *);
     PyObject *(*self_iter)(PyObject *);
+    int (*get_optional_attr)(PyObject *, PyObject *, PyObject **);
+    int (*as_file_descriptor)(PyObject *);
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiObject;
 

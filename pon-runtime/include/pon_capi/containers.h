@@ -55,6 +55,7 @@ typedef struct PyPonCapiContainers {
     PyObject *(*mapping_keys)(PyObject *);
     PyObject *(*mapping_get_item_string)(PyObject *, const char *);
     int (*mapping_set_item_string)(PyObject *, const char *, PyObject *);
+    int (*dict_get_item_ref)(PyObject *, PyObject *, PyObject **);
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiContainers;
 

@@ -12,6 +12,10 @@ static inline PyObject *PyObject_GetAttrString(PyObject *object, const char *nam
     return PyPon_Capi()->object_->get_attr_string(object, name);
 }
 
+static inline int PyObject_GetOptionalAttr(PyObject *object, PyObject *name, PyObject **result) {
+    return PyPon_Capi()->object_->get_optional_attr(object, name, result);
+}
+
 static inline int PyObject_SetAttr(PyObject *object, PyObject *name, PyObject *value) {
     return PyPon_Capi()->object_->set_attr(object, name, value);
 }
@@ -42,6 +46,68 @@ static inline PyObject *PyObject_CallNoArgs(PyObject *callable) {
 
 static inline PyObject *PyObject_CallOneArg(PyObject *callable, PyObject *arg) {
     return PyPon_Capi()->object_->call_one_arg(callable, arg);
+}
+
+static inline PyObject *_PyPon_CallArgsFromFormat(const char *format, va_list vargs) {
+    if (format == NULL || format[0] == '\0') {
+        return PyTuple_New(0);
+    }
+    PyObject *built = Py_VaBuildValue(format, vargs);
+    if (built == NULL) {
+        return NULL;
+    }
+    if (PyTuple_Check(built)) {
+        return built;
+    }
+    PyObject *tuple = PyTuple_New(1);
+    if (tuple == NULL) {
+        Py_DECREF(built);
+        return NULL;
+    }
+    if (PyTuple_SetItem(tuple, 0, built) < 0) {
+        Py_DECREF(tuple);
+        Py_DECREF(built);
+        return NULL;
+    }
+    return tuple;
+}
+
+static inline PyObject *_PyPon_CallWithFormat(PyObject *callable, const char *format, va_list vargs) {
+    if (format == NULL || format[0] == '\0') {
+        return PyObject_CallNoArgs(callable);
+    }
+    PyObject *args = _PyPon_CallArgsFromFormat(format, vargs);
+    if (args == NULL) {
+        return NULL;
+    }
+    PyObject *result = PyObject_CallObject(callable, args);
+    Py_DECREF(args);
+    return result;
+}
+
+static inline PyObject *PyObject_CallFunction(PyObject *callable, const char *format, ...) {
+    va_list vargs;
+    va_start(vargs, format);
+    PyObject *result = _PyPon_CallWithFormat(callable, format, vargs);
+    va_end(vargs);
+    return result;
+}
+
+static inline PyObject *PyObject_CallMethod(PyObject *object, const char *name, const char *format, ...) {
+    if (name == NULL) {
+        PyErr_SetString(PyExc_TypeError, "method name must not be NULL");
+        return NULL;
+    }
+    PyObject *method = PyObject_GetAttrString(object, name);
+    if (method == NULL) {
+        return NULL;
+    }
+    va_list vargs;
+    va_start(vargs, format);
+    PyObject *result = _PyPon_CallWithFormat(method, format, vargs);
+    va_end(vargs);
+    Py_DECREF(method);
+    return result;
 }
 
 #define _PON_OBJECT_VARARGS_CAP 16
@@ -138,6 +204,10 @@ static inline Py_ssize_t PyObject_Size(PyObject *object) {
 
 static inline Py_hash_t PyObject_Hash(PyObject *object) {
     return PyPon_Capi()->object_->hash(object);
+}
+
+static inline int PyObject_AsFileDescriptor(PyObject *object) {
+    return PyPon_Capi()->object_->as_file_descriptor(object);
 }
 
 static inline int PyCallable_Check(PyObject *object) {

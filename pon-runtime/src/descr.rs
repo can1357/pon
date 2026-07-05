@@ -512,12 +512,25 @@ unsafe fn is_type_object(object: *mut PyObject) -> bool {
     unsafe { (*meta).name() == "type" || mro::mro_entries(meta).iter().any(|ty| !ty.is_null() && (**ty).name() == "type") }
 }
 
-/// Layout-gated instance dict: `tp_dictoffset == 0` marks layouts whose
-/// instances carry NO `PyHeapInstance` dict slot (slot-only classes,
-/// C-extension instances); reading through the cast would misread their
-/// payload. This is the single place that decides "does this instance have
-/// a dict?" — every dict probe (slow path, IC replay, setattr) goes
-/// through it.
+/// True when instances of `ty` share the [`PyHeapInstance`] prefix (plain
+/// heap instances and payload subclasses). Boxed exceptions and C-extension
+/// instances do NOT, despite flowing through some generic attribute paths.
+fn has_heap_instance_prefix(ty: *const PyType) -> bool {
+    if ty.is_null() {
+        return false;
+    }
+    // SAFETY: type objects are process-lifetime.
+    let id = unsafe { (*ty).gc_type_id };
+    id == crate::types::type_::TYPE_ID_HEAP_INSTANCE.0 as usize
+        || id == crate::types::type_::TYPE_ID_PAYLOAD_SUBCLASS_INSTANCE.0 as usize
+}
+
+/// Layout-gated instance dict. Only the [`PyHeapInstance`]-prefixed families
+/// carry the dict pointer this cast reads — boxed exceptions and C-extension
+/// instances have their own layouts, and slot-only classes
+/// (`tp_dictoffset == 0`) carry no dict at all. This is the single place
+/// that decides "does this instance have a dict?": every dict probe (slow
+/// path, IC replay, setattr) goes through it.
 unsafe fn instance_dict(object: *mut PyObject) -> *mut PyClassDict {
     if object.is_null() {
         return ptr::null_mut();
@@ -528,7 +541,7 @@ unsafe fn instance_dict(object: *mut PyObject) -> *mut PyClassDict {
     }
     // SAFETY: non-type heap objects carry a readable header.
     let ty = unsafe { (*object).ob_type };
-    if ty.is_null() || unsafe { (*ty).tp_dictoffset } == 0 {
+    if !has_heap_instance_prefix(ty) || unsafe { (*ty).tp_dictoffset } == 0 {
         return ptr::null_mut();
     }
     let instance = object.cast::<PyHeapInstance>();
@@ -884,7 +897,11 @@ pub unsafe extern "C" fn generic_set_attr(object: *mut PyObject, name: *mut PyOb
     }
 
     // §6 explicit non-site: instance slots are instance state, never bumped.
-    if !is_type && unsafe { type_::instance_set_slot(object.cast::<PyHeapInstance>(), name_id, value) } {
+    // Only `PyHeapInstance`-prefixed layouts carry slot storage.
+    if !is_type
+        && has_heap_instance_prefix(obj_ty)
+        && unsafe { type_::instance_set_slot(object.cast::<PyHeapInstance>(), name_id, value) }
+    {
         return 0;
     }
 

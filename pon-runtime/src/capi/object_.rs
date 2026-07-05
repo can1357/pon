@@ -4,10 +4,13 @@ use core::ffi::{c_char, c_int};
 use core::ptr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use num_bigint::{BigInt, Sign};
 use num_traits::cast::ToPrimitive;
 
 use crate::abi;
+use crate::intern::intern;
 use crate::object::{PyObject, PyType};
+use crate::types::exc::ExceptionKind;
 use crate::thread_state::{pon_err_clear, pon_err_occurred};
 
 use super::c_string;
@@ -45,6 +48,8 @@ pub(crate) struct PyPonCapiObject {
     is_subclass: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> c_int,
     type_: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
     self_iter: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+    get_optional_attr: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut *mut PyObject) -> c_int,
+    as_file_descriptor: unsafe extern "C" fn(*mut PyObject) -> c_int,
 }
 
 unsafe impl Send for PyPonCapiObject {}
@@ -81,6 +86,8 @@ pub(crate) fn build() -> PyPonCapiObject {
         is_subclass: capi_is_subclass,
         type_: capi_type,
         self_iter: capi_self_iter,
+        get_optional_attr: capi_get_optional_attr,
+        as_file_descriptor: capi_as_file_descriptor,
     }
 }
 
@@ -121,6 +128,35 @@ fn type_error_status(message: &str) -> c_int {
 fn type_error_isize(message: &str) -> isize {
     let _ = raise_type_error(message);
     -1
+}
+
+fn value_error_status(message: &str) -> c_int {
+    let _ = abi::exc::raise_kind_error_text(ExceptionKind::ValueError, message);
+    -1
+}
+
+fn overflow_error_status(message: &str) -> c_int {
+    let _ = abi::exc::raise_kind_error_text(ExceptionKind::OverflowError, message);
+    -1
+}
+
+fn file_descriptor_from_bigint(value: &BigInt) -> c_int {
+    if value.sign() == Sign::Minus {
+        return value_error_status(&format!("file descriptor cannot be a negative integer ({value})"));
+    }
+    value
+        .to_i32()
+        .map(|value| value as c_int)
+        .unwrap_or_else(|| overflow_error_status("Python int too large to convert to C int"))
+}
+
+unsafe fn file_descriptor_from_required_integer(object: *mut PyObject, type_error: &str) -> c_int {
+    let object = normalize_object_arg(object);
+    let object = crate::tag::untag_arg(object);
+    let Some(value) = (unsafe { crate::types::int::to_bigint_including_bool(object) }) else {
+        return type_error_status(type_error);
+    };
+    file_descriptor_from_bigint(&value)
 }
 
 fn normalize_object_arg(object: *mut PyObject) -> *mut PyObject {
@@ -307,6 +343,39 @@ unsafe extern "C" fn capi_get_attr_string(object: *mut PyObject, name: *const c_
         // Same owned-reference contract as `capi_get_attr`.
         super::pin_object(value);
         value
+    })
+}
+
+unsafe extern "C" fn capi_get_optional_attr(
+    object: *mut PyObject,
+    name: *mut PyObject,
+    result: *mut *mut PyObject,
+) -> c_int {
+    catch_status(|| {
+        if result.is_null() {
+            return type_error_status("PyObject_GetOptionalAttr result pointer must not be NULL");
+        }
+        unsafe {
+            *result = ptr::null_mut();
+        }
+        let name = match unsafe { name_object_to_interned(name) } {
+            Ok(name) => name,
+            Err(_) => return -1,
+        };
+        let value = unsafe { get_attr_unpinned(object, name) };
+        if !value.is_null() {
+            // Owned-reference out-param: mirror capi_get_attr's pinned result.
+            super::pin_object(value);
+            unsafe {
+                *result = value;
+            }
+            return 1;
+        }
+        if !pon_err_occurred() || abi::exc::pending_exception_is("AttributeError") {
+            pon_err_clear();
+            return 0;
+        }
+        -1
     })
 }
 
@@ -605,6 +674,31 @@ unsafe extern "C" fn capi_hash(object: *mut PyObject) -> isize {
                 -1
             }
         }
+    })
+}
+
+unsafe extern "C" fn capi_as_file_descriptor(object: *mut PyObject) -> c_int {
+    catch_status(|| {
+        let object = normalize_object_arg(object);
+        let object = crate::tag::untag_arg(object);
+        if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(object) } {
+            return file_descriptor_from_bigint(&value);
+        }
+
+        let method = unsafe { get_attr_unpinned(object, intern("fileno")) };
+        if method.is_null() {
+            if !pon_err_occurred() || abi::exc::pending_exception_is("AttributeError") {
+                pon_err_clear();
+                return type_error_status("argument must be an int, or have a fileno() method.");
+            }
+            return -1;
+        }
+
+        let result = unsafe { call_with_argv(method, ptr::null_mut(), 0) };
+        if result.is_null() {
+            return -1;
+        }
+        unsafe { file_descriptor_from_required_integer(result, "fileno() returned a non-integer") }
     })
 }
 
@@ -917,5 +1011,219 @@ PyMODINIT_FUNC PyInit_capi_object_test_ext(void) {
         let result = unsafe { pon_call(repr_truth, argv.as_mut_ptr(), 1) };
         assert_eq!(format_object(result).as_deref(), Ok("1"));
 
+    }
+
+    #[test]
+    fn protocol_gap_extension_exercises_owned_refs_and_varargs() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+
+        let temp = TempExtensionRoot::new();
+        let module_path = compile_extension(
+            &temp,
+            "capi_protocol_gap_ext",
+            r#"
+#include <Python.h>
+#include <limits.h>
+
+#define BIT(n) (1L << (n))
+static PyObject *module_ref = NULL;
+
+
+static int long_equals(PyObject *object, long expected) {
+    if (object == NULL) {
+        if (PyErr_Occurred()) PyErr_Clear();
+        return 0;
+    }
+    long value = PyLong_AsLong(object);
+    if (PyErr_Occurred()) {
+        PyErr_Clear();
+        return 0;
+    }
+    return value == expected;
+}
+
+static PyObject *sum_two(PyObject *self, PyObject *args) {
+    (void)self;
+    int left = 0;
+    int right = 0;
+    if (!PyArg_ParseTuple(args, "ii", &left, &right)) {
+        return NULL;
+    }
+    return PyLong_FromLong((long)(left + right));
+}
+
+static PyObject *no_args(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    return PyLong_FromLong(23);
+}
+
+static PyObject *returns_fd(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    return PyLong_FromLong(13);
+}
+
+static PyObject *drive(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    PyObject *module_obj = module_ref;
+    long mask = 0;
+
+    PyObject *too_big = PyLong_FromUnsignedLongLong((unsigned long long)LONG_MAX + 1ULL);
+    int overflow = -99;
+    long as_long = PyLong_AsLongAndOverflow(too_big, &overflow);
+    if (as_long == -1 && overflow == 1 && PyErr_Occurred() == NULL) {
+        mask |= BIT(0);
+    } else {
+        PyErr_Clear();
+    }
+
+    PyObject *dict = PyDict_New();
+    PyObject *key = PyUnicode_FromString("answer");
+    PyObject *missing = PyUnicode_FromString("missing");
+    PyObject *value = PyLong_FromLong(42);
+    PyObject *ref = NULL;
+    if (dict != NULL && key != NULL && missing != NULL && value != NULL && PyDict_SetItem(dict, key, value) == 0) {
+        int status = PyDict_GetItemRef(dict, key, &ref);
+        if (status == 1 && long_equals(ref, 42)) {
+            mask |= BIT(1);
+        }
+        Py_XDECREF(ref);
+        ref = (PyObject *)0x1;
+        status = PyDict_GetItemRef(dict, missing, &ref);
+        if (status == 0 && ref == NULL && PyErr_Occurred() == NULL) {
+            mask |= BIT(2);
+        } else {
+            PyErr_Clear();
+        }
+        status = PyDict_GetItemRef(value, key, &ref);
+        if (status == -1 && PyErr_Occurred() != NULL) {
+            mask |= BIT(3);
+        }
+        PyErr_Clear();
+    } else {
+        PyErr_Clear();
+    }
+
+    PyObject *attr_name = PyUnicode_FromString("dynamic_value");
+    PyObject *missing_attr = PyUnicode_FromString("definitely_missing");
+    PyObject *attr_value = PyLong_FromLong(77);
+    PyObject *optional = NULL;
+    if (module_obj != NULL && attr_name != NULL && missing_attr != NULL && attr_value != NULL && PyObject_SetAttr(module_obj, attr_name, attr_value) == 0) {
+        int status = PyObject_GetOptionalAttr(module_obj, attr_name, &optional);
+        if (status == 1 && long_equals(optional, 77)) {
+            mask |= BIT(4);
+        }
+        Py_XDECREF(optional);
+        optional = (PyObject *)0x1;
+        status = PyObject_GetOptionalAttr(module_obj, missing_attr, &optional);
+        if (status == 0 && optional == NULL && PyErr_Occurred() == NULL) {
+            mask |= BIT(5);
+        } else {
+            PyErr_Clear();
+        }
+    } else {
+        PyErr_Clear();
+    }
+
+    PyObject *sum = module_obj == NULL ? NULL : PyObject_GetAttrString(module_obj, "sum_two");
+    if (sum != NULL) {
+        PyObject *called = PyObject_CallFunction(sum, "(ii)", 2, 5);
+        if (long_equals(called, 7)) {
+            mask |= BIT(6);
+        }
+        Py_XDECREF(called);
+
+        PyObject *left = PyLong_FromLong(4);
+        PyObject *right = PyLong_FromLong(5);
+        called = PyObject_CallFunctionObjArgs(sum, left, right, NULL);
+        if (long_equals(called, 9)) {
+            mask |= BIT(8);
+        }
+        Py_XDECREF(called);
+        Py_XDECREF(left);
+        Py_XDECREF(right);
+    } else {
+        PyErr_Clear();
+    }
+    Py_XDECREF(sum);
+
+    PyObject *called = module_obj == NULL ? NULL : PyObject_CallMethod(module_obj, "no_args", NULL);
+    if (long_equals(called, 23)) {
+        mask |= BIT(7);
+    }
+    Py_XDECREF(called);
+
+    if (PyObject_AsFileDescriptor(PyLong_FromLong(8)) == 8 && PyErr_Occurred() == NULL) {
+        mask |= BIT(9);
+    } else {
+        PyErr_Clear();
+    }
+    PyObject *fd_func = module_obj == NULL ? NULL : PyObject_GetAttrString(module_obj, "returns_fd");
+    if (fd_func != NULL && PyObject_SetAttrString(module_obj, "fileno", fd_func) == 0) {
+        int fd = PyObject_AsFileDescriptor(module_obj);
+        if (fd == 13 && PyErr_Occurred() == NULL) {
+            mask |= BIT(10);
+        } else {
+            PyErr_Clear();
+        }
+    } else {
+        PyErr_Clear();
+    }
+    Py_XDECREF(fd_func);
+    if (PyObject_AsFileDescriptor(Py_None) == -1 && PyErr_Occurred() != NULL) {
+        mask |= BIT(11);
+    }
+    PyErr_Clear();
+
+    return PyLong_FromLong(mask);
+}
+
+static PyMethodDef methods[] = {
+    {"drive", drive, METH_NOARGS, "exercise protocol C-API gaps"},
+    {"sum_two", sum_two, METH_VARARGS, "sum two ints"},
+    {"no_args", no_args, METH_NOARGS, "return a sentinel"},
+    {"returns_fd", returns_fd, METH_NOARGS, "return a file descriptor"},
+    {NULL, NULL, 0, NULL}
+};
+
+static struct PyModuleDef module = {
+    PyModuleDef_HEAD_INIT,
+    "capi_protocol_gap_ext",
+    "Pon protocol-gap C-API test extension",
+    -1,
+    methods
+};
+
+PyMODINIT_FUNC PyInit_capi_protocol_gap_ext(void) {
+    PyObject *m = PyModule_Create(&module);
+    if (m != NULL) {
+        Py_INCREF(m);
+        module_ref = m;
+    }
+    return m;
+}
+"#,
+        );
+
+        let module = super::super::load_extension_module("capi_protocol_gap_ext", &module_path)
+            .unwrap_or_else(|message| panic!("failed to load protocol gap C extension: {message}"));
+        assert!(!module.is_null(), "extension loader returned NULL module");
+
+        let module_name = intern("capi_protocol_gap_ext");
+        let drive = module_attr(module_name, intern("drive")).expect("drive method registered");
+        let result = unsafe { pon_call(drive, ptr::null_mut(), 0) };
+        assert!(!result.is_null(), "drive() returned NULL: {:?}", pon_err_message());
+        assert_eq!(
+            format_object(result).as_deref(),
+            Ok("4095"),
+            "protocol gap bitmask mismatch: {:?}",
+            pon_err_message()
+        );
     }
 }

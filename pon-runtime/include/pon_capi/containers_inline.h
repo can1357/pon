@@ -159,6 +159,10 @@ static inline PyObject *PyDict_GetItemWithError(PyObject *dict, PyObject *key) {
     return PyPon_Capi()->containers->dict_get_item_with_error(dict, key);
 }
 
+static inline int PyDict_GetItemRef(PyObject *dict, PyObject *key, PyObject **result) {
+    return PyPon_Capi()->containers->dict_get_item_ref(dict, key, result);
+}
+
 static inline int PyDict_DelItem(PyObject *dict, PyObject *key) {
     return PyPon_Capi()->containers->dict_del_item(dict, key);
 }

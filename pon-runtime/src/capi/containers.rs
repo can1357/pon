@@ -73,6 +73,7 @@ pub(crate) struct PyPonCapiContainers {
     mapping_keys: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
     mapping_get_item_string: unsafe extern "C" fn(*mut PyObject, *const c_char) -> *mut PyObject,
     mapping_set_item_string: unsafe extern "C" fn(*mut PyObject, *const c_char, *mut PyObject) -> c_int,
+    dict_get_item_ref: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut *mut PyObject) -> c_int,
 }
 
 unsafe impl Send for PyPonCapiContainers {}
@@ -131,6 +132,7 @@ pub(crate) fn build() -> PyPonCapiContainers {
         mapping_keys: capi_mapping_keys,
         mapping_get_item_string: capi_mapping_get_item_string,
         mapping_set_item_string: capi_mapping_set_item_string,
+        dict_get_item_ref: capi_dict_get_item_ref,
     }
 }
 
@@ -561,6 +563,39 @@ unsafe extern "C" fn capi_dict_get_item_string(dict: *mut PyObject, key: *const 
 
 unsafe extern "C" fn capi_dict_get_item_with_error(dict: *mut PyObject, key: *mut PyObject) -> *mut PyObject {
     catch_object(|| dict_get_impl(dict, key, false))
+}
+
+unsafe extern "C" fn capi_dict_get_item_ref(
+    dict: *mut PyObject,
+    key: *mut PyObject,
+    result: *mut *mut PyObject,
+) -> c_int {
+    catch_status(|| {
+        if result.is_null() {
+            return status_type_error("PyDict_GetItemRef result pointer must not be NULL");
+        }
+        unsafe {
+            *result = ptr::null_mut();
+        }
+        let dict = crate::tag::untag_arg(dict);
+        let key = crate::tag::untag_arg(key);
+        match unsafe { dict::dict_get(dict, key) } {
+            Ok(Some(value)) => {
+                super::pin_object(value);
+                unsafe {
+                    *result = value;
+                }
+                1
+            }
+            Ok(None) => {
+                if pon_err_occurred() {
+                    pon_err_clear();
+                }
+                0
+            }
+            Err(message) => status_error(message),
+        }
+    })
 }
 
 fn dict_get_impl(dict: *mut PyObject, key: *mut PyObject, clear_miss: bool) -> *mut PyObject {
