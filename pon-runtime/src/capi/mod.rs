@@ -2,34 +2,47 @@
 //!
 //! This is not CPython's binary ABI. Extensions include Pon's `Python.h`, link
 //! the bootstrap object once, and the loader injects this process's function
-//! table before calling `PyInit_*`.
+//! tables before calling `PyInit_*`.
+//!
+//! Dispatch is grouped into per-family tables (see `include/pon_capi/*.h`);
+//! the top-level [`PyPonCapi`] only aggregates family-table pointers plus a
+//! `size` drift guard, so families evolve independently.
 
-use core::ffi::{c_char, c_int, c_long, c_void};
+mod containers;
+mod err;
+mod numbers;
+mod strings;
+mod runtime_;
+mod object_;
+mod typeobj;
+#[cfg(test)]
+mod args_test;
+pub(crate) mod twin;
+
+pub(crate) use typeobj::is_capi_class;
+
+use core::ffi::{c_char, c_int, c_void};
 use core::mem;
 use core::ptr;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::path::Path;
-use std::sync::{LazyLock, Mutex};
-
-use num_traits::ToPrimitive;
+use std::sync::{LazyLock, Mutex, OnceLock};
 
 use crate::abi;
 use crate::intern::intern;
 use crate::object::{CallFunc, PyObject, PyObjectHeader, PyType, as_object_ptr};
 use crate::thread_state::{pon_err_message, pon_err_occurred, pon_err_set};
-use crate::types::exc::ExceptionKind;
 
 const METH_VARARGS: c_int = 0x0001;
 const METH_KEYWORDS: c_int = 0x0002;
 const METH_NOARGS: c_int = 0x0004;
 const METH_O: c_int = 0x0008;
+const METH_CLASS: c_int = 0x0010;
+const METH_STATIC: c_int = 0x0020;
+const METH_FASTCALL: c_int = 0x0080;
 
 const PYTHON_API_VERSION: c_int = 1013;
-const PON_EXCEPTION_RUNTIME_ERROR: usize = 1;
-const PON_EXCEPTION_TYPE_ERROR: usize = 2;
-const PON_EXCEPTION_VALUE_ERROR: usize = 3;
-const PON_EXCEPTION_IMPORT_ERROR: usize = 4;
 
 /// C signature used by classic `PyMethodDef` function entries.
 pub type PyCFunction = unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject;
@@ -73,27 +86,45 @@ pub struct PyModuleDef {
     m_free: *mut c_void,
 }
 
-/// Function table injected into recompiled extension modules.
+/// Function-table hub injected into recompiled extension modules.
+///
+/// `size` guards layout drift at load time; the bootstrap rejects a table
+/// whose size differs from the header it was compiled against. Family
+/// pointers only: append new families at the end, never reorder.
 #[repr(C)]
 pub struct PyPonCapi {
-    module_create2: unsafe extern "C" fn(*mut PyModuleDef, c_int) -> *mut PyObject,
-    module_add_object: unsafe extern "C" fn(*mut PyObject, *const c_char, *mut PyObject) -> c_int,
-    long_from_long: unsafe extern "C" fn(c_long) -> *mut PyObject,
-    long_as_long: unsafe extern "C" fn(*mut PyObject) -> c_long,
-    unicode_from_string: unsafe extern "C" fn(*const c_char) -> *mut PyObject,
-    inc_ref: unsafe extern "C" fn(*mut PyObject),
-    dec_ref: unsafe extern "C" fn(*mut PyObject),
-    none: unsafe extern "C" fn() -> *mut PyObject,
-    err_set_string: unsafe extern "C" fn(*mut PyObject, *const c_char),
-    err_occurred: unsafe extern "C" fn() -> *mut PyObject,
-    exc_runtime_error: *mut PyObject,
-    exc_type_error: *mut PyObject,
-    exc_value_error: *mut PyObject,
-    exc_import_error: *mut PyObject,
+    size: usize,
+    core: *const PyPonCapiCore,
+    err: *const err::PyPonCapiErr,
+    numbers: *const numbers::PyPonCapiNumbers,
+    strings: *const strings::PyPonCapiStrings,
+    containers: *const containers::PyPonCapiContainers,
+    runtime_: *const runtime_::PyPonCapiRuntime,
+    object_: *const object_::PyPonCapiObject,
+    typeobj: *const typeobj::PyPonCapiTypeObj,
 }
 
 unsafe impl Sync for PyPonCapi {}
 unsafe impl Send for PyPonCapi {}
+
+/// C mirror: `include/pon_capi/core.h` `PyPonCapiCore`.
+#[repr(C)]
+struct PyPonCapiCore {
+    module_create2: unsafe extern "C" fn(*mut PyModuleDef, c_int) -> *mut PyObject,
+    module_add_object: unsafe extern "C" fn(*mut PyObject, *const c_char, *mut PyObject) -> c_int,
+    inc_ref: unsafe extern "C" fn(*mut PyObject),
+    dec_ref: unsafe extern "C" fn(*mut PyObject),
+    none: unsafe extern "C" fn() -> *mut PyObject,
+    bool_true: unsafe extern "C" fn() -> *mut PyObject,
+    bool_false: unsafe extern "C" fn() -> *mut PyObject,
+    not_implemented: unsafe extern "C" fn() -> *mut PyObject,
+    register_local_twins: unsafe extern "C" fn(*const *mut twin::ForeignTypeObject, c_int) -> c_int,
+    builtin_type_id: unsafe extern "C" fn(*mut PyObject) -> c_int,
+    foreign_of: unsafe extern "C" fn(*mut PyObject) -> *mut twin::ForeignTypeObject,
+}
+
+unsafe impl Sync for PyPonCapiCore {}
+unsafe impl Send for PyPonCapiCore {}
 
 #[repr(C)]
 struct PyCFunctionObject {
@@ -104,31 +135,93 @@ struct PyCFunctionObject {
     name: u32,
 }
 
+/// GC type id for C-function carriers (registry: pon-gc ids live in
+/// `abi::register_gc_types` and per-module constants; 141 is next to the
+/// native-file id 120 and capi-instance id 140).
+const TYPE_ID_CAPI_CFUNCTION: pon_gc::TypeId = pon_gc::TypeId(141);
+
+/// Traces the bound receiver so a carrier can never outlive it.
+///
+/// # Safety
+///
+/// `object` points to a live `PyCFunctionObject` allocation.
+unsafe extern "C" fn trace_cfunction(object: *mut u8, visitor: &mut dyn FnMut(*mut u8)) {
+    if object.is_null() {
+        return;
+    }
+    // SAFETY: caller contract — live carrier allocation.
+    let receiver = unsafe { (*object.cast::<PyCFunctionObject>()).self_object };
+    if !receiver.is_null() && crate::tag::is_heap(receiver.cast()) {
+        visitor(receiver.cast());
+    }
+}
+
 static C_FUNCTION_TYPE: LazyLock<usize> = LazyLock::new(|| {
     let mut ty = PyType::new(ptr::null(), "builtin_function_or_method", mem::size_of::<PyCFunctionObject>());
     ty.tp_call = Some(cfunction_call as CallFunc);
+    // C methods installed in a Ready'd type's namespace bind their receiver
+    // through the descriptor protocol (METH_CLASS binds the type,
+    // METH_STATIC stays unbound).
+    ty.tp_descr_get = Some(cfunction_descr_get);
     Box::into_raw(Box::new(ty)) as usize
 });
 
 static CAPI_PINS: LazyLock<Mutex<HashMap<usize, usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static EXTENSION_HANDLES: LazyLock<Mutex<Vec<usize>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
-static PON_CAPI: PyPonCapi = PyPonCapi {
-    module_create2: py_module_create2,
-    module_add_object: py_module_add_object,
-    long_from_long: py_long_from_long,
-    long_as_long: py_long_as_long,
-    unicode_from_string: py_unicode_from_string,
-    inc_ref: py_inc_ref,
-    dec_ref: py_dec_ref,
-    none: py_none,
-    err_set_string: py_err_set_string,
-    err_occurred: py_err_occurred,
-    exc_runtime_error: PON_EXCEPTION_RUNTIME_ERROR as *mut PyObject,
-    exc_type_error: PON_EXCEPTION_TYPE_ERROR as *mut PyObject,
-    exc_value_error: PON_EXCEPTION_VALUE_ERROR as *mut PyObject,
-    exc_import_error: PON_EXCEPTION_IMPORT_ERROR as *mut PyObject,
-};
+/// Owns every family table. Built on first extension load: the err family
+/// fabricates `PyExc_*` twins and therefore requires an initialized runtime
+/// (`OnceLock`, not `LazyLock`: runtime input).
+struct Families {
+    core: PyPonCapiCore,
+    err: err::PyPonCapiErr,
+    numbers: numbers::PyPonCapiNumbers,
+    strings: strings::PyPonCapiStrings,
+    containers: containers::PyPonCapiContainers,
+    runtime_: runtime_::PyPonCapiRuntime,
+    object_: object_::PyPonCapiObject,
+    typeobj: typeobj::PyPonCapiTypeObj,
+}
+
+static FAMILIES: OnceLock<Families> = OnceLock::new();
+static CAPI: OnceLock<PyPonCapi> = OnceLock::new();
+
+/// Assembles (once) and returns the process-lifetime injected table.
+fn capi_table() -> *const PyPonCapi {
+    let families = FAMILIES.get_or_init(|| Families {
+        core: PyPonCapiCore {
+            module_create2: py_module_create2,
+            module_add_object: py_module_add_object,
+            inc_ref: py_inc_ref,
+            dec_ref: py_dec_ref,
+            none: py_none,
+            bool_true: py_true,
+            bool_false: py_false,
+            not_implemented: py_not_implemented,
+            register_local_twins: twin::capi_register_local_twins,
+            builtin_type_id: twin::capi_builtin_type_id,
+            foreign_of: twin::capi_foreign_of,
+        },
+        err: err::build(),
+        numbers: numbers::build(),
+        strings: strings::build(),
+        containers: containers::build(),
+        runtime_: runtime_::build(),
+        object_: object_::build(),
+        typeobj: typeobj::build(),
+    });
+    CAPI.get_or_init(|| PyPonCapi {
+        size: mem::size_of::<PyPonCapi>(),
+        core: &families.core,
+        err: &families.err,
+        numbers: &families.numbers,
+        strings: &families.strings,
+        containers: &families.containers,
+        runtime_: &families.runtime_,
+        object_: &families.object_,
+        typeobj: &families.typeobj,
+    })
+}
 
 /// Extension suffixes Pon will consider for source-recompiled modules.
 #[must_use]
@@ -177,7 +270,7 @@ pub(crate) fn load_extension_module(name: &str, path: &Path) -> Result<*mut PyOb
     }
 
     let set_capi = unsafe { symbol::<PyPonSetCapi>(handle, "PyPon_SetCapi") }?;
-    let set_result = unsafe { set_capi(&raw const PON_CAPI) };
+    let set_result = unsafe { set_capi(capi_table()) };
     if set_result != 0 {
         unsafe { libc::dlclose(handle) };
         return Err(format!("extension '{}' rejected Pon C API table", path.display()));
@@ -270,6 +363,14 @@ unsafe extern "C" fn py_module_add_object(module: *mut PyObject, name: *const c_
         pon_err_set("PyModule_AddObject received NULL".to_owned());
         return -1;
     }
+    // Extensions publish their static types as module attributes
+    // (`PyModule_AddObject(m, "Counter", (PyObject *)&CounterType)`); foreign
+    // statics must never enter the runtime object graph — swap in the native
+    // type they were Ready'd into.
+    let value = match twin::registered_native_of_foreign(value.cast::<twin::ForeignTypeObject>()) {
+        Some(native) => native.cast::<PyObject>(),
+        None => value,
+    };
     let Some(attr) = c_string(name) else {
         pon_err_set("PyModule_AddObject name is not valid UTF-8".to_owned());
         return -1;
@@ -284,34 +385,30 @@ unsafe extern "C" fn py_module_add_object(module: *mut PyObject, name: *const c_
     }
 }
 
-unsafe extern "C" fn py_long_from_long(value: c_long) -> *mut PyObject {
-    crate::types::int::from_i64(value as i64)
+unsafe extern "C" fn py_true() -> *mut PyObject {
+    crate::types::bool_::from_bool(true)
 }
 
-unsafe extern "C" fn py_long_as_long(object: *mut PyObject) -> c_long {
-    let object = crate::tag::untag_arg(object);
-    match unsafe { crate::types::int::to_bigint_including_bool(object) }.and_then(|value| value.to_i64()) {
-        Some(value) => value as c_long,
-        None => {
-            let _ = crate::abi::exc::raise_kind_error_text(ExceptionKind::TypeError, "an integer is required");
-            -1
-        }
-    }
+unsafe extern "C" fn py_false() -> *mut PyObject {
+    crate::types::bool_::from_bool(false)
 }
 
-unsafe extern "C" fn py_unicode_from_string(value: *const c_char) -> *mut PyObject {
-    let Some(text) = c_string(value) else {
-        return abi::return_null_with_error("PyUnicode_FromString received invalid UTF-8");
-    };
-    unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }
+unsafe extern "C" fn py_not_implemented() -> *mut PyObject {
+    unsafe { abi::pon_not_implemented() }
 }
 
-unsafe extern "C" fn py_inc_ref(object: *mut PyObject) {
+/// Pins `object` as an explicit GC root (C-side owned reference); counted,
+/// so pins nest. No-op for NULL, sentinel low addresses, and immediates.
+pub(super) fn pin_object(object: *mut PyObject) {
     if object.is_null() || object.addr() < 4096 || !crate::tag::is_heap(object) {
         return;
     }
     let mut pins = CAPI_PINS.lock().unwrap_or_else(|poison| poison.into_inner());
     *pins.entry(object as usize).or_insert(0) += 1;
+}
+
+unsafe extern "C" fn py_inc_ref(object: *mut PyObject) {
+    pin_object(object);
 }
 
 unsafe extern "C" fn py_dec_ref(object: *mut PyObject) {
@@ -331,24 +428,6 @@ unsafe extern "C" fn py_none() -> *mut PyObject {
     unsafe { abi::pon_none() }
 }
 
-unsafe extern "C" fn py_err_set_string(exception: *mut PyObject, message: *const c_char) {
-    let text = c_string(message).unwrap_or_else(|| "C extension error".to_owned());
-    let kind = match exception as usize {
-        PON_EXCEPTION_TYPE_ERROR => ExceptionKind::TypeError,
-        PON_EXCEPTION_VALUE_ERROR => ExceptionKind::ValueError,
-        PON_EXCEPTION_IMPORT_ERROR => ExceptionKind::ImportError,
-        _ => ExceptionKind::RuntimeError,
-    };
-    let _ = crate::abi::exc::raise_kind_error_text(kind, &text);
-}
-
-unsafe extern "C" fn py_err_occurred() -> *mut PyObject {
-    if pon_err_occurred() {
-        PON_EXCEPTION_RUNTIME_ERROR as *mut PyObject
-    } else {
-        ptr::null_mut()
-    }
-}
 
 unsafe extern "C" fn cfunction_call(callee: *mut PyObject, args: *mut PyObject, _kwargs: *mut PyObject) -> *mut PyObject {
     if callee.is_null() {
@@ -359,8 +438,31 @@ unsafe extern "C" fn cfunction_call(callee: *mut PyObject, args: *mut PyObject, 
         Ok(values) => values,
         Err(message) => return abi::return_null_with_error(message),
     };
-    if function.flags & METH_KEYWORDS != 0 {
-        return abi::return_null_with_error("METH_KEYWORDS extension calls are not supported yet");
+    if function.flags & METH_KEYWORDS != 0 && function.flags & METH_FASTCALL == 0 {
+        // METH_VARARGS|METH_KEYWORDS: (self, args_tuple, kwargs_dict_or_NULL).
+        let with_keywords: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject =
+            // SAFETY: the METH_KEYWORDS flag certifies the C entry was
+            // declared with the PyCFunctionWithKeywords signature.
+            unsafe { mem::transmute(function.method) };
+        let tuple = if args.is_null() {
+            unsafe { abi::seq::pon_build_tuple(ptr::null_mut(), 0) }
+        } else {
+            args
+        };
+        return unsafe { with_keywords(function.self_object, tuple, _kwargs) };
+    }
+    if function.flags & METH_FASTCALL != 0 {
+        if function.flags & METH_KEYWORDS != 0 {
+            let fastcall_kw: unsafe extern "C" fn(*mut PyObject, *const *mut PyObject, isize, *mut PyObject) -> *mut PyObject =
+                // SAFETY: METH_FASTCALL|METH_KEYWORDS certifies the
+                // _PyCFunctionFastWithKeywords signature.
+                unsafe { mem::transmute(function.method) };
+            return unsafe { fastcall_kw(function.self_object, positional.as_ptr(), positional.len() as isize, ptr::null_mut()) };
+        }
+        let fastcall: unsafe extern "C" fn(*mut PyObject, *const *mut PyObject, isize) -> *mut PyObject =
+            // SAFETY: METH_FASTCALL certifies the _PyCFunctionFast signature.
+            unsafe { mem::transmute(function.method) };
+        return unsafe { fastcall(function.self_object, positional.as_ptr(), positional.len() as isize) };
     }
     if function.flags & METH_NOARGS != 0 {
         if !positional.is_empty() {
@@ -392,18 +494,57 @@ unsafe fn tuple_args<'a>(args: *mut PyObject) -> Result<&'a [*mut PyObject], Str
     unsafe { crate::abi::seq::exact_tuple_slice(args) }.ok_or_else(|| "C function call args were not a tuple".to_owned())
 }
 
-fn alloc_cfunction(function: PyCFunction, flags: c_int, self_object: *mut PyObject, name: &str) -> *mut PyObject {
-    let object = Box::new(PyCFunctionObject {
-        ob_base: PyObjectHeader::new(*C_FUNCTION_TYPE as *const PyType),
-        method: function,
-        flags,
-        self_object,
-        name: intern(name),
-    });
-    as_object_ptr(Box::into_raw(object))
+/// Binds a C method carrier to its receiver: instance access clones the
+/// carrier with `self_object` filled; class access and METH_STATIC return the
+/// carrier unbound; METH_CLASS binds the owning type.
+unsafe extern "C" fn cfunction_descr_get(descriptor: *mut PyObject, instance: *mut PyObject, owner: *mut PyObject) -> *mut PyObject {
+    if descriptor.is_null() {
+        return abi::return_null_with_error("NULL C function descriptor");
+    }
+    // SAFETY: the descriptor protocol dispatches here only for live
+    // PyCFunctionObject values (C_FUNCTION_TYPE's tp_descr_get).
+    let function = unsafe { &*descriptor.cast::<PyCFunctionObject>() };
+    if function.flags & METH_STATIC != 0 {
+        return descriptor;
+    }
+    if function.flags & METH_CLASS != 0 {
+        let receiver = if owner.is_null() { instance } else { owner };
+        return alloc_cfunction_named(function.method, function.flags, receiver, function.name);
+    }
+    if instance.is_null() {
+        return descriptor;
+    }
+    alloc_cfunction_named(function.method, function.flags, instance, function.name)
 }
 
-fn c_string(ptr: *const c_char) -> Option<String> {
+pub(super) fn alloc_cfunction(function: PyCFunction, flags: c_int, self_object: *mut PyObject, name: &str) -> *mut PyObject {
+    alloc_cfunction_named(function, flags, self_object, intern(name))
+}
+
+fn alloc_cfunction_named(function: PyCFunction, flags: c_int, self_object: *mut PyObject, name: u32) -> *mut PyObject {
+    let info = pon_gc::GcTypeInfo {
+        size: mem::size_of::<PyCFunctionObject>(),
+        trace: trace_cfunction,
+        finalize: None,
+    };
+    let Ok(block) = abi::alloc_gc_object(TYPE_ID_CAPI_CFUNCTION, info) else {
+        return abi::return_null_with_error("runtime is not initialized");
+    };
+    let object = block.cast::<PyCFunctionObject>();
+    // SAFETY: `block` is a fresh zeroed allocation of the carrier's size.
+    unsafe {
+        object.write(PyCFunctionObject {
+            ob_base: PyObjectHeader::new(*C_FUNCTION_TYPE as *const PyType),
+            method: function,
+            flags,
+            self_object,
+            name,
+        });
+    }
+    as_object_ptr(object)
+}
+
+pub(super) fn c_string(ptr: *const c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
     }
@@ -428,12 +569,12 @@ mod tests {
 
     static NEXT_TEMP_ID: AtomicUsize = AtomicUsize::new(0);
 
-    struct TempExtensionRoot {
+    pub(super) struct TempExtensionRoot {
         path: PathBuf,
     }
 
     impl TempExtensionRoot {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
             let path = env::temp_dir().join(format!("pon-capi-extension-{}-{id}", process::id()));
             let _ = fs::remove_dir_all(&path);
@@ -441,7 +582,7 @@ mod tests {
             Self { path }
         }
 
-        fn path(&self) -> &Path {
+        pub(super) fn path(&self) -> &Path {
             &self.path
         }
     }
@@ -452,7 +593,7 @@ mod tests {
         }
     }
 
-    struct ResetImportStateOnDrop;
+    pub(super) struct ResetImportStateOnDrop;
 
     impl Drop for ResetImportStateOnDrop {
         fn drop(&mut self) {
@@ -460,7 +601,7 @@ mod tests {
         }
     }
 
-    fn compile_extension(temp: &TempExtensionRoot, module_name: &str, source: &str) -> PathBuf {
+    pub(super) fn compile_extension(temp: &TempExtensionRoot, module_name: &str, source: &str) -> PathBuf {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         let source_path = temp.path().join(format!("{module_name}.c"));
         let output_path = temp.path().join(format!("{module_name}.pon.so"));
@@ -468,6 +609,7 @@ mod tests {
 
         let include_path = manifest.join("include");
         let bootstrap_path = manifest.join("capi").join("pon_capi_bootstrap.c");
+        let args_path = manifest.join("capi").join("pon_capi_args.c");
         let mut args = vec![
             OsStr::new("-fPIC").to_owned(),
             OsStr::new("-I").to_owned(),
@@ -482,6 +624,7 @@ mod tests {
         }
         args.push(source_path.as_os_str().to_owned());
         args.push(bootstrap_path.as_os_str().to_owned());
+        args.push(args_path.as_os_str().to_owned());
         args.push(OsStr::new("-o").to_owned());
         args.push(output_path.as_os_str().to_owned());
 
@@ -610,5 +753,77 @@ PyMODINIT_FUNC PyInit_capi_test_ext(void) {
             pon_err_message()
         );
         assert_eq!(format_object_for_print(echoed).as_deref(), Ok("99"));
+    }
+    #[test]
+    fn capi_type_and_error_identity_holds_across_the_boundary() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+
+        let temp = TempExtensionRoot::new();
+        let module_path = compile_extension(
+            &temp,
+            "capi_twin_ext",
+            r#"
+#include <Python.h>
+
+/* Returns a bitmask of passed checks; Rust asserts the full mask. */
+static PyObject *identity_checks(PyObject *self, PyObject *args) {
+    long ok = 0;
+    (void)self;
+    (void)args;
+
+    PyObject *seven = PyLong_FromLong(7);
+    if (Py_TYPE(seven) == &PyLong_Type) ok |= 1L << 0;
+    if (Py_TYPE(seven) == Py_TYPE(seven)) ok |= 1L << 1;
+    if (Py_TYPE(Py_None) == &_PyNone_Type) ok |= 1L << 2;
+    if (Py_TYPE(Py_True) == &PyBool_Type) ok |= 1L << 3;
+    if (PyLong_Type.tp_name != 0 && strcmp(PyLong_Type.tp_name, "int") == 0) ok |= 1L << 4;
+    if (PyLong_Type.tp_basicsize > 0) ok |= 1L << 5;
+
+    PyErr_SetString(PyExc_ValueError, "twin identity probe");
+    if (PyErr_Occurred() == PyExc_ValueError) ok |= 1L << 6;
+    if (((PyTypeObject *)PyExc_ValueError)->tp_flags & Py_TPFLAGS_BASE_EXC_SUBCLASS) ok |= 1L << 7;
+    PyErr_Clear();
+    if (PyErr_Occurred() == 0) ok |= 1L << 8;
+
+    return PyLong_FromLong(ok);
+}
+
+static PyMethodDef twin_methods[] = {
+    {"identity_checks", identity_checks, METH_NOARGS, 0},
+    {0, 0, 0, 0},
+};
+
+static struct PyModuleDef twin_module = {
+    PyModuleDef_HEAD_INIT,
+    "capi_twin_ext",
+    0,
+    -1,
+    twin_methods,
+    0,
+    0,
+    0,
+    0,
+};
+
+PyMODINIT_FUNC PyInit_capi_twin_ext(void) {
+    return PyModule_Create(&twin_module);
+}
+"#,
+        );
+
+        let module = load_extension_module("capi_twin_ext", &module_path)
+            .unwrap_or_else(|message| panic!("failed to load C extension: {message}"));
+        assert!(!module.is_null(), "extension loader returned NULL module");
+
+        let module_name = intern("capi_twin_ext");
+        let checks = module_attr(module_name, intern("identity_checks")).expect("identity_checks registered");
+        let result = unsafe { pon_call(checks, ptr::null_mut(), 0) };
+        assert!(!result.is_null(), "identity_checks() returned NULL: {:?}", pon_err_message());
+        // All nine identity bits must hold; a partial mask names the failure.
+        assert_eq!(format_object_for_print(result).as_deref(), Ok("511"), "twin identity bitmask mismatch");
     }
 }

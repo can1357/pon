@@ -1,0 +1,48 @@
+#ifndef PON_CAPI_ERR_H
+#define PON_CAPI_ERR_H
+
+/* Error family: exception raising, inspection, and exception-type
+ * singletons. Singleton fields hold REAL runtime exception type objects;
+ * they are valid arguments to any API taking a type or class.
+ */
+
+typedef struct PyPonCapiErr {
+    void (*set_string)(PyObject *, const char *);
+    void (*set_object)(PyObject *, PyObject *);
+    void (*set_none)(PyObject *);
+    PyObject *(*occurred)(void);
+    void (*clear)(void);
+
+    PyObject *exc_base_exception;
+    PyObject *exc_exception;
+    PyObject *exc_runtime_error;
+    PyObject *exc_type_error;
+    PyObject *exc_value_error;
+    PyObject *exc_import_error;
+    PyObject *exc_overflow_error;
+    PyObject *exc_index_error;
+    PyObject *exc_key_error;
+    PyObject *exc_attribute_error;
+    PyObject *exc_not_implemented_error;
+    PyObject *exc_stop_iteration;
+    PyObject *exc_memory_error;
+    PyObject *exc_os_error;
+    PyObject *exc_system_error;
+    PyObject *exc_buffer_error;
+    PyObject *exc_zero_division_error;
+    PyObject *exc_arithmetic_error;
+    PyObject *exc_floating_point_error;
+    PyObject *exc_deprecation_warning;
+    PyObject *exc_runtime_warning;
+    PyObject *exc_user_warning;
+    PyObject *exc_lookup_error;
+    int (*exception_matches)(PyObject *);
+    int (*given_exception_matches)(PyObject *, PyObject *);
+    void (*fetch)(PyObject **, PyObject **, PyObject **);
+    void (*restore)(PyObject *, PyObject *, PyObject *);
+    int (*warn_ex)(PyObject *, const char *, Py_ssize_t);
+    void (*write_unraisable)(PyObject *);
+    /* Family expansion point: append fields only; never reorder. */
+} PyPonCapiErr;
+
+#endif /* PON_CAPI_ERR_H */
