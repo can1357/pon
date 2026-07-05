@@ -1086,6 +1086,129 @@ fn execute(nodes: &[Node], subject: &SubjectData, start: MatchState, collect_all
     Ok(out)
 }
 
+enum RepeatOneStep {
+    Matched(MatchState),
+    Failed,
+    Unsupported,
+}
+
+fn repeat_single_unit_candidates(
+    body: &[Node],
+    subject: &SubjectData,
+    state: MatchState,
+    min: usize,
+    max: Option<usize>,
+    kind: RepeatKind,
+) -> Option<Vec<MatchState>> {
+    let cap = max.unwrap_or(usize::MAX);
+    let lazy = matches!(kind, RepeatKind::Lazy);
+    let mut current = state;
+    let mut count = 0_usize;
+    let mut out = Vec::new();
+    if min == 0 {
+        out.push(current.clone());
+        if lazy && out.len() >= RESULT_LIMIT {
+            return Some(out);
+        }
+    }
+    while count < cap {
+        let next = match repeat_single_unit_step(body, subject, current.clone()) {
+            RepeatOneStep::Matched(next) => next,
+            RepeatOneStep::Failed => break,
+            RepeatOneStep::Unsupported => return None,
+        };
+        if next.pos == current.pos {
+            return None;
+        }
+        count += 1;
+        current = next;
+        if count >= min {
+            out.push(current.clone());
+            if lazy && out.len() >= RESULT_LIMIT {
+                return Some(out);
+            }
+        }
+    }
+    if count < min {
+        return Some(Vec::new());
+    }
+    if !lazy {
+        out.reverse();
+        out.truncate(RESULT_LIMIT);
+    }
+    Some(out)
+}
+
+fn repeat_single_unit_step(body: &[Node], subject: &SubjectData, mut state: MatchState) -> RepeatOneStep {
+    let mut consumed = false;
+    for node in body {
+        match node {
+            Node::Mark(mark) => {
+                if *mark < state.marks.len() {
+                    state.marks[*mark] = Some(state.pos);
+                    if mark % 2 == 1 {
+                        state.lastindex = Some(mark / 2 + 1);
+                    }
+                }
+            }
+            Node::Literal { value, case } => {
+                if consumed {
+                    return RepeatOneStep::Unsupported;
+                }
+                let Some(unit) = subject.unit(state.pos) else {
+                    return RepeatOneStep::Failed;
+                };
+                if !matches_literal(Some(unit), *value, *case) {
+                    return RepeatOneStep::Failed;
+                }
+                state.pos += 1;
+                consumed = true;
+            }
+            Node::NotLiteral { value, case } => {
+                if consumed {
+                    return RepeatOneStep::Unsupported;
+                }
+                let Some(unit) = subject.unit(state.pos) else {
+                    return RepeatOneStep::Failed;
+                };
+                if matches_literal(Some(unit), *value, *case) {
+                    return RepeatOneStep::Failed;
+                }
+                state.pos += 1;
+                consumed = true;
+            }
+            Node::Any { all } => {
+                if consumed {
+                    return RepeatOneStep::Unsupported;
+                }
+                let Some(unit) = subject.unit(state.pos) else {
+                    return RepeatOneStep::Failed;
+                };
+                if !*all && unit == 10 {
+                    return RepeatOneStep::Failed;
+                }
+                state.pos += 1;
+                consumed = true;
+            }
+            Node::In { set, case } => {
+                if consumed {
+                    return RepeatOneStep::Unsupported;
+                }
+                let Some(unit) = subject.unit(state.pos) else {
+                    return RepeatOneStep::Failed;
+                };
+                if !set.matches(unit, *case) {
+                    return RepeatOneStep::Failed;
+                }
+                state.pos += 1;
+                consumed = true;
+            }
+            _ => return RepeatOneStep::Unsupported,
+        }
+    }
+    if consumed { RepeatOneStep::Matched(state) } else { RepeatOneStep::Unsupported }
+}
+
 fn repeat_candidates(
     body: &[Node],
     subject: &SubjectData,
@@ -1094,6 +1217,9 @@ fn repeat_candidates(
     max: Option<usize>,
     kind: RepeatKind,
 ) -> Result<Vec<MatchState>, Error> {
+    if let Some(candidates) = repeat_single_unit_candidates(body, subject, state.clone(), min, max, kind) {
+        return Ok(candidates);
+    }
     // Preference-ordered depth-first enumeration of repetition end states:
     // index 0 is the match the backtracking engine tries first — greedy prefers
     // more repetitions (forward-march longest), lazy prefers fewer.  Emitted

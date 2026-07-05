@@ -274,6 +274,10 @@ fn none() -> *mut PyObject {
     unsafe { abi::pon_none() }
 }
 
+fn is_none(object: *mut PyObject) -> bool {
+    untag(object) == none()
+}
+
 fn alloc_str_object(text: &str) -> *mut PyObject {
     // SAFETY: Runtime allocation helper; NULL on failure with the error set.
     unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }
@@ -660,11 +664,18 @@ fn run_match(
     }
 }
 
-fn run_finditer(pattern: &vm::Pattern, subject: &Subject) -> Result<Vec<vm::Match>, vm::Error> {
-    match subject {
-        Subject::Str { text, .. } => pattern.finditer_str(text),
-        Subject::Bytes { data } => pattern.finditer_bytes(data),
+fn run_finditer(pattern: &vm::Pattern, subject: &Subject, pos: usize, endpos: usize) -> Result<Vec<vm::Match>, vm::Error> {
+    if pos > endpos {
+        return Ok(Vec::new());
     }
+    let matches = match subject {
+        Subject::Str { text, offsets } => pattern.finditer_str(&text[..offsets[endpos]])?,
+        Subject::Bytes { data } => pattern.finditer_bytes(&data[..endpos])?,
+    };
+    Ok(matches
+        .into_iter()
+        .filter(|matched| matched.span(0).flatten().is_some_and(|(start, _)| start >= pos))
+        .collect())
 }
 
 /// Extracts `(receiver, subject, extra args)` shared by every Pattern method.
@@ -701,10 +712,29 @@ fn optional_bound(args: &[*mut PyObject], index: usize, default: usize, units: u
     let Some(&arg) = args.get(index) else {
         return Ok(default);
     };
+    if arg.is_null() || is_none(arg) {
+        return Ok(default);
+    }
     match to_i64(arg) {
         Some(value) => Ok(value.clamp(0, units as i64) as usize),
         None => {
             pon_err_set(format!("{name}() expected an integer position argument"));
+            Err(())
+        }
+    }
+}
+
+fn optional_i64(args: &[*mut PyObject], index: usize, default: i64, name: &str, arg_name: &str) -> Result<i64, ()> {
+    let Some(&arg) = args.get(index) else {
+        return Ok(default);
+    };
+    if arg.is_null() || is_none(arg) {
+        return Ok(default);
+    }
+    match to_i64(arg) {
+        Some(value) => Ok(value),
+        None => {
+            pon_err_set(format!("{name}() expected integer {arg_name} argument"));
             Err(())
         }
     }
@@ -744,31 +774,42 @@ unsafe extern "C" fn pattern_search_method(argv: *mut *mut PyObject, argc: usize
 }
 
 unsafe extern "C" fn pattern_findall_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    let Some((pattern, subject, _args)) = (unsafe { pattern_method_prelude(argv, argc, "findall", 1) }) else {
+    let Some((pattern, subject, args)) = (unsafe { pattern_method_prelude(argv, argc, "findall", 1) }) else {
         return ptr::null_mut();
     };
-    let rows = match &subject {
-        Subject::Str { text, .. } => pattern.pattern.findall_str(text),
-        Subject::Bytes { data } => pattern.pattern.findall_bytes(data),
+    let units = subject.units();
+    let (Ok(pos), Ok(endpos)) = (
+        optional_bound(args, 2, 0, units, "findall"),
+        optional_bound(args, 3, units, units, "findall"),
+    ) else {
+        return ptr::null_mut();
     };
-    let rows = match rows {
-        Ok(rows) => rows,
+    let matches = match run_finditer(&pattern.pattern, &subject, pos, endpos) {
+        Ok(matches) => matches,
         Err(error) => return fail(format!("findall(): {error}")),
     };
-    let mut items = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut columns = Vec::with_capacity(row.len());
-        for value in &row {
-            // CPython findall maps unmatched groups to the empty string/bytes.
-            columns.push(match value {
-                Some(value) => matched_value_object(value),
-                None => subject.make_object(&[]),
-            });
-        }
-        if columns.len() == 1 {
-            items.push(columns.pop().expect("one column"));
+    let group_count = pattern.pattern.groups();
+    let mut items = Vec::with_capacity(matches.len());
+    for matched in matches {
+        let mut columns = Vec::with_capacity(group_count.max(1));
+        if group_count == 0 {
+            columns.push(matched.group(0));
+        } else if group_count == 1 {
+            columns.push(matched.group(1));
         } else {
-            items.push(alloc_tuple(columns));
+            for group in 1..=group_count {
+                columns.push(matched.group(group));
+            }
+        }
+        let mut objects = Vec::with_capacity(columns.len());
+        for value in columns {
+            // CPython findall maps unmatched groups to the empty string/bytes.
+            objects.push(value.map_or_else(|| subject.make_object(&[]), |value| matched_value_object(&value)));
+        }
+        if objects.len() == 1 {
+            items.push(objects.pop().expect("one column"));
+        } else {
+            items.push(alloc_tuple(objects));
         }
     }
     alloc_list(items)
@@ -778,7 +819,14 @@ unsafe extern "C" fn pattern_finditer_method(argv: *mut *mut PyObject, argc: usi
     let Some((pattern, subject, args)) = (unsafe { pattern_method_prelude(argv, argc, "finditer", 1) }) else {
         return ptr::null_mut();
     };
-    match run_finditer(&pattern.pattern, &subject) {
+    let units = subject.units();
+    let (Ok(pos), Ok(endpos)) = (
+        optional_bound(args, 2, 0, units, "finditer"),
+        optional_bound(args, 3, units, units, "finditer"),
+    ) else {
+        return ptr::null_mut();
+    };
+    match run_finditer(&pattern.pattern, &subject, pos, endpos) {
         Ok(matches) => {
             let string_obj = untag(args[1]);
             let items = matches
@@ -795,8 +843,11 @@ unsafe extern "C" fn pattern_split_method(argv: *mut *mut PyObject, argc: usize)
     let Some((pattern, subject, args)) = (unsafe { pattern_method_prelude(argv, argc, "split", 1) }) else {
         return ptr::null_mut();
     };
-    let maxsplit = args.get(2).copied().and_then(to_i64).unwrap_or(0);
-    let matches = match run_finditer(&pattern.pattern, &subject) {
+    let maxsplit = match optional_i64(args, 2, 0, "split", "maxsplit") {
+        Ok(value) => value,
+        Err(()) => return ptr::null_mut(),
+    };
+    let matches = match run_finditer(&pattern.pattern, &subject, 0, subject.units()) {
         Ok(matches) => matches,
         Err(error) => return fail(format!("split(): {error}")),
     };
@@ -841,7 +892,10 @@ unsafe fn pattern_run_sub(argv: *mut *mut PyObject, argc: usize, name: &str, wit
     let Some((pattern, subject, args)) = (unsafe { pattern_method_prelude(argv, argc, name, 2) }) else {
         return ptr::null_mut();
     };
-    let count = args.get(3).copied().and_then(to_i64).unwrap_or(0);
+    let count = match optional_i64(args, 3, 0, name, "count") {
+        Ok(value) => value,
+        Err(()) => return ptr::null_mut(),
+    };
     let repl_obj = untag(args[1]);
     // SAFETY: heap-or-NULL after untagging; accessors reject NULL.
     let repl = if let Some(text) = unsafe { unicode_text(repl_obj) } {
@@ -866,10 +920,15 @@ unsafe fn pattern_run_sub(argv: *mut *mut PyObject, argc: usize, name: &str, wit
         Repl::Callable(repl_obj)
     };
 
-    let matches = match run_finditer(&pattern.pattern, &subject) {
+    let matches = match run_finditer(&pattern.pattern, &subject, 0, subject.units()) {
         Ok(matches) => matches,
         Err(error) => return fail(format!("{name}(): {error}")),
     };
+    if matches.is_empty() {
+        let original = untag(args[2]);
+        return if with_count { alloc_tuple(vec![original, alloc_int_object(0)]) } else { original };
+    }
+
 
     let mut out: Vec<u8> = Vec::new();
     let mut last = 0usize;
