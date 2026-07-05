@@ -713,6 +713,12 @@ unsafe fn object_equal_structural(left: *mut PyObject, right: *mut PyObject) -> 
             Some(Ok(unsafe { l.as_slice() == r.as_slice() }))
         }
         (Some("frozenset"), Some("frozenset")) => Some(crate::types::frozenset::frozenset_equal(left, right)),
+        // `set` pairs (and set/frozenset mixes) compare by contents exactly
+        // like `==` (CPython set_richcompare): container membership (`x in
+        // (a, b)`) must agree with direct equality.
+        (Some("set"), Some("set")) | (Some("set"), Some("frozenset")) | (Some("frozenset"), Some("set")) => {
+            Some(unsafe { crate::types::set_::set_equal(left, right) })
+        }
         (Some("tuple"), Some("tuple")) => {
             let (Some(l), Some(r)) = (
                 unsafe { crate::abi::seq::exact_tuple_slice(left) },
