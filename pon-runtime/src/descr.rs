@@ -462,8 +462,12 @@ pub unsafe fn lookup_in_type(ty: *mut PyType, name: u32) -> *mut PyObject {
     if ty.is_null() {
         return ptr::null_mut();
     }
+    let known_types = sync::namespaced_types();
+    if !known_types.contains(&ty) {
+        return ptr::null_mut();
+    }
     for cls in unsafe { mro::mro_entries(ty) } {
-        if cls.is_null() {
+        if cls.is_null() || !known_types.contains(&cls) {
             continue;
         }
         let dict = unsafe { (*cls).tp_dict };
@@ -591,9 +595,34 @@ fn has_heap_instance_prefix(ty: *const PyType) -> bool {
 static CAPI_INSTANCE_DICTS: LazyLock<Mutex<HashMap<usize, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+static CAPI_INSTANCE_DICT_ROOT_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let namespace = type_::new_namespace();
+    let mut ty = PyType::new(abi::runtime_type_type(), "__capi_slot_dict_roots__", mem::size_of::<PyObject>());
+    ty.tp_dict = namespace.cast::<PyObject>();
+    let ty = Box::into_raw(Box::new(ty));
+    sync::register_namespaced_type(ty);
+    ty as usize
+});
+
+fn capi_instance_dict_root_namespace() -> *mut PyClassDict {
+    let ty = *CAPI_INSTANCE_DICT_ROOT_TYPE as *mut PyType;
+    if ty.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { (*ty).tp_dict.cast::<PyClassDict>() }
+}
+
+fn capi_instance_dict_root_name(object: *mut PyObject) -> u32 {
+    intern::intern(&format!("capi_slot_dict:{:016x}", object as usize))
+}
+
 fn remember_capi_instance_dict(object: *mut PyObject, dict: *mut PyObject) {
     if object.is_null() || dict.is_null() {
         return;
+    }
+    let root_dict = capi_instance_dict_root_namespace();
+    if !root_dict.is_null() {
+        unsafe { (&mut *root_dict).set(capi_instance_dict_root_name(object), dict) };
     }
     CAPI_INSTANCE_DICTS
         .lock()
@@ -605,10 +634,27 @@ pub(crate) unsafe fn forget_capi_instance_dict(object: *mut PyObject) {
     if object.is_null() {
         return;
     }
+    let root_dict = capi_instance_dict_root_namespace();
+    if !root_dict.is_null() {
+        unsafe {
+            (&mut *root_dict).del(capi_instance_dict_root_name(object));
+        }
+    }
     CAPI_INSTANCE_DICTS
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .remove(&(object as usize));
+}
+
+pub(crate) fn registered_capi_instance_dict(object: *mut PyObject) -> *mut PyObject {
+    if object.is_null() {
+        return ptr::null_mut();
+    }
+    CAPI_INSTANCE_DICTS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(&(object as usize))
+        .map_or(ptr::null_mut(), |&dict| dict as *mut PyObject)
 }
 
 unsafe fn capi_instance_dict_slot(object: *mut PyObject, ty: *const PyType) -> Result<Option<*mut *mut PyObject>, String> {
@@ -637,33 +683,31 @@ unsafe fn capi_instance_dict_object(object: *mut PyObject, ty: *const PyType) ->
     let Some(slot) = (unsafe { capi_instance_dict_slot(object, ty) })? else {
         return Ok(ptr::null_mut());
     };
+    let dict = registered_capi_instance_dict(object);
+    if !dict.is_null() {
+        unsafe { slot.write(dict) };
+        return Ok(dict);
+    }
     let current = unsafe { slot.read() };
     if current.is_null() {
         return Ok(ptr::null_mut());
     }
-    let registered = CAPI_INSTANCE_DICTS
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .get(&(object as usize))
-        .copied();
-    if registered == Some(current as usize) {
-        Ok(current)
-    } else {
-        Ok(ptr::null_mut())
-    }
+    remember_capi_instance_dict(object, current);
+    Ok(current)
 }
 
 pub(crate) unsafe fn ensure_capi_instance_dict(object: *mut PyObject, ty: *const PyType) -> Result<*mut PyObject, String> {
     let Some(slot) = (unsafe { capi_instance_dict_slot(object, ty) })? else {
         return Ok(ptr::null_mut());
     };
+    let current = registered_capi_instance_dict(object);
+    if !current.is_null() {
+        unsafe { slot.write(current) };
+        return Ok(current);
+    }
     let current = unsafe { slot.read() };
-    let registered = CAPI_INSTANCE_DICTS
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .get(&(object as usize))
-        .copied();
-    if !current.is_null() && registered == Some(current as usize) {
+    if !current.is_null() {
+        remember_capi_instance_dict(object, current);
         return Ok(current);
     }
     let dict = unsafe { abi::map::pon_build_map(ptr::null_mut(), 0) };
