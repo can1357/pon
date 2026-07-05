@@ -254,6 +254,30 @@ pub unsafe extern "C" fn builtin_ord(argv: *mut *mut PyObject, argc: usize) -> *
     let Some(args) = (unsafe { exact_args(argv, argc, 1, "ord") }) else {
         return ptr::null_mut();
     };
+    // CPython `ord()` also accepts length-1 bytes/bytearray, including
+    // subclasses (cython's BytesLiteral): the result is the byte value.
+    {
+        let raw = unsafe { crate::types::type_::payload_subclass_value(args[0]) }.unwrap_or(args[0]);
+        if !raw.is_null() && crate::tag::is_heap(raw) {
+            let ty = unsafe { (*raw).ob_type };
+            let bytes: Option<&[u8]> = if crate::types::bytes_::is_bytes_type(ty) {
+                Some(unsafe { (*raw.cast::<crate::types::bytes_::PyBytes>()).as_slice() })
+            } else if crate::types::bytearray_::is_bytearray_type(ty) {
+                Some(unsafe { &*raw.cast::<crate::types::bytearray_::PyByteArray>() }.as_slice())
+            } else {
+                None
+            };
+            if let Some(bytes) = bytes {
+                if bytes.len() != 1 {
+                    return raise_type_error(&format!(
+                        "ord() expected a character, but string of length {} found",
+                        bytes.len()
+                    ));
+                }
+                return int::from_i64(i64::from(bytes[0]));
+            }
+        }
+    }
     let Some(text) = (unsafe { object_to_string(args[0]) }) else {
         return raise_type_error(&format!("ord() expected string of length 1, but {} found", type_name(args[0])));
     };
