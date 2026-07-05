@@ -107,6 +107,10 @@ static inline int PyCapsule_SetContext(PyObject *capsule, void *context) {
     return PyPon_Capi()->runtime_->capsule_set_context(capsule, context);
 }
 
+static inline int PyCapsule_SetName(PyObject *capsule, const char *name) {
+    return PyPon_Capi()->runtime_->capsule_set_name(capsule, name);
+}
+
 static inline void *PyCapsule_GetContext(PyObject *capsule) {
     return PyPon_Capi()->runtime_->capsule_get_context(capsule);
 }
@@ -121,6 +125,10 @@ static inline PyObject *PyImport_ImportModule(const char *name) {
 
 static inline PyObject *PyImport_AddModule(const char *name) {
     return PyPon_Capi()->runtime_->import_add_module(name);
+}
+
+static inline PyObject *PyImport_Import(PyObject *name) {
+    return PyPon_Capi()->runtime_->import_import(name);
 }
 
 static inline PyObject *PyModule_GetDict(PyObject *module) {

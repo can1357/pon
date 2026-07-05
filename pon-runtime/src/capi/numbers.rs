@@ -90,6 +90,8 @@ pub(crate) struct PyPonCapiNumbers {
     number_inplace_xor: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
     number_inplace_or: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
     number_inplace_matrix_multiply: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+    number_check: unsafe extern "C" fn(*mut PyObject) -> c_int,
+    hash_double: unsafe extern "C" fn(*mut PyObject, c_double) -> isize,
 }
 
 unsafe impl Send for PyPonCapiNumbers {}
@@ -165,7 +167,58 @@ pub(crate) fn build() -> PyPonCapiNumbers {
         number_inplace_xor: capi_number_inplace_xor,
         number_inplace_or: capi_number_inplace_or,
         number_inplace_matrix_multiply: capi_number_inplace_matrix_multiply,
+        number_check: capi_number_check,
+        hash_double: capi_hash_double,
     }
+}
+
+/// `PyNumber_Check`: true for objects usable as numbers (CPython: any of the
+/// nb_int/nb_float/nb_index surfaces). Pon: numeric builtins plus anything
+/// exposing `__index__`, `__int__`, or `__float__` through its MRO.
+unsafe extern "C" fn capi_number_check(object: *mut PyObject) -> c_int {
+    if object.is_null() {
+        return 0;
+    }
+    if crate::tag::is_small_int(object) {
+        return 1;
+    }
+    if !crate::tag::is_heap(object) {
+        return 0;
+    }
+    for tid in [
+        super::twin::TID_LONG,
+        super::twin::TID_BOOL,
+        super::twin::TID_FLOAT,
+        super::twin::TID_COMPLEX,
+    ] {
+        if unsafe { capi_type_check(object, tid as c_int) } == 1 {
+            return 1;
+        }
+    }
+    // SAFETY: heap-tagged live object with a readable header.
+    let ty = unsafe { (*object).ob_type }.cast_mut();
+    for dunder in ["__index__", "__int__", "__float__"] {
+        if !unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern(dunder)) }.is_null() {
+            return 1;
+        }
+    }
+    0
+}
+
+/// `_Py_HashDouble(inst, value)`: CPython 3.10+ contract — NaN hashes to the
+/// carrying instance's pointer hash (distinct NaN objects hash differently),
+/// everything else to the platform float hash (Pon's `hash_f64` matches
+/// CPython's `pyhash.c` algorithm; k3 canaries cover the boundary widths).
+unsafe extern "C" fn capi_hash_double(inst: *mut PyObject, value: c_double) -> isize {
+    if value.is_nan() {
+        // CPython Py_HashPointer: rotate the address right by 4 bits so
+        // allocation alignment does not zero the low hash bits.
+        let bits = inst as usize;
+        let hash = (bits >> 4) | (bits << (usize::BITS as usize - 4));
+        let hash = hash as isize;
+        return if hash == -1 { -2 } else { hash };
+    }
+    crate::types::float::hash_f64(value)
 }
 
 unsafe extern "C" fn capi_long_from_long(value: c_long) -> *mut PyObject {

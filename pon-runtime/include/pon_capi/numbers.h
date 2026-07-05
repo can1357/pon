@@ -72,6 +72,8 @@ typedef struct PyPonCapiNumbers {
     PyObject *(*number_inplace_xor)(PyObject *, PyObject *);
     PyObject *(*number_inplace_or)(PyObject *, PyObject *);
     PyObject *(*number_inplace_matrix_multiply)(PyObject *, PyObject *);
+    int (*number_check)(PyObject *);
+    Py_hash_t (*hash_double)(PyObject *, double);
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiNumbers;
 

@@ -49,6 +49,11 @@ typedef struct PyPonCapiCore {
     int (*builtin_type_id)(PyObject *);
     PyTypeObject *(*foreign_of)(PyObject *);
     PyObject *(*ellipsis)(void);
+    /* Foreign-face -> native translation; C code MUST route objects it
+     * stores into pon structures (tuples/dicts built for calls) through
+     * this so registered foreign type statics collapse onto their native
+     * class. Non-foreign pointers pass through unchanged. */
+    PyObject *(*normalize_foreign)(PyObject *);
 } PyPonCapiCore;
 
 #endif /* PON_CAPI_CORE_H */

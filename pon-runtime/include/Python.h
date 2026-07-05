@@ -773,6 +773,51 @@ static inline const PyPonCapi *PyPon_Capi(void) {
 #define Py_UNICODE_ISUPPER(ch) (iswupper((wint_t)(Py_UCS4)(ch)) != 0)
 #define Py_UNICODE_TOLOWER(ch) ((Py_UCS4)towlower((wint_t)(Py_UCS4)(ch)))
 #define Py_UNICODE_TOUPPER(ch) ((Py_UCS4)towupper((wint_t)(Py_UCS4)(ch)))
+/* Approximations over wctype (documented divergence from CPython's own
+ * category tables, exact for ASCII and common BMP ranges): ISDECIMAL and
+ * ISNUMERIC collapse onto digit-ness (Nd); ISTITLE onto uppercase (the Lt
+ * category has no wctype probe; titlecase digraphs are vanishingly rare). */
+#define Py_UNICODE_ISDECIMAL(ch) (iswdigit((wint_t)(Py_UCS4)(ch)) != 0)
+#define Py_UNICODE_ISNUMERIC(ch) (iswdigit((wint_t)(Py_UCS4)(ch)) != 0)
+#define Py_UNICODE_ISTITLE(ch) (iswupper((wint_t)(Py_UCS4)(ch)) != 0)
+
+/* ---- CPython pyport/pyconfig compat tail ---- */
+#define PY_LONG_LONG long long
+/* Release-mode CPython Py_SAFE_DOWNCAST: plain cast, no assertion. */
+#define Py_SAFE_DOWNCAST(VALUE, WIDE, NARROW) ((NARROW)(VALUE))
+
+/* Recursion depth is guarded by Pon's own call machinery; the C-level
+ * bookkeeping is a no-op that always grants entry. */
+static inline int Py_EnterRecursiveCall(const char *where) { (void)where; return 0; }
+static inline void Py_LeaveRecursiveCall(void) {}
+
+#define PyExceptionInstance_Class(x) ((PyObject *)Py_TYPE(x))
+
+/* tracemalloc is not modeled under Pon: tracking no-ops report success. */
+#define PYMEM_DOMAIN_RAW 0
+#define PYMEM_DOMAIN_MEM 1
+#define PYMEM_DOMAIN_OBJ 2
+static inline int PyTraceMalloc_Track(unsigned int domain, uintptr_t ptr, size_t size) {
+    (void)domain; (void)ptr; (void)size;
+    return 0;
+}
+static inline int PyTraceMalloc_Untrack(unsigned int domain, uintptr_t ptr) {
+    (void)domain; (void)ptr;
+    return 0;
+}
+
+/* Single interpreter, no GIL: the calling thread always "holds" it. */
+static inline int PyGILState_Check(void) { return 1; }
+
+/* CPython 3.14 bytes layout (compile surface ONLY — same caveat as
+ * PyUnicodeObject: Pon bytes do NOT use this layout; reading these fields
+ * from a live bytes object yields garbage). numpy sizes its bytes-scalar
+ * base struct from it. */
+typedef struct {
+    PyVarObject ob_base;
+    Py_hash_t ob_shash;
+    char ob_sval[1];
+} PyBytesObject;
 
 /* Pon has one interpreter and no free-threaded object locks; preserve CPython's
  * bracketing syntax without taking locks.

@@ -27,6 +27,10 @@ static inline PyObject *PyType_FromModuleAndSpec(PyObject *module, PyType_Spec *
     return PyPon_Capi()->typeobj->type_from_module_and_spec(module, spec, bases);
 }
 
+static inline void PyType_Modified(PyTypeObject *type) {
+    PyPon_Capi()->typeobj->type_modified(type);
+}
+
 static inline int PyType_IsSubtype(PyTypeObject *a, PyTypeObject *b) {
     return PyPon_Capi()->typeobj->is_subtype(a, b);
 }

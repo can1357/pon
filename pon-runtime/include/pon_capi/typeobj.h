@@ -37,6 +37,7 @@ typedef struct PyPonCapiTypeObj {
     PyObject *(*type_from_spec)(PyType_Spec *);
     PyObject *(*type_from_spec_with_bases)(PyType_Spec *, PyObject *);
     PyObject *(*type_from_module_and_spec)(PyObject *, PyType_Spec *, PyObject *);
+    void (*type_modified)(PyTypeObject *);
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiTypeObj;
 

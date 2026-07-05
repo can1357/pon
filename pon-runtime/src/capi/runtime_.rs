@@ -48,6 +48,8 @@ pub(crate) struct PyPonCapiRuntime {
     contextvar_get: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut *mut PyObject) -> c_int,
     datetime_capi_import: unsafe extern "C" fn() -> *mut c_void,
     datetime_get_attr_int: unsafe extern "C" fn(*mut PyObject, *const c_char) -> c_int,
+    capsule_set_name: unsafe extern "C" fn(*mut PyObject, *const c_char) -> c_int,
+    import_import: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
 }
 
 unsafe impl Send for PyPonCapiRuntime {}
@@ -161,6 +163,8 @@ pub(crate) fn build() -> PyPonCapiRuntime {
         contextvar_get: capi_contextvar_get,
         datetime_capi_import: capi_datetime_capi_import,
         datetime_get_attr_int: capi_datetime_get_attr_int,
+        capsule_set_name: capi_capsule_set_name,
+        import_import: capi_import_import,
     }
 }
 
@@ -1129,6 +1133,24 @@ unsafe extern "C" fn capi_import_import_module(name: *const c_char) -> *mut PyOb
         return raise_import_error_null("PyImport_ImportModule called with invalid module name");
     };
     import_module_text(&name)
+}
+
+/// `PyImport_Import`: object-name variant of PyImport_ImportModule.
+unsafe extern "C" fn capi_import_import(name: *mut PyObject) -> *mut PyObject {
+    let Some(text) = (unsafe { crate::types::type_::unicode_text(crate::tag::untag_arg(name)) }) else {
+        return raise_import_error_null("PyImport_Import expects a str module name");
+    };
+    import_module_text(&text.to_owned())
+}
+
+/// `PyCapsule_SetName`: replaces the stored name pointer (caller keeps the
+/// storage alive, CPython contract).
+unsafe extern "C" fn capi_capsule_set_name(capsule: *mut PyObject, name: *const c_char) -> c_int {
+    let Some(capsule) = (unsafe { checked_capsule_any_name(capsule, "PyCapsule_SetName") }) else {
+        return -1;
+    };
+    capsule.name = name;
+    0
 }
 
 unsafe extern "C" fn capi_import_add_module(name: *const c_char) -> *mut PyObject {

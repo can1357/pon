@@ -303,4 +303,12 @@ static inline PyObject *PyNumber_InPlaceMatrixMultiply(PyObject *left, PyObject 
     return PyPon_Capi()->numbers->number_inplace_matrix_multiply(left, right);
 }
 
+static inline int PyNumber_Check(PyObject *object) {
+    return PyPon_Capi()->numbers->number_check(object);
+}
+
+static inline Py_hash_t _Py_HashDouble(PyObject *inst, double value) {
+    return PyPon_Capi()->numbers->hash_double(inst, value);
+}
+
 #endif /* PON_CAPI_NUMBERS_INLINE_H */

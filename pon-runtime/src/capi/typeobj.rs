@@ -244,6 +244,7 @@ pub(crate) struct PyPonCapiTypeObj {
     type_from_spec: unsafe extern "C" fn(*mut PyTypeSpec) -> *mut PyObject,
     type_from_spec_with_bases: unsafe extern "C" fn(*mut PyTypeSpec, *mut PyObject) -> *mut PyObject,
     type_from_module_and_spec: unsafe extern "C" fn(*mut PyObject, *mut PyTypeSpec, *mut PyObject) -> *mut PyObject,
+    type_modified: unsafe extern "C" fn(*mut ForeignTypeObject),
 }
 
 unsafe impl Send for PyPonCapiTypeObj {}
@@ -261,6 +262,7 @@ pub(crate) fn build() -> PyPonCapiTypeObj {
         type_from_spec: capi_type_from_spec,
         type_from_spec_with_bases: capi_type_from_spec_with_bases,
         type_from_module_and_spec: capi_type_from_module_and_spec,
+        type_modified: capi_type_modified,
     }
 }
 
@@ -531,6 +533,15 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
 /// `PyPonCapiTypeObj.type_from_spec` (`PyType_FromSpec`).
 unsafe extern "C" fn capi_type_from_spec(spec: *mut PyTypeSpec) -> *mut PyObject {
     unsafe { capi_type_from_module_and_spec(ptr::null_mut(), spec, ptr::null_mut()) }
+}
+
+/// `PyType_Modified`: invalidates cached type state after C-side mutation
+/// (numpy pokes docstrings/slots after PyType_Ready).
+unsafe extern "C" fn capi_type_modified(foreign: *mut ForeignTypeObject) {
+    if let Some(native) = twin::registered_native_of_foreign(foreign) {
+        // `sync::type_modified` bumps the owner and subclass versions itself.
+        crate::sync::type_modified(native);
+    }
 }
 
 /// `PyPonCapiTypeObj.type_from_spec_with_bases` (`PyType_FromSpecWithBases`).
