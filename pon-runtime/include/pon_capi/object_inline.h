@@ -4,6 +4,16 @@
 /* Inline wrapper layer for the object family. Included by Python.h after the
  * PyPonCapi definition and core/error inline wrappers. */
 
+
+#define Py_PRINT_RAW 1
+
+static inline int PyType_Check(PyObject *object) {
+    return PyPon_Capi()->object_->type_check(object);
+}
+
+static inline int PyIter_Check(PyObject *object) {
+    return PyPon_Capi()->object_->iter_check(object);
+}
 static inline PyObject *PyObject_GetAttr(PyObject *object, PyObject *name) {
     return PyPon_Capi()->object_->get_attr(object, name);
 }
@@ -46,6 +56,58 @@ static inline PyObject *PyObject_CallNoArgs(PyObject *callable) {
 
 static inline PyObject *PyObject_CallOneArg(PyObject *callable, PyObject *arg) {
     return PyPon_Capi()->object_->call_one_arg(callable, arg);
+}
+
+static inline PyObject *PyObject_CallMethodNoArgs(PyObject *object, PyObject *name) {
+    PyObject *method = PyObject_GetAttr(object, name);
+    if (method == NULL) {
+        return NULL;
+    }
+    PyObject *result = PyObject_CallNoArgs(method);
+    Py_DECREF(method);
+    return result;
+}
+
+static inline PyObject *PyObject_CallMethodOneArg(PyObject *object, PyObject *name, PyObject *arg) {
+    PyObject *method = PyObject_GetAttr(object, name);
+    if (method == NULL) {
+        return NULL;
+    }
+    PyObject *result = PyObject_CallOneArg(method, arg);
+    Py_DECREF(method);
+    return result;
+}
+
+static inline PyObject *PyObject_Vectorcall(PyObject *callable, PyObject *const *args, size_t nargsf, PyObject *kwnames) {
+    return PyPon_Capi()->object_->vectorcall(callable, args, nargsf, kwnames);
+}
+
+static inline PyObject *PyObject_VectorcallDict(PyObject *callable, PyObject *const *args, size_t nargsf, PyObject *kwargs) {
+    return PyPon_Capi()->object_->vectorcall_dict(callable, args, nargsf, kwargs);
+}
+
+static inline PyObject *PyVectorcall_Call(PyObject *callable, PyObject *tuple, PyObject *dict) {
+    return PyPon_Capi()->object_->vectorcall_call(callable, tuple, dict);
+}
+
+static inline vectorcallfunc PyVectorcall_Function(PyObject *callable) {
+    return (vectorcallfunc)PyPon_Capi()->object_->vectorcall_function(callable);
+}
+
+static inline PyObject *PyObject_VectorcallMethod(PyObject *name, PyObject *const *args, size_t nargsf, PyObject *kwnames) {
+    Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+    if (nargs < 1 || args == NULL) {
+        PyErr_SetString(PyExc_TypeError, "PyObject_VectorcallMethod requires a receiver");
+        return NULL;
+    }
+    PyObject *method = PyObject_GetAttr(args[0], name);
+    if (method == NULL) {
+        return NULL;
+    }
+    size_t forwarded = ((size_t)(nargs - 1)) | (nargsf & PY_VECTORCALL_ARGUMENTS_OFFSET);
+    PyObject *result = PyObject_Vectorcall(method, args + 1, forwarded, kwnames);
+    Py_DECREF(method);
+    return result;
 }
 
 static inline PyObject *_PyPon_CallArgsFromFormat(const char *format, va_list vargs) {
@@ -160,6 +222,14 @@ static inline PyObject *PyObject_Str(PyObject *object) {
     return PyPon_Capi()->object_->str(object);
 }
 
+
+static inline int PyObject_Print(PyObject *object, FILE *file, int flags) {
+    return PyPon_Capi()->object_->print(object, file, flags);
+}
+
+static inline PyObject *PyObject_Format(PyObject *object, PyObject *format_spec) {
+    return PyPon_Capi()->object_->format(object, format_spec);
+}
 static inline int PyObject_IsTrue(PyObject *object) {
     return PyPon_Capi()->object_->is_true(object);
 }
@@ -229,5 +299,60 @@ static inline PyObject *PyObject_Type(PyObject *object) {
 static inline PyObject *PyObject_SelfIter(PyObject *object) {
     return PyPon_Capi()->object_->self_iter(object);
 }
+
+static inline PyObject *PyObject_GenericGetAttr(PyObject *object, PyObject *name) {
+    return PyPon_Capi()->object_->generic_get_attr(object, name);
+}
+
+static inline int PyObject_GenericSetAttr(PyObject *object, PyObject *name, PyObject *value) {
+    return PyPon_Capi()->object_->generic_set_attr(object, name, value);
+}
+
+static inline PyObject *PyObject_GenericGetDict(PyObject *object, void *context) {
+    return PyPon_Capi()->object_->generic_get_dict(object, context);
+}
+
+static inline void PyObject_ClearWeakRefs(PyObject *object) {
+    PyPon_Capi()->object_->clear_weakrefs(object);
+}
+
+static inline PyObject *PySeqIter_New(PyObject *sequence) {
+    return PyPon_Capi()->object_->seq_iter_new(sequence);
+}
+
+static inline PyObject *PyMethod_New(PyObject *function, PyObject *self) {
+    return PyPon_Capi()->object_->method_new(function, self);
+}
+
+static inline int PyObject_GetBuffer(PyObject *object, Py_buffer *view, int flags) {
+    return PyPon_Capi()->object_->get_buffer(object, view, flags);
+}
+
+static inline int PyObject_CheckBuffer(PyObject *object) {
+    return PyPon_Capi()->object_->check_buffer(object);
+}
+
+static inline int PyBuffer_FillInfo(Py_buffer *view, PyObject *object, void *buf, Py_ssize_t len, int readonly, int flags) {
+    return PyPon_Capi()->object_->buffer_fill_info(view, object, buf, len, readonly, flags);
+}
+
+static inline int PyBuffer_IsContiguous(const Py_buffer *view, char order) {
+    return PyPon_Capi()->object_->buffer_is_contiguous(view, order);
+}
+
+static inline PyObject *PyMemoryView_FromObject(PyObject *object) {
+    return PyPon_Capi()->object_->memoryview_from_object(object);
+}
+
+static inline PyObject *PyMemoryView_FromBuffer(const Py_buffer *view) {
+    return PyPon_Capi()->object_->memoryview_from_buffer(view);
+}
+
+static inline int PyMemoryView_Check(PyObject *object) {
+    return Py_IS_TYPE(object, &PyMemoryView_Type);
+}
+
+#define PyMemoryView_GET_BUFFER(object) (PyPon_Capi()->object_->memoryview_get_buffer((PyObject *)(object)))
+#define PyMemoryView_GET_BASE(object) (PyPon_Capi()->object_->memoryview_get_base((PyObject *)(object)))
 
 #endif /* PON_CAPI_OBJECT_INLINE_H */

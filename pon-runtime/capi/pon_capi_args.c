@@ -1167,15 +1167,7 @@ void PyBuffer_Release(Py_buffer *view) {
     if (view == NULL) {
         return;
     }
-    view->buf = NULL;
-    view->obj = NULL;
-    view->len = 0;
-    view->itemsize = 0;
-    view->readonly = 0;
-    view->ndim = 0;
-    view->format = NULL;
-    view->shape = NULL;
-    view->strides = NULL;
-    view->suboffsets = NULL;
-    view->internal = NULL;
+    PyObject *obj = view->obj;
+    PyPon_Capi()->object_->release_buffer(view);
+    Py_XDECREF(obj);
 }

@@ -1,6 +1,8 @@
 #ifndef PON_CAPI_OBJECT_H
 #define PON_CAPI_OBJECT_H
 
+#include <stdio.h>
+
 /* Object family: attributes, generic calls, object protocol helpers, and
  * type/class predicates. */
 
@@ -36,6 +38,29 @@ typedef struct PyPonCapiObject {
     PyObject *(*self_iter)(PyObject *);
     int (*get_optional_attr)(PyObject *, PyObject *, PyObject **);
     int (*as_file_descriptor)(PyObject *);
+    PyObject *(*vectorcall)(PyObject *, PyObject *const *, size_t, PyObject *);
+    PyObject *(*vectorcall_dict)(PyObject *, PyObject *const *, size_t, PyObject *);
+    PyObject *(*vectorcall_call)(PyObject *, PyObject *, PyObject *);
+    void *(*vectorcall_function)(PyObject *);
+    int (*get_buffer)(PyObject *, Py_buffer *, int);
+    void (*release_buffer)(Py_buffer *);
+    int (*buffer_fill_info)(Py_buffer *, PyObject *, void *, Py_ssize_t, int, int);
+    int (*buffer_is_contiguous)(const Py_buffer *, char);
+    int (*check_buffer)(PyObject *);
+    PyObject *(*memoryview_from_object)(PyObject *);
+    PyObject *(*memoryview_from_buffer)(const Py_buffer *);
+    Py_buffer *(*memoryview_get_buffer)(PyObject *);
+    PyObject *(*memoryview_get_base)(PyObject *);
+    int (*type_check)(PyObject *);
+    int (*iter_check)(PyObject *);
+    PyObject *(*generic_get_attr)(PyObject *, PyObject *);
+    int (*generic_set_attr)(PyObject *, PyObject *, PyObject *);
+    PyObject *(*generic_get_dict)(PyObject *, void *);
+    int (*print)(PyObject *, FILE *, int);
+    PyObject *(*format)(PyObject *, PyObject *);
+    void (*clear_weakrefs)(PyObject *);
+    PyObject *(*seq_iter_new)(PyObject *);
+    PyObject *(*method_new)(PyObject *, PyObject *);
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiObject;
 
