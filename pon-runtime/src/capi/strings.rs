@@ -1,7 +1,7 @@
 //! Strings family: str/bytes/bytearray construction and extraction.
 
 use core::ffi::{c_char, c_int, c_void};
-use core::ptr;
+use core::{mem, ptr};
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::sync::{LazyLock, Mutex};
@@ -54,6 +54,15 @@ pub(crate) struct PyPonCapiStrings {
     unicode_read_char: unsafe extern "C" fn(*mut PyObject, PySsizeT) -> u32,
     unicode_is_ascii: unsafe extern "C" fn(*mut PyObject) -> c_int,
     unicode_as_latin1_string: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+    unicode_from_encoded_object: unsafe extern "C" fn(*mut PyObject, *const c_char, *const c_char) -> *mut PyObject,
+    unicode_from_kind_and_data: unsafe extern "C" fn(c_int, *const c_void, PySsizeT) -> *mut PyObject,
+    unicode_as_ucs4_copy: unsafe extern "C" fn(*mut PyObject) -> *mut u32,
+    unicode_as_encoded_string: unsafe extern "C" fn(*mut PyObject, *const c_char, *const c_char) -> *mut PyObject,
+    unicode_format: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+    unicode_replace: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject, PySsizeT) -> *mut PyObject,
+    unicode_tailmatch: unsafe extern "C" fn(*mut PyObject, *mut PyObject, PySsizeT, PySsizeT, c_int) -> PySsizeT,
+    unicode_contains: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> c_int,
+    long_from_unicode_object: unsafe extern "C" fn(*mut PyObject, c_int) -> *mut PyObject,
 }
 
 unsafe impl Send for PyPonCapiStrings {}
@@ -123,6 +132,15 @@ pub(crate) fn build() -> PyPonCapiStrings {
         unicode_read_char: capi_unicode_read_char,
         unicode_is_ascii: capi_unicode_is_ascii,
         unicode_as_latin1_string: capi_unicode_as_latin1_string,
+        unicode_from_encoded_object: capi_unicode_from_encoded_object,
+        unicode_from_kind_and_data: capi_unicode_from_kind_and_data,
+        unicode_as_ucs4_copy: capi_unicode_as_ucs4_copy,
+        unicode_as_encoded_string: capi_unicode_as_encoded_string,
+        unicode_format: capi_unicode_format,
+        unicode_replace: capi_unicode_replace,
+        unicode_tailmatch: capi_unicode_tailmatch,
+        unicode_contains: capi_unicode_contains,
+        long_from_unicode_object: capi_long_from_unicode_object,
     }
 }
 
@@ -236,6 +254,85 @@ unsafe extern "C" fn capi_unicode_decode_latin1(value: *const c_char, size: PySs
     unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }
 }
 
+unsafe extern "C" fn capi_unicode_from_encoded_object(
+    object: *mut PyObject,
+    encoding: *const c_char,
+    errors: *const c_char,
+) -> *mut PyObject {
+    if (unsafe { crate::types::type_::unicode_text(object) }).is_some() {
+        return raise_null(ExceptionKind::TypeError, "decoding str is not supported");
+    }
+    let bytes = match unsafe { encoded_object_bytes(object) } {
+        Ok(bytes) => bytes,
+        Err(BytesLikeError::Type(message)) => return raise_null(ExceptionKind::TypeError, &message),
+        Err(BytesLikeError::Value(message)) => return raise_null(ExceptionKind::ValueError, &message),
+    };
+    let encoding = match normalize_text_encoding(encoding) {
+        Ok(encoding) => encoding,
+        Err(message) => return raise_null(ExceptionKind::LookupError, &message),
+    };
+    unsafe { decode_bytes_with_encoding(bytes, encoding, errors) }
+}
+
+unsafe extern "C" fn capi_unicode_from_kind_and_data(kind: c_int, data: *const c_void, size: PySsizeT) -> *mut PyObject {
+    if size < 0 {
+        return raise_null(ExceptionKind::ValueError, "PyUnicode_FromKindAndData size must be non-negative");
+    }
+    let len = size as usize;
+    if data.is_null() && len != 0 {
+        return raise_null(ExceptionKind::SystemError, "PyUnicode_FromKindAndData received NULL data");
+    }
+
+    let mut text = String::with_capacity(len);
+    match kind {
+        1 => {
+            let units = if len == 0 { &[] } else { unsafe { core::slice::from_raw_parts(data.cast::<u8>(), len) } };
+            for &unit in units {
+                text.push(char::from(unit));
+            }
+        }
+        2 => {
+            let units = if len == 0 { &[] } else { unsafe { core::slice::from_raw_parts(data.cast::<u16>(), len) } };
+            for &unit in units {
+                if push_unicode_codepoint(&mut text, u32::from(unit)).is_err() {
+                    return raise_null(ExceptionKind::ValueError, "PyUnicode_FromKindAndData received an invalid code point");
+                }
+            }
+        }
+        4 => {
+            let units = if len == 0 { &[] } else { unsafe { core::slice::from_raw_parts(data.cast::<u32>(), len) } };
+            for &unit in units {
+                if push_unicode_codepoint(&mut text, unit).is_err() {
+                    return raise_null(ExceptionKind::ValueError, "PyUnicode_FromKindAndData received an invalid code point");
+                }
+            }
+        }
+        _ => return raise_null(ExceptionKind::SystemError, "PyUnicode_FromKindAndData received invalid kind"),
+    }
+    unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }
+}
+
+unsafe extern "C" fn capi_unicode_as_ucs4_copy(object: *mut PyObject) -> *mut u32 {
+    let Some(text) = (unsafe { crate::types::type_::unicode_text(object) }) else {
+        return raise_null(ExceptionKind::TypeError, "bad argument type for PyUnicode_AsUCS4Copy");
+    };
+    let Some(count_with_nul) = text.chars().count().checked_add(1) else {
+        return raise_null(ExceptionKind::MemoryError, "PyUnicode_AsUCS4Copy result is too large");
+    };
+    let Some(byte_len) = count_with_nul.checked_mul(mem::size_of::<u32>()) else {
+        return raise_null(ExceptionKind::MemoryError, "PyUnicode_AsUCS4Copy result is too large");
+    };
+    let out = unsafe { libc::malloc(byte_len) }.cast::<u32>();
+    if out.is_null() {
+        return raise_null(ExceptionKind::MemoryError, "PyUnicode_AsUCS4Copy allocation failed");
+    }
+    for (index, ch) in text.chars().enumerate() {
+        unsafe { *out.add(index) = ch as u32 };
+    }
+    unsafe { *out.add(count_with_nul - 1) = 0 };
+    out
+}
+
 unsafe extern "C" fn capi_unicode_as_utf8_string(object: *mut PyObject) -> *mut PyObject {
     let Some(text) = (unsafe { crate::types::type_::unicode_text(object) }) else {
         return raise_null(ExceptionKind::TypeError, "bad argument type for PyUnicode_AsUTF8String");
@@ -269,6 +366,22 @@ unsafe extern "C" fn capi_unicode_as_latin1_string(object: *mut PyObject) -> *mu
         bytes.push(code as u8);
     }
     unsafe { abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) }
+}
+
+unsafe extern "C" fn capi_unicode_as_encoded_string(
+    object: *mut PyObject,
+    encoding: *const c_char,
+    _errors: *const c_char,
+) -> *mut PyObject {
+    if (unsafe { crate::types::type_::unicode_text(object) }).is_none() {
+        return raise_null(ExceptionKind::TypeError, "bad argument type for built-in operation");
+    }
+    match normalize_text_encoding(encoding) {
+        Ok(TextEncoding::Utf8) => unsafe { capi_unicode_as_utf8_string(object) },
+        Ok(TextEncoding::Ascii) => unsafe { capi_unicode_as_ascii_string(object) },
+        Ok(TextEncoding::Latin1) => unsafe { capi_unicode_as_latin1_string(object) },
+        Err(message) => raise_null(ExceptionKind::LookupError, &message),
+    }
 }
 unsafe extern "C" fn capi_unicode_kind(object: *mut PyObject) -> c_int {
     let Some(text) = (unsafe { crate::types::type_::unicode_text(object) }) else {
@@ -373,6 +486,86 @@ unsafe extern "C" fn capi_unicode_concat(left: *mut PyObject, right: *mut PyObje
     out.push_str(left_text);
     out.push_str(right_text);
     unsafe { abi::pon_const_str(out.as_ptr(), out.len()) }
+}
+
+unsafe extern "C" fn capi_unicode_format(format: *mut PyObject, args: *mut PyObject) -> *mut PyObject {
+    unsafe { crate::abi::format::percent_format(format, args) }
+}
+
+unsafe extern "C" fn capi_unicode_replace(
+    object: *mut PyObject,
+    old: *mut PyObject,
+    new: *mut PyObject,
+    maxcount: PySsizeT,
+) -> *mut PyObject {
+    let Some(text) = (unsafe { crate::types::type_::unicode_text(object) }) else {
+        return raise_null(ExceptionKind::TypeError, "PyUnicode_Replace first argument must be str");
+    };
+    let Some(old_text) = (unsafe { crate::types::type_::unicode_text(old) }) else {
+        return raise_null(ExceptionKind::TypeError, "PyUnicode_Replace old argument must be str");
+    };
+    let Some(new_text) = (unsafe { crate::types::type_::unicode_text(new) }) else {
+        return raise_null(ExceptionKind::TypeError, "PyUnicode_Replace new argument must be str");
+    };
+    let out = if maxcount < 0 {
+        text.replace(old_text, new_text)
+    } else {
+        text.replacen(old_text, new_text, maxcount as usize)
+    };
+    unsafe { abi::pon_const_str(out.as_ptr(), out.len()) }
+}
+
+unsafe extern "C" fn capi_unicode_tailmatch(
+    object: *mut PyObject,
+    substr: *mut PyObject,
+    start: PySsizeT,
+    end: PySsizeT,
+    direction: c_int,
+) -> PySsizeT {
+    let Some(text) = (unsafe { crate::types::type_::unicode_text(object) }) else {
+        raise_null::<PyObject>(ExceptionKind::TypeError, "PyUnicode_Tailmatch first argument must be str");
+        return -1;
+    };
+    let Some(substr_text) = (unsafe { crate::types::type_::unicode_text(substr) }) else {
+        raise_null::<PyObject>(ExceptionKind::TypeError, "PyUnicode_Tailmatch substring argument must be str");
+        return -1;
+    };
+    let len = text.chars().count();
+    let (start, end) = clamp_unicode_indices(len, start, end);
+    if end < start {
+        return 0;
+    }
+    let haystack = unicode_char_slice(text, start, end);
+    if (direction <= 0 && haystack.starts_with(substr_text)) || (direction > 0 && haystack.ends_with(substr_text)) {
+        1
+    } else {
+        0
+    }
+}
+
+unsafe extern "C" fn capi_unicode_contains(container: *mut PyObject, element: *mut PyObject) -> c_int {
+    let Some(container_text) = (unsafe { crate::types::type_::unicode_text(container) }) else {
+        raise_null::<PyObject>(ExceptionKind::TypeError, "PyUnicode_Contains container must be str");
+        return -1;
+    };
+    let Some(element_text) = (unsafe { crate::types::type_::unicode_text(element) }) else {
+        raise_null::<PyObject>(ExceptionKind::TypeError, "PyUnicode_Contains element must be str");
+        return -1;
+    };
+    c_int::from(container_text.contains(element_text))
+}
+
+unsafe extern "C" fn capi_long_from_unicode_object(object: *mut PyObject, base: c_int) -> *mut PyObject {
+    if (unsafe { crate::types::type_::unicode_text(object) }).is_none() {
+        return raise_null(ExceptionKind::TypeError, "PyLong_FromUnicodeObject argument must be str");
+    }
+    // CPython 3.14 accepts underscores, surrounding whitespace, and base-0
+    // prefixes here exactly like int(str, base); reuse Pon's int constructor.
+    let base_object = crate::types::int::from_i64(i64::from(base));
+    if base_object.is_null() {
+        return ptr::null_mut();
+    }
+    crate::types::int::construct_from_args(&[object, base_object])
 }
 
 unsafe extern "C" fn capi_bytes_from_string_and_size(value: *const c_char, size: PySsizeT) -> *mut PyObject {
@@ -616,6 +809,120 @@ fn cache_unicode_data(object: *mut PyObject, text: &str) -> *const c_void {
         unicode_data_for_text(text)
     });
     entry.as_ptr()
+}
+
+#[derive(Clone, Copy)]
+enum TextEncoding {
+    Utf8,
+    Ascii,
+    Latin1,
+}
+
+fn normalize_text_encoding(encoding: *const c_char) -> Result<TextEncoding, String> {
+    if encoding.is_null() {
+        return Ok(TextEncoding::Utf8);
+    }
+    let Some(name) = c_string(encoding) else {
+        return Err("unknown encoding: <invalid utf-8>".to_owned());
+    };
+    let mut normalized = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        if byte != b'-' && byte != b'_' {
+            normalized.push(char::from(byte).to_ascii_lowercase());
+        }
+    }
+    match normalized.as_str() {
+        "utf8" => Ok(TextEncoding::Utf8),
+        "ascii" | "usascii" => Ok(TextEncoding::Ascii),
+        "latin1" | "iso88591" => Ok(TextEncoding::Latin1),
+        _ => Err(format!("unknown encoding: {name}")),
+    }
+}
+
+unsafe fn decode_bytes_with_encoding(bytes: &[u8], encoding: TextEncoding, errors: *const c_char) -> *mut PyObject {
+    let data = if bytes.is_empty() { ptr::null() } else { bytes.as_ptr().cast::<c_char>() };
+    match encoding {
+        TextEncoding::Utf8 => unsafe { capi_unicode_decode_utf8(data, bytes.len() as PySsizeT, errors) },
+        TextEncoding::Ascii => unsafe { capi_unicode_decode_ascii(data, bytes.len() as PySsizeT, errors) },
+        TextEncoding::Latin1 => unsafe { capi_unicode_decode_latin1(data, bytes.len() as PySsizeT, errors) },
+    }
+}
+
+enum BytesLikeError {
+    Type(String),
+    Value(String),
+}
+
+unsafe fn encoded_object_bytes<'a>(object: *mut PyObject) -> Result<&'a [u8], BytesLikeError> {
+    if let Some(bytes) = unsafe { bytes_payload_slice(object) } {
+        return Ok(bytes);
+    }
+
+    let normalized = unsafe { crate::types::type_::payload_subclass_value(object) }.unwrap_or(object);
+    if let Some(bytearray) = unsafe { bytearray_ref(normalized) } {
+        return Ok(bytearray.as_slice());
+    }
+    if !normalized.is_null() && crate::tag::is_heap(normalized) {
+        let ty = unsafe { (*normalized).ob_type };
+        if crate::types::memoryview::is_memoryview_type(ty) {
+            let view = unsafe { &*normalized.cast::<crate::types::memoryview::PyMemoryView>() };
+            if view.released {
+                return Err(BytesLikeError::Value(crate::types::memoryview::RELEASED_ERROR.to_owned()));
+            }
+            return Ok(unsafe { view.as_slice() });
+        }
+    }
+
+    Err(BytesLikeError::Type(format!(
+        "decoding to str: need a bytes-like object, {} found",
+        object_type_name(object)
+    )))
+}
+
+fn object_type_name(object: *mut PyObject) -> &'static str {
+    if object.is_null() {
+        return "NULL";
+    }
+    if crate::tag::is_small_int(object) {
+        return "int";
+    }
+    if !crate::tag::is_heap(object) {
+        return "object";
+    }
+    unsafe { crate::types::dict::type_name(object) }.unwrap_or("object")
+}
+
+fn push_unicode_codepoint(text: &mut String, code: u32) -> Result<(), ()> {
+    let Some(ch) = char::from_u32(code) else {
+        return Err(());
+    };
+    text.push(ch);
+    Ok(())
+}
+
+fn clamp_unicode_indices(len: usize, start: PySsizeT, end: PySsizeT) -> (usize, usize) {
+    fn clamp_one(index: PySsizeT, len: PySsizeT) -> usize {
+        let adjusted = if index < 0 { index.saturating_add(len) } else { index };
+        adjusted.clamp(0, len) as usize
+    }
+    let len = len.min(PySsizeT::MAX as usize) as PySsizeT;
+    (clamp_one(start, len), clamp_one(end, len))
+}
+
+fn byte_index_for_char(text: &str, index: usize) -> usize {
+    if index == 0 {
+        return 0;
+    }
+    match text.char_indices().nth(index) {
+        Some((byte, _)) => byte,
+        None => text.len(),
+    }
+}
+
+fn unicode_char_slice(text: &str, start: usize, end: usize) -> &str {
+    let start_byte = byte_index_for_char(text, start);
+    let end_byte = byte_index_for_char(text, end);
+    &text[start_byte..end_byte]
 }
 
 
@@ -994,6 +1301,15 @@ static int bytes_equal(PyObject *object, const char *expected, Py_ssize_t expect
     return size == expected_size && memcmp(buffer, expected, (size_t)expected_size) == 0;
 }
 
+static int text_equal(PyObject *object, const char *expected, Py_ssize_t expected_size) {
+    Py_ssize_t size = 0;
+    const char *text = PyUnicode_AsUTF8AndSize(object, &size);
+    if (text == NULL) {
+        return 0;
+    }
+    return size == expected_size && memcmp(text, expected, (size_t)expected_size) == 0;
+}
+
 static PyObject *format_v_helper(const char *format, ...) {
     va_list vargs;
     va_start(vargs, format);
@@ -1089,6 +1405,86 @@ static PyObject *probe(PyObject *self, PyObject *args) {
         ok |= 1L << 13;
     }
 
+
+    PyObject *encoded_bytes = PyBytes_FromStringAndSize(latin1_bytes, 1);
+    PyObject *decoded_latin = PyUnicode_FromEncodedObject(encoded_bytes, "latin-1", NULL);
+    PyObject *encoded_bytearray = PyByteArray_FromStringAndSize("BA", 2);
+    PyObject *decoded_bytearray = PyUnicode_FromEncodedObject(encoded_bytearray, "ASCII", "strict");
+    PyObject *memoryview_source = PyBytes_FromStringAndSize("mv", 2);
+    PyObject *memoryview = PyMemoryView_FromObject(memoryview_source);
+    PyObject *decoded_memoryview = PyUnicode_FromEncodedObject(memoryview, "utf_8", NULL);
+    if (text_equal(decoded_latin, "\xC3\xA9", 2) &&
+            text_equal(decoded_bytearray, "BA", 2) &&
+            text_equal(decoded_memoryview, "mv", 2)) {
+        ok |= 1L << 14;
+    }
+
+    PyObject *from_unknown = PyUnicode_FromEncodedObject(encoded_bytes, "unknown-codec", NULL);
+    if (from_unknown == NULL && PyErr_ExceptionMatches(PyExc_LookupError)) {
+        ok |= 1L << 15;
+    }
+    PyErr_Clear();
+
+    Py_UCS1 kind1_data[] = {'A', 0xE9};
+    Py_UCS2 kind2_data[] = {0x20AC};
+    Py_UCS4 kind4_data[] = {0x1D11E};
+    PyObject *kind1 = PyUnicode_FromKindAndData(PyUnicode_1BYTE_KIND, kind1_data, 2);
+    PyObject *kind2 = PyUnicode_FromKindAndData(PyUnicode_2BYTE_KIND, kind2_data, 1);
+    PyObject *kind4 = PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, kind4_data, 1);
+    if (text_equal(kind1, "A\xC3\xA9", 3) &&
+            kind2 != NULL && PyUnicode_READ_CHAR(kind2, 0) == 0x20AC &&
+            kind4 != NULL && PyUnicode_READ_CHAR(kind4, 0) == 0x1D11E) {
+        ok |= 1L << 16;
+    }
+
+    Py_UCS4 *ucs4_copy = PyUnicode_AsUCS4Copy(astral);
+    if (ucs4_copy != NULL && ucs4_copy[0] == 'a' && ucs4_copy[1] == 0x1D11E && ucs4_copy[2] == 0) {
+        ok |= 1L << 17;
+    }
+    PyMem_Free(ucs4_copy);
+
+    PyObject *encoded_utf8 = PyUnicode_AsEncodedString(latin1, "UTF_8", NULL);
+    PyObject *encoded_ascii = PyUnicode_AsEncodedString(ascii, "ASCII", NULL);
+    PyObject *encoded_latin1 = PyUnicode_AsEncodedString(latin1, "latin-1", NULL);
+    if (bytes_equal(encoded_utf8, "\xC3\xA9", 2) &&
+            bytes_equal(encoded_ascii, "abc", 3) &&
+            bytes_equal(encoded_latin1, "\xE9", 1)) {
+        ok |= 1L << 18;
+    }
+    PyObject *encoded_unknown = PyUnicode_AsEncodedString(ascii, "unknown-codec", NULL);
+    if (encoded_unknown == NULL && PyErr_ExceptionMatches(PyExc_LookupError)) {
+        ok |= 1L << 19;
+    }
+    PyErr_Clear();
+
+    PyObject *format = PyUnicode_FromString("%s:%d");
+    PyObject *format_args = PyTuple_Pack(2, PyUnicode_FromString("v"), PyLong_FromLong(7));
+    PyObject *format_result = PyUnicode_Format(format, format_args);
+    if (text_equal(format_result, "v:7", 3)) {
+        ok |= 1L << 20;
+    }
+
+    PyObject *replace_result = PyUnicode_Replace(
+            PyUnicode_FromString("banana"), PyUnicode_FromString("na"), PyUnicode_FromString("NA"), 1);
+    if (text_equal(replace_result, "baNAna", 6)) {
+        ok |= 1L << 21;
+    }
+
+    if (PyUnicode_Tailmatch(ascii, PyUnicode_FromString("b"), -3, -1, 1) == 1) {
+        ok |= 1L << 22;
+    }
+
+    if (PyUnicode_Contains(ascii, PyUnicode_FromString("b")) == 1) {
+        ok |= 1L << 23;
+    }
+
+    PyObject *base0 = PyLong_FromUnicodeObject(PyUnicode_FromString("  0x1_0  "), 0);
+    long base0_value = PyLong_AsLong(base0);
+    if (base0_value == 16 && PyErr_Occurred() == NULL) {
+        ok |= 1L << 24;
+    } else {
+        PyErr_Clear();
+    }
     if (PyErr_Occurred() != NULL) {
         PyErr_Clear();
     }
@@ -1125,6 +1521,6 @@ PyMODINIT_FUNC PyInit_capi_strings_gap_ext(void) {
             "probe() returned NULL: {:?}",
             pon_err_message()
         );
-        assert_eq!(format_object_for_print(result).as_deref(), Ok("16383"));
+        assert_eq!(format_object_for_print(result).as_deref(), Ok("33554431"));
     }
 }

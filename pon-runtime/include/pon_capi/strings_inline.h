@@ -44,6 +44,10 @@ static inline PyObject *PyUnicode_DecodeLatin1(const char *value, Py_ssize_t siz
     return PyPon_Capi()->strings->unicode_decode_latin1(value, size, errors);
 }
 
+static inline PyObject *PyUnicode_FromEncodedObject(PyObject *object, const char *encoding, const char *errors) {
+    return PyPon_Capi()->strings->unicode_from_encoded_object(object, encoding, errors);
+}
+
 static inline PyObject *PyUnicode_AsUTF8String(PyObject *object) {
     return PyPon_Capi()->strings->unicode_as_utf8_string(object);
 }
@@ -54,6 +58,10 @@ static inline PyObject *PyUnicode_AsASCIIString(PyObject *object) {
 
 static inline PyObject *PyUnicode_AsLatin1String(PyObject *object) {
     return PyPon_Capi()->strings->unicode_as_latin1_string(object);
+}
+
+static inline PyObject *PyUnicode_AsEncodedString(PyObject *object, const char *encoding, const char *errors) {
+    return PyPon_Capi()->strings->unicode_as_encoded_string(object, encoding, errors);
 }
 
 static inline PyObject *PyUnicode_InternFromString(const char *value) {
@@ -72,6 +80,22 @@ static inline PyObject *PyUnicode_Concat(PyObject *left, PyObject *right) {
     return PyPon_Capi()->strings->unicode_concat(left, right);
 }
 
+static inline PyObject *PyUnicode_Format(PyObject *format, PyObject *args) {
+    return PyPon_Capi()->strings->unicode_format(format, args);
+}
+
+static inline PyObject *PyUnicode_Replace(PyObject *object, PyObject *old, PyObject *replacement, Py_ssize_t maxcount) {
+    return PyPon_Capi()->strings->unicode_replace(object, old, replacement, maxcount);
+}
+
+static inline Py_ssize_t PyUnicode_Tailmatch(PyObject *object, PyObject *substr, Py_ssize_t start, Py_ssize_t end, int direction) {
+    return PyPon_Capi()->strings->unicode_tailmatch(object, substr, start, end, direction);
+}
+
+static inline int PyUnicode_Contains(PyObject *container, PyObject *element) {
+    return PyPon_Capi()->strings->unicode_contains(container, element);
+}
+
 static inline int PyUnicode_Check(PyObject *object) {
     return PyPon_Capi()->strings->unicode_check(object);
 }
@@ -87,6 +111,14 @@ static inline int PyUnicode_CheckExact(PyObject *object) {
 #define PyUnicode_1BYTE_KIND 1
 #define PyUnicode_2BYTE_KIND 2
 #define PyUnicode_4BYTE_KIND 4
+
+static inline PyObject *PyUnicode_FromKindAndData(int kind, const void *data, Py_ssize_t size) {
+    return PyPon_Capi()->strings->unicode_from_kind_and_data(kind, data, size);
+}
+
+static inline Py_UCS4 *PyUnicode_AsUCS4Copy(PyObject *object) {
+    return PyPon_Capi()->strings->unicode_as_ucs4_copy(object);
+}
 
 static inline Py_ssize_t PyUnicode_GET_LENGTH(PyObject *object) {
     return PyUnicode_GetLength(object);
@@ -136,6 +168,10 @@ static inline Py_UCS4 PyUnicode_READ(int kind, const void *data, Py_ssize_t inde
 
 static inline int PyUnicode_IS_ASCII(PyObject *object) {
     return PyPon_Capi()->strings->unicode_is_ascii(object);
+}
+
+static inline PyObject *PyLong_FromUnicodeObject(PyObject *object, int base) {
+    return PyPon_Capi()->strings->long_from_unicode_object(object, base);
 }
 
 /* ---- bytes ---- */
