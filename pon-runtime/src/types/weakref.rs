@@ -722,6 +722,12 @@ mod tests {
             assert_eq!((*object.cast::<PyHeapInstance>()).weakrefs, weakref);
             assert_eq!(pon_call(weakref, ptr::null_mut(), 0), object);
 
+            // Age gate: garbage born this epoch is only finalized on the
+            // collect after next — the first collect just ages it.
+            collect().expect("aging collection should complete");
+            assert_eq!(DEL_CALLS.load(Ordering::SeqCst), 0);
+            assert_eq!(WEAKREF_CALLBACKS.load(Ordering::SeqCst), 0);
+
             collect().expect("collection should complete");
             assert_eq!(DEL_CALLS.load(Ordering::SeqCst), 1);
             assert_eq!(WEAKREF_CALLBACKS.load(Ordering::SeqCst), 1);

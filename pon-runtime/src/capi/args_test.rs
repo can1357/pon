@@ -232,3 +232,478 @@ PyMODINIT_FUNC PyInit_capi_args_ext(void) {
         "PyArg_ParseTuple arity TypeError must match python3.14 getargs.c"
     );
 }
+
+#[test]
+fn c_api_new_refs_survive_collect_and_decref_unpins() {
+    let _guard = test_state_lock();
+    let _reset = ResetImportStateOnDrop;
+    unsafe {
+        assert_eq!(pon_runtime_init(), 0);
+    }
+    pon_err_clear();
+    reset_import_state_for_tests();
+
+    let temp = TempExtensionRoot::new();
+    let module_path = compile_extension(
+        &temp,
+        "capi_refpin_ext",
+        r#"
+#include <Python.h>
+
+#define BIT(n) (1L << (n))
+
+static PyObject *exercise(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    long ok = 0;
+    const long expected = (long)(1ULL << 62);
+    PyObject *value = PyLong_FromLong(expected);
+    if (value == NULL) {
+        return NULL;
+    }
+
+    Py_ssize_t pinned = _PyPon_TestCollectPinCount(value);
+    if (pinned == 1) {
+        ok |= BIT(0);
+    } else if (pinned < 0) {
+        PyErr_Clear();
+    }
+
+    long observed = PyLong_AsLong(value);
+    if ((observed != -1 || PyErr_Occurred() == NULL) && observed == expected) {
+        ok |= BIT(1);
+    } else if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+
+    Py_DECREF(value);
+    Py_ssize_t after_decref = _PyPon_TestCollectPinCount(value);
+    if (after_decref == 0) {
+        ok |= BIT(2);
+    } else if (after_decref < 0) {
+        PyErr_Clear();
+    }
+
+    return PyLong_FromLong(ok);
+}
+
+static PyMethodDef methods[] = {
+    {"exercise", exercise, METH_NOARGS, "exercise C-API new-reference pins"},
+    {NULL, NULL, 0, NULL}
+};
+
+static struct PyModuleDef module = {
+    PyModuleDef_HEAD_INIT,
+    "capi_refpin_ext",
+    "Pon C-API new-reference pin test extension",
+    -1,
+    methods
+};
+
+PyMODINIT_FUNC PyInit_capi_refpin_ext(void) {
+    return PyModule_Create(&module);
+}
+"#,
+    );
+
+    let module = load_extension_module("capi_refpin_ext", &module_path)
+        .unwrap_or_else(|message| panic!("failed to load refpin C extension: {message}"));
+    assert!(!module.is_null(), "extension loader returned NULL module");
+    let module_name = intern("capi_refpin_ext");
+    let function = module_attr(module_name, intern("exercise")).expect("exercise registered");
+    let result = unsafe { pon_call(function, ptr::null_mut(), 0) };
+    assert!(
+        !result.is_null(),
+        "exercise() returned NULL: {:?}",
+        pon_err_message()
+    );
+    assert_eq!(format_object_for_print(result).as_deref(), Ok("7"));
+}
+
+#[test]
+fn gc_tracked_c_type_traverse_roots_payload() {
+    let _guard = test_state_lock();
+    let _reset = ResetImportStateOnDrop;
+    unsafe {
+        assert_eq!(pon_runtime_init(), 0);
+    }
+    pon_err_clear();
+    reset_import_state_for_tests();
+
+    let temp = TempExtensionRoot::new();
+    let module_path = compile_extension(
+        &temp,
+        "capi_gc_traverse_ext",
+        r#"
+#include <Python.h>
+#include <structmember.h>
+
+#define BIT(n) (1L << (n))
+
+typedef struct {
+    PyObject_HEAD
+    PyObject *payload;
+    PyObject *type_payload;
+} CounterObject;
+
+static long traverse_count = 0;
+
+static int Counter_traverse(CounterObject *self, visitproc visit, void *arg) {
+    traverse_count += 1;
+    Py_VISIT(self->payload);
+    Py_VISIT(self->type_payload);
+    return 0;
+}
+
+static void Counter_dealloc(CounterObject *self) {
+    PyObject_GC_UnTrack(self);
+    Py_CLEAR(self->payload);
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+static PyMemberDef Counter_members[] = {
+    {"type_payload", T_OBJECT, offsetof(CounterObject, type_payload), READONLY, "foreign type face payload"},
+    {NULL, 0, 0, 0, NULL}
+};
+
+static PyTypeObject CounterType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "capi_gc_traverse_ext.Counter",
+    .tp_basicsize = sizeof(CounterObject),
+    .tp_dealloc = (destructor)Counter_dealloc,
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
+    .tp_traverse = (traverseproc)Counter_traverse,
+    .tp_members = Counter_members,
+    .tp_new = PyType_GenericNew,
+};
+
+static PyObject *drive(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    long ok = 0;
+    const long expected = 4611686018427387904L;
+
+    if (PyType_Ready(&CounterType) == 0) {
+        ok |= BIT(0);
+    } else if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+
+    PyObject *obj = PyObject_CallNoArgs((PyObject *)&CounterType);
+    if (obj == NULL) {
+        return NULL;
+    }
+    ok |= BIT(1);
+    PyObject_GC_Track(obj);
+
+    PyObject *payload = PyLong_FromLong(expected);
+    if (payload == NULL) {
+        Py_DECREF(obj);
+        return NULL;
+    }
+    ((CounterObject *)obj)->payload = payload;
+    ((CounterObject *)obj)->type_payload = (PyObject *)&CounterType;
+    PyObject *type_payload = PyObject_GetAttrString(obj, "type_payload");
+    if (type_payload == (PyObject *)&CounterType) {
+        ok |= BIT(8);
+    }
+    Py_XDECREF(type_payload);
+    if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+    Py_DECREF(payload);
+
+    long before = traverse_count;
+    Py_ssize_t first_pin_count = _PyPon_TestCollectPinCount(payload);
+    if (first_pin_count == 0) {
+        ok |= BIT(2);
+    } else if (first_pin_count < 0 && PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+    Py_ssize_t second_pin_count = _PyPon_TestCollectPinCount(payload);
+    if (second_pin_count == 0) {
+        ok |= BIT(3);
+    } else if (second_pin_count < 0 && PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+    if (traverse_count >= before + 2) {
+        ok |= BIT(4);
+    }
+
+    PyObject *survivor = ((CounterObject *)obj)->payload;
+    long observed = PyLong_AsLong(survivor);
+    if ((observed != -1 || PyErr_Occurred() == NULL) && observed == expected) {
+        ok |= BIT(5);
+    } else if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+
+    PyObject_GC_UnTrack(obj);
+    PyObject_GC_Track(obj);
+    Py_DECREF(obj);
+    Py_ssize_t collect_a = _PyPon_TestCollectPinCount(NULL);
+    Py_ssize_t collect_b = _PyPon_TestCollectPinCount(NULL);
+    Py_ssize_t collect_c = _PyPon_TestCollectPinCount(NULL);
+    if (collect_a >= 0 && collect_b >= 0 && collect_c >= 0) {
+        ok |= BIT(6);
+    } else if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+    if (CounterType.tp_flags & Py_TPFLAGS_HAVE_GC) {
+        ok |= BIT(7);
+    }
+
+    return PyLong_FromLong(ok);
+}
+
+static PyMethodDef methods[] = {
+    {"drive", drive, METH_NOARGS, "exercise GC-tracked C type traversal"},
+    {NULL, NULL, 0, NULL}
+};
+
+static struct PyModuleDef module = {
+    PyModuleDef_HEAD_INIT,
+    "capi_gc_traverse_ext",
+    "Pon C-API GC traversal bridge test extension",
+    -1,
+    methods
+};
+
+PyMODINIT_FUNC PyInit_capi_gc_traverse_ext(void) {
+    if (PyType_Ready(&CounterType) < 0) {
+        return NULL;
+    }
+    PyObject *m = PyModule_Create(&module);
+    if (m == NULL) {
+        return NULL;
+    }
+    Py_INCREF(&CounterType);
+    if (PyModule_AddObject(m, "Counter", (PyObject *)&CounterType) < 0) {
+        Py_DECREF(&CounterType);
+        Py_DECREF(m);
+        return NULL;
+    }
+    return m;
+}
+"#,
+    );
+
+    let module = load_extension_module("capi_gc_traverse_ext", &module_path)
+        .unwrap_or_else(|message| panic!("failed to load GC traversal C extension: {message}"));
+    assert!(!module.is_null(), "extension loader returned NULL module");
+    let module_name = intern("capi_gc_traverse_ext");
+    let function = module_attr(module_name, intern("drive")).expect("drive registered");
+    let result = unsafe { pon_call(function, ptr::null_mut(), 0) };
+    assert!(
+        !result.is_null(),
+        "drive() returned NULL: {:?}",
+        pon_err_message()
+    );
+    assert_eq!(format_object_for_print(result).as_deref(), Ok("511"));
+}
+
+#[test]
+fn c_api_str_subclass_layout_trailing_fields_survive_unicode_probes() {
+    let _guard = test_state_lock();
+    let _reset = ResetImportStateOnDrop;
+    unsafe {
+        assert_eq!(pon_runtime_init(), 0);
+    }
+    pon_err_clear();
+    reset_import_state_for_tests();
+
+    let temp = TempExtensionRoot::new();
+    let module_path = compile_extension(
+        &temp,
+        "capi_str_subclass_layout_ext",
+        r#"
+#include <Python.h>
+#include <string.h>
+
+#define BIT(n) (1L << (n))
+
+typedef struct {
+    PyUnicodeObject base;
+    long tag;
+} StrSub;
+
+static PyObject *StrSub_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
+    (void)args;
+    (void)kwds;
+    PyObject *obj = type->tp_alloc(type, 0);
+    if (obj != NULL) {
+        ((StrSub *)obj)->tag = 0;
+    }
+    return obj;
+}
+
+static void StrSub_dealloc(StrSub *self) {
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+
+static PyTypeObject StrSubType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "capi_str_subclass_layout_ext.StrSub",
+    .tp_basicsize = sizeof(StrSub),
+    .tp_dealloc = (destructor)StrSub_dealloc,
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_base = &PyUnicode_Type,
+    .tp_new = StrSub_new,
+};
+
+static int clear_loud_type_error(void) {
+    if (PyErr_ExceptionMatches(PyExc_TypeError)) {
+        PyErr_Clear();
+        return 1;
+    }
+    if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+    return 0;
+}
+
+static int sane_unicode_text(PyObject *value) {
+    Py_ssize_t length = PyUnicode_GetLength(value);
+    if (length < 0) {
+        if (PyErr_Occurred() != NULL) {
+            PyErr_Clear();
+        }
+        return 0;
+    }
+    Py_ssize_t utf8_size = 0;
+    const char *text = PyUnicode_AsUTF8AndSize(value, &utf8_size);
+    if (text == NULL) {
+        if (PyErr_Occurred() != NULL) {
+            PyErr_Clear();
+        }
+        return 0;
+    }
+    return utf8_size >= 0 && utf8_size < 256;
+}
+
+static int str_probe_is_sane_or_loud(PyObject *obj) {
+    PyObject *text = PyObject_Str(obj);
+    if (text == NULL) {
+        return clear_loud_type_error();
+    }
+    int ok = sane_unicode_text(text);
+    Py_DECREF(text);
+    return ok;
+}
+
+static int unicode_probe_is_sane_or_loud(PyObject *obj) {
+    Py_ssize_t length = PyUnicode_GetLength(obj);
+    if (length < 0) {
+        if (!clear_loud_type_error()) {
+            return 0;
+        }
+    } else if (length >= 256) {
+        return 0;
+    }
+
+    Py_ssize_t utf8_size = 0;
+    const char *text = PyUnicode_AsUTF8AndSize(obj, &utf8_size);
+    if (text == NULL) {
+        return clear_loud_type_error();
+    }
+    return utf8_size >= 0 && utf8_size < 256;
+}
+
+static PyObject *drive(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    long ok = 0;
+    const long expected = 0x1234567L;
+
+    if (PyType_Ready(&StrSubType) == 0) {
+        ok |= BIT(0);
+    } else if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+
+    PyObject *before = PyUnicode_FromString("before-neighbor");
+    if (before == NULL) {
+        return NULL;
+    }
+
+    PyObject *obj = PyObject_CallNoArgs((PyObject *)&StrSubType);
+    if (obj == NULL) {
+        Py_DECREF(before);
+        if (PyErr_Occurred() != NULL) {
+            PyErr_Clear();
+        }
+        return PyLong_FromLong(ok);
+    }
+    ok |= BIT(1);
+
+    ((StrSub *)obj)->tag = expected;
+    if (((StrSub *)obj)->tag == expected) {
+        ok |= BIT(2);
+    }
+
+    PyObject *after = PyUnicode_FromString("after-neighbor");
+    if (after == NULL) {
+        Py_DECREF(obj);
+        Py_DECREF(before);
+        return NULL;
+    }
+
+    Py_ssize_t collect_a = _PyPon_TestCollectPinCount(NULL);
+    Py_ssize_t collect_b = _PyPon_TestCollectPinCount(NULL);
+    Py_ssize_t collect_c = _PyPon_TestCollectPinCount(NULL);
+    const char *before_text = PyUnicode_AsUTF8(before);
+    const char *after_text = PyUnicode_AsUTF8(after);
+    if (collect_a >= 0 && collect_b >= 0 && collect_c >= 0
+            && ((StrSub *)obj)->tag == expected
+            && before_text != NULL && strcmp(before_text, "before-neighbor") == 0
+            && after_text != NULL && strcmp(after_text, "after-neighbor") == 0) {
+        ok |= BIT(3);
+    } else if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+
+    if (str_probe_is_sane_or_loud(obj)) {
+        ok |= BIT(4);
+    }
+    if (unicode_probe_is_sane_or_loud(obj)) {
+        ok |= BIT(5);
+    }
+
+    Py_DECREF(after);
+    Py_DECREF(obj);
+    Py_DECREF(before);
+    return PyLong_FromLong(ok);
+}
+
+static PyMethodDef methods[] = {
+    {"drive", drive, METH_NOARGS, "exercise str-subclass layout with trailing C fields"},
+    {NULL, NULL, 0, NULL}
+};
+
+static struct PyModuleDef module = {
+    PyModuleDef_HEAD_INIT,
+    "capi_str_subclass_layout_ext",
+    "Pon C-API str-subclass layout regression extension",
+    -1,
+    methods
+};
+
+PyMODINIT_FUNC PyInit_capi_str_subclass_layout_ext(void) {
+    return PyModule_Create(&module);
+}
+"#,
+    );
+
+    let module = load_extension_module("capi_str_subclass_layout_ext", &module_path)
+        .unwrap_or_else(|message| panic!("failed to load str-subclass layout C extension: {message}"));
+    assert!(!module.is_null(), "extension loader returned NULL module");
+    let module_name = intern("capi_str_subclass_layout_ext");
+    let function = module_attr(module_name, intern("drive")).expect("drive registered");
+    let result = unsafe { pon_call(function, ptr::null_mut(), 0) };
+    assert!(
+        !result.is_null(),
+        "drive() returned NULL: {:?}",
+        pon_err_message()
+    );
+    assert_eq!(format_object_for_print(result).as_deref(), Ok("63"));
+}

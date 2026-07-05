@@ -1553,6 +1553,18 @@ mod tests {
         let _object = heap.alloc(16, TYPE_ID);
 
         heap.collect(&mut Roots(Vec::new()));
+        assert_eq!(
+            FINALIZED.load(Ordering::SeqCst),
+            0,
+            "young garbage is age-gated for one cycle"
+        );
+        assert_eq!(
+            heap.lock_state().allocations.len(),
+            1,
+            "young garbage survives its birth epoch"
+        );
+
+        heap.collect(&mut Roots(Vec::new()));
         assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
         assert_eq!(
             heap.lock_state().allocations.len(),
@@ -1582,6 +1594,19 @@ mod tests {
         let heap = Heap::new();
         heap.register_type(TYPE_ID, type_info(16, Some(finalize)));
         let _object = heap.alloc(16, TYPE_ID);
+
+        heap.collect(&mut Roots(Vec::new()));
+        assert_eq!(
+            FINALIZED.load(Ordering::SeqCst),
+            0,
+            "young garbage is age-gated for one cycle"
+        );
+        assert_eq!(
+            RESURRECTED.load(Ordering::SeqCst),
+            0,
+            "finalizer has not run during the birth epoch"
+        );
+        assert_eq!(heap.lock_state().allocations.len(), 1);
 
         heap.collect(&mut Roots(Vec::new()));
         assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
@@ -1641,7 +1666,13 @@ mod tests {
         unsafe { (*parent.cast::<Node>()).next = child };
 
         heap.collect(&mut Roots(Vec::new()));
+        assert_eq!(
+            OBSERVED.load(Ordering::SeqCst),
+            0,
+            "young garbage is not finalized during its birth epoch"
+        );
 
+        heap.collect(&mut Roots(Vec::new()));
         assert_eq!(OBSERVED.load(Ordering::SeqCst), 0xC0FFEE, "child memory was valid during finalize");
     }
 
@@ -1659,7 +1690,13 @@ mod tests {
         let object = heap.alloc(32, TYPE_ID);
 
         heap.collect(&mut Roots(vec![tagged_small_int(0), tagged_small_int(-1), 0x2 as *mut u8]));
+        assert_eq!(
+            FINALIZED.load(Ordering::SeqCst),
+            0,
+            "tagged non-heap roots must not retain young garbage before the age gate opens"
+        );
 
+        heap.collect(&mut Roots(vec![tagged_small_int(0), tagged_small_int(-1), 0x2 as *mut u8]));
         assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
 
         let heap = Heap::new();
