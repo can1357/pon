@@ -271,7 +271,12 @@ fn load_source_module(request: SourceModuleRequest<'_>) -> std::result::Result<*
     let mut engine = JitEngine::new();
     engine
         .run(&module)
-        .map_err(|error| format!("failed to execute source module '{}': {error}", request.name))?;
+        .map_err(|error| {
+            let where_ = pon_runtime::pending_traceback_lines()
+                .map(|lines| format!(" [{lines}]"))
+                .unwrap_or_default();
+            format!("failed to execute source module '{}': {error}{where_}", request.name)
+        })?;
     std::mem::forget(engine);
     cached_module(intern(request.name)).ok_or_else(|| format!("source module '{}' was not cached", request.name))
 }

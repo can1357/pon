@@ -10,9 +10,10 @@ pub use builtins::pon_load_builtin;
 pub mod call;
 pub mod exc;
 pub use exc::{
-    pon_exc_fetch, pon_exc_group_split, pon_exc_matches, pon_exc_restore, pon_raise, pon_raise_attribute_error,
-    pon_raise_index_error, pon_raise_key_error, pon_raise_stop_iteration, pon_raise_type_error, pon_raise_value_error,
-    pon_reraise, raise_import_error_text, raise_system_exit, take_pending_system_exit,
+    pending_traceback_lines, pon_exc_fetch, pon_exc_group_split, pon_exc_matches, pon_exc_restore, pon_raise,
+    pon_raise_attribute_error, pon_raise_index_error, pon_raise_key_error, pon_raise_stop_iteration,
+    pon_raise_type_error, pon_raise_value_error, pon_reraise, raise_import_error_text, raise_system_exit,
+    take_pending_system_exit,
 };
 pub mod format;
 pub mod r#gen;

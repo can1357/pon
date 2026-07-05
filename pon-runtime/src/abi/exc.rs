@@ -79,6 +79,27 @@ pub(crate) fn pending_exception_object() -> Option<*mut PyObject> {
     }
 }
 
+/// Line numbers of the pending exception's traceback chain, outermost first
+/// (`"lines 12 -> 88 -> 1043"`); `None` without a pending boxed exception or
+/// traceback. Import-machinery error strings append this so module-exec
+/// failures stay locatable (pon frames carry no file names).
+pub fn pending_traceback_lines() -> Option<String> {
+    let exception = pending_exception_object()?;
+    // SAFETY: pending exceptions are live boxed base-exception instances.
+    let mut tb = unsafe { (*exception.cast::<PyBaseException>()).traceback };
+    let mut lines = Vec::new();
+    while !tb.is_null() && lines.len() < 64 {
+        // SAFETY: traceback chain entries are live boxed PyTraceback values.
+        let entry = unsafe { &*tb.cast::<crate::traceback::PyTraceback>() };
+        lines.push(entry.lineno.to_string());
+        tb = entry.tb_next;
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!("lines {}", lines.join(" -> ")))
+}
+
 /// Returns true when the pending exception is an instance of the named
 /// builtin exception type (raw MRO walk, matching except-clause semantics).
 pub(crate) fn pending_exception_is(name: &str) -> bool {
