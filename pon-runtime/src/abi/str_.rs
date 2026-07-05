@@ -369,11 +369,22 @@ unsafe extern "C" fn bytes_dunder_contains_entry(argv: *mut *mut PyObject, argc:
 /// (`crate::gcroot`).  The bytes/bytearray iterators above hold only leaked
 /// non-GC receivers and are never registered.
 static STR_ITER_REGISTRY: RootRegistry = RootRegistry::new();
+/// Runtime-initialized cache of exact ASCII one-character strings.
+///
+/// This deliberately stays a `OnceLock`: initialization needs the active
+/// runtime heap, and the GC root hook must be able to inspect the cache
+/// without forcing allocations during collection.
+const ASCII_SINGLE_CHAR_COUNT: usize = 128;
+static ASCII_SINGLE_CHAR_STRINGS: OnceLock<Result<[usize; ASCII_SINGLE_CHAR_COUNT], String>> = OnceLock::new();
 
 /// References held by live `str` iterators.  Consumed by
 /// `crate::abi::collect` while the runtime lock is held.
 pub(crate) fn gc_held_roots() -> Vec<*mut PyObject> {
-    STR_ITER_REGISTRY.held_roots()
+    let mut roots = STR_ITER_REGISTRY.held_roots();
+    if let Some(Ok(chars)) = ASCII_SINGLE_CHAR_STRINGS.get() {
+        roots.extend(chars.iter().copied().map(|addr| addr as *mut PyObject));
+    }
+    roots
 }
 
 /// Iterator over an immutable str payload, yielding one-code-point strings.
@@ -1419,6 +1430,7 @@ pub(crate) fn ensure_str_type_methods_installed(ty: *mut PyType) {
             continue;
         }
         if let Ok(function) = alloc_native_str_function(name, *entry) {
+            crate::types::function::mark_native_method_descriptor(function);
             unsafe { (&mut *namespace).set(interned, function) };
         }
     }
@@ -1526,6 +1538,7 @@ fn install_binary_type_methods(
         }
         let Some(entry) = entry_for_name(name) else { continue };
         if let Ok(function) = alloc_native_str_function(name, entry) {
+            crate::types::function::mark_native_method_descriptor(function);
             unsafe { (&mut *namespace).set(interned, function) };
         }
     }
@@ -2194,7 +2207,10 @@ pub unsafe extern "C" fn pon_bytes_method(
     super::catch_object_helper(|| {
         let receiver_object = receiver;
         let Ok((receiver, mutable_receiver)) = expect_bytes_receiver(receiver) else {
-            return super::return_null_with_error("bytes method receiver must be bytes-like");
+            let type_name = unsafe { crate::types::dict::type_name(receiver) }.unwrap_or("<unknown>");
+            return super::return_null_with_error(format!(
+                "bytes method receiver must be bytes-like (method id {method}, got '{type_name}')"
+            ));
         };
         let Some(args) = raw_args(argv, argc) else {
             return super::return_null_with_error("bytes method argv pointer is null");
@@ -2324,18 +2340,49 @@ fn str_join_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
     if args.len() != 1 {
         return raise_type_error("str.join expected exactly one argument");
     }
+    if let Some(values) = unsafe { super::seq::exact_list_slice(args[0]) } {
+        return str_join_objects(receiver, values);
+    }
+    if let Some(values) = unsafe { super::seq::exact_tuple_slice(args[0]) } {
+        return str_join_objects(receiver, values);
+    }
     let values = match super::seq::sequence_to_vec(args[0]) {
         Ok(values) => values,
         Err(message) => return raise_type_error(message),
     };
-    let mut items = Vec::with_capacity(values.len());
-    for value in values {
-        match expect_str(value) {
-            Ok(item) => items.push(item),
+    str_join_objects(receiver, &values)
+}
+
+fn str_join_objects(receiver: &str, values: &[*mut PyObject]) -> *mut PyObject {
+    let mut total = 0_usize;
+    for (index, value) in values.iter().copied().enumerate() {
+        let item = match borrow_str(value) {
+            Ok(item) => item,
             Err(_) => return raise_type_error("str.join expected every item to be str"),
+        };
+        total = match total.checked_add(item.len()) {
+            Some(total) => total,
+            None => return raise_overflow_error("joined string is too large"),
+        };
+        if index != 0 {
+            total = match total.checked_add(receiver.len()) {
+                Some(total) => total,
+                None => return raise_overflow_error("joined string is too large"),
+            };
         }
     }
-    alloc_str_object(&str_type::join(receiver, &items))
+    let mut out = String::with_capacity(total);
+    for (index, value) in values.iter().copied().enumerate() {
+        if index != 0 {
+            out.push_str(receiver);
+        }
+        let item = match borrow_str(value) {
+            Ok(item) => item,
+            Err(_) => return raise_type_error("str.join expected every item to be str"),
+        };
+        out.push_str(item);
+    }
+    alloc_str_object(&out)
 }
 
 fn str_replace_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
@@ -2604,8 +2651,31 @@ fn str_maketrans_method(args: &[*mut PyObject]) -> *mut PyObject {
     let from = match expect_str(args[0]) { Ok(value) => value, Err(message) => return raise_type_error(message) };
     let to = match expect_str(args[1]) { Ok(value) => value, Err(message) => return raise_type_error(message) };
     let delete = match args.get(2).copied().map(expect_str).transpose() { Ok(value) => value, Err(message) => return raise_type_error(message) };
-    let table = match str_type::maketrans(&from, &to, delete.as_deref()) { Ok(table) => table, Err(message) => return raise_value_error(message) };
-    as_object_ptr(Box::into_raw(Box::new(PyStrTranslateTable { ob_base: PyObjectHeader::new(str_translate_table_type()), table })))
+    let mut flat = Vec::new();
+    for (source, target) in from.chars().zip(to.chars()) {
+        let key = unsafe { super::pon_const_int(i64::from(u32::from(source))) };
+        let value = unsafe { super::pon_const_int(i64::from(u32::from(target))) };
+        if key.is_null() || value.is_null() {
+            return ptr::null_mut();
+        }
+        flat.push(key);
+        flat.push(value);
+    }
+    if let Some(delete) = delete.as_deref() {
+        let none = unsafe { super::pon_none() };
+        if none.is_null() {
+            return ptr::null_mut();
+        }
+        for source in delete.chars() {
+            let key = unsafe { super::pon_const_int(i64::from(u32::from(source))) };
+            if key.is_null() {
+                return ptr::null_mut();
+            }
+            flat.push(key);
+            flat.push(none);
+        }
+    }
+    unsafe { super::map::pon_build_map(flat.as_mut_ptr(), flat.len() / 2) }
 }
 
 /// CPython's one-argument `str.maketrans(dict)` form.
@@ -2613,9 +2683,9 @@ fn str_maketrans_method(args: &[*mut PyObject]) -> *mut PyObject {
 /// Keys must be ints (kept as-is, `bool <: int` included) or length-1
 /// strings (re-keyed to their ordinal); values pass through UNVALIDATED —
 /// CPython defers value checking to `str.translate`, and the dict leg of
-/// [`expect_translate_table`] applies the same deferred contract.  Returns a
-/// REAL dict exactly like CPython (the 2/3-argument form predates this leg
-/// and keeps the opaque representative table).  Error messages reproduce the
+/// [`expect_translate_table`] applies the same deferred contract.  Both this
+/// form and the two/three-argument form return a REAL dict exactly like
+/// CPython.  Error messages reproduce the
 /// CPython 3.14.6 oracle byte-for-byte, historical typos included
 /// ("mustbe", "translatetable").  Consumed at import by `_pyrepl.utils`
 /// (`ZERO_WIDTH_TRANS = str.maketrans({"\x01": "", "\x02": ""})`) on the
@@ -3478,6 +3548,11 @@ fn bytes_affix_values(value: *mut PyObject) -> Result<Vec<Vec<u8>>, String> {
 
 fn expect_bytes_receiver(value: *mut PyObject) -> Result<(Vec<u8>, bool), String> {
     if value.is_null() { return Err("expected bytes-like object, got NULL".to_owned()); }
+    // Bytes/bytearray SUBCLASS receivers (e.g. cython's BytesLiteral) read
+    // through their canonical payload; methods return base-type results,
+    // matching CPython.
+    let value = unsafe { crate::types::type_::payload_subclass_value(value) }.unwrap_or(value);
+    if !crate::tag::is_heap(value) { return Err("expected bytes or bytearray receiver".to_owned()); }
     let ty = unsafe { (*value).ob_type };
     if bytes_type::is_bytes_type(ty) {
         let bytes = unsafe { &*value.cast::<bytes_type::PyBytes>() };
@@ -3631,15 +3706,76 @@ fn memoryview_assign_slice(object: *mut PyObject, key: *mut PyObject, replacemen
     Ok(())
 }
 
-fn alloc_str_object(text: &str) -> *mut PyObject {
+pub(crate) fn single_char_str_object(ch: char) -> Result<*mut PyObject, String> {
+    if ch.is_ascii() {
+        if let Err(message) = install_str_slots() {
+            return Err(message);
+        }
+        return ascii_single_char_object(ch as u8);
+    }
+    let mut buf = [0_u8; 4];
+    alloc_str_result(ch.encode_utf8(&mut buf))
+}
+
+fn ascii_single_char_object(byte: u8) -> Result<*mut PyObject, String> {
+    debug_assert!(byte.is_ascii());
+    let objects = ASCII_SINGLE_CHAR_STRINGS.get_or_init(|| {
+        super::with_runtime(|runtime| {
+            let mut objects = [0_usize; ASCII_SINGLE_CHAR_COUNT];
+            for (byte, slot) in objects.iter_mut().enumerate() {
+                let bytes = [byte as u8];
+                let object = super::alloc_unicode(runtime, &bytes)?;
+                *slot = object as usize;
+            }
+            Ok(objects)
+        })
+        .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
+    });
+    match objects {
+        Ok(objects) => Ok(objects[usize::from(byte)] as *mut PyObject),
+        Err(message) => Err(message.clone()),
+    }
+}
+
+fn alloc_str_result(text: &str) -> Result<*mut PyObject, String> {
     if let Err(message) = install_str_slots() {
-        return super::return_null_with_error(message);
+        return Err(message);
     }
-    match super::with_runtime(|runtime| super::alloc_unicode(runtime, text.as_bytes())) {
-        Some(Ok(object)) => object,
-        Some(Err(message)) => super::return_null_with_error(message),
-        None => super::return_null_with_error("runtime is not initialized"),
+    if text.len() == 1 {
+        let byte = text.as_bytes()[0];
+        if byte.is_ascii() {
+            return ascii_single_char_object(byte);
+        }
     }
+    super::with_runtime(|runtime| super::alloc_unicode(runtime, text.as_bytes()))
+        .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
+}
+
+fn alloc_str_object(text: &str) -> *mut PyObject {
+    match alloc_str_result(text) {
+        Ok(object) => object,
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
+fn borrow_str<'a>(value: *mut PyObject) -> Result<&'a str, String> {
+    if value.is_null() {
+        return Err("expected str, got NULL".to_owned());
+    }
+    // `str`-subclass instances (payload subclasses: `StrEnum` members, ...)
+    // read through their embedded canonical payload.
+    let value = unsafe { crate::types::type_::payload_subclass_value(value) }.unwrap_or(value);
+    if let Err(message) = super::ensure_runtime_initialized() {
+        return Err(message);
+    }
+    super::with_runtime(|runtime| unsafe {
+        if !is_exact_type(value, runtime.unicode_type) {
+            return Err("expected str object".to_owned());
+        }
+        let unicode = &*value.cast::<PyUnicode>();
+        unicode.as_str().ok_or_else(|| "unicode object contains invalid UTF-8".to_owned())
+    })
+    .unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
 }
 
 fn expect_str(value: *mut PyObject) -> Result<String, String> {

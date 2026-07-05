@@ -121,6 +121,16 @@ pub(crate) unsafe fn exact_tuple_slice<'a>(object: *mut PyObject) -> Option<&'a 
     Some(unsafe { (*object.cast::<PyTuple>()).as_slice() })
 }
 
+/// Returns the elements of an exact seq-family `PyList`, or `None` when
+/// `object` is not one.  Fast consumers use this only when bypassing iteration
+/// cannot skip user-defined subclass hooks.
+pub(crate) unsafe fn exact_list_slice<'a>(object: *mut PyObject) -> Option<&'a [*mut PyObject]> {
+    if object.is_null() || unsafe { (*object).ob_type } != list_type().cast_const() {
+        return None;
+    }
+    Some(unsafe { (*object.cast::<PyList>()).as_slice() })
+}
+
 fn range_type() -> *mut PyType {
     RANGE_TYPE.get_or_init(|| {
         let sequence = Box::leak(Box::new(PySequenceMethods {
@@ -1065,6 +1075,7 @@ fn list_resize(list: &mut list::PyListStorage, new_cap: usize) -> Result<(), Str
     Ok(())
 }
 
+
 /// Length of a runtime list, or `None` when `object` is not a list.
 /// Untagged native callers only (`crate::import`'s `sys.meta_path` seeding).
 pub(crate) fn list_len(object: *mut PyObject) -> Option<usize> {
@@ -1091,6 +1102,51 @@ pub(crate) fn list_append_raw(list_object: *mut PyObject, item: *mut PyObject) -
     }
     unsafe { crate::sync::store_heap_pointer(list.items.add(list.len), item) };
     list.len += 1;
+    Ok(())
+}
+
+fn list_reserve_additional(list: &mut list::PyListStorage, additional: usize) -> Result<(), String> {
+    let needed = list.len.checked_add(additional).ok_or_else(|| "list is too large".to_owned())?;
+    if needed <= list.cap {
+        return Ok(());
+    }
+    if additional >= 8_000_000 {
+        return list_resize(list, needed);
+    }
+    let doubled = if list.cap == 0 { 4 } else { list.cap.saturating_mul(2) };
+    let new_cap = doubled.max(needed);
+    if new_cap < needed {
+        return Err("list is too large".to_owned());
+    }
+    list_resize(list, new_cap)
+}
+
+unsafe fn exact_unicode_text<'a>(object: *mut PyObject) -> Option<&'a str> {
+    if object.is_null() {
+        return None;
+    }
+    let is_exact = with_runtime(|runtime| unsafe { is_exact_type(object, runtime.unicode_type) }).unwrap_or(false);
+    if !is_exact {
+        return None;
+    }
+    unsafe { (*object.cast::<PyUnicode>()).as_str() }
+}
+
+fn list_extend_exact_str_raw(list_object: *mut PyObject, text: &str) -> Result<(), String> {
+    let additional = text.chars().count();
+    if additional == 0 {
+        return Ok(());
+    }
+    let Some(list) = (unsafe { list_cells(list_object) }) else {
+        return Err(format!("list append expected list, got {}", object_type_name(list_object)));
+    };
+    let _guard = crate::sync::begin_critical_section(list_object);
+    list_reserve_additional(list, additional)?;
+    for ch in text.chars() {
+        let item = super::str_::single_char_str_object(ch)?;
+        unsafe { crate::sync::store_heap_pointer(list.items.add(list.len), item) };
+        list.len += 1;
+    }
     Ok(())
 }
 
@@ -1368,6 +1424,12 @@ unsafe extern "C" fn list_extend_method(argv: *mut *mut PyObject, argc: usize) -
         if args.len() != 2 {
             return raise_seq_type_error(format!("list.extend() takes exactly one argument ({} given)", args.len().saturating_sub(1)));
         }
+        if let Some(text) = unsafe { exact_unicode_text(args[1]) } {
+            return match list_extend_exact_str_raw(args[0], text) {
+                Ok(()) => seq_none(),
+                Err(message) => raise_seq_stream_error(message),
+            };
+        }
         let values = match sequence_to_vec(args[1]) {
             Ok(values) => values,
             Err(message) => return raise_seq_type_error(message),
@@ -1386,6 +1448,12 @@ unsafe extern "C" fn list_extend_method(argv: *mut *mut PyObject, argc: usize) -
 /// binary `+` demands a list operand).  Consulted by `try_inplace_binary`
 /// before the plain binary path, mirroring `binary_iop1`.
 unsafe extern "C" fn list_inplace_concat_slot(receiver: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    if let Some(text) = unsafe { exact_unicode_text(other) } {
+        return match list_extend_exact_str_raw(receiver, text) {
+            Ok(()) => receiver,
+            Err(message) => raise_seq_stream_error(message),
+        };
+    }
     let values = match sequence_to_vec(other) {
         Ok(values) => values,
         Err(message) => return raise_seq_type_error(message),
@@ -2013,6 +2081,7 @@ pub(crate) fn ensure_list_type_methods_installed(ty: *mut PyType) {
         }
         let function = unsafe { crate::abi::pon_make_function(*code, crate::builtins::variadic_arity(), interned) };
         if !function.is_null() {
+            crate::types::function::mark_native_method_descriptor(function);
             unsafe { (&mut *namespace).set(interned, function) };
         }
     }
@@ -2421,6 +2490,7 @@ pub(crate) fn ensure_tuple_type_methods_installed(ty: *mut PyType) {
         }
         let function = unsafe { crate::abi::pon_make_function(*code, crate::builtins::variadic_arity(), interned) };
         if !function.is_null() {
+            crate::types::function::mark_native_method_descriptor(function);
             unsafe { (&mut *namespace).set(interned, function) };
         }
     }
@@ -2910,6 +2980,12 @@ pub unsafe extern "C" fn pon_list_append(list: *mut PyObject, value: *mut PyObje
 pub unsafe extern "C" fn pon_list_extend(list: *mut PyObject, iterable: *mut PyObject) -> *mut PyObject {
     crate::untag_prelude!(list, iterable);
     catch_object_helper(|| {
+        if let Some(text) = unsafe { exact_unicode_text(iterable) } {
+            return match list_extend_exact_str_raw(list, text) {
+                Ok(()) => list,
+                Err(message) => raise_seq_stream_error(message),
+            };
+        }
         let values = match sequence_to_vec(iterable) {
             Ok(values) => values,
             Err(message) => return raise_seq_type_error(message),
@@ -3167,6 +3243,30 @@ mod tests {
             assert!(!pon_list_sort(list).is_null());
             assert_eq!(long_at(list, 0), 2);
             assert_eq!(long_at(list, 1), 4);
+        }
+    }
+
+    unsafe fn str_at(list: *mut PyObject, index: isize) -> String {
+        let item = sequence_item_raw(list, index).unwrap();
+        unsafe { (*item.cast::<PyUnicode>()).as_str().unwrap().to_owned() }
+    }
+
+    #[test]
+    fn list_extend_exact_str_appends_codepoint_strings() {
+        let _guard = test_state_lock();
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+            let list = pon_build_list(ptr::null_mut(), 0);
+            assert!(!list.is_null());
+            let text = "abé";
+            let value = pon_const_str(text.as_ptr(), text.len());
+            let mut argv = [list, value];
+            let result = list_extend_method(argv.as_mut_ptr(), argv.len());
+            assert_eq!(result, pon_none());
+            assert_eq!(sequence_len_raw(list), Ok(3));
+            assert_eq!(str_at(list, 0), "a");
+            assert_eq!(str_at(list, 1), "b");
+            assert_eq!(str_at(list, 2), "é");
         }
     }
 
