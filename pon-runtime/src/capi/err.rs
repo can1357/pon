@@ -347,33 +347,75 @@ unsafe extern "C" fn capi_err_restore(exception: *mut PyObject, value: *mut PyOb
     let _ = abi::exc::raise_kind_error_text(ExceptionKind::SystemError, "PyErr_Restore called without an exception type");
 }
 
-unsafe extern "C" fn capi_err_warn_ex(category: *mut PyObject, message: *const c_char, stack_level: isize) -> c_int {
-    let text = c_string(message).unwrap_or_default();
-    let warnings = import_module_text("warnings");
-    if warnings.is_null() {
+unsafe fn warning_category_type(category: *mut PyObject) -> Option<*mut PyType> {
+    let ty = if category.is_null() {
+        abi::exception_type_object(ExceptionKind::Warning)
+    } else {
+        let Some(native) = (unsafe { native_class_type(category) }) else {
+            let _ = abi::exc::raise_kind_error_text(ExceptionKind::TypeError, "category must be a Warning subclass");
+            return None;
+        };
+        native
+    };
+    let warning = abi::exception_type_object(ExceptionKind::Warning);
+    if unsafe { !crate::types::exc::is_exception_subclass(ty.cast_const(), warning.cast_const()) } {
+        let _ = abi::exc::raise_kind_error_text(ExceptionKind::TypeError, "category must be a Warning subclass");
+        return None;
+    }
+    Some(ty)
+}
+
+unsafe fn warn_as_error(category: *mut PyType, text: &str) -> c_int {
+    let message = unsafe { abi::pon_const_str(text.as_ptr(), text.len()) };
+    if message.is_null() {
         return -1;
     }
-    let warn = unsafe { abi::pon_get_attr(warnings, intern("warn"), ptr::null_mut()) };
-    if warn.is_null() {
+    let mut argv = [message];
+    unsafe { raise_call(category.cast::<PyObject>(), &mut argv) };
+    -1
+}
+
+unsafe extern "C" fn capi_err_warn_ex(category: *mut PyObject, message: *const c_char, stack_level: isize) -> c_int {
+    let text = c_string(message).unwrap_or_default();
+    let Some(category) = (unsafe { warning_category_type(category) }) else {
         return -1;
+    };
+    let warnings = import_module_text("warnings");
+    if warnings.is_null() {
+        pon_err_clear();
+        return unsafe { warn_as_error(category, &text) };
+    }
+    let no_python_frame = abi::current_function_stack_depth() == 0;
+    let warn_name = if no_python_frame { "warn_explicit" } else { "warn" };
+    let warn = unsafe { abi::pon_get_attr(warnings, intern(warn_name), ptr::null_mut()) };
+    if warn.is_null() {
+        pon_err_clear();
+        return unsafe { warn_as_error(category, &text) };
     }
     let message = unsafe { abi::pon_const_str(text.as_ptr(), text.len()) };
     if message.is_null() {
         return -1;
     }
-    let category = if category.is_null() {
-        abi::exception_type_object(ExceptionKind::Warning).cast::<PyObject>()
-    } else if let Some(native) = unsafe { native_class_type(category) } {
-        native.cast::<PyObject>()
+    let category = category.cast::<PyObject>();
+    let result = if no_python_frame {
+        // Direct C-extension calls from Rust tests have no Python frame for
+        // warnings.warn() to inspect. Match CPython's no-frame fallback by
+        // issuing the warning at an explicit synthetic <sys>:0 location.
+        let filename = unsafe { abi::pon_const_str("<sys>".as_ptr(), "<sys>".len()) };
+        let lineno = unsafe { abi::pon_const_int(0) };
+        if filename.is_null() || lineno.is_null() {
+            return -1;
+        }
+        let mut argv = [message, category, filename, lineno];
+        unsafe { abi::pon_call(warn, argv.as_mut_ptr(), argv.len()) }
     } else {
-        category
+        let stack_level = unsafe { abi::pon_const_int(stack_level as i64) };
+        if stack_level.is_null() {
+            return -1;
+        }
+        let mut argv = [message, category, stack_level];
+        unsafe { abi::pon_call(warn, argv.as_mut_ptr(), argv.len()) }
     };
-    let stack_level = unsafe { abi::pon_const_int(stack_level as i64) };
-    if stack_level.is_null() {
-        return -1;
-    }
-    let mut argv = [message, category, stack_level];
-    let result = unsafe { abi::pon_call(warn, argv.as_mut_ptr(), argv.len()) };
     if result.is_null() { -1 } else { 0 }
 }
 
@@ -883,7 +925,10 @@ static PyObject *drive(PyObject *self, PyObject *args) {
 
     PyObject *warnings = PyImport_ImportModule("warnings");
     PyObject *filter_result = warnings == NULL ? NULL : PyObject_CallMethod(warnings, "simplefilter", "sO", "error", PyExc_UserWarning);
-    if (filter_result != NULL) {
+    if (warnings == NULL && PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+    if (warnings == NULL || filter_result != NULL) {
         int warn_status = PyErr_WarnFormat(PyExc_UserWarning, 1, "warn %s %zd", "count", (Py_ssize_t)42);
         if (warn_status == -1 && PyErr_ExceptionMatches(PyExc_UserWarning)) {
             PyObject *warn_type = NULL;
