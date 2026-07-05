@@ -20,6 +20,10 @@ static inline PyObject *PyUnicode_FromStringAndSize(const char *value, Py_ssize_
     return PyPon_Capi()->strings->unicode_from_string_and_size(value, size);
 }
 
+static inline PyObject *PyUnicode_FromOrdinal(int ordinal) {
+    return PyPon_Capi()->strings->unicode_from_ordinal(ordinal);
+}
+
 static inline const char *PyUnicode_AsUTF8(PyObject *object) {
     return PyPon_Capi()->strings->unicode_as_utf8(object);
 }
@@ -46,6 +50,10 @@ static inline PyObject *PyUnicode_DecodeASCII(const char *value, Py_ssize_t size
 
 static inline PyObject *PyUnicode_DecodeLatin1(const char *value, Py_ssize_t size, const char *errors) {
     return PyPon_Capi()->strings->unicode_decode_latin1(value, size, errors);
+}
+
+static inline PyObject *PyUnicode_Decode(const char *value, Py_ssize_t size, const char *encoding, const char *errors) {
+    return PyPon_Capi()->strings->unicode_decode(value, size, encoding, errors);
 }
 
 static inline PyObject *PyUnicode_FromEncodedObject(PyObject *object, const char *encoding, const char *errors) {
@@ -176,6 +184,16 @@ static inline Py_UCS4 PyUnicode_READ(int kind, const void *data, Py_ssize_t inde
 
 static inline int PyUnicode_IS_ASCII(PyObject *object) {
     return PyPon_Capi()->strings->unicode_is_ascii(object);
+}
+
+#define PyUnicode_CHECK_INTERNED(op) (0)
+
+static inline int PyUnicode_Resize(PyObject **unicode, Py_ssize_t new_size) {
+    return PyPon_Capi()->strings->unicode_resize(unicode, new_size);
+}
+
+static inline Py_ssize_t PyUnicode_CopyCharacters(PyObject *to, Py_ssize_t to_start, PyObject *from, Py_ssize_t from_start, Py_ssize_t how_many) {
+    return PyPon_Capi()->strings->unicode_copy_characters(to, to_start, from, from_start, how_many);
 }
 
 static inline PyObject *PyLong_FromUnicodeObject(PyObject *object, int base) {

@@ -65,6 +65,10 @@ pub(crate) struct PyPonCapiStrings {
     long_from_unicode_object: unsafe extern "C" fn(*mut PyObject, c_int) -> *mut PyObject,
     unicode_substring: unsafe extern "C" fn(*mut PyObject, PySsizeT, PySsizeT) -> *mut PyObject,
     unicode_as_ucs4: unsafe extern "C" fn(*mut PyObject, *mut u32, PySsizeT, c_int) -> *mut u32,
+    unicode_from_ordinal: unsafe extern "C" fn(c_int) -> *mut PyObject,
+    unicode_decode: unsafe extern "C" fn(*const c_char, PySsizeT, *const c_char, *const c_char) -> *mut PyObject,
+    unicode_resize: unsafe extern "C" fn(*mut *mut PyObject, PySsizeT) -> c_int,
+    unicode_copy_characters: unsafe extern "C" fn(*mut PyObject, PySsizeT, *mut PyObject, PySsizeT, PySsizeT) -> PySsizeT,
 }
 
 unsafe impl Send for PyPonCapiStrings {}
@@ -145,6 +149,10 @@ pub(crate) fn build() -> PyPonCapiStrings {
         long_from_unicode_object: capi_long_from_unicode_object,
         unicode_substring: capi_unicode_substring,
         unicode_as_ucs4: capi_unicode_as_ucs4,
+        unicode_from_ordinal: capi_unicode_from_ordinal,
+        unicode_decode: capi_unicode_decode,
+        unicode_resize: capi_unicode_resize,
+        unicode_copy_characters: capi_unicode_copy_characters,
     }
 }
 
@@ -172,6 +180,17 @@ unsafe extern "C" fn capi_unicode_from_utf8(value: *const c_char, size: PySsizeT
         return raise_null(ExceptionKind::UnicodeDecodeError, "UnicodeDecodeError: 'utf-8' codec can't decode input");
     }
     new_reference(unsafe { abi::pon_const_str(bytes.as_ptr(), bytes.len()) })
+}
+
+unsafe extern "C" fn capi_unicode_from_ordinal(ordinal: c_int) -> *mut PyObject {
+    let Ok(code) = u32::try_from(ordinal) else {
+        return raise_null(ExceptionKind::ValueError, "chr() arg not in range(0x110000)");
+    };
+    let mut text = String::new();
+    if push_unicode_codepoint(&mut text, code).is_err() {
+        return raise_null(ExceptionKind::ValueError, "chr() arg not in range(0x110000)");
+    }
+    new_reference(unsafe { abi::pon_const_str(text.as_ptr(), text.len()) })
 }
 
 unsafe extern "C" fn capi_unicode_as_utf8(object: *mut PyObject) -> *const c_char {
@@ -213,6 +232,56 @@ unsafe extern "C" fn capi_unicode_substring(object: *mut PyObject, start: PySsiz
     }
     let slice = unicode_char_slice(text, start, end);
     new_reference(unsafe { abi::pon_const_str(slice.as_ptr(), slice.len()) })
+}
+
+unsafe extern "C" fn capi_unicode_resize(slot: *mut *mut PyObject, new_size: PySsizeT) -> c_int {
+    if slot.is_null() {
+        return status_error("PyUnicode_Resize received NULL object pointer");
+    }
+    if new_size < 0 {
+        return status_value_error("PyUnicode_Resize received negative size");
+    }
+    let object = unsafe { *slot };
+    if object.is_null() {
+        return status_error("PyUnicode_Resize received NULL unicode object");
+    }
+    let Some(text) = (unsafe { crate::types::type_::unicode_text(object) }) else {
+        return status_type_error("PyUnicode_Resize expected a str object");
+    };
+    let current_len = text.chars().count();
+    let new_len = new_size as usize;
+    if new_len > current_len {
+        let _ = abi::exc::raise_kind_error_text(
+            ExceptionKind::NotImplementedError,
+            "PyUnicode_Resize cannot grow immutable Pon str objects",
+        );
+        return -1;
+    }
+    if new_len == current_len {
+        return 0;
+    }
+    let prefix = unicode_char_slice(text, 0, new_len);
+    let replacement = new_reference(unsafe { abi::pon_const_str(prefix.as_ptr(), prefix.len()) });
+    if replacement.is_null() {
+        return -1;
+    }
+    unsafe { *slot = replacement };
+    super::unpin_object(object);
+    0
+}
+
+unsafe extern "C" fn capi_unicode_copy_characters(
+    _to: *mut PyObject,
+    _to_start: PySsizeT,
+    _from: *mut PyObject,
+    _from_start: PySsizeT,
+    _how_many: PySsizeT,
+) -> PySsizeT {
+    let _ = abi::exc::raise_kind_error_text(
+        ExceptionKind::NotImplementedError,
+        "PyUnicode_CopyCharacters cannot mutate immutable Pon str objects",
+    );
+    -1
 }
 
 unsafe extern "C" fn capi_unicode_decode_utf8(value: *const c_char, size: PySsizeT, errors: *const c_char) -> *mut PyObject {
@@ -277,6 +346,23 @@ unsafe extern "C" fn capi_unicode_decode_latin1(value: *const c_char, size: PySs
         text.push(char::from(byte));
     }
     new_reference(unsafe { abi::pon_const_str(text.as_ptr(), text.len()) })
+}
+
+unsafe extern "C" fn capi_unicode_decode(
+    value: *const c_char,
+    size: PySsizeT,
+    encoding: *const c_char,
+    errors: *const c_char,
+) -> *mut PyObject {
+    let bytes = match unsafe { raw_c_bytes(value, size, "encoded unicode input") } {
+        Ok(bytes) => bytes,
+        Err(message) => return abi::return_null_with_error(message),
+    };
+    let encoding = match normalize_text_encoding(encoding) {
+        Ok(encoding) => encoding,
+        Err(message) => return raise_null(ExceptionKind::LookupError, &message),
+    };
+    unsafe { decode_bytes_with_encoding(bytes, encoding, errors) }
 }
 
 unsafe extern "C" fn capi_unicode_from_encoded_object(
