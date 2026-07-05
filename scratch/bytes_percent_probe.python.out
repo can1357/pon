@@ -1,0 +1,30 @@
+single_int OK bytes b'7'
+tuple_ints OK bytes b'7:-8:9'
+mapping_bytes_keys OK bytes b'pon:0005'
+bytes_b OK bytes b'abc'
+bytearray_b OK bytes b'abc'
+memoryview_b OK bytes b'abc'
+dunder_bytes_b OK bytes b'BYTESISH'
+bytes_s_alias OK bytes b'alias'
+bytes_subclass_operand OK bytes b'sub'
+bytearray_subclass_operand OK bytes b'mut'
+bytes_subclass_lhs OK bytes b'lhs'
+bytearray_lhs OK bytearray bytearray(b'lhs')
+bytearray_subclass_lhs OK bytearray bytearray(b'lhs')
+ascii_a OK bytes b"'\\xe9'"
+repr_r_oracle OK bytes b"'\\xe9'"
+oct_hex OK bytes b'0o12:0xa:0XA'
+float_all OK bytes b'1.2e+00:1.2E+00:1.25:1.25:1.23e+03:1.23E+03'
+char_int OK bytes b'A'
+char_bytes OK bytes b'Z'
+char_bytearray OK bytes b'Y'
+literal_percent OK bytes b'% 3'
+width_zero_int OK bytes b'00042'
+precision_float OK bytes b'1.23'
+precision_bytes OK bytes b'   ab'
+err_unsupported ERR ValueError unsupported format character 'q' (0x71) at index 1
+err_b_str ERR TypeError %b requires a bytes-like object, or an object that implements __bytes__, not 'str'
+err_not_all ERR TypeError not all arguments converted during bytes formatting
+err_not_enough ERR TypeError not enough arguments for format string
+err_char_str ERR TypeError %c requires an integer in range(256) or a single byte, not str
+err_char_range ERR OverflowError %c arg not in range(256)

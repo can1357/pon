@@ -1,6 +1,7 @@
-for name in ['dataclasses','collections.abc','os','sys']:
-    try:
-        m = __import__(name, fromlist=['*'])
-        print(name, 'OK')
-    except Exception as exc:
-        print(name, 'ERR', type(exc).__name__, exc)
+from dataclasses import dataclass, field
+@dataclass
+class P:
+    x: int
+    y: str = 'd'
+p = P(1)
+print(p.x, p.y, P(2, 'z'))

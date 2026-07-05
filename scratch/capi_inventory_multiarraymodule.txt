@@ -1,0 +1,206 @@
+# CPython C-API surface demanded by ONE numpy TU (multiarraymodule.c),
+# compiled against pon-runtime/include/Python.h in /tmp/pon_meson_final
+# (numpy 2.5.0 sdist, meson-configured).
+#
+# STATUS 2026-07-04: CLOSED at compile level — 720 errors -> 0 (exit 0,
+# 2 benign -Wincompatible-pointer-types warnings that numpy also emits on
+# CPython). Every symbol below now resolves. Landed this session:
+#   multi-phase init (PyModuleDef_Init + Py_mod_exec/gil/multiple_interpreters),
+#   PyType_FromSpec/PyType_Slot/PyHeapTypeObject, PyType_Ready e2e (Counter),
+#   err surface (NoMemory/Normalize/Print/SetFromErrno/PyException_Set*),
+#   protocol gaps (PyLong_As*Overflow/Ssize_t, PyDict_GetItemRef,
+#   PyObject_GetOptionalAttr/AsFileDescriptor/CallFunction/CallMethod),
+#   runtime structural (PyThreadState/PyMutex/vectorcall/contextvars/frames),
+#   bytes+unicode (PyBytes_FromFormatV/_PyBytes_Resize/AsLatin1String/
+#   PyUnicode_DATA-KIND-READ, PyASCIIObject layout: compile-surface only,
+#   see Python.h warning), Py_Ellipsis, PyExc_IOError, PyAPI_FUNC,
+#   Py_GCC_ATTRIBUTE, PyCapsule_CheckExact, PyBytes_AS_STRING/GET_SIZE,
+#   PyMem_FREE, assert.h.
+#
+# Known NOT-yet-runtime-correct (compile-only surfaces, loud where possible):
+#   PyFrame_GetBack/GetCode (loud SystemError), PyASCIIObject field reads
+#   (dead code in numpy), tp_as_number/sequence/mapping/buffer protocol
+#   tables (PyType_FromSpec rejects loudly), buffer protocol beyond args
+#   engine, vectorcall dispatch.
+#
+# Repro:
+#   python3 -c "see compile_commands.json in /tmp/pon_meson_final; strip -o/-MF"
+#   or: cd /tmp/pon_meson_final && cc <flags from compile_commands.json for
+#   multiarraymodule.c> -ferror-limit=4000 -c
+#     ../numpy_src/numpy-2.5.0/numpy/_core/src/multiarray/multiarraymodule.c
+# Classification (design FIRST, do not stub leaf functions piecemeal):
+#   [ABI]  structural: PyTypeObject full slot layout for static type defs,
+#          PyVarObject/PyObject_VAR_HEAD, PyHeapTypeObject, PyType_Slot +
+#          Py_mod_exec multi-phase init, structmember.h, vectorcallfunc,
+#          PyThreadState + PyEval_SaveThread/RestoreThread, PyFrameObject
+#          introspection, capsules, contextvars, _Py_SetImmortal.
+#   [FN]   callable surface mappable onto the PyPonCapi dispatch table:
+#          PyErr_*, PyArg_ParseTuple(AndKeywords), Py_BuildValue,
+#          PyObject_* protocol family, PyLong_/PyFloat_/PyBytes_/
+#          PyUnicode_/PyTuple_/PyDict_/PySequence_*, PyType_Ready,
+#          PyMem_* allocators, exception type singletons.
+#
+# Symbols (sorted, deduplicated):
+FILE
+PyAPI_FUNC
+PyASCIIObject
+PyArg_ParseTuple
+PyArg_ParseTupleAndKeywords
+PyArrayDTypeMeta_Type
+PyArray_RUNTIME_VERSION
+PyBool_Check
+PyBool_FromLong
+PyBool_Type
+PyBytes_AS_STRING
+PyBytes_AsString
+PyBytes_Check
+PyBytes_FromFormatV
+PyBytes_FromStringAndSize
+PyBytes_GET_SIZE
+PyBytes_Type
+PyCapsule_CheckExact
+PyCapsule_GetContext
+PyCapsule_GetPointer
+PyCapsule_New
+PyCapsule_SetContext
+PyCodeObject
+PyComplex_Check
+PyComplex_CheckExact
+PyComplex_Type
+PyContextVar_Get
+PyContextVar_New
+PyDict_GetItemRef
+PyDict_GetItemString
+PyDict_New
+PyDict_SetItemString
+PyDict_Type
+PyErr_Clear
+PyErr_Fetch
+PyErr_Format
+PyErr_NoMemory
+PyErr_NormalizeException
+PyErr_Print
+PyErr_Restore
+PyErr_SetFromErrno
+PyErr_SetObject
+PyErr_WarnEx
+PyEval_GetBuiltins
+PyEval_RestoreThread
+PyEval_SaveThread
+PyExc_Exception
+PyExc_IOError
+PyExc_IndexError
+PyExc_OSError
+PyExc_OverflowError
+PyExc_SystemError
+PyExc_UserWarning
+PyException_SetCause
+PyException_SetContext
+PyException_SetTraceback
+PyFloat_AsDouble
+PyFloat_Check
+PyFloat_CheckExact
+PyFloat_Type
+PyFrameObject
+PyFrame_GetBack
+PyFrame_GetCode
+PyFrozenSet_Type
+PyHeapTypeObject
+PyImport_ImportModule
+PyInterpreterState_Main
+PyList_Type
+PyLong_AsLongAndOverflow
+PyLong_AsLongLong
+PyLong_AsSsize_t
+PyLong_Check
+PyLong_CheckExact
+PyLong_FromSsize_t
+PyLong_Type
+PyMappingMethods
+PyMem_FREE
+PyMem_Free
+PyMem_Malloc
+PyMem_RawFree
+PyMem_RawMalloc
+PyModuleDef_Init
+PyModule_GetDict
+PyMutex
+PyNumberMethods
+PyNumber_AsSsize_t
+PyObject_AsFileDescriptor
+PyObject_CallFunction
+PyObject_CallFunctionObjArgs
+PyObject_CallMethod
+PyObject_CallObject
+PyObject_GetAttr
+PyObject_GetAttrString
+PyObject_GetOptionalAttr
+PyObject_IsInstance
+PyObject_IsTrue
+PyObject_SelfIter
+PyObject_SetAttrString
+PyObject_TypeCheck
+PyObject_VAR_HEAD
+PySequence_Check
+PySequence_Fast
+PySequence_Fast_GET_ITEM
+PySequence_GetItem
+PySequence_Size
+PySet_Type
+PySlice_Type
+PySys_GetObject
+PyThreadState
+PyThreadState_Get
+PyThreadState_GetFrame
+PyTuple_GetItem
+PyTuple_New
+PyTuple_SET_ITEM
+PyTuple_SetItem
+PyTuple_Size
+PyTuple_Type
+PyType_GenericNew
+PyType_IsSubtype
+PyType_Ready
+PyType_Slot
+PyType_Type
+PyUnicodeObject
+PyUnicode_AsASCIIString
+PyUnicode_Check
+PyUnicode_GetLength
+PyUnicode_Type
+PyUnstable_Object_IsUniquelyReferenced
+PyVectorcall_NARGS
+Py_BuildValue
+Py_CLEAR
+Py_EQ
+Py_Ellipsis
+Py_False
+Py_GE
+Py_GT
+Py_LE
+Py_LT
+Py_MOD_GIL_NOT_USED
+Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED
+Py_NE
+Py_NewRef
+Py_NotImplemented
+Py_RETURN_FALSE
+Py_RETURN_TRUE
+Py_SETREF
+Py_SET_TYPE
+Py_TYPE
+Py_True
+Py_XNewRef
+Py_intptr_t
+Py_mod_exec
+Py_mod_gil
+Py_mod_multiple_interpreters
+_PyBytes_Resize
+_Py_SetImmortal
+_save
+assert
+back
+code
+frame
+getenv
+vectorcallfunc
