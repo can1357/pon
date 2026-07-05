@@ -63,6 +63,8 @@ pub(crate) struct PyPonCapiStrings {
     unicode_tailmatch: unsafe extern "C" fn(*mut PyObject, *mut PyObject, PySsizeT, PySsizeT, c_int) -> PySsizeT,
     unicode_contains: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> c_int,
     long_from_unicode_object: unsafe extern "C" fn(*mut PyObject, c_int) -> *mut PyObject,
+    unicode_substring: unsafe extern "C" fn(*mut PyObject, PySsizeT, PySsizeT) -> *mut PyObject,
+    unicode_as_ucs4: unsafe extern "C" fn(*mut PyObject, *mut u32, PySsizeT, c_int) -> *mut u32,
 }
 
 unsafe impl Send for PyPonCapiStrings {}
@@ -141,6 +143,8 @@ pub(crate) fn build() -> PyPonCapiStrings {
         unicode_tailmatch: capi_unicode_tailmatch,
         unicode_contains: capi_unicode_contains,
         long_from_unicode_object: capi_long_from_unicode_object,
+        unicode_substring: capi_unicode_substring,
+        unicode_as_ucs4: capi_unicode_as_ucs4,
     }
 }
 
@@ -192,6 +196,23 @@ unsafe extern "C" fn capi_unicode_get_length(object: *mut PyObject) -> PySsizeT 
         return -1;
     };
     text.chars().count() as PySsizeT
+}
+
+unsafe extern "C" fn capi_unicode_substring(object: *mut PyObject, start: PySsizeT, end: PySsizeT) -> *mut PyObject {
+    let Some(text) = (unsafe { crate::types::type_::unicode_text(object) }) else {
+        return raise_null(ExceptionKind::TypeError, "bad argument type for PyUnicode_Substring");
+    };
+    if start < 0 || end < 0 {
+        return raise_null(ExceptionKind::IndexError, "string index out of range");
+    }
+    let len = text.chars().count();
+    let start = start as usize;
+    let end = usize::min(end as usize, len);
+    if start >= len || end < start {
+        return new_reference(unsafe { abi::pon_const_str(ptr::NonNull::<u8>::dangling().as_ptr(), 0) });
+    }
+    let slice = unicode_char_slice(text, start, end);
+    new_reference(unsafe { abi::pon_const_str(slice.as_ptr(), slice.len()) })
 }
 
 unsafe extern "C" fn capi_unicode_decode_utf8(value: *const c_char, size: PySsizeT, errors: *const c_char) -> *mut PyObject {
@@ -335,6 +356,35 @@ unsafe extern "C" fn capi_unicode_as_ucs4_copy(object: *mut PyObject) -> *mut u3
     }
     unsafe { *out.add(count_with_nul - 1) = 0 };
     out
+}
+
+unsafe extern "C" fn capi_unicode_as_ucs4(
+    object: *mut PyObject,
+    buffer: *mut u32,
+    buflen: PySsizeT,
+    copy_null: c_int,
+) -> *mut u32 {
+    let Some(text) = (unsafe { crate::types::type_::unicode_text(object) }) else {
+        return raise_null(ExceptionKind::TypeError, "bad argument type for PyUnicode_AsUCS4");
+    };
+    if buffer.is_null() {
+        return raise_null(ExceptionKind::SystemError, "PyUnicode_AsUCS4 received a NULL buffer");
+    }
+    if buflen < 0 {
+        return raise_null(ExceptionKind::SystemError, "PyUnicode_AsUCS4 received a negative buffer length");
+    }
+    let codepoints = text.chars().count();
+    let needed = codepoints.saturating_add(usize::from(copy_null != 0));
+    if (buflen as usize) < needed {
+        return raise_null(ExceptionKind::SystemError, "PyUnicode_AsUCS4 buffer is too small");
+    }
+    for (index, ch) in text.chars().enumerate() {
+        unsafe { *buffer.add(index) = ch as u32 };
+    }
+    if copy_null != 0 {
+        unsafe { *buffer.add(codepoints) = 0 };
+    }
+    buffer
 }
 
 unsafe extern "C" fn capi_unicode_as_utf8_string(object: *mut PyObject) -> *mut PyObject {

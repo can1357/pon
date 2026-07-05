@@ -32,6 +32,10 @@ static inline Py_ssize_t PyUnicode_GetLength(PyObject *object) {
     return PyPon_Capi()->strings->unicode_get_length(object);
 }
 
+static inline PyObject *PyUnicode_Substring(PyObject *object, Py_ssize_t start, Py_ssize_t end) {
+    return PyPon_Capi()->strings->unicode_substring(object, start, end);
+}
+
 static inline PyObject *PyUnicode_DecodeUTF8(const char *value, Py_ssize_t size, const char *errors) {
     return PyPon_Capi()->strings->unicode_decode_utf8(value, size, errors);
 }
@@ -118,6 +122,10 @@ static inline PyObject *PyUnicode_FromKindAndData(int kind, const void *data, Py
 
 static inline Py_UCS4 *PyUnicode_AsUCS4Copy(PyObject *object) {
     return PyPon_Capi()->strings->unicode_as_ucs4_copy(object);
+}
+
+static inline Py_UCS4 *PyUnicode_AsUCS4(PyObject *object, Py_UCS4 *buffer, Py_ssize_t buflen, int copy_null) {
+    return PyPon_Capi()->strings->unicode_as_ucs4(object, buffer, buflen, copy_null);
 }
 
 static inline Py_ssize_t PyUnicode_GET_LENGTH(PyObject *object) {

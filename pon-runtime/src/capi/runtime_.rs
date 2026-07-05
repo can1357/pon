@@ -52,6 +52,7 @@ pub(crate) struct PyPonCapiRuntime {
     import_import: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
     #[cfg(test)]
     test_collect_pin_count: unsafe extern "C" fn(*mut PyObject) -> isize,
+    contextvar_set: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
 }
 
 unsafe impl Send for PyPonCapiRuntime {}
@@ -169,6 +170,7 @@ pub(crate) fn build() -> PyPonCapiRuntime {
         import_import: capi_import_import,
         #[cfg(test)]
         test_collect_pin_count: capi_test_collect_pin_count,
+        contextvar_set: capi_contextvar_set,
     }
 }
 
@@ -276,6 +278,16 @@ unsafe extern "C" fn capi_contextvar_get(
         }
     }
     status
+}
+
+unsafe extern "C" fn capi_contextvar_set(var: *mut PyObject, value: *mut PyObject) -> *mut PyObject {
+    let method = unsafe { abi::pon_get_attr(var, intern("set"), ptr::null_mut()) };
+    if method.is_null() {
+        return ptr::null_mut();
+    }
+    let value = super::object_::normalize_object_arg(value);
+    let mut argv = [value];
+    new_reference(unsafe { abi::pon_call(method, argv.as_mut_ptr(), argv.len()) })
 }
 
 unsafe extern "C" fn capi_datetime_capi_import() -> *mut c_void {

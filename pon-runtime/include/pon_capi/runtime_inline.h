@@ -174,6 +174,10 @@ static inline int PyContextVar_Get(PyObject *var, PyObject *def, PyObject **valu
     return PyPon_Capi()->runtime_->contextvar_get(var, def, value);
 }
 
+static inline PyObject *PyContextVar_Set(PyObject *var, PyObject *value) {
+    return PyPon_Capi()->runtime_->contextvar_set(var, value);
+}
+
 static inline void *_PyPon_DateTime_CAPIImport(void) {
     return PyPon_Capi()->runtime_->datetime_capi_import();
 }

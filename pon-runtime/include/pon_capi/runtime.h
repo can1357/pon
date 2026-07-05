@@ -56,6 +56,7 @@ typedef struct PyPonCapiRuntime {
 #ifdef PON_CAPI_TESTING
     Py_ssize_t (*test_collect_pin_count)(PyObject *);
 #endif
+    PyObject *(*contextvar_set)(PyObject *, PyObject *);
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiRuntime;
 
