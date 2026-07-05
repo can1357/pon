@@ -2,7 +2,8 @@
 
 use core::ffi::c_int;
 use core::{mem, ptr};
-use std::sync::LazyLock;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 use crate::abi;
 use crate::feedback::{ATTR_DESCR_BLIND, ATTR_DESCR_PROBE_DICT, AttrCacheKind, AttrIC, FeedbackCell};
@@ -335,22 +336,16 @@ unsafe fn synthetic_type_attr(ty: *mut PyType, name_id: u32) -> *mut PyObject {
     ptr::null_mut()
 }
 
-unsafe fn set_instance_dict(object: *mut PyObject, value: *mut PyObject) -> c_int {
-    // Layout gate: dict-less instances (see `instance_dict`) reject
-    // `__dict__` assignment outright.
-    if unsafe { instance_dict(object) }.is_null() {
-        return raise_missing_attr_status(object, intern::intern("__dict__"));
-    }
-    let instance = object.cast::<PyHeapInstance>();
+unsafe fn replacement_instance_dict(value: *mut PyObject) -> Result<*mut PyClassDict, c_int> {
     let replacement = type_::new_namespace();
     if !value.is_null() {
         if unsafe { !dict::is_dict(value) } {
             let got = unsafe { object_type_display(value) };
-            return raise_type_status(format!("__dict__ must be set to a dictionary, not a '{got}'"));
+            return Err(raise_type_status(format!("__dict__ must be set to a dictionary, not a '{got}'")));
         }
         let entries = match unsafe { dict::dict_entries_snapshot(value) } {
             Ok(entries) => entries,
-            Err(message) => return raise_type_status(message),
+            Err(message) => return Err(raise_type_status(message)),
         };
         for entry in entries {
             if let Some(text) = unsafe { type_::unicode_text(entry.key) } {
@@ -360,6 +355,70 @@ unsafe fn set_instance_dict(object: *mut PyObject, value: *mut PyObject) -> c_in
             }
         }
     }
+    Ok(replacement)
+}
+
+unsafe fn new_capi_dict_object() -> Result<*mut PyObject, c_int> {
+    let dict = unsafe { abi::map::pon_build_map(ptr::null_mut(), 0) };
+    if dict.is_null() { Err(-1) } else { Ok(dict) }
+}
+
+unsafe fn replacement_capi_dict_object(value: *mut PyObject) -> Result<*mut PyObject, c_int> {
+    let replacement = unsafe { new_capi_dict_object()? };
+    if !value.is_null() {
+        if unsafe { !dict::is_dict(value) } {
+            let got = unsafe { object_type_display(value) };
+            return Err(raise_type_status(format!("__dict__ must be set to a dictionary, not a '{got}'")));
+        }
+        let entries = match unsafe { dict::dict_entries_snapshot(value) } {
+            Ok(entries) => entries,
+            Err(message) => return Err(raise_type_status(message)),
+        };
+        for entry in entries {
+            if let Some(text) = unsafe { type_::unicode_text(entry.key) } {
+                let key = unsafe { abi::pon_const_str(text.as_ptr(), text.len()) };
+                if key.is_null() {
+                    return Err(-1);
+                }
+                let roots = vec![replacement, key, entry.value];
+                let _roots = abi::scoped_roots(&roots as *const Vec<*mut PyObject>);
+                let _guard = sync::begin_critical_section(replacement);
+                if let Err(message) = unsafe { dict::dict_insert(replacement, key, entry.value) } {
+                    return Err(raise_type_status(message));
+                }
+            }
+        }
+    }
+    Ok(replacement)
+}
+
+unsafe fn set_instance_dict(object: *mut PyObject, value: *mut PyObject) -> c_int {
+    let ty = unsafe { object_type(object) };
+    if unsafe { crate::capi::is_capi_class(ty) } {
+        let slot = match unsafe { capi_instance_dict_slot(object, ty) } {
+            Ok(Some(slot)) => slot,
+            Ok(None) => return raise_missing_attr_status(object, intern::intern("__dict__")),
+            Err(message) => return raise_attr_status(message),
+        };
+        let replacement = match unsafe { replacement_capi_dict_object(value) } {
+            Ok(dict) => dict,
+            Err(status) => return status,
+        };
+        unsafe { slot.write(replacement) };
+        remember_capi_instance_dict(object, replacement);
+        return 0;
+    }
+
+    // Layout gate: dict-less instances (see `instance_dict`) reject
+    // `__dict__` assignment outright.
+    if unsafe { instance_dict(object) }.is_null() {
+        return raise_missing_attr_status(object, intern::intern("__dict__"));
+    }
+    let replacement = match unsafe { replacement_instance_dict(value) } {
+        Ok(dict) => dict,
+        Err(status) => return status,
+    };
+    let instance = object.cast::<PyHeapInstance>();
     unsafe {
         (*instance).dict = replacement;
     }
@@ -525,12 +584,157 @@ fn has_heap_instance_prefix(ty: *const PyType) -> bool {
         || id == crate::types::type_::TYPE_ID_PAYLOAD_SUBCLASS_INSTANCE.0 as usize
 }
 
-/// Layout-gated instance dict. Only the [`PyHeapInstance`]-prefixed families
-/// carry the dict pointer this cast reads — boxed exceptions and C-extension
-/// instances have their own layouts, and slot-only classes
-/// (`tp_dictoffset == 0`) carry no dict at all. This is the single place
-/// that decides "does this instance have a dict?": every dict probe (slow
-/// path, IC replay, setattr) goes through it.
+/// C-extension instance dictionaries are exact GC-owned dict objects stored in
+/// the foreign layout's `PyObject *` slot. The registry records slots initialized
+/// by the generic attribute path so an uninitialized, non-zero C field is never
+/// trusted or dereferenced as a dict.
+static CAPI_INSTANCE_DICTS: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn remember_capi_instance_dict(object: *mut PyObject, dict: *mut PyObject) {
+    if object.is_null() || dict.is_null() {
+        return;
+    }
+    CAPI_INSTANCE_DICTS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(object as usize, dict as usize);
+}
+
+pub(crate) unsafe fn forget_capi_instance_dict(object: *mut PyObject) {
+    if object.is_null() {
+        return;
+    }
+    CAPI_INSTANCE_DICTS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(&(object as usize));
+}
+
+unsafe fn capi_instance_dict_slot(object: *mut PyObject, ty: *const PyType) -> Result<Option<*mut *mut PyObject>, String> {
+    if object.is_null() || ty.is_null() || !unsafe { crate::capi::is_capi_class(ty) } {
+        return Ok(None);
+    }
+    let offset = unsafe { (*ty).tp_dictoffset };
+    if offset <= 0 {
+        return Ok(None);
+    }
+    let offset = offset as usize;
+    let end = offset
+        .checked_add(mem::size_of::<*mut PyObject>())
+        .ok_or_else(|| "C instance tp_dictoffset overflow".to_owned())?;
+    let basicsize = unsafe { (*ty).tp_basicsize };
+    if end > basicsize {
+        let type_name = unsafe { (*ty).name() };
+        return Err(format!(
+            "C instance dict offset for {type_name} ({offset}) exceeds fixed instance size {basicsize}"
+        ));
+    }
+    Ok(Some(unsafe { object.cast::<u8>().add(offset).cast::<*mut PyObject>() }))
+}
+
+unsafe fn capi_instance_dict_object(object: *mut PyObject, ty: *const PyType) -> Result<*mut PyObject, String> {
+    let Some(slot) = (unsafe { capi_instance_dict_slot(object, ty) })? else {
+        return Ok(ptr::null_mut());
+    };
+    let current = unsafe { slot.read() };
+    if current.is_null() {
+        return Ok(ptr::null_mut());
+    }
+    let registered = CAPI_INSTANCE_DICTS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(&(object as usize))
+        .copied();
+    if registered == Some(current as usize) {
+        Ok(current)
+    } else {
+        Ok(ptr::null_mut())
+    }
+}
+
+pub(crate) unsafe fn ensure_capi_instance_dict(object: *mut PyObject, ty: *const PyType) -> Result<*mut PyObject, String> {
+    let Some(slot) = (unsafe { capi_instance_dict_slot(object, ty) })? else {
+        return Ok(ptr::null_mut());
+    };
+    let current = unsafe { slot.read() };
+    let registered = CAPI_INSTANCE_DICTS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(&(object as usize))
+        .copied();
+    if !current.is_null() && registered == Some(current as usize) {
+        return Ok(current);
+    }
+    let dict = unsafe { abi::map::pon_build_map(ptr::null_mut(), 0) };
+    if dict.is_null() {
+        return Err("failed to allocate C instance dictionary".to_owned());
+    }
+    unsafe { slot.write(dict) };
+    remember_capi_instance_dict(object, dict);
+    Ok(dict)
+}
+
+unsafe fn capi_attr_key(name_id: u32) -> Result<*mut PyObject, String> {
+    let Some(spelling) = intern::resolve(name_id) else {
+        return Err(format!("attribute name id {name_id} is not interned"));
+    };
+    let key = unsafe { abi::pon_const_str(spelling.as_ptr(), spelling.len()) };
+    if key.is_null() {
+        Err(format!("failed to allocate attribute key {spelling:?}"))
+    } else {
+        Ok(key)
+    }
+}
+
+unsafe fn capi_dict_get_attr(object: *mut PyObject, ty: *const PyType, name_id: u32) -> Result<Option<*mut PyObject>, String> {
+    let dict = unsafe { capi_instance_dict_object(object, ty)? };
+    if dict.is_null() {
+        return Ok(None);
+    }
+    let key = unsafe { capi_attr_key(name_id)? };
+    let roots = vec![dict, key];
+    let _roots = abi::scoped_roots(&roots as *const Vec<*mut PyObject>);
+    let _guard = sync::begin_critical_section(dict);
+    unsafe { dict::dict_get(dict, key) }
+}
+
+unsafe fn capi_dict_set_attr(object: *mut PyObject, ty: *const PyType, name_id: u32, value: *mut PyObject) -> Result<*mut PyObject, String> {
+    let dict = unsafe { ensure_capi_instance_dict(object, ty)? };
+    if dict.is_null() {
+        return Err("C instance type has no instance dictionary".to_owned());
+    }
+    let key = unsafe { capi_attr_key(name_id)? };
+    let roots = vec![dict, key, value];
+    let _roots = abi::scoped_roots(&roots as *const Vec<*mut PyObject>);
+    let _guard = sync::begin_critical_section(dict);
+    unsafe { dict::dict_insert(dict, key, value)? };
+    Ok(dict)
+}
+
+unsafe fn capi_dict_del_attr(object: *mut PyObject, ty: *const PyType, name_id: u32) -> Result<bool, String> {
+    let dict = unsafe { capi_instance_dict_object(object, ty)? };
+    if dict.is_null() {
+        return Ok(false);
+    }
+    let key = unsafe { capi_attr_key(name_id)? };
+    let roots = vec![dict, key];
+    let _roots = abi::scoped_roots(&roots as *const Vec<*mut PyObject>);
+    let _guard = sync::begin_critical_section(dict);
+    unsafe { dict::dict_remove(dict, key).map(|removed| removed.is_some()) }
+}
+
+unsafe fn instance_dict_value(object: *mut PyObject, ty: *mut PyType, name_id: u32) -> Result<Option<*mut PyObject>, String> {
+    if unsafe { crate::capi::is_capi_class(ty) } && unsafe { (*ty).tp_dictoffset > 0 } {
+        return unsafe { capi_dict_get_attr(object, ty, name_id) };
+    }
+    let dict = unsafe { instance_dict(object) };
+    if dict.is_null() {
+        return Ok(None);
+    }
+    Ok(unsafe { (&*dict).get(name_id) })
+}
+
 unsafe fn instance_dict(object: *mut PyObject) -> *mut PyClassDict {
     if object.is_null() {
         return ptr::null_mut();
@@ -593,11 +797,10 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
                 AttrCacheKind::DictOffset => {
                     // The record proved the name resolves from the instance
                     // dict (no shadowing data descriptor at this version).
-                    let dict = unsafe { instance_dict(object) };
-                    if !dict.is_null() {
-                        if let Some(value) = unsafe { (&*dict).get(name_id) } {
-                            return value;
-                        }
+                    match unsafe { instance_dict_value(object, obj_ty, name_id) } {
+                        Ok(Some(value)) => return value,
+                        Ok(None) => {}
+                        Err(message) => return raise_attr_error(message),
                     }
                     // Instance mutation is not version-guarded: the name is
                     // gone from this instance — take the slow path (which
@@ -605,11 +808,10 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
                 }
                 AttrCacheKind::Descriptor => {
                     if ic.offset == ATTR_DESCR_PROBE_DICT {
-                        let dict = unsafe { instance_dict(object) };
-                        if !dict.is_null() {
-                            if let Some(value) = unsafe { (&*dict).get(name_id) } {
-                                return value;
-                            }
+                        match unsafe { instance_dict_value(object, obj_ty, name_id) } {
+                            Ok(Some(value)) => return value,
+                            Ok(None) => {}
+                            Err(message) => return raise_attr_error(message),
                         }
                     }
                     return unsafe { descriptor_get(ic.descriptor as *mut PyObject, object, obj_ty) };
@@ -757,14 +959,20 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
         // Heap-layout receivers (plain instances and payload subclasses,
         // which share the PyHeapInstance prefix) get the LIVE view: writes
         // through `obj.__dict__` are attribute writes (mock initializes
-        // every Mock that way).  Exception-layout receivers keep the
-        // legacy snapshot — their layout carries no PyHeapInstance prefix
-        // for the view to bind.
+        // every Mock that way). C-extension receivers with tp_dictoffset
+        // expose the exact dict object stored in the foreign slot.
         let type_id = unsafe { (*obj_ty).gc_type_id };
         if type_id == crate::types::type_::TYPE_ID_HEAP_INSTANCE.0 as usize
             || type_id == crate::types::type_::TYPE_ID_PAYLOAD_SUBCLASS_INSTANCE.0 as usize
         {
             return unsafe { crate::types::instance_dict::new_view(object.cast::<PyHeapInstance>()) };
+        }
+        if unsafe { crate::capi::is_capi_class(obj_ty) } {
+            return match unsafe { capi_instance_dict_object(object, obj_ty) } {
+                Ok(dict) if !dict.is_null() => dict,
+                Ok(_) => unsafe { abi::pon_raise_attribute_error(object, name_id) },
+                Err(message) => raise_attr_error(message),
+            };
         }
         let dict = unsafe { instance_dict(object) };
         if dict.is_null() {
@@ -797,14 +1005,15 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
         return unsafe { abi::pon_raise_attribute_error(object, name_id) };
     }
 
-    let dict = unsafe { instance_dict(object) };
-    if !dict.is_null() {
-        if let Some(value) = unsafe { (&*dict).get(name_id) } {
+    match unsafe { instance_dict_value(object, obj_ty, name_id) } {
+        Ok(Some(value)) => {
             if !is_type {
                 unsafe { record_dict_translation(cell, obj_ty, version) };
             }
             return value;
         }
+        Ok(None) => {}
+        Err(message) => return raise_attr_error(message),
     }
 
     if !class_descr.is_null() {
@@ -917,6 +1126,31 @@ pub unsafe extern "C" fn generic_set_attr(object: *mut PyObject, name: *mut PyOb
         return 0;
     }
 
+    if !is_type && unsafe { crate::capi::is_capi_class(obj_ty) } && unsafe { (*obj_ty).tp_dictoffset > 0 } {
+        if value.is_null() {
+            return match unsafe { capi_dict_del_attr(object, obj_ty, name_id) } {
+                Ok(true) => 0,
+                Ok(false) => raise_missing_attr_status(object, name_id),
+                Err(message) => raise_attr_status(message),
+            };
+        }
+        let dict = match unsafe { capi_dict_set_attr(object, obj_ty, name_id, value) } {
+            Ok(dict) => dict,
+            Err(message) => return raise_attr_status(message),
+        };
+        {
+            // TEMP diagnostic for numpy bring-up.
+            let ty_name = unsafe { crate::types::dict::type_name(object) }.unwrap_or("<untyped>");
+            let attr = crate::intern::resolve(name_id).unwrap_or_default();
+            let capi = unsafe { crate::capi::is_capi_class(obj_ty) };
+            eprintln!(
+                "[pon-diag] generic_set_attr insert: recv '{}' attr '{}' capi {} dictoffset {} dict {:p}",
+                ty_name, attr, capi, unsafe { (*obj_ty).tp_dictoffset }, dict
+            );
+        }
+        return 0;
+    }
+
     let dict = unsafe { instance_dict(object) };
     if dict.is_null() {
         return raise_missing_attr_status(object, name_id);
@@ -935,6 +1169,16 @@ pub unsafe extern "C" fn generic_set_attr(object: *mut PyObject, name: *mut PyOb
             raise_missing_attr_status(object, name_id)
         }
     } else {
+        {
+            // TEMP diagnostic for numpy bring-up.
+            let ty_name = unsafe { crate::types::dict::type_name(object) }.unwrap_or("<untyped>");
+            let attr = crate::intern::resolve(name_id).unwrap_or_default();
+            let capi = unsafe { crate::capi::is_capi_class(obj_ty) };
+            eprintln!(
+                "[pon-diag] generic_set_attr insert: recv '{}' attr '{}' capi {} dictoffset {} dict {:p}",
+                ty_name, attr, capi, unsafe { (*obj_ty).tp_dictoffset }, dict
+            );
+        }
         unsafe { (&mut *dict).set(name_id, value) };
         if is_type {
             let ty = object.cast::<PyType>();

@@ -344,6 +344,7 @@ typedef struct {
     PyObject_HEAD
     PyObject *payload;
     PyObject *type_payload;
+    PyObject *dict;
 } CounterObject;
 
 static long traverse_count = 0;
@@ -358,11 +359,13 @@ static int Counter_traverse(CounterObject *self, visitproc visit, void *arg) {
 static void Counter_dealloc(CounterObject *self) {
     PyObject_GC_UnTrack(self);
     Py_CLEAR(self->payload);
+    Py_CLEAR(self->dict);
     Py_TYPE(self)->tp_free((PyObject *)self);
 }
 
 static PyMemberDef Counter_members[] = {
     {"type_payload", T_OBJECT, offsetof(CounterObject, type_payload), READONLY, "foreign type face payload"},
+    {"__dict__", T_OBJECT, offsetof(CounterObject, dict), READONLY, "instance dictionary"},
     {NULL, 0, 0, 0, NULL}
 };
 
@@ -374,6 +377,7 @@ static PyTypeObject CounterType = {
     .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
     .tp_traverse = (traverseproc)Counter_traverse,
     .tp_members = Counter_members,
+    .tp_dictoffset = offsetof(CounterObject, dict),
     .tp_new = PyType_GenericNew,
 };
 
@@ -412,6 +416,56 @@ static PyObject *drive(PyObject *self, PyObject *args) {
         PyErr_Clear();
     }
     Py_DECREF(payload);
+
+    PyObject *attr_value = PyLong_FromLong(5);
+    if (attr_value == NULL) {
+        Py_DECREF(obj);
+        return NULL;
+    }
+    if (PyObject_SetAttrString(obj, "attr", attr_value) == 0) {
+        ok |= BIT(9);
+    } else if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+    Py_DECREF(attr_value);
+
+    PyObject *attr_before = PyObject_GetAttrString(obj, "attr");
+    if (attr_before != NULL && PyLong_AsLong(attr_before) == 5 && PyErr_Occurred() == NULL) {
+        ok |= BIT(10);
+    }
+    Py_XDECREF(attr_before);
+    if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+
+    Py_ssize_t attr_collect_a = _PyPon_TestCollectPinCount(NULL);
+    Py_ssize_t attr_collect_b = _PyPon_TestCollectPinCount(NULL);
+    Py_ssize_t attr_collect_c = _PyPon_TestCollectPinCount(NULL);
+    if (attr_collect_a >= 0 && attr_collect_b >= 0 && attr_collect_c >= 0) {
+        ok |= BIT(11);
+    } else if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+    PyObject *attr_after = PyObject_GetAttrString(obj, "attr");
+    if (attr_after != NULL && PyLong_AsLong(attr_after) == 5 && PyErr_Occurred() == NULL) {
+        ok |= BIT(12);
+    }
+    Py_XDECREF(attr_after);
+    if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+
+    if (PyObject_SetAttrString(obj, "attr", NULL) == 0) {
+        ok |= BIT(13);
+    } else if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+    PyObject *deleted = PyObject_GetAttrString(obj, "attr");
+    if (deleted == NULL && PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+        ok |= BIT(14);
+    }
+    Py_XDECREF(deleted);
 
     long before = traverse_count;
     Py_ssize_t first_pin_count = _PyPon_TestCollectPinCount(payload);
@@ -499,7 +553,7 @@ PyMODINIT_FUNC PyInit_capi_gc_traverse_ext(void) {
         "drive() returned NULL: {:?}",
         pon_err_message()
     );
-    assert_eq!(format_object_for_print(result).as_deref(), Ok("511"));
+    assert_eq!(format_object_for_print(result).as_deref(), Ok("32767"));
 }
 
 #[test]

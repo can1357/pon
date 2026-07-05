@@ -699,7 +699,7 @@ unsafe extern "C" fn capi_get_optional_attr(
             // Owned-reference out-param: mirror capi_get_attr's pinned result.
             super::pin_object(value);
             unsafe {
-                *result = value;
+                *result = super::foreignize_type_result(value);
             }
             return 1;
         }
@@ -737,13 +737,23 @@ unsafe extern "C" fn capi_set_attr_string(object: *mut PyObject, name: *const c_
             Err(_) => return -1,
         };
         let value = normalize_object_arg(value);
-        if value.is_null() {
+        let status = if value.is_null() {
             // SAFETY: Attribute deletion dispatch tolerates a live receiver and interned name.
             unsafe { abi::pon_del_attr(object, name) }
         } else {
             // SAFETY: Attribute assignment dispatch tolerates a live receiver/value and interned name.
             unsafe { abi::pon_set_attr(object, name, value) }
+        };
+        if status < 0 {
+            // TEMP diagnostic for numpy bring-up.
+            let ty = unsafe { crate::types::dict::type_name(object) }.unwrap_or("<untyped>");
+            let attr = crate::intern::resolve(name).unwrap_or_default();
+            eprintln!(
+                "[pon-diag] capi setattr failed: type '{}' attr '{}' err {:?}",
+                ty, attr, crate::thread_state::pon_err_message()
+            );
         }
+        status
     })
 }
 
@@ -1646,6 +1656,24 @@ unsafe extern "C" fn capi_generic_set_attr(object: *mut PyObject, name: *mut PyO
 unsafe extern "C" fn capi_generic_get_dict(object: *mut PyObject, _context: *mut c_void) -> *mut PyObject {
     catch_object(|| {
         let object = normalize_object_arg(object);
+        if object.is_null() {
+            return abi::return_null_with_error("PyObject_GenericGetDict(NULL)");
+        }
+        // SAFETY: normalized live receiver.
+        let ty = unsafe { (*object).ob_type };
+        if unsafe { crate::capi::is_capi_class(ty) } && unsafe { (*ty).tp_dictoffset } > 0 {
+            // Read the tp_dictoffset slot DIRECTLY: routing through attribute
+            // lookup re-enters the type's own `__dict__` getset (numpy wires
+            // it to this very function) and recurses to a stack overflow.
+            return match unsafe { crate::descr::ensure_capi_instance_dict(object, ty) } {
+                Ok(dict) if !dict.is_null() => dict,
+                Ok(_) => abi::exc::raise_kind_error_text(
+                    ExceptionKind::NotImplementedError,
+                    "PyObject_GenericGetDict receiver has no instance dict slot",
+                ),
+                Err(message) => abi::return_null_with_error(message),
+            };
+        }
         let name = unsafe { abi::pon_const_str(b"__dict__".as_ptr(), b"__dict__".len()) };
         if name.is_null() {
             return ptr::null_mut();
@@ -1784,17 +1812,18 @@ unsafe extern "C" fn capi_visit_managed_dict(object: *mut PyObject, visit: Visit
 
 unsafe extern "C" fn capi_cfunction_new_ex(method_def: *mut super::PyMethodDef, self_object: *mut PyObject, _module: *mut PyObject) -> *mut PyObject {
     catch_object(|| {
-        let Some(method_def) = (unsafe { method_def.as_ref() }) else {
+        let method_def_ptr = method_def;
+        let Some(method_def) = (unsafe { method_def_ptr.as_ref() }) else {
             return raise_type_error("PyCFunction_NewEx method definition must not be NULL");
         };
-        let Some(function) = method_def.ml_meth else {
+        if method_def.ml_meth.is_none() {
             return raise_type_error("PyCFunction_NewEx ml_meth must not be NULL");
-        };
+        }
         let Some(name) = c_string(method_def.ml_name) else {
             return raise_type_error("PyCFunction_NewEx ml_name must not be NULL");
         };
         let self_object = normalize_object_arg(self_object);
-        super::alloc_cfunction(function, method_def.ml_flags, self_object, &name)
+        super::alloc_cfunction_from_method_def(method_def_ptr, self_object, &name)
     })
 }
 

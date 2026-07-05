@@ -361,6 +361,18 @@ fn checked_capi_instance_size(foreign: &ForeignTypeObject, native: *mut PyType, 
         unsafe { (*native).tp_basicsize }
     };
     let fixed = foreign_fixed.max(native_fixed).max(mem::size_of::<PyObjectHeader>());
+    if foreign.tp_dictoffset > 0 {
+        let dict_offset = foreign.tp_dictoffset as usize;
+        let dict_end = dict_offset
+            .checked_add(mem::size_of::<*mut PyObject>())
+            .ok_or_else(|| "PyType_GenericAlloc: tp_dictoffset overflow".to_owned())?;
+        if dict_end > fixed {
+            return Err(format!(
+                "PyType_GenericAlloc: tp_dictoffset {} exceeds fixed instance size {fixed}",
+                foreign.tp_dictoffset
+            ));
+        }
+    }
     let count = nitems.max(0) as usize;
     let itemsize = foreign.tp_itemsize.max(0) as usize;
     let variable = itemsize
@@ -400,6 +412,12 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
     let metaclass_native = if foreign_ref.ob_type.is_null() {
         abi::runtime_type_type()
     } else {
+        // CPython readies an unready metatype on demand.
+        if twin::registered_native_of_foreign(foreign_ref.ob_type).is_none()
+            && unsafe { capi_type_ready(foreign_ref.ob_type) } != 0
+        {
+            return -1;
+        }
         let Some(meta) = twin::registered_native_of_foreign(foreign_ref.ob_type) else {
             raise_type_error(format!("PyType_Ready: metatype of {name_full} is not ready"));
             return -1;
@@ -419,6 +437,13 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
     let base_native = if foreign_ref.tp_base.is_null() {
         crate::native::builtins_mod::builtin_native_type("object").unwrap_or(ptr::null_mut())
     } else {
+        // CPython `PyType_Ready` recursively readies an unready tp_base
+        // (numpy readies DType subclasses before their descriptor base).
+        if twin::native_of_foreign(foreign_ref.tp_base).is_none()
+            && unsafe { capi_type_ready(foreign_ref.tp_base) } != 0
+        {
+            return -1;
+        }
         match twin::native_of_foreign(foreign_ref.tp_base) {
             Some(native) => native,
             None => {
@@ -536,6 +561,11 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
         } else {
             None
         };
+        ty.tp_dictoffset = if foreign_ref.tp_dictoffset > 0 {
+            foreign_ref.tp_dictoffset
+        } else {
+            0
+        };
         if let Some(repr) = slot(foreign_ref.tp_repr) {
             ty.tp_repr = Some(repr);
         }
@@ -594,6 +624,24 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
     }
     super::pin_object(tp_dict);
     foreign_ref.tp_dict = tp_dict;
+    if foreign_ref.tp_base.is_null() {
+        // CPython sets a NULL tp_base to `&PyBaseObject_Type` on ready.
+        foreign_ref.tp_base = twin::foreign_of_native(base_native);
+    }
+    if foreign_ref.tp_bases.is_null() && !foreign_ref.tp_base.is_null() {
+        // CPython parity: `tp_bases` holds the declared bases. Elements are
+        // FOREIGN faces so C-side identity checks (`GET_ITEM(bases, 0) ==
+        // &Base`) hold; the tuple itself is a pinned pon allocation the GC
+        // traces (face elements classify as non-heap and are skipped). It is
+        // C-face-only state and never crosses into pon code paths.
+        let mut items = [foreign_ref.tp_base.cast::<PyObject>()];
+        let bases = unsafe { abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) };
+        if bases.is_null() {
+            return -1;
+        }
+        super::pin_object(bases);
+        foreign_ref.tp_bases = bases;
+    }
     foreign_ref.tp_flags |= TPFLAGS_READY;
     if foreign_ref.tp_alloc.is_null() {
         foreign_ref.tp_alloc = capi_generic_alloc as *mut ();
@@ -910,11 +958,11 @@ unsafe fn install_namespace(namespace: *mut PyClassDict, foreign: &ForeignTypeOb
                 raise_type_error("PyType_Ready: method with invalid name");
                 return false;
             };
-            let Some(function) = method.ml_meth else {
+            if method.ml_meth.is_none() {
                 raise_type_error(format!("PyType_Ready: method '{method_name}' has no function"));
                 return false;
-            };
-            let carrier = super::alloc_cfunction(function, method.ml_flags, ptr::null_mut(), &method_name);
+            }
+            let carrier = super::alloc_cfunction_from_method_def(cursor, ptr::null_mut(), &method_name);
             if carrier.is_null() {
                 return false;
             }
@@ -973,6 +1021,17 @@ unsafe extern "C" fn capi_tp_new_trampoline(cls: *mut PyType, args: *mut PyObjec
         let new_fn: unsafe extern "C" fn(*mut ForeignTypeObject, *mut PyObject, *mut PyObject) -> *mut PyObject =
             // SAFETY: tp_new fields hold newfunc pointers by header contract.
             unsafe { core::mem::transmute(tp_new) };
+        // CPython always hands tp_new a REAL args tuple (possibly empty);
+        // NULL breaks PyArg_ParseTuple* inside C constructors.
+        let args = if args.is_null() {
+            let empty = unsafe { abi::seq::pon_build_tuple(ptr::null_mut(), 0) };
+            if empty.is_null() {
+                return ptr::null_mut();
+            }
+            empty
+        } else {
+            args
+        };
         unsafe { new_fn(foreign, args, kwargs) }
     };
     transfer_new_reference_to_runtime(result)
@@ -1027,6 +1086,9 @@ unsafe extern "C" fn capi_generic_alloc(foreign: *mut ForeignTypeObject, nitems:
             // PyVarObject.ob_size sits directly after the header.
             object.cast::<u8>().add(mem::size_of::<PyObjectHeader>()).cast::<isize>().write(nitems);
         }
+        if let Some(dict_slot) = capi_instance_dict_slot(block, native) {
+            dict_slot.write(ptr::null_mut());
+        }
     }
     CAPI_INSTANCES
         .lock()
@@ -1062,6 +1124,23 @@ unsafe extern "C" fn capi_traverse_visit(object: *mut PyObject, arg: *mut c_void
     0
 }
 
+unsafe fn capi_instance_dict_slot(object: *mut u8, native: *const PyType) -> Option<*mut *mut PyObject> {
+    if object.is_null() || native.is_null() {
+        return None;
+    }
+    let offset = unsafe { (*native).tp_dictoffset };
+    if offset <= 0 {
+        return None;
+    }
+    let offset = offset as usize;
+    let end = offset.checked_add(mem::size_of::<*mut PyObject>())?;
+    if end > unsafe { (*native).tp_basicsize } {
+        return None;
+    }
+    Some(unsafe { object.add(offset).cast::<*mut PyObject>() })
+}
+
+
 /// Traces declared `T_OBJECT`/`T_OBJECT_EX` members precisely: the foreign
 /// member table names every ref-holding field offset, so stored values —
 /// including ones C code wrote straight into the struct — live exactly as
@@ -1093,6 +1172,7 @@ unsafe extern "C" fn trace_capi_instance(object: *mut u8, visitor: &mut dyn FnMu
             }
         }
     }
+
 
     // SAFETY: `native` is the runtime type object paired with `foreign`.
     let Some(traverse) = (unsafe { (*native).capi_tp_traverse }) else {
@@ -1128,6 +1208,7 @@ unsafe extern "C" fn finalize_capi_instance(object: *mut u8) {
             unsafe { core::mem::transmute(dealloc) };
         unsafe { dealloc_fn(object.cast::<PyObject>()) };
     }
+    unsafe { crate::descr::forget_capi_instance_dict(object.cast::<PyObject>()) };
     CAPI_INSTANCES
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
@@ -1168,6 +1249,9 @@ unsafe extern "C" fn capi_object_init(object: *mut PyObject, foreign: *mut Forei
     unsafe {
         (*object).ob_type = native;
         (*object).gc_meta = crate::object::GcMeta::default();
+        if let Some(dict_slot) = capi_instance_dict_slot(object.cast::<u8>(), native) {
+            dict_slot.write(ptr::null_mut());
+        }
     }
     new_reference(object)
 }
