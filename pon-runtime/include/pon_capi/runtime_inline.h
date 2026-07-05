@@ -74,6 +74,20 @@ static inline PyThreadState *PyThreadState_Get(void) {
     return PyPon_Capi()->runtime_->thread_state_get();
 }
 
+#define PyThreadState_GET() PyThreadState_Get()
+
+static inline PyThreadState *PyThreadState_GetUnchecked(void) {
+    return PyThreadState_Get();
+}
+
+static inline PyThreadState *PyThreadState_UncheckedGet(void) {
+    return PyThreadState_Get();
+}
+
+static inline PyThreadState *_PyThreadState_UncheckedGet(void) {
+    return PyThreadState_Get();
+}
+
 static inline PyFrameObject *PyThreadState_GetFrame(PyThreadState *state) {
     return PyPon_Capi()->runtime_->thread_state_get_frame(state);
 }
@@ -121,6 +135,16 @@ static inline void *PyCapsule_Import(const char *name, int no_block) {
 
 static inline PyObject *PyImport_ImportModule(const char *name) {
     return PyPon_Capi()->runtime_->import_import_module(name);
+}
+
+static inline PyObject *PyImport_ImportModuleLevel(
+    const char *name,
+    PyObject *globals,
+    PyObject *locals,
+    PyObject *fromlist,
+    int level)
+{
+    return PyPon_Capi()->runtime_->import_import_module_level(name, globals, locals, fromlist, level);
 }
 
 static inline PyObject *PyImport_AddModule(const char *name) {
@@ -185,6 +209,13 @@ static inline void *_PyPon_DateTime_CAPIImport(void) {
 static inline int _PyPon_DateTime_GetAttrInt(PyObject *object, const char *name) {
     return PyPon_Capi()->runtime_->datetime_get_attr_int(object, name);
 }
+
+static inline PySendResult PyIter_Send(PyObject *iter, PyObject *arg, PyObject **presult) {
+    return PyPon_Capi()->runtime_->iter_send(iter, arg, presult);
+}
+
+#define PyAsyncGen_CheckExact(object) \
+    (PyPon_Capi()->runtime_->async_gen_check_exact((PyObject *)(object)))
 
 #ifdef PON_CAPI_TESTING
 static inline Py_ssize_t _PyPon_TestCollectPinCount(PyObject *object) {

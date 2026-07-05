@@ -28,6 +28,7 @@ const PY_PRINT_RAW: c_int = 1;
 type PySsizeT = isize;
 type GetBufferProc = unsafe extern "C" fn(*mut PyObject, *mut PyBuffer, c_int) -> c_int;
 type ReleaseBufferProc = unsafe extern "C" fn(*mut PyObject, *mut PyBuffer);
+type VisitProc = unsafe extern "C" fn(*mut PyObject, *mut c_void) -> c_int;
 
 #[repr(C)]
 pub(crate) struct PyBuffer {
@@ -142,6 +143,11 @@ pub(crate) struct PyPonCapiObject {
     method_new: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
     bytes: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
     length_hint: unsafe extern "C" fn(*mut PyObject, isize) -> isize,
+    cfunction_new_ex: unsafe extern "C" fn(*mut super::PyMethodDef, *mut PyObject, *mut PyObject) -> *mut PyObject,
+    generic_set_dict: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut c_void) -> c_int,
+    clear_managed_dict: unsafe extern "C" fn(*mut PyObject) -> c_int,
+    visit_managed_dict: unsafe extern "C" fn(*mut PyObject, VisitProc, *mut c_void) -> c_int,
+    memoryview_from_memory: unsafe extern "C" fn(*mut c_char, PySsizeT, c_int) -> *mut PyObject,
 }
 
 unsafe impl Send for PyPonCapiObject {}
@@ -205,6 +211,11 @@ pub(crate) fn build() -> PyPonCapiObject {
         method_new: capi_method_new,
         bytes: capi_bytes,
         length_hint: capi_length_hint,
+        cfunction_new_ex: capi_cfunction_new_ex,
+        generic_set_dict: capi_generic_set_dict,
+        clear_managed_dict: capi_clear_managed_dict,
+        visit_managed_dict: capi_visit_managed_dict,
+        memoryview_from_memory: capi_memoryview_from_memory,
     }
 }
 
@@ -1520,6 +1531,15 @@ unsafe extern "C" fn capi_memoryview_from_buffer(_view: *const PyBuffer) -> *mut
     })
 }
 
+unsafe extern "C" fn capi_memoryview_from_memory(_mem: *mut c_char, _size: PySsizeT, _flags: c_int) -> *mut PyObject {
+    catch_object(|| {
+        abi::exc::raise_kind_error_text(
+            ExceptionKind::NotImplementedError,
+            "PyMemoryView_FromMemory is not implemented yet: wrapping raw foreign memory is not safe under Pon",
+        )
+    })
+}
+
 fn memoryview_format_pointer(format: u8) -> *mut c_char {
     match format {
         b'I' => BUFFER_FORMAT_I.as_ptr().cast::<c_char>().cast_mut(),
@@ -1645,6 +1665,26 @@ unsafe extern "C" fn capi_generic_get_dict(object: *mut PyObject, _context: *mut
     })
 }
 
+unsafe extern "C" fn capi_generic_set_dict(object: *mut PyObject, value: *mut PyObject, _context: *mut c_void) -> c_int {
+    catch_status(|| {
+        let object = normalize_object_arg(object);
+        let value = normalize_object_arg(value);
+        let name = unsafe { abi::pon_const_str(b"__dict__".as_ptr(), b"__dict__".len()) };
+        if name.is_null() {
+            return -1;
+        }
+        let status = unsafe { crate::descr::generic_set_attr(object, name, value) };
+        if status < 0 && (abi::exc::pending_exception_is("AttributeError") || !pon_err_occurred()) {
+            pon_err_clear();
+            return raise_status(
+                ExceptionKind::NotImplementedError,
+                "PyObject_GenericSetDict is only implemented for objects with a Pon-managed __dict__ view",
+            );
+        }
+        status
+    })
+}
+
 unsafe extern "C" fn capi_print(object: *mut PyObject, file: *mut libc::FILE, flags: c_int) -> c_int {
     catch_status(|| {
         if file.is_null() {
@@ -1708,6 +1748,54 @@ unsafe extern "C" fn capi_clear_weakrefs(object: *mut PyObject) {
         // objects without a registry row are a documented no-op here.
         crate::types::weakref::clear_weakrefs(object);
     }));
+}
+
+/// Pon has no CPython split managed-dict storage: instance namespaces are traced
+/// directly by the GC, so there is no C-level dict pointer to clear during
+/// cycle breaking. Keep the API as an explicit no-op for extension tp_clear code.
+unsafe extern "C" fn capi_clear_managed_dict(_object: *mut PyObject) -> c_int {
+    0
+}
+
+unsafe extern "C" fn capi_visit_managed_dict(object: *mut PyObject, visit: VisitProc, arg: *mut c_void) -> c_int {
+    catch_status(|| {
+        let object = normalize_object_arg(object);
+        if object.is_null() {
+            return 0;
+        }
+        let name = unsafe { abi::pon_const_str(b"__dict__".as_ptr(), b"__dict__".len()) };
+        if name.is_null() {
+            return -1;
+        }
+        let dict = unsafe { crate::descr::generic_get_attr(object, name) };
+        if dict.is_null() {
+            if abi::exc::pending_exception_is("AttributeError") || !pon_err_occurred() {
+                pon_err_clear();
+                return 0;
+            }
+            return -1;
+        }
+        super::pin_object(dict);
+        let status = unsafe { visit(dict, arg) };
+        super::unpin_object(dict);
+        status
+    })
+}
+
+unsafe extern "C" fn capi_cfunction_new_ex(method_def: *mut super::PyMethodDef, self_object: *mut PyObject, _module: *mut PyObject) -> *mut PyObject {
+    catch_object(|| {
+        let Some(method_def) = (unsafe { method_def.as_ref() }) else {
+            return raise_type_error("PyCFunction_NewEx method definition must not be NULL");
+        };
+        let Some(function) = method_def.ml_meth else {
+            return raise_type_error("PyCFunction_NewEx ml_meth must not be NULL");
+        };
+        let Some(name) = c_string(method_def.ml_name) else {
+            return raise_type_error("PyCFunction_NewEx ml_name must not be NULL");
+        };
+        let self_object = normalize_object_arg(self_object);
+        super::alloc_cfunction(function, method_def.ml_flags, self_object, &name)
+    })
 }
 
 unsafe extern "C" fn capi_seq_iter_new(sequence: *mut PyObject) -> *mut PyObject {

@@ -7,6 +7,9 @@
 
 #define Py_PRINT_RAW 1
 
+typedef PyObject *(*PyCMethod)(PyObject *, PyTypeObject *, PyObject *const *, size_t, PyObject *);
+
+
 static inline int PyType_Check(PyObject *object) {
     return PyPon_Capi()->object_->type_check(object);
 }
@@ -320,6 +323,18 @@ static inline PyObject *PyObject_GenericGetDict(PyObject *object, void *context)
     return PyPon_Capi()->object_->generic_get_dict(object, context);
 }
 
+static inline int PyObject_GenericSetDict(PyObject *object, PyObject *value, void *context) {
+    return PyPon_Capi()->object_->generic_set_dict(object, value, context);
+}
+
+static inline int PyObject_ClearManagedDict(PyObject *object) {
+    return PyPon_Capi()->object_->clear_managed_dict(object);
+}
+
+static inline int PyObject_VisitManagedDict(PyObject *object, visitproc visit, void *arg) {
+    return PyPon_Capi()->object_->visit_managed_dict(object, visit, arg);
+}
+
 static inline void PyObject_ClearWeakRefs(PyObject *object) {
     PyPon_Capi()->object_->clear_weakrefs(object);
 }
@@ -330,6 +345,14 @@ static inline PyObject *PySeqIter_New(PyObject *sequence) {
 
 static inline PyObject *PyMethod_New(PyObject *function, PyObject *self) {
     return PyPon_Capi()->object_->method_new(function, self);
+}
+
+static inline PyObject *PyCFunction_NewEx(PyMethodDef *ml, PyObject *self, PyObject *module) {
+    return PyPon_Capi()->object_->cfunction_new_ex(ml, self, module);
+}
+
+static inline PyObject *PyCFunction_New(PyMethodDef *ml, PyObject *self) {
+    return PyCFunction_NewEx(ml, self, NULL);
 }
 
 static inline int PyObject_GetBuffer(PyObject *object, Py_buffer *view, int flags) {
@@ -354,6 +377,10 @@ static inline PyObject *PyMemoryView_FromObject(PyObject *object) {
 
 static inline PyObject *PyMemoryView_FromBuffer(const Py_buffer *view) {
     return PyPon_Capi()->object_->memoryview_from_buffer(view);
+}
+
+static inline PyObject *PyMemoryView_FromMemory(char *mem, Py_ssize_t size, int flags) {
+    return PyPon_Capi()->object_->memoryview_from_memory(mem, size, flags);
 }
 
 static inline int PyMemoryView_Check(PyObject *object) {

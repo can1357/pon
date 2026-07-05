@@ -8,17 +8,27 @@ use std::ffi::{CStr, CString};
 use std::sync::{LazyLock, Mutex};
 
 use num_traits::ToPrimitive;
+use pon_gc::{GcTypeInfo, TypeId};
 
 use crate::abi;
 use crate::intern::{intern, resolve};
-use crate::object::{PyObject, PyObjectHeader, PyType};
+use crate::object::{PyObject, PyObjectHeader, PyType, is_exact_type};
 use crate::thread_state::{pon_err_clear, pon_err_message, pon_err_occurred};
 use crate::types::exc::ExceptionKind;
+use crate::types::async_generator::ensure_async_generator_type;
+use crate::types::coroutine::ensure_coroutine_type;
+use crate::types::frame::{TYPE_ID_FRAME, ensure_frame_type, finalize_frame, trace_frame};
+use crate::types::generator::ensure_generator_type;
 
 use super::twin::{self, ForeignTypeObject};
 use super::{PyModuleDef, c_string};
 
 pub(crate) type PyCapsuleDestructor = Option<unsafe extern "C" fn(*mut PyObject)>;
+type PySendResult = c_int;
+const PYGEN_RETURN: PySendResult = 0;
+const PYGEN_ERROR: PySendResult = -1;
+const PYGEN_NEXT: PySendResult = 1;
+
 
 /// C mirror: `include/pon_capi/runtime.h` `PyPonCapiRuntime`.
 #[repr(C)]
@@ -53,6 +63,55 @@ pub(crate) struct PyPonCapiRuntime {
     #[cfg(test)]
     test_collect_pin_count: unsafe extern "C" fn(*mut PyObject) -> isize,
     contextvar_set: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+    frame_new: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut PyObject, *mut PyObject) -> *mut c_void,
+    traceback_here: unsafe extern "C" fn(*mut c_void) -> c_int,
+    traceback_check: unsafe extern "C" fn(*mut PyObject) -> c_int,
+    code_new_empty: unsafe extern "C" fn(*const c_char, *const c_char, c_int) -> *mut c_void,
+    code_new: unsafe extern "C" fn(
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        *mut PyObject,
+        *mut PyObject,
+        *mut PyObject,
+        *mut PyObject,
+        *mut PyObject,
+        *mut PyObject,
+        *mut PyObject,
+        *mut PyObject,
+        *mut PyObject,
+        c_int,
+        *mut PyObject,
+        *mut PyObject,
+    ) -> *mut c_void,
+    code_new_with_posonly_args: unsafe extern "C" fn(
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        *mut PyObject,
+        *mut PyObject,
+        *mut PyObject,
+        *mut PyObject,
+        *mut PyObject,
+        *mut PyObject,
+        *mut PyObject,
+        *mut PyObject,
+        *mut PyObject,
+        c_int,
+        *mut PyObject,
+        *mut PyObject,
+    ) -> *mut c_void,
+    code_get_num_free: unsafe extern "C" fn(*mut c_void) -> c_int,
+    code_has_free_vars: unsafe extern "C" fn(*mut c_void) -> c_int,
+    import_import_module_level:
+        unsafe extern "C" fn(*const c_char, *mut PyObject, *mut PyObject, *mut PyObject, c_int) -> *mut PyObject,
+    iter_send: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut *mut PyObject) -> PySendResult,
+    async_gen_check_exact: unsafe extern "C" fn(*mut PyObject) -> c_int,
 }
 
 unsafe impl Send for PyPonCapiRuntime {}
@@ -79,12 +138,41 @@ unsafe impl Send for PyInterpreterState {}
 unsafe impl Sync for PyInterpreterState {}
 
 #[repr(C)]
+struct PyErrStackItem {
+    exc_value: *mut PyObject,
+    previous_item: *mut PyErrStackItem,
+}
+
+unsafe impl Send for PyErrStackItem {}
+unsafe impl Sync for PyErrStackItem {}
+
+#[repr(C)]
 struct PyThreadState {
     interp: *mut PyInterpreterState,
+    exc_info: *mut PyErrStackItem,
+    exc_state: PyErrStackItem,
 }
 
 unsafe impl Send for PyThreadState {}
 unsafe impl Sync for PyThreadState {}
+
+/// GC id for C-API-created code objects.  It lives in the C-extension carrier
+/// range next to the other capi-only heap payloads.
+const TYPE_ID_CAPI_CODE: TypeId = TypeId(143);
+
+#[repr(C)]
+struct PyCapiCodeObject {
+    ob_base: PyObjectHeader,
+    _co_firsttraceable: c_int,
+    co_firstlineno: c_int,
+    co_filename: *mut PyObject,
+    co_name: *mut PyObject,
+    co_qualname: *mut PyObject,
+    co_nfreevars: c_int,
+}
+
+unsafe impl Send for PyCapiCodeObject {}
+unsafe impl Sync for PyCapiCodeObject {}
 
 #[repr(C)]
 struct PyDateTimeCapi {
@@ -133,8 +221,17 @@ static DATETIME_CAPI: LazyLock<Mutex<Option<usize>>> = LazyLock::new(|| Mutex::n
 const DATETIME_CAPSULE_NAME: &str = "datetime.datetime_CAPI";
 
 static MAIN_INTERPRETER_STATE: LazyLock<PyInterpreterState> = LazyLock::new(|| PyInterpreterState { _private: 0 });
-static MAIN_THREAD_STATE: LazyLock<PyThreadState> = LazyLock::new(|| PyThreadState {
-    interp: interpreter_state_main(),
+static MAIN_THREAD_STATE: LazyLock<usize> = LazyLock::new(|| {
+    let mut state = Box::new(PyThreadState {
+        interp: interpreter_state_main(),
+        exc_info: ptr::null_mut(),
+        exc_state: PyErrStackItem {
+            exc_value: ptr::null_mut(),
+            previous_item: ptr::null_mut(),
+        },
+    });
+    state.exc_info = &mut state.exc_state;
+    Box::into_raw(state) as usize
 });
 static MODULE_STATES: LazyLock<Mutex<HashMap<usize, Box<[u8]>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -171,6 +268,17 @@ pub(crate) fn build() -> PyPonCapiRuntime {
         #[cfg(test)]
         test_collect_pin_count: capi_test_collect_pin_count,
         contextvar_set: capi_contextvar_set,
+        frame_new: capi_frame_new,
+        traceback_here: capi_traceback_here,
+        traceback_check: capi_traceback_check,
+        code_new_empty: capi_code_new_empty,
+        code_new: capi_code_new,
+        code_new_with_posonly_args: capi_code_new_with_posonly_args,
+        code_get_num_free: capi_code_get_num_free,
+        code_has_free_vars: capi_code_has_free_vars,
+        import_import_module_level: capi_import_import_module_level,
+        iter_send: capi_iter_send,
+        async_gen_check_exact: capi_async_gen_check_exact,
     }
 }
 
@@ -188,7 +296,7 @@ fn interpreter_state_main() -> *mut PyInterpreterState {
 }
 
 fn thread_state_singleton() -> *mut PyThreadState {
-    ptr::from_ref(&*MAIN_THREAD_STATE).cast_mut()
+    *MAIN_THREAD_STATE as *mut PyThreadState
 }
 pub(super) fn register_module_state(module: *mut PyObject, size: usize) -> Result<(), String> {
     if module.is_null() {
@@ -256,6 +364,242 @@ unsafe extern "C" fn capi_frame_get_back(_frame: *mut c_void) -> *mut c_void {
 unsafe extern "C" fn capi_frame_get_code(_frame: *mut c_void) -> *mut c_void {
     raise_system_error("PyFrame_GetCode is not implemented: Pon exposes no C-visible frame objects");
     ptr::null_mut()
+}
+
+unsafe extern "C" fn capi_frame_new(
+    _tstate: *mut c_void,
+    code: *mut c_void,
+    _globals: *mut PyObject,
+    _locals: *mut PyObject,
+) -> *mut c_void {
+    if code.is_null() {
+        return raise_system_error_null("PyFrame_New called with NULL code").cast::<c_void>();
+    }
+    let frame_type = ensure_frame_type(abi::runtime_type_type());
+    let info = GcTypeInfo {
+        size: mem::size_of::<abi::PyFrame>(),
+        trace: trace_frame,
+        finalize: Some(finalize_frame),
+    };
+    let block = match abi::alloc_gc_object(TYPE_ID_FRAME, info) {
+        Ok(block) => block,
+        Err(message) => return raise_system_error_null(&message).cast::<c_void>(),
+    };
+    let frame = block.cast::<abi::PyFrame>();
+    let firstlineno = unsafe { (*code.cast::<PyCapiCodeObject>()).co_firstlineno };
+    let line = if firstlineno > 0 { firstlineno as u32 } else { 0 };
+    unsafe {
+        ptr::write(frame, abi::PyFrame::new(frame_type.cast_const(), 0, ptr::null_mut()));
+        (*frame).line = line;
+    }
+    new_reference(frame.cast::<PyObject>()).cast::<c_void>()
+}
+
+unsafe extern "C" fn capi_traceback_here(frame: *mut c_void) -> c_int {
+    match abi::exc::prepend_traceback_for_frame(frame.cast::<abi::PyFrame>()) {
+        Ok(()) => 0,
+        Err(message) => {
+            raise_system_error(&message);
+            -1
+        }
+    }
+}
+
+unsafe extern "C" fn capi_traceback_check(object: *mut PyObject) -> c_int {
+    if object.is_null() || !crate::tag::is_heap(object) {
+        return 0;
+    }
+    let traceback_type = crate::traceback::ensure_traceback_type(abi::runtime_type_type());
+    (unsafe { (*object).ob_type } == traceback_type.cast_const()) as c_int
+}
+
+unsafe extern "C" fn capi_code_new_empty(
+    filename: *const c_char,
+    funcname: *const c_char,
+    firstlineno: c_int,
+) -> *mut c_void {
+    let Some(filename) = c_string(filename) else {
+        return raise_system_error_null("PyCode_NewEmpty called with invalid filename").cast::<c_void>();
+    };
+    let Some(funcname) = c_string(funcname) else {
+        return raise_system_error_null("PyCode_NewEmpty called with invalid function name").cast::<c_void>();
+    };
+    let Some(filename_object) = unicode_object_from_str(&filename) else {
+        return ptr::null_mut();
+    };
+    let Some(name_object) = unicode_object_from_str(&funcname) else {
+        return ptr::null_mut();
+    };
+    alloc_capi_code_object(filename_object, name_object, name_object, firstlineno, 0)
+}
+
+unsafe extern "C" fn capi_code_new(
+    _argcount: c_int,
+    _kwonlyargcount: c_int,
+    _nlocals: c_int,
+    _stacksize: c_int,
+    _flags: c_int,
+    _code: *mut PyObject,
+    _consts: *mut PyObject,
+    _names: *mut PyObject,
+    _varnames: *mut PyObject,
+    _freevars: *mut PyObject,
+    _cellvars: *mut PyObject,
+    filename: *mut PyObject,
+    name: *mut PyObject,
+    qualname: *mut PyObject,
+    firstlineno: c_int,
+    _linetable: *mut PyObject,
+    _exceptiontable: *mut PyObject,
+) -> *mut c_void {
+    unsafe { capi_code_new_common(filename, name, qualname, firstlineno) }
+}
+
+unsafe extern "C" fn capi_code_new_with_posonly_args(
+    _argcount: c_int,
+    _posonlyargcount: c_int,
+    _kwonlyargcount: c_int,
+    _nlocals: c_int,
+    _stacksize: c_int,
+    _flags: c_int,
+    _code: *mut PyObject,
+    _consts: *mut PyObject,
+    _names: *mut PyObject,
+    _varnames: *mut PyObject,
+    _freevars: *mut PyObject,
+    _cellvars: *mut PyObject,
+    filename: *mut PyObject,
+    name: *mut PyObject,
+    qualname: *mut PyObject,
+    firstlineno: c_int,
+    _linetable: *mut PyObject,
+    _exceptiontable: *mut PyObject,
+) -> *mut c_void {
+    unsafe { capi_code_new_common(filename, name, qualname, firstlineno) }
+}
+
+unsafe fn capi_code_new_common(
+    filename: *mut PyObject,
+    name: *mut PyObject,
+    qualname: *mut PyObject,
+    firstlineno: c_int,
+) -> *mut c_void {
+    let Some(filename) = (unsafe { code_text_arg(filename, "filename") }) else {
+        return ptr::null_mut();
+    };
+    let Some(name) = (unsafe { code_text_arg(name, "name") }) else {
+        return ptr::null_mut();
+    };
+    let qualname = if qualname.is_null() {
+        name
+    } else {
+        let Some(qualname) = (unsafe { code_text_arg(qualname, "qualname") }) else {
+            return ptr::null_mut();
+        };
+        qualname
+    };
+    alloc_capi_code_object(filename, name, qualname, firstlineno, 0)
+}
+
+unsafe fn code_text_arg(object: *mut PyObject, label: &str) -> Option<*mut PyObject> {
+    let object = crate::tag::untag_arg(object);
+    if object.is_null() {
+        raise_type_error(&format!("PyCode_New {label} must be str, not NULL"));
+        return None;
+    }
+    if unsafe { crate::types::type_::unicode_text(object) }.is_none() {
+        raise_type_error(&format!("PyCode_New {label} must be str"));
+        return None;
+    }
+    Some(object)
+}
+
+fn unicode_object_from_str(text: &str) -> Option<*mut PyObject> {
+    let object = unsafe { abi::pon_const_str(text.as_ptr(), text.len()) };
+    if object.is_null() { None } else { Some(object) }
+}
+
+fn alloc_capi_code_object(
+    filename: *mut PyObject,
+    name: *mut PyObject,
+    qualname: *mut PyObject,
+    firstlineno: c_int,
+    nfreevars: c_int,
+) -> *mut c_void {
+    let info = GcTypeInfo {
+        size: mem::size_of::<PyCapiCodeObject>(),
+        trace: trace_capi_code,
+        finalize: None,
+    };
+    let block = match abi::alloc_gc_object(TYPE_ID_CAPI_CODE, info) {
+        Ok(block) => block,
+        Err(message) => return raise_system_error_null(&message).cast::<c_void>(),
+    };
+    let code = block.cast::<PyCapiCodeObject>();
+    unsafe {
+        ptr::write(
+            code,
+            PyCapiCodeObject {
+                ob_base: PyObjectHeader::new(capi_code_type().cast_const()),
+                _co_firsttraceable: 0,
+                co_firstlineno: firstlineno,
+                co_filename: filename,
+                co_name: name,
+                co_qualname: qualname,
+                co_nfreevars: if nfreevars < 0 { 0 } else { nfreevars },
+            },
+        );
+    }
+    new_reference(code.cast::<PyObject>()).cast::<c_void>()
+}
+
+fn capi_code_type() -> *mut PyType {
+    static CODE_TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut ty = PyType::new(abi::runtime_type_type().cast_const(), "code", mem::size_of::<PyCapiCodeObject>());
+        ty.gc_type_id = TYPE_ID_CAPI_CODE.0 as usize;
+        ty.tp_getattro = Some(capi_code_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *CODE_TYPE as *mut PyType
+}
+
+unsafe extern "C" fn capi_code_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(attr) = (unsafe { crate::types::type_::unicode_text(crate::tag::untag_arg(name)) }) else {
+        raise_type_error("code attribute name must be str");
+        return ptr::null_mut();
+    };
+    let code = unsafe { &*object.cast::<PyCapiCodeObject>() };
+    match attr {
+        "co_filename" => new_reference(code.co_filename),
+        "co_name" => new_reference(code.co_name),
+        "co_qualname" => new_reference(code.co_qualname),
+        "co_firstlineno" => unsafe { abi::pon_const_int(i64::from(code.co_firstlineno)) },
+        _ => unsafe { abi::pon_raise_attribute_error(object, intern(attr)) },
+    }
+}
+
+unsafe extern "C" fn trace_capi_code(object: *mut u8, visitor: &mut dyn FnMut(*mut u8)) {
+    if object.is_null() {
+        return;
+    }
+    let code = unsafe { &*object.cast::<PyCapiCodeObject>() };
+    for value in [code.co_filename, code.co_name, code.co_qualname] {
+        if !value.is_null() {
+            visitor(value.cast::<u8>());
+        }
+    }
+}
+
+unsafe extern "C" fn capi_code_get_num_free(code: *mut c_void) -> c_int {
+    if code.is_null() {
+        raise_system_error("PyCode_GetNumFree called with NULL code");
+        return 0;
+    }
+    unsafe { (*code.cast::<PyCapiCodeObject>()).co_nfreevars }
+}
+
+unsafe extern "C" fn capi_code_has_free_vars(code: *mut c_void) -> c_int {
+    (unsafe { capi_code_get_num_free(code) } > 0) as c_int
 }
 
 unsafe extern "C" fn capi_contextvar_new(name: *const c_char, default: *mut PyObject) -> *mut PyObject {
@@ -1174,6 +1518,29 @@ unsafe extern "C" fn capi_import_import(name: *mut PyObject) -> *mut PyObject {
     new_reference(import_module_text(&text.to_owned()))
 }
 
+unsafe extern "C" fn capi_import_import_module_level(
+    name: *const c_char,
+    _globals: *mut PyObject,
+    _locals: *mut PyObject,
+    fromlist: *mut PyObject,
+    level: c_int,
+) -> *mut PyObject {
+    let Some(name) = c_string(name) else {
+        return raise_import_error_null("PyImport_ImportModuleLevel called with invalid module name");
+    };
+    let fromlist = crate::tag::untag_arg(fromlist);
+    let none = unsafe { abi::pon_none() };
+    let has_fromlist = !fromlist.is_null() && fromlist != none;
+    let star = [intern("*")];
+    let (fromlist_ptr, fromlist_len) = if has_fromlist {
+        (star.as_ptr(), star.len())
+    } else {
+        (ptr::null(), 0)
+    };
+    let level = if level <= 0 { 0 } else { level as u32 };
+    new_reference(unsafe { crate::import::pon_import_name(intern(&name), fromlist_ptr, fromlist_len, level) })
+}
+
 /// `PyCapsule_SetName`: replaces the stored name pointer (caller keeps the
 /// storage alive, CPython contract).
 unsafe extern "C" fn capi_capsule_set_name(capsule: *mut PyObject, name: *const c_char) -> c_int {
@@ -1252,6 +1619,95 @@ fn import_module_text(name: &str) -> *mut PyObject {
     let name_id = intern(name);
     let fromlist = [intern("*")];
     unsafe { crate::import::pon_import_name(name_id, fromlist.as_ptr(), fromlist.len(), 0) }
+}
+
+unsafe fn is_none_object(object: *mut PyObject) -> bool {
+    let object = crate::tag::untag_arg(object);
+    object.is_null() || object == unsafe { abi::pon_none() }
+}
+
+unsafe fn is_exact_generator_family(object: *mut PyObject) -> bool {
+    let object = crate::tag::untag_arg(object);
+    if object.is_null() || !crate::tag::is_heap(object) {
+        return false;
+    }
+    let type_type = abi::runtime_type_type();
+    if type_type.is_null() {
+        return false;
+    }
+    let generator = ensure_generator_type(type_type).cast_const();
+    let coroutine = ensure_coroutine_type(type_type).cast_const();
+    let async_generator = ensure_async_generator_type(type_type).cast_const();
+    unsafe { is_exact_type(object, generator) || is_exact_type(object, coroutine) || is_exact_type(object, async_generator) }
+}
+
+fn finish_iter_send_return(presult: *mut *mut PyObject) -> PySendResult {
+    if abi::exc::pending_exception_is("StopIteration") {
+        let value = unsafe { abi::r#gen::pon_gen_stop_value() };
+        if value.is_null() {
+            return PYGEN_ERROR;
+        }
+        unsafe { *presult = new_reference(value) };
+        return PYGEN_RETURN;
+    }
+    if abi::exc::pending_exception_is("StopAsyncIteration") {
+        pon_err_clear();
+        let none = unsafe { abi::pon_none() };
+        if none.is_null() {
+            return PYGEN_ERROR;
+        }
+        unsafe { *presult = new_reference(none) };
+        return PYGEN_RETURN;
+    }
+    PYGEN_ERROR
+}
+
+unsafe extern "C" fn capi_iter_send(iter: *mut PyObject, arg: *mut PyObject, presult: *mut *mut PyObject) -> PySendResult {
+    if presult.is_null() {
+        raise_system_error("PyIter_Send result pointer must not be NULL");
+        return PYGEN_ERROR;
+    }
+    unsafe { *presult = ptr::null_mut() };
+    let iter = crate::tag::untag_arg(iter);
+    let arg = if arg.is_null() {
+        unsafe { abi::pon_none() }
+    } else {
+        crate::tag::untag_arg(arg)
+    };
+    if arg.is_null() {
+        return PYGEN_ERROR;
+    }
+    if unsafe { is_exact_generator_family(iter) } {
+        let result = unsafe { abi::r#gen::pon_gen_send(iter, arg) };
+        if !result.is_null() {
+            unsafe { *presult = new_reference(result) };
+            return PYGEN_NEXT;
+        }
+        return finish_iter_send_return(presult);
+    }
+    if !unsafe { is_none_object(arg) } {
+        raise_type_error("PyIter_Send with a non-None value requires a generator or coroutine");
+        return PYGEN_ERROR;
+    }
+    let result = unsafe { abi::pon_iter_next(iter, ptr::null_mut()) };
+    if !result.is_null() {
+        unsafe { *presult = new_reference(result) };
+        return PYGEN_NEXT;
+    }
+    finish_iter_send_return(presult)
+}
+
+unsafe extern "C" fn capi_async_gen_check_exact(object: *mut PyObject) -> c_int {
+    let object = crate::tag::untag_arg(object);
+    if object.is_null() || !crate::tag::is_heap(object) {
+        return 0;
+    }
+    let type_type = abi::runtime_type_type();
+    if type_type.is_null() {
+        return 0;
+    }
+    let async_generator = ensure_async_generator_type(type_type).cast_const();
+    unsafe { is_exact_type(object, async_generator) as c_int }
 }
 
 #[cfg(test)]

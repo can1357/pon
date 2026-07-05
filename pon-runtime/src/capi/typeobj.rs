@@ -249,6 +249,7 @@ pub(crate) struct PyPonCapiTypeObj {
     type_from_spec_with_bases: unsafe extern "C" fn(*mut PyTypeSpec, *mut PyObject) -> *mut PyObject,
     type_from_module_and_spec: unsafe extern "C" fn(*mut PyObject, *mut PyTypeSpec, *mut PyObject) -> *mut PyObject,
     type_modified: unsafe extern "C" fn(*mut ForeignTypeObject),
+    type_from_metaclass: unsafe extern "C" fn(*mut ForeignTypeObject, *mut PyObject, *mut PyTypeSpec, *mut PyObject) -> *mut PyObject,
 }
 
 unsafe impl Send for PyPonCapiTypeObj {}
@@ -267,6 +268,7 @@ pub(crate) fn build() -> PyPonCapiTypeObj {
         type_from_spec_with_bases: capi_type_from_spec_with_bases,
         type_from_module_and_spec: capi_type_from_module_and_spec,
         type_modified: capi_type_modified,
+        type_from_metaclass: capi_type_from_metaclass,
     }
 }
 
@@ -619,7 +621,7 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
 
 /// `PyPonCapiTypeObj.type_from_spec` (`PyType_FromSpec`).
 unsafe extern "C" fn capi_type_from_spec(spec: *mut PyTypeSpec) -> *mut PyObject {
-    unsafe { capi_type_from_module_and_spec(ptr::null_mut(), spec, ptr::null_mut()) }
+    unsafe { type_from_metaclass_impl(ptr::null_mut(), ptr::null_mut(), spec, ptr::null_mut()) }
 }
 
 /// `PyType_Modified`: invalidates cached type state after C-side mutation
@@ -633,14 +635,35 @@ unsafe extern "C" fn capi_type_modified(foreign: *mut ForeignTypeObject) {
 
 /// `PyPonCapiTypeObj.type_from_spec_with_bases` (`PyType_FromSpecWithBases`).
 unsafe extern "C" fn capi_type_from_spec_with_bases(spec: *mut PyTypeSpec, bases: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_type_from_module_and_spec(ptr::null_mut(), spec, bases) }
+    unsafe { type_from_metaclass_impl(ptr::null_mut(), ptr::null_mut(), spec, bases) }
 }
 
 /// `PyPonCapiTypeObj.type_from_module_and_spec` (`PyType_FromModuleAndSpec`).
 ///
 /// Pon does not expose `PyType_GetModule`/module-state lookup yet; the module
 /// argument is intentionally ignored while the C type itself is made ready.
-unsafe extern "C" fn capi_type_from_module_and_spec(_module: *mut PyObject, spec: *mut PyTypeSpec, bases: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn capi_type_from_module_and_spec(module: *mut PyObject, spec: *mut PyTypeSpec, bases: *mut PyObject) -> *mut PyObject {
+    unsafe { type_from_metaclass_impl(ptr::null_mut(), module, spec, bases) }
+}
+
+/// `PyPonCapiTypeObj.type_from_metaclass` (`PyType_FromMetaclass`).
+unsafe extern "C" fn capi_type_from_metaclass(
+    metaclass: *mut ForeignTypeObject,
+    module: *mut PyObject,
+    spec: *mut PyTypeSpec,
+    bases: *mut PyObject,
+) -> *mut PyObject {
+    unsafe { type_from_metaclass_impl(metaclass, module, spec, bases) }
+}
+
+/// Shared `PyType_Spec` materialization path. `module` is intentionally ignored
+/// until Pon exposes module-state lookups, matching `PyType_FromModuleAndSpec`.
+unsafe fn type_from_metaclass_impl(
+    metaclass: *mut ForeignTypeObject,
+    _module: *mut PyObject,
+    spec: *mut PyTypeSpec,
+    bases: *mut PyObject,
+) -> *mut PyObject {
     if spec.is_null() {
         raise_type_error("PyType_FromSpec(NULL)");
         return ptr::null_mut();
@@ -658,6 +681,7 @@ unsafe extern "C" fn capi_type_from_module_and_spec(_module: *mut PyObject, spec
 
     // SAFETY: ForeignTypeObject is a POD C mirror; all-zero is NULL/0.
     let mut foreign: ForeignTypeObject = unsafe { core::mem::zeroed() };
+    foreign.ob_type = metaclass;
     foreign.tp_basicsize = spec_ref.basicsize as isize;
     foreign.tp_itemsize = spec_ref.itemsize as isize;
     foreign.tp_flags = spec_ref.flags as u64;
