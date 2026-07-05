@@ -17,7 +17,7 @@
 //! object, exactly as on CPython. The GC layer itself stays sound.
 //!
 //! Unsupported (loud `PyType_Ready` failure, never silent): GC-tracked types
-//! (`Py_TPFLAGS_HAVE_GC`, `tp_traverse`, `tp_clear`) and custom metatypes.
+//! (`Py_TPFLAGS_HAVE_GC`, `tp_traverse`, `tp_clear`).
 
 use core::ffi::{c_char, c_int, c_uint, c_void};
 use core::ptr;
@@ -29,7 +29,10 @@ use pon_gc::{GcTypeInfo, TypeId};
 
 use crate::abi;
 use crate::intern::intern;
-use crate::object::{InitFunc, PyObject, PyObjectHeader, PyType, as_object_ptr};
+use crate::object::{
+    BinaryFunc, InitFunc, InquiryFunc, LenFunc, ObjObjArgProc, ObjObjProc, PyMappingMethods, PyNumberMethods, PyObject,
+    PyObjectHeader, PySequenceMethods, PyType, SSizeArgFunc, SSizeObjArgProc, TernaryFunc, UnaryFunc, as_object_ptr,
+};
 use crate::types::exc::ExceptionKind;
 use crate::types::type_::{PyClassDict, new_namespace};
 
@@ -47,6 +50,50 @@ const TPFLAGS_HAVE_GC: u64 = 1 << 14;
 
 // CPython stable-ABI slot ids mirrored in include/Python.h/typeslots.h.
 const PY_BF_GETBUFFER: c_int = 1;
+const PY_BF_RELEASEBUFFER: c_int = 2;
+const PY_MP_ASS_SUBSCRIPT: c_int = 3;
+const PY_MP_LENGTH: c_int = 4;
+const PY_MP_SUBSCRIPT: c_int = 5;
+const PY_NB_ABSOLUTE: c_int = 6;
+const PY_NB_ADD: c_int = 7;
+const PY_NB_AND: c_int = 8;
+const PY_NB_BOOL: c_int = 9;
+const PY_NB_DIVMOD: c_int = 10;
+const PY_NB_FLOAT: c_int = 11;
+const PY_NB_FLOOR_DIVIDE: c_int = 12;
+const PY_NB_INDEX: c_int = 13;
+const PY_NB_INPLACE_ADD: c_int = 14;
+const PY_NB_INPLACE_AND: c_int = 15;
+const PY_NB_INPLACE_FLOOR_DIVIDE: c_int = 16;
+const PY_NB_INPLACE_LSHIFT: c_int = 17;
+const PY_NB_INPLACE_MULTIPLY: c_int = 18;
+const PY_NB_INPLACE_OR: c_int = 19;
+const PY_NB_INPLACE_POWER: c_int = 20;
+const PY_NB_INPLACE_REMAINDER: c_int = 21;
+const PY_NB_INPLACE_RSHIFT: c_int = 22;
+const PY_NB_INPLACE_SUBTRACT: c_int = 23;
+const PY_NB_INPLACE_TRUE_DIVIDE: c_int = 24;
+const PY_NB_INPLACE_XOR: c_int = 25;
+const PY_NB_INT: c_int = 26;
+const PY_NB_INVERT: c_int = 27;
+const PY_NB_LSHIFT: c_int = 28;
+const PY_NB_MULTIPLY: c_int = 29;
+const PY_NB_NEGATIVE: c_int = 30;
+const PY_NB_OR: c_int = 31;
+const PY_NB_POSITIVE: c_int = 32;
+const PY_NB_POWER: c_int = 33;
+const PY_NB_REMAINDER: c_int = 34;
+const PY_NB_RSHIFT: c_int = 35;
+const PY_NB_SUBTRACT: c_int = 36;
+const PY_NB_TRUE_DIVIDE: c_int = 37;
+const PY_NB_XOR: c_int = 38;
+const PY_SQ_ASS_ITEM: c_int = 39;
+const PY_SQ_CONCAT: c_int = 40;
+const PY_SQ_CONTAINS: c_int = 41;
+const PY_SQ_INPLACE_CONCAT: c_int = 42;
+const PY_SQ_INPLACE_REPEAT: c_int = 43;
+const PY_SQ_ITEM: c_int = 44;
+const PY_SQ_LENGTH: c_int = 45;
 const PY_SQ_REPEAT: c_int = 46;
 const PY_TP_ALLOC: c_int = 47;
 const PY_TP_BASE: c_int = 48;
@@ -80,8 +127,8 @@ const PY_NB_MATRIX_MULTIPLY: c_int = 75;
 const PY_NB_INPLACE_MATRIX_MULTIPLY: c_int = 76;
 const PY_AM_AWAIT: c_int = 77;
 const PY_AM_ANEXT: c_int = 79;
-const PY_AM_SEND: c_int = 81;
 const PY_TP_FINALIZE: c_int = 80;
+const PY_AM_SEND: c_int = 81;
 const PY_TP_VECTORCALL: c_int = 82;
 const PY_TP_TOKEN: c_int = 83;
 
@@ -99,6 +146,85 @@ struct PyTypeSpec {
     flags: c_uint,
     slots: *mut PyTypeSlot,
 }
+
+#[repr(C)]
+struct PyBufferProcs {
+    bf_getbuffer: *mut c_void,
+    bf_releasebuffer: *mut c_void,
+}
+
+/// C-facing `PyNumberMethods`: exact CPython 3.14 `object.h` field order.
+/// Do not reuse [`PyNumberMethods`]: Pon's native table adds reflected slots.
+#[repr(C)]
+struct CNumberMethods {
+    nb_add: *mut (),
+    nb_subtract: *mut (),
+    nb_multiply: *mut (),
+    nb_remainder: *mut (),
+    nb_divmod: *mut (),
+    nb_power: *mut (),
+    nb_negative: *mut (),
+    nb_positive: *mut (),
+    nb_absolute: *mut (),
+    nb_bool: *mut (),
+    nb_invert: *mut (),
+    nb_lshift: *mut (),
+    nb_rshift: *mut (),
+    nb_and: *mut (),
+    nb_xor: *mut (),
+    nb_or: *mut (),
+    nb_int: *mut (),
+    nb_reserved: *mut (),
+    nb_float: *mut (),
+    nb_inplace_add: *mut (),
+    nb_inplace_subtract: *mut (),
+    nb_inplace_multiply: *mut (),
+    nb_inplace_remainder: *mut (),
+    nb_inplace_power: *mut (),
+    nb_inplace_lshift: *mut (),
+    nb_inplace_rshift: *mut (),
+    nb_inplace_and: *mut (),
+    nb_inplace_xor: *mut (),
+    nb_inplace_or: *mut (),
+    nb_floor_divide: *mut (),
+    nb_true_divide: *mut (),
+    nb_inplace_floor_divide: *mut (),
+    nb_inplace_true_divide: *mut (),
+    nb_index: *mut (),
+    nb_matrix_multiply: *mut (),
+    nb_inplace_matrix_multiply: *mut (),
+}
+
+/// C-facing `PySequenceMethods`: exact CPython 3.14 `object.h` field order.
+/// Pon's native table intentionally differs for repeat slots, so translate.
+#[repr(C)]
+struct CSequenceMethods {
+    sq_length: *mut (),
+    sq_concat: *mut (),
+    sq_repeat: *mut (),
+    sq_item: *mut (),
+    was_sq_slice: *mut (),
+    sq_ass_item: *mut (),
+    was_sq_ass_slice: *mut (),
+    sq_contains: *mut (),
+    sq_inplace_concat: *mut (),
+    sq_inplace_repeat: *mut (),
+}
+
+/// C-facing `PyMappingMethods`: exact CPython 3.14 `object.h` field order.
+#[repr(C)]
+struct CMappingMethods {
+    mp_length: *mut (),
+    mp_subscript: *mut (),
+    mp_ass_subscript: *mut (),
+}
+
+/// Heap protocol tables allocated while materializing `PyType_FromSpec` types.
+/// Static extension tables are not ours, so per-member inheritance only mutates
+/// pointers recorded here.
+static FROMSPEC_NUMBER_TABLES: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static FROMSPEC_SEQUENCE_TABLES: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+static FROMSPEC_MAPPING_TABLES: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Addresses of live C-extension instances allocated on the GC heap.
 /// `PyObject_Free` must no-op for these (the GC owns the block); the
@@ -206,15 +332,22 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
         raise_type_error(format!("PyType_Ready: GC-tracked C types are not supported yet: {name_full}"));
         return -1;
     }
-    if !foreign_ref.ob_type.is_null() {
-        // A metatype is only acceptable when it resolves to plain `type`.
-        match twin::native_of_foreign(foreign_ref.ob_type) {
-            Some(meta) if meta == abi::runtime_type_type() => {}
-            _ => {
-                raise_type_error(format!("PyType_Ready: custom metatypes are not supported yet: {name_full}"));
-                return -1;
-            }
+    let metaclass_native = if foreign_ref.ob_type.is_null() {
+        abi::runtime_type_type()
+    } else {
+        let Some(meta) = twin::registered_native_of_foreign(foreign_ref.ob_type) else {
+            raise_type_error(format!("PyType_Ready: metatype of {name_full} is not ready"));
+            return -1;
+        };
+        if unsafe { !crate::mro::is_subtype(meta, abi::runtime_type_type()) } {
+            raise_type_error(format!("PyType_Ready: metatype of {name_full} does not derive from type"));
+            return -1;
         }
+        meta
+    };
+    if metaclass_native.is_null() {
+        raise_type_error("PyType_Ready: cannot resolve metatype");
+        return -1;
     }
 
     // Base resolution: NULL means `object`.
@@ -261,6 +394,7 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
             (&mut foreign_ref.tp_setattro, base.tp_setattro),
             (&mut foreign_ref.tp_descr_get, base.tp_descr_get),
             (&mut foreign_ref.tp_descr_set, base.tp_descr_set),
+            (&mut foreign_ref.tp_as_buffer, base.tp_as_buffer),
             (&mut foreign_ref.tp_init, base.tp_init),
             (&mut foreign_ref.tp_alloc, base.tp_alloc),
             (&mut foreign_ref.tp_free, base.tp_free),
@@ -270,6 +404,11 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
                 *child = parent;
             }
         }
+        // Protocol table inheritance: when the child has no table, inherit the
+        // base table wholesale. If a PyType_FromSpec child owns a heap table,
+        // copy only missing members into it; extension-owned static child
+        // tables are left untouched because Pon does not own their storage.
+        unsafe { inherit_foreign_protocol_tables(foreign_ref, base) };
     }
 
     let namespace = new_namespace();
@@ -280,9 +419,10 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
         }
     }
 
-    // SAFETY: live base type, live namespace, runtime initialized.
+    // SAFETY: live metaclass/base type, live namespace, runtime initialized.
     let native = unsafe {
         crate::types::type_::construct_capi_class(
+            metaclass_native,
             name,
             &[base_native],
             namespace,
@@ -338,6 +478,7 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
         if let Some(descr_set) = slot(foreign_ref.tp_descr_set) {
             ty.tp_descr_set = Some(descr_set);
         }
+        install_native_protocol_tables(ty, foreign_ref);
         ty.bump_version();
     }
 
@@ -348,14 +489,21 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
     // Fill the foreign struct's runtime-owned fields (CPython PyType_Ready
     // parity: inherited slots surface in the static struct).
     foreign_ref.tp_pon_twin = native_ty;
-    foreign_ref.tp_flags |= TPFLAGS_READY;
     if foreign_ref.ob_type.is_null() {
         foreign_ref.ob_type = twin::foreign_of_native(abi::runtime_type_type());
     }
-    // tp_dict stays NULL in this iteration (documented in typeobj.h): the
-    // native class dict has no PyObject header yet, so it cannot cross the
-    // boundary as a dict object. Type attributes are reachable through
-    // PyObject_GetAttr/SetAttr on the type object instead.
+    if !foreign_ref.tp_dict.is_null()
+        && !unsafe { crate::types::type_::merge_tp_dict_into_class(native_ty, foreign_ref.tp_dict) }
+    {
+        return -1;
+    }
+    let tp_dict = unsafe { crate::types::type_::new_class_dict_view(native_ty) };
+    if tp_dict.is_null() {
+        return -1;
+    }
+    super::pin_object(tp_dict);
+    foreign_ref.tp_dict = tp_dict;
+    foreign_ref.tp_flags |= TPFLAGS_READY;
     if foreign_ref.tp_alloc.is_null() {
         foreign_ref.tp_alloc = capi_generic_alloc as *mut ();
     }
@@ -444,15 +592,56 @@ unsafe fn apply_type_spec_slots(foreign: &mut ForeignTypeObject, slots: *mut PyT
         if slot.slot == 0 {
             return true;
         }
-        if is_unsupported_protocol_slot(slot.slot) {
-            raise_type_error(format!(
-                "PyType_FromSpec: protocol slot id {} is not supported yet for {type_name}",
-                slot.slot
-            ));
-            return false;
-        }
         let field = slot.pfunc.cast::<()>();
         match slot.slot {
+            PY_BF_GETBUFFER => unsafe { ensure_buffer_procs(foreign).bf_getbuffer = slot.pfunc },
+            PY_BF_RELEASEBUFFER => unsafe { ensure_buffer_procs(foreign).bf_releasebuffer = slot.pfunc },
+            PY_MP_ASS_SUBSCRIPT => unsafe { ensure_fromspec_mapping_table(foreign).mp_ass_subscript = field },
+            PY_MP_LENGTH => unsafe { ensure_fromspec_mapping_table(foreign).mp_length = field },
+            PY_MP_SUBSCRIPT => unsafe { ensure_fromspec_mapping_table(foreign).mp_subscript = field },
+            PY_NB_ABSOLUTE => unsafe { ensure_fromspec_number_table(foreign).nb_absolute = field },
+            PY_NB_ADD => unsafe { ensure_fromspec_number_table(foreign).nb_add = field },
+            PY_NB_AND => unsafe { ensure_fromspec_number_table(foreign).nb_and = field },
+            PY_NB_BOOL => unsafe { ensure_fromspec_number_table(foreign).nb_bool = field },
+            PY_NB_DIVMOD => unsafe { ensure_fromspec_number_table(foreign).nb_divmod = field },
+            PY_NB_FLOAT => unsafe { ensure_fromspec_number_table(foreign).nb_float = field },
+            PY_NB_FLOOR_DIVIDE => unsafe { ensure_fromspec_number_table(foreign).nb_floor_divide = field },
+            PY_NB_INDEX => unsafe { ensure_fromspec_number_table(foreign).nb_index = field },
+            PY_NB_INPLACE_ADD => unsafe { ensure_fromspec_number_table(foreign).nb_inplace_add = field },
+            PY_NB_INPLACE_AND => unsafe { ensure_fromspec_number_table(foreign).nb_inplace_and = field },
+            PY_NB_INPLACE_FLOOR_DIVIDE => unsafe { ensure_fromspec_number_table(foreign).nb_inplace_floor_divide = field },
+            PY_NB_INPLACE_LSHIFT => unsafe { ensure_fromspec_number_table(foreign).nb_inplace_lshift = field },
+            PY_NB_INPLACE_MULTIPLY => unsafe { ensure_fromspec_number_table(foreign).nb_inplace_multiply = field },
+            PY_NB_INPLACE_OR => unsafe { ensure_fromspec_number_table(foreign).nb_inplace_or = field },
+            PY_NB_INPLACE_POWER => unsafe { ensure_fromspec_number_table(foreign).nb_inplace_power = field },
+            PY_NB_INPLACE_REMAINDER => unsafe { ensure_fromspec_number_table(foreign).nb_inplace_remainder = field },
+            PY_NB_INPLACE_RSHIFT => unsafe { ensure_fromspec_number_table(foreign).nb_inplace_rshift = field },
+            PY_NB_INPLACE_SUBTRACT => unsafe { ensure_fromspec_number_table(foreign).nb_inplace_subtract = field },
+            PY_NB_INPLACE_TRUE_DIVIDE => unsafe { ensure_fromspec_number_table(foreign).nb_inplace_true_divide = field },
+            PY_NB_INPLACE_XOR => unsafe { ensure_fromspec_number_table(foreign).nb_inplace_xor = field },
+            PY_NB_INT => unsafe { ensure_fromspec_number_table(foreign).nb_int = field },
+            PY_NB_INVERT => unsafe { ensure_fromspec_number_table(foreign).nb_invert = field },
+            PY_NB_LSHIFT => unsafe { ensure_fromspec_number_table(foreign).nb_lshift = field },
+            PY_NB_MATRIX_MULTIPLY => unsafe { ensure_fromspec_number_table(foreign).nb_matrix_multiply = field },
+            PY_NB_MULTIPLY => unsafe { ensure_fromspec_number_table(foreign).nb_multiply = field },
+            PY_NB_NEGATIVE => unsafe { ensure_fromspec_number_table(foreign).nb_negative = field },
+            PY_NB_OR => unsafe { ensure_fromspec_number_table(foreign).nb_or = field },
+            PY_NB_POSITIVE => unsafe { ensure_fromspec_number_table(foreign).nb_positive = field },
+            PY_NB_POWER => unsafe { ensure_fromspec_number_table(foreign).nb_power = field },
+            PY_NB_REMAINDER => unsafe { ensure_fromspec_number_table(foreign).nb_remainder = field },
+            PY_NB_RSHIFT => unsafe { ensure_fromspec_number_table(foreign).nb_rshift = field },
+            PY_NB_SUBTRACT => unsafe { ensure_fromspec_number_table(foreign).nb_subtract = field },
+            PY_NB_TRUE_DIVIDE => unsafe { ensure_fromspec_number_table(foreign).nb_true_divide = field },
+            PY_NB_XOR => unsafe { ensure_fromspec_number_table(foreign).nb_xor = field },
+            PY_NB_INPLACE_MATRIX_MULTIPLY => unsafe { ensure_fromspec_number_table(foreign).nb_inplace_matrix_multiply = field },
+            PY_SQ_ASS_ITEM => unsafe { ensure_fromspec_sequence_table(foreign).sq_ass_item = field },
+            PY_SQ_CONCAT => unsafe { ensure_fromspec_sequence_table(foreign).sq_concat = field },
+            PY_SQ_CONTAINS => unsafe { ensure_fromspec_sequence_table(foreign).sq_contains = field },
+            PY_SQ_INPLACE_CONCAT => unsafe { ensure_fromspec_sequence_table(foreign).sq_inplace_concat = field },
+            PY_SQ_INPLACE_REPEAT => unsafe { ensure_fromspec_sequence_table(foreign).sq_inplace_repeat = field },
+            PY_SQ_ITEM => unsafe { ensure_fromspec_sequence_table(foreign).sq_item = field },
+            PY_SQ_LENGTH => unsafe { ensure_fromspec_sequence_table(foreign).sq_length = field },
+            PY_SQ_REPEAT => unsafe { ensure_fromspec_sequence_table(foreign).sq_repeat = field },
             PY_TP_ALLOC => foreign.tp_alloc = field,
             PY_TP_BASE => {
                 if !apply_type_spec_base(foreign, slot.pfunc.cast::<ForeignTypeObject>(), type_name, "Py_tp_base") {
@@ -500,9 +689,49 @@ unsafe fn apply_type_spec_slots(foreign: &mut ForeignTypeObject, slots: *mut PyT
     }
 }
 
-fn is_unsupported_protocol_slot(slot_id: c_int) -> bool {
-    (PY_BF_GETBUFFER..=PY_SQ_REPEAT).contains(&slot_id)
-        || matches!(slot_id, PY_NB_MATRIX_MULTIPLY | PY_NB_INPLACE_MATRIX_MULTIPLY)
+unsafe fn ensure_fromspec_number_table(foreign: &mut ForeignTypeObject) -> &mut CNumberMethods {
+    if foreign.tp_as_number.is_null() {
+        // SAFETY: C protocol tables are plain nullable-pointer records.
+        let table = Box::into_raw(Box::new(unsafe { core::mem::zeroed::<CNumberMethods>() }));
+        FROMSPEC_NUMBER_TABLES.lock().unwrap_or_else(|poison| poison.into_inner()).insert(table as usize);
+        foreign.tp_as_number = table.cast::<()>();
+    }
+    // SAFETY: created above or supplied by an earlier Py_nb_* slot in this spec.
+    unsafe { &mut *foreign.tp_as_number.cast::<CNumberMethods>() }
+}
+
+unsafe fn ensure_fromspec_sequence_table(foreign: &mut ForeignTypeObject) -> &mut CSequenceMethods {
+    if foreign.tp_as_sequence.is_null() {
+        // SAFETY: C protocol tables are plain nullable-pointer records.
+        let table = Box::into_raw(Box::new(unsafe { core::mem::zeroed::<CSequenceMethods>() }));
+        FROMSPEC_SEQUENCE_TABLES.lock().unwrap_or_else(|poison| poison.into_inner()).insert(table as usize);
+        foreign.tp_as_sequence = table.cast::<()>();
+    }
+    // SAFETY: created above or supplied by an earlier Py_sq_* slot in this spec.
+    unsafe { &mut *foreign.tp_as_sequence.cast::<CSequenceMethods>() }
+}
+
+unsafe fn ensure_fromspec_mapping_table(foreign: &mut ForeignTypeObject) -> &mut CMappingMethods {
+    if foreign.tp_as_mapping.is_null() {
+        // SAFETY: C protocol tables are plain nullable-pointer records.
+        let table = Box::into_raw(Box::new(unsafe { core::mem::zeroed::<CMappingMethods>() }));
+        FROMSPEC_MAPPING_TABLES.lock().unwrap_or_else(|poison| poison.into_inner()).insert(table as usize);
+        foreign.tp_as_mapping = table.cast::<()>();
+    }
+    // SAFETY: created above or supplied by an earlier Py_mp_* slot in this spec.
+    unsafe { &mut *foreign.tp_as_mapping.cast::<CMappingMethods>() }
+}
+
+unsafe fn ensure_buffer_procs(foreign: &mut ForeignTypeObject) -> &mut PyBufferProcs {
+    if foreign.tp_as_buffer.is_null() {
+        let table = Box::new(PyBufferProcs {
+            bf_getbuffer: ptr::null_mut(),
+            bf_releasebuffer: ptr::null_mut(),
+        });
+        foreign.tp_as_buffer = Box::into_raw(table).cast::<()>();
+    }
+    // SAFETY: the field is either extension-owned `PyBufferProcs` storage or the table allocated above.
+    unsafe { &mut *foreign.tp_as_buffer.cast::<PyBufferProcs>() }
 }
 
 fn apply_type_spec_base(foreign: &mut ForeignTypeObject, base: *mut ForeignTypeObject, type_name: &str, source: &str) -> bool {
@@ -605,7 +834,7 @@ unsafe fn install_namespace(namespace: *mut PyClassDict, foreign: &ForeignTypeOb
             cursor = unsafe { cursor.add(1) };
         }
     }
-    true
+    unsafe { install_slot_wrappers(ns, foreign).is_some() }
 }
 
 /// `tp_new` bridge: recovers the FOREIGN type for the native class and calls
@@ -778,6 +1007,828 @@ unsafe extern "C" fn capi_object_init(object: *mut PyObject, foreign: *mut Forei
 /// allocation without calling the C `tp_new`.
 unsafe extern "C" fn capi_object_new_raw(foreign: *mut ForeignTypeObject, nitems: isize) -> *mut PyObject {
     unsafe { capi_generic_alloc(foreign, nitems) }
+}
+
+/// GC type id for slot-wrapper descriptor carriers.
+const TYPE_ID_CAPI_SLOT_WRAPPER: TypeId = TypeId(142);
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlotKind {
+    Unary,
+    Binary,
+    ReflectedBinary,
+    Ternary,
+    ReflectedTernary,
+    InquiryBool,
+    Len,
+    SSizeItem,
+    SSizeRepeat,
+    SSizeSetItem,
+    SSizeDelItem,
+    ObjObjProc,
+    ObjObjArgSet,
+    ObjObjArgDel,
+}
+
+#[repr(C)]
+struct PySlotWrapper {
+    ob_base: PyObjectHeader,
+    slot: *mut (),
+    self_object: *mut PyObject,
+    name: u32,
+    kind: SlotKind,
+}
+
+unsafe extern "C" fn trace_slot_wrapper(object: *mut u8, visitor: &mut dyn FnMut(*mut u8)) {
+    if object.is_null() {
+        return;
+    }
+    // SAFETY: GC dispatch supplies a live PySlotWrapper allocation.
+    let receiver = unsafe { (*object.cast::<PySlotWrapper>()).self_object };
+    if !receiver.is_null() && crate::tag::is_heap(receiver.cast()) {
+        visitor(receiver.cast());
+    }
+}
+
+static SLOT_WRAPPER_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let mut ty = PyType::new(abi::runtime_type_type(), "wrapper_descriptor", core::mem::size_of::<PySlotWrapper>());
+    ty.tp_call = Some(slot_wrapper_call);
+    ty.tp_descr_get = Some(slot_wrapper_descr_get);
+    Box::into_raw(Box::new(ty)) as usize
+});
+
+fn alloc_slot_wrapper(slot_ptr: *mut (), kind: SlotKind, self_object: *mut PyObject, name: u32) -> *mut PyObject {
+    let info = GcTypeInfo {
+        size: core::mem::size_of::<PySlotWrapper>(),
+        trace: trace_slot_wrapper,
+        finalize: None,
+    };
+    let Ok(block) = abi::alloc_gc_object(TYPE_ID_CAPI_SLOT_WRAPPER, info) else {
+        return abi::return_null_with_error("runtime is not initialized");
+    };
+    let object = block.cast::<PySlotWrapper>();
+    // SAFETY: `block` is a fresh zeroed allocation of the carrier's size.
+    unsafe {
+        object.write(PySlotWrapper {
+            ob_base: PyObjectHeader::new(*SLOT_WRAPPER_TYPE as *const PyType),
+            slot: slot_ptr,
+            self_object,
+            name,
+            kind,
+        });
+    }
+    as_object_ptr(object)
+}
+
+unsafe extern "C" fn slot_wrapper_descr_get(descriptor: *mut PyObject, instance: *mut PyObject, _owner: *mut PyObject) -> *mut PyObject {
+    if descriptor.is_null() {
+        return abi::return_null_with_error("NULL slot wrapper descriptor");
+    }
+    if instance.is_null() {
+        return descriptor;
+    }
+    // SAFETY: descriptor protocol dispatches here only for PySlotWrapper values.
+    let wrapper = unsafe { &*descriptor.cast::<PySlotWrapper>() };
+    alloc_slot_wrapper(wrapper.slot, wrapper.kind, instance, wrapper.name)
+}
+
+unsafe extern "C" fn slot_wrapper_call(callee: *mut PyObject, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
+    if callee.is_null() {
+        return abi::return_null_with_error("NULL slot wrapper");
+    }
+    if !kwargs.is_null() {
+        return abi::return_null_with_error("slot wrappers do not accept keyword arguments");
+    }
+    // SAFETY: tp_call dispatches here only for PySlotWrapper values.
+    let wrapper = unsafe { &*callee.cast::<PySlotWrapper>() };
+    let positional = match unsafe { slot_wrapper_args(args) } {
+        Ok(values) => values,
+        Err(message) => return abi::return_null_with_error(message),
+    };
+    let (receiver, rest) = if wrapper.self_object.is_null() {
+        let Some((&receiver, rest)) = positional.split_first() else {
+            return abi::return_null_with_error(format!("descriptor '{}' needs an argument", slot_wrapper_name(wrapper)));
+        };
+        (receiver, rest)
+    } else {
+        (wrapper.self_object, positional)
+    };
+    match wrapper.kind {
+        SlotKind::Unary => unsafe { call_unary_slot_wrapper(wrapper, receiver, rest) },
+        SlotKind::Binary => unsafe { call_binary_slot_wrapper(wrapper, receiver, rest, false) },
+        SlotKind::ReflectedBinary => unsafe { call_binary_slot_wrapper(wrapper, receiver, rest, true) },
+        SlotKind::Ternary => unsafe { call_ternary_slot_wrapper(wrapper, receiver, rest, false) },
+        SlotKind::ReflectedTernary => unsafe { call_ternary_slot_wrapper(wrapper, receiver, rest, true) },
+        SlotKind::InquiryBool => unsafe { call_inquiry_slot_wrapper(wrapper, receiver, rest) },
+        SlotKind::Len => unsafe { call_len_slot_wrapper(wrapper, receiver, rest) },
+        SlotKind::SSizeItem => unsafe { call_ssizearg_slot_wrapper(wrapper, receiver, rest) },
+        SlotKind::SSizeRepeat => unsafe { call_ssizearg_slot_wrapper(wrapper, receiver, rest) },
+        SlotKind::SSizeSetItem => unsafe { call_ssizeobjarg_slot_wrapper(wrapper, receiver, rest, false) },
+        SlotKind::SSizeDelItem => unsafe { call_ssizeobjarg_slot_wrapper(wrapper, receiver, rest, true) },
+        SlotKind::ObjObjProc => unsafe { call_objobjproc_slot_wrapper(wrapper, receiver, rest) },
+        SlotKind::ObjObjArgSet => unsafe { call_objobjarg_slot_wrapper(wrapper, receiver, rest, false) },
+        SlotKind::ObjObjArgDel => unsafe { call_objobjarg_slot_wrapper(wrapper, receiver, rest, true) },
+    }
+}
+
+unsafe fn slot_wrapper_args<'a>(args: *mut PyObject) -> Result<&'a [*mut PyObject], String> {
+    if args.is_null() {
+        return Ok(&[]);
+    }
+    unsafe { abi::seq::exact_tuple_slice(args) }.ok_or_else(|| "slot wrapper call args were not a tuple".to_owned())
+}
+
+fn slot_wrapper_name(wrapper: &PySlotWrapper) -> String {
+    crate::intern::resolve(wrapper.name).unwrap_or_else(|| "<slot>".to_owned())
+}
+
+fn slot_wrapper_arity_error(wrapper: &PySlotWrapper, expected: usize, got: usize) -> *mut PyObject {
+    abi::return_null_with_error(format!("{} expected {expected} argument(s), got {got}", slot_wrapper_name(wrapper)))
+}
+
+fn require_slot_arity(wrapper: &PySlotWrapper, args: &[*mut PyObject], expected: usize) -> bool {
+    args.len() == expected || {
+        let _ = slot_wrapper_arity_error(wrapper, expected, args.len());
+        false
+    }
+}
+
+fn ensure_slot_exception(message: impl Into<String>) {
+    if !crate::thread_state::pon_err_occurred() {
+        crate::thread_state::pon_err_set(message);
+    }
+}
+
+fn normalize_object_slot_result(result: *mut PyObject, message: &'static str) -> *mut PyObject {
+    if result.is_null() {
+        ensure_slot_exception(message);
+    }
+    result
+}
+
+unsafe fn call_unary_slot_wrapper(wrapper: &PySlotWrapper, receiver: *mut PyObject, args: &[*mut PyObject]) -> *mut PyObject {
+    if !require_slot_arity(wrapper, args, 0) {
+        return ptr::null_mut();
+    }
+    let Some(function) = (unsafe { slot::<UnaryFunc>(wrapper.slot) }) else {
+        return abi::return_null_with_error("slot wrapper has no unary function");
+    };
+    normalize_object_slot_result(unsafe { function(receiver) }, "unary slot returned NULL without setting an exception")
+}
+
+unsafe fn call_binary_slot_wrapper(
+    wrapper: &PySlotWrapper,
+    receiver: *mut PyObject,
+    args: &[*mut PyObject],
+    reflected: bool,
+) -> *mut PyObject {
+    if !require_slot_arity(wrapper, args, 1) {
+        return ptr::null_mut();
+    }
+    let Some(function) = (unsafe { slot::<BinaryFunc>(wrapper.slot) }) else {
+        return abi::return_null_with_error("slot wrapper has no binary function");
+    };
+    let result = if reflected {
+        unsafe { function(args[0], receiver) }
+    } else {
+        unsafe { function(receiver, args[0]) }
+    };
+    normalize_object_slot_result(result, "binary slot returned NULL without setting an exception")
+}
+
+unsafe fn call_ternary_slot_wrapper(
+    wrapper: &PySlotWrapper,
+    receiver: *mut PyObject,
+    args: &[*mut PyObject],
+    reflected: bool,
+) -> *mut PyObject {
+    if !require_slot_arity(wrapper, args, 1) {
+        return ptr::null_mut();
+    }
+    let Some(function) = (unsafe { slot::<TernaryFunc>(wrapper.slot) }) else {
+        return abi::return_null_with_error("slot wrapper has no ternary function");
+    };
+    let none = unsafe { abi::pon_none() };
+    let result = if reflected {
+        unsafe { function(args[0], receiver, none) }
+    } else {
+        unsafe { function(receiver, args[0], none) }
+    };
+    normalize_object_slot_result(result, "ternary slot returned NULL without setting an exception")
+}
+
+unsafe fn call_inquiry_slot_wrapper(wrapper: &PySlotWrapper, receiver: *mut PyObject, args: &[*mut PyObject]) -> *mut PyObject {
+    if !require_slot_arity(wrapper, args, 0) {
+        return ptr::null_mut();
+    }
+    let Some(function) = (unsafe { slot::<InquiryFunc>(wrapper.slot) }) else {
+        return abi::return_null_with_error("slot wrapper has no inquiry function");
+    };
+    let status = unsafe { function(receiver) };
+    if status < 0 {
+        ensure_slot_exception("inquiry slot returned an error without setting an exception");
+        return ptr::null_mut();
+    }
+    unsafe { abi::number::pon_const_bool(c_int::from(status != 0)) }
+}
+
+unsafe fn call_len_slot_wrapper(wrapper: &PySlotWrapper, receiver: *mut PyObject, args: &[*mut PyObject]) -> *mut PyObject {
+    if !require_slot_arity(wrapper, args, 0) {
+        return ptr::null_mut();
+    }
+    let Some(function) = (unsafe { slot::<LenFunc>(wrapper.slot) }) else {
+        return abi::return_null_with_error("slot wrapper has no length function");
+    };
+    let len = unsafe { function(receiver) };
+    if len < 0 {
+        ensure_slot_exception("length slot returned a negative value without setting an exception");
+        return ptr::null_mut();
+    }
+    let Ok(len) = i64::try_from(len) else {
+        return abi::return_null_with_error("length slot result exceeds i64");
+    };
+    unsafe { abi::pon_const_int(len) }
+}
+
+unsafe fn call_ssizearg_slot_wrapper(wrapper: &PySlotWrapper, receiver: *mut PyObject, args: &[*mut PyObject]) -> *mut PyObject {
+    if !require_slot_arity(wrapper, args, 1) {
+        return ptr::null_mut();
+    }
+    let Some(index) = (unsafe { object_to_ssize(args[0], &slot_wrapper_name(wrapper)) }) else {
+        return ptr::null_mut();
+    };
+    let Some(function) = (unsafe { slot::<SSizeArgFunc>(wrapper.slot) }) else {
+        return abi::return_null_with_error("slot wrapper has no ssizearg function");
+    };
+    normalize_object_slot_result(
+        unsafe { function(receiver, index) },
+        "ssizearg slot returned NULL without setting an exception",
+    )
+}
+
+unsafe fn call_ssizeobjarg_slot_wrapper(
+    wrapper: &PySlotWrapper,
+    receiver: *mut PyObject,
+    args: &[*mut PyObject],
+    delete: bool,
+) -> *mut PyObject {
+    let expected = if delete { 1 } else { 2 };
+    if !require_slot_arity(wrapper, args, expected) {
+        return ptr::null_mut();
+    }
+    let Some(index) = (unsafe { object_to_ssize(args[0], &slot_wrapper_name(wrapper)) }) else {
+        return ptr::null_mut();
+    };
+    let Some(function) = (unsafe { slot::<SSizeObjArgProc>(wrapper.slot) }) else {
+        return abi::return_null_with_error("slot wrapper has no ssizeobjarg function");
+    };
+    let value = if delete { ptr::null_mut() } else { args[1] };
+    if unsafe { function(receiver, index, value) } < 0 {
+        ensure_slot_exception("ssizeobjarg slot returned an error without setting an exception");
+        return ptr::null_mut();
+    }
+    unsafe { abi::pon_none() }
+}
+
+unsafe fn call_objobjproc_slot_wrapper(wrapper: &PySlotWrapper, receiver: *mut PyObject, args: &[*mut PyObject]) -> *mut PyObject {
+    if !require_slot_arity(wrapper, args, 1) {
+        return ptr::null_mut();
+    }
+    let Some(function) = (unsafe { slot::<ObjObjProc>(wrapper.slot) }) else {
+        return abi::return_null_with_error("slot wrapper has no objobjproc function");
+    };
+    let status = unsafe { function(receiver, args[0]) };
+    if status < 0 {
+        ensure_slot_exception("objobjproc slot returned an error without setting an exception");
+        return ptr::null_mut();
+    }
+    unsafe { abi::number::pon_const_bool(c_int::from(status != 0)) }
+}
+
+unsafe fn call_objobjarg_slot_wrapper(
+    wrapper: &PySlotWrapper,
+    receiver: *mut PyObject,
+    args: &[*mut PyObject],
+    delete: bool,
+) -> *mut PyObject {
+    let expected = if delete { 1 } else { 2 };
+    if !require_slot_arity(wrapper, args, expected) {
+        return ptr::null_mut();
+    }
+    let Some(function) = (unsafe { slot::<ObjObjArgProc>(wrapper.slot) }) else {
+        return abi::return_null_with_error("slot wrapper has no objobjarg function");
+    };
+    let value = if delete { ptr::null_mut() } else { args[1] };
+    if unsafe { function(receiver, args[0], value) } < 0 {
+        ensure_slot_exception("objobjarg slot returned an error without setting an exception");
+        return ptr::null_mut();
+    }
+    unsafe { abi::pon_none() }
+}
+
+unsafe fn object_to_ssize(value: *mut PyObject, context: &str) -> Option<isize> {
+    if value.is_null() {
+        raise_type_error(format!("{context} argument cannot be NULL"));
+        return None;
+    }
+    let value = crate::tag::untag_arg(value);
+    if let Some(index) = unsafe { bigint_object_to_ssize(value, context) } {
+        return Some(index);
+    }
+    let ty = unsafe { value.as_ref().and_then(|object| object.ob_type.as_ref()) };
+    if let Some(index_slot) = ty.and_then(|ty| unsafe { ty.tp_as_number.as_ref().and_then(|methods| methods.nb_index) }) {
+        let result = unsafe { index_slot(value) };
+        if result.is_null() {
+            ensure_slot_exception("__index__ slot returned NULL without setting an exception");
+            return None;
+        }
+        let result = crate::tag::untag_arg(result);
+        if let Some(index) = unsafe { bigint_object_to_ssize(result, context) } {
+            return Some(index);
+        }
+        raise_type_error("__index__ returned non-int");
+        return None;
+    }
+    raise_type_error(format!("{context} argument cannot be interpreted as an integer"));
+    None
+}
+
+unsafe fn bigint_object_to_ssize(value: *mut PyObject, context: &str) -> Option<isize> {
+    let value = unsafe { crate::types::int::to_bigint_including_bool(value) }?;
+    match num_traits::ToPrimitive::to_isize(&value) {
+        Some(index) => Some(index),
+        None => {
+            raise_type_error(format!("{context} argument is out of Py_ssize_t range"));
+            None
+        }
+    }
+}
+
+unsafe fn install_slot_wrappers(ns: &mut PyClassDict, foreign: &ForeignTypeObject) -> Option<()> {
+    let mapping = if foreign.tp_as_mapping.is_null() {
+        None
+    } else {
+        Some(unsafe { &*foreign.tp_as_mapping.cast::<CMappingMethods>() })
+    };
+    let mapping_has_len = mapping.map_or(false, |methods| !methods.mp_length.is_null());
+    let mapping_has_getitem = mapping.map_or(false, |methods| !methods.mp_subscript.is_null());
+    let mapping_has_ass_item = mapping.map_or(false, |methods| !methods.mp_ass_subscript.is_null());
+
+    if !foreign.tp_as_number.is_null() {
+        let methods = unsafe { &*foreign.tp_as_number.cast::<CNumberMethods>() };
+        install_slot_wrapper(ns, "__add__", methods.nb_add, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__radd__", methods.nb_add, SlotKind::ReflectedBinary)?;
+        install_slot_wrapper(ns, "__sub__", methods.nb_subtract, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__rsub__", methods.nb_subtract, SlotKind::ReflectedBinary)?;
+        install_slot_wrapper(ns, "__mul__", methods.nb_multiply, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__rmul__", methods.nb_multiply, SlotKind::ReflectedBinary)?;
+        install_slot_wrapper(ns, "__mod__", methods.nb_remainder, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__rmod__", methods.nb_remainder, SlotKind::ReflectedBinary)?;
+        install_slot_wrapper(ns, "__divmod__", methods.nb_divmod, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__rdivmod__", methods.nb_divmod, SlotKind::ReflectedBinary)?;
+        install_slot_wrapper(ns, "__pow__", methods.nb_power, SlotKind::Ternary)?;
+        install_slot_wrapper(ns, "__rpow__", methods.nb_power, SlotKind::ReflectedTernary)?;
+        install_slot_wrapper(ns, "__neg__", methods.nb_negative, SlotKind::Unary)?;
+        install_slot_wrapper(ns, "__pos__", methods.nb_positive, SlotKind::Unary)?;
+        install_slot_wrapper(ns, "__abs__", methods.nb_absolute, SlotKind::Unary)?;
+        install_slot_wrapper(ns, "__bool__", methods.nb_bool, SlotKind::InquiryBool)?;
+        install_slot_wrapper(ns, "__invert__", methods.nb_invert, SlotKind::Unary)?;
+        install_slot_wrapper(ns, "__lshift__", methods.nb_lshift, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__rlshift__", methods.nb_lshift, SlotKind::ReflectedBinary)?;
+        install_slot_wrapper(ns, "__rshift__", methods.nb_rshift, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__rrshift__", methods.nb_rshift, SlotKind::ReflectedBinary)?;
+        install_slot_wrapper(ns, "__and__", methods.nb_and, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__rand__", methods.nb_and, SlotKind::ReflectedBinary)?;
+        install_slot_wrapper(ns, "__xor__", methods.nb_xor, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__rxor__", methods.nb_xor, SlotKind::ReflectedBinary)?;
+        install_slot_wrapper(ns, "__or__", methods.nb_or, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__ror__", methods.nb_or, SlotKind::ReflectedBinary)?;
+        install_slot_wrapper(ns, "__int__", methods.nb_int, SlotKind::Unary)?;
+        install_slot_wrapper(ns, "__float__", methods.nb_float, SlotKind::Unary)?;
+        install_slot_wrapper(ns, "__iadd__", methods.nb_inplace_add, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__isub__", methods.nb_inplace_subtract, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__imul__", methods.nb_inplace_multiply, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__imod__", methods.nb_inplace_remainder, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__ipow__", methods.nb_inplace_power, SlotKind::Ternary)?;
+        install_slot_wrapper(ns, "__ilshift__", methods.nb_inplace_lshift, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__irshift__", methods.nb_inplace_rshift, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__iand__", methods.nb_inplace_and, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__ixor__", methods.nb_inplace_xor, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__ior__", methods.nb_inplace_or, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__floordiv__", methods.nb_floor_divide, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__rfloordiv__", methods.nb_floor_divide, SlotKind::ReflectedBinary)?;
+        install_slot_wrapper(ns, "__truediv__", methods.nb_true_divide, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__rtruediv__", methods.nb_true_divide, SlotKind::ReflectedBinary)?;
+        install_slot_wrapper(ns, "__ifloordiv__", methods.nb_inplace_floor_divide, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__itruediv__", methods.nb_inplace_true_divide, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__index__", methods.nb_index, SlotKind::Unary)?;
+        install_slot_wrapper(ns, "__matmul__", methods.nb_matrix_multiply, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__rmatmul__", methods.nb_matrix_multiply, SlotKind::ReflectedBinary)?;
+        install_slot_wrapper(ns, "__imatmul__", methods.nb_inplace_matrix_multiply, SlotKind::Binary)?;
+    }
+
+    if !foreign.tp_as_sequence.is_null() {
+        let methods = unsafe { &*foreign.tp_as_sequence.cast::<CSequenceMethods>() };
+        if !mapping_has_len {
+            install_slot_wrapper(ns, "__len__", methods.sq_length, SlotKind::Len)?;
+        }
+        install_slot_wrapper(ns, "__add__", methods.sq_concat, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__mul__", methods.sq_repeat, SlotKind::SSizeRepeat)?;
+        install_slot_wrapper(ns, "__rmul__", methods.sq_repeat, SlotKind::SSizeRepeat)?;
+        if !mapping_has_getitem {
+            install_slot_wrapper(ns, "__getitem__", methods.sq_item, SlotKind::SSizeItem)?;
+        }
+        if !mapping_has_ass_item {
+            install_slot_wrapper(ns, "__setitem__", methods.sq_ass_item, SlotKind::SSizeSetItem)?;
+            install_slot_wrapper(ns, "__delitem__", methods.sq_ass_item, SlotKind::SSizeDelItem)?;
+        }
+        install_slot_wrapper(ns, "__contains__", methods.sq_contains, SlotKind::ObjObjProc)?;
+        install_slot_wrapper(ns, "__iadd__", methods.sq_inplace_concat, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__imul__", methods.sq_inplace_repeat, SlotKind::SSizeRepeat)?;
+    }
+
+    if let Some(methods) = mapping {
+        install_slot_wrapper(ns, "__len__", methods.mp_length, SlotKind::Len)?;
+        install_slot_wrapper(ns, "__getitem__", methods.mp_subscript, SlotKind::Binary)?;
+        install_slot_wrapper(ns, "__setitem__", methods.mp_ass_subscript, SlotKind::ObjObjArgSet)?;
+        install_slot_wrapper(ns, "__delitem__", methods.mp_ass_subscript, SlotKind::ObjObjArgDel)?;
+    }
+
+    Some(())
+}
+
+fn install_slot_wrapper(ns: &mut PyClassDict, name: &str, slot_ptr: *mut (), kind: SlotKind) -> Option<()> {
+    if slot_ptr.is_null() {
+        return Some(());
+    }
+    let name_id = intern(name);
+    if ns.get(name_id).is_some() {
+        return Some(());
+    }
+    let descriptor = alloc_slot_wrapper(slot_ptr, kind, ptr::null_mut(), name_id);
+    if descriptor.is_null() {
+        return None;
+    }
+    ns.set(name_id, descriptor);
+    Some(())
+}
+
+unsafe fn inherit_foreign_protocol_tables(child: &mut ForeignTypeObject, base: &ForeignTypeObject) {
+    unsafe { inherit_number_protocol_table(&mut child.tp_as_number, base.tp_as_number) };
+    unsafe { inherit_sequence_protocol_table(&mut child.tp_as_sequence, base.tp_as_sequence) };
+    unsafe { inherit_mapping_protocol_table(&mut child.tp_as_mapping, base.tp_as_mapping) };
+}
+
+unsafe fn inherit_number_protocol_table(child: &mut *mut (), base: *mut ()) {
+    if base.is_null() {
+        return;
+    }
+    if child.is_null() {
+        *child = base;
+        return;
+    }
+    if !FROMSPEC_NUMBER_TABLES.lock().unwrap_or_else(|poison| poison.into_inner()).contains(&(*child as usize)) {
+        return;
+    }
+    let child = unsafe { &mut *child.cast::<CNumberMethods>() };
+    let base = unsafe { &*base.cast::<CNumberMethods>() };
+    macro_rules! inherit_field {
+        ($field:ident) => {
+            if child.$field.is_null() {
+                child.$field = base.$field;
+            }
+        };
+    }
+    inherit_field!(nb_add);
+    inherit_field!(nb_subtract);
+    inherit_field!(nb_multiply);
+    inherit_field!(nb_remainder);
+    inherit_field!(nb_divmod);
+    inherit_field!(nb_power);
+    inherit_field!(nb_negative);
+    inherit_field!(nb_positive);
+    inherit_field!(nb_absolute);
+    inherit_field!(nb_bool);
+    inherit_field!(nb_invert);
+    inherit_field!(nb_lshift);
+    inherit_field!(nb_rshift);
+    inherit_field!(nb_and);
+    inherit_field!(nb_xor);
+    inherit_field!(nb_or);
+    inherit_field!(nb_int);
+    inherit_field!(nb_reserved);
+    inherit_field!(nb_float);
+    inherit_field!(nb_inplace_add);
+    inherit_field!(nb_inplace_subtract);
+    inherit_field!(nb_inplace_multiply);
+    inherit_field!(nb_inplace_remainder);
+    inherit_field!(nb_inplace_power);
+    inherit_field!(nb_inplace_lshift);
+    inherit_field!(nb_inplace_rshift);
+    inherit_field!(nb_inplace_and);
+    inherit_field!(nb_inplace_xor);
+    inherit_field!(nb_inplace_or);
+    inherit_field!(nb_floor_divide);
+    inherit_field!(nb_true_divide);
+    inherit_field!(nb_inplace_floor_divide);
+    inherit_field!(nb_inplace_true_divide);
+    inherit_field!(nb_index);
+    inherit_field!(nb_matrix_multiply);
+    inherit_field!(nb_inplace_matrix_multiply);
+}
+
+unsafe fn inherit_sequence_protocol_table(child: &mut *mut (), base: *mut ()) {
+    if base.is_null() {
+        return;
+    }
+    if child.is_null() {
+        *child = base;
+        return;
+    }
+    if !FROMSPEC_SEQUENCE_TABLES.lock().unwrap_or_else(|poison| poison.into_inner()).contains(&(*child as usize)) {
+        return;
+    }
+    let child = unsafe { &mut *child.cast::<CSequenceMethods>() };
+    let base = unsafe { &*base.cast::<CSequenceMethods>() };
+    macro_rules! inherit_field {
+        ($field:ident) => {
+            if child.$field.is_null() {
+                child.$field = base.$field;
+            }
+        };
+    }
+    inherit_field!(sq_length);
+    inherit_field!(sq_concat);
+    inherit_field!(sq_repeat);
+    inherit_field!(sq_item);
+    inherit_field!(was_sq_slice);
+    inherit_field!(sq_ass_item);
+    inherit_field!(was_sq_ass_slice);
+    inherit_field!(sq_contains);
+    inherit_field!(sq_inplace_concat);
+    inherit_field!(sq_inplace_repeat);
+}
+
+unsafe fn inherit_mapping_protocol_table(child: &mut *mut (), base: *mut ()) {
+    if base.is_null() {
+        return;
+    }
+    if child.is_null() {
+        *child = base;
+        return;
+    }
+    if !FROMSPEC_MAPPING_TABLES.lock().unwrap_or_else(|poison| poison.into_inner()).contains(&(*child as usize)) {
+        return;
+    }
+    let child = unsafe { &mut *child.cast::<CMappingMethods>() };
+    let base = unsafe { &*base.cast::<CMappingMethods>() };
+    if child.mp_length.is_null() {
+        child.mp_length = base.mp_length;
+    }
+    if child.mp_subscript.is_null() {
+        child.mp_subscript = base.mp_subscript;
+    }
+    if child.mp_ass_subscript.is_null() {
+        child.mp_ass_subscript = base.mp_ass_subscript;
+    }
+}
+
+unsafe fn install_native_protocol_tables(ty: &mut PyType, foreign: &ForeignTypeObject) {
+    if let Some(methods) = unsafe { native_number_methods(foreign) } {
+        ty.tp_as_number = Box::into_raw(Box::new(methods));
+    }
+    if let Some(methods) = unsafe { native_sequence_methods(foreign) } {
+        ty.tp_as_sequence = Box::into_raw(Box::new(methods));
+    }
+    if let Some(methods) = unsafe { native_mapping_methods(foreign) } {
+        ty.tp_as_mapping = Box::into_raw(Box::new(methods));
+    }
+}
+
+unsafe fn native_number_methods(foreign: &ForeignTypeObject) -> Option<PyNumberMethods> {
+    if foreign.tp_as_number.is_null() {
+        return None;
+    }
+    let c = unsafe { &*foreign.tp_as_number.cast::<CNumberMethods>() };
+    let mut methods = PyNumberMethods::EMPTY;
+    if let Some(function) = unsafe { slot::<BinaryFunc>(c.nb_add) } {
+        methods.nb_add = Some(function);
+        methods.nb_reflected_add = Some(capi_nb_reflected_add);
+    }
+    if let Some(function) = unsafe { slot::<BinaryFunc>(c.nb_subtract) } {
+        methods.nb_subtract = Some(function);
+        methods.nb_reflected_subtract = Some(capi_nb_reflected_subtract);
+    }
+    if let Some(function) = unsafe { slot::<BinaryFunc>(c.nb_multiply) } {
+        methods.nb_multiply = Some(function);
+        methods.nb_reflected_multiply = Some(capi_nb_reflected_multiply);
+    }
+    if let Some(function) = unsafe { slot::<BinaryFunc>(c.nb_remainder) } {
+        methods.nb_remainder = Some(function);
+        methods.nb_reflected_remainder = Some(capi_nb_reflected_remainder);
+    }
+    if let Some(function) = unsafe { slot::<BinaryFunc>(c.nb_divmod) } {
+        methods.nb_divmod = Some(function);
+        methods.nb_reflected_divmod = Some(capi_nb_reflected_divmod);
+    }
+    methods.nb_power = unsafe { slot::<TernaryFunc>(c.nb_power) };
+    if methods.nb_power.is_some() {
+        methods.nb_reflected_power = Some(capi_nb_reflected_power);
+    }
+    methods.nb_negative = unsafe { slot::<UnaryFunc>(c.nb_negative) };
+    methods.nb_positive = unsafe { slot::<UnaryFunc>(c.nb_positive) };
+    methods.nb_absolute = unsafe { slot::<UnaryFunc>(c.nb_absolute) };
+    methods.nb_bool = unsafe { slot::<InquiryFunc>(c.nb_bool) };
+    methods.nb_invert = unsafe { slot::<UnaryFunc>(c.nb_invert) };
+    if let Some(function) = unsafe { slot::<BinaryFunc>(c.nb_lshift) } {
+        methods.nb_lshift = Some(function);
+        methods.nb_reflected_lshift = Some(capi_nb_reflected_lshift);
+    }
+    if let Some(function) = unsafe { slot::<BinaryFunc>(c.nb_rshift) } {
+        methods.nb_rshift = Some(function);
+        methods.nb_reflected_rshift = Some(capi_nb_reflected_rshift);
+    }
+    if let Some(function) = unsafe { slot::<BinaryFunc>(c.nb_and) } {
+        methods.nb_and = Some(function);
+        methods.nb_reflected_and = Some(capi_nb_reflected_and);
+    }
+    if let Some(function) = unsafe { slot::<BinaryFunc>(c.nb_xor) } {
+        methods.nb_xor = Some(function);
+        methods.nb_reflected_xor = Some(capi_nb_reflected_xor);
+    }
+    if let Some(function) = unsafe { slot::<BinaryFunc>(c.nb_or) } {
+        methods.nb_or = Some(function);
+        methods.nb_reflected_or = Some(capi_nb_reflected_or);
+    }
+    methods.nb_int = unsafe { slot::<UnaryFunc>(c.nb_int) };
+    methods.nb_float = unsafe { slot::<UnaryFunc>(c.nb_float) };
+    methods.nb_inplace_add = unsafe { slot::<BinaryFunc>(c.nb_inplace_add) };
+    methods.nb_inplace_subtract = unsafe { slot::<BinaryFunc>(c.nb_inplace_subtract) };
+    methods.nb_inplace_multiply = unsafe { slot::<BinaryFunc>(c.nb_inplace_multiply) };
+    methods.nb_inplace_remainder = unsafe { slot::<BinaryFunc>(c.nb_inplace_remainder) };
+    methods.nb_inplace_power = unsafe { slot::<TernaryFunc>(c.nb_inplace_power) };
+    methods.nb_inplace_lshift = unsafe { slot::<BinaryFunc>(c.nb_inplace_lshift) };
+    methods.nb_inplace_rshift = unsafe { slot::<BinaryFunc>(c.nb_inplace_rshift) };
+    methods.nb_inplace_and = unsafe { slot::<BinaryFunc>(c.nb_inplace_and) };
+    methods.nb_inplace_xor = unsafe { slot::<BinaryFunc>(c.nb_inplace_xor) };
+    methods.nb_inplace_or = unsafe { slot::<BinaryFunc>(c.nb_inplace_or) };
+    if let Some(function) = unsafe { slot::<BinaryFunc>(c.nb_floor_divide) } {
+        methods.nb_floor_divide = Some(function);
+        methods.nb_reflected_floor_divide = Some(capi_nb_reflected_floor_divide);
+    }
+    if let Some(function) = unsafe { slot::<BinaryFunc>(c.nb_true_divide) } {
+        methods.nb_true_divide = Some(function);
+        methods.nb_reflected_true_divide = Some(capi_nb_reflected_true_divide);
+    }
+    methods.nb_inplace_floor_divide = unsafe { slot::<BinaryFunc>(c.nb_inplace_floor_divide) };
+    methods.nb_inplace_true_divide = unsafe { slot::<BinaryFunc>(c.nb_inplace_true_divide) };
+    methods.nb_index = unsafe { slot::<UnaryFunc>(c.nb_index) };
+    if let Some(function) = unsafe { slot::<BinaryFunc>(c.nb_matrix_multiply) } {
+        methods.nb_matrix_multiply = Some(function);
+        methods.nb_reflected_matrix_multiply = Some(capi_nb_reflected_matrix_multiply);
+    }
+    methods.nb_inplace_matrix_multiply = unsafe { slot::<BinaryFunc>(c.nb_inplace_matrix_multiply) };
+    Some(methods)
+}
+
+unsafe fn native_sequence_methods(foreign: &ForeignTypeObject) -> Option<PySequenceMethods> {
+    if foreign.tp_as_sequence.is_null() {
+        return None;
+    }
+    let c = unsafe { &*foreign.tp_as_sequence.cast::<CSequenceMethods>() };
+    let mapping_has_length = if foreign.tp_as_mapping.is_null() {
+        false
+    } else {
+        !unsafe { (*foreign.tp_as_mapping.cast::<CMappingMethods>()).mp_length }.is_null()
+    };
+    let mut methods = PySequenceMethods::EMPTY;
+    if !mapping_has_length {
+        methods.sq_length = unsafe { slot::<LenFunc>(c.sq_length) };
+    }
+    methods.sq_concat = unsafe { slot::<BinaryFunc>(c.sq_concat) };
+    if !c.sq_repeat.is_null() {
+        methods.sq_repeat = Some(capi_sq_repeat);
+    }
+    methods.sq_item = unsafe { slot::<SSizeArgFunc>(c.sq_item) };
+    methods.sq_ass_item = unsafe { slot::<SSizeObjArgProc>(c.sq_ass_item) };
+    methods.sq_contains = unsafe { slot::<ObjObjProc>(c.sq_contains) };
+    methods.sq_inplace_concat = unsafe { slot::<BinaryFunc>(c.sq_inplace_concat) };
+    if !c.sq_inplace_repeat.is_null() {
+        methods.sq_inplace_repeat = Some(capi_sq_inplace_repeat);
+    }
+    Some(methods)
+}
+
+unsafe fn native_mapping_methods(foreign: &ForeignTypeObject) -> Option<PyMappingMethods> {
+    if foreign.tp_as_mapping.is_null() {
+        return None;
+    }
+    let c = unsafe { &*foreign.tp_as_mapping.cast::<CMappingMethods>() };
+    let mut methods = PyMappingMethods::EMPTY;
+    methods.mp_length = unsafe { slot::<LenFunc>(c.mp_length) };
+    methods.mp_subscript = unsafe { slot::<BinaryFunc>(c.mp_subscript) };
+    methods.mp_ass_subscript = unsafe { slot::<ObjObjArgProc>(c.mp_ass_subscript) };
+    Some(methods)
+}
+
+unsafe fn foreign_type_for_slot_receiver(receiver: *mut PyObject) -> Option<*mut ForeignTypeObject> {
+    if receiver.is_null() {
+        return None;
+    }
+    let receiver = crate::tag::untag_arg(receiver);
+    // SAFETY: `receiver` is a live object supplied to a native slot.
+    let native = unsafe { (*receiver).ob_type.cast_mut() };
+    twin::registered_foreign_of_native(native)
+}
+
+unsafe fn call_reflected_number_slot(
+    receiver: *mut PyObject,
+    other: *mut PyObject,
+    select: impl FnOnce(&CNumberMethods) -> *mut (),
+    slot_name: &'static str,
+) -> *mut PyObject {
+    let Some(foreign) = (unsafe { foreign_type_for_slot_receiver(receiver) }) else {
+        return abi::return_null_with_error(format!("{slot_name} reflected slot receiver is not a ready C type"));
+    };
+    let table = unsafe { (*foreign).tp_as_number };
+    if table.is_null() {
+        return abi::return_null_with_error(format!("{slot_name} reflected slot table is missing"));
+    }
+    let slot_ptr = select(unsafe { &*table.cast::<CNumberMethods>() });
+    let Some(function) = (unsafe { slot::<BinaryFunc>(slot_ptr) }) else {
+        return abi::return_null_with_error(format!("{slot_name} reflected slot is missing"));
+    };
+    unsafe { function(other, receiver) }
+}
+
+unsafe fn call_reflected_power_slot(receiver: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+    let Some(foreign) = (unsafe { foreign_type_for_slot_receiver(receiver) }) else {
+        return abi::return_null_with_error("nb_power reflected slot receiver is not a ready C type");
+    };
+    let table = unsafe { (*foreign).tp_as_number };
+    if table.is_null() {
+        return abi::return_null_with_error("nb_power reflected slot table is missing");
+    }
+    let slot_ptr = unsafe { (*table.cast::<CNumberMethods>()).nb_power };
+    let Some(function) = (unsafe { slot::<TernaryFunc>(slot_ptr) }) else {
+        return abi::return_null_with_error("nb_power reflected slot is missing");
+    };
+    let none = unsafe { abi::pon_none() };
+    unsafe { function(other, receiver, none) }
+}
+
+macro_rules! reflected_number_slot {
+    ($fn_name:ident, $field:ident) => {
+        unsafe extern "C" fn $fn_name(receiver: *mut PyObject, other: *mut PyObject) -> *mut PyObject {
+            unsafe { call_reflected_number_slot(receiver, other, |methods| methods.$field, stringify!($field)) }
+        }
+    };
+}
+
+reflected_number_slot!(capi_nb_reflected_add, nb_add);
+reflected_number_slot!(capi_nb_reflected_subtract, nb_subtract);
+reflected_number_slot!(capi_nb_reflected_multiply, nb_multiply);
+reflected_number_slot!(capi_nb_reflected_remainder, nb_remainder);
+reflected_number_slot!(capi_nb_reflected_divmod, nb_divmod);
+reflected_number_slot!(capi_nb_reflected_lshift, nb_lshift);
+reflected_number_slot!(capi_nb_reflected_rshift, nb_rshift);
+reflected_number_slot!(capi_nb_reflected_and, nb_and);
+reflected_number_slot!(capi_nb_reflected_xor, nb_xor);
+reflected_number_slot!(capi_nb_reflected_or, nb_or);
+reflected_number_slot!(capi_nb_reflected_floor_divide, nb_floor_divide);
+reflected_number_slot!(capi_nb_reflected_true_divide, nb_true_divide);
+reflected_number_slot!(capi_nb_reflected_matrix_multiply, nb_matrix_multiply);
+
+unsafe extern "C" fn capi_nb_reflected_power(receiver: *mut PyObject, other: *mut PyObject, _modulo: *mut PyObject) -> *mut PyObject {
+    unsafe { call_reflected_power_slot(receiver, other) }
+}
+
+unsafe extern "C" fn capi_sq_repeat(receiver: *mut PyObject, count: *mut PyObject) -> *mut PyObject {
+    unsafe { call_sequence_repeat_slot(receiver, count, false) }
+}
+
+unsafe extern "C" fn capi_sq_inplace_repeat(receiver: *mut PyObject, count: *mut PyObject) -> *mut PyObject {
+    unsafe { call_sequence_repeat_slot(receiver, count, true) }
+}
+
+unsafe fn call_sequence_repeat_slot(receiver: *mut PyObject, count: *mut PyObject, inplace: bool) -> *mut PyObject {
+    let Some(index) = (unsafe { object_to_ssize(count, if inplace { "sq_inplace_repeat" } else { "sq_repeat" }) }) else {
+        return ptr::null_mut();
+    };
+    let Some(foreign) = (unsafe { foreign_type_for_slot_receiver(receiver) }) else {
+        return abi::return_null_with_error("sequence repeat slot receiver is not a ready C type");
+    };
+    let table = unsafe { (*foreign).tp_as_sequence };
+    if table.is_null() {
+        return abi::return_null_with_error("sequence repeat slot table is missing");
+    }
+    let methods = unsafe { &*table.cast::<CSequenceMethods>() };
+    let slot_ptr = if inplace { methods.sq_inplace_repeat } else { methods.sq_repeat };
+    let Some(function) = (unsafe { slot::<SSizeArgFunc>(slot_ptr) }) else {
+        return abi::return_null_with_error("sequence repeat slot is missing");
+    };
+    unsafe { function(receiver, index) }
 }
 
 /// getset descriptor carrier.
@@ -1066,7 +2117,7 @@ mod tests {
 
     use super::super::load_extension_module;
     use super::super::tests::{ResetImportStateOnDrop, TempExtensionRoot, compile_extension};
-    use crate::abi::{format_object_for_print, pon_call, pon_const_int, pon_runtime_init};
+    use crate::abi::{format_object_for_print, pon_call, pon_const_int, pon_get_attr, pon_runtime_init};
     use crate::import::module_attr;
     use crate::intern::intern;
     use crate::object::PyObject;
@@ -1230,6 +2281,30 @@ static PyObject *drive(PyObject *self, PyObject *args) {
 
     if (PyType_IsSubtype(&CounterType, &CounterType)) ok |= 1L << 12;
 
+    if (CounterType.tp_dict != NULL) ok |= 1L << 13;
+    if (CounterType.tp_dict != NULL && PyDict_CheckExact(CounterType.tp_dict)) ok |= 1L << 17;
+    PyObject *carrier = CounterType.tp_dict == NULL ? NULL : PyDict_GetItemString(CounterType.tp_dict, "increment");
+    if (carrier != NULL) ok |= 1L << 14;
+    if (PyErr_Occurred() != NULL) PyErr_Clear();
+
+    PyObject *extra = PyUnicode_FromString("from-tp-dict");
+    if (CounterType.tp_dict != NULL && extra != NULL
+            && PyDict_SetItemString(CounterType.tp_dict, "extra", extra) == 0) {
+        PyObject *got = PyObject_GetAttrString((PyObject *)&CounterType, "extra");
+        if (got == extra) ok |= 1L << 15;
+        Py_XDECREF(got);
+    }
+    Py_XDECREF(extra);
+    if (PyErr_Occurred() != NULL) PyErr_Clear();
+
+    PyObject *pre_ready = PyObject_GetAttrString((PyObject *)&CounterType, "pre_ready");
+    if (pre_ready != NULL) {
+        const char *text = PyUnicode_AsUTF8(pre_ready);
+        if (text != NULL && strcmp(text, "pre-ready") == 0) ok |= 1L << 16;
+    }
+    Py_XDECREF(pre_ready);
+    if (PyErr_Occurred() != NULL) PyErr_Clear();
+
     Py_DECREF(obj);
     return PyLong_FromLong(ok);
 }
@@ -1256,6 +2331,17 @@ static struct PyModuleDef module = {
 
 PyMODINIT_FUNC PyInit_capi_typeobj_ext(void) {
     PyObject *m;
+    PyObject *pre_ready = PyUnicode_FromString("pre-ready");
+    CounterType.tp_dict = PyDict_New();
+    if (CounterType.tp_dict == NULL || pre_ready == NULL) {
+        Py_XDECREF(pre_ready);
+        return NULL;
+    }
+    if (PyDict_SetItemString(CounterType.tp_dict, "pre_ready", pre_ready) < 0) {
+        Py_DECREF(pre_ready);
+        return NULL;
+    }
+    Py_DECREF(pre_ready);
     if (PyType_Ready(&CounterType) < 0) {
         return NULL;
     }
@@ -1265,6 +2351,449 @@ PyMODINIT_FUNC PyInit_capi_typeobj_ext(void) {
     }
     Py_INCREF(&CounterType);
     if (PyModule_AddObject(m, "Counter", (PyObject *)&CounterType) < 0) {
+        return NULL;
+    }
+    return m;
+}
+"#;
+
+    const CUSTOM_METATYPE_SOURCE: &str = r#"
+#include <Python.h>
+
+#define BIT(n) (1L << (n))
+
+typedef struct {
+    PyObject_HEAD
+} ThingObject;
+
+typedef struct {
+    PyTypeObject type;
+    int extra;
+} ThingTypeObject;
+
+static PyObject *Meta_tag(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    return PyUnicode_FromString("metatype-tag");
+}
+
+static PyMethodDef Meta_methods[] = {
+    {"tag", Meta_tag, METH_NOARGS, "metatype method"},
+    {NULL, NULL, 0, NULL},
+};
+
+static PyTypeObject MetaType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "capi_custom_metatype_ext.Meta",
+    .tp_basicsize = sizeof(ThingTypeObject),
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+    .tp_methods = Meta_methods,
+};
+
+static ThingTypeObject ThingType = {
+    {
+        PyVarObject_HEAD_INIT(&MetaType, 0)
+        .tp_name = "capi_custom_metatype_ext.Thing",
+        .tp_basicsize = sizeof(ThingObject),
+        .tp_flags = Py_TPFLAGS_DEFAULT,
+        .tp_new = PyType_GenericNew,
+    },
+    314159,
+};
+
+static PyObject *drive(PyObject *self, PyObject *args) {
+    long ok = 0;
+    (void)self;
+    (void)args;
+
+    MetaType.tp_base = &PyType_Type;
+
+    if (PyType_Ready(&MetaType) == 0) {
+        ok |= BIT(0);
+    } else if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+
+    if (PyType_Ready((PyTypeObject *)&ThingType) == 0) {
+        ok |= BIT(1);
+    } else if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+
+    if (Py_TYPE((PyObject *)&ThingType) == &MetaType) ok |= BIT(2);
+    if (PyObject_IsInstance((PyObject *)&ThingType, (PyObject *)&MetaType) == 1) ok |= BIT(3);
+    if (PyErr_Occurred() != NULL) PyErr_Clear();
+
+    PyObject *obj = PyObject_CallObject((PyObject *)&ThingType, NULL);
+    if (obj != NULL) {
+        ok |= BIT(4);
+        if (Py_TYPE(obj) == (PyTypeObject *)&ThingType) ok |= BIT(5);
+    } else if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+
+    PyObject *tag = PyObject_CallMethod((PyObject *)&ThingType, "tag", NULL);
+    if (tag != NULL) {
+        const char *text = PyUnicode_AsUTF8(tag);
+        if (text != NULL && strcmp(text, "metatype-tag") == 0) ok |= BIT(6);
+        Py_DECREF(tag);
+    }
+    if (PyErr_Occurred() != NULL) PyErr_Clear();
+
+    if (ThingType.extra == 314159) ok |= BIT(7);
+
+    Py_XDECREF(obj);
+    return PyLong_FromLong(ok);
+}
+
+static PyMethodDef module_methods[] = {
+    {"drive", drive, METH_NOARGS, "exercise static custom metatype"},
+    {NULL, NULL, 0, NULL},
+};
+
+static struct PyModuleDef module = {
+    PyModuleDef_HEAD_INIT,
+    "capi_custom_metatype_ext",
+    "custom metatype PyType_Ready fixture",
+    -1,
+    module_methods,
+};
+
+PyMODINIT_FUNC PyInit_capi_custom_metatype_ext(void) {
+    return PyModule_Create(&module);
+}
+"#;
+
+    const PROTOCOL_SOURCE: &str = r#"
+#include <Python.h>
+
+#define BIT(n) (1L << (n))
+
+typedef struct {
+    PyObject_HEAD
+} ProtoObject;
+
+static PyTypeObject ProtoType;
+static PyTypeObject LeftType;
+static long set_count = 0;
+static long del_count = 0;
+static long last_set_key = 0;
+static long last_set_value = 0;
+static long last_del_key = 0;
+
+static PyObject *Proto_add(PyObject *left, PyObject *right) {
+    if (Py_TYPE(left) == &LeftType && Py_TYPE(right) == &ProtoType) {
+        return PyLong_FromLong(7001);
+    }
+    if (Py_TYPE(left) == &ProtoType && Py_TYPE(right) == &LeftType) {
+        return PyLong_FromLong(7002);
+    }
+    if (Py_TYPE(left) == &ProtoType && Py_TYPE(right) == &ProtoType) {
+        return PyLong_FromLong(7003);
+    }
+    Py_RETURN_NOTIMPLEMENTED;
+}
+
+static PyObject *Proto_negative(PyObject *self) {
+    (void)self;
+    return PyLong_FromLong(7100);
+}
+
+static PyObject *Proto_absolute(PyObject *self) {
+    (void)self;
+    return PyLong_FromLong(7400);
+}
+
+static int Proto_bool(PyObject *self) {
+    (void)self;
+    return 1;
+}
+
+static PyObject *Proto_iadd(PyObject *left, PyObject *right) {
+    (void)left;
+    (void)right;
+    return PyLong_FromLong(7200);
+}
+
+static PyObject *Proto_power(PyObject *left, PyObject *right, PyObject *modulo) {
+    (void)left;
+    (void)right;
+    return PyLong_FromLong(modulo == Py_None ? 7300 : 7301);
+}
+
+static Py_ssize_t Proto_sq_length(PyObject *self) {
+    (void)self;
+    return 5;
+}
+
+static PyObject *Proto_sq_item(PyObject *self, Py_ssize_t index) {
+    (void)self;
+    return PyLong_FromLong(8000 + (long)index);
+}
+
+static int Proto_sq_contains(PyObject *self, PyObject *value) {
+    (void)self;
+    long needle = PyLong_AsLong(value);
+    if (PyErr_Occurred() != NULL) {
+        return -1;
+    }
+    return needle == 7;
+}
+
+static PyObject *Proto_mp_subscript(PyObject *self, PyObject *key) {
+    (void)self;
+    long index = PyLong_AsLong(key);
+    if (PyErr_Occurred() != NULL) {
+        return NULL;
+    }
+    return PyLong_FromLong(8100 + index);
+}
+
+static int Proto_mp_ass_subscript(PyObject *self, PyObject *key, PyObject *value) {
+    (void)self;
+    long index = PyLong_AsLong(key);
+    if (PyErr_Occurred() != NULL) {
+        return -1;
+    }
+    if (value == NULL) {
+        del_count += 1;
+        last_del_key = index;
+        return 0;
+    }
+    long stored = PyLong_AsLong(value);
+    if (PyErr_Occurred() != NULL) {
+        return -1;
+    }
+    set_count += 1;
+    last_set_key = index;
+    last_set_value = stored;
+    return 0;
+}
+
+static PyObject *Explicit_abs(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    return PyLong_FromLong(9999);
+}
+
+static PyMethodDef Proto_methods[] = {
+    {"__abs__", Explicit_abs, METH_NOARGS, "explicit method must beat slot wrapper"},
+    {NULL, NULL, 0, NULL},
+};
+
+static PyNumberMethods Proto_as_number = {
+    .nb_add = Proto_add,
+    .nb_power = Proto_power,
+    .nb_negative = Proto_negative,
+    .nb_absolute = Proto_absolute,
+    .nb_bool = Proto_bool,
+    .nb_inplace_add = Proto_iadd,
+};
+
+static PySequenceMethods Proto_as_sequence = {
+    .sq_length = Proto_sq_length,
+    .sq_item = Proto_sq_item,
+    .sq_contains = Proto_sq_contains,
+};
+
+static PyMappingMethods Proto_as_mapping = {
+    .mp_subscript = Proto_mp_subscript,
+    .mp_ass_subscript = Proto_mp_ass_subscript,
+};
+
+static PyTypeObject ProtoType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "capi_protocol_slots_ext.Proto",
+    .tp_basicsize = sizeof(ProtoObject),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_as_number = &Proto_as_number,
+    .tp_as_sequence = &Proto_as_sequence,
+    .tp_as_mapping = &Proto_as_mapping,
+    .tp_methods = Proto_methods,
+    .tp_new = PyType_GenericNew,
+};
+
+static PyTypeObject LeftType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name = "capi_protocol_slots_ext.Left",
+    .tp_basicsize = sizeof(ProtoObject),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_new = PyType_GenericNew,
+};
+
+static int check_long_result(PyObject *object, long expected) {
+    if (object == NULL) {
+        if (PyErr_Occurred() != NULL) PyErr_Clear();
+        return 0;
+    }
+    long value = PyLong_AsLong(object);
+    int ok = PyErr_Occurred() == NULL && value == expected;
+    Py_DECREF(object);
+    if (PyErr_Occurred() != NULL) PyErr_Clear();
+    return ok;
+}
+
+static int check_bool_result(PyObject *object, int expected) {
+    if (object == NULL) {
+        if (PyErr_Occurred() != NULL) PyErr_Clear();
+        return 0;
+    }
+    int truth = PyObject_IsTrue(object);
+    int ok = truth == expected;
+    Py_DECREF(object);
+    if (PyErr_Occurred() != NULL) PyErr_Clear();
+    return ok;
+}
+
+static int check_none_result(PyObject *object) {
+    if (object == NULL) {
+        if (PyErr_Occurred() != NULL) PyErr_Clear();
+        return 0;
+    }
+    int ok = object == Py_None;
+    Py_DECREF(object);
+    if (PyErr_Occurred() != NULL) PyErr_Clear();
+    return ok;
+}
+
+static int check_attr_call0(PyObject *receiver, const char *name, long expected) {
+    PyObject *method = PyObject_GetAttrString(receiver, name);
+    if (method == NULL) {
+        if (PyErr_Occurred() != NULL) PyErr_Clear();
+        return 0;
+    }
+    PyObject *result = PyObject_CallNoArgs(method);
+    Py_DECREF(method);
+    return check_long_result(result, expected);
+}
+
+static int check_attr_call1(PyObject *receiver, const char *name, PyObject *arg, long expected) {
+    PyObject *method = PyObject_GetAttrString(receiver, name);
+    if (method == NULL) {
+        if (PyErr_Occurred() != NULL) PyErr_Clear();
+        return 0;
+    }
+    PyObject *result = PyObject_CallOneArg(method, arg);
+    Py_DECREF(method);
+    return check_long_result(result, expected);
+}
+
+static int check_attr_call1_bool(PyObject *receiver, const char *name, PyObject *arg, int expected) {
+    PyObject *method = PyObject_GetAttrString(receiver, name);
+    if (method == NULL) {
+        if (PyErr_Occurred() != NULL) PyErr_Clear();
+        return 0;
+    }
+    PyObject *result = PyObject_CallOneArg(method, arg);
+    Py_DECREF(method);
+    return check_bool_result(result, expected);
+}
+
+static int check_attr_setitem(PyObject *receiver, PyObject *key, PyObject *value) {
+    PyObject *method = PyObject_GetAttrString(receiver, "__setitem__");
+    if (method == NULL) {
+        if (PyErr_Occurred() != NULL) PyErr_Clear();
+        return 0;
+    }
+    PyObject *args = PyTuple_Pack(2, key, value);
+    PyObject *result = args == NULL ? NULL : PyObject_CallObject(method, args);
+    Py_XDECREF(args);
+    Py_DECREF(method);
+    return check_none_result(result);
+}
+
+static int check_attr_delitem(PyObject *receiver, PyObject *key) {
+    PyObject *method = PyObject_GetAttrString(receiver, "__delitem__");
+    if (method == NULL) {
+        if (PyErr_Occurred() != NULL) PyErr_Clear();
+        return 0;
+    }
+    PyObject *result = PyObject_CallOneArg(method, key);
+    Py_DECREF(method);
+    return check_none_result(result);
+}
+
+static PyObject *drive(PyObject *self, PyObject *args) {
+    long ok = 0;
+    (void)self;
+    (void)args;
+
+    PyObject *a = PyObject_CallNoArgs((PyObject *)&ProtoType);
+    PyObject *b = PyObject_CallNoArgs((PyObject *)&ProtoType);
+    PyObject *left = PyObject_CallNoArgs((PyObject *)&LeftType);
+    PyObject *key = PyLong_FromLong(3);
+    PyObject *value = PyLong_FromLong(11);
+    PyObject *seven = PyLong_FromLong(7);
+    if (a == NULL || b == NULL || left == NULL || key == NULL || value == NULL || seven == NULL) {
+        Py_XDECREF(a);
+        Py_XDECREF(b);
+        Py_XDECREF(left);
+        Py_XDECREF(key);
+        Py_XDECREF(value);
+        Py_XDECREF(seven);
+        return NULL;
+    }
+
+    if (check_long_result(Proto_as_number.nb_add(a, b), 7003)) ok |= BIT(0);
+    if (check_long_result(Proto_as_number.nb_power(a, b, Py_None), 7300)) ok |= BIT(1);
+    if (check_attr_call0(a, "__neg__", 7100)) ok |= BIT(2);
+    if (check_attr_call1(a, "__add__", b, 7003)) ok |= BIT(3);
+    if (check_attr_call1(b, "__radd__", left, 7001)) ok |= BIT(4);
+    if (check_attr_call1(a, "__iadd__", b, 7200)) ok |= BIT(5);
+    if (check_attr_call0(a, "__abs__", 9999)) ok |= BIT(6);
+    if (check_long_result(PyObject_GetItem(a, key), 8103)) ok |= BIT(7);
+    if (check_attr_call1(a, "__getitem__", key, 8103)) ok |= BIT(8);
+    if (PyObject_SetItem(a, key, value) == 0 && set_count == 1 && last_set_key == 3 && last_set_value == 11) ok |= BIT(9);
+    if (PyObject_DelItem(a, key) == 0 && del_count == 1 && last_del_key == 3) ok |= BIT(10);
+    if (check_attr_setitem(a, key, value) && set_count == 2 && last_set_key == 3 && last_set_value == 11) ok |= BIT(11);
+    if (check_attr_delitem(a, key) && del_count == 2 && last_del_key == 3) ok |= BIT(12);
+    if (PySequence_Contains(a, seven) == 1) ok |= BIT(13);
+    if (check_attr_call1_bool(a, "__contains__", seven, 1)) ok |= BIT(14);
+    if (PyObject_IsTrue(a) == 1) ok |= BIT(15);
+    if (PyObject_Size(a) == 5) ok |= BIT(16);
+    if (check_attr_call0(a, "__len__", 5)) ok |= BIT(17);
+    if (check_long_result(Proto_as_sequence.sq_item(a, 4), 8004)) ok |= BIT(18);
+    if (PyErr_Occurred() != NULL) PyErr_Clear();
+
+    Py_DECREF(a);
+    Py_DECREF(b);
+    Py_DECREF(left);
+    Py_DECREF(key);
+    Py_DECREF(value);
+    Py_DECREF(seven);
+    return PyLong_FromLong(ok);
+}
+
+static PyMethodDef module_methods[] = {
+    {"drive", drive, METH_NOARGS, "exercise protocol slot wrappers"},
+    {NULL, NULL, 0, NULL},
+};
+
+static struct PyModuleDef module = {
+    PyModuleDef_HEAD_INIT,
+    "capi_protocol_slots_ext",
+    "protocol slot wrapper fixture",
+    -1,
+    module_methods,
+};
+
+PyMODINIT_FUNC PyInit_capi_protocol_slots_ext(void) {
+    if (PyType_Ready(&LeftType) < 0) {
+        return NULL;
+    }
+    if (PyType_Ready(&ProtoType) < 0) {
+        return NULL;
+    }
+    PyObject *m = PyModule_Create(&module);
+    if (m == NULL) {
+        return NULL;
+    }
+    Py_INCREF(&ProtoType);
+    if (PyModule_AddObject(m, "Proto", (PyObject *)&ProtoType) < 0) {
+        return NULL;
+    }
+    Py_INCREF(&LeftType);
+    if (PyModule_AddObject(m, "Left", (PyObject *)&LeftType) < 0) {
         return NULL;
     }
     return m;
@@ -1301,14 +2830,17 @@ PyMODINIT_FUNC PyInit_capi_typeobj_ext(void) {
 
         let module_name = intern("capi_typeobj_ext");
 
-        // C-side probe: all thirteen bits must hold; a partial mask names
+        // C-side probe: all eighteen bits must hold; a partial mask names
         // the first failing surface.
         let drive = module_attr(module_name, intern("drive")).expect("drive registered");
         let result = unsafe { pon_call(drive, ptr::null_mut(), 0) };
         assert!(!result.is_null(), "drive() returned NULL: {:?}", pon_err_message());
-        assert_eq!(format_object_for_print(result).as_deref(), Ok("8191"), "C-side bitmask mismatch");
+        assert_eq!(format_object_for_print(result).as_deref(), Ok("262143"), "C-side bitmask mismatch");
 
         let counter = module_attr(module_name, intern("Counter")).expect("Counter registered");
+        let extra = unsafe { pon_get_attr(counter, intern("extra"), ptr::null_mut()) };
+        assert!(!extra.is_null(), "pon-side Counter.extra lookup failed: {:?}", pon_err_message());
+        assert_eq!(format_object_for_print(extra).as_deref(), Ok("from-tp-dict"));
         construct_and_probe_counter(counter);
 
         // Dealloc bridge: both instances are garbage now. The first collect
@@ -1330,6 +2862,63 @@ PyMODINIT_FUNC PyInit_capi_typeobj_ext(void) {
             (1..=2).contains(&deallocs),
             "expected 1-2 Counter deallocs after two collects, got {deallocs}"
         );
+    }
+
+
+    #[test]
+    fn capi_static_protocol_tables_install_slot_wrappers() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+
+        let temp = TempExtensionRoot::new();
+        let module_path = compile_extension(&temp, "capi_protocol_slots_ext", PROTOCOL_SOURCE);
+        let module = load_extension_module("capi_protocol_slots_ext", &module_path)
+            .unwrap_or_else(|message| panic!("failed to load protocol C extension: {message}"));
+        assert!(!module.is_null(), "extension loader returned NULL module");
+
+        let module_name = intern("capi_protocol_slots_ext");
+        let drive = module_attr(module_name, intern("drive")).expect("drive registered");
+        let result = unsafe { pon_call(drive, ptr::null_mut(), 0) };
+        assert!(!result.is_null(), "drive() returned NULL: {:?}", pon_err_message());
+        assert_eq!(format_object_for_print(result).as_deref(), Ok("524287"), "C-side protocol bitmask mismatch");
+
+        let proto_type = module_attr(module_name, intern("Proto")).expect("Proto registered");
+        let left_type = module_attr(module_name, intern("Left")).expect("Left registered");
+        let proto_a = unsafe { pon_call(proto_type, ptr::null_mut(), 0) };
+        let proto_b = unsafe { pon_call(proto_type, ptr::null_mut(), 0) };
+        let left = unsafe { pon_call(left_type, ptr::null_mut(), 0) };
+        assert!(!proto_a.is_null() && !proto_b.is_null() && !left.is_null(), "instance construction failed: {:?}", pon_err_message());
+
+        let sum = unsafe { crate::abi::number::pon_binary_op(crate::abstract_op::BINARY_ADD, proto_a, proto_b, ptr::null_mut()) };
+        assert!(!sum.is_null(), "Proto + Proto returned NULL: {:?}", pon_err_message());
+        assert_eq!(format_object_for_print(sum).as_deref(), Ok("7003"));
+
+        let reflected = unsafe { crate::abi::number::pon_binary_op(crate::abstract_op::BINARY_ADD, left, proto_b, ptr::null_mut()) };
+        assert!(!reflected.is_null(), "Left + Proto returned NULL: {:?}", pon_err_message());
+        assert_eq!(format_object_for_print(reflected).as_deref(), Ok("7001"));
+    }
+    #[test]
+    fn capi_static_custom_metatype_instances_are_type_objects() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+
+        let temp = TempExtensionRoot::new();
+        let module_path = compile_extension(&temp, "capi_custom_metatype_ext", CUSTOM_METATYPE_SOURCE);
+        let module = load_extension_module("capi_custom_metatype_ext", &module_path)
+            .unwrap_or_else(|message| panic!("failed to load custom metatype C extension: {message}"));
+        assert!(!module.is_null(), "extension loader returned NULL module");
+
+        let module_name = intern("capi_custom_metatype_ext");
+        let drive = module_attr(module_name, intern("drive")).expect("drive registered");
+        let result = unsafe { pon_call(drive, ptr::null_mut(), 0) };
+        assert!(!result.is_null(), "drive() returned NULL: {:?}", pon_err_message());
+        assert_eq!(format_object_for_print(result).as_deref(), Ok("255"), "C-side bitmask mismatch");
     }
 }
 
@@ -1384,10 +2973,20 @@ static PyObject *FromSpec_bump(PyObject *self, PyObject *args) {
     return PyLong_FromLong(obj->value);
 }
 
-static PyObject *Bad_add(PyObject *left, PyObject *right) {
+static PyObject *FromSpec_add(PyObject *left, PyObject *right) {
     (void)left;
     (void)right;
-    Py_RETURN_NOTIMPLEMENTED;
+    return PyLong_FromLong(77);
+}
+
+static Py_ssize_t FromSpec_len(PyObject *self) {
+    (void)self;
+    return 12;
+}
+
+static PyObject *Bad_await(PyObject *self) {
+    (void)self;
+    Py_RETURN_NONE;
 }
 
 static PyMethodDef FromSpec_methods[] = {
@@ -1406,6 +3005,8 @@ static PyType_Slot FromSpec_slots[] = {
     {Py_tp_new, FromSpec_new},
     {Py_tp_init, FromSpec_init},
     {Py_tp_repr, FromSpec_repr},
+    {Py_nb_add, FromSpec_add},
+    {Py_sq_length, FromSpec_len},
     {0, NULL},
 };
 
@@ -1418,7 +3019,7 @@ static PyType_Spec FromSpec_spec = {
 };
 
 static PyType_Slot Bad_slots[] = {
-    {Py_nb_add, Bad_add},
+    {Py_am_await, Bad_await},
     {0, NULL},
 };
 
@@ -1467,10 +3068,27 @@ static PyObject *drive(PyObject *self, PyObject *args) {
     Py_XDECREF(repr);
     if (PyErr_Occurred() != NULL) PyErr_Clear();
 
+    PyObject *sum = (obj == NULL || FromSpec_Type->tp_as_number == NULL) ? NULL : FromSpec_Type->tp_as_number->nb_add(obj, obj);
+    if (sum != NULL && PyLong_AsLong(sum) == 77) ok |= 1L << 7;
+    Py_XDECREF(sum);
+    if (PyErr_Occurred() != NULL) PyErr_Clear();
+
+    if (obj != NULL && PyObject_Size(obj) == 12) ok |= 1L << 8;
+    if (PyErr_Occurred() != NULL) PyErr_Clear();
+
+    PyObject *add_method = obj == NULL ? NULL : PyObject_GetAttrString(obj, "__add__");
+    if (add_method != NULL) {
+        PyObject *dunder_sum = PyObject_CallOneArg(add_method, obj);
+        if (dunder_sum != NULL && PyLong_AsLong(dunder_sum) == 77) ok |= 1L << 9;
+        Py_XDECREF(dunder_sum);
+        Py_DECREF(add_method);
+    }
+    if (PyErr_Occurred() != NULL) PyErr_Clear();
+
     PyObject *bad = PyType_FromSpec(&Bad_spec);
     if (bad == NULL && PyErr_ExceptionMatches(PyExc_TypeError)) {
         PyErr_Clear();
-        ok |= 1L << 7;
+        ok |= 1L << 10;
     } else {
         Py_XDECREF(bad);
         if (PyErr_Occurred() != NULL) PyErr_Clear();
@@ -1512,7 +3130,7 @@ PyMODINIT_FUNC PyInit_capi_fromspec_ext(void) {
 "#;
 
     #[test]
-    fn capi_type_from_spec_builds_heap_type_and_rejects_protocol_slots() {
+    fn capi_type_from_spec_builds_heap_type_and_protocol_slots() {
         let _guard = test_state_lock();
         let _reset = ResetImportStateOnDrop;
         unsafe {
@@ -1529,6 +3147,6 @@ PyMODINIT_FUNC PyInit_capi_fromspec_ext(void) {
         let drive = module_attr(module_name, intern("drive")).expect("drive registered");
         let result = unsafe { pon_call(drive, ptr::null_mut(), 0) };
         assert!(!result.is_null(), "drive() returned NULL: {:?}", pon_err_message());
-        assert_eq!(format_object_for_print(result).as_deref(), Ok("255"), "C-side bitmask mismatch");
+        assert_eq!(format_object_for_print(result).as_deref(), Ok("2047"), "C-side bitmask mismatch");
     }
 }

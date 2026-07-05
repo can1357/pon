@@ -20,10 +20,10 @@
  * valid-but-torn-down object, exactly as on CPython. tp_free on GC-owned
  * instances is a no-op (the collector owns the block).
  *
- * TODO(typeobj): type->tp_dict stays NULL after PyType_Ready — the native
- * class dict cannot cross the boundary as a dict object yet. Mutate type
- * attributes through PyObject_SetAttrString((PyObject *)type, ...) instead;
- * PyDict_* on a NULL tp_dict raises rather than crashing.
+ * PyType_Ready backfills type->tp_dict with a live dict-shaped view over the
+ * native class namespace. PyDict_GetItem* reads current class entries, and
+ * PyDict_SetItem* writes update native type attributes and invalidate type
+ * caches just like PyObject_SetAttrString((PyObject *)type, ...).
  */
 
 typedef struct PyPonCapiTypeObj {

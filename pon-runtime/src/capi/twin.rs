@@ -350,7 +350,9 @@ fn fill_twin(twin: *mut ForeignTypeObject, native: *mut PyType, tid: Option<usiz
         (*twin).tp_itemsize = (*native).tp_itemsize;
         (*twin).tp_flags = twin_flags(native, tid, type_type);
         (*twin).tp_pon_twin = native;
-        (*twin).ob_type = resolve_in_batch(type_type, batch);
+        let meta = (*native).ob_base.ob_type.cast_mut();
+        let meta = if meta.is_null() { type_type } else { meta };
+        (*twin).ob_type = resolve_in_batch(meta, batch);
         let base = (*native).tp_base;
         (*twin).tp_base = resolve_in_batch(base, batch);
     }
@@ -463,6 +465,9 @@ pub(crate) unsafe extern "C" fn capi_builtin_type_id(object: *mut PyObject) -> c
     if object.is_null() {
         return -1;
     }
+    if registered_native_of_foreign(object.cast::<ForeignTypeObject>()).is_some() {
+        return -1;
+    }
     if crate::tag::is_small_int(object) {
         return TID_LONG as c_int;
     }
@@ -472,6 +477,9 @@ pub(crate) unsafe extern "C" fn capi_builtin_type_id(object: *mut PyObject) -> c
     let Some(keys) = builtin_keys() else {
         return -1;
     };
+    if unsafe { crate::types::type_::is_class_dict_view(object) } {
+        return TID_DICT as c_int;
+    }
     // SAFETY: heap-tagged live object.
     let ty = unsafe { (*object).ob_type } as usize;
     for key in keys {
@@ -486,6 +494,16 @@ pub(crate) unsafe extern "C" fn capi_builtin_type_id(object: *mut PyObject) -> c
 pub(crate) unsafe extern "C" fn capi_foreign_of(object: *mut PyObject) -> *mut ForeignTypeObject {
     if object.is_null() {
         return ptr::null_mut();
+    }
+    let foreign_type_object = object.cast::<ForeignTypeObject>();
+    if registered_native_of_foreign(foreign_type_object).is_some() {
+        // `Py_TYPE((PyObject *)SomeReadyPyTypeObject)` reads the extension's
+        // own type header.  Do not reinterpret that foreign `ob_type` as a
+        // native `PyType *`; for custom metatypes it is another foreign static.
+        // SAFETY: registry membership proves this pointer is a ready foreign
+        // `PyTypeObject` prefix.
+        let meta = unsafe { (*foreign_type_object).ob_type };
+        return if meta.is_null() { foreign_of_native(abi::runtime_type_type()) } else { meta };
     }
     let native = if crate::tag::is_small_int(object) {
         abi::runtime_long_type()
