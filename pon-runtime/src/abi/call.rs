@@ -21,6 +21,40 @@ pub const CODE_FLAG_COROUTINE: CodeFlags = 1 << 1;
 /// async-generator object on call (PEP 525).
 pub const CODE_FLAG_ASYNC_GENERATOR: CodeFlags = 1 << 2;
 
+/// CPython `PyCallable_Check`: `type(o)->tp_call != NULL`.  pon's function/
+/// method/type objects dispatch through dedicated [`pon_call`] fast paths
+/// without `tp_call` slots, so they are named explicitly.  Type objects with
+/// a custom metaclass (ABCs, `class Meta(type)`) report the metaclass name
+/// instead of `"type"` yet inherit `type.tp_call`, so any metaclass instance
+/// is callable.  Everything else is callable when its type carries `tp_call`
+/// or its MRO defines `__call__` (heap instances go through the DunderCall
+/// path).  Backs `builtins.callable` and the argument checks in `os` and
+/// `collections`.
+pub(crate) fn is_callable_object(object: *mut PyObject) -> bool {
+    // Tagged small ints are ints: never callable, and must not be
+    // dereferenced as heap pointers.
+    if object.is_null() || crate::tag::is_small_int(object) {
+        return false;
+    }
+    if matches!(
+        unsafe { crate::types::dict::type_name(object) },
+        Some("function" | "method" | "type")
+    ) {
+        return true;
+    }
+    // Same criterion as `pon_call`'s type-callee dispatch
+    // (`is_runtime_type_object`): the metatype is a `type` subtype, so the
+    // object inherits `type.tp_call` regardless of its metaclass name.
+    let is_type = super::with_runtime(|runtime| unsafe { super::is_runtime_type_object(runtime, object) });
+    if is_type == Some(true) {
+        return true;
+    }
+    let ty = unsafe { (*object).ob_type.cast_mut() };
+    !ty.is_null()
+        && (unsafe { (*ty).tp_call.is_some() }
+            || !unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern(crate::intern::DUNDER_CALL)) }.is_null())
+}
+
 /// Calls a boxed callable with positional, keyword, `*args`, and `**kwargs`
 /// operands.  Unsupported expansion forms report a NULL-sentinel error rather
 /// than unwinding.

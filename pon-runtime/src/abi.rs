@@ -107,6 +107,16 @@ pub(crate) fn object_dunder_str_carrier() -> *mut PyObject {
     OBJECT_DUNDER_STR_CARRIER.load(Ordering::Acquire)
 }
 
+pub(crate) fn object_dunder_init_carrier() -> *mut PyObject {
+    OBJECT_DUNDER_INIT_CARRIER.load(Ordering::Acquire)
+}
+
+/// Freshly allocated empty tuple for slot calls whose C contract requires a
+/// real tuple (a C-extension class's bridged `tp_init`, never NULL args).
+pub(crate) fn empty_args_tuple() -> Result<*mut PyObject, String> {
+    with_runtime(|runtime| seq::alloc_tuple_from_slice(runtime, &[])).ok_or_else(|| "runtime is not initialized".to_owned())?
+}
+
 const DEOPT_THRASH_THRESHOLD: u32 = 64;
 const DEOPT_BACKOFF_MAX_SHIFT: u32 = 6;
 const DEOPT_PIN_EPOCH: u8 = 8;
@@ -1637,6 +1647,29 @@ pub(crate) fn runtime_type_type() -> *mut PyType {
     with_runtime(|runtime| runtime._type_type).unwrap_or(ptr::null_mut())
 }
 
+/// Canonical `int` type object (C-API twin registration).
+pub(crate) fn runtime_long_type() -> *mut PyType {
+    with_runtime(|runtime| runtime.long_type).unwrap_or(ptr::null_mut())
+}
+
+/// Canonical `str` type object (C-API twin registration).
+pub(crate) fn runtime_unicode_type() -> *mut PyType {
+    with_runtime(|runtime| runtime.unicode_type).unwrap_or(ptr::null_mut())
+}
+
+/// Canonical `NoneType` type object (C-API twin registration).
+pub(crate) fn runtime_none_type() -> *mut PyType {
+    with_runtime(|runtime| runtime.none_type).unwrap_or(ptr::null_mut())
+}
+
+/// Canonical builtin exception type object for `kind` (C-API `PyExc_*`).
+///
+/// Sources the runtime's own [`ExceptionTypeSet`] rather than the mutable
+/// builtin globals so the C-API singletons cannot drift.
+pub(crate) fn exception_type_object(kind: crate::types::exc::ExceptionKind) -> *mut PyType {
+    with_runtime(|runtime| runtime.exception_types.get(kind)).unwrap_or(ptr::null_mut())
+}
+
 pub(crate) fn class_construction_active() -> bool {
     with_runtime(|runtime| !runtime.class_namespace_stack.is_empty() || !runtime.class_construction_stack.is_empty()).unwrap_or(false)
 }
@@ -3113,6 +3146,14 @@ fn builtin_constructor_for_name(name: &str) -> Option<BuiltinConstructor> {
         // binder's trailing marker into `builtin_dict`, which merges them
         // after the positional source (argparse's `dict(kwargs, dest=...)`).
         "dict" => Some(crate::native::builtins_mod::builtin_dict),
+        // Builtin data constructors: the binder flattens the keyword surface
+        // to the exact positional layout or raises CPython's TypeErrors for
+        // keyword holes (numpy's meson features module hashes with
+        // `bytes(str(a), encoding='utf-8')`).
+        "str" => Some(crate::native::builtins_mod::builtin_str),
+        "bytes" => Some(crate::native::builtins_mod::builtin_bytes),
+        "bytearray" => Some(crate::native::builtins_mod::builtin_bytearray),
+        "int" => Some(crate::native::builtins_mod::builtin_int),
         _ => None,
     }
 }
@@ -3917,6 +3958,9 @@ unsafe fn call_bound_code_pointer(
     if code.is_null() {
         return return_null_with_error("function code pointer is null");
     }
+    if let Some(raised) = guard_recursion_limit() {
+        return raised;
+    }
 
     let _guard = CurrentFunctionGuard::push(function, argv, argc);
     let _handled_guard = HandledExcGuard::enter_clearing_pending();
@@ -3926,6 +3970,23 @@ unsafe fn call_bound_code_pointer(
         return return_null_with_error("call returned NULL without setting an exception");
     }
     result
+}
+
+/// CPython's recursion guard at compiled-call entry: `Some(NULL)` with a
+/// RecursionError set once the compiled-call stack reaches
+/// `sys.getrecursionlimit()`, `None` when the call may proceed.  Converts
+/// runaway Python recursion into the catchable CPython error instead of a
+/// fatal host stack overflow (meson's feature-implication walks were the
+/// first consumer; the `sys.setrecursionlimit` section comment names this
+/// hook).
+pub(crate) fn guard_recursion_limit() -> Option<*mut PyObject> {
+    if current_function_stack_depth() < crate::native::sys::recursion_limit() {
+        return None;
+    }
+    Some(exc::raise_kind_error_text(
+        crate::types::exc::ExceptionKind::RecursionError,
+        "maximum recursion depth exceeded",
+    ))
 }
 
 pub(crate) struct CurrentFunctionGuard {
@@ -4291,13 +4352,8 @@ unsafe fn call_type_from_argv(callee: *mut PyObject, argv: *mut *mut PyObject, a
         if instance.is_null() {
             return ptr::null_mut();
         }
-        // Builtin native constructors (tp_new != type_new) perform COMPLETE
-        // construction: the returned object is fully initialized from `args`.
-        // The class-dict `__init__` installed for heap subclasses resolving
-        // through the builtin's MRO (dict/list surfaces) must not run a
-        // second construction pass — `list(map(...))` would re-consume the
-        // exhausted iterator and replace the contents with the empty tail.
-        if new as *const () as usize != type_::type_new as *const () as usize {
+        // Post-`tp_new` initialization decision shared with `type_call`.
+        if !unsafe { type_::construction_runs_init(cls, new, instance) } {
             return instance;
         }
         instance
@@ -4323,29 +4379,62 @@ unsafe fn call_type_from_argv(callee: *mut PyObject, argv: *mut *mut PyObject, a
         instance
     };
 
-    let init = unsafe { crate::descr::lookup_in_type(cls, crate::intern::intern("__init__")) };
+    let init = unsafe { type_::construction_init_override(cls) };
     if !init.is_null() {
         let init_is_function = with_runtime(|runtime| unsafe { is_exact_type(init, runtime.function_type) }).unwrap_or(false);
-        if !init_is_function {
-            return return_null_with_type_error("type __init__ is not callable");
-        }
-        let mut positional = Vec::with_capacity(argc.saturating_add(1));
-        positional.push(instance);
-        positional.extend_from_slice(args);
-        let keywords = function::KeywordArgs {
-            names: &[],
-            values: &[],
-        };
-        match unsafe { function::call_bound_function(init, &positional, keywords, None, None) } {
-            Ok(result) => {
-                if result.is_null() {
-                    return ptr::null_mut();
+        if init_is_function {
+            // Hot path: a plain Python function skips generic descriptor
+            // dispatch and calls bound directly.
+            let mut positional = Vec::with_capacity(argc.saturating_add(1));
+            positional.push(instance);
+            positional.extend_from_slice(args);
+            let keywords = function::KeywordArgs {
+                names: &[],
+                values: &[],
+            };
+            match unsafe { function::call_bound_function(init, &positional, keywords, None, None) } {
+                Ok(result) => {
+                    if result.is_null() {
+                        return ptr::null_mut();
+                    }
                 }
+                Err(message) => return return_null_with_error(message),
             }
-            Err(message) => return return_null_with_error(message),
+        } else {
+            // Generic path, identical to `type_call`: bind through the
+            // descriptor protocol and dispatch dynamically (native
+            // descriptors, C-function carriers, wrappers).
+            let bound = unsafe { crate::descr::descriptor_get(init, instance, cls) };
+            if bound.is_null() {
+                return ptr::null_mut();
+            }
+            let mut init_argv = args.to_vec();
+            let result = unsafe {
+                pon_call(
+                    bound,
+                    if init_argv.is_empty() { ptr::null_mut() } else { init_argv.as_mut_ptr() },
+                    init_argv.len(),
+                )
+            };
+            if result.is_null() {
+                return ptr::null_mut();
+            }
         }
     } else if let Some(init_slot) = unsafe { (*cls).tp_init } {
-        if unsafe { init_slot(instance, ptr::null_mut(), ptr::null_mut()) } < 0 {
+        // CPython passes the constructor arguments through to `tp_init`;
+        // NULL stands in for the empty tuple (Pon slot convention), except
+        // for C-extension classes whose bridged `tp_init` follows the
+        // CPython contract: a real (possibly empty) tuple, never NULL.
+        let args_object = if args.is_empty() && !unsafe { crate::capi::is_capi_class(cls) } {
+            ptr::null_mut()
+        } else {
+            match with_runtime(|runtime| seq::alloc_tuple_from_slice(runtime, args)) {
+                Some(Ok(tuple)) => tuple,
+                Some(Err(message)) => return return_null_with_error(message),
+                None => return return_null_with_error("runtime is not initialized"),
+            }
+        };
+        if unsafe { init_slot(instance, args_object, ptr::null_mut()) } < 0 {
             return ptr::null_mut();
         }
     }
@@ -5608,6 +5697,13 @@ fn collect_impl() -> Result<(), String> {
 /// `HELPERS` row, never visible to compiled code.
 pub(crate) fn alloc_gc_object(type_id: TypeId, info: GcTypeInfo) -> Result<*mut u8, String> {
     let size = info.size;
+    alloc_gc_object_sized(type_id, info, size)
+}
+
+/// Variable-size variant of [`alloc_gc_object`] for C-extension instances
+/// (`tp_basicsize + nitems * tp_itemsize`); `info.size` stays the nominal
+/// fixed prefix.
+pub(crate) fn alloc_gc_object_sized(type_id: TypeId, info: GcTypeInfo, size: usize) -> Result<*mut u8, String> {
     with_runtime(|runtime| {
         runtime.heap.register_type(type_id, info);
         runtime.heap.alloc(size, type_id)
