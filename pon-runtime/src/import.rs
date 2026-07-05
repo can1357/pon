@@ -1268,6 +1268,35 @@ static SYNTHETIC_MODULE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// (deadlock-freedom mirrors the [`gc_held_roots`] contract).
 static SYNTHETIC_MODULES: LazyLock<Mutex<HashMap<u32, usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Hidden executable module namespace for dynamic `eval`/`exec` globals dicts.
+///
+/// These backing modules are deliberately absent from the import cache and
+/// `sys.modules`; they exist only so compiled dynamic code has a persistent
+/// module object for global resolution and function `__globals__` identity.
+pub(crate) fn create_dynexec_backing_module(name: &str) -> Result<u32, String> {
+    let name_id = intern(name);
+    let module_type = {
+        let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        state.module_type
+    };
+    {
+        let synthetic = SYNTHETIC_MODULES.lock().unwrap_or_else(|poison| poison.into_inner());
+        if synthetic.contains_key(&name_id) {
+            return Ok(name_id);
+        }
+    }
+    let object = Box::new(PyModuleObject {
+        ob_base: PyObjectHeader::new(module_type),
+        name: name_id,
+        registry_key: name_id,
+        attrs: HashMap::new(),
+    });
+    let object = as_object_ptr(Box::into_raw(object));
+    let mut synthetic = SYNTHETIC_MODULES.lock().unwrap_or_else(|poison| poison.into_inner());
+    synthetic.insert(name_id, object as usize);
+    Ok(name_id)
+}
+
 /// `type(sys)(name, doc=None)`: CPython `module.__new__` + `module.__init__`
 /// fused into one construction pass, per this runtime's builtin-constructor
 /// convention (`type_call` skips the `__init__` leg when `tp_new` is not

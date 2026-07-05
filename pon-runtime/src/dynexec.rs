@@ -6,9 +6,10 @@
 //! Python-visible code object shell plus namespace defaulting for
 //! `compile`/`eval`/`exec`, `globals`, `locals`, and `__import__`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use num_traits::ToPrimitive;
@@ -136,9 +137,16 @@ unsafe fn as_code_object<'a>(object: *mut PyObject) -> Option<&'a PyCodeObject> 
     Some(unsafe { &*object.cast::<PyCodeObject>() })
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GlobalsBindingKind {
+    ModuleNamespace,
+    DynExecGlobals,
+}
+
 #[derive(Clone, Copy)]
 struct GlobalsBinding {
     module_name: u32,
+    kind: GlobalsBindingKind,
 }
 
 #[derive(Default)]
@@ -148,6 +156,8 @@ struct GlobalsRegistry {
 }
 
 static GLOBALS_REGISTRY: LazyLock<Mutex<GlobalsRegistry>> = LazyLock::new(|| Mutex::new(GlobalsRegistry::default()));
+static DYNEXEC_GLOBALS_SEQ: AtomicU64 = AtomicU64::new(0);
+static SUSPENDED_GLOBAL_MIRRORS: LazyLock<Mutex<HashMap<u32, usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// GC roots for module globals dictionaries returned by `globals()`.
 pub(crate) fn rooted_globals_dicts() -> Vec<*mut PyObject> {
@@ -239,15 +249,22 @@ fn module_globals_dict() -> Result<*mut PyObject, String> {
 /// sync back into the module's attrs (`globals()` for the active module,
 /// `some_module.__dict__` for any module).
 pub(crate) fn module_namespace_dict(module_name: u32) -> Result<*mut PyObject, String> {
-    if let Some(dict_addr) = GLOBALS_REGISTRY
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .by_module
-        .get(&module_name)
-        .copied()
-    {
+    let existing = {
+        let registry = GLOBALS_REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
+        registry.by_module.get(&module_name).copied().map(|dict_addr| {
+            let kind = registry
+                .by_dict
+                .get(&dict_addr)
+                .map(|binding| binding.kind)
+                .unwrap_or(GlobalsBindingKind::ModuleNamespace);
+            (dict_addr, kind)
+        })
+    };
+    if let Some((dict_addr, kind)) = existing {
         let dict_object = dict_addr as *mut PyObject;
-        sync_module_attrs_into_dict(module_name, dict_object)?;
+        if kind == GlobalsBindingKind::ModuleNamespace {
+            sync_module_attrs_into_dict(module_name, dict_object)?;
+        }
         return Ok(dict_object);
     }
 
@@ -255,9 +272,13 @@ pub(crate) fn module_namespace_dict(module_name: u32) -> Result<*mut PyObject, S
     sync_module_attrs_into_dict(module_name, dict_object)?;
     let mut registry = GLOBALS_REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
     registry.by_module.insert(module_name, dict_object as usize);
-    registry
-        .by_dict
-        .insert(dict_object as usize, GlobalsBinding { module_name });
+    registry.by_dict.insert(
+        dict_object as usize,
+        GlobalsBinding {
+            module_name,
+            kind: GlobalsBindingKind::ModuleNamespace,
+        },
+    );
     Ok(dict_object)
 }
 
@@ -291,20 +312,45 @@ fn key_name_id(key: *mut PyObject) -> Option<u32> {
     Some(intern(&text))
 }
 
+fn module_dict_binding(module_name: u32) -> Option<(usize, GlobalsBindingKind)> {
+    let registry = GLOBALS_REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
+    let dict_addr = registry.by_module.get(&module_name).copied()?;
+    let kind = registry
+        .by_dict
+        .get(&dict_addr)
+        .map(|binding| binding.kind)
+        .unwrap_or(GlobalsBindingKind::ModuleNamespace);
+    Some((dict_addr, kind))
+}
+
+fn scratch_infra_key(name: u32) -> bool {
+    name == intern("__pon_dyn_eval_result")
+}
+
+fn global_mirror_suspended(module_name: u32) -> bool {
+    SUSPENDED_GLOBAL_MIRRORS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .contains_key(&module_name)
+}
+
+fn global_mirror_blocked(module_name: u32) -> bool {
+    global_mirror_suspended(module_name) && crate::abi::current_defining_module() != Some(module_name)
+}
+
 /// Mirror a compiled global store into `module_name`'s previously-returned
 /// globals dict (defining-module scoping: the store may target a module other
 /// than the active one when a cross-module function body rebinds a global).
 pub(crate) fn sync_global_store_for_module(module_name: u32, name: u32, value: *mut PyObject) {
-    if value.is_null() {
+    if value.is_null() || global_mirror_blocked(module_name) {
         return;
     }
-    let dict_addr = {
-        let registry = GLOBALS_REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
-        registry.by_module.get(&module_name).copied()
-    };
-    let Some(dict_addr) = dict_addr else {
+    let Some((dict_addr, kind)) = module_dict_binding(module_name) else {
         return;
     };
+    if kind == GlobalsBindingKind::DynExecGlobals && scratch_infra_key(name) {
+        return;
+    }
     let Some(name_text) = resolve(name) else {
         return;
     };
@@ -316,13 +362,15 @@ pub(crate) fn sync_global_store_for_module(module_name: u32, name: u32, value: *
 /// Mirror a compiled global deletion into `module_name`'s previously-returned
 /// globals dict (defining-module scoping, matching `sync_global_store_for_module`).
 pub(crate) fn sync_global_delete_for_module(module_name: u32, name: u32) {
-    let dict_addr = {
-        let registry = GLOBALS_REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
-        registry.by_module.get(&module_name).copied()
-    };
-    let Some(dict_addr) = dict_addr else {
+    if global_mirror_blocked(module_name) {
+        return;
+    }
+    let Some((dict_addr, kind)) = module_dict_binding(module_name) else {
         return;
     };
+    if kind == GlobalsBindingKind::DynExecGlobals && scratch_infra_key(name) {
+        return;
+    }
     let Some(name_text) = resolve(name) else {
         return;
     };
@@ -339,13 +387,21 @@ pub(crate) fn sync_globals_dict_set(dict_object: *mut PyObject, key: *mut PyObje
     let Some(binding) = binding_for_dict(dict_object) else {
         return;
     };
-    if crate::import::active_module_name_id() != Some(binding.module_name) {
-        return;
-    }
     let Some(name) = key_name_id(key) else {
         return;
     };
-    crate::import::store_active_module_attr(name, value);
+    match binding.kind {
+        GlobalsBindingKind::ModuleNamespace => {
+            if crate::import::active_module_name_id() == Some(binding.module_name) {
+                crate::import::store_active_module_attr(name, value);
+            }
+        }
+        GlobalsBindingKind::DynExecGlobals => {
+            if !scratch_infra_key(name) {
+                crate::import::store_module_attr(binding.module_name, name, value);
+            }
+        }
+    }
 }
 
 /// Called by dict item-deletion helpers after a successful delete.
@@ -356,13 +412,21 @@ pub(crate) fn sync_globals_dict_delete(dict_object: *mut PyObject, key: *mut PyO
     let Some(binding) = binding_for_dict(dict_object) else {
         return;
     };
-    if crate::import::active_module_name_id() != Some(binding.module_name) {
-        return;
-    }
     let Some(name) = key_name_id(key) else {
         return;
     };
-    crate::import::delete_active_module_attr(name);
+    match binding.kind {
+        GlobalsBindingKind::ModuleNamespace => {
+            if crate::import::active_module_name_id() == Some(binding.module_name) {
+                crate::import::delete_active_module_attr(name);
+            }
+        }
+        GlobalsBindingKind::DynExecGlobals => {
+            if !scratch_infra_key(name) {
+                crate::import::delete_module_attr(binding.module_name, name);
+            }
+        }
+    }
 }
 
 /// Called by `dict.update` after a successful bulk write.
@@ -378,10 +442,16 @@ pub(crate) fn sync_globals_dict_bulk(dict_object: *mut PyObject) {
     let Some(binding) = binding_for_dict(dict_object) else {
         return;
     };
-    if crate::import::active_module_name_id() != Some(binding.module_name) {
-        return;
+    match binding.kind {
+        GlobalsBindingKind::ModuleNamespace => {
+            if crate::import::active_module_name_id() == Some(binding.module_name) {
+                let _ = copy_dict_to_module(dict_object, binding.module_name);
+            }
+        }
+        GlobalsBindingKind::DynExecGlobals => {
+            let _ = restore_backing_module_to_globals(binding.module_name, dict_object);
+        }
     }
-    let _ = copy_dict_to_module(dict_object, binding.module_name);
 }
 
 /// Dynamic-compile failure split by Python-visible type: `Syntax` raises a
@@ -565,6 +635,34 @@ unsafe fn source_text_arg(object: *mut PyObject, filename: &str) -> Result<Optio
     }
 }
 
+struct GlobalMirrorGuard {
+    module_name: u32,
+}
+
+impl GlobalMirrorGuard {
+    fn enter(module_name: u32) -> Self {
+        let mut mirrors = SUSPENDED_GLOBAL_MIRRORS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *mirrors.entry(module_name).or_insert(0) += 1;
+        Self { module_name }
+    }
+}
+
+impl Drop for GlobalMirrorGuard {
+    fn drop(&mut self) {
+        let mut mirrors = SUSPENDED_GLOBAL_MIRRORS
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(count) = mirrors.get_mut(&self.module_name) {
+            *count -= 1;
+            if *count == 0 {
+                mirrors.remove(&self.module_name);
+            }
+        }
+    }
+}
+
 fn execute_code(code: &PyCodeObject, globals: *mut PyObject, locals: *mut PyObject) -> Result<*mut PyObject, String> {
     let hook = DYN_HOOKS
         .lock()
@@ -573,24 +671,26 @@ fn execute_code(code: &PyCodeObject, globals: *mut PyObject, locals: *mut PyObje
     let Some(hook) = hook else {
         return Err("dynamic code execution is not available in this runtime".to_owned());
     };
-    let registered_module = execution_context_module(globals, locals);
-    let module_name = registered_module.unwrap_or_else(module_name_for_globals);
-    let name_key = intern("__name__");
-    let restore_name = registered_module.is_none().then(|| crate::import::module_attr(module_name, name_key)).flatten();
+    if let Some(module_name) = execution_context_module(globals, locals) {
+        execute_registered_code(code, hook, module_name, globals, locals)
+    } else {
+        execute_plain_dict_code(code, hook, globals, locals)
+    }
+}
+
+fn execute_registered_code(
+    code: &PyCodeObject,
+    hook: DynExecuteHook,
+    module_name: u32,
+    globals: *mut PyObject,
+    locals: *mut PyObject,
+) -> Result<*mut PyObject, String> {
     if unsafe { dict::is_dict(globals) } {
         copy_dict_to_module(globals, module_name)?;
     }
     if locals != globals && unsafe { dict::is_dict(locals) } {
         copy_dict_to_module(locals, module_name)?;
     }
-    // Dynamic code always executes through one backing module namespace: a
-    // real registered module when `globals`/`locals` are that module's live
-    // `__dict__`, else the current active module / `__main__` scratch space.
-    // The scratch path preserves today's exec/eval plumbing (the JIT hook
-    // reads `active_module_attr("__pon_dyn_eval_result")`) but restores the
-    // caller's `__name__` afterward so helpers like `collections.namedtuple`
-    // do not permanently clobber the importing module (`decimal.__name__`
-    // must stay `decimal`, not `namedtuple_DecimalTuple`).
     let context_module_name = resolve(module_name).filter(|name| crate::import::begin_module_execution(name).is_ok());
     let result = hook(DynExecuteRequest {
         source: &code.source,
@@ -608,28 +708,215 @@ fn execute_code(code: &PyCodeObject, globals: *mut PyObject, locals: *mut PyObje
     if locals != globals && unsafe { dict::is_dict(locals) } {
         sync_module_attrs_into_dict(module_name, locals)?;
     }
-    if registered_module.is_none() {
-        match restore_name {
-            Some(value) => {
-                crate::import::store_module_attr(module_name, name_key, value);
-            }
-            None => {
-                crate::import::delete_module_attr(module_name, name_key);
+    finish_execute_result(result)
+}
+
+fn execute_plain_dict_code(
+    code: &PyCodeObject,
+    hook: DynExecuteHook,
+    globals: *mut PyObject,
+    locals: *mut PyObject,
+) -> Result<*mut PyObject, String> {
+    let binding = ensure_dynexec_globals_binding(globals)?;
+    let module_name = binding.module_name;
+    let globals_keys_before = dict_key_ids(globals)?;
+    let locals_keys_before = (locals != globals).then(|| dict_key_ids(locals)).transpose()?;
+
+    restore_backing_module_to_globals(module_name, globals)?;
+    if locals != globals {
+        copy_dict_to_module(locals, module_name)?;
+    }
+    let seeded_name = seed_builtin_name_if_missing(module_name)?;
+
+    let module_text = resolve(module_name).ok_or_else(|| format!("dynamic backing module {module_name} is not interned"))?;
+    let result = {
+        let _mirror_guard = (locals != globals).then(|| GlobalMirrorGuard::enter(module_name));
+        crate::import::begin_module_execution(&module_text)?;
+        let result = hook(DynExecuteRequest {
+            source: &code.source,
+            filename: &code.filename,
+            mode: code.mode,
+            globals,
+            locals,
+        });
+        crate::import::end_module_execution(&module_text);
+        result
+    };
+
+    sync_plain_module_attrs(
+        module_name,
+        globals,
+        locals,
+        &globals_keys_before,
+        locals_keys_before.as_ref(),
+        seeded_name,
+    )?;
+    restore_backing_module_to_globals(module_name, globals)?;
+    finish_execute_result(result)
+}
+
+fn execution_context_module(globals: *mut PyObject, locals: *mut PyObject) -> Option<u32> {
+    binding_for_dict(globals)
+        .filter(|binding| binding.kind == GlobalsBindingKind::ModuleNamespace)
+        .or_else(|| {
+            (locals != globals).then(|| {
+                binding_for_dict(locals).filter(|binding| binding.kind == GlobalsBindingKind::ModuleNamespace)
+            })?
+        })
+        .map(|binding| binding.module_name)
+}
+
+fn ensure_dynexec_globals_binding(globals: *mut PyObject) -> Result<GlobalsBinding, String> {
+    if let Some(binding) = binding_for_dict(globals) {
+        return Ok(binding);
+    }
+    let sequence = DYNEXEC_GLOBALS_SEQ.fetch_add(1, Ordering::Relaxed);
+    let module_text = format!("\0pon_dyn_globals:{sequence}");
+    let module_name = crate::import::create_dynexec_backing_module(&module_text)?;
+    let binding = GlobalsBinding {
+        module_name,
+        kind: GlobalsBindingKind::DynExecGlobals,
+    };
+    let mut registry = GLOBALS_REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(binding) = registry.by_dict.get(&(globals as usize)).copied() {
+        return Ok(binding);
+    }
+    registry.by_module.insert(module_name, globals as usize);
+    registry.by_dict.insert(globals as usize, binding);
+    Ok(binding)
+}
+
+fn dict_key_ids(dict_object: *mut PyObject) -> Result<HashSet<u32>, String> {
+    let entries = unsafe { dict::dict_entries_snapshot(dict_object)? };
+    let mut keys = HashSet::with_capacity(entries.len());
+    for entry in entries {
+        if let Some(name) = key_name_id(entry.key) {
+            keys.insert(name);
+        }
+    }
+    Ok(keys)
+}
+
+fn insert_name_into_dict(dict_object: *mut PyObject, name: u32, value: *mut PyObject) -> Result<(), String> {
+    let Some(name_text) = resolve(name) else {
+        return Ok(());
+    };
+    let key = const_str_object(&name_text)?;
+    unsafe { dict::dict_insert(dict_object, key, value)? };
+    if let Some(binding) = binding_for_dict(dict_object)
+        && binding.kind == GlobalsBindingKind::DynExecGlobals
+        && !scratch_infra_key(name)
+    {
+        crate::import::store_module_attr(binding.module_name, name, value);
+    }
+    Ok(())
+}
+
+fn delete_name_from_dict(dict_object: *mut PyObject, name: u32) -> Result<(), String> {
+    let Some(name_text) = resolve(name) else {
+        return Ok(());
+    };
+    let key = const_str_object(&name_text)?;
+    unsafe { dict::dict_remove(dict_object, key)? };
+    if let Some(binding) = binding_for_dict(dict_object)
+        && binding.kind == GlobalsBindingKind::DynExecGlobals
+        && !scratch_infra_key(name)
+    {
+        crate::import::delete_module_attr(binding.module_name, name);
+    }
+    Ok(())
+}
+
+
+fn restore_backing_module_to_globals(module_name: u32, globals: *mut PyObject) -> Result<(), String> {
+    let globals_keys = dict_key_ids(globals)?;
+    if let Some(attrs) = crate::import::module_attrs_snapshot(module_name) {
+        for (name, _) in attrs {
+            if scratch_infra_key(name) || !globals_keys.contains(&name) {
+                crate::import::delete_module_attr(module_name, name);
             }
         }
     }
+    copy_dict_to_module(globals, module_name)?;
+    crate::import::delete_module_attr(module_name, intern("__pon_dyn_eval_result"));
+    Ok(())
+}
+
+fn seed_builtin_name_if_missing(module_name: u32) -> Result<Option<*mut PyObject>, String> {
+    let name_key = intern("__name__");
+    if crate::import::module_attr(module_name, name_key).is_some() {
+        return Ok(None);
+    }
+    let value = const_str_object("builtins")?;
+    crate::import::store_module_attr(module_name, name_key, value);
+    Ok(Some(value))
+}
+
+fn seeded_builtin_name(name: u32, value: *mut PyObject, seeded_name: Option<*mut PyObject>) -> bool {
+    name == intern("__name__") && seeded_name == Some(value)
+}
+
+fn sync_plain_module_attrs(
+    module_name: u32,
+    globals: *mut PyObject,
+    locals: *mut PyObject,
+    globals_keys_before: &HashSet<u32>,
+    locals_keys_before: Option<&HashSet<u32>>,
+    seeded_name: Option<*mut PyObject>,
+) -> Result<(), String> {
+    let Some(attrs) = crate::import::module_attrs_snapshot(module_name) else {
+        return Ok(());
+    };
+    let present_keys: HashSet<u32> = attrs.iter().map(|(name, _)| *name).collect();
+    if locals == globals {
+        for &name in globals_keys_before {
+            if !scratch_infra_key(name) && !present_keys.contains(&name) {
+                delete_name_from_dict(globals, name)?;
+            }
+        }
+    } else {
+        if let Some(locals_keys) = locals_keys_before {
+            for &name in locals_keys {
+                if !scratch_infra_key(name) && !present_keys.contains(&name) {
+                    delete_name_from_dict(locals, name)?;
+                }
+            }
+        }
+        for &name in globals_keys_before {
+            if locals_keys_before.is_some_and(|keys| keys.contains(&name)) {
+                continue;
+            }
+            if !scratch_infra_key(name) && !present_keys.contains(&name) {
+                delete_name_from_dict(globals, name)?;
+            }
+        }
+    }
+    let current_globals_keys = dict_key_ids(globals)?;
+    for (name, value) in attrs {
+        if scratch_infra_key(name) || seeded_builtin_name(name, value, seeded_name) {
+            continue;
+        }
+        let target = if locals == globals {
+            globals
+        } else if locals_keys_before.is_some_and(|keys| keys.contains(&name)) {
+            locals
+        } else if current_globals_keys.contains(&name) || globals_keys_before.contains(&name) {
+            globals
+        } else {
+            locals
+        };
+        insert_name_into_dict(target, name, value)?;
+    }
+    Ok(())
+}
+
+fn finish_execute_result(result: Result<*mut PyObject, String>) -> Result<*mut PyObject, String> {
     let result = result?;
     if result.is_null() {
         Err("dynamic code execution returned NULL".to_owned())
     } else {
         Ok(result)
     }
-}
-
-fn execution_context_module(globals: *mut PyObject, locals: *mut PyObject) -> Option<u32> {
-    binding_for_dict(globals)
-        .or_else(|| (locals != globals).then(|| binding_for_dict(locals)).flatten())
-        .map(|binding| binding.module_name)
 }
 
 fn copy_dict_to_module(dict_object: *mut PyObject, module_name: u32) -> Result<(), String> {
