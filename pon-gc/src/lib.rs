@@ -486,6 +486,7 @@ impl Heap {
             layout,
             type_id,
             classification: AllocationClass::LargeFallback,
+            finalized: false,
         });
         let mark_state = state.new_allocation_mark_state();
         state.mark_states.push(mark_state);
@@ -546,54 +547,78 @@ impl Heap {
             }
         }
 
-        while let Some(index) = mark_queue.pop() {
-            if !state.begin_object_scan(index) {
+        // Objects whose finalizers are RUNNING right now (outer collect
+        // frame, lock released) are roots: a nested collection must not
+        // free memory an in-flight finalizer is still touching.
+        let in_flight = state.pending_finalizer_roots.clone();
+        for root in in_flight {
+            mark_pointer(&mut state, &mut mark_queue, root.as_ptr());
+        }
+
+        drain_mark_queue(&mut state, &mut mark_queue);
+
+        // Finalization-deferred-free: an unreached allocation whose type
+        // carries a not-yet-run finalizer is resurrected for THIS cycle as a
+        // root wave, so everything its finalizer can touch or store —
+        // including the object itself — stays valid while the finalizer runs.
+        // The allocation is reclaimed by a later cycle once `finalized` is
+        // set (finalizers run at most once; a resurrected object that dies
+        // again is freed without a second callback).
+        let mut pending: Vec<(NonNull<u8>, FinalizeFn)> = Vec::new();
+        for index in 0..state.allocations.len() {
+            if state
+                .mark_states
+                .get(index)
+                .is_some_and(|mark_state| mark_state.is_reached())
+            {
                 continue;
             }
-
-            let Some(allocation) = state.allocations.get(index) else {
+            let allocation = &state.allocations[index];
+            if allocation.finalized {
+                continue;
+            }
+            let Some(finalize) = state.types.get(&allocation.type_id).and_then(|info| info.finalize) else {
                 continue;
             };
-            let start = allocation.start.as_ptr();
-            let type_id = allocation.type_id;
-            let Some(info) = state.types.get(&type_id).copied() else {
-                state.finish_object_scan(index, SingleObjectScan::new(start));
-                continue;
-            };
-
-            let mut scan = SingleObjectScan::new(start);
-            let mut visitor = |child| {
-                if mark_pointer(&mut state, &mut mark_queue, child) {
-                    scan.record_hit();
+            pending.push((allocation.start, finalize));
+        }
+        if !pending.is_empty() {
+            for &(start, _) in &pending {
+                let root = start.as_ptr();
+                mark_pointer(&mut state, &mut mark_queue, root);
+            }
+            drain_mark_queue(&mut state, &mut mark_queue);
+            for &(start, _) in &pending {
+                if let Some(classification) = state.classify_pointer(start.as_ptr()) {
+                    state.allocations[classification.index].finalized = true;
                 }
-            };
-
-            // SAFETY: The allocation is owned by this heap and remains live for
-            // the whole mark phase.  The visitor only records additional
-            // candidate pointers in this collector's mark queue.
-            unsafe {
-                (info.trace)(start, &mut visitor);
             }
-            state.finish_object_scan(index, scan);
-
+            // Root the pending set across the unlocked callback window below.
+            state.pending_finalizer_roots.extend(pending.iter().map(|&(start, _)| start));
         }
         let unreachable = state.sweep();
         drop(state);
         // Finalizers run OUTSIDE the state lock: Python-level hooks
-        // (`__del__`, weakref death callbacks) re-enter `Heap::alloc`, which
-        // takes the same mutex — running them under the lock self-deadlocks
-        // the collecting thread.  The heap tables are already consistent
-        // (survivors re-indexed, unreachable detached), so re-entrant
-        // allocation and even a nested collection are safe: detached blocks
-        // are invisible to both and freed only by this frame below.
-        for allocation in &unreachable {
-            if let Some(finalize) = allocation.finalize {
-                // SAFETY: The object is unreachable and still allocated.  All
-                // unreachable allocation storage remains live until the
-                // deallocation pass below, so finalizers may safely inspect
-                // other unreachable objects they still reference.
-                unsafe {
-                    finalize(allocation.start.as_ptr());
+        // (`__del__`, weakref death callbacks, C `tp_dealloc` bridges)
+        // re-enter `Heap::alloc`, which takes the same mutex — running them
+        // under the lock self-deadlocks the collecting thread.  Every pending
+        // object and its whole subgraph survived the sweep above, and stays
+        // rooted through `pending_finalizer_roots` until every callback
+        // returns, so a nested collection cannot free memory an in-flight
+        // finalizer still touches; `finalized` suppresses a second callback.
+        for &(start, finalize) in &pending {
+            // SAFETY: The object survived this cycle's sweep and remains
+            // allocated; `finalized` was set under the lock so the callback
+            // runs at most once process-wide.
+            unsafe {
+                finalize(start.as_ptr());
+            }
+        }
+        if !pending.is_empty() {
+            let mut state = self.lock_state();
+            for (start, _) in &pending {
+                if let Some(position) = state.pending_finalizer_roots.iter().position(|root| root == start) {
+                    state.pending_finalizer_roots.swap_remove(position);
                 }
             }
         }
@@ -648,6 +673,9 @@ struct HeapState {
     /// the Cython compiler — into O(1) with identical span assignment.
     open_spans: HashMap<usize, usize>,
     large_fallbacks: Vec<usize>,
+    /// Allocation starts whose finalizers are executing in an outer
+    /// `collect` frame with the lock released; rooted by every mark phase.
+    pending_finalizer_roots: Vec<NonNull<u8>>,
 }
 
 impl Default for HeapState {
@@ -666,6 +694,7 @@ impl HeapState {
             spans: Vec::new(),
             open_spans: HashMap::new(),
             large_fallbacks: Vec::new(),
+            pending_finalizer_roots: Vec::new(),
         }
     }
 
@@ -791,9 +820,10 @@ impl HeapState {
     }
 
     /// Detaches every unreached allocation from the heap tables and re-indexes
-    /// the survivors.  Finalization and deallocation are the CALLER's job,
-    /// outside the state lock (see [`Heap::collect`]): the returned records
-    /// carry the resolved finalizer so no further table access is needed.
+    /// the survivors.  Deallocation is the CALLER's job, outside the state
+    /// lock (see [`Heap::collect`]).  Finalizers never run on the detached
+    /// set: an unreached allocation with a pending finalizer was resurrected
+    /// for one cycle by `collect` before this point.
     fn sweep(&mut self) -> Vec<UnreachableAllocation> {
         let old_allocations = std::mem::take(&mut self.allocations);
         let old_mark_states = std::mem::take(&mut self.mark_states);
@@ -814,10 +844,6 @@ impl HeapState {
                 unreachable.push(UnreachableAllocation {
                     start: allocation.start,
                     layout: allocation.layout,
-                    finalize: self
-                        .types
-                        .get(&allocation.type_id)
-                        .and_then(|info| info.finalize),
                 });
             }
         }
@@ -856,13 +882,15 @@ struct Allocation {
     layout: Layout,
     type_id: TypeId,
     classification: AllocationClass,
+    /// The type's finalizer already ran for this allocation; it is freed
+    /// without a second callback once unreached again.
+    finalized: bool,
 }
-/// A detached, unreached allocation awaiting finalization and deallocation
-/// outside the heap state lock (produced by [`HeapState::sweep`]).
+/// A detached, unreached allocation awaiting deallocation outside the heap
+/// state lock (produced by [`HeapState::sweep`]).
 struct UnreachableAllocation {
     start: NonNull<u8>,
     layout: Layout,
-    finalize: Option<FinalizeFn>,
 }
 
 impl Allocation {
@@ -1124,6 +1152,40 @@ fn size_class_for(size: usize) -> usize {
 
 fn is_tagged_non_heap_candidate(pointer: *mut u8) -> bool {
     pointer.addr() & IMMEDIATE_TAG_MASK != IMMEDIATE_TAG_HEAP
+}
+
+/// Scans queued gray objects to fixpoint, shading every traced child.
+fn drain_mark_queue(state: &mut HeapState, mark_queue: &mut MarkQueue) {
+    while let Some(index) = mark_queue.pop() {
+        if !state.begin_object_scan(index) {
+            continue;
+        }
+
+        let Some(allocation) = state.allocations.get(index) else {
+            continue;
+        };
+        let start = allocation.start.as_ptr();
+        let type_id = allocation.type_id;
+        let Some(info) = state.types.get(&type_id).copied() else {
+            state.finish_object_scan(index, SingleObjectScan::new(start));
+            continue;
+        };
+
+        let mut scan = SingleObjectScan::new(start);
+        let mut visitor = |child| {
+            if mark_pointer(state, mark_queue, child) {
+                scan.record_hit();
+            }
+        };
+
+        // SAFETY: The allocation is owned by this heap and remains live for
+        // the whole mark phase.  The visitor only records additional
+        // candidate pointers in this collector's mark queue.
+        unsafe {
+            (info.trace)(start, &mut visitor);
+        }
+        state.finish_object_scan(index, scan);
+    }
 }
 
 fn mark_pointer(state: &mut HeapState, mark_queue: &mut MarkQueue, pointer: *mut u8) -> bool {
@@ -1439,6 +1501,112 @@ mod tests {
         heap.collect(&mut Roots(Vec::new()));
 
         assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn finalized_allocation_survives_its_cycle_and_frees_on_the_next() {
+        static FINALIZED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn finalize(_object: *mut u8) {
+            FINALIZED.fetch_add(1, Ordering::SeqCst);
+        }
+
+        FINALIZED.store(0, Ordering::SeqCst);
+        let heap = Heap::new();
+        heap.register_type(TYPE_ID, type_info(16, Some(finalize)));
+        let _object = heap.alloc(16, TYPE_ID);
+
+        heap.collect(&mut Roots(Vec::new()));
+        assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            heap.lock_state().allocations.len(),
+            1,
+            "finalized object is resurrected for its finalization cycle"
+        );
+
+        heap.collect(&mut Roots(Vec::new()));
+        assert_eq!(FINALIZED.load(Ordering::SeqCst), 1, "finalizer never re-runs");
+        assert!(heap.lock_state().allocations.is_empty(), "freed one cycle later");
+    }
+
+    #[test]
+    fn finalizer_resurrection_keeps_object_alive_without_refinalize() {
+        static FINALIZED: AtomicUsize = AtomicUsize::new(0);
+        static RESURRECTED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn finalize(object: *mut u8) {
+            FINALIZED.fetch_add(1, Ordering::SeqCst);
+            // Resurrect: publish the dying object where later root
+            // enumerations will see it.
+            RESURRECTED.store(object as usize, Ordering::SeqCst);
+        }
+
+        FINALIZED.store(0, Ordering::SeqCst);
+        RESURRECTED.store(0, Ordering::SeqCst);
+        let heap = Heap::new();
+        heap.register_type(TYPE_ID, type_info(16, Some(finalize)));
+        let _object = heap.alloc(16, TYPE_ID);
+
+        heap.collect(&mut Roots(Vec::new()));
+        assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
+        let resurrected = RESURRECTED.load(Ordering::SeqCst) as *mut u8;
+        assert!(!resurrected.is_null());
+
+        // The resurrected object is a live root now: it must survive, and its
+        // finalizer must not run again.
+        heap.collect(&mut Roots(vec![resurrected]));
+        assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
+        assert_eq!(heap.lock_state().allocations.len(), 1);
+
+        // Dropping the last reference frees it silently.
+        heap.collect(&mut Roots(Vec::new()));
+        assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
+        assert!(heap.lock_state().allocations.is_empty());
+    }
+
+    #[test]
+    fn finalizer_sees_valid_children_of_the_dying_object() {
+        static OBSERVED: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn trace_node(object: *mut u8, visitor: &mut dyn FnMut(*mut u8)) {
+            // SAFETY: test objects of this type are Node-shaped.
+            let next = unsafe { (*object.cast::<Node>()).next };
+            if !next.is_null() {
+                visitor(next);
+            }
+        }
+
+        unsafe extern "C" fn finalize(object: *mut u8) {
+            // SAFETY: the dying object and everything it references stay
+            // valid throughout the finalization cycle.
+            let child = unsafe { (*object.cast::<Node>()).next };
+            let value = unsafe { child.cast::<usize>().read() };
+            OBSERVED.store(value, Ordering::SeqCst);
+        }
+
+        const CHILD_TYPE_ID: TypeId = TypeId(2);
+        OBSERVED.store(0, Ordering::SeqCst);
+        let heap = Heap::new();
+        heap.register_type(
+            TYPE_ID,
+            GcTypeInfo {
+                size: std::mem::size_of::<Node>(),
+                trace: trace_node,
+                finalize: Some(finalize),
+            },
+        );
+        heap.register_type(CHILD_TYPE_ID, type_info(std::mem::size_of::<usize>(), None));
+
+        let child = heap.alloc(std::mem::size_of::<usize>(), CHILD_TYPE_ID);
+        // SAFETY: fresh zeroed allocation of usize size.
+        unsafe { child.cast::<usize>().write(0xC0FFEE) };
+        let parent = heap.alloc(std::mem::size_of::<Node>(), TYPE_ID);
+        // SAFETY: fresh zeroed Node-sized allocation.
+        unsafe { (*parent.cast::<Node>()).next = child };
+
+        heap.collect(&mut Roots(Vec::new()));
+
+        assert_eq!(OBSERVED.load(Ordering::SeqCst), 0xC0FFEE, "child memory was valid during finalize");
     }
 
     #[test]
