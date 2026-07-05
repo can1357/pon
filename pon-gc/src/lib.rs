@@ -12,7 +12,7 @@ pub use handshake::{
 use std::alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error};
 use std::collections::{HashMap, VecDeque};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 /// Default byte alignment used for every heap allocation.
@@ -422,6 +422,11 @@ impl ConcurrentWorkerState {
 pub struct Heap {
     state: Mutex<HeapState>,
     _config: HeapConfig,
+    /// Bytes allocated since the last collection: the allocation-pressure
+    /// "debt" the runtime's automatic-collection trigger reads lock-free.
+    bytes_since_collect: AtomicUsize,
+    /// Estimated live bytes: alloc adds, sweep subtracts reclaimed blocks.
+    live_bytes: AtomicUsize,
 }
 
 impl Heap {
@@ -441,12 +446,30 @@ impl Heap {
         Self {
             state: Mutex::new(HeapState::new(config)),
             _config: config,
+            bytes_since_collect: AtomicUsize::new(0),
+            live_bytes: AtomicUsize::new(0),
         }
     }
 
     /// Registers or replaces layout information for `type_id`.
     pub fn register_type(&self, type_id: TypeId, info: GcTypeInfo) {
         self.lock_state().types.insert(type_id, info);
+    }
+
+    /// Bytes allocated since the last collection (lock-free).
+    ///
+    /// Consumed by the runtime's allocation-pressure trigger; reset by
+    /// [`Heap::collect`].
+    #[must_use]
+    pub fn allocation_debt(&self) -> usize {
+        self.bytes_since_collect.load(Ordering::Relaxed)
+    }
+
+    /// Estimated live bytes on the heap (lock-free; allocation adds,
+    /// sweeping subtracts reclaimed blocks).
+    #[must_use]
+    pub fn live_bytes(&self) -> usize {
+        self.live_bytes.load(Ordering::Relaxed)
     }
 
     /// Allocates a zeroed, aligned, non-moving object for `type_id`.
@@ -479,6 +502,7 @@ impl Heap {
         // SAFETY: `raw` was just checked for null.
         let start = unsafe { NonNull::new_unchecked(raw) };
         let allocation_index = state.allocations.len();
+        let birth_epoch = state.epoch;
         state.allocations.push(Allocation {
             start,
             requested_size: size,
@@ -487,10 +511,13 @@ impl Heap {
             type_id,
             classification: AllocationClass::LargeFallback,
             finalized: false,
+            birth_epoch,
         });
         let mark_state = state.new_allocation_mark_state();
         state.mark_states.push(mark_state);
         state.index_allocation(allocation_index);
+        self.bytes_since_collect.fetch_add(allocated_size, Ordering::Relaxed);
+        self.live_bytes.fetch_add(allocated_size, Ordering::Relaxed);
 
         raw
     }
@@ -501,6 +528,10 @@ impl Heap {
     /// pointers to allocation starts, traces registered object layouts, and then
     /// finalizes and frees every unreached allocation.
     pub fn collect(&self, roots: &mut dyn RootSource) {
+        // Snapshot the pre-collect allocation debt: finalizers running later
+        // in this cycle may allocate, and THEIR debt must survive the reset
+        // below (only debt this collection actually examined is paid off).
+        let debt_at_entry = self.bytes_since_collect.load(Ordering::Relaxed);
         let trace_roots = std::env::var_os(TRACE_ROOTS_ENV).is_some();
         let mut root_values: Vec<*mut u8> = Vec::new();
         // Provenance is recorded only under [`TRACE_ROOTS_ENV`]; the default
@@ -577,6 +608,13 @@ impl Heap {
             if allocation.finalized {
                 continue;
             }
+            // Age gate: unreached blocks born in the CURRENT epoch may still
+            // be referenced by suspended Rust helper frames (heap-backed
+            // buffers the conservative scan cannot see). They are neither
+            // finalized nor swept until at least one full epoch old.
+            if allocation.birth_epoch >= state.epoch {
+                continue;
+            }
             let Some(finalize) = state.types.get(&allocation.type_id).and_then(|info| info.finalize) else {
                 continue;
             };
@@ -597,6 +635,7 @@ impl Heap {
             state.pending_finalizer_roots.extend(pending.iter().map(|&(start, _)| start));
         }
         let unreachable = state.sweep();
+        state.epoch += 1;
         drop(state);
         // Finalizers run OUTSIDE the state lock: Python-level hooks
         // (`__del__`, weakref death callbacks, C `tp_dealloc` bridges)
@@ -622,7 +661,9 @@ impl Heap {
                 }
             }
         }
+        let mut reclaimed = 0usize;
         for allocation in unreachable {
+            reclaimed += allocation.layout.size();
             // SAFETY: Every allocation record was created from `alloc_zeroed`
             // with the same layout and has not yet been deallocated; detached
             // records are owned solely by this frame.
@@ -630,6 +671,8 @@ impl Heap {
                 dealloc(allocation.start.as_ptr(), allocation.layout);
             }
         }
+        self.live_bytes.fetch_sub(reclaimed, Ordering::Relaxed);
+        self.bytes_since_collect.fetch_sub(debt_at_entry, Ordering::Relaxed);
     }
 
     fn lock_state(&self) -> MutexGuard<'_, HeapState> {
@@ -676,6 +719,13 @@ struct HeapState {
     /// Allocation starts whose finalizers are executing in an outer
     /// `collect` frame with the lock released; rooted by every mark phase.
     pending_finalizer_roots: Vec<NonNull<u8>>,
+    /// Allocation start address -> `allocations` index, kept in address
+    /// order for O(log n) [`HeapState::classify_pointer`] lookups.
+    by_address: std::collections::BTreeMap<usize, usize>,
+    /// Completed-collection counter; allocations record it at birth. The
+    /// sweep only reclaims unreached blocks born BEFORE the current epoch
+    /// (see `Allocation::birth_epoch`).
+    epoch: u64,
 }
 
 impl Default for HeapState {
@@ -695,6 +745,8 @@ impl HeapState {
             open_spans: HashMap::new(),
             large_fallbacks: Vec::new(),
             pending_finalizer_roots: Vec::new(),
+            by_address: std::collections::BTreeMap::new(),
+            epoch: 0,
         }
     }
 
@@ -713,6 +765,7 @@ impl HeapState {
         let Some(allocation) = self.allocations.get(allocation_index) else {
             return;
         };
+        self.by_address.insert(allocation.start.as_ptr().addr(), allocation_index);
 
         if allocation.allocated_size <= self.config.small_obj_max {
             let size_class = size_class_for(allocation.allocated_size);
@@ -746,55 +799,28 @@ impl HeapState {
         if pointer.is_null() {
             return None;
         }
-
         let address = pointer.addr();
-        self.classify_small_pointer(address)
-            .or_else(|| self.classify_large_fallback_pointer(address))
-    }
-
-    fn classify_small_pointer(&self, address: usize) -> Option<PointerClassification> {
-        for span in &self.spans {
-            for &index in &span.allocation_indices {
-                let allocation = self.allocations.get(index)?;
-                if allocation.contains_address(address) {
-                    debug_assert!(matches!(
-                        allocation.classification,
-                        AllocationClass::Small {
-                            span_index,
-                            size_class,
-                        } if self
-                            .spans
-                            .get(span_index)
-                            .is_some_and(|candidate| candidate.size_class == size_class)
-                    ));
-                    return Some(PointerClassification {
-                        index,
-                        representative: allocation.start.as_ptr(),
-                        route: ClassificationRoute::SmallSpan {
-                            span_size: span.span_size,
-                            size_class: span.size_class,
-                        },
-                    });
-                }
-            }
+        // Address-ordered lookup: allocations are disjoint byte ranges, so
+        // the greatest start <= address is the only candidate block. This
+        // MUST stay sublinear — every conservative stack word and traced
+        // edge classifies, so a linear scan turns collection quadratic.
+        let (_, &index) = self.by_address.range(..=address).next_back()?;
+        let allocation = self.allocations.get(index)?;
+        if !allocation.contains_address(address) {
+            return None;
         }
-
-        None
-    }
-
-    fn classify_large_fallback_pointer(&self, address: usize) -> Option<PointerClassification> {
-        for &index in &self.large_fallbacks {
-            let allocation = self.allocations.get(index)?;
-            if allocation.contains_address(address) {
-                return Some(PointerClassification {
-                    index,
-                    representative: allocation.start.as_ptr(),
-                    route: ClassificationRoute::LargeFallback,
-                });
-            }
-        }
-
-        None
+        let route = match allocation.classification {
+            AllocationClass::Small { span_index, size_class } => ClassificationRoute::SmallSpan {
+                span_size: self.spans.get(span_index)?.span_size,
+                size_class,
+            },
+            AllocationClass::LargeFallback => ClassificationRoute::LargeFallback,
+        };
+        Some(PointerClassification {
+            index,
+            representative: allocation.start.as_ptr(),
+            route,
+        })
     }
 
     fn begin_object_scan(&mut self, index: usize) -> bool {
@@ -835,10 +861,13 @@ impl HeapState {
         self.large_fallbacks.clear();
 
         for (index, allocation) in old_allocations.into_iter().enumerate() {
-            if old_mark_states
+            let reached = old_mark_states
                 .get(index)
-                .is_some_and(|mark_state| mark_state.is_reached())
-            {
+                .is_some_and(|mark_state| mark_state.is_reached());
+            // Age gate: unreached blocks born in the CURRENT epoch survive
+            // one cycle — they may still be referenced from Rust helper
+            // buffers the conservative scan cannot see.
+            if reached || allocation.birth_epoch >= self.epoch {
                 survivors.push(allocation);
             } else {
                 unreachable.push(UnreachableAllocation {
@@ -858,6 +887,7 @@ impl HeapState {
         self.spans.clear();
         self.open_spans.clear();
         self.large_fallbacks.clear();
+        self.by_address.clear();
 
         for allocation in &mut self.allocations {
             allocation.classification = AllocationClass::LargeFallback;
@@ -885,6 +915,12 @@ struct Allocation {
     /// The type's finalizer already ran for this allocation; it is freed
     /// without a second callback once unreached again.
     finalized: bool,
+    /// Collection epoch this block was allocated in. Unreached allocations
+    /// are only RECLAIMED once they are at least one full epoch old:
+    /// in-flight temporaries held solely by Rust helper frames (heap-backed
+    /// Vecs the conservative stack scan cannot see) are young by
+    /// construction and survive the cycle that races them.
+    birth_epoch: u64,
 }
 /// A detached, unreached allocation awaiting deallocation outside the heap
 /// state lock (produced by [`HeapState::sweep`]).
