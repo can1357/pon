@@ -182,4 +182,10 @@ static inline int _PyPon_DateTime_GetAttrInt(PyObject *object, const char *name)
     return PyPon_Capi()->runtime_->datetime_get_attr_int(object, name);
 }
 
+#ifdef PON_CAPI_TESTING
+static inline Py_ssize_t _PyPon_TestCollectPinCount(PyObject *object) {
+    return PyPon_Capi()->runtime_->test_collect_pin_count(object);
+}
+#endif
+
 #endif /* PON_CAPI_RUNTIME_INLINE_H */

@@ -206,7 +206,7 @@ pub(crate) fn build() -> PyPonCapiObject {
 
 fn catch_object(f: impl FnOnce() -> *mut PyObject) -> *mut PyObject {
     match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(value) => value,
+        Ok(value) => super::pin_new_reference(value),
         Err(_) => abi::return_null_with_error("object C-API helper panicked"),
     }
 }
@@ -639,12 +639,7 @@ unsafe extern "C" fn capi_get_attr(object: *mut PyObject, name: *mut PyObject) -
             Ok(name) => name,
             Err(error) => return error,
         };
-        let value = unsafe { get_attr_unpinned(object, name) };
-        // C owned-reference contract: the result must outlive its source
-        // (e.g. an instance-held object member) and the caller releases it
-        // with Py_DECREF; pin to balance that release.
-        super::pin_object(value);
-        value
+        unsafe { get_attr_unpinned(object, name) }
     })
 }
 
@@ -654,10 +649,7 @@ unsafe extern "C" fn capi_get_attr_string(object: *mut PyObject, name: *const c_
             Ok(name) => name,
             Err(error) => return error,
         };
-        let value = unsafe { get_attr_unpinned(object, name) };
-        // Same owned-reference contract as `capi_get_attr`.
-        super::pin_object(value);
-        value
+        unsafe { get_attr_unpinned(object, name) }
     })
 }
 
@@ -875,13 +867,30 @@ unsafe extern "C" fn capi_vectorcall_call(callable: *mut PyObject, args: *mut Py
             let argv = if positional.is_empty() { ptr::null() } else { positional.as_ptr() };
             // SAFETY: `argv` and `kwnames` live for the duration of the call;
             // the function pointer was read from the callable's vectorcall slot.
-            return unsafe { vectorcall(callable, argv, positional_count, kwnames) };
+            let result = unsafe { vectorcall(callable, argv, positional_count, kwnames) };
+            super::unpin_object(result);
+            return result;
         }
         if unsafe { vectorcall_fallback_would_recurse(callable) } {
             return raise_type_error("PyVectorcall_Call callable does not provide a vectorcall function");
         }
-        // SAFETY: no vectorcall slot exists; delegate to the regular call API.
-        unsafe { capi_call(callable, args, kwargs) }
+        if kwargs.is_null() {
+            unsafe { call_with_argv(callable, argv_ptr(&mut positional), positional.len()) }
+        } else {
+            unsafe {
+                abi::call::pon_call_ex(
+                    callable,
+                    argv_ptr(&mut positional),
+                    positional.len(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                    0,
+                    kwargs,
+                    ptr::null_mut(),
+                )
+            }
+        }
     })
 }
 
@@ -958,8 +967,9 @@ unsafe extern "C" fn capi_rich_compare_bool(left: *mut PyObject, right: *mut PyO
         if result.is_null() {
             return -1;
         }
-        // SAFETY: Truth dispatch handles arbitrary Python result objects.
-        unsafe { abi::pon_is_true(result) }
+        let truth = unsafe { abi::pon_is_true(result) };
+        super::unpin_object(result);
+        truth
     })
 }
 
@@ -1094,7 +1104,7 @@ unsafe extern "C" fn capi_type(object: *mut PyObject) -> *mut PyObject {
 }
 
 unsafe extern "C" fn capi_self_iter(object: *mut PyObject) -> *mut PyObject {
-    object
+    super::pin_new_reference(object)
 }
 
 fn raise_status(kind: ExceptionKind, message: &str) -> c_int {
@@ -1473,11 +1483,7 @@ unsafe extern "C" fn capi_generic_get_attr(object: *mut PyObject, name: *mut PyO
     catch_object(|| {
         let object = normalize_object_arg(object);
         let name = normalize_object_arg(name);
-        let result = unsafe { crate::descr::generic_get_attr(object, name) };
-        if !result.is_null() {
-            super::pin_object(result);
-        }
-        result
+        unsafe { crate::descr::generic_get_attr(object, name) }
     })
 }
 
@@ -1499,7 +1505,6 @@ unsafe extern "C" fn capi_generic_get_dict(object: *mut PyObject, _context: *mut
         }
         let result = unsafe { crate::descr::generic_get_attr(object, name) };
         if !result.is_null() {
-            super::pin_object(result);
             return result;
         }
         if abi::exc::pending_exception_is("AttributeError") || !pon_err_occurred() {
@@ -1527,16 +1532,23 @@ unsafe extern "C" fn capi_print(object: *mut PyObject, file: *mut libc::FILE, fl
             return -1;
         }
         let Some(text) = (unsafe { crate::types::type_::unicode_text(rendered) }) else {
+            super::unpin_object(rendered);
             return type_error_status("PyObject_Print rendering did not produce str");
         };
         let c_text = match CString::new(text.as_bytes()) {
             Ok(text) => text,
-            Err(_) => return value_error_status("PyObject_Print cannot write strings containing NUL through fputs"),
+            Err(_) => {
+                super::unpin_object(rendered);
+                return value_error_status("PyObject_Print cannot write strings containing NUL through fputs");
+            }
         };
-        if unsafe { libc::fputs(c_text.as_ptr(), file) } == libc::EOF {
-            return raise_status(ExceptionKind::OSError, "PyObject_Print failed to write to FILE*");
-        }
-        0
+        let status = if unsafe { libc::fputs(c_text.as_ptr(), file) } == libc::EOF {
+            raise_status(ExceptionKind::OSError, "PyObject_Print failed to write to FILE*")
+        } else {
+            0
+        };
+        super::unpin_object(rendered);
+        status
     })
 }
 

@@ -9,9 +9,10 @@
  * and single inheritance from `object`, builtin twins, or other Ready'd
  * foreign types.
  *
- * NOT supported (PyType_Ready fails loudly, never silently):
- * - Py_TPFLAGS_HAVE_GC, tp_traverse, tp_clear (GC-tracked C types),
- * - custom metatypes (ob_type must be NULL or resolve to `type`).
+ * GC-tracked C types are accepted: Py_TPFLAGS_HAVE_GC does not change
+ * allocation ownership under Pon, tp_traverse is bridged into the runtime
+ * tracer, and tp_clear is intentionally ignored because Pon's tracing GC does
+ * not need C-level cycle breaking.
  *
  * tp_dealloc bridging: Pon's GC runs tp_dealloc as a deferred finalizer —
  * the object and everything it references stay valid for the whole callback;

@@ -172,6 +172,10 @@ pub(crate) fn build() -> PyPonCapiNumbers {
     }
 }
 
+fn new_reference(object: *mut PyObject) -> *mut PyObject {
+    super::pin_new_reference(object)
+}
+
 /// `PyNumber_Check`: true for objects usable as numbers (CPython: any of the
 /// nb_int/nb_float/nb_index surfaces). Pon: numeric builtins plus anything
 /// exposing `__index__`, `__int__`, or `__float__` through its MRO.
@@ -222,7 +226,7 @@ unsafe extern "C" fn capi_hash_double(inst: *mut PyObject, value: c_double) -> i
 }
 
 unsafe extern "C" fn capi_long_from_long(value: c_long) -> *mut PyObject {
-    crate::types::int::from_bigint(BigInt::from(value))
+    new_reference(crate::types::int::from_bigint(BigInt::from(value)))
 }
 
 unsafe extern "C" fn capi_long_as_long(object: *mut PyObject) -> c_long {
@@ -239,23 +243,23 @@ unsafe extern "C" fn capi_long_as_long(object: *mut PyObject) -> c_long {
 }
 
 unsafe extern "C" fn capi_long_from_long_long(value: c_longlong) -> *mut PyObject {
-    crate::types::int::from_bigint(BigInt::from(value))
+    new_reference(crate::types::int::from_bigint(BigInt::from(value)))
 }
 
 unsafe extern "C" fn capi_long_from_unsigned_long(value: c_ulong) -> *mut PyObject {
-    crate::types::int::from_bigint(BigInt::from(value))
+    new_reference(crate::types::int::from_bigint(BigInt::from(value)))
 }
 
 unsafe extern "C" fn capi_long_from_unsigned_long_long(value: c_ulonglong) -> *mut PyObject {
-    crate::types::int::from_bigint(BigInt::from(value))
+    new_reference(crate::types::int::from_bigint(BigInt::from(value)))
 }
 
 unsafe extern "C" fn capi_long_from_ssize_t(value: isize) -> *mut PyObject {
-    crate::types::int::from_bigint(BigInt::from(value))
+    new_reference(crate::types::int::from_bigint(BigInt::from(value)))
 }
 
 unsafe extern "C" fn capi_long_from_size_t(value: usize) -> *mut PyObject {
-    crate::types::int::from_bigint(BigInt::from(value))
+    new_reference(crate::types::int::from_bigint(BigInt::from(value)))
 }
 
 unsafe extern "C" fn capi_long_from_double(value: c_double) -> *mut PyObject {
@@ -268,7 +272,7 @@ unsafe extern "C" fn capi_long_from_double(value: c_double) -> *mut PyObject {
         return ptr::null_mut();
     }
     match crate::types::int::bigint_from_f64_trunc(value) {
-        Some(value) => crate::types::int::from_bigint(value),
+        Some(value) => new_reference(crate::types::int::from_bigint(value)),
         None => {
             raise_overflow("cannot convert float infinity to integer");
             ptr::null_mut()
@@ -433,7 +437,7 @@ unsafe extern "C" fn capi_long_as_long_long_and_overflow(object: *mut PyObject, 
 }
 
 unsafe extern "C" fn capi_long_from_void_ptr(value: *mut c_void) -> *mut PyObject {
-    crate::types::int::from_bigint(BigInt::from(value as usize))
+    new_reference(crate::types::int::from_bigint(BigInt::from(value as usize)))
 }
 
 unsafe extern "C" fn capi_long_as_void_ptr(object: *mut PyObject) -> *mut c_void {
@@ -460,11 +464,11 @@ unsafe extern "C" fn capi_long_as_void_ptr(object: *mut PyObject) -> *mut c_void
 }
 
 unsafe extern "C" fn capi_bool_from_long(value: c_long) -> *mut PyObject {
-    crate::types::bool_::from_bool(value != 0)
+    new_reference(crate::types::bool_::from_bool(value != 0))
 }
 
 unsafe extern "C" fn capi_float_from_double(value: c_double) -> *mut PyObject {
-    crate::types::float::from_f64(value)
+    new_reference(crate::types::float::from_f64(value))
 }
 
 unsafe extern "C" fn capi_float_as_double(object: *mut PyObject) -> c_double {
@@ -485,7 +489,7 @@ unsafe extern "C" fn capi_float_from_string(object: *mut PyObject) -> *mut PyObj
     let mut argv = [object];
     // Verified against `python3.14 -c`: `float("1e3") == 1000.0` and
     // `math.isnan(float("nan"))`; Pon's float constructor uses the same tokens.
-    unsafe { crate::native::builtins_mod::builtin_float(argv.as_mut_ptr(), argv.len()) }
+    new_reference(unsafe { crate::native::builtins_mod::builtin_float(argv.as_mut_ptr(), argv.len()) })
 }
 
 unsafe extern "C" fn capi_os_string_to_double(
@@ -537,7 +541,7 @@ unsafe extern "C" fn capi_os_string_to_double(
 }
 
 unsafe extern "C" fn capi_complex_from_c_complex(value: PyComplexC) -> *mut PyObject {
-    crate::types::complex_::from_f64s(value.real, value.imag)
+    new_reference(crate::types::complex_::from_f64s(value.real, value.imag))
 }
 
 unsafe extern "C" fn capi_complex_as_c_complex(object: *mut PyObject) -> PyComplexC {
@@ -554,7 +558,7 @@ unsafe extern "C" fn capi_complex_as_c_complex(object: *mut PyObject) -> PyCompl
 }
 
 unsafe extern "C" fn capi_complex_from_doubles(real: c_double, imag: c_double) -> *mut PyObject {
-    crate::types::complex_::from_f64s(real, imag)
+    new_reference(crate::types::complex_::from_f64s(real, imag))
 }
 
 unsafe extern "C" fn capi_complex_real_as_double(object: *mut PyObject) -> c_double {
@@ -611,7 +615,7 @@ unsafe extern "C" fn capi_number_index(object: *mut PyObject) -> *mut PyObject {
         return ptr::null_mut();
     };
     match unsafe { coerce_index_bigint(object) } {
-        Ok(value) => crate::types::int::from_bigint(value),
+        Ok(value) => new_reference(crate::types::int::from_bigint(value)),
         Err(()) => ptr::null_mut(),
     }
 }
@@ -620,7 +624,7 @@ unsafe extern "C" fn capi_number_long(object: *mut PyObject) -> *mut PyObject {
     let Some(object) = normalize_arg(object) else {
         return ptr::null_mut();
     };
-    crate::types::int::construct_from_args(&[object])
+    new_reference(crate::types::int::construct_from_args(&[object]))
 }
 
 unsafe extern "C" fn capi_number_float(object: *mut PyObject) -> *mut PyObject {
@@ -628,7 +632,7 @@ unsafe extern "C" fn capi_number_float(object: *mut PyObject) -> *mut PyObject {
         return ptr::null_mut();
     };
     match unsafe { coerce_f64(object) } {
-        Ok(value) => crate::types::float::from_f64(value),
+        Ok(value) => new_reference(crate::types::float::from_f64(value)),
         Err(()) => ptr::null_mut(),
     }
 }
@@ -657,11 +661,11 @@ unsafe extern "C" fn capi_number_as_ssize_t(object: *mut PyObject, exc: *mut PyO
 }
 
 unsafe fn capi_number_binary(op: u8, left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { abi::number::pon_binary_op(op, left, right, ptr::null_mut()) }
+    new_reference(unsafe { abi::number::pon_binary_op(op, left, right, ptr::null_mut()) })
 }
 
 unsafe fn capi_number_inplace_binary(op: u8, left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { abi::number::pon_number_inplace(op, left, right, ptr::null_mut()) }
+    new_reference(unsafe { abi::number::pon_number_inplace(op, left, right, ptr::null_mut()) })
 }
 
 unsafe fn modulo_is_none(modulo: *mut PyObject) -> bool {
@@ -694,7 +698,7 @@ unsafe extern "C" fn capi_number_remainder(left: *mut PyObject, right: *mut PyOb
 }
 
 unsafe extern "C" fn capi_number_divmod(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    abi::number::divmod_objects(left, right)
+    new_reference(abi::number::divmod_objects(left, right))
 }
 
 unsafe extern "C" fn capi_number_power(left: *mut PyObject, right: *mut PyObject, modulo: *mut PyObject) -> *mut PyObject {
@@ -706,11 +710,11 @@ unsafe extern "C" fn capi_number_power(left: *mut PyObject, right: *mut PyObject
 }
 
 unsafe extern "C" fn capi_number_negative(object: *mut PyObject) -> *mut PyObject {
-    unsafe { abi::number::pon_unary_op(abi::number::UNARY_NEG, object, ptr::null_mut()) }
+    new_reference(unsafe { abi::number::pon_unary_op(abi::number::UNARY_NEG, object, ptr::null_mut()) })
 }
 
 unsafe extern "C" fn capi_number_positive(object: *mut PyObject) -> *mut PyObject {
-    unsafe { abi::number::pon_unary_op(abi::number::UNARY_POS, object, ptr::null_mut()) }
+    new_reference(unsafe { abi::number::pon_unary_op(abi::number::UNARY_POS, object, ptr::null_mut()) })
 }
 
 unsafe extern "C" fn capi_number_absolute(object: *mut PyObject) -> *mut PyObject {
@@ -736,17 +740,18 @@ unsafe extern "C" fn capi_number_absolute(object: *mut PyObject) -> *mut PyObjec
                 return ptr::null_mut();
             }
             if unsafe { crate::abstract_op::is_not_implemented(result) } {
+                super::unpin_object(result);
                 raise_type("bad operand type for abs()");
                 return ptr::null_mut();
             }
-            return result;
+            return new_reference(result);
         }
     }
-    abi::number::abs_object(object)
+    new_reference(abi::number::abs_object(object))
 }
 
 unsafe extern "C" fn capi_number_invert(object: *mut PyObject) -> *mut PyObject {
-    unsafe { abi::number::pon_unary_op(abi::number::UNARY_INVERT, object, ptr::null_mut()) }
+    new_reference(unsafe { abi::number::pon_unary_op(abi::number::UNARY_INVERT, object, ptr::null_mut()) })
 }
 
 unsafe extern "C" fn capi_number_lshift(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {

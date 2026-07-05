@@ -720,7 +720,7 @@ unsafe extern "C" fn capi_err_new_exception(name: *const c_char, base: *mut PyOb
         unsafe { drop(Box::from_raw(namespace)) };
         return ptr::null_mut();
     }
-    unsafe { crate::types::type_::build_class_from_namespace(class_name, &bases, namespace, &[]) }
+    super::pin_new_reference(unsafe { crate::types::type_::build_class_from_namespace(class_name, &bases, namespace, &[]) })
 }
 
 unsafe extern "C" fn capi_err_check_signals() -> c_int {

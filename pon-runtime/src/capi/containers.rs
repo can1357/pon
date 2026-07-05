@@ -179,8 +179,12 @@ static DICT_PROXY_TYPE: LazyLock<usize> = LazyLock::new(|| {
 });
 
 fn catch_object(f: impl FnOnce() -> *mut PyObject) -> *mut PyObject {
+    catch_borrowed_object(|| super::pin_new_reference(f()))
+}
+
+fn catch_borrowed_object(f: impl FnOnce() -> *mut PyObject) -> *mut PyObject {
     match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(value) => value,
+        Ok(object) => object,
         Err(_) => abi::return_null_with_error("container C-API helper panicked"),
     }
 }
@@ -364,7 +368,7 @@ unsafe extern "C" fn capi_tuple_size(tuple: *mut PyObject) -> isize {
 }
 
 unsafe extern "C" fn capi_tuple_get_item(tuple: *mut PyObject, index: isize) -> *mut PyObject {
-    catch_object(|| {
+    catch_borrowed_object(|| {
         let tuple = crate::tag::untag_arg(tuple);
         let Some(items) = tuple_slice(tuple) else {
             return type_error("expected tuple object");
@@ -380,19 +384,25 @@ unsafe extern "C" fn capi_tuple_get_item(tuple: *mut PyObject, index: isize) -> 
 unsafe extern "C" fn capi_tuple_set_item(tuple: *mut PyObject, index: isize, item: *mut PyObject) -> c_int {
     catch_status(|| {
         let tuple = crate::tag::untag_arg(tuple);
+        let original_item = item;
         let item = crate::tag::untag_arg(normalize_object_arg(item));
         if item.is_null() {
             return status_type_error("tuple item must not be NULL");
         }
         let Some(tuple_object) = exact_tuple_mut(tuple) else {
+            super::unpin_object(original_item);
             return status_type_error("expected exact tuple object");
         };
         let index = match checked_index(index, tuple_object.len, "tuple") {
             Ok(index) => index,
-            Err(_) => return -1,
+            Err(_) => {
+                super::unpin_object(original_item);
+                return -1;
+            }
         };
         let _guard = crate::sync::begin_critical_section(tuple);
         unsafe { crate::sync::store_heap_pointer(tuple_object.items.add(index), item) };
+        super::unpin_object(original_item);
         0
     })
 }
@@ -460,7 +470,7 @@ unsafe extern "C" fn capi_list_size(list: *mut PyObject) -> isize {
 }
 
 unsafe extern "C" fn capi_list_get_item(list: *mut PyObject, index: isize) -> *mut PyObject {
-    catch_object(|| {
+    catch_borrowed_object(|| {
         let list = crate::tag::untag_arg(list);
         let Some(storage) = list_storage(list) else {
             return type_error("expected list object");
@@ -472,23 +482,28 @@ unsafe extern "C" fn capi_list_get_item(list: *mut PyObject, index: isize) -> *m
         unsafe { *storage.items.add(index) }
     })
 }
-
 unsafe extern "C" fn capi_list_set_item(list: *mut PyObject, index: isize, item: *mut PyObject) -> c_int {
     catch_status(|| {
         let list = crate::tag::untag_arg(list);
+        let original_item = item;
         let item = crate::tag::untag_arg(normalize_object_arg(item));
         if item.is_null() {
             return status_type_error("list item must not be NULL");
         }
         let Some(storage) = list_storage_mut(list) else {
+            super::unpin_object(original_item);
             return status_type_error("expected list object");
         };
         let index = match checked_index(index, storage.len, "list") {
             Ok(index) => index,
-            Err(_) => return -1,
+            Err(_) => {
+                super::unpin_object(original_item);
+                return -1;
+            }
         };
         let _guard = crate::sync::begin_critical_section(list);
         unsafe { crate::sync::store_heap_pointer(storage.items.add(index), item) };
+        super::unpin_object(original_item);
         0
     })
 }
@@ -585,11 +600,11 @@ unsafe extern "C" fn capi_dict_set_item_string(dict: *mut PyObject, key: *const 
 }
 
 unsafe extern "C" fn capi_dict_get_item(dict: *mut PyObject, key: *mut PyObject) -> *mut PyObject {
-    catch_object(|| dict_get_impl(dict, key, true))
+    catch_borrowed_object(|| dict_get_impl(dict, key, true))
 }
 
 unsafe extern "C" fn capi_dict_get_item_string(dict: *mut PyObject, key: *const c_char) -> *mut PyObject {
-    catch_object(|| {
+    catch_borrowed_object(|| {
         let Some(key) = string_key(key) else {
             return ptr::null_mut();
         };
@@ -598,7 +613,7 @@ unsafe extern "C" fn capi_dict_get_item_string(dict: *mut PyObject, key: *const 
 }
 
 unsafe extern "C" fn capi_dict_get_item_with_error(dict: *mut PyObject, key: *mut PyObject) -> *mut PyObject {
-    catch_object(|| dict_get_impl(dict, key, false))
+    catch_borrowed_object(|| dict_get_impl(dict, key, false))
 }
 
 unsafe extern "C" fn capi_dict_get_item_ref(

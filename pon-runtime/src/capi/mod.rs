@@ -317,6 +317,10 @@ pub(crate) fn load_extension_module(name: &str, path: &Path) -> Result<*mut PyOb
             }
         }
     } else {
+        // PyInit_* returns a new reference to the loader.  Once the module is
+        // installed in Pon's import registry, transfer that C-owned reference
+        // back to the GC-managed runtime.
+        unpin_object(init_result);
         init_result
     };
 
@@ -396,7 +400,7 @@ unsafe extern "C" fn py_module_create2(def: *mut PyModuleDef, api_version: c_int
         return abi::return_null_with_error("invalid PyModuleDef");
     }
     let def_ref = unsafe { &*def };
-    unsafe { create_module_from_def(def_ref, true) }
+    pin_new_reference(unsafe { create_module_from_def(def_ref, true) })
 }
 
 unsafe fn create_module_from_def(def_ref: &PyModuleDef, reject_slots: bool) -> *mut PyObject {
@@ -503,6 +507,7 @@ unsafe extern "C" fn py_module_add_object(module: *mut PyObject, name: *const c_
     // (`PyModule_AddObject(m, "Counter", (PyObject *)&CounterType)`); foreign
     // statics must never enter the runtime object graph — swap in the native
     // type they were Ready'd into.
+    let original_value = value;
     let value = match twin::registered_native_of_foreign(value.cast::<twin::ForeignTypeObject>()) {
         Some(native) => native.cast::<PyObject>(),
         None => value,
@@ -514,6 +519,7 @@ unsafe extern "C" fn py_module_add_object(module: *mut PyObject, name: *const c_
     let module = module.cast::<crate::import::PyModuleObject>();
     let module_name = unsafe { (*module).name };
     if crate::import::store_module_attr(module_name, intern(&attr), value) {
+        unpin_object(original_value);
         0
     } else {
         pon_err_set(format!("PyModule_AddObject target is not a module for '{attr}'"));
@@ -543,11 +549,12 @@ pub(super) fn pin_object(object: *mut PyObject) {
     *pins.entry(object as usize).or_insert(0) += 1;
 }
 
-unsafe extern "C" fn py_inc_ref(object: *mut PyObject) {
+pub(super) fn pin_new_reference(object: *mut PyObject) -> *mut PyObject {
     pin_object(object);
+    object
 }
 
-unsafe extern "C" fn py_dec_ref(object: *mut PyObject) {
+pub(super) fn unpin_object(object: *mut PyObject) {
     if object.is_null() || object.addr() < 4096 || !crate::tag::is_heap(object) {
         return;
     }
@@ -558,6 +565,27 @@ unsafe extern "C" fn py_dec_ref(object: *mut PyObject) {
             pins.remove(&(object as usize));
         }
     }
+}
+
+#[cfg(test)]
+pub(super) fn pin_count(object: *mut PyObject) -> usize {
+    if object.is_null() || object.addr() < 4096 || !crate::tag::is_heap(object) {
+        return 0;
+    }
+    CAPI_PINS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(&(object as usize))
+        .copied()
+        .unwrap_or(0)
+}
+
+unsafe extern "C" fn py_inc_ref(object: *mut PyObject) {
+    pin_object(object);
+}
+
+unsafe extern "C" fn py_dec_ref(object: *mut PyObject) {
+    unpin_object(object);
 }
 
 unsafe extern "C" fn py_none() -> *mut PyObject {
@@ -597,7 +625,9 @@ unsafe extern "C" fn cfunction_call(callee: *mut PyObject, args: *mut PyObject, 
         } else {
             args
         };
-        return unsafe { with_keywords(function.self_object, tuple, _kwargs) };
+        let result = unsafe { with_keywords(function.self_object, tuple, _kwargs) };
+        unpin_object(result);
+        return result;
     }
     if function.flags & METH_FASTCALL != 0 {
         if function.flags & METH_KEYWORDS != 0 {
@@ -605,24 +635,32 @@ unsafe extern "C" fn cfunction_call(callee: *mut PyObject, args: *mut PyObject, 
                 // SAFETY: METH_FASTCALL|METH_KEYWORDS certifies the
                 // _PyCFunctionFastWithKeywords signature.
                 unsafe { mem::transmute(function.method) };
-            return unsafe { fastcall_kw(function.self_object, positional.as_ptr(), positional.len() as isize, ptr::null_mut()) };
+            let result = unsafe { fastcall_kw(function.self_object, positional.as_ptr(), positional.len() as isize, ptr::null_mut()) };
+            unpin_object(result);
+            return result;
         }
         let fastcall: unsafe extern "C" fn(*mut PyObject, *const *mut PyObject, isize) -> *mut PyObject =
             // SAFETY: METH_FASTCALL certifies the _PyCFunctionFast signature.
             unsafe { mem::transmute(function.method) };
-        return unsafe { fastcall(function.self_object, positional.as_ptr(), positional.len() as isize) };
+        let result = unsafe { fastcall(function.self_object, positional.as_ptr(), positional.len() as isize) };
+        unpin_object(result);
+        return result;
     }
     if function.flags & METH_NOARGS != 0 {
         if !positional.is_empty() {
             return abi::return_null_with_error(format!("{}() takes no arguments", crate::intern::resolve(function.name).unwrap_or_default()));
         }
-        return unsafe { (function.method)(function.self_object, ptr::null_mut()) };
+        let result = unsafe { (function.method)(function.self_object, ptr::null_mut()) };
+        unpin_object(result);
+        return result;
     }
     if function.flags & METH_O != 0 {
         if positional.len() != 1 {
             return abi::return_null_with_error(format!("{}() takes exactly one argument", crate::intern::resolve(function.name).unwrap_or_default()));
         }
-        return unsafe { (function.method)(function.self_object, positional[0]) };
+        let result = unsafe { (function.method)(function.self_object, positional[0]) };
+        unpin_object(result);
+        return result;
     }
     if function.flags & METH_VARARGS != 0 {
         let tuple = if args.is_null() {
@@ -630,7 +668,9 @@ unsafe extern "C" fn cfunction_call(callee: *mut PyObject, args: *mut PyObject, 
         } else {
             args
         };
-        return unsafe { (function.method)(function.self_object, tuple) };
+        let result = unsafe { (function.method)(function.self_object, tuple) };
+        unpin_object(result);
+        return result;
     }
     abi::return_null_with_error("unsupported C function calling convention")
 }
@@ -760,6 +800,7 @@ mod tests {
         let args_path = manifest.join("capi").join("pon_capi_args.c");
         let mut args = vec![
             OsStr::new("-fPIC").to_owned(),
+            OsStr::new("-DPON_CAPI_TESTING").to_owned(),
             OsStr::new("-I").to_owned(),
             include_path.as_os_str().to_owned(),
         ];

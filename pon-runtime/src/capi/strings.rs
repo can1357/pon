@@ -144,11 +144,15 @@ pub(crate) fn build() -> PyPonCapiStrings {
     }
 }
 
+fn new_reference(object: *mut PyObject) -> *mut PyObject {
+    super::pin_new_reference(object)
+}
+
 unsafe extern "C" fn capi_unicode_from_string(value: *const c_char) -> *mut PyObject {
     let Some(text) = c_string(value) else {
         return abi::return_null_with_error("PyUnicode_FromString received invalid UTF-8");
     };
-    unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }
+    new_reference(unsafe { abi::pon_const_str(text.as_ptr(), text.len()) })
 }
 
 unsafe extern "C" fn capi_unicode_from_string_and_size(value: *const c_char, size: PySsizeT) -> *mut PyObject {
@@ -163,7 +167,7 @@ unsafe extern "C" fn capi_unicode_from_utf8(value: *const c_char, size: PySsizeT
     if core::str::from_utf8(bytes).is_err() {
         return raise_null(ExceptionKind::UnicodeDecodeError, "UnicodeDecodeError: 'utf-8' codec can't decode input");
     }
-    unsafe { abi::pon_const_str(bytes.as_ptr(), bytes.len()) }
+    new_reference(unsafe { abi::pon_const_str(bytes.as_ptr(), bytes.len()) })
 }
 
 unsafe extern "C" fn capi_unicode_as_utf8(object: *mut PyObject) -> *const c_char {
@@ -197,16 +201,16 @@ unsafe extern "C" fn capi_unicode_decode_utf8(value: *const c_char, size: PySsiz
     };
     match decode_error_handler(errors) {
         Ok(DecodeErrors::Strict) => match core::str::from_utf8(bytes) {
-            Ok(text) => unsafe { abi::pon_const_str(text.as_ptr(), text.len()) },
+            Ok(text) => new_reference(unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }),
             Err(_) => raise_null(ExceptionKind::UnicodeDecodeError, "UnicodeDecodeError: 'utf-8' codec can't decode input"),
         },
         Ok(DecodeErrors::Replace) => {
             let text = String::from_utf8_lossy(bytes);
-            unsafe { abi::pon_const_str(text.as_bytes().as_ptr(), text.len()) }
+            new_reference(unsafe { abi::pon_const_str(text.as_bytes().as_ptr(), text.len()) })
         }
         Ok(DecodeErrors::Ignore) => {
             let text = utf8_decode_ignore(bytes);
-            unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }
+            new_reference(unsafe { abi::pon_const_str(text.as_ptr(), text.len()) })
         }
         Err(message) => abi::return_null_with_error(message),
     }
@@ -222,18 +226,18 @@ unsafe extern "C" fn capi_unicode_decode_ascii(value: *const c_char, size: PySsi
             if bytes.iter().any(|byte| !byte.is_ascii()) {
                 return raise_null(ExceptionKind::UnicodeDecodeError, "UnicodeDecodeError: 'ascii' codec can't decode input");
             }
-            unsafe { abi::pon_const_str(bytes.as_ptr(), bytes.len()) }
+            new_reference(unsafe { abi::pon_const_str(bytes.as_ptr(), bytes.len()) })
         }
         Ok(DecodeErrors::Replace) => {
             let mut text = String::with_capacity(bytes.len());
             for &byte in bytes {
                 if byte.is_ascii() { text.push(byte as char) } else { text.push('\u{fffd}') }
             }
-            unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }
+            new_reference(unsafe { abi::pon_const_str(text.as_ptr(), text.len()) })
         }
         Ok(DecodeErrors::Ignore) => {
             let text: Vec<u8> = bytes.iter().copied().filter(u8::is_ascii).collect();
-            unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }
+            new_reference(unsafe { abi::pon_const_str(text.as_ptr(), text.len()) })
         }
         Err(message) => abi::return_null_with_error(message),
     }
@@ -251,7 +255,7 @@ unsafe extern "C" fn capi_unicode_decode_latin1(value: *const c_char, size: PySs
     for &byte in bytes {
         text.push(char::from(byte));
     }
-    unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }
+    new_reference(unsafe { abi::pon_const_str(text.as_ptr(), text.len()) })
 }
 
 unsafe extern "C" fn capi_unicode_from_encoded_object(
@@ -309,7 +313,7 @@ unsafe extern "C" fn capi_unicode_from_kind_and_data(kind: c_int, data: *const c
         }
         _ => return raise_null(ExceptionKind::SystemError, "PyUnicode_FromKindAndData received invalid kind"),
     }
-    unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }
+    new_reference(unsafe { abi::pon_const_str(text.as_ptr(), text.len()) })
 }
 
 unsafe extern "C" fn capi_unicode_as_ucs4_copy(object: *mut PyObject) -> *mut u32 {
@@ -337,7 +341,7 @@ unsafe extern "C" fn capi_unicode_as_utf8_string(object: *mut PyObject) -> *mut 
     let Some(text) = (unsafe { crate::types::type_::unicode_text(object) }) else {
         return raise_null(ExceptionKind::TypeError, "bad argument type for PyUnicode_AsUTF8String");
     };
-    unsafe { abi::str_::pon_const_bytes(text.as_ptr(), text.len()) }
+    new_reference(unsafe { abi::str_::pon_const_bytes(text.as_ptr(), text.len()) })
 }
 
 unsafe extern "C" fn capi_unicode_as_ascii_string(object: *mut PyObject) -> *mut PyObject {
@@ -347,7 +351,7 @@ unsafe extern "C" fn capi_unicode_as_ascii_string(object: *mut PyObject) -> *mut
     if !text.is_ascii() {
         return raise_null(ExceptionKind::UnicodeEncodeError, "UnicodeEncodeError: 'ascii' codec can't encode character");
     }
-    unsafe { abi::str_::pon_const_bytes(text.as_ptr(), text.len()) }
+    new_reference(unsafe { abi::str_::pon_const_bytes(text.as_ptr(), text.len()) })
 }
 
 unsafe extern "C" fn capi_unicode_as_latin1_string(object: *mut PyObject) -> *mut PyObject {
@@ -365,7 +369,7 @@ unsafe extern "C" fn capi_unicode_as_latin1_string(object: *mut PyObject) -> *mu
         }
         bytes.push(code as u8);
     }
-    unsafe { abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) }
+    new_reference(unsafe { abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) })
 }
 
 unsafe extern "C" fn capi_unicode_as_encoded_string(
@@ -434,17 +438,17 @@ unsafe extern "C" fn capi_unicode_intern_from_string(value: *const c_char) -> *m
     {
         let interned = INTERNED_UNICODE.lock().unwrap_or_else(|poison| poison.into_inner());
         if let Some(&object) = interned.get(&text) {
-            return object as *mut PyObject;
+            return new_reference(object as *mut PyObject);
         }
     }
     let object = unsafe { abi::pon_const_str(text.as_ptr(), text.len()) };
     if object.is_null() {
         return object;
     }
-    // SAFETY: Pinning gives the interned C-API object process-lifetime reachability.
-    unsafe { super::py_inc_ref(object) };
+    // Pinning gives the interned C-API object process-lifetime reachability.
+    super::pin_object(object);
     let mut interned = INTERNED_UNICODE.lock().unwrap_or_else(|poison| poison.into_inner());
-    *interned.entry(text).or_insert(object as usize) as *mut PyObject
+    new_reference(*interned.entry(text).or_insert(object as usize) as *mut PyObject)
 }
 
 unsafe extern "C" fn capi_unicode_compare(left: *mut PyObject, right: *mut PyObject) -> c_int {
@@ -485,11 +489,11 @@ unsafe extern "C" fn capi_unicode_concat(left: *mut PyObject, right: *mut PyObje
     let mut out = String::with_capacity(left_text.len() + right_text.len());
     out.push_str(left_text);
     out.push_str(right_text);
-    unsafe { abi::pon_const_str(out.as_ptr(), out.len()) }
+    new_reference(unsafe { abi::pon_const_str(out.as_ptr(), out.len()) })
 }
 
 unsafe extern "C" fn capi_unicode_format(format: *mut PyObject, args: *mut PyObject) -> *mut PyObject {
-    unsafe { crate::abi::format::percent_format(format, args) }
+    new_reference(unsafe { crate::abi::format::percent_format(format, args) })
 }
 
 unsafe extern "C" fn capi_unicode_replace(
@@ -512,7 +516,7 @@ unsafe extern "C" fn capi_unicode_replace(
     } else {
         text.replacen(old_text, new_text, maxcount as usize)
     };
-    unsafe { abi::pon_const_str(out.as_ptr(), out.len()) }
+    new_reference(unsafe { abi::pon_const_str(out.as_ptr(), out.len()) })
 }
 
 unsafe extern "C" fn capi_unicode_tailmatch(
@@ -565,7 +569,7 @@ unsafe extern "C" fn capi_long_from_unicode_object(object: *mut PyObject, base: 
     if base_object.is_null() {
         return ptr::null_mut();
     }
-    crate::types::int::construct_from_args(&[object, base_object])
+    new_reference(crate::types::int::construct_from_args(&[object, base_object]))
 }
 
 unsafe extern "C" fn capi_bytes_from_string_and_size(value: *const c_char, size: PySsizeT) -> *mut PyObject {
@@ -573,7 +577,7 @@ unsafe extern "C" fn capi_bytes_from_string_and_size(value: *const c_char, size:
         Ok(bytes) => bytes,
         Err(message) => return abi::return_null_with_error(message),
     };
-    unsafe { abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) }
+    new_reference(unsafe { abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) })
 }
 
 unsafe extern "C" fn capi_bytes_from_string(value: *const c_char) -> *mut PyObject {
@@ -582,7 +586,7 @@ unsafe extern "C" fn capi_bytes_from_string(value: *const c_char) -> *mut PyObje
     }
     // SAFETY: `value` is a non-NULL NUL-terminated C string by API contract.
     let bytes = unsafe { CStr::from_ptr(value) }.to_bytes();
-    unsafe { abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) }
+    new_reference(unsafe { abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) })
 }
 
 unsafe extern "C" fn capi_bytes_size(object: *mut PyObject) -> PySsizeT {
@@ -641,19 +645,22 @@ unsafe extern "C" fn capi_bytes_concat(slot: *mut *mut PyObject, newpart: *mut P
     let Some(left_bytes) = (unsafe { bytes_payload_slice(left) }) else {
         let _ = status_type_error("expected bytes object");
         unsafe { *slot = ptr::null_mut() };
+        super::unpin_object(left);
         return;
     };
     let Some(right_bytes) = (unsafe { bytes_payload_slice(newpart) }) else {
         let _ = status_type_error("expected bytes object");
         unsafe { *slot = ptr::null_mut() };
+        super::unpin_object(left);
         return;
     };
     let mut out = Vec::with_capacity(left_bytes.len() + right_bytes.len());
     out.extend_from_slice(left_bytes);
     out.extend_from_slice(right_bytes);
-    let result = unsafe { abi::str_::pon_const_bytes(out.as_ptr(), out.len()) };
+    let result = new_reference(unsafe { abi::str_::pon_const_bytes(out.as_ptr(), out.len()) });
     // SAFETY: `slot` is non-NULL by the check above.
     unsafe { *slot = result };
+    super::unpin_object(left);
 }
 
 unsafe extern "C" fn capi_bytearray_from_string_and_size(value: *const c_char, size: PySsizeT) -> *mut PyObject {
@@ -661,7 +668,7 @@ unsafe extern "C" fn capi_bytearray_from_string_and_size(value: *const c_char, s
         Ok(bytes) => bytes,
         Err(message) => return abi::return_null_with_error(message),
     };
-    unsafe { abi::str_::pon_const_bytearray(bytes.as_ptr(), bytes.len()) }
+    new_reference(unsafe { abi::str_::pon_const_bytearray(bytes.as_ptr(), bytes.len()) })
 }
 
 unsafe extern "C" fn capi_bytearray_size(object: *mut PyObject) -> PySsizeT {
@@ -708,14 +715,14 @@ unsafe extern "C" fn capi_bytearray_check_exact(object: *mut PyObject) -> c_int 
 
 unsafe extern "C" fn capi_object_str(object: *mut PyObject) -> *mut PyObject {
     match crate::native::builtins_mod::try_str_text(object) {
-        Ok(text) => unsafe { abi::pon_const_str(text.as_ptr(), text.len()) },
+        Ok(text) => new_reference(unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }),
         Err(()) => ptr::null_mut(),
     }
 }
 
 unsafe extern "C" fn capi_object_repr(object: *mut PyObject) -> *mut PyObject {
     match crate::native::builtins_mod::try_repr_text(object) {
-        Ok(text) => unsafe { abi::pon_const_str(text.as_ptr(), text.len()) },
+        Ok(text) => new_reference(unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }),
         Err(()) => ptr::null_mut(),
     }
 }

@@ -53,6 +53,9 @@ typedef struct PyPonCapiRuntime {
     int (*datetime_get_attr_int)(PyObject *, const char *);
     int (*capsule_set_name)(PyObject *, const char *);
     PyObject *(*import_import)(PyObject *);
+#ifdef PON_CAPI_TESTING
+    Py_ssize_t (*test_collect_pin_count)(PyObject *);
+#endif
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiRuntime;
 

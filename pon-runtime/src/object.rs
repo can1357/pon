@@ -90,6 +90,11 @@ pub type DescrSetFunc = unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut 
 pub type InitFunc = unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> c_int;
 /// Object allocator/constructor slot.
 pub type NewFunc = unsafe extern "C" fn(*mut PyType, *mut PyObject, *mut PyObject) -> *mut PyObject;
+/// C-API GC visit callback used by `tp_traverse`.
+pub type VisitFunc = unsafe extern "C" fn(*mut PyObject, *mut c_void) -> c_int;
+/// C-API GC traversal slot.  Only foreign-origin types installed through
+/// `PyType_Ready` populate this; native runtime types leave it unset.
+pub type TraverseFunc = unsafe extern "C" fn(*mut PyObject, VisitFunc, *mut c_void) -> c_int;
 /// Indexed sequence getter.
 pub type SSizeArgFunc = unsafe extern "C" fn(*mut PyObject, isize) -> *mut PyObject;
 /// Indexed sequence setter/deleter.  A NULL value means deletion.
@@ -472,6 +477,8 @@ pub struct PyType {
     pub tp_as_mapping: *mut PyMappingMethods,
     /// Async protocol table, or NULL when absent.
     pub tp_as_async: *mut PyAsyncMethods,
+    /// Foreign C `tp_traverse` bridge for C-API instance layouts, or `None`.
+    pub capi_tp_traverse: Option<TraverseFunc>,
     /// Runtime GC type id associated with instances of this type.
     pub gc_type_id: usize,
     /// Object-valued dunder definitions that drive slot refreshes.
@@ -499,7 +506,7 @@ pub struct PyType {
 ///
 /// Tier-1 codegen emits raw `u32` loads at `type_ptr + this` for inline-cache
 /// guards; the compile-time assertion below keeps the constant honest.
-pub const PY_TYPE_VERSION_TAG_OFFSET: usize = 336;
+pub const PY_TYPE_VERSION_TAG_OFFSET: usize = 344;
 
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(offset_of!(PyType, version_tag) == PY_TYPE_VERSION_TAG_OFFSET);
@@ -546,6 +553,7 @@ impl PyType {
             tp_as_sequence: ptr::null_mut(),
             tp_as_mapping: ptr::null_mut(),
             tp_as_async: ptr::null_mut(),
+            capi_tp_traverse: None,
             gc_type_id: 0,
             dunder_slots: PyDunderSlots::EMPTY,
             version_tag: AtomicU32::new(Self::VERSION_TAG_SEED),

@@ -50,6 +50,8 @@ pub(crate) struct PyPonCapiRuntime {
     datetime_get_attr_int: unsafe extern "C" fn(*mut PyObject, *const c_char) -> c_int,
     capsule_set_name: unsafe extern "C" fn(*mut PyObject, *const c_char) -> c_int,
     import_import: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+    #[cfg(test)]
+    test_collect_pin_count: unsafe extern "C" fn(*mut PyObject) -> isize,
 }
 
 unsafe impl Send for PyPonCapiRuntime {}
@@ -165,6 +167,8 @@ pub(crate) fn build() -> PyPonCapiRuntime {
         datetime_get_attr_int: capi_datetime_get_attr_int,
         capsule_set_name: capi_capsule_set_name,
         import_import: capi_import_import,
+        #[cfg(test)]
+        test_collect_pin_count: capi_test_collect_pin_count,
     }
 }
 
@@ -206,6 +210,10 @@ pub(super) fn unregister_module_state(module: *mut PyObject) {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .remove(&(module as usize));
+}
+
+fn new_reference(object: *mut PyObject) -> *mut PyObject {
+    super::pin_new_reference(object)
 }
 
 
@@ -252,7 +260,7 @@ unsafe extern "C" fn capi_contextvar_new(name: *const c_char, default: *mut PyOb
     let Some(name) = c_string(name) else {
         return raise_system_error_null("PyContextVar_New called with invalid name");
     };
-    crate::native::contextvars::capi_contextvar_new(&name, default)
+    new_reference(crate::native::contextvars::capi_contextvar_new(&name, default))
 }
 
 unsafe extern "C" fn capi_contextvar_get(
@@ -260,7 +268,14 @@ unsafe extern "C" fn capi_contextvar_get(
     default: *mut PyObject,
     value: *mut *mut PyObject,
 ) -> c_int {
-    unsafe { crate::native::contextvars::capi_contextvar_get(var, default, value) }
+    let status = unsafe { crate::native::contextvars::capi_contextvar_get(var, default, value) };
+    if status == 0 && !value.is_null() {
+        let object = unsafe { *value };
+        if !object.is_null() {
+            super::pin_object(object);
+        }
+    }
+    status
 }
 
 unsafe extern "C" fn capi_datetime_capi_import() -> *mut c_void {
@@ -800,7 +815,7 @@ unsafe extern "C" fn capi_datetime_date_from_date(
     let Some(mut args) = (unsafe { datetime_int_args3(year, month, day) }) else {
         return ptr::null_mut();
     };
-    unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) }
+    new_reference(unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) })
 }
 
 unsafe extern "C" fn capi_datetime_datetime_from_date_and_time(
@@ -858,7 +873,7 @@ unsafe fn call_datetime_datetime_constructor(
             return ptr::null_mut();
         };
         let fold_name = [intern("fold")];
-        return unsafe {
+        let result = unsafe {
             abi::call::pon_call_ex(
                 callee,
                 args.as_mut_ptr(),
@@ -871,8 +886,9 @@ unsafe fn call_datetime_datetime_constructor(
                 ptr::null_mut(),
             )
         };
+        return new_reference(result);
     }
-    unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) }
+    new_reference(unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) })
 }
 
 unsafe extern "C" fn capi_datetime_time_from_time(
@@ -921,7 +937,7 @@ unsafe fn call_datetime_time_constructor(
             return ptr::null_mut();
         };
         let fold_name = [intern("fold")];
-        return unsafe {
+        let result = unsafe {
             abi::call::pon_call_ex(
                 callee,
                 args.as_mut_ptr(),
@@ -934,8 +950,9 @@ unsafe fn call_datetime_time_constructor(
                 ptr::null_mut(),
             )
         };
+        return new_reference(result);
     }
-    unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) }
+    new_reference(unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) })
 }
 
 unsafe extern "C" fn capi_datetime_delta_from_delta(
@@ -955,7 +972,7 @@ unsafe extern "C" fn capi_datetime_delta_from_delta(
     let Some(mut args) = (unsafe { datetime_int_args3(days, seconds, useconds) }) else {
         return ptr::null_mut();
     };
-    unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) }
+    new_reference(unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) })
 }
 
 unsafe fn datetime_constructor_type(type_: *mut ForeignTypeObject, symbol: &str) -> Option<*mut PyObject> {
@@ -1062,14 +1079,16 @@ unsafe extern "C" fn capi_capsule_new(
         raise_value_error("PyCapsule_New called with null pointer");
         return ptr::null_mut();
     }
-    Box::into_raw(Box::new(PyCapsule {
-        ob_base: PyObjectHeader::new(capsule_type()),
-        pointer,
-        name,
-        destructor,
-        context: ptr::null_mut(),
-    }))
-    .cast::<PyObject>()
+    new_reference(
+        Box::into_raw(Box::new(PyCapsule {
+            ob_base: PyObjectHeader::new(capsule_type()),
+            pointer,
+            name,
+            destructor,
+            context: ptr::null_mut(),
+        }))
+        .cast::<PyObject>(),
+    )
 }
 
 unsafe extern "C" fn capi_capsule_get_pointer(capsule: *mut PyObject, name: *const c_char) -> *mut c_void {
@@ -1132,7 +1151,7 @@ unsafe extern "C" fn capi_import_import_module(name: *const c_char) -> *mut PyOb
     let Some(name) = c_string(name) else {
         return raise_import_error_null("PyImport_ImportModule called with invalid module name");
     };
-    import_module_text(&name)
+    new_reference(import_module_text(&name))
 }
 
 /// `PyImport_Import`: object-name variant of PyImport_ImportModule.
@@ -1140,7 +1159,7 @@ unsafe extern "C" fn capi_import_import(name: *mut PyObject) -> *mut PyObject {
     let Some(text) = (unsafe { crate::types::type_::unicode_text(crate::tag::untag_arg(name)) }) else {
         return raise_import_error_null("PyImport_Import expects a str module name");
     };
-    import_module_text(&text.to_owned())
+    new_reference(import_module_text(&text.to_owned()))
 }
 
 /// `PyCapsule_SetName`: replaces the stored name pointer (caller keeps the
@@ -1221,6 +1240,17 @@ fn import_module_text(name: &str) -> *mut PyObject {
     let name_id = intern(name);
     let fromlist = [intern("*")];
     unsafe { crate::import::pon_import_name(name_id, fromlist.as_ptr(), fromlist.len(), 0) }
+}
+
+#[cfg(test)]
+unsafe extern "C" fn capi_test_collect_pin_count(object: *mut PyObject) -> isize {
+    match abi::collect() {
+        Ok(()) => super::pin_count(object) as isize,
+        Err(message) => {
+            raise_system_error(&message);
+            -1
+        }
+    }
 }
 
 unsafe fn capsule_ref<'a>(capsule: *mut PyObject) -> Option<&'a mut PyCapsule> {
