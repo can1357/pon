@@ -1,4 +1,4 @@
-//! Git-backed VCS requirement fetching for pon-pm.
+//! Git-backed VCS requirement fetching for pon.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};

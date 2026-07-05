@@ -163,7 +163,7 @@ pub fn run_full_suite(root: &Path, opts: &FullSuiteOptions) -> Result<Scoreboard
         && selected
             .iter()
             .any(|unit| ledger.exclusion_for(&unit.key, &unit.stem).is_none());
-    let pon_binary = if needs_pon { Some(suite::ensure_pon_cli(root)?) } else { None };
+    let pon_binary = if needs_pon { Some(suite::ensure_pon(root)?) } else { None };
 
     let scratch_base = env::temp_dir().join(format!("pon-conf-full-{}", std::process::id()));
     fs::create_dir_all(&scratch_base)

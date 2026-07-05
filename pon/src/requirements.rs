@@ -1,4 +1,4 @@
-//! Pip-compatible requirements-file parsing for `pon-pm`.
+//! Pip-compatible requirements-file parsing for `pon`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -719,7 +719,7 @@ mod tests {
 
     fn temp_dir(label: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
-            "pon-pm-requirements-{label}-{}-{}",
+            "pon-requirements-{label}-{}-{}",
             std::process::id(),
             unique_suffix()
         ));

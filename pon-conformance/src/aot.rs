@@ -215,7 +215,7 @@ pub fn run_aot_suite(root: &Path, requested_modules: &[PathBuf]) -> Result<Score
         return Ok(scoreboard);
     }
 
-    let pon_binary = suite::ensure_pon_cli(root)?;
+    let pon_binary = suite::ensure_pon(root)?;
     let run_dir = aot_run_dir(root)?;
     let timeout = aot_timeout();
 
@@ -313,7 +313,7 @@ pub fn run_aot_parity_suite(root: &Path, requested_modules: &[PathBuf]) -> Resul
         return Ok(report);
     }
 
-    let pon_binary = suite::ensure_pon_cli(root)?;
+    let pon_binary = suite::ensure_pon(root)?;
     let run_dir = aot_run_dir(root)?;
     let python_available = suite::python314_available();
     let timeout = aot_timeout();
@@ -632,7 +632,7 @@ print(add(2, 3))
             "hello_no_class{}",
             std::env::consts::EXE_SUFFIX
         ));
-        let pon_binary = suite::ensure_pon_cli(&root).expect("build pon-cli for AoT regression");
+        let pon_binary = suite::ensure_pon(&root).expect("build pon-cli for AoT regression");
 
         let build = match run_build(&root, &pon_binary, &script, &exe, aot_timeout()).expect("spawn pon build") {
             AotRun::Completed(build) => build,

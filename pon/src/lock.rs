@@ -18,7 +18,7 @@ use crate::resolve::source::{PackageKind, PackageRecord};
 use crate::resolve::{Resolution, ResolvedArtifact, ResolvedDist};
 
 pub const LOCK_VERSION: &str = "1.0";
-pub const CREATED_BY: &str = concat!("pon-pm ", env!("CARGO_PKG_VERSION"));
+pub const CREATED_BY: &str = concat!("pon ", env!("CARGO_PKG_VERSION"));
 pub const DEFAULT_REQUIRES_PYTHON: &str = ">=3.14";
 pub const LOCK_FILE_NAME: &str = "pon.lock";
 
@@ -621,12 +621,12 @@ where
 
 #[must_use]
 pub fn stale_lock_error() -> Error {
-    Error::Cli("pon.lock is stale (input-hash mismatch); run `pon-pm lock`".to_owned())
+    Error::Cli("pon.lock is stale (input-hash mismatch); run `pon lock`".to_owned())
 }
 
 #[must_use]
 pub fn missing_frozen_lock_error() -> Error {
-    Error::Cli("pon.lock not found; run `pon-pm lock`".to_owned())
+    Error::Cli("pon.lock not found; run `pon lock`".to_owned())
 }
 
 fn fetch_locked_artifact(
@@ -903,7 +903,7 @@ mod tests {
         let rendered = lock.to_string();
 
         assert!(rendered.contains("lock-version = \"1.0\""));
-        assert!(rendered.contains("created-by = \"pon-pm 0.1.0\""));
+        assert!(rendered.contains("created-by = \"pon 0.1.0\""));
         assert!(rendered.contains("requires-python = \">=3.14\""));
         assert!(rendered.contains("[tool.pon]\ninput-hash = \"sha256:fixture\""));
         assert!(rendered.contains("[[packages]]\nname = \"fastjson\"\nversion = \"0.1.0\""));
@@ -975,7 +975,7 @@ mod tests {
     fn rejects_unsupported_major_version() {
         let lock = concat!(
             "lock-version = \"2.0\"\n",
-            "created-by = \"pon-pm 0.1.0\"\n",
+            "created-by = \"pon 0.1.0\"\n",
             "requires-python = \">=3.14\"\n",
             "\n",
             "[tool.pon]\n",

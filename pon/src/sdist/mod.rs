@@ -163,6 +163,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        std::env::temp_dir().join(format!("pon-pm-sdist-{label}-{unique}"))
+        std::env::temp_dir().join(format!("pon-sdist-{label}-{unique}"))
     }
 }

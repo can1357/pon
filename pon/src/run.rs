@@ -1,4 +1,4 @@
-#![doc = "Library-first entry points for running and building Pon programs."]
+#![doc = "Library-first entry points for running Pon programs."]
 
 use std::env;
 use std::ffi::{CString, OsString};
@@ -13,14 +13,11 @@ use pon_runtime::dynexec::{DynCodeMode, DynCompileRequest, DynExecuteRequest, se
 use pon_runtime::import::{SourceModuleRequest, active_module_attr, begin_module_execution, cached_module, end_module_execution, install_module, set_source_module_loader};
 use pon_runtime::{PyObject, intern, pon_const_str, pon_none, pon_runtime_init, pon_sys_set_argv};
 
-mod astconv;
-pub mod build;
-
-
 /// A `sys.exit(code)` request surfaced from a top-level run.  The CLI entry
 /// point (`main`) maps it to the process exit status; embedded callers such as
-/// `pon-pm`'s in-process build hooks treat it as an ordinary error so they can
-/// report a backend failure instead of terminating their own process.
+/// the package manager's in-process build hooks (`crate::sdist`) treat it as an
+/// ordinary error so they can report a backend failure instead of terminating
+/// their own process.
 #[derive(Debug)]
 pub struct SystemExitRequested(pub i32);
 
@@ -45,50 +42,6 @@ impl std::fmt::Display for UncaughtExceptionReported {
 }
 
 impl std::error::Error for UncaughtExceptionReported {}
-/// Dispatches the process command line using the same behavior as the `pon-cli` binary.
-pub fn run_from_env() -> Result<()> {
-    run_from_args(env::args())
-}
-
-/// Dispatches a `pon` command-line argument vector.
-///
-/// The iterator must include argv[0]. This shape keeps binary dispatch and tests
-/// using one parser while allowing `pon-pm` to delegate to the same implementation.
-pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()> {
-    let mut args = args.into_iter();
-    let program = args.next().unwrap_or_else(|| "pon".to_owned());
-    match args.next().as_deref() {
-        Some("run") => {
-            let file = args.next().context("missing file for `pon run <file>`")?;
-            if let Some(extra) = args.next() {
-                bail!("unexpected argument `{extra}` for `pon run <file>`");
-            }
-            run_file(file)
-        }
-        Some("build") => build_from_args(args),
-        Some("repl") => bail!("`pon repl` is unsupported in Phase A"),
-        Some("-m") => {
-            let module = args.next().context("missing module name for `pon -m <module>`")?;
-            run_module_as_main(&module, args.collect())
-        }
-        Some(command) => {
-            // Python-compatible script invocation: `pon <script> [args...]`
-            // runs the file directly (like `python script.py args`), so tools
-            // that spawn `[sys.executable, <script>, ...]` (e.g. meson-python
-            // invoking meson) work.  Gated on `command` naming an existing file
-            // so real subcommand typos still error out.
-            let script = Path::new(command);
-            if script.is_file() {
-                let mut argv = vec![command.to_owned()];
-                argv.extend(args);
-                return run_file_with_env(script, std::iter::empty::<(OsString, OsString)>(), &argv);
-            }
-            bail!("unknown subcommand `{command}`\n{}", usage(&program));
-        }
-        None => bail!(usage(program)),
-    }
-}
-
 /// Runs one Pon/Python source file through the JIT backend using the current process environment.
 ///
 /// The runtime receives a `sys.argv` containing the source path as argv[0].
@@ -125,7 +78,7 @@ fn run_file_inner(path: &Path, argv: &[String]) -> Result<()> {
 /// leads the import path, a dotted module runs with `__name__ = "__main__"`
 /// and `__package__` set to its parent package so relative imports resolve,
 /// and a package target runs its `__main__` submodule.
-fn run_module_as_main(module: &str, extra_args: Vec<String>) -> Result<()> {
+pub(crate) fn run_module_as_main(module: &str, extra_args: Vec<String>) -> Result<()> {
     let mut overlay = EnvOverlay::new();
     let cwd = env::current_dir().context("cannot resolve the current directory for `pon -m`")?;
     let mut roots = vec![cwd.clone().into_os_string()];
@@ -181,6 +134,22 @@ fn run_module_as_main(module: &str, extra_args: Vec<String>) -> Result<()> {
     run_file_inner_with_package(&path, &argv, Some(&package))
 }
 
+/// How `__main__` is materialized for a top-level run.
+enum MainModule<'a> {
+    /// `pon run file.py` / `pon file.py` / `pon -m`: file-backed `__main__`.
+    Script(&'a Path),
+    /// `pon -c` / `pon -`: inline `__main__` without `__file__`.
+    Inline,
+}
+
+fn inline_module_attrs() -> Result<Vec<(u32, *mut PyObject)>> {
+    let cached = unsafe { pon_none() };
+    if cached.is_null() {
+        bail!("failed to allocate None for __cached__");
+    }
+    Ok(vec![(intern("__cached__"), cached)])
+}
+
 fn run_file_inner_with_package(path: &Path, argv: &[String], main_package: Option<&str>) -> Result<()> {
     let source = fs::read_to_string(path)
         .with_context(|| format!("failed to read UTF-8 source `{}`", path.display()))?;
@@ -199,20 +168,23 @@ fn run_file_inner_with_package(path: &Path, argv: &[String], main_package: Optio
         script_path_guard.set(OsString::from("PONPATH"), joined);
     }
     let module = lower_source(&source).context("failed to parse/lower source")?;
+    execute_main(&module, argv, MainModule::Script(path), main_package)
+}
+
+/// Installs the JIT dynamic-code hooks, initializes the runtime, records the
+/// conservative-stack root boundary, and installs `sys.argv`.
+///
+/// `stack_base_marker` must point at a local in a caller frame that outlives
+/// every JIT frame; the GC scans the native stack down from it.
+pub(crate) fn boot_runtime(argv: &[String], stack_base_marker: *mut u8) -> Result<()> {
     set_source_module_loader(load_source_module);
     set_dynamic_code_hooks(validate_dynamic_source, execute_dynamic_source);
-    set_ast_parse_hook(astconv::parse_dynamic_ast);
+    set_ast_parse_hook(crate::astconv::parse_dynamic_ast);
     let init_status = unsafe { pon_runtime_init() };
     if init_status != 0 {
         bail!("runtime initialization failed");
     }
-    // Conservative-stack root boundary for the JIT, mirroring `pon_aot_entry`:
-    // all generated code runs in frames below this one, so a `gc.collect()`
-    // triggered inside JIT code scans the native stack range holding JIT frame
-    // locals.  Without the boundary the collector sees no stack roots at all
-    // and frees objects held only by JIT frame slots (locals across collect).
-    let mut stack_base_marker = 0usize;
-    pon_runtime::aot_entry::capture_stack_base(std::ptr::addr_of_mut!(stack_base_marker).cast::<u8>());
+    pon_runtime::aot_entry::capture_stack_base(stack_base_marker);
     let mut argv_cstrings = Vec::with_capacity(argv.len());
     for arg in argv {
         let c_arg = match CString::new(arg.as_str()) {
@@ -228,7 +200,23 @@ fn run_file_inner_with_package(path: &Path, argv: &[String], main_package: Optio
     if unsafe { pon_sys_set_argv(argv_ptrs.len() as i32, argv_ptrs.as_ptr()) } != 0 {
         bail!("runtime initialization failed");
     }
-    install_module("__main__", script_module_attrs(path)?).map_err(anyhow::Error::msg)?;
+    Ok(())
+}
+
+/// Executes an already-lowered `__main__` module.
+fn execute_main(
+    module: &pon_ir::Module,
+    argv: &[String],
+    main: MainModule<'_>,
+    main_package: Option<&str>,
+) -> Result<()> {
+    let mut stack_base_marker = 0usize;
+    boot_runtime(argv, std::ptr::addr_of_mut!(stack_base_marker).cast::<u8>())?;
+    match main {
+        MainModule::Script(path) => install_module("__main__", script_module_attrs(path)?),
+        MainModule::Inline => install_module("__main__", inline_module_attrs()?),
+    }
+    .map_err(anyhow::Error::msg)?;
     if let Some(package) = main_package.filter(|package| !package.is_empty()) {
         // runpy: `__main__.__package__` names the parent package so the
         // module's relative imports resolve.
@@ -240,7 +228,7 @@ fn run_file_inner_with_package(path: &Path, argv: &[String], main_package: Optio
     }
     let mut engine = JitEngine::new();
     begin_module_execution("__main__").map_err(anyhow::Error::msg)?;
-    let result = engine.run(&module).context("JIT execution failed");
+    let result = engine.run(module).context("JIT execution failed");
     // `sys.exit` raises SystemExit; capture the requested process exit status
     // before finalizers run (CPython runs atexit callbacks, then exits with
     // the code).
@@ -264,6 +252,31 @@ fn run_file_inner_with_package(path: &Path, argv: &[String], main_package: Optio
         return Err(error);
     }
     io::stdout().flush().context("failed to flush stdout")
+}
+
+/// Runs an in-memory program as `__main__`.
+pub(crate) fn run_inline_source<I, K, V>(source: &str, extra_env: I, argv: &[String]) -> Result<()>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: Into<OsString>,
+    V: Into<OsString>,
+{
+    let mut guard = EnvOverlay::new();
+    for (key, value) in extra_env {
+        guard.set(key.into(), value.into());
+    }
+    let cwd = env::current_dir().context("cannot resolve the current directory for inline execution")?;
+    let mut roots = vec![cwd.into_os_string()];
+    if let Some(existing) = env::var_os("PONPATH") {
+        roots.extend(env::split_paths(&existing).map(|path| path.into_os_string()));
+    }
+    let mut cwd_path_guard = EnvOverlay::new();
+    cwd_path_guard.set(
+        OsString::from("PONPATH"),
+        env::join_paths(roots).context("failed to build import search path")?,
+    );
+    let module = lower_source(source).context("failed to parse/lower source")?;
+    execute_main(&module, argv, MainModule::Inline, None)
 }
 
 fn load_source_module(request: SourceModuleRequest<'_>) -> std::result::Result<*mut pon_runtime::PyObject, String> {
@@ -337,6 +350,16 @@ fn execute_dynamic_source(request: DynExecuteRequest<'_>) -> std::result::Result
     }
 }
 
+/// Compiles and runs one interactive entry inside the caller's active `__main__` execution.
+pub(crate) fn exec_interactive(source: &str) -> std::result::Result<(), String> {
+    let wrapped = dynexec_single_source(source);
+    let module = lower_source(&wrapped).map_err(|error| error.to_string())?;
+    let mut engine = JitEngine::new();
+    engine.run(&module).map_err(|error| error.to_string())?;
+    std::mem::forget(engine);
+    Ok(())
+}
+
 /// Runs one Pon/Python source file with additional environment visible to the runtime.
 ///
 /// This is the library-first hook used by package-manager delegation when it
@@ -392,14 +415,3 @@ impl Drop for EnvOverlay {
     }
 }
 
-/// Builds one Pon/Python source file through the AoT backend.
-pub fn build_from_args(args: impl IntoIterator<Item = String>) -> Result<()> {
-    build::run_from_args(args)
-}
-
-fn usage(program: impl AsRef<str>) -> String {
-    let program = program.as_ref();
-    format!(
-        "usage: {program} run <file>\n       {program} build <file> -o <out> [--allow-dynamic] [--opt] [--target <triple>]"
-    )
-}

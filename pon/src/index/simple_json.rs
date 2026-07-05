@@ -669,7 +669,7 @@ mod tests {
     #[test]
     fn lookup_uses_fresh_cache_without_network() {
         let temp = std::env::temp_dir().join(format!(
-            "pon-pm-simple-json-cache-{}",
+            "pon-simple-json-cache-{}",
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")

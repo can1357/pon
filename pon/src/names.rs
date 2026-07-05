@@ -72,7 +72,7 @@ mod tests {
 
     #[test]
     fn validates_distribution_names() {
-        assert!(validate("pon-pm_1.0").is_ok());
+        assert!(validate("demo-pkg_1.0").is_ok());
         assert!(validate("-pon").is_err());
         assert!(validate("pon!").is_err());
         assert!(validate("").is_err());
@@ -80,6 +80,6 @@ mod tests {
 
     #[test]
     fn normalized_comparison_ignores_allowed_separators_and_case() {
-        assert!(normalized_eq("Pon_PM", "pon-pm"));
+        assert!(normalized_eq("Demo_Pkg", "demo-pkg"));
     }
 }

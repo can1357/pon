@@ -74,7 +74,7 @@ pub fn install_editable(env: &EnvLayout, resolved_record: &ResolvedRecord, path:
     record_files.push(write_dist_info_file(
         &dist_info_path.join("INSTALLER"),
         dist_info_relative.join("INSTALLER"),
-        "pon-pm\n".to_owned(),
+        "pon\n".to_owned(),
     )?);
     record_files.push(write_dist_info_file(
         &dist_info_path.join("direct_url.json"),
@@ -240,7 +240,7 @@ fn create_editable_link(source: &Path, destination: &Path, kind: SourceKind) -> 
         Ok(()) => Ok(LinkOutcome::Linked),
         Err(error) => {
             eprintln!(
-                "warning: editable install copied files (symlinks unavailable: {error}); re-run `pon-pm install` after edits"
+                "warning: editable install copied files (symlinks unavailable: {error}); re-run `pon install` after edits"
             );
             Ok(LinkOutcome::Copied)
         }

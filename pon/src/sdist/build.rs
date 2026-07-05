@@ -335,7 +335,7 @@ fn run_get_requires_for_build_wheel_hook(
     script.push_str("_pon_file.close()\n");
     fs::write(&script_path, script)?;
     let argv = [script_path.display().to_string()];
-    let result = pon_cli::run_file_with_env(
+    let result = crate::run::run_file_with_env(
         &script_path,
         build_runtime_env(build_env, source_root, backend_path),
         &argv,
@@ -376,7 +376,7 @@ fn run_build_wheel_hook(
     ));
     fs::write(&script_path, script)?;
     let argv = [script_path.display().to_string()];
-    let result = pon_cli::run_file_with_env(
+    let result = crate::run::run_file_with_env(
         &script_path,
         build_runtime_env(build_env, source_root, backend_path),
         &argv,
@@ -410,20 +410,13 @@ fn build_hook_path(build_env: &EnvLayout) -> OsString {
     path
 }
 
-/// Spawnable Python-runner path advertised to build hooks as
-/// `sys.executable` (through `PON_SYS_EXECUTABLE`): the `pon-cli` binary
-/// next to this `pon-pm` executable, so backend code spawning
-/// `[sys.executable, script, ...]` (mesonpy launching meson) gets a real
-/// script runner instead of re-entering pon-pm. Falls back to the current
-/// executable when no sibling exists.
+/// Spawnable Python-runner path advertised to build hooks as `sys.executable`
+/// (through `PON_SYS_EXECUTABLE`): the running `pon` binary itself, which
+/// executes `pon <script> [args...]` directly.
 fn pon_sys_executable() -> OsString {
-    let current = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("pon"));
-    let sibling = current.with_file_name(if cfg!(windows) { "pon-cli.exe" } else { "pon-cli" });
-    if sibling.exists() {
-        sibling.into_os_string()
-    } else {
-        current.into_os_string()
-    }
+    std::env::current_exe()
+        .map(PathBuf::into_os_string)
+        .unwrap_or_else(|_| OsString::from("pon"))
 }
 
 fn build_import_path(build_env: &EnvLayout, source_root: &Path, backend_path: &[String]) -> OsString {

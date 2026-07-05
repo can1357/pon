@@ -2,12 +2,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::Read;
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use clap::{Args, Parser, Subcommand};
+use anyhow::{anyhow, Context};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use pep440_rs::{Operator, Version, VersionSpecifiers};
 use pep508_rs::{Requirement, VersionOrUrl};
 use sha2::{Digest, Sha256};
@@ -29,10 +29,9 @@ use crate::resolve::provider::{PonProvider, ResolveProvider};
 use crate::resolve::source::{IndexSource, PackageKind, PackageRecord};
 use crate::resolve::{resolve_root, Resolution, ResolvedArtifact, ResolvedDist};
 
-static INLINE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Parser)]
-#[command(name = "pon-pm", disable_help_subcommand = true)]
+#[command(name = "pon", version, disable_help_subcommand = true)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -40,18 +39,35 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Init(ManifestArgs),
-    Add(AddArgs),
-    Remove(RemoveArgs),
-    Install(InstallArgs),
-    Lock(LockArgs),
+    /// Run a Python file, inline code, or entry point in the project environment
     Run(RunArgs),
+    /// Start the interactive session
+    Repl,
+    /// Compile a Python file to a native executable
+    Build(BuildArgs),
+    /// Create a pyproject.toml
+    Init(ManifestArgs),
+    /// Add dependencies to pyproject.toml and install them
+    Add(AddArgs),
+    /// Remove dependencies from pyproject.toml
+    Remove(RemoveArgs),
+    /// Install project dependencies or explicit requirements
+    Install(InstallArgs),
+    /// Resolve dependencies and write pon.lock
+    Lock(LockArgs),
+    /// List installed packages
     List(ManifestArgs),
+    /// Print installed packages as pinned requirements
     Freeze,
+    /// Show metadata for installed packages
     Show(ShowArgs),
+    /// Download distribution artifacts without installing
     Download(DownloadArgs),
+    /// Verify installed packages satisfy their requirements
     Check,
+    /// Inspect or clear the artifact cache
     Cache(CacheArgs),
+    /// Print the environment layout
     Env(EnvArgs),
 }
 
@@ -138,6 +154,25 @@ struct RunArgs {
 }
 
 #[derive(Debug, Args)]
+struct BuildArgs {
+    /// Python source file to compile
+    #[arg(value_name = "file")]
+    file: PathBuf,
+    /// Output executable path
+    #[arg(short = 'o', long = "output", value_name = "out")]
+    out: PathBuf,
+    /// Permit dynamic constructs the AoT backend rejects by default
+    #[arg(long)]
+    allow_dynamic: bool,
+    /// Enable optimization
+    #[arg(long)]
+    opt: bool,
+    /// Cross-compilation target triple
+    #[arg(long, value_name = "triple")]
+    target: Option<String>,
+}
+
+#[derive(Debug, Args)]
 struct ShowArgs {
     #[arg(value_name = "name", required = true)]
     names: Vec<String>,
@@ -210,27 +245,133 @@ struct ResolveOptions {
     constraints: HashMap<String, VersionSpecifiers>,
 }
 
-pub fn run_from_env() -> Result<()> {
+pub fn run_from_env() -> anyhow::Result<()> {
     run_from_args(env::args())
 }
 
-pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()> {
-    let cli = Cli::try_parse_from(args).map_err(|error| Error::Cli(error.to_string().trim_end().to_owned()))?;
-    match cli.command {
-        Command::Init(args) => init_command(args),
-        Command::Add(args) => add_command(args),
-        Command::Remove(args) => remove_command(args),
-        Command::Install(args) => install_command(args),
-        Command::Lock(args) => lock_command(args),
-        Command::Run(args) => run_command(args),
-        Command::List(args) => list_command(args.manifest.as_path()),
-        Command::Freeze => freeze_command(),
-        Command::Show(args) => show_command(&args.names),
-        Command::Download(args) => download_command(args),
-        Command::Check => check_command(),
-        Command::Cache(args) => cache_command(args),
-        Command::Env(args) => env_command(args.root),
+pub fn run_from_args(args: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
+    let argv: Vec<String> = args.into_iter().collect();
+    match argv.get(1).map(String::as_str) {
+        None | Some("-h" | "--help" | "help") => {
+            print_root_help();
+            Ok(())
+        }
+        Some("-m") => {
+            let module = argv.get(2).context("missing module name for `pon -m <module>`")?;
+            crate::run::run_module_as_main(module, argv[3..].to_vec())
+        }
+        Some("-c") => {
+            let code = argv.get(2).context("missing code for `pon -c <code>`")?;
+            let mut inline_argv = vec!["-c".to_owned()];
+            inline_argv.extend(argv[3..].iter().cloned());
+            crate::run::run_inline_source(code, std::iter::empty::<(OsString, OsString)>(), &inline_argv)
+        }
+        Some("-") => {
+            let mut code = String::new();
+            io::stdin()
+                .read_to_string(&mut code)
+                .context("failed to read program from stdin")?;
+            let mut inline_argv = vec!["-".to_owned()];
+            inline_argv.extend(argv[2..].iter().cloned());
+            crate::run::run_inline_source(&code, std::iter::empty::<(OsString, OsString)>(), &inline_argv)
+        }
+        Some(token)
+            if !token.starts_with('-')
+                && Cli::command().find_subcommand(token).is_none()
+                && Path::new(token).is_file() =>
+        {
+            let mut script_argv = vec![token.to_owned()];
+            script_argv.extend(argv[2..].iter().cloned());
+            crate::run::run_file_with_env(token, std::iter::empty::<(OsString, OsString)>(), &script_argv)
+        }
+        _ => {
+            let cli = Cli::try_parse_from(argv.clone()).unwrap_or_else(|error| error.exit());
+            match cli.command {
+                Command::Run(args) => Ok(run_command(args)?),
+                Command::Repl => crate::repl::run(),
+                Command::Build(args) => build_command(args),
+                Command::Init(args) => Ok(init_command(args)?),
+                Command::Add(args) => Ok(add_command(args)?),
+                Command::Remove(args) => Ok(remove_command(args)?),
+                Command::Install(args) => Ok(install_command(args)?),
+                Command::Lock(args) => Ok(lock_command(args)?),
+                Command::List(args) => Ok(list_command(args.manifest.as_path())?),
+                Command::Freeze => Ok(freeze_command()?),
+                Command::Show(args) => Ok(show_command(&args.names)?),
+                Command::Download(args) => Ok(download_command(args)?),
+                Command::Check => Ok(check_command()?),
+                Command::Cache(args) => Ok(cache_command(args)?),
+                Command::Env(args) => Ok(env_command(args.root)?),
+            }
+        }
     }
+}
+
+fn style(on: bool, code: &'static str) -> &'static str {
+    if on { code } else { "" }
+}
+
+fn print_root_help() {
+    let no_color = env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty());
+    let on = io::stdout().is_terminal() && !no_color;
+    let bold = style(on, "\x1b[1m");
+    let command = style(on, "\x1b[1;36m");
+    let dim = style(on, "\x1b[2m");
+    let reset = style(on, "\x1b[0m");
+    print!(
+        "{bold}pon — Python runtime & package manager (v{}){reset}\n\
+\n\
+Usage: pon <command> [...flags] [...args]\n\
+       pon <file>.py [args]      run a script (python-style)\n\
+       pon -m <module> [args]    run a module as __main__\n\
+       pon -c <code> [args]      run inline code\n\
+       pon -                     run a program from stdin\n\
+\n\
+{bold}Runtime:{reset}\n\
+  {command}run{reset}       {dim}pon run app.py{reset}            Run a file, -c code, or --entry in the project env\n\
+  {command}repl{reset}      {dim}pon repl{reset}                  Start the interactive session\n\
+  {command}build{reset}     {dim}pon build app.py -o app{reset}   Compile to a native executable\n\
+\n\
+{bold}Project:{reset}\n\
+  {command}init{reset}                                Create pyproject.toml\n\
+  {command}add{reset}       {dim}pon add requests{reset}          Add dependencies and install them\n\
+  {command}remove{reset}    {dim}pon remove requests{reset}       Remove dependencies\n\
+  {command}install{reset}                             Install project or explicit requirements\n\
+  {command}lock{reset}                                Resolve and write pon.lock\n\
+\n\
+{bold}Inspect:{reset}\n\
+  {command}list{reset}                                List installed packages\n\
+  {command}freeze{reset}                              Print pinned requirements\n\
+  {command}show{reset}      {dim}pon show requests{reset}         Show package metadata\n\
+  {command}check{reset}                               Verify installed packages\n\
+  {command}env{reset}                                 Print the environment layout\n\
+\n\
+{bold}Artifacts:{reset}\n\
+  {command}download{reset}                            Download distribution artifacts\n\
+  {command}cache{reset}                               Inspect or clear the artifact cache\n\
+\n\
+{bold}Flags:{reset}\n\
+  -h, --help                          Show this help (per-command: pon <command> --help)\n\
+  -V, --version                       Print the version\n\
+\n",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+fn build_command(args: BuildArgs) -> anyhow::Result<()> {
+    let mut options = pon_aot::BuildOptions {
+        out_path: args.out,
+        allow_dynamic: args.allow_dynamic,
+        opt: args.opt,
+        target: None,
+    };
+    if let Some(raw) = args.target {
+        options.target = Some(
+            raw.parse()
+                .map_err(|error| anyhow!("invalid target triple `{raw}`: {error}"))?,
+        );
+    }
+    pon_aot::build(&args.file, &options).map(|_| ())
 }
 
 fn init_command(args: ManifestArgs) -> Result<()> {
@@ -472,16 +613,20 @@ fn strip_arg_delimiter(args: &mut Vec<String>, index: usize) {
 }
 
 fn run_command(mut args: RunArgs) -> Result<()> {
-    let layout = discover_layout()?;
-    layout.create_dirs()?;
-    let extra_env = runtime_env(&layout);
+    let extra_env = if let Some(layout) = discover_project()? {
+        layout.create_dirs()?;
+        runtime_env(&layout)
+    } else {
+        Vec::new()
+    };
 
     if let Some(code) = args.code {
         if args.entry.is_some() || !args.args.is_empty() {
             return Err(Error::Cli("unexpected argument for `run -c`".to_owned()));
         }
         let argv = [String::from("-c")];
-        return run_inline_code(&layout, &code, extra_env, &argv);
+        return crate::run::run_inline_source(&code, extra_env, &argv)
+            .map_err(|error| Error::Cli(format!("{error:#}")));
     }
 
     if let Some(entry) = args.entry {
@@ -494,7 +639,8 @@ fn run_command(mut args: RunArgs) -> Result<()> {
         let mut argv = Vec::with_capacity(args.args.len() + 1);
         argv.push(entry);
         argv.extend(args.args);
-        return run_inline_code(&layout, &code, extra_env, &argv);
+        return crate::run::run_inline_source(&code, extra_env, &argv)
+            .map_err(|error| Error::Cli(format!("{error:#}")));
     }
 
     let Some(file) = args.args.first().cloned() else {
@@ -502,23 +648,7 @@ fn run_command(mut args: RunArgs) -> Result<()> {
     };
     let mut argv = args.args;
     strip_arg_delimiter(&mut argv, 1);
-    pon_cli::run_file_with_env(file.as_str(), extra_env, &argv).map_err(|error| Error::Cli(format!("{error:#}")))
-}
-
-fn run_inline_code(
-    layout: &EnvLayout,
-    code: &str,
-    extra_env: Vec<(OsString, OsString)>,
-    argv: &[String],
-) -> Result<()> {
-    let run_dir = layout.pon_dir.join("run");
-    fs::create_dir_all(&run_dir)?;
-    let counter = INLINE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = run_dir.join(format!("inline-{}-{counter}.py", std::process::id()));
-    fs::write(&path, code)?;
-    let result = pon_cli::run_file_with_env(&path, extra_env, argv).map_err(|error| Error::Cli(format!("{error:#}")));
-    let _ = fs::remove_file(path);
-    result
+    crate::run::run_file_with_env(file.as_str(), extra_env, &argv).map_err(|error| Error::Cli(format!("{error:#}")))
 }
 
 fn list_command(manifest_path: &Path) -> Result<()> {
@@ -1223,14 +1353,22 @@ fn layout_for_manifest(manifest_path: &Path) -> EnvLayout {
     EnvLayout::new(root)
 }
 
-fn discover_layout() -> Result<EnvLayout> {
+/// Nearest ancestor of the cwd with a `pyproject.toml` or `.pon/` marker.
+fn discover_project() -> Result<Option<EnvLayout>> {
     let cwd = env::current_dir()?;
     for ancestor in cwd.ancestors() {
         if ancestor.join("pyproject.toml").is_file() || ancestor.join(".pon").is_dir() {
-            return Ok(EnvLayout::new(ancestor));
+            return Ok(Some(EnvLayout::new(ancestor)));
         }
     }
-    Ok(EnvLayout::new(cwd))
+    Ok(None)
+}
+
+fn discover_layout() -> Result<EnvLayout> {
+    Ok(match discover_project()? {
+        Some(layout) => layout,
+        None => EnvLayout::new(env::current_dir()?),
+    })
 }
 
 fn runtime_env(layout: &EnvLayout) -> Vec<(OsString, OsString)> {
@@ -1494,7 +1632,7 @@ mod tests {
 
     fn temp_project(name: &str) -> PathBuf {
         let unique = format!(
-            "pon-pm-cli-{name}-{}-{}",
+            "pon-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1507,7 +1645,7 @@ mod tests {
     #[test]
     fn clap_accepts_manifest_and_index_urls_for_resolving_commands() {
         let cli = Cli::try_parse_from([
-            "pon-pm",
+            "pon",
             "install",
             "--manifest",
             "demo.toml",
@@ -1537,7 +1675,7 @@ mod tests {
     #[test]
     fn clap_accepts_install_requirement_file_and_flags() {
         let cli = Cli::try_parse_from([
-            "pon-pm",
+            "pon",
             "install",
             "requests==2.32.0",
             "-r",
@@ -1630,7 +1768,7 @@ mod tests {
 
     #[test]
     fn clap_accepts_run_file_args_and_entry_args_without_runtime_execution() {
-        let file_cli = Cli::try_parse_from(["pon-pm", "run", "app.py", "--", "-x", "value"])
+        let file_cli = Cli::try_parse_from(["pon", "run", "app.py", "--", "-x", "value"])
             .expect("parse file run");
         let Command::Run(file_run) = file_cli.command else {
             panic!("run command");
@@ -1641,7 +1779,7 @@ mod tests {
         assert_eq!(file_run.entry, None);
         assert_eq!(file_args, vec!["app.py".to_owned(), "-x".to_owned(), "value".to_owned()]);
 
-        let entry_cli = Cli::try_parse_from(["pon-pm", "run", "--entry", "demo_pkg.cli:main", "--", "a", "b"])
+        let entry_cli = Cli::try_parse_from(["pon", "run", "--entry", "demo_pkg.cli:main", "--", "a", "b"])
             .expect("parse entry run");
         let Command::Run(entry_run) = entry_cli.command else {
             panic!("run command");
@@ -1658,7 +1796,7 @@ mod tests {
         let manifest = root.join("pyproject.toml");
 
         run_from_args([
-            "pon-pm".to_owned(),
+            "pon".to_owned(),
             "init".to_owned(),
             "--manifest".to_owned(),
             manifest.display().to_string(),
@@ -1679,7 +1817,7 @@ mod tests {
         fs::create_dir_all(&root).expect("root");
 
         run_from_args([
-            "pon-pm".to_owned(),
+            "pon".to_owned(),
             "add".to_owned(),
             "idna".to_owned(),
             "--manifest".to_owned(),
@@ -1709,7 +1847,7 @@ mod tests {
         let raw_path = sdist_path.display().to_string();
 
         run_from_args([
-            "pon-pm".to_owned(),
+            "pon".to_owned(),
             "add".to_owned(),
             raw_path.clone(),
             "--manifest".to_owned(),
@@ -1746,7 +1884,7 @@ mod tests {
         let manifest = root.join("pyproject.toml");
         fs::create_dir_all(&root).expect("root");
         run_from_args([
-            "pon-pm".to_owned(),
+            "pon".to_owned(),
             "add".to_owned(),
             "idna".to_owned(),
             "--manifest".to_owned(),
@@ -1757,7 +1895,7 @@ mod tests {
         .expect("add");
 
         run_from_args([
-            "pon-pm".to_owned(),
+            "pon".to_owned(),
             "remove".to_owned(),
             "idna".to_owned(),
             "--manifest".to_owned(),
@@ -1780,7 +1918,7 @@ mod tests {
         fs::create_dir_all(&root).expect("root");
 
         let error = run_from_args([
-            "pon-pm".to_owned(),
+            "pon".to_owned(),
             "add".to_owned(),
             "numpy".to_owned(),
             "--manifest".to_owned(),

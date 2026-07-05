@@ -357,7 +357,7 @@ mod tests {
 
     fn temp_path(name: &str) -> PathBuf {
         let unique = format!(
-            "pon-pm-{name}-{}-{}",
+            "pon-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

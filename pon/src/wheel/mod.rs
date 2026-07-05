@@ -76,7 +76,7 @@ pub fn install_wheel(
     installed_record_entries.push(write_recorded_file(
         &env.site_packages.join(&dist_info_dir).join("INSTALLER"),
         path_to_record_string(&dist_info_dir.join("INSTALLER"))?,
-        b"pon-pm\n",
+        b"pon\n",
         false,
     )?);
 
@@ -380,7 +380,7 @@ fn write_entry_point_scripts(env: &EnvLayout, filename: &str, entry_point: &Entr
     let launcher_path = env.scripts_dir.join(format!("{}.py", script_name.to_string_lossy()));
     let script_path_literal = shell_double_quoted(&launcher_path.to_string_lossy());
     let script_content = format!(
-        "#!/bin/sh\nexec \"${{PON_SYS_EXECUTABLE:-pon-cli}}\" \"{script_path_literal}\" \"$@\"\n"
+        "#!/bin/sh\nexec \"${{PON_SYS_EXECUTABLE:-pon}}\" \"{script_path_literal}\" \"$@\"\n"
     );
     let launcher_content = python_launcher_content(entry_point, &env.scripts_dir, &env.site_packages);
 
@@ -743,7 +743,7 @@ fn rewrite_python_shebang(mut bytes: Vec<u8>) -> Vec<u8> {
     if !bytes.starts_with(b"#!python") {
         return bytes;
     }
-    let mut rewritten = b"#!/usr/bin/env -S pon-pm run".to_vec();
+    let mut rewritten = b"#!/usr/bin/env -S pon run".to_vec();
     if let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') {
         rewritten.extend_from_slice(&bytes[newline..]);
     }
@@ -833,7 +833,7 @@ mod tests {
         let script_path_literal = shell_double_quoted(&launcher_path.to_string_lossy());
         assert_eq!(
             fs::read_to_string(&script_path).expect("shell shim"),
-            format!("#!/bin/sh\nexec \"${{PON_SYS_EXECUTABLE:-pon-cli}}\" \"{script_path_literal}\" \"$@\"\n")
+            format!("#!/bin/sh\nexec \"${{PON_SYS_EXECUTABLE:-pon}}\" \"{script_path_literal}\" \"$@\"\n")
         );
         let launcher = fs::read_to_string(&launcher_path).expect("python launcher");
         assert!(launcher.contains("if __name__ != '__main__':\n"));
@@ -940,6 +940,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        std::env::temp_dir().join(format!("pon-pm-wheel-{label}-{unique}"))
+        std::env::temp_dir().join(format!("pon-wheel-{label}-{unique}"))
     }
 }

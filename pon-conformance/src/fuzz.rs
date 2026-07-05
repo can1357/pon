@@ -149,7 +149,7 @@ pub fn run_fuzz_suite(root: &Path, opts: &FuzzOptions) -> Result<FuzzSummary> {
         anyhow::bail!("python3.14 reference interpreter is not available");
     }
 
-    let pon_binary = suite::ensure_pon_cli(root)?;
+    let pon_binary = suite::ensure_pon(root)?;
     let run_dir = root
         .join("target")
         .join(RUNNER_DIR)

@@ -1,18 +1,25 @@
 [package]
-name = "pon-pm"
+name = "pon"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
 [features]
 default = []
-free-threading = ["pon-cli/free-threading"]
+free-threading = ["pon-jit/free-threading", "pon-aot/free-threading"]
 
 [lints]
 workspace = true
 
 [dependencies]
-pon-cli.workspace = true
+pon-ir.workspace = true
+pon-jit.workspace = true
+pon-runtime.workspace = true
+pon-aot.workspace = true
+anyhow.workspace = true
+ruff_python_ast.workspace = true
+ruff_python_parser.workspace = true
+ruff_text_size.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ureq.workspace = true
@@ -27,3 +34,4 @@ pep508_rs.workspace = true
 version-ranges.workspace = true
 toml_edit.workspace = true
 clap.workspace = true
+rustyline.workspace = true

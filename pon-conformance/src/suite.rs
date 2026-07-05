@@ -77,7 +77,7 @@ pub fn run_slice_suite(root: &Path, requested_modules: &[PathBuf]) -> Result<Sco
         ReferenceMode::BuiltInGoldens => println!("reference: built-in Phase-A goldens"),
     }
 
-    let pon_binary = ensure_pon_cli(root)?;
+    let pon_binary = ensure_pon(root)?;
     let mut scoreboard = Scoreboard::new("slice", None);
 
     for script in scripts {
@@ -133,7 +133,7 @@ pub fn run_cpython_suite(root: &Path, requested_modules: &[PathBuf]) -> Result<S
         return Ok(scoreboard);
     }
 
-    let pon_binary = ensure_pon_cli(root)?;
+    let pon_binary = ensure_pon(root)?;
     for (label, script, missing_status, missing_detail) in modules {
         let Some(script) = script else {
             scoreboard.push(label, missing_status, Some(missing_detail));
@@ -187,7 +187,7 @@ pub fn run_ft_stress_suite(root: &Path, requested_modules: &[PathBuf]) -> Result
         ReferenceMode::BuiltInGoldens => println!("reference: built-in FT stress goldens"),
     }
 
-    let pon_binary = ensure_pon_cli_free_threading(root)?;
+    let pon_binary = ensure_pon_free_threading(root)?;
     let mut scoreboard = Scoreboard::new("ft-stress", None);
 
     for script in scripts {
@@ -288,7 +288,7 @@ pub(crate) fn python314_available() -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-pub(crate) fn ensure_pon_cli(root: &Path) -> Result<PathBuf> {
+pub(crate) fn ensure_pon(root: &Path) -> Result<PathBuf> {
     let output = Command::new("cargo")
         .arg("build")
         .arg("--quiet")
@@ -314,7 +314,7 @@ pub(crate) fn ensure_pon_cli(root: &Path) -> Result<PathBuf> {
     Ok(binary)
 }
 
-fn ensure_pon_cli_free_threading(root: &Path) -> Result<PathBuf> {
+fn ensure_pon_free_threading(root: &Path) -> Result<PathBuf> {
     let output = Command::new("cargo")
         .arg("build")
         .arg("--quiet")

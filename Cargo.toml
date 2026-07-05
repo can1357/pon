@@ -1,16 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
-	"pon-ir",
-	"pon-gc",
-	"pon-runtime",
-	"pon-codegen",
-	"pon-jit",
-	"pon-aot",
-	"pon-abi",
-	"pon-cli",
-	"pon-conformance",
-	"pon-pm",
+    "pon-ir",
+    "pon-gc",
+    "pon-runtime",
+    "pon-codegen",
+    "pon-jit",
+    "pon-aot",
+    "pon-abi",
+    "pon",
+    "pon-conformance",
 ]
 
 [workspace.package]
@@ -26,9 +25,8 @@ pon-codegen     = { path = "pon-codegen" }
 pon-jit         = { path = "pon-jit" }
 pon-aot         = { path = "pon-aot" }
 pon-abi         = { path = "pon-abi" }
-pon-cli         = { path = "pon-cli" }
+pon = { path = "pon" }
 pon-conformance = { path = "pon-conformance" }
-pon-pm          = { path = "pon-pm" }
 
 # --- Cranelift: exact-pin lockstep across all six crates ---
 cranelift-codegen   = "=0.133.1"
@@ -74,7 +72,8 @@ pep440_rs           = { version = "0.7.3", features = ["version-ranges"] }
 pep508_rs           = "0.9"
 version-ranges      = "0.1"
 toml_edit           = { version = "0.23", features = ["serde"] }
-clap                = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }
+rustyline = "18"
 
 [workspace.lints.rust]
 # ──────────────────────────────────────────────────────────────────────────────
