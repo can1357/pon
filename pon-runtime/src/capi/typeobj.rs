@@ -19,9 +19,10 @@
 //! Unsupported (loud `PyType_Ready` failure, never silent): GC-tracked types
 //! (`Py_TPFLAGS_HAVE_GC`, `tp_traverse`, `tp_clear`) and custom metatypes.
 
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_char, c_int, c_uint, c_void};
 use core::ptr;
 use std::collections::HashSet;
+use std::ffi::CString;
 use std::sync::{LazyLock, Mutex};
 
 use pon_gc::{GcTypeInfo, TypeId};
@@ -44,6 +45,61 @@ const TYPE_ID_CAPI_INSTANCE: TypeId = TypeId(140);
 const TPFLAGS_READY: u64 = 1 << 12;
 const TPFLAGS_HAVE_GC: u64 = 1 << 14;
 
+// CPython stable-ABI slot ids mirrored in include/Python.h/typeslots.h.
+const PY_BF_GETBUFFER: c_int = 1;
+const PY_SQ_REPEAT: c_int = 46;
+const PY_TP_ALLOC: c_int = 47;
+const PY_TP_BASE: c_int = 48;
+const PY_TP_BASES: c_int = 49;
+const PY_TP_CALL: c_int = 50;
+const PY_TP_CLEAR: c_int = 51;
+const PY_TP_DEALLOC: c_int = 52;
+const PY_TP_DEL: c_int = 53;
+const PY_TP_DESCR_GET: c_int = 54;
+const PY_TP_DESCR_SET: c_int = 55;
+const PY_TP_DOC: c_int = 56;
+const PY_TP_GETATTR: c_int = 57;
+const PY_TP_GETATTRO: c_int = 58;
+const PY_TP_HASH: c_int = 59;
+const PY_TP_INIT: c_int = 60;
+const PY_TP_IS_GC: c_int = 61;
+const PY_TP_ITER: c_int = 62;
+const PY_TP_ITERNEXT: c_int = 63;
+const PY_TP_METHODS: c_int = 64;
+const PY_TP_NEW: c_int = 65;
+const PY_TP_REPR: c_int = 66;
+const PY_TP_RICHCOMPARE: c_int = 67;
+const PY_TP_SETATTR: c_int = 68;
+const PY_TP_SETATTRO: c_int = 69;
+const PY_TP_STR: c_int = 70;
+const PY_TP_TRAVERSE: c_int = 71;
+const PY_TP_MEMBERS: c_int = 72;
+const PY_TP_GETSET: c_int = 73;
+const PY_TP_FREE: c_int = 74;
+const PY_NB_MATRIX_MULTIPLY: c_int = 75;
+const PY_NB_INPLACE_MATRIX_MULTIPLY: c_int = 76;
+const PY_AM_AWAIT: c_int = 77;
+const PY_AM_ANEXT: c_int = 79;
+const PY_AM_SEND: c_int = 81;
+const PY_TP_FINALIZE: c_int = 80;
+const PY_TP_VECTORCALL: c_int = 82;
+const PY_TP_TOKEN: c_int = 83;
+
+#[repr(C)]
+struct PyTypeSlot {
+    slot: c_int,
+    pfunc: *mut c_void,
+}
+
+#[repr(C)]
+struct PyTypeSpec {
+    name: *const c_char,
+    basicsize: c_int,
+    itemsize: c_int,
+    flags: c_uint,
+    slots: *mut PyTypeSlot,
+}
+
 /// Addresses of live C-extension instances allocated on the GC heap.
 /// `PyObject_Free` must no-op for these (the GC owns the block); the
 /// finalizer drops entries as objects die.
@@ -59,6 +115,9 @@ pub(crate) struct PyPonCapiTypeObj {
     object_free: unsafe extern "C" fn(*mut c_void),
     object_init: unsafe extern "C" fn(*mut PyObject, *mut ForeignTypeObject) -> *mut PyObject,
     object_new_raw: unsafe extern "C" fn(*mut ForeignTypeObject, isize) -> *mut PyObject,
+    type_from_spec: unsafe extern "C" fn(*mut PyTypeSpec) -> *mut PyObject,
+    type_from_spec_with_bases: unsafe extern "C" fn(*mut PyTypeSpec, *mut PyObject) -> *mut PyObject,
+    type_from_module_and_spec: unsafe extern "C" fn(*mut PyObject, *mut PyTypeSpec, *mut PyObject) -> *mut PyObject,
 }
 
 unsafe impl Send for PyPonCapiTypeObj {}
@@ -73,6 +132,9 @@ pub(crate) fn build() -> PyPonCapiTypeObj {
         object_free: capi_object_free,
         object_init: capi_object_init,
         object_new_raw: capi_object_new_raw,
+        type_from_spec: capi_type_from_spec,
+        type_from_spec_with_bases: capi_type_from_spec_with_bases,
+        type_from_module_and_spec: capi_type_from_module_and_spec,
     }
 }
 
@@ -316,6 +378,165 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
         };
     }
     0
+}
+
+/// `PyPonCapiTypeObj.type_from_spec` (`PyType_FromSpec`).
+unsafe extern "C" fn capi_type_from_spec(spec: *mut PyTypeSpec) -> *mut PyObject {
+    unsafe { capi_type_from_module_and_spec(ptr::null_mut(), spec, ptr::null_mut()) }
+}
+
+/// `PyPonCapiTypeObj.type_from_spec_with_bases` (`PyType_FromSpecWithBases`).
+unsafe extern "C" fn capi_type_from_spec_with_bases(spec: *mut PyTypeSpec, bases: *mut PyObject) -> *mut PyObject {
+    unsafe { capi_type_from_module_and_spec(ptr::null_mut(), spec, bases) }
+}
+
+/// `PyPonCapiTypeObj.type_from_module_and_spec` (`PyType_FromModuleAndSpec`).
+///
+/// Pon does not expose `PyType_GetModule`/module-state lookup yet; the module
+/// argument is intentionally ignored while the C type itself is made ready.
+unsafe extern "C" fn capi_type_from_module_and_spec(_module: *mut PyObject, spec: *mut PyTypeSpec, bases: *mut PyObject) -> *mut PyObject {
+    if spec.is_null() {
+        raise_type_error("PyType_FromSpec(NULL)");
+        return ptr::null_mut();
+    }
+    // SAFETY: extension-owned spec pointer per C-API contract.
+    let spec_ref = unsafe { &*spec };
+    let Some(name_full) = c_string(spec_ref.name) else {
+        raise_type_error("PyType_FromSpec: spec name is NULL");
+        return ptr::null_mut();
+    };
+    if spec_ref.slots.is_null() {
+        raise_type_error(format!("PyType_FromSpec: spec slots are NULL for {name_full}"));
+        return ptr::null_mut();
+    }
+
+    // SAFETY: ForeignTypeObject is a POD C mirror; all-zero is NULL/0.
+    let mut foreign: ForeignTypeObject = unsafe { core::mem::zeroed() };
+    foreign.tp_basicsize = spec_ref.basicsize as isize;
+    foreign.tp_itemsize = spec_ref.itemsize as isize;
+    foreign.tp_flags = spec_ref.flags as u64;
+
+    if unsafe { !apply_type_spec_slots(&mut foreign, spec_ref.slots, &name_full) } {
+        return ptr::null_mut();
+    }
+    if !bases.is_null() && unsafe { !apply_type_spec_bases(&mut foreign, bases, &name_full) } {
+        return ptr::null_mut();
+    }
+
+    let Ok(name_copy) = CString::new(name_full.as_bytes()) else {
+        raise_type_error(format!("PyType_FromSpec: type name contains NUL: {name_full}"));
+        return ptr::null_mut();
+    };
+    foreign.tp_name = name_copy.into_raw().cast_const();
+
+    let foreign_ptr = Box::into_raw(Box::new(foreign));
+    if unsafe { capi_type_ready(foreign_ptr) } < 0 {
+        return ptr::null_mut();
+    }
+    foreign_ptr.cast::<PyObject>()
+}
+
+unsafe fn apply_type_spec_slots(foreign: &mut ForeignTypeObject, slots: *mut PyTypeSlot, type_name: &str) -> bool {
+    let mut cursor = slots;
+    loop {
+        // SAFETY: PyType_Spec slot arrays are 0-terminated by contract.
+        let slot = unsafe { &*cursor };
+        if slot.slot == 0 {
+            return true;
+        }
+        if is_unsupported_protocol_slot(slot.slot) {
+            raise_type_error(format!(
+                "PyType_FromSpec: protocol slot id {} is not supported yet for {type_name}",
+                slot.slot
+            ));
+            return false;
+        }
+        let field = slot.pfunc.cast::<()>();
+        match slot.slot {
+            PY_TP_ALLOC => foreign.tp_alloc = field,
+            PY_TP_BASE => {
+                if !apply_type_spec_base(foreign, slot.pfunc.cast::<ForeignTypeObject>(), type_name, "Py_tp_base") {
+                    return false;
+                }
+            }
+            PY_TP_BASES => {
+                if unsafe { !apply_type_spec_bases(foreign, slot.pfunc.cast::<PyObject>(), type_name) } {
+                    return false;
+                }
+            }
+            PY_TP_CALL => foreign.tp_call = field,
+            PY_TP_CLEAR => foreign.tp_clear = field,
+            PY_TP_DEALLOC => foreign.tp_dealloc = field,
+            PY_TP_DESCR_GET => foreign.tp_descr_get = field,
+            PY_TP_DESCR_SET => foreign.tp_descr_set = field,
+            PY_TP_DOC => foreign.tp_doc = slot.pfunc.cast::<c_char>().cast_const(),
+            PY_TP_GETATTRO => foreign.tp_getattro = field,
+            PY_TP_HASH => foreign.tp_hash = field,
+            PY_TP_INIT => foreign.tp_init = field,
+            PY_TP_ITER => foreign.tp_iter = field,
+            PY_TP_ITERNEXT => foreign.tp_iternext = field,
+            PY_TP_METHODS => foreign.tp_methods = field,
+            PY_TP_MEMBERS => foreign.tp_members = field,
+            PY_TP_GETSET => foreign.tp_getset = field,
+            PY_TP_NEW => foreign.tp_new = field,
+            PY_TP_REPR => foreign.tp_repr = field,
+            PY_TP_RICHCOMPARE => foreign.tp_richcompare = field,
+            PY_TP_SETATTRO => foreign.tp_setattro = field,
+            PY_TP_STR => foreign.tp_str = field,
+            PY_TP_TRAVERSE => foreign.tp_traverse = field,
+            PY_TP_FREE => foreign.tp_free = field,
+            PY_TP_FINALIZE => foreign.tp_finalize = field,
+            PY_TP_DEL | PY_TP_GETATTR | PY_TP_IS_GC | PY_TP_SETATTR | PY_TP_VECTORCALL | PY_TP_TOKEN | PY_AM_AWAIT..=PY_AM_ANEXT | PY_AM_SEND => {
+                raise_type_error(format!("PyType_FromSpec: slot id {} is not supported yet for {type_name}", slot.slot));
+                return false;
+            }
+            _ => {
+                raise_type_error(format!("PyType_FromSpec: unknown slot id {} for {type_name}", slot.slot));
+                return false;
+            }
+        }
+        // SAFETY: 0-terminated slot array; cursor is advanced one element.
+        cursor = unsafe { cursor.add(1) };
+    }
+}
+
+fn is_unsupported_protocol_slot(slot_id: c_int) -> bool {
+    (PY_BF_GETBUFFER..=PY_SQ_REPEAT).contains(&slot_id)
+        || matches!(slot_id, PY_NB_MATRIX_MULTIPLY | PY_NB_INPLACE_MATRIX_MULTIPLY)
+}
+
+fn apply_type_spec_base(foreign: &mut ForeignTypeObject, base: *mut ForeignTypeObject, type_name: &str, source: &str) -> bool {
+    if !base.is_null() && twin::registered_native_of_foreign(base).is_none() {
+        raise_type_error(format!("PyType_FromSpec: {source} for {type_name} is not a ready foreign PyTypeObject*"));
+        return false;
+    }
+    foreign.tp_base = base;
+    true
+}
+
+unsafe fn apply_type_spec_bases(foreign: &mut ForeignTypeObject, bases: *mut PyObject, type_name: &str) -> bool {
+    if bases.is_null() {
+        foreign.tp_bases = ptr::null_mut();
+        foreign.tp_base = ptr::null_mut();
+        return true;
+    }
+    let bases = crate::tag::untag_arg(bases);
+    let Some(items) = (unsafe { abi::seq::exact_tuple_slice(bases) }) else {
+        raise_type_error(format!("PyType_FromSpec: Py_tp_bases for {type_name} must be an exact tuple"));
+        return false;
+    };
+    if items.len() != 1 {
+        raise_type_error(format!(
+            "PyType_FromSpec: Py_tp_bases for {type_name} must contain exactly one base (got {})",
+            items.len()
+        ));
+        return false;
+    }
+    if !apply_type_spec_base(foreign, items[0].cast::<ForeignTypeObject>(), type_name, "Py_tp_bases[0]") {
+        return false;
+    }
+    foreign.tp_bases = bases;
+    true
 }
 
 /// Builds the class-dict namespace from the foreign method/getset/member
@@ -1109,5 +1330,205 @@ PyMODINIT_FUNC PyInit_capi_typeobj_ext(void) {
             (1..=2).contains(&deallocs),
             "expected 1-2 Counter deallocs after two collects, got {deallocs}"
         );
+    }
+}
+
+#[cfg(test)]
+mod fromspec_tests {
+    use core::ptr;
+
+    use super::super::load_extension_module;
+    use super::super::tests::{ResetImportStateOnDrop, TempExtensionRoot, compile_extension};
+    use crate::abi::{format_object_for_print, pon_call, pon_runtime_init};
+    use crate::import::module_attr;
+    use crate::intern::intern;
+    use crate::thread_state::{pon_err_message, test_state_lock};
+
+    const FROM_SPEC_SOURCE: &str = r#"
+#include <Python.h>
+#include <structmember.h>
+
+typedef struct {
+    PyObject_HEAD
+    long value;
+} FromSpecObject;
+
+static PyTypeObject *FromSpec_Type = NULL;
+
+static PyObject *FromSpec_new(PyTypeObject *type, PyObject *args, PyObject *kwds) {
+    (void)args;
+    (void)kwds;
+    return type->tp_alloc(type, 0);
+}
+
+static int FromSpec_init(PyObject *self, PyObject *args, PyObject *kwds) {
+    FromSpecObject *obj = (FromSpecObject *)self;
+    long value = 0;
+    (void)kwds;
+    if (!PyArg_ParseTuple(args, "|l", &value)) {
+        return -1;
+    }
+    obj->value = value;
+    return 0;
+}
+
+static PyObject *FromSpec_repr(PyObject *self) {
+    FromSpecObject *obj = (FromSpecObject *)self;
+    return PyUnicode_FromFormat("FromSpecThing(%ld)", obj->value);
+}
+
+static PyObject *FromSpec_bump(PyObject *self, PyObject *args) {
+    FromSpecObject *obj = (FromSpecObject *)self;
+    (void)args;
+    obj->value += 1;
+    return PyLong_FromLong(obj->value);
+}
+
+static PyObject *Bad_add(PyObject *left, PyObject *right) {
+    (void)left;
+    (void)right;
+    Py_RETURN_NOTIMPLEMENTED;
+}
+
+static PyMethodDef FromSpec_methods[] = {
+    {"bump", FromSpec_bump, METH_NOARGS, "increment value"},
+    {NULL, NULL, 0, NULL},
+};
+
+static PyMemberDef FromSpec_members[] = {
+    {"value", T_LONG, offsetof(FromSpecObject, value), 0, "stored value"},
+    {NULL, 0, 0, 0, NULL},
+};
+
+static PyType_Slot FromSpec_slots[] = {
+    {Py_tp_methods, FromSpec_methods},
+    {Py_tp_members, FromSpec_members},
+    {Py_tp_new, FromSpec_new},
+    {Py_tp_init, FromSpec_init},
+    {Py_tp_repr, FromSpec_repr},
+    {0, NULL},
+};
+
+static PyType_Spec FromSpec_spec = {
+    "capi_fromspec_ext.FromSpecThing",
+    sizeof(FromSpecObject),
+    0,
+    Py_TPFLAGS_DEFAULT,
+    FromSpec_slots,
+};
+
+static PyType_Slot Bad_slots[] = {
+    {Py_nb_add, Bad_add},
+    {0, NULL},
+};
+
+static PyType_Spec Bad_spec = {
+    "capi_fromspec_ext.Bad",
+    sizeof(FromSpecObject),
+    0,
+    Py_TPFLAGS_DEFAULT,
+    Bad_slots,
+};
+
+static PyObject *drive(PyObject *self, PyObject *args) {
+    long ok = 0;
+    (void)self;
+    (void)args;
+
+    if (FromSpec_Type != NULL) ok |= 1L << 0;
+    PyObject *five = PyLong_FromLong(5);
+    PyObject *obj = PyObject_CallOneArg((PyObject *)FromSpec_Type, five);
+    if (obj != NULL) ok |= 1L << 1;
+    if (obj != NULL && Py_TYPE(obj) == FromSpec_Type) ok |= 1L << 2;
+
+    PyObject *value = obj == NULL ? NULL : PyObject_GetAttrString(obj, "value");
+    if (value != NULL && PyLong_AsLong(value) == 5) ok |= 1L << 3;
+    Py_XDECREF(value);
+    if (PyErr_Occurred() != NULL) PyErr_Clear();
+
+    PyObject *method = obj == NULL ? NULL : PyObject_GetAttrString(obj, "bump");
+    if (method != NULL) {
+        PyObject *bumped = PyObject_CallNoArgs(method);
+        if (bumped != NULL && PyLong_AsLong(bumped) == 6 && ((FromSpecObject *)obj)->value == 6) ok |= 1L << 4;
+        Py_XDECREF(bumped);
+        Py_DECREF(method);
+    }
+    if (PyErr_Occurred() != NULL) PyErr_Clear();
+
+    if (obj != NULL && PyObject_SetAttrString(obj, "value", PyLong_FromLong(41)) == 0
+        && ((FromSpecObject *)obj)->value == 41) ok |= 1L << 5;
+    if (PyErr_Occurred() != NULL) PyErr_Clear();
+
+    PyObject *repr = obj == NULL ? NULL : PyObject_Repr(obj);
+    if (repr != NULL) {
+        const char *text = PyUnicode_AsUTF8(repr);
+        if (text != NULL && strcmp(text, "FromSpecThing(41)") == 0) ok |= 1L << 6;
+    }
+    Py_XDECREF(repr);
+    if (PyErr_Occurred() != NULL) PyErr_Clear();
+
+    PyObject *bad = PyType_FromSpec(&Bad_spec);
+    if (bad == NULL && PyErr_ExceptionMatches(PyExc_TypeError)) {
+        PyErr_Clear();
+        ok |= 1L << 7;
+    } else {
+        Py_XDECREF(bad);
+        if (PyErr_Occurred() != NULL) PyErr_Clear();
+    }
+
+    Py_XDECREF(obj);
+    return PyLong_FromLong(ok);
+}
+
+static PyMethodDef module_methods[] = {
+    {"drive", drive, METH_NOARGS, "exercise PyType_FromSpec"},
+    {NULL, NULL, 0, NULL},
+};
+
+static struct PyModuleDef module = {
+    PyModuleDef_HEAD_INIT,
+    "capi_fromspec_ext",
+    "PyType_FromSpec fixture",
+    -1,
+    module_methods,
+};
+
+PyMODINIT_FUNC PyInit_capi_fromspec_ext(void) {
+    PyObject *m;
+    FromSpec_Type = (PyTypeObject *)PyType_FromSpec(&FromSpec_spec);
+    if (FromSpec_Type == NULL) {
+        return NULL;
+    }
+    m = PyModule_Create(&module);
+    if (m == NULL) {
+        return NULL;
+    }
+    Py_INCREF(FromSpec_Type);
+    if (PyModule_AddObject(m, "FromSpecThing", (PyObject *)FromSpec_Type) < 0) {
+        return NULL;
+    }
+    return m;
+}
+"#;
+
+    #[test]
+    fn capi_type_from_spec_builds_heap_type_and_rejects_protocol_slots() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+
+        let temp = TempExtensionRoot::new();
+        let module_path = compile_extension(&temp, "capi_fromspec_ext", FROM_SPEC_SOURCE);
+        let module = load_extension_module("capi_fromspec_ext", &module_path)
+            .unwrap_or_else(|message| panic!("failed to load FromSpec C extension: {message}"));
+        assert!(!module.is_null(), "extension loader returned NULL module");
+
+        let module_name = intern("capi_fromspec_ext");
+        let drive = module_attr(module_name, intern("drive")).expect("drive registered");
+        let result = unsafe { pon_call(drive, ptr::null_mut(), 0) };
+        assert!(!result.is_null(), "drive() returned NULL: {:?}", pon_err_message());
+        assert_eq!(format_object_for_print(result).as_deref(), Ok("255"), "C-side bitmask mismatch");
     }
 }

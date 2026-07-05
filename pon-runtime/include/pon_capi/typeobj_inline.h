@@ -15,6 +15,18 @@ static inline PyObject *PyType_GenericNew(PyTypeObject *type, PyObject *args, Py
     return PyPon_Capi()->typeobj->generic_new(type, args, kwds);
 }
 
+static inline PyObject *PyType_FromSpec(PyType_Spec *spec) {
+    return PyPon_Capi()->typeobj->type_from_spec(spec);
+}
+
+static inline PyObject *PyType_FromSpecWithBases(PyType_Spec *spec, PyObject *bases) {
+    return PyPon_Capi()->typeobj->type_from_spec_with_bases(spec, bases);
+}
+
+static inline PyObject *PyType_FromModuleAndSpec(PyObject *module, PyType_Spec *spec, PyObject *bases) {
+    return PyPon_Capi()->typeobj->type_from_module_and_spec(module, spec, bases);
+}
+
 static inline int PyType_IsSubtype(PyTypeObject *a, PyTypeObject *b) {
     return PyPon_Capi()->typeobj->is_subtype(a, b);
 }
