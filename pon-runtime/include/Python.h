@@ -1,6 +1,10 @@
 #ifndef PON_PYTHON_H
 #define PON_PYTHON_H
 
+/* CPython's include-guard sentinel: cython-generated C (and other
+ * refcount-portable extensions) gate compilation on it being defined. */
+#define Py_PYTHON_H
+
 /* CPython-source compatibility shim for extensions recompiled against Pon.
  *
  * This is NOT CPython's binary ABI. Extensions include this header, compile
@@ -874,6 +878,9 @@ typedef struct {
 #define PyObject_INIT(op, typeobj) PyObject_Init((PyObject *)(op), (typeobj))
 #define PyObject_INIT_VAR(op, typeobj, size) PyObject_InitVar((PyVarObject *)(op), (typeobj), (size))
 #define PyObject_FREE PyObject_Free
+#ifndef PyMem_MALLOC
+#define PyMem_MALLOC(size) PyMem_Malloc(size)
+#endif
 
 static inline PyVarObject *PyObject_InitVar(PyVarObject *op, PyTypeObject *type, Py_ssize_t size) {
     if (PyObject_Init((PyObject *)op, type) == NULL) {

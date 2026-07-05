@@ -5,6 +5,8 @@
  * PyPonCapi definition; never include directly.
  */
 
+#include <stdlib.h>
+
 static inline int PyLong_Check(PyObject *object) {
     return PyPon_Capi()->numbers->type_check(object, PON_TID_LONG);
 }
@@ -137,6 +139,14 @@ static inline PyObject *PyFloat_FromString(PyObject *object) {
 
 static inline double PyOS_string_to_double(const char *text, char **endptr, PyObject *overflow_exception) {
     return PyPon_Capi()->numbers->os_string_to_double(text, endptr, overflow_exception);
+}
+
+static inline long PyOS_strtol(const char *text, char **endptr, int base) {
+    return strtol(text, endptr, base);
+}
+
+static inline unsigned long PyOS_strtoul(const char *text, char **endptr, int base) {
+    return strtoul(text, endptr, base);
 }
 
 static inline PyObject *PyComplex_FromDoubles(double real, double imag) {
