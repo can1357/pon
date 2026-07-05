@@ -3279,8 +3279,14 @@ pub(super) unsafe fn call_type_with_keywords(
         instance
     };
 
-    let new_overridden =
-        !(user_new.is_null() || user_new == object_new) || unsafe { type_new_is_overridden(cls) };
+    // A native `tp_new` slot (ContextVar, deque, …) is an override too:
+    // CPython's `type_call` skips the excess-argument check whenever
+    // `tp_new != object.__new__`, and the slot already consumed the keywords.
+    let slot_new_overridden = unsafe { (*cls).tp_new }
+        .is_some_and(|slot| !core::ptr::fn_addr_eq(slot, type_::type_new as unsafe extern "C" fn(*mut PyType, *mut PyObject, *mut PyObject) -> *mut PyObject));
+    let new_overridden = !(user_new.is_null() || user_new == object_new)
+        || unsafe { type_new_is_overridden(cls) }
+        || slot_new_overridden;
     let init = unsafe { crate::descr::lookup_in_type(cls, crate::intern::intern("__init__")) };
     if init == OBJECT_DUNDER_INIT_CARRIER.load(Ordering::Acquire) {
         // The permissive terminus is not a user override.  With `__new__`
@@ -3307,7 +3313,7 @@ pub(super) unsafe fn call_type_with_keywords(
         if result.is_null() {
             return ptr::null_mut();
         }
-    } else if !keywords.names.is_empty() {
+    } else if !keywords.names.is_empty() && !new_overridden {
         let name = unsafe { (*cls).name() };
         return return_null_with_error(format!("{name}() takes no keyword arguments"));
     } else if let Some(init_slot) = unsafe { (*cls).tp_init } {
