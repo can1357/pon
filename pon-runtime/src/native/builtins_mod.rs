@@ -17,8 +17,8 @@ use num_traits::{One, Signed, ToPrimitive, Zero};
 use crate::abi::{self, pon_get_iter, pon_iter_next};
 use crate::gcroot::{HeldRoots, RootRegistry};
 use crate::intern::{intern, resolve};
-use crate::object::{PyFunction, PyMappingMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType, PyUnicode, UnaryFunc};
-use crate::thread_state::{pon_err_clear, pon_err_message, pon_err_occurred, pon_err_set};
+use crate::object::{PyFunction, PyMappingMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType, UnaryFunc};
+use crate::thread_state::{pon_err_clear, pon_err_occurred, pon_err_set};
 use crate::types::{bool_, property};
 use crate::types::exc::PyBaseException;
 
@@ -2488,7 +2488,7 @@ fn stop_iteration() -> *mut PyObject {
     unsafe { abi::pon_raise_stop_iteration(ptr::null_mut()) }
 }
 fn stop_iteration_pending() -> bool {
-    pon_err_message().is_some_and(|message| message.starts_with("StopIteration"))
+    abi::exc::pending_exception_is("StopIteration")
 }
 
 
@@ -2522,8 +2522,10 @@ fn object_to_string(object: *mut PyObject) -> Option<String> {
         if ty.is_null() {
             return None;
         }
-        if (*ty).name() == "str" {
-            return (*object.cast::<PyUnicode>()).as_str().map(ToOwned::to_owned);
+        // Exact str and str subclasses read through the canonical payload
+        // (e.g. cython's EncodedString returned from __str__/__repr__ hooks).
+        if let Some(text) = crate::types::type_::unicode_text(object) {
+            return Some(text.to_owned());
         }
         exception_message_text(object, ty)
     }
@@ -2932,6 +2934,7 @@ fn collect_iterable(object: *mut PyObject) -> Result<Vec<*mut PyObject>, String>
     }
     let mut items = Vec::new();
     let guard = abi::scoped_roots(&items as *const _);
+    let _stop_guard = abi::exc::suppress_stop_iteration_traceback();
     loop {
         let value = unsafe { pon_iter_next(iter, ptr::null_mut()) };
         if value.is_null() {

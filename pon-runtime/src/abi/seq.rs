@@ -911,6 +911,7 @@ pub(crate) fn sequence_to_vec(object: *mut PyObject) -> Result<Vec<*mut PyObject
     if !iter.is_null() {
         let mut out = Vec::new();
         let guard = super::scoped_roots(&out as *const _);
+        let _stop_guard = super::exc::suppress_stop_iteration_traceback();
         loop {
             let value = unsafe { super::iter::pon_iter_next(iter, ptr::null_mut()) };
             if value.is_null() {

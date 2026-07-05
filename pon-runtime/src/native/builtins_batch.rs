@@ -927,6 +927,7 @@ pub(super) fn collect_iterable(object: *mut PyObject) -> Result<Vec<*mut PyObjec
     }
     let mut items = Vec::new();
     let guard = abi::scoped_roots(&items as *const _);
+    let _stop_guard = abi::exc::suppress_stop_iteration_traceback();
     loop {
         let value = unsafe { abi::pon_iter_next(iter, ptr::null_mut()) };
         if value.is_null() {

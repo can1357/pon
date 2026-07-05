@@ -3487,7 +3487,7 @@ fn is_false(object: *mut PyObject) -> bool {
 }
 
 fn stop_iteration_pending() -> bool {
-    pon_err_message().is_some_and(|message| message.starts_with("StopIteration"))
+    abi::exc::pending_exception_is("StopIteration")
 }
 
 fn strip_input_newline(line: &mut String) {

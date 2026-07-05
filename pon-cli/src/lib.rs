@@ -31,6 +31,20 @@ impl std::fmt::Display for SystemExitRequested {
 }
 
 impl std::error::Error for SystemExitRequested {}
+
+/// A top-level runtime exception already rendered through Pon's traceback path.
+/// The CLI maps it to failure without adding an `anyhow` prefix, preserving the
+/// Python-shaped final exception line for stderr consumers.
+#[derive(Debug)]
+pub struct UncaughtExceptionReported;
+
+impl std::fmt::Display for UncaughtExceptionReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("uncaught exception")
+    }
+}
+
+impl std::error::Error for UncaughtExceptionReported {}
 /// Dispatches the process command line using the same behavior as the `pon-cli` binary.
 pub fn run_from_env() -> Result<()> {
     run_from_args(env::args())
@@ -239,7 +253,16 @@ fn run_file_inner_with_package(path: &Path, argv: &[String], main_package: Optio
         io::stdout().flush().context("failed to flush stdout")?;
         return Err(SystemExitRequested(code).into());
     }
-    result?;
+    if let Err(error) = result {
+        if pon_runtime::pon_err_occurred() {
+            unsafe {
+                pon_runtime::pon_err_report_uncaught();
+            }
+            io::stdout().flush().context("failed to flush stdout")?;
+            return Err(UncaughtExceptionReported.into());
+        }
+        return Err(error);
+    }
     io::stdout().flush().context("failed to flush stdout")
 }
 

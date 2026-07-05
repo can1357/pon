@@ -9,7 +9,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use pon_gc::{GcTypeInfo, TypeId};
 
-use crate::object::{as_object_ptr, PyLong, PyObject, PyType, PyUnicode};
+use crate::object::{as_object_ptr, PyLong, PyObject, PyType};
 use crate::thread_state::pon_err_set;
 use crate::types::{dict, frozenset, method, set_};
 
@@ -113,11 +113,9 @@ fn raise_map_type_error(message: impl AsRef<str>) -> *mut PyObject {
 }
 
 fn duplicate_keyword_error(key: *mut PyObject) -> *mut PyObject {
-    if unsafe { dict::type_name(key) } != Some("str") {
+    // Str subclasses are valid keywords; only non-strings mis-shape the call.
+    let Some(name) = (unsafe { crate::types::type_::unicode_text(key) }) else {
         return raise_map_type_error("keywords must be strings");
-    }
-    let Some(name) = (unsafe { (&*key.cast::<PyUnicode>()).as_str() }) else {
-        return null_error("keyword name is not valid UTF-8");
     };
     raise_map_type_error(format!("got multiple values for keyword argument '{name}'"))
 }

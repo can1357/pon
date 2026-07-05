@@ -37,6 +37,18 @@ impl ExcStarFrame {
         }
     }
 }
+#[derive(Clone, Debug)]
+enum DiagnosticMessage {
+    Text(String),
+    LazyExceptionDisplay { placeholder: String },
+}
+
+impl DiagnosticMessage {
+    fn text(message: impl Into<String>) -> Self {
+        Self::Text(message.into())
+    }
+}
+
 /// Interpreter state observed by runtime helpers.
 #[derive(Debug)]
 pub struct PonThreadState {
@@ -71,7 +83,7 @@ pub struct PonThreadState {
     pub stack_top_fp: *mut u8,
     /// Nested GC-safe-region depth for the current thread.
     gc_safe_region_depth: usize,
-    diagnostic_message: Option<String>,
+    diagnostic_message: Option<DiagnosticMessage>,
 }
 
 unsafe impl Send for PonThreadState {}
@@ -247,7 +259,7 @@ pub fn pon_err_set(message: impl Into<String>) {
         return;
     }
     state.current_exc = sentinel;
-    state.diagnostic_message = Some(message.into());
+    state.diagnostic_message = Some(DiagnosticMessage::text(message));
 }
 
 /// Records an error with a concrete boxed exception object.
@@ -258,7 +270,24 @@ pub fn pon_err_set_object(exception: *mut PyObject, message: impl Into<String>) 
     } else {
         exception
     };
-    state.diagnostic_message = Some(message.into());
+    state.diagnostic_message = Some(DiagnosticMessage::text(message));
+}
+
+/// Records a boxed exception whose human-readable display may re-enter Pon.
+///
+/// The cheap placeholder remains available for consumers that only need a
+/// type-shaped diagnostic; [`pon_err_message`] renders the full text after
+/// dropping the thread-state lock.
+pub(crate) fn pon_err_set_object_lazy_display(exception: *mut PyObject, placeholder: impl Into<String>) {
+    let mut state = thread_state_lock();
+    state.current_exc = if exception.is_null() {
+        core::ptr::NonNull::<PyObject>::dangling().as_ptr()
+    } else {
+        exception
+    };
+    state.diagnostic_message = Some(DiagnosticMessage::LazyExceptionDisplay {
+        placeholder: placeholder.into(),
+    });
 }
 
 /// Clears the current exception state.
@@ -277,7 +306,25 @@ pub fn pon_err_occurred() -> bool {
 /// Returns the latest Phase-A diagnostic message, if any.
 #[must_use]
 pub fn pon_err_message() -> Option<String> {
-    thread_state_lock().diagnostic_message.clone()
+    let (current_exc, diagnostic) = {
+        let state = thread_state_lock();
+        (state.current_exc, state.diagnostic_message.clone())
+    };
+    match diagnostic? {
+        DiagnosticMessage::Text(message) => Some(message),
+        DiagnosticMessage::LazyExceptionDisplay { placeholder } => {
+            if current_exc.is_null() || crate::abi::exc::is_diagnostic_sentinel(current_exc) {
+                return Some(placeholder);
+            }
+            let roots = vec![current_exc];
+            let _guard = crate::abi::scoped_roots(&roots as *const _);
+            let rendered = crate::abi::exc::exception_display_diagnostic(current_exc, &placeholder);
+            let mut state = thread_state_lock();
+            state.current_exc = current_exc;
+            state.diagnostic_message = Some(DiagnosticMessage::LazyExceptionDisplay { placeholder });
+            Some(rendered)
+        }
+    }
 }
 
 #[cfg(test)]

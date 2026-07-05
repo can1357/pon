@@ -771,6 +771,7 @@ pub unsafe extern "C" fn pon_gen_delegate_step(frame: *mut GenFrame, delegate: *
         }
 
         // Plain step: None ⇒ __next__, real value ⇒ send().
+        let _stop_guard = super::exc::suppress_stop_iteration_traceback();
         if sent.is_null() || unsafe { is_none_value(sent) } {
             // SAFETY: One nullable iterator step preserving StopIteration.
             return unsafe { abstract_op::iter_next(delegate) };
@@ -845,6 +846,7 @@ pub unsafe extern "C" fn pon_get_aiter(object: *mut PyObject, feedback: *mut Fee
 pub unsafe extern "C" fn pon_for_next(iterator: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
     crate::untag_prelude!(iterator);
     // SAFETY: Delegates to the sync iterator helper, preserving NULL+StopIteration.
+    let _stop_guard = super::exc::suppress_stop_iteration_traceback();
     unsafe { super::iter::pon_iter_next(iterator, feedback) }
 }
 

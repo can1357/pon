@@ -7,6 +7,7 @@
 use core::ffi::c_int;
 use core::mem::size_of;
 use core::ptr;
+use std::cell::Cell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
@@ -14,7 +15,7 @@ use pon_gc::GcTypeInfo;
 
 use crate::intern;
 use crate::object::{PyObject, PyType, as_object_ptr, is_exact_type};
-use crate::thread_state::{ExcStarFrame, pon_err_clear, pon_err_occurred, pon_err_set_object, thread_state_lock};
+use crate::thread_state::{ExcStarFrame, pon_err_clear, pon_err_occurred, pon_err_set_object, pon_err_set_object_lazy_display, thread_state_lock};
 use crate::traceback::{PyTraceback, TYPE_ID_TRACEBACK, ensure_traceback_type, trace_traceback};
 use crate::types::exc::{
     EXC_GROUP_METHOD_DERIVE, EXC_GROUP_METHOD_SPLIT, EXC_GROUP_METHOD_SUBGROUP, ExceptionKind, ExceptionTypeSet,
@@ -189,6 +190,27 @@ fn active_context() -> *mut PyObject {
     pending_exception_object().unwrap_or(ptr::null_mut())
 }
 
+thread_local! {
+    static STOP_ITERATION_TRACEBACK_SUPPRESS_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+pub(crate) struct StopIterationTracebackGuard;
+
+pub(crate) fn suppress_stop_iteration_traceback() -> StopIterationTracebackGuard {
+    STOP_ITERATION_TRACEBACK_SUPPRESS_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    StopIterationTracebackGuard
+}
+
+impl Drop for StopIterationTracebackGuard {
+    fn drop(&mut self) {
+        STOP_ITERATION_TRACEBACK_SUPPRESS_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+fn stop_iteration_traceback_suppressed() -> bool {
+    STOP_ITERATION_TRACEBACK_SUPPRESS_DEPTH.with(|depth| depth.get() != 0)
+}
+
 pub(super) fn alloc_exception_object(
     runtime: &Runtime,
     ty: *mut PyType,
@@ -340,13 +362,65 @@ fn attach_current_traceback(runtime: &Runtime, exception: *mut PyObject) {
     *slot = next;
 }
 
+fn attach_innermost_traceback(runtime: &Runtime, exception: *mut PyObject) {
+    if exception.is_null() || is_diagnostic_sentinel(exception) {
+        return;
+    }
+    runtime.heap.register_type(
+        TYPE_ID_TRACEBACK,
+        GcTypeInfo {
+            size: size_of::<PyTraceback>(),
+            trace: trace_traceback,
+            finalize: None,
+        },
+    );
+    runtime.heap.register_type(
+        TYPE_ID_FRAME,
+        GcTypeInfo {
+            size: size_of::<PyFrame>(),
+            trace: trace_frame,
+            finalize: Some(finalize_frame),
+        },
+    );
+    let frame_type = ensure_frame_type(runtime._type_type);
+    let traceback_type = ensure_traceback_type(runtime._type_type);
+    let line = super::current_line();
+
+    // SAFETY: Raise-path callers pass a live boxed exception instance.
+    let slot = unsafe { &mut (*exception.cast::<PyBaseException>()).traceback };
+    let next = *slot;
+    let frame = runtime.heap.alloc(size_of::<PyFrame>(), TYPE_ID_FRAME).cast::<PyFrame>();
+    // SAFETY: `frame` points to a freshly allocated zeroed block of the right size.
+    unsafe {
+        ptr::write(frame, PyFrame::new(frame_type.cast_const(), 0, ptr::null_mut()));
+        (*frame).line = line;
+    }
+    let entry = runtime
+        .heap
+        .alloc(size_of::<PyTraceback>(), TYPE_ID_TRACEBACK)
+        .cast::<PyTraceback>();
+    // SAFETY: `entry` points to a freshly allocated zeroed block of the right size.
+    unsafe {
+        ptr::write(
+            entry,
+            PyTraceback::new(traceback_type.cast_const(), frame.cast::<PyObject>(), i64::from(line), next),
+        );
+    }
+    *slot = entry.cast::<PyObject>();
+}
+
 /// Installs `exception` as pending WITHOUT touching its traceback.
 ///
 /// Restore-flavored paths (`pon_exc_restore`, `except*` bookkeeping) reinstall
 /// exceptions that already own their chain; CPython appends traceback entries
 /// only on raise, so only [`raise_current_exception`] attaches.
 fn set_current_exception(runtime: &Runtime, exception: *mut PyObject) {
-    pon_err_set_object(exception, exception_diagnostic(runtime, exception));
+    let (diagnostic, lazy_display) = exception_diagnostic(runtime, exception);
+    if lazy_display {
+        pon_err_set_object_lazy_display(exception, diagnostic);
+    } else {
+        pon_err_set_object(exception, diagnostic);
+    }
 }
 
 /// Raise-flavored install: appends the current-stack traceback segment first.
@@ -359,6 +433,43 @@ fn raise_builtin_value(runtime: &Runtime, kind: ExceptionKind, value: *mut PyObj
     match alloc_exception_object(runtime, runtime.exception_types.get(kind), value, ptr::null_mut()) {
         Ok(exception) => {
             attach_current_traceback(runtime, exception);
+            pon_err_set_object(exception, diagnostic);
+            ptr::null_mut()
+        }
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
+/// Raises a builtin exception without attaching a traceback.
+///
+/// Internal iterator exhaustion is caught and cleared by loop/unpack
+/// consumers; materializing the full Python call chain for every exhausted
+/// iterator is pure allocator load.  Explicit user `raise` still routes
+/// through `pon_raise`/`raise_current_exception` and keeps the full walk.
+fn raise_builtin_value_without_traceback(
+    runtime: &Runtime,
+    kind: ExceptionKind,
+    value: *mut PyObject,
+    diagnostic: String,
+) -> *mut PyObject {
+    match alloc_exception_object(runtime, runtime.exception_types.get(kind), value, ptr::null_mut()) {
+        Ok(exception) => {
+            pon_err_set_object(exception, diagnostic);
+            ptr::null_mut()
+        }
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
+fn raise_builtin_value_with_innermost_traceback(
+    runtime: &Runtime,
+    kind: ExceptionKind,
+    value: *mut PyObject,
+    diagnostic: String,
+) -> *mut PyObject {
+    match alloc_exception_object(runtime, runtime.exception_types.get(kind), value, ptr::null_mut()) {
+        Ok(exception) => {
+            attach_innermost_traceback(runtime, exception);
             pon_err_set_object(exception, diagnostic);
             ptr::null_mut()
         }
@@ -618,6 +729,30 @@ fn raise_value_exception(kind: ExceptionKind, value: *mut PyObject, diagnostic: 
     }
 }
 
+/// Fast path for iterator/generator exhaustion.
+///
+/// User-visible `next()`/`tp_iternext` exhaustion gets a single innermost
+/// traceback entry, matching CPython's caught `StopIteration` shape without
+/// walking the whole call stack.  Internal loop/unpack/delegation consumers
+/// bracket their iterator step with [`suppress_stop_iteration_traceback`] and
+/// get no traceback at all because they catch-and-clear immediately.
+fn raise_stop_iteration(value: *mut PyObject) -> *mut PyObject {
+    match ensure_runtime_for_exc() {
+        Ok(()) => match super::with_runtime(|runtime| {
+            let diagnostic = "StopIteration".to_owned();
+            if stop_iteration_traceback_suppressed() {
+                raise_builtin_value_without_traceback(runtime, ExceptionKind::StopIteration, value, diagnostic)
+            } else {
+                raise_builtin_value_with_innermost_traceback(runtime, ExceptionKind::StopIteration, value, diagnostic)
+            }
+        }) {
+            Some(result) => result,
+            None => super::return_null_with_error("runtime is not initialized"),
+        },
+        Err(message) => super::return_null_with_error(message),
+    }
+}
+
 pub(super) fn is_type_object(runtime: &Runtime, object: *mut PyObject) -> bool {
     if object.is_null() {
         return false;
@@ -790,31 +925,68 @@ fn exception_diagnostic_from_unicode(runtime: &Runtime, kind: ExceptionKind, val
     name.to_owned()
 }
 
-fn exception_diagnostic(runtime: &Runtime, exception: *mut PyObject) -> String {
-    if exception.is_null() {
-        return "NULL exception".to_owned();
-    }
-    if is_diagnostic_sentinel(exception) {
-        return "diagnostic exception".to_owned();
+pub(crate) fn exception_display_diagnostic(exception: *mut PyObject, placeholder: &str) -> String {
+    if exception.is_null() || is_diagnostic_sentinel(exception) {
+        return placeholder.to_owned();
     }
 
     // SAFETY: Callers pass a live boxed exception instance.
     unsafe {
         let ty = (*exception).ob_type;
         let name = if ty.is_null() { "BaseException" } else { (*ty).name() };
-        let exception = &*exception.cast::<PyBaseException>();
-        // Multi-argument exceptions stringify as the full args tuple
-        // (CPython `BaseException.__str__` with `len(args) != 1`).
-        if !exception.args.is_null() {
-            return format!("{name}: {}", crate::native::builtins_mod::repr_text(exception.args));
+        let text = crate::native::builtins_mod::str_text(exception);
+        if text.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{name}: {text}")
         }
-        let message = exception.message;
+    }
+}
+
+fn exception_uses_python_str_override(exception: *mut PyObject) -> bool {
+    if exception.is_null() || is_diagnostic_sentinel(exception) {
+        return false;
+    }
+    // SAFETY: Callers pass a live boxed exception instance.
+    unsafe {
+        let ty = (*exception).ob_type.cast_mut();
+        if !crate::types::type_::type_dispatches_python_dunders(ty.cast_const()) {
+            return false;
+        }
+        let hook = crate::descr::lookup_in_type(ty, crate::intern::intern("__str__"));
+        !hook.is_null() && hook != super::object_dunder_str_carrier()
+    }
+}
+
+fn exception_diagnostic(runtime: &Runtime, exception: *mut PyObject) -> (String, bool) {
+    if exception.is_null() {
+        return ("NULL exception".to_owned(), false);
+    }
+    if is_diagnostic_sentinel(exception) {
+        return ("diagnostic exception".to_owned(), false);
+    }
+
+    // SAFETY: Callers pass a live boxed exception instance.
+    unsafe {
+        let ty = (*exception).ob_type;
+        let name = if ty.is_null() { "BaseException" } else { (*ty).name() };
+        let exception_ref = &*exception.cast::<PyBaseException>();
+        if exception_uses_python_str_override(exception) {
+            return (name.to_owned(), true);
+        }
+        if !exception_ref.args.is_null() {
+            return (name.to_owned(), true);
+        }
+        let message = exception_ref.message;
         if !message.is_null() && is_exact_type(message, runtime.unicode_type.cast_const()) {
             if let Some(text) = (*message.cast::<crate::object::PyUnicode>()).as_str() {
-                return format!("{name}: {text}");
+                return (format!("{name}: {text}"), false);
             }
         }
-        name.to_owned()
+        if !message.is_null() {
+            return (name.to_owned(), true);
+        }
+        (name.to_owned(), false)
     }
 }
 
@@ -995,7 +1167,7 @@ pub unsafe extern "C" fn pon_raise_attribute_error(obj: *mut PyObject, name: u32
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_raise_stop_iteration(value: *mut PyObject) -> *mut PyObject {
     crate::untag_prelude!(value);
-    super::catch_object_helper(|| raise_value_exception(ExceptionKind::StopIteration, value, "StopIteration".to_owned()))
+    super::catch_object_helper(|| raise_stop_iteration(value))
 }
 
 /// Returns `1` when the current exception matches `exc_type`, `0` for no match, and `-1` on misuse.

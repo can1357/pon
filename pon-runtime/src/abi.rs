@@ -4047,7 +4047,9 @@ pub unsafe extern "C" fn pon_call(callee: *mut PyObject, argv: *mut *mut PyObjec
                 let ty = unsafe { (*callee).ob_type.cast_mut() };
                 let dunder = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern(crate::intern::DUNDER_CALL)) };
                 if dunder.is_null() {
-                    return return_null_with_type_error("callee is not callable");
+                    // CPython: TypeError: 'X' object is not callable.
+                    let type_name = unsafe { (*ty).name() };
+                    return return_null_with_type_error(format!("'{type_name}' object is not callable"));
                 }
                 let bound = unsafe { crate::descr::descriptor_get(dunder, callee, ty) };
                 if bound.is_null() {

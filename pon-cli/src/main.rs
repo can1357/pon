@@ -14,6 +14,9 @@ fn main() -> ExitCode {
             if let Some(pon_cli::SystemExitRequested(code)) = error.downcast_ref::<pon_cli::SystemExitRequested>() {
                 return ExitCode::from(*code as u8);
             }
+            if error.downcast_ref::<pon_cli::UncaughtExceptionReported>().is_some() {
+                return ExitCode::FAILURE;
+            }
             eprintln!("pon: {error:#}");
             ExitCode::FAILURE
         }

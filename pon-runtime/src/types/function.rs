@@ -1396,11 +1396,10 @@ values: &mut Vec<*mut PyObject>,) -> Result<(), String> {
     }
     for pair in pairs.chunks_exact(2) {
         let (key, value) = (pair[0], pair[1]);
-        if unsafe { dict::type_name(key) } != Some("str") {
+        // CPython accepts any str INSTANCE as a keyword (subclasses read
+        // through their canonical payload, e.g. cython's EncodedString).
+        let Some(name_text) = (unsafe { crate::types::type_::unicode_text(key) }) else {
             return Err(raise_boxed_type_error("keywords must be strings".to_owned()));
-        }
-        let Some(name_text) = (unsafe { (&*key.cast::<PyUnicode>()).as_str() }) else {
-            return Err("keyword name is not valid UTF-8".to_owned());
         };
         let name = intern::intern(name_text);
         if names.contains(&name) {
