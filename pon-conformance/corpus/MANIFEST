@@ -56,6 +56,14 @@ pon-conformance/corpus/cpython/float_repr.py
 pon-conformance/corpus/cpython/int_parse.py
 pon-conformance/corpus/cpython/complex_ops.py
 pon-conformance/corpus/cpython/file_io.py
+pon-conformance/corpus/cpython/callable_metaclass.py
+pon-conformance/corpus/cpython/str_method_cold_lookup.py
+pon-conformance/corpus/cpython/subprocess_posix_spawn_path.py
+pon-conformance/corpus/cpython/set_variadic_methods.py
+pon-conformance/corpus/cpython/repr_cycles_recursion.py
+pon-conformance/corpus/cpython/operator_native_module.py
+pon-conformance/corpus/cpython/exec_into_module_dict.py
+pon-conformance/corpus/cpython/builtin_dunder_buffer_io.py
 pon-conformance/corpus/cpython/object_augassign_custom_methods.py
 pon-conformance/corpus/cpython/object_callable_special_lookup.py
 pon-conformance/corpus/cpython/object_compare_ne_notimplemented.py
