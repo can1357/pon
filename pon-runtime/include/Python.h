@@ -21,10 +21,13 @@
  */
 
 #include <assert.h>
+#include <ctype.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <wctype.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,6 +41,16 @@ typedef size_t Py_uhash_t;
 typedef uint32_t Py_UCS4;
 typedef uint16_t Py_UCS2;
 typedef uint8_t Py_UCS1;
+
+/* ---- CPython-compatible complex scalar value ----
+ * Numpy expects `Py_complex` to be a by-value struct whose fields are readable
+ * as `.real` and `.imag`, matching CPython's public C API. Pon complex objects
+ * still use Pon's own heap layout; this struct is only the C-API transport type.
+ */
+typedef struct {
+    double real;
+    double imag;
+} Py_complex;
 
 /* Extension code (pythoncapi-compat) spells declarations through these;
  * recompiled extensions have no DLL surface, so they are identity macros. */
@@ -173,7 +186,7 @@ typedef int (*descrsetfunc)(PyObject *, PyObject *, PyObject *);
 
 /* ---- buffer protocol ---- */
 
-typedef struct bufferinfo {
+typedef struct {
     void *buf;
     PyObject *obj;
     Py_ssize_t len;
@@ -190,8 +203,10 @@ typedef struct bufferinfo {
 typedef int (*getbufferproc)(PyObject *, Py_buffer *, int);
 typedef void (*releasebufferproc)(PyObject *, Py_buffer *);
 
+#define PyBUF_MAX_NDIM 64
 #define PyBUF_SIMPLE 0
 #define PyBUF_WRITABLE 0x0001
+#define PyBUF_WRITEABLE PyBUF_WRITABLE
 #define PyBUF_FORMAT 0x0004
 #define PyBUF_ND 0x0008
 #define PyBUF_STRIDES (0x0010 | PyBUF_ND)
@@ -378,6 +393,7 @@ struct _typeobject {
 #define Py_TPFLAGS_HAVE_GC (1UL << 14)
 #define Py_TPFLAGS_HEAPTYPE (1UL << 9)
 #define Py_TPFLAGS_HAVE_VECTORCALL (1UL << 11)
+#define _Py_TPFLAGS_HAVE_VECTORCALL Py_TPFLAGS_HAVE_VECTORCALL
 #define Py_TPFLAGS_IMMUTABLETYPE (1UL << 8)
 #define Py_TPFLAGS_DISALLOW_INSTANTIATION (1UL << 7)
 #define Py_TPFLAGS_LONG_SUBCLASS (1UL << 24)
@@ -481,9 +497,7 @@ static inline Py_ssize_t PyVectorcall_NARGS(size_t n) {
     return (Py_ssize_t)(n & ~PY_VECTORCALL_ARGUMENTS_OFFSET);
 }
 
-static inline void Py_SET_TYPE(PyObject *ob, PyTypeObject *type) {
-    ob->ob_type = type;
-}
+#define Py_SET_TYPE(ob, type) ((void)(((PyObject *)(ob))->ob_type = (PyTypeObject *)(type)))
 
 /* All Pon objects are GC-managed; CPython-style immortality has no meaning. */
 static inline void _Py_SetImmortal(PyObject *op) {
@@ -497,6 +511,20 @@ static inline int PyUnstable_Object_IsUniquelyReferenced(PyObject *op) {
     (void)op;
     return 0;
 }
+
+/* Pon tuple layout mirrors the real runtime tuple carrier: header, length,
+ * then an out-of-line item pointer vector. This keeps PyTuple_GET_ITEM an
+ * lvalue (`&PyTuple_GET_ITEM(t, 0)`) without fabricating CPython's inline
+ * ob_item[] tail, which Pon does not have.
+ */
+#ifndef PON_HAVE_PYTUPLEOBJECT_LAYOUT
+#define PON_HAVE_PYTUPLEOBJECT_LAYOUT 1
+typedef struct {
+    PyObject ob_base;
+    Py_ssize_t len;
+    PyObject **items;
+} PyTupleObject;
+#endif
 
 /* ---- PyType_FromSpec heap-type compatibility (CPython 3.14) ---- */
 
@@ -671,6 +699,229 @@ static inline const PyPonCapi *PyPon_Capi(void) {
 #include "pon_capi/object_inline.h"
 #include "pon_capi/typeobj_inline.h"
 
+/* ---- CPython header-compat compile surface (NumPy 2.5) ----
+ * These are source-compatibility helpers whose behavior either maps to an
+ * existing Pon C-API table entry above or is a compile-time constant/no-op for
+ * Pon's single-interpreter runtime. Keep real runtime behavior in the family
+ * tables; this block is only for CPython header macros and tiny inlines.
+ */
+
+#ifndef Py_MIN
+#define Py_MIN(x, y) (((x) > (y)) ? (y) : (x))
+#endif
+#ifndef Py_MAX
+#define Py_MAX(x, y) (((x) > (y)) ? (x) : (y))
+#endif
+
+#ifndef SIZEOF_VOID_P
+#  if defined(__SIZEOF_POINTER__)
+#    define SIZEOF_VOID_P __SIZEOF_POINTER__
+#  elif defined(_WIN64) || defined(__LP64__) || defined(_LP64)
+#    define SIZEOF_VOID_P 8
+#  else
+#    define SIZEOF_VOID_P 4
+#  endif
+#endif
+#ifndef SIZEOF_SIZE_T
+#  if defined(__SIZEOF_SIZE_T__)
+#    define SIZEOF_SIZE_T __SIZEOF_SIZE_T__
+#  else
+#    define SIZEOF_SIZE_T SIZEOF_VOID_P
+#  endif
+#endif
+#ifndef SIZEOF_LONG
+#  if defined(__SIZEOF_LONG__)
+#    define SIZEOF_LONG __SIZEOF_LONG__
+#  elif defined(_WIN64)
+#    define SIZEOF_LONG 4
+#  elif defined(__LP64__) || defined(_LP64)
+#    define SIZEOF_LONG 8
+#  else
+#    define SIZEOF_LONG 4
+#  endif
+#endif
+#ifndef SIZEOF_INT
+#  if defined(__SIZEOF_INT__)
+#    define SIZEOF_INT __SIZEOF_INT__
+#  else
+#    define SIZEOF_INT 4
+#  endif
+#endif
+#ifndef SIZEOF_LONG_LONG
+#  if defined(__SIZEOF_LONG_LONG__)
+#    define SIZEOF_LONG_LONG __SIZEOF_LONG_LONG__
+#  else
+#    define SIZEOF_LONG_LONG 8
+#  endif
+#endif
+
+#ifndef Py_CHARMASK
+#define Py_CHARMASK(c) ((unsigned char)((c) & 0xff))
+#endif
+
+/* CPython uses Unicode database tables. Pon's compile shim delegates to the C
+ * library's wide-character predicates: this is locale-sensitive, but matches
+ * the BMP whitespace NumPy parses on this target. Spot-check:
+ * python3.14 str.isspace vs Darwin iswspace agreed for U+0009, U+0020,
+ * U+00A0, U+1680, U+2000, U+2028, U+2029, and U+3000.
+ */
+#define Py_UNICODE_ISSPACE(ch) (iswspace((wint_t)(Py_UCS4)(ch)) != 0)
+#define Py_UNICODE_ISDIGIT(ch) (iswdigit((wint_t)(Py_UCS4)(ch)) != 0)
+#define Py_UNICODE_ISALPHA(ch) (iswalpha((wint_t)(Py_UCS4)(ch)) != 0)
+#define Py_UNICODE_ISALNUM(ch) (iswalnum((wint_t)(Py_UCS4)(ch)) != 0)
+#define Py_UNICODE_ISLOWER(ch) (iswlower((wint_t)(Py_UCS4)(ch)) != 0)
+#define Py_UNICODE_ISUPPER(ch) (iswupper((wint_t)(Py_UCS4)(ch)) != 0)
+#define Py_UNICODE_TOLOWER(ch) ((Py_UCS4)towlower((wint_t)(Py_UCS4)(ch)))
+#define Py_UNICODE_TOUPPER(ch) ((Py_UCS4)towupper((wint_t)(Py_UCS4)(ch)))
+
+/* Pon has one interpreter and no free-threaded object locks; preserve CPython's
+ * bracketing syntax without taking locks.
+ */
+#define Py_BEGIN_CRITICAL_SECTION(op) {
+#define Py_END_CRITICAL_SECTION() }
+#define Py_BEGIN_CRITICAL_SECTION2(a, b) {
+#define Py_END_CRITICAL_SECTION2() }
+
+#define Py_VISIT(op)                                                    \
+    do {                                                                \
+        if (op) {                                                       \
+            int vret = visit((PyObject *)(op), arg);                    \
+            if (vret) {                                                 \
+                return vret;                                            \
+            }                                                           \
+        }                                                               \
+    } while (0)
+
+#define Py_RETURN_RICHCOMPARE(val1, val2, op)                           \
+    do {                                                                \
+        switch (op) {                                                   \
+        case Py_EQ: if ((val1) == (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE; \
+        case Py_NE: if ((val1) != (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE; \
+        case Py_LT: if ((val1) < (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE; \
+        case Py_GT: if ((val1) > (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE; \
+        case Py_LE: if ((val1) <= (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE; \
+        case Py_GE: if ((val1) >= (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE; \
+        default:                                                        \
+            PyErr_BadInternalCall();                                    \
+            return NULL;                                                \
+        }                                                               \
+    } while (0)
+
+#ifndef Py_CLEANUP_SUPPORTED
+#define Py_CLEANUP_SUPPORTED 0x20000
+#endif
+#ifndef Py_TPFLAGS_SEQUENCE
+#define Py_TPFLAGS_SEQUENCE (1UL << 5)
+#endif
+#ifndef Py_TPFLAGS_MAPPING
+#define Py_TPFLAGS_MAPPING (1UL << 6)
+#endif
+#ifndef Py_TPFLAGS_METHOD_DESCRIPTOR
+#define Py_TPFLAGS_METHOD_DESCRIPTOR (1UL << 17)
+#endif
+#ifndef _Py_TPFLAGS_HAVE_VECTORCALL
+#define _Py_TPFLAGS_HAVE_VECTORCALL Py_TPFLAGS_HAVE_VECTORCALL
+#endif
+
+/* Pon pins objects via Py_INCREF/Py_DECREF, not an in-object refcount field. */
+#define Py_SET_REFCNT(op, n) do { (void)(op); (void)(n); } while (0)
+
+#define PyObject_INIT(op, typeobj) PyObject_Init((PyObject *)(op), (typeobj))
+#define PyObject_INIT_VAR(op, typeobj, size) PyObject_InitVar((PyVarObject *)(op), (typeobj), (size))
+#define PyObject_FREE PyObject_Free
+
+static inline PyVarObject *PyObject_InitVar(PyVarObject *op, PyTypeObject *type, Py_ssize_t size) {
+    if (PyObject_Init((PyObject *)op, type) == NULL) {
+        return NULL;
+    }
+    Py_SET_SIZE(op, size);
+    return op;
+}
+
+#if ((SIZEOF_VOID_P - 1) & SIZEOF_VOID_P) != 0
+#  error "_PyObject_VAR_SIZE requires SIZEOF_VOID_P be a power of 2"
+#endif
+static inline size_t _PyObject_VAR_SIZE(PyTypeObject *type, Py_ssize_t nitems) {
+    size_t size = (size_t)type->tp_basicsize;
+    size += (size_t)nitems * (size_t)type->tp_itemsize;
+    return (size + (size_t)(SIZEOF_VOID_P - 1)) & ~(size_t)(SIZEOF_VOID_P - 1);
+}
+
+#ifndef PON_HAVE_SSIZESSIZE_SLOT_TYPEDEFS
+#define PON_HAVE_SSIZESSIZE_SLOT_TYPEDEFS 1
+typedef PyObject *(*ssizessizeargfunc)(PyObject *, Py_ssize_t, Py_ssize_t);
+typedef int (*ssizessizeobjargproc)(PyObject *, Py_ssize_t, Py_ssize_t, PyObject *);
+#endif
+
+static inline int Py_IsInitialized(void) {
+    return 1;
+}
+
+/* NumPy uses Py_GenericAlias only for __class_getitem__ helpers. Failing loudly
+ * is preferable to pretending Pon implements runtime typing aliases.
+ */
+static inline PyObject *Py_GenericAlias(PyObject *origin, PyObject *args) {
+    (void)origin;
+    (void)args;
+    PyErr_SetString(PyExc_NotImplementedError, "Py_GenericAlias is not implemented by Pon");
+    return NULL;
+}
+
+
+/* ---- Object/container protocol completion compile surface (NumPy 2.5) ----
+ * The descriptor/C-function object structs below exist so CPython-source casts
+ * compile; their type sentinels are deliberately unregistered compile-only
+ * statics so code must not reinterpret Pon's native descriptor carriers as
+ * these CPython layouts at runtime.
+ */
+
+typedef struct {
+    PyObject ob_base;
+    PyMethodDef *m_ml;
+    PyObject *m_self;
+    PyObject *m_module;
+    void *vectorcall;
+} PyCFunctionObject;
+
+typedef struct {
+    PyObject ob_base;
+    PyTypeObject *d_type;
+    PyObject *d_name;
+    PyObject *d_qualname;
+} PyDescrObject;
+
+typedef struct {
+    PyDescrObject d_common;
+    PyMemberDef *d_member;
+} PyMemberDescrObject;
+
+typedef struct {
+    PyDescrObject d_common;
+    PyGetSetDef *d_getset;
+} PyGetSetDescrObject;
+
+typedef struct {
+    PyDescrObject d_common;
+    PyMethodDef *d_method;
+} PyMethodDescrObject;
+
+static PyTypeObject _PyPon_CFunction_Type_CompileOnly;
+static PyTypeObject _PyPon_MemberDescr_Type_CompileOnly;
+static PyTypeObject _PyPon_GetSetDescr_Type_CompileOnly;
+static PyTypeObject _PyPon_MethodDescr_Type_CompileOnly;
+
+#define PyCFunction_Type _PyPon_CFunction_Type_CompileOnly
+#define PyMemberDescr_Type _PyPon_MemberDescr_Type_CompileOnly
+#define PyGetSetDescr_Type _PyPon_GetSetDescr_Type_CompileOnly
+#define PyMethodDescr_Type _PyPon_MethodDescr_Type_CompileOnly
+
+/* Same rationale as PyUnstable_Object_IsUniquelyReferenced above: Pon has no
+ * per-object refcount, so this CPython optimization predicate is never true.
+ */
+static inline int PyUnstable_Object_IsUniqueReferencedTemporary(PyObject *op) {
+    (void)op;
+    return 0;
+}
 #ifdef __cplusplus
 }
 #endif
