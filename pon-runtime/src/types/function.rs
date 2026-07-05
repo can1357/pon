@@ -700,6 +700,9 @@ pub fn function_record(function: *mut PyObject) -> Option<FunctionRecord> {
 
 fn function_attr_by_id(function: *mut PyObject, name_id: u32) -> Option<*mut PyObject> {
     if name_id == intern("__class__") {
+        if is_native_method_descriptor(function) {
+            return Some(method_descriptor_type().cast::<PyObject>());
+        }
         let ty = unsafe { (*function.cast::<PyFunction>()).ob_base.ob_type };
         return Some(ty.cast_mut().cast::<PyObject>());
     }
@@ -1201,6 +1204,19 @@ static NATIVE_FUNCTIONS: LazyLock<Mutex<HashSet<usize>>> =
 /// lookup must still bind them when an instance receiver is supplied.
 static NATIVE_METHOD_DESCRIPTORS: LazyLock<Mutex<HashSet<usize>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn method_descriptor_type() -> *mut PyType {
+    static TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let ty = PyType::new(
+            crate::abi::runtime_type_type(),
+            "method_descriptor",
+            mem::size_of::<PyObjectHeader>(),
+        );
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *TYPE as *mut PyType
+}
+
 
 /// Record `function` as a native (builtin) function — normally a
 /// non-descriptor.  Values that are not function objects are ignored, so
@@ -1962,6 +1978,20 @@ fn bind_posix_spawn_keywords(
     )
 }
 
+fn first_positional_type_name(positional: &[*mut PyObject]) -> Option<&'static str> {
+    positional
+        .first()
+        .and_then(|&receiver| unsafe { dict::type_name(crate::tag::untag_arg(receiver)) })
+}
+
+fn is_re_pattern_receiver(positional: &[*mut PyObject]) -> bool {
+    first_positional_type_name(positional) == Some("re.Pattern")
+}
+
+fn is_re_match_receiver(positional: &[*mut PyObject]) -> bool {
+    first_positional_type_name(positional) == Some("re.Match")
+}
+
 pub(crate) fn bind_native_keywords_for_name(
     name: &str,
     positional: &[*mut PyObject],
@@ -1979,6 +2009,19 @@ pub(crate) fn bind_native_keywords_for_name(
         "max" => bind_minmax_keywords(positional, keywords, "max"),
         "zip" => bind_zip_keywords(positional, keywords),
         "enumerate" => bind_single_keyword(positional, keywords, "enumerate", "start", 1, 2),
+        // `re.Pattern.{search,match,fullmatch,findall,finditer}(string,
+        // pos=0, endpos=sys.maxsize)`: the bound receiver occupies slot 0.
+        "search" | "match" | "fullmatch" | "findall" | "finditer" if is_re_pattern_receiver(positional) => {
+            bind_optional_named_keywords(positional, keywords, name, &["self", "string", "pos", "endpos"], 4)
+        }
+        // `re.Match.groups(default=None)` / `groupdict(default=None)`.
+        "groups" | "groupdict" if is_re_match_receiver(positional) => {
+            bind_optional_named_keywords(positional, keywords, name, &["self", "default"], 2)
+        }
+        // `re.Pattern.sub(repl, string, count=0)` and `subn` share a shape.
+        "sub" | "subn" if is_re_pattern_receiver(positional) => {
+            bind_optional_named_keywords(positional, keywords, name, &["self", "repl", "string", "count"], 4)
+        }
         // `str.splitlines(keepends=False)`: the bound receiver is the sole
         // required positional; `keepends` may arrive positionally or by
         // keyword (Cython's Code.py passes `keepends=True`).
@@ -2290,6 +2333,9 @@ pub(crate) fn bind_native_keywords_for_name(
         // absent optionals arrive as None (`str_split_args` maps None to the
         // whitespace-sep / unlimited-maxsplit defaults).  `ipaddress.py`
         // module exec runs `ip_str.split(':', maxsplit=_max_parts)`.
+        "split" if is_re_pattern_receiver(positional) => {
+            bind_optional_named_keywords(positional, keywords, "split", &["self", "string", "maxsplit"], 3)
+        }
         "split" => bind_optional_named_keywords(positional, keywords, "split", &["self", "sep", "maxsplit"], 3),
         "rsplit" => {
             bind_optional_named_keywords(positional, keywords, "rsplit", &["self", "sep", "maxsplit"], 3)
