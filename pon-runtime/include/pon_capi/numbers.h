@@ -3,6 +3,16 @@
 
 /* Numbers family: int/bool/float/complex construction and extraction. */
 
+typedef PyObject PyLongObject;
+
+#define Py_ASNATIVEBYTES_DEFAULTS -1
+#define Py_ASNATIVEBYTES_BIG_ENDIAN 0
+#define Py_ASNATIVEBYTES_LITTLE_ENDIAN 1
+#define Py_ASNATIVEBYTES_NATIVE_ENDIAN 3
+#define Py_ASNATIVEBYTES_UNSIGNED_BUFFER 4
+#define Py_ASNATIVEBYTES_REJECT_NEGATIVE 8
+#define Py_ASNATIVEBYTES_ALLOW_INDEX 16
+
 typedef struct PyPonCapiNumbers {
     PyObject *(*long_from_long)(long);
     long (*long_as_long)(PyObject *);
@@ -74,6 +84,10 @@ typedef struct PyPonCapiNumbers {
     PyObject *(*number_inplace_matrix_multiply)(PyObject *, PyObject *);
     int (*number_check)(PyObject *);
     Py_hash_t (*hash_double)(PyObject *, double);
+    Py_ssize_t (*long_as_native_bytes)(PyObject *, void *, Py_ssize_t, int);
+    PyObject *(*long_from_native_bytes)(const void *, size_t, int);
+    PyObject *(*long_from_unsigned_native_bytes)(const void *, size_t, int);
+    PyObject *(*long_from_string)(const char *, char **, int);
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiNumbers;
 

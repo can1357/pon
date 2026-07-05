@@ -54,6 +54,10 @@ typedef struct PyPonCapiStrings {
     PyObject *(*long_from_unicode_object)(PyObject *, int);
     PyObject *(*unicode_substring)(PyObject *, Py_ssize_t, Py_ssize_t);
     Py_UCS4 *(*unicode_as_ucs4)(PyObject *, Py_UCS4 *, Py_ssize_t, int);
+    PyObject *(*unicode_from_ordinal)(int);
+    PyObject *(*unicode_decode)(const char *, Py_ssize_t, const char *, const char *);
+    int (*unicode_resize)(PyObject **, Py_ssize_t);
+    Py_ssize_t (*unicode_copy_characters)(PyObject *, Py_ssize_t, PyObject *, Py_ssize_t, Py_ssize_t);
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiStrings;
 

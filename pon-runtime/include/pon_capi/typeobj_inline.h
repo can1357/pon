@@ -27,6 +27,10 @@ static inline PyObject *PyType_FromModuleAndSpec(PyObject *module, PyType_Spec *
     return PyPon_Capi()->typeobj->type_from_module_and_spec(module, spec, bases);
 }
 
+static inline PyObject *PyType_FromMetaclass(PyTypeObject *metaclass, PyObject *module, PyType_Spec *spec, PyObject *bases) {
+    return PyPon_Capi()->typeobj->type_from_metaclass(metaclass, module, spec, bases);
+}
+
 static inline void PyType_Modified(PyTypeObject *type) {
     PyPon_Capi()->typeobj->type_modified(type);
 }
@@ -49,6 +53,16 @@ static inline int PyType_HasFeature(PyTypeObject *type, unsigned long feature) {
 }
 
 #define PyType_FastSubclass(type, flag) PyType_HasFeature((type), (flag))
+
+#ifndef Py_TPFLAGS_MANAGED_WEAKREF
+#define Py_TPFLAGS_MANAGED_WEAKREF (1UL << 3)
+#endif
+#ifndef Py_TPFLAGS_MANAGED_DICT
+#define Py_TPFLAGS_MANAGED_DICT (1UL << 4)
+#endif
+#ifndef Py_TPFLAGS_IS_ABSTRACT
+#define Py_TPFLAGS_IS_ABSTRACT (1UL << 20)
+#endif
 
 /* Object memory: PyObject_Malloc pairs with PyObject_Free for raw blocks;
  * PyObject_Free is also the default tp_free and no-ops for GC-owned

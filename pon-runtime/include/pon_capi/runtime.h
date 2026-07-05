@@ -18,6 +18,8 @@ typedef struct _is PyInterpreterState;
  */
 typedef struct _ts {
     PyInterpreterState *interp;
+    _PyErr_StackItem *exc_info;
+    _PyErr_StackItem exc_state;
 } PyThreadState;
 typedef int PyGILState_STATE;
 #define PyGILState_LOCKED 0
@@ -57,6 +59,17 @@ typedef struct PyPonCapiRuntime {
     Py_ssize_t (*test_collect_pin_count)(PyObject *);
 #endif
     PyObject *(*contextvar_set)(PyObject *, PyObject *);
+    PyFrameObject *(*frame_new)(PyThreadState *, PyCodeObject *, PyObject *, PyObject *);
+    int (*traceback_here)(PyFrameObject *);
+    int (*traceback_check)(PyObject *);
+    PyCodeObject *(*code_new_empty)(const char *, const char *, int);
+    PyCodeObject *(*code_new)(int, int, int, int, int, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, int, PyObject *, PyObject *);
+    PyCodeObject *(*code_new_with_posonly_args)(int, int, int, int, int, int, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, PyObject *, int, PyObject *, PyObject *);
+    int (*code_get_num_free)(PyCodeObject *);
+    int (*code_has_free_vars)(PyCodeObject *);
+    PyObject *(*import_import_module_level)(const char *, PyObject *, PyObject *, PyObject *, int);
+    PySendResult (*iter_send)(PyObject *, PyObject *, PyObject **);
+    int (*async_gen_check_exact)(PyObject *);
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiRuntime;
 

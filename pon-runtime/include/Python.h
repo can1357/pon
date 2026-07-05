@@ -5,6 +5,11 @@
  * refcount-portable extensions) gate compilation on it being defined. */
 #define Py_PYTHON_H
 
+/* Cython-generated modules embed BOTH compressed and plain string tables and
+ * pick at C-compile time: force the plain branch so module init never needs
+ * PyMemoryView_FromMemory + zlib before the runtime is fully up. */
+#define CYTHON_COMPRESS_STRINGS 0
+
 /* CPython-source compatibility shim for extensions recompiled against Pon.
  *
  * This is NOT CPython's binary ABI. Extensions include this header, compile
@@ -28,10 +33,13 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 #include <wctype.h>
+#include "compile.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -76,6 +84,38 @@ typedef struct {
 #define PY_MICRO_VERSION 0
 #define PYTHON_API_VERSION 1013
 
+static const unsigned long Py_Version = PY_VERSION_HEX;
+
+static inline void Py_FatalError(const char *message) {
+    fputs("Fatal Python error: ", stderr);
+    fputs(message != NULL ? message : "(null)", stderr);
+    fputc('\n', stderr);
+    abort();
+}
+
+/* Pon's C-API shim is source-compatible, not CPython-internal-layout
+ * compatible.  Force Cython away from direct thread-state/list/long/dict
+ * internals while leaving the public CPython API branch selected.
+ */
+#ifndef CYTHON_FAST_THREAD_STATE
+#define CYTHON_FAST_THREAD_STATE 0
+#endif
+#ifndef CYTHON_ASSUME_SAFE_MACROS
+#define CYTHON_ASSUME_SAFE_MACROS 0
+#endif
+#ifndef CYTHON_USE_PYLIST_INTERNALS
+#define CYTHON_USE_PYLIST_INTERNALS 0
+#endif
+#ifndef CYTHON_USE_PYLONG_INTERNALS
+#define CYTHON_USE_PYLONG_INTERNALS 0
+#endif
+#ifndef CYTHON_USE_DICT_VERSIONS
+#define CYTHON_USE_DICT_VERSIONS 0
+#endif
+#ifndef CYTHON_USE_UNICODE_INTERNALS
+#define CYTHON_USE_UNICODE_INTERNALS 0
+#endif
+
 /* ---- object model (mirrors Pon's PyObjectHeader: type word, gc word) ---- */
 
 typedef struct _typeobject PyTypeObject;
@@ -93,10 +133,18 @@ typedef struct {
 #define PyObject_HEAD PyObject ob_base;
 #define PyObject_VAR_HEAD PyVarObject ob_base;
 #define PyObject_HEAD_INIT(type) { (type), 0 },
+typedef struct {
+    PyObject ob_base;
+    Py_complex cval;
+} PyComplexObject;
 #define PyVarObject_HEAD_INIT(type, size) { PyObject_HEAD_INIT(type) (size) },
 
 #define Py_SIZE(ob) (((PyVarObject *)(ob))->ob_size)
 #define Py_SET_SIZE(ob, size) (((PyVarObject *)(ob))->ob_size = (size))
+
+typedef struct PyGenObject {
+    PyObject ob_base;
+} PyGenObject;
 
 /* ---- CPython 3.14 str object layout (compile surface ONLY) ----
  * numpy embeds PyUnicodeObject as the base of its unicode scalar struct
@@ -140,6 +188,18 @@ typedef struct {
 typedef PyObject *(*PyCFunction)(PyObject *, PyObject *);
 typedef PyObject *(*PyCFunctionWithKeywords)(PyObject *, PyObject *, PyObject *);
 typedef PyObject *(*vectorcallfunc)(PyObject *, PyObject *const *, size_t, PyObject *);
+typedef PyObject *(*PyCFunctionFast)(PyObject *, PyObject *const *, Py_ssize_t);
+typedef PyObject *(*PyCFunctionFastWithKeywords)(PyObject *, PyObject *const *, Py_ssize_t, PyObject *);
+typedef PyCFunctionFast _PyCFunctionFast;
+typedef PyCFunctionFastWithKeywords _PyCFunctionFastWithKeywords;
+
+typedef enum {
+    PYGEN_RETURN = 0,
+    PYGEN_ERROR = -1,
+    PYGEN_NEXT = 1,
+} PySendResult;
+
+typedef PySendResult (*sendfunc)(PyObject *, PyObject *, PyObject **);
 
 #define METH_VARARGS 0x0001
 #define METH_KEYWORDS 0x0002
@@ -298,7 +358,7 @@ typedef struct {
     unaryfunc am_await;
     unaryfunc am_aiter;
     unaryfunc am_anext;
-    void *am_send;
+    sendfunc am_send;
 } PyAsyncMethods;
 
 /* ---- member/getset descriptors (see structmember.h for T_* codes) ---- */
@@ -460,7 +520,9 @@ typedef struct PyModuleDef {
 static inline PyObject *PyModuleDef_Init(PyModuleDef *def);
 
 #ifndef PyMODINIT_FUNC
-#define PyMODINIT_FUNC PyObject *
+/* Module init entries must stay dlsym-visible even under
+ * -fvisibility=hidden (numpy compiles extensions that way). */
+#define PyMODINIT_FUNC __attribute__((visibility("default"))) PyObject *
 #endif
 
 /* ---- structural runtime compatibility (NumPy C-API surface) ----
@@ -473,7 +535,31 @@ typedef intptr_t Py_intptr_t;
 typedef uintptr_t Py_uintptr_t;
 
 typedef struct _frame PyFrameObject;
-typedef struct PyCodeObject PyCodeObject;
+#ifndef PON_CODEOBJECT_STRUCT_DEFINED
+#define PON_CODEOBJECT_STRUCT_DEFINED 1
+typedef struct PyCodeObject {
+    PyObject_HEAD
+    int _co_firsttraceable;
+    int co_firstlineno;
+    PyObject *co_filename;
+    PyObject *co_name;
+    PyObject *co_qualname;
+    int co_nfreevars;
+} PyCodeObject;
+#endif
+
+typedef struct _traceback {
+    PyObject ob_base;
+    struct _traceback *tb_next;
+    PyFrameObject *tb_frame;
+    int tb_lasti;
+    int tb_lineno;
+} PyTracebackObject;
+
+_Static_assert(offsetof(PyTracebackObject, tb_next) == sizeof(PyObject),
+               "Pon PyTracebackObject tb_next must mirror traceback prefix");
+_Static_assert(offsetof(PyTracebackObject, tb_frame) == sizeof(PyObject) + sizeof(PyObject *),
+               "Pon PyTracebackObject tb_frame must mirror traceback frame slot");
 
 typedef struct {
     uint8_t _bits;
@@ -523,10 +609,20 @@ static inline int PyUnstable_Object_IsUniquelyReferenced(PyObject *op) {
  */
 #ifndef PON_HAVE_PYTUPLEOBJECT_LAYOUT
 #define PON_HAVE_PYTUPLEOBJECT_LAYOUT 1
+
+typedef struct {
+    PyObject ob_base;
+    Py_ssize_t ob_size;
+    Py_ssize_t allocated;
+    PyObject **ob_item;
+} PyListObject;
 typedef struct {
     PyObject ob_base;
     Py_ssize_t len;
-    PyObject **items;
+    union {
+        PyObject **items;
+        PyObject **ob_item;
+    };
 } PyTupleObject;
 #endif
 
@@ -787,6 +883,11 @@ static inline const PyPonCapi *PyPon_Capi(void) {
 
 /* ---- CPython pyport/pyconfig compat tail ---- */
 #define PY_LONG_LONG long long
+#define PY_INT64_T int64_t
+#define PY_UINT64_T uint64_t
+typedef uint32_t digit;
+#define PyLong_SHIFT 30
+#define PyLong_MASK ((1U << PyLong_SHIFT) - 1)
 /* Release-mode CPython Py_SAFE_DOWNCAST: plain cast, no assertion. */
 #define Py_SAFE_DOWNCAST(VALUE, WIDE, NARROW) ((NARROW)(VALUE))
 
@@ -797,6 +898,49 @@ static inline void Py_LeaveRecursiveCall(void) {}
 
 #define PyExceptionInstance_Class(x) ((PyObject *)Py_TYPE(x))
 
+static inline int PyExceptionInstance_Check(PyObject *object) {
+    return object != NULL && PyObject_IsInstance(object, PyExc_BaseException);
+}
+
+static inline int PyExceptionClass_Check(PyObject *object) {
+    return object != NULL && PyObject_IsSubclass(object, PyExc_BaseException);
+}
+
+static inline PyObject *PyException_GetTraceback(PyObject *object) {
+    return PyObject_GetAttrString(object, "__traceback__");
+}
+
+static inline void PyErr_GetExcInfo(PyObject **ptype, PyObject **pvalue, PyObject **ptraceback) {
+    if (ptype != NULL) {
+        *ptype = NULL;
+    }
+    if (pvalue != NULL) {
+        *pvalue = NULL;
+    }
+    if (ptraceback != NULL) {
+        *ptraceback = NULL;
+    }
+}
+
+static inline void PyErr_SetExcInfo(PyObject *type, PyObject *value, PyObject *traceback) {
+    Py_XDECREF(type);
+    Py_XDECREF(value);
+    Py_XDECREF(traceback);
+}
+
+static inline PyObject *PyErr_GetRaisedException(void) {
+    PyObject *type = NULL;
+    PyObject *value = NULL;
+    PyObject *traceback = NULL;
+    PyErr_Fetch(&type, &value, &traceback);
+    Py_XDECREF(type);
+    Py_XDECREF(traceback);
+    return value;
+}
+
+static inline void PyErr_SetHandledException(PyObject *exception) {
+    (void)exception;
+}
 /* tracemalloc is not modeled under Pon: tracking no-ops report success. */
 #define PYMEM_DOMAIN_RAW 0
 #define PYMEM_DOMAIN_MEM 1
@@ -872,6 +1016,37 @@ typedef struct {
 #define _Py_TPFLAGS_HAVE_VECTORCALL Py_TPFLAGS_HAVE_VECTORCALL
 #endif
 
+#ifndef Py_TPFLAGS_HAVE_VERSION_TAG
+#define Py_TPFLAGS_HAVE_VERSION_TAG 0
+#endif
+
+#define PyDoc_STR(str) str
+#define PyDoc_VAR(name) static const char name[]
+#define PyDoc_STRVAR(name, str) PyDoc_VAR(name) = PyDoc_STR(str)
+
+
+static inline int PyObject_GC_IsFinalized(PyObject *object) {
+    (void)object;
+    return 0;
+}
+
+static inline int PyObject_CallFinalizerFromDealloc(PyObject *object) {
+    (void)object;
+    return 0;
+}
+
+static inline int PyType_IS_GC(PyTypeObject *type) {
+    return type != NULL && (type->tp_flags & Py_TPFLAGS_HAVE_GC) != 0;
+}
+
+static inline void PyUnstable_Object_EnableDeferredRefcount(PyObject *object) {
+    (void)object;
+}
+
+static inline int64_t PyInterpreterState_GetID(PyInterpreterState *interp) {
+    (void)interp;
+    return 0;
+}
 /* Pon pins objects via Py_INCREF/Py_DECREF, not an in-object refcount field. */
 #define Py_SET_REFCNT(op, n) do { (void)(op); (void)(n); } while (0)
 
@@ -932,8 +1107,20 @@ typedef struct {
     PyMethodDef *m_ml;
     PyObject *m_self;
     PyObject *m_module;
+    PyObject *m_weakreflist;
     void *vectorcall;
 } PyCFunctionObject;
+
+typedef struct {
+    PyCFunctionObject func;
+    PyTypeObject *mm_class;
+} PyCMethodObject;
+
+typedef struct {
+    PyObject ob_base;
+    PyObject *im_func;
+    PyObject *im_self;
+} PyMethodObject;
 
 typedef struct {
     PyObject ob_base;
@@ -959,6 +1146,8 @@ typedef struct {
 
 static PyTypeObject _PyPon_CFunction_Type_CompileOnly;
 static PyTypeObject _PyPon_MemberDescr_Type_CompileOnly;
+static PyTypeObject _PyPon_Range_Type_CompileOnly;
+
 static PyTypeObject _PyPon_GetSetDescr_Type_CompileOnly;
 static PyTypeObject _PyPon_MethodDescr_Type_CompileOnly;
 
@@ -966,6 +1155,177 @@ static PyTypeObject _PyPon_MethodDescr_Type_CompileOnly;
 #define PyMemberDescr_Type _PyPon_MemberDescr_Type_CompileOnly
 #define PyGetSetDescr_Type _PyPon_GetSetDescr_Type_CompileOnly
 #define PyMethodDescr_Type _PyPon_MethodDescr_Type_CompileOnly
+#define PyRange_Type _PyPon_Range_Type_CompileOnly
+
+
+static inline int PyCFunction_Check(PyObject *object) {
+    return object != NULL && Py_TYPE(object) == &PyCFunction_Type;
+}
+
+static inline int PyCFunction_CheckExact(PyObject *object) {
+    return PyCFunction_Check(object);
+}
+
+#define PyCFunction_GET_FUNCTION(func) (((PyCFunctionObject *)(func))->m_ml->ml_meth)
+#define PyCFunction_GET_SELF(func) (((PyCFunctionObject *)(func))->m_self)
+
+static inline int PyMethod_Check(PyObject *object) {
+    (void)object;
+    return 0;
+}
+
+#define PyMethod_GET_SELF(method) (((PyMethodObject *)(method))->im_self)
+#define PyMethod_GET_FUNCTION(method) (((PyMethodObject *)(method))->im_func)
+
+static inline PyObject *_PyDict_GetItem_KnownHash(PyObject *dict, PyObject *key, Py_hash_t hash) {
+    (void)hash;
+    return PyDict_GetItemWithError(dict, key);
+}
+
+static inline PyObject *_PyDict_NewPresized(Py_ssize_t minused) {
+    (void)minused;
+    return PyDict_New();
+}
+
+static inline int PyObject_HasAttrWithError(PyObject *object, PyObject *name) {
+    return PyObject_HasAttr(object, name);
+}
+
+static inline int PyArg_ValidateKeywordArguments(PyObject *kwargs) {
+    return kwargs == NULL || PyDict_Check(kwargs);
+}
+
+static inline int PyGC_Disable(void) {
+    return 1;
+}
+
+static inline int PyGC_Enable(void) {
+    return 1;
+}
+
+#ifndef PON_HAVE_PYTRACEBACK_INLINE
+#define PON_HAVE_PYTRACEBACK_INLINE 1
+static inline int PyTraceBack_Check(PyObject *object) {
+    return PyPon_Capi()->runtime_->traceback_check(object);
+}
+#endif
+
+
+static inline PyObject *_PyType_Lookup(PyTypeObject *type, PyObject *name) {
+    return PyObject_GetAttr((PyObject *)type, name);
+}
+
+static inline const char *PyCapsule_GetName(PyObject *capsule) {
+    (void)capsule;
+    return NULL;
+}
+
+static inline Py_ssize_t PyUnicode_FindChar(PyObject *str, Py_UCS4 ch, Py_ssize_t start, Py_ssize_t end, int direction) {
+    Py_ssize_t size = 0;
+    const char *text = PyUnicode_AsUTF8AndSize(str, &size);
+    if (text == NULL || ch > 0x7f) {
+        return -1;
+    }
+    if (start < 0) {
+        start = 0;
+    }
+    if (end > size) {
+        end = size;
+    }
+    if (direction >= 0) {
+        for (Py_ssize_t i = start; i < end; i++) {
+            if ((unsigned char)text[i] == (unsigned char)ch) {
+                return i;
+            }
+        }
+    } else {
+        for (Py_ssize_t i = end; i > start; i--) {
+            if ((unsigned char)text[i - 1] == (unsigned char)ch) {
+                return i - 1;
+            }
+        }
+    }
+    return -1;
+}
+
+static inline PyObject *PyImport_ImportModuleLevelObject(
+    PyObject *name,
+    PyObject *globals,
+    PyObject *locals,
+    PyObject *fromlist,
+    int level)
+{
+    (void)globals;
+    (void)locals;
+    (void)fromlist;
+    (void)level;
+    return PyImport_Import(name);
+}
+
+static inline PyObject **_PyObject_GetDictPtr(PyObject *object) {
+    (void)object;
+    static PyObject *dict = NULL;
+    return &dict;
+}
+
+static inline PyObject *PyModule_NewObject(PyObject *name) {
+    const char *text = PyUnicode_AsUTF8(name);
+    if (text == NULL) {
+        return NULL;
+    }
+    PyObject *module = PyImport_AddModule(text);
+    Py_XINCREF(module);
+    return module;
+}
+
+static inline PyObject *PyImport_AddModuleRef(const char *name) {
+    PyObject *module = PyImport_AddModule(name);
+    Py_XINCREF(module);
+    return module;
+}
+
+static inline PyObject *PyImport_GetModuleDict(void) {
+    return PySys_GetObject("modules");
+}
+
+static inline PyObject *PyImport_GetModule(PyObject *name) {
+    return PyImport_Import(name);
+}
+
+static inline void PyUnicode_InternInPlace(PyObject **object) {
+    (void)object;
+}
+
+static inline int PyRange_Check(PyObject *object) {
+    (void)object;
+    return 0;
+}
+
+static inline Py_UCS4 PyUnicode_MAX_CHAR_VALUE(PyObject *object) {
+    (void)object;
+    return 0x10ffffU;
+}
+
+static inline PyObject *PyUnicode_Join(PyObject *separator, PyObject *seq) {
+    return PyObject_CallMethod(separator, "join", "O", seq);
+}
+
+static inline int PyDict_Pop(PyObject *dict, PyObject *key, PyObject **result) {
+    if (result == NULL) {
+        PyErr_SetString(PyExc_TypeError, "PyDict_Pop result pointer must not be NULL");
+        return -1;
+    }
+    *result = NULL;
+    int found = PyDict_GetItemRef(dict, key, result);
+    if (found <= 0) {
+        return found;
+    }
+    if (PyDict_DelItem(dict, key) < 0) {
+        Py_CLEAR(*result);
+        return -1;
+    }
+    return 1;
+}
 
 /* Same rationale as PyUnstable_Object_IsUniquelyReferenced above: Pon has no
  * per-object refcount, so this CPython optimization predicate is never true.

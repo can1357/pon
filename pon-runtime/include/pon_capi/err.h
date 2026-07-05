@@ -22,6 +22,23 @@ typedef struct PyBaseExceptionObject {
     unsigned char suppress_context;
 } PyBaseExceptionObject;
 
+typedef struct _err_stackitem {
+    PyObject *exc_value;
+    struct _err_stackitem *previous_item;
+} _PyErr_StackItem;
+
+/* Pon stores StopIteration.value in PyBaseExceptionObject.message.  This C
+ * face deliberately maps the public `value` field onto that slot for Cython's
+ * direct fast-path read; it is not CPython's binary layout.
+ */
+typedef struct PyStopIterationObject {
+    PyObject ob_base;
+    PyObject *value;
+} PyStopIterationObject;
+
+_Static_assert(offsetof(PyStopIterationObject, value) == offsetof(PyBaseExceptionObject, message),
+               "Pon PyStopIterationObject.value must alias PyBaseExceptionObject.message");
+
 typedef struct PyPonCapiErr {
     void (*set_string)(PyObject *, const char *);
     void (*set_object)(PyObject *, PyObject *);
@@ -77,6 +94,10 @@ typedef struct PyPonCapiErr {
     PyObject *exc_recursion_error;
     PyObject *(*new_exception)(const char *, PyObject *, PyObject *);
     int (*check_signals)(void);
+    void (*set_raised_exception)(PyObject *);
+    PyObject *exc_generator_exit;
+    PyObject *exc_stop_async_iteration;
+    PyObject *exc_unbound_local_error;
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiErr;
 

@@ -63,6 +63,11 @@ typedef struct PyPonCapiObject {
     PyObject *(*method_new)(PyObject *, PyObject *);
     PyObject *(*bytes)(PyObject *);
     Py_ssize_t (*length_hint)(PyObject *, Py_ssize_t);
+    PyObject *(*cfunction_new_ex)(PyMethodDef *, PyObject *, PyObject *);
+    int (*generic_set_dict)(PyObject *, PyObject *, void *);
+    int (*clear_managed_dict)(PyObject *);
+    int (*visit_managed_dict)(PyObject *, visitproc, void *);
+    PyObject *(*memoryview_from_memory)(char *, Py_ssize_t, int);
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiObject;
 
