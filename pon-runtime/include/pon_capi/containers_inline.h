@@ -289,6 +289,18 @@ static inline PyObject *PySequence_Concat(PyObject *left, PyObject *right) {
     return PyPon_Capi()->containers->sequence_concat(left, right);
 }
 
+static inline PyObject *PySequence_Repeat(PyObject *object, Py_ssize_t count) {
+    return PyPon_Capi()->containers->sequence_repeat(object, count);
+}
+
+static inline PyObject *PySequence_InPlaceRepeat(PyObject *object, Py_ssize_t count) {
+    return PyPon_Capi()->containers->sequence_inplace_repeat(object, count);
+}
+
+static inline PyObject *PySequence_InPlaceConcat(PyObject *left, PyObject *right) {
+    return PyPon_Capi()->containers->sequence_inplace_concat(left, right);
+}
+
 static inline PyObject *PySequence_GetItem(PyObject *object, Py_ssize_t index) {
     return PyPon_Capi()->containers->sequence_get_item(object, index);
 }

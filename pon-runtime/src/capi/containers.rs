@@ -82,6 +82,9 @@ pub(crate) struct PyPonCapiContainers {
     dict_proxy_new: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
     dict_proxy_type: unsafe extern "C" fn() -> *mut ForeignTypeObject,
     sequence_concat: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+    sequence_repeat: unsafe extern "C" fn(*mut PyObject, isize) -> *mut PyObject,
+    sequence_inplace_repeat: unsafe extern "C" fn(*mut PyObject, isize) -> *mut PyObject,
+    sequence_inplace_concat: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
 }
 
 unsafe impl Send for PyPonCapiContainers {}
@@ -148,6 +151,9 @@ pub(crate) fn build() -> PyPonCapiContainers {
         dict_proxy_new: capi_dict_proxy_new,
         dict_proxy_type: capi_dict_proxy_type,
         sequence_concat: capi_sequence_concat,
+        sequence_repeat: capi_sequence_repeat,
+        sequence_inplace_repeat: capi_sequence_inplace_repeat,
+        sequence_inplace_concat: capi_sequence_inplace_concat,
     }
 }
 
@@ -1327,6 +1333,43 @@ unsafe extern "C" fn capi_sequence_concat(left: *mut PyObject, right: *mut PyObj
         let right = crate::tag::untag_arg(right);
         unsafe { crate::abstract_op::binary_op(crate::abstract_op::BINARY_ADD, left, right) }
     })
+}
+
+unsafe extern "C" fn capi_sequence_repeat(object: *mut PyObject, count: isize) -> *mut PyObject {
+    catch_object(|| {
+        let object = crate::tag::untag_arg(object);
+        let count = sequence_repeat_count_object(count);
+        if count.is_null() {
+            return ptr::null_mut();
+        }
+        unsafe { crate::abstract_op::binary_op(crate::abstract_op::BINARY_MUL, object, count) }
+    })
+}
+
+unsafe extern "C" fn capi_sequence_inplace_repeat(object: *mut PyObject, count: isize) -> *mut PyObject {
+    catch_object(|| {
+        let object = crate::tag::untag_arg(object);
+        let count = sequence_repeat_count_object(count);
+        if count.is_null() {
+            return ptr::null_mut();
+        }
+        unsafe { abi::number::pon_number_inplace(abi::number::BINARY_MUL, object, count, ptr::null_mut()) }
+    })
+}
+
+unsafe extern "C" fn capi_sequence_inplace_concat(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    catch_object(|| {
+        let left = crate::tag::untag_arg(left);
+        let right = crate::tag::untag_arg(right);
+        unsafe { abi::number::pon_number_inplace(abi::number::BINARY_ADD, left, right, ptr::null_mut()) }
+    })
+}
+
+fn sequence_repeat_count_object(count: isize) -> *mut PyObject {
+    let Ok(count) = i64::try_from(count) else {
+        return abi::return_null_with_error("sequence repeat count is out of range");
+    };
+    unsafe { abi::pon_const_int(count) }
 }
 
 unsafe extern "C" fn capi_sequence_tuple(object: *mut PyObject) -> *mut PyObject {

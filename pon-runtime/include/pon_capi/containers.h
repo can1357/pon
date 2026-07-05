@@ -63,6 +63,9 @@ typedef struct PyPonCapiContainers {
     PyObject *(*dict_proxy_new)(PyObject *);
     PyTypeObject *(*dict_proxy_type)(void);
     PyObject *(*sequence_concat)(PyObject *, PyObject *);
+    PyObject *(*sequence_repeat)(PyObject *, Py_ssize_t);
+    PyObject *(*sequence_inplace_repeat)(PyObject *, Py_ssize_t);
+    PyObject *(*sequence_inplace_concat)(PyObject *, PyObject *);
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiContainers;
 

@@ -61,6 +61,8 @@ typedef struct PyPonCapiObject {
     void (*clear_weakrefs)(PyObject *);
     PyObject *(*seq_iter_new)(PyObject *);
     PyObject *(*method_new)(PyObject *, PyObject *);
+    PyObject *(*bytes)(PyObject *);
+    Py_ssize_t (*length_hint)(PyObject *, Py_ssize_t);
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiObject;
 

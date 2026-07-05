@@ -222,6 +222,10 @@ static inline PyObject *PyObject_Str(PyObject *object) {
     return PyPon_Capi()->object_->str(object);
 }
 
+static inline PyObject *PyObject_Bytes(PyObject *object) {
+    return PyPon_Capi()->object_->bytes(object);
+}
+
 
 static inline int PyObject_Print(PyObject *object, FILE *file, int flags) {
     return PyPon_Capi()->object_->print(object, file, flags);
@@ -271,6 +275,10 @@ static inline Py_ssize_t PyObject_Size(PyObject *object) {
 }
 
 #define PyObject_Length PyObject_Size
+
+static inline Py_ssize_t PyObject_LengthHint(PyObject *object, Py_ssize_t default_value) {
+    return PyPon_Capi()->object_->length_hint(object, default_value);
+}
 
 static inline Py_hash_t PyObject_Hash(PyObject *object) {
     return PyPon_Capi()->object_->hash(object);

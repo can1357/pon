@@ -140,6 +140,8 @@ pub(crate) struct PyPonCapiObject {
     clear_weakrefs: unsafe extern "C" fn(*mut PyObject),
     seq_iter_new: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
     method_new: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+    bytes: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+    length_hint: unsafe extern "C" fn(*mut PyObject, isize) -> isize,
 }
 
 unsafe impl Send for PyPonCapiObject {}
@@ -201,6 +203,8 @@ pub(crate) fn build() -> PyPonCapiObject {
         clear_weakrefs: capi_clear_weakrefs,
         seq_iter_new: capi_seq_iter_new,
         method_new: capi_method_new,
+        bytes: capi_bytes,
+        length_hint: capi_length_hint,
     }
 }
 
@@ -249,6 +253,16 @@ fn value_error_status(message: &str) -> c_int {
 }
 
 fn overflow_error_status(message: &str) -> c_int {
+    let _ = abi::exc::raise_kind_error_text(ExceptionKind::OverflowError, message);
+    -1
+}
+
+fn value_error_isize(message: &str) -> isize {
+    let _ = abi::exc::raise_kind_error_text(ExceptionKind::ValueError, message);
+    -1
+}
+
+fn overflow_error_isize(message: &str) -> isize {
     let _ = abi::exc::raise_kind_error_text(ExceptionKind::OverflowError, message);
     -1
 }
@@ -924,6 +938,15 @@ unsafe extern "C" fn capi_str(object: *mut PyObject) -> *mut PyObject {
     })
 }
 
+unsafe extern "C" fn capi_bytes(object: *mut PyObject) -> *mut PyObject {
+    catch_object(|| {
+        let object = normalize_object_arg(object);
+        let mut argv = [object];
+        // SAFETY: `argv` is a live one-element positional argument vector for `bytes(object)`.
+        unsafe { crate::native::builtins_mod::builtin_bytes(argv.as_mut_ptr(), argv.len()) }
+    })
+}
+
 unsafe extern "C" fn capi_is_true(object: *mut PyObject) -> c_int {
     let object = normalize_object_arg(object);
     // SAFETY: Delegates truth dispatch to the runtime helper.
@@ -1038,6 +1061,110 @@ unsafe extern "C" fn capi_size(object: *mut PyObject) -> isize {
             .to_isize()
             .unwrap_or_else(|| type_error_isize("__len__() result is too large"))
     })
+}
+
+unsafe extern "C" fn capi_length_hint(object: *mut PyObject, default_value: isize) -> isize {
+    catch_isize(|| {
+        let object = normalize_object_arg(object);
+        if object.is_null() {
+            return type_error_isize("PyObject_LengthHint called with NULL object");
+        }
+        if default_value < 0 {
+            return value_error_isize("PyObject_LengthHint default must be non-negative");
+        }
+
+        match unsafe { length_hint_slot_len(object) } {
+            LengthHintOutcome::Value(len) => return len,
+            LengthHintOutcome::Error => return -1,
+            LengthHintOutcome::Missing => {}
+        }
+
+        match unsafe { call_optional_length_method(object, "__len__") } {
+            Ok(Some(result)) => return length_hint_result_to_isize(result, "__len__()"),
+            Ok(None) => {}
+            Err(()) => return -1,
+        }
+
+        match unsafe { call_optional_length_method(object, "__length_hint__") } {
+            Ok(Some(result)) => {
+                let result = crate::tag::untag_arg(result);
+                if unsafe { crate::abstract_op::is_not_implemented(result) } {
+                    default_value
+                } else {
+                    length_hint_result_to_isize(result, "__length_hint__()")
+                }
+            }
+            Ok(None) => default_value,
+            Err(()) => -1,
+        }
+    })
+}
+
+enum LengthHintOutcome {
+    Missing,
+    Value(isize),
+    Error,
+}
+
+unsafe fn length_hint_slot_len(object: *mut PyObject) -> LengthHintOutcome {
+    let object = crate::tag::untag_arg(object);
+    if object.is_null() || !crate::tag::is_heap(object) {
+        return LengthHintOutcome::Missing;
+    }
+    let ty = unsafe { (*object).ob_type };
+    if ty.is_null() {
+        return LengthHintOutcome::Missing;
+    }
+    let slot = unsafe { (*ty).tp_as_sequence.as_ref().and_then(|methods| methods.sq_length) }
+        .or_else(|| unsafe { (*ty).tp_as_mapping.as_ref().and_then(|methods| methods.mp_length) });
+    let Some(slot) = slot else {
+        return LengthHintOutcome::Missing;
+    };
+    let len = unsafe { slot(object) };
+    if len >= 0 {
+        return LengthHintOutcome::Value(len);
+    }
+    if pon_err_occurred() && abi::exc::pending_exception_is("TypeError") {
+        pon_err_clear();
+        return LengthHintOutcome::Missing;
+    }
+    if !pon_err_occurred() {
+        let _ = value_error_isize("__len__() should return >= 0");
+    }
+    LengthHintOutcome::Error
+}
+
+unsafe fn call_optional_length_method(object: *mut PyObject, name: &str) -> Result<Option<*mut PyObject>, ()> {
+    let method = unsafe { abi::pon_get_attr(object, intern(name), ptr::null_mut()) };
+    if method.is_null() {
+        if !pon_err_occurred() || abi::exc::pending_exception_is("AttributeError") {
+            pon_err_clear();
+            return Ok(None);
+        }
+        return Err(());
+    }
+    let result = unsafe { abi::pon_call(method, ptr::null_mut(), 0) };
+    if result.is_null() {
+        if abi::exc::pending_exception_is("TypeError") {
+            pon_err_clear();
+            return Ok(None);
+        }
+        return Err(());
+    }
+    Ok(Some(result))
+}
+
+fn length_hint_result_to_isize(result: *mut PyObject, source: &str) -> isize {
+    let result = crate::tag::untag_arg(result);
+    let Some(length) = (unsafe { crate::types::int::to_bigint_including_bool(result) }) else {
+        return type_error_isize(&format!("{source} should return an integer"));
+    };
+    if length.sign() == Sign::Minus {
+        return value_error_isize(&format!("{source} should return >= 0"));
+    }
+    length
+        .to_isize()
+        .unwrap_or_else(|| overflow_error_isize(&format!("{source} result is too large")))
 }
 
 unsafe extern "C" fn capi_hash(object: *mut PyObject) -> isize {
