@@ -6,6 +6,22 @@
  * they are valid arguments to any API taking a type or class.
  */
 
+
+/* Pon's boxed BaseException payload. This is a source-compatibility mirror of
+ * the runtime layout for C code that inspects exception chaining fields; it is
+ * not CPython's binary ABI.
+ */
+typedef struct PyBaseExceptionObject {
+    PyObject ob_base;
+    PyObject *message;
+    PyObject *cause;
+    PyObject *context;
+    PyObject *traceback;
+    PyObject *args;
+    void *dict;
+    unsigned char suppress_context;
+} PyBaseExceptionObject;
+
 typedef struct PyPonCapiErr {
     void (*set_string)(PyObject *, const char *);
     void (*set_object)(PyObject *, PyObject *);
@@ -42,7 +58,16 @@ typedef struct PyPonCapiErr {
     void (*restore)(PyObject *, PyObject *, PyObject *);
     int (*warn_ex)(PyObject *, const char *, Py_ssize_t);
     void (*write_unraisable)(PyObject *);
+    void (*normalize_exception)(PyObject **, PyObject **, PyObject **);
+    void (*print)(void);
+    void (*print_ex)(int);
+    PyObject *(*set_from_errno)(PyObject *);
+    void (*exception_set_cause)(PyObject *, PyObject *);
+    void (*exception_set_context)(PyObject *, PyObject *);
+    int (*exception_set_traceback)(PyObject *, PyObject *);
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiErr;
 
+
+#include "err_inline.h"
 #endif /* PON_CAPI_ERR_H */
