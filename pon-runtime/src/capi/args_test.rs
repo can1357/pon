@@ -1,28 +1,34 @@
 use std::ptr;
 
-use super::load_extension_module;
-use super::tests::{ResetImportStateOnDrop, TempExtensionRoot, compile_extension};
-use crate::abi::str_::pon_const_bytes;
-use crate::abi::{format_object_for_print, pon_call, pon_const_int, pon_const_str, pon_runtime_init};
-use crate::import::{module_attr, reset_import_state_for_tests};
-use crate::intern::intern;
-use crate::thread_state::{pon_err_clear, pon_err_message, test_state_lock};
+use super::{
+	load_extension_module,
+	tests::{ResetImportStateOnDrop, TempExtensionRoot, compile_extension},
+};
+use crate::{
+	abi::{
+		format_object_for_print, pon_call, pon_const_int, pon_const_str, pon_runtime_init,
+		str_::pon_const_bytes,
+	},
+	import::{module_attr, reset_import_state_for_tests},
+	intern::intern,
+	thread_state::{pon_err_clear, pon_err_message, test_state_lock},
+};
 
 #[test]
 fn args_parse_and_buildvalue_extension_paths() {
-    let _guard = test_state_lock();
-    let _reset = ResetImportStateOnDrop;
-    unsafe {
-        assert_eq!(pon_runtime_init(), 0);
-    }
-    pon_err_clear();
-    reset_import_state_for_tests();
+	let _guard = test_state_lock();
+	let _reset = ResetImportStateOnDrop;
+	unsafe {
+		assert_eq!(pon_runtime_init(), 0);
+	}
+	pon_err_clear();
+	reset_import_state_for_tests();
 
-    let temp = TempExtensionRoot::new();
-    let module_path = compile_extension(
-        &temp,
-        "capi_args_ext",
-        r#"
+	let temp = TempExtensionRoot::new();
+	let module_path = compile_extension(
+		&temp,
+		"capi_args_ext",
+		r#"
 #include <Python.h>
 
 static int double_converter(PyObject *object, void *out) {
@@ -164,90 +170,96 @@ PyMODINIT_FUNC PyInit_capi_args_ext(void) {
     return PyModule_Create(&module);
 }
 "#,
-    );
+	);
 
-    let module = load_extension_module("capi_args_ext", &module_path)
-        .unwrap_or_else(|message| panic!("failed to load args C extension: {message}"));
-    assert!(!module.is_null(), "extension loader returned NULL module");
-    let module_name = intern("capi_args_ext");
+	let module = load_extension_module("capi_args_ext", &module_path)
+		.unwrap_or_else(|message| panic!("failed to load args C extension: {message}"));
+	assert!(!module.is_null(), "extension loader returned NULL module");
+	let module_name = intern("capi_args_ext");
 
-    let call_noargs = |name: &str| {
-        let function = module_attr(module_name, intern(name)).unwrap_or_else(|| panic!("{name} registered"));
-        let result = unsafe { pon_call(function, ptr::null_mut(), 0) };
-        assert!(!result.is_null(), "{name} returned NULL: {:?}", pon_err_message());
-        result
-    };
-    let call_with_args = |name: &str, argv: &mut [*mut crate::object::PyObject]| {
-        let function = module_attr(module_name, intern(name)).unwrap_or_else(|| panic!("{name} registered"));
-        let result = unsafe { pon_call(function, argv.as_mut_ptr(), argv.len()) };
-        assert!(!result.is_null(), "{name} returned NULL: {:?}", pon_err_message());
-        result
-    };
+	let call_noargs = |name: &str| {
+		let function =
+			module_attr(module_name, intern(name)).unwrap_or_else(|| panic!("{name} registered"));
+		let result = unsafe { pon_call(function, ptr::null_mut(), 0) };
+		assert!(!result.is_null(), "{name} returned NULL: {:?}", pon_err_message());
+		result
+	};
+	let call_with_args = |name: &str, argv: &mut [*mut crate::object::PyObject]| {
+		let function =
+			module_attr(module_name, intern(name)).unwrap_or_else(|| panic!("{name} registered"));
+		let result = unsafe { pon_call(function, argv.as_mut_ptr(), argv.len()) };
+		assert!(!result.is_null(), "{name} returned NULL: {:?}", pon_err_message());
+		result
+	};
 
-    let mut optional_args = [unsafe { pon_const_int(1) }, unsafe { pon_const_int(2) }];
-    let optional = call_with_args("parse_optional", &mut optional_args);
-    assert_eq!(format_object_for_print(optional).as_deref(), Ok("3"));
+	let mut optional_args = [unsafe { pon_const_int(1) }, unsafe { pon_const_int(2) }];
+	let optional = call_with_args("parse_optional", &mut optional_args);
+	assert_eq!(format_object_for_print(optional).as_deref(), Ok("3"));
 
-    let label = unsafe { pon_const_str(b"x".as_ptr(), 1) };
-    let mut optional_with_label = [unsafe { pon_const_int(1) }, unsafe { pon_const_int(2) }, label];
-    let optional = call_with_args("parse_optional", &mut optional_with_label);
-    assert_eq!(format_object_for_print(optional).as_deref(), Ok("13"));
+	let label = unsafe { pon_const_str(b"x".as_ptr(), 1) };
+	let mut optional_with_label = [unsafe { pon_const_int(1) }, unsafe { pon_const_int(2) }, label];
+	let optional = call_with_args("parse_optional", &mut optional_with_label);
+	assert_eq!(format_object_for_print(optional).as_deref(), Ok("13"));
 
-    let text = unsafe { pon_const_str(b"ok".as_ptr(), 2) };
-    let mut type_args = [text];
-    let checked = call_with_args("parse_type_checked", &mut type_args);
-    assert_eq!(format_object_for_print(checked).as_deref(), Ok("ok"));
+	let text = unsafe { pon_const_str(b"ok".as_ptr(), 2) };
+	let mut type_args = [text];
+	let checked = call_with_args("parse_type_checked", &mut type_args);
+	assert_eq!(format_object_for_print(checked).as_deref(), Ok("ok"));
 
-    let mut converter_args = [unsafe { pon_const_int(6) }];
-    let converted = call_with_args("parse_converted", &mut converter_args);
-    assert_eq!(format_object_for_print(converted).as_deref(), Ok("12"));
+	let mut converter_args = [unsafe { pon_const_int(6) }];
+	let converted = call_with_args("parse_converted", &mut converter_args);
+	assert_eq!(format_object_for_print(converted).as_deref(), Ok("12"));
 
-    let bytes = unsafe { pon_const_bytes(b"abc".as_ptr(), 3) };
-    let mut bytes_args = [bytes];
-    let sized = call_with_args("parse_s_hash", &mut bytes_args);
-    assert_eq!(format_object_for_print(sized).as_deref(), Ok("100"));
+	let bytes = unsafe { pon_const_bytes(b"abc".as_ptr(), 3) };
+	let mut bytes_args = [bytes];
+	let sized = call_with_args("parse_s_hash", &mut bytes_args);
+	assert_eq!(format_object_for_print(sized).as_deref(), Ok("100"));
 
-    let mut truth_args = [unsafe { pon_const_int(0) }];
-    let truth = call_with_args("parse_truth", &mut truth_args);
-    assert_eq!(format_object_for_print(truth).as_deref(), Ok("0"));
+	let mut truth_args = [unsafe { pon_const_int(0) }];
+	let truth = call_with_args("parse_truth", &mut truth_args);
+	assert_eq!(format_object_for_print(truth).as_deref(), Ok("0"));
 
-    let keywords = call_noargs("parse_keywords");
-    assert_eq!(format_object_for_print(keywords).as_deref(), Ok("12"));
+	let keywords = call_noargs("parse_keywords");
+	assert_eq!(format_object_for_print(keywords).as_deref(), Ok("12"));
 
-    let mut unpack_args = [unsafe { pon_const_int(4) }, unsafe { pon_const_int(2) }];
-    let unpacked = call_with_args("unpack_pair", &mut unpack_args);
-    assert_eq!(format_object_for_print(unpacked).as_deref(), Ok("42"));
+	let mut unpack_args = [unsafe { pon_const_int(4) }, unsafe { pon_const_int(2) }];
+	let unpacked = call_with_args("unpack_pair", &mut unpack_args);
+	assert_eq!(format_object_for_print(unpacked).as_deref(), Ok("42"));
 
-    let nested = call_noargs("build_nested");
-    assert_eq!(format_object_for_print(nested).as_deref(), Ok("(7, ['name', 2.5], {'answer': 4})"));
+	let nested = call_noargs("build_nested");
+	assert_eq!(format_object_for_print(nested).as_deref(), Ok("(7, ['name', 2.5], {'answer': 4})"));
 
-    let arity = module_attr(module_name, intern("arity_two")).expect("arity_two registered");
-    let mut too_few = [unsafe { pon_const_int(1) }];
-    pon_err_clear();
-    let result = unsafe { pon_call(arity, too_few.as_mut_ptr(), too_few.len()) };
-    assert!(result.is_null(), "arity_two unexpectedly succeeded: {:?}", format_object_for_print(result));
-    assert_eq!(
-        pon_err_message().as_deref(),
-        Some("TypeError: arity_two() takes exactly 2 arguments (1 given)"),
-        "PyArg_ParseTuple arity TypeError must match python3.14 getargs.c"
-    );
+	let arity = module_attr(module_name, intern("arity_two")).expect("arity_two registered");
+	let mut too_few = [unsafe { pon_const_int(1) }];
+	pon_err_clear();
+	let result = unsafe { pon_call(arity, too_few.as_mut_ptr(), too_few.len()) };
+	assert!(
+		result.is_null(),
+		"arity_two unexpectedly succeeded: {:?}",
+		format_object_for_print(result)
+	);
+	assert_eq!(
+		pon_err_message().as_deref(),
+		Some("TypeError: arity_two() takes exactly 2 arguments (1 given)"),
+		"PyArg_ParseTuple arity TypeError must match python3.14 getargs.c"
+	);
 }
 
 #[test]
 fn c_api_new_refs_survive_collect_and_decref_unpins() {
-    let _guard = test_state_lock();
-    let _reset = ResetImportStateOnDrop;
-    unsafe {
-        assert_eq!(pon_runtime_init(), 0);
-    }
-    pon_err_clear();
-    reset_import_state_for_tests();
+	let _guard = test_state_lock();
+	let _reset = ResetImportStateOnDrop;
+	unsafe {
+		assert_eq!(pon_runtime_init(), 0);
+	}
+	pon_err_clear();
+	reset_import_state_for_tests();
 
-    let temp = TempExtensionRoot::new();
-    let module_path = compile_extension(
-        &temp,
-        "capi_refpin_ext",
-        r#"
+	let temp = TempExtensionRoot::new();
+	let module_path = compile_extension(
+		&temp,
+		"capi_refpin_ext",
+		r#"
 #include <Python.h>
 
 #define BIT(n) (1L << (n))
@@ -304,37 +316,33 @@ PyMODINIT_FUNC PyInit_capi_refpin_ext(void) {
     return PyModule_Create(&module);
 }
 "#,
-    );
+	);
 
-    let module = load_extension_module("capi_refpin_ext", &module_path)
-        .unwrap_or_else(|message| panic!("failed to load refpin C extension: {message}"));
-    assert!(!module.is_null(), "extension loader returned NULL module");
-    let module_name = intern("capi_refpin_ext");
-    let function = module_attr(module_name, intern("exercise")).expect("exercise registered");
-    let result = unsafe { pon_call(function, ptr::null_mut(), 0) };
-    assert!(
-        !result.is_null(),
-        "exercise() returned NULL: {:?}",
-        pon_err_message()
-    );
-    assert_eq!(format_object_for_print(result).as_deref(), Ok("7"));
+	let module = load_extension_module("capi_refpin_ext", &module_path)
+		.unwrap_or_else(|message| panic!("failed to load refpin C extension: {message}"));
+	assert!(!module.is_null(), "extension loader returned NULL module");
+	let module_name = intern("capi_refpin_ext");
+	let function = module_attr(module_name, intern("exercise")).expect("exercise registered");
+	let result = unsafe { pon_call(function, ptr::null_mut(), 0) };
+	assert!(!result.is_null(), "exercise() returned NULL: {:?}", pon_err_message());
+	assert_eq!(format_object_for_print(result).as_deref(), Ok("7"));
 }
 
 #[test]
 fn gc_tracked_c_type_traverse_roots_payload() {
-    let _guard = test_state_lock();
-    let _reset = ResetImportStateOnDrop;
-    unsafe {
-        assert_eq!(pon_runtime_init(), 0);
-    }
-    pon_err_clear();
-    reset_import_state_for_tests();
+	let _guard = test_state_lock();
+	let _reset = ResetImportStateOnDrop;
+	unsafe {
+		assert_eq!(pon_runtime_init(), 0);
+	}
+	pon_err_clear();
+	reset_import_state_for_tests();
 
-    let temp = TempExtensionRoot::new();
-    let module_path = compile_extension(
-        &temp,
-        "capi_gc_traverse_ext",
-        r#"
+	let temp = TempExtensionRoot::new();
+	let module_path = compile_extension(
+		&temp,
+		"capi_gc_traverse_ext",
+		r#"
 #include <Python.h>
 #include <structmember.h>
 
@@ -540,37 +548,33 @@ PyMODINIT_FUNC PyInit_capi_gc_traverse_ext(void) {
     return m;
 }
 "#,
-    );
+	);
 
-    let module = load_extension_module("capi_gc_traverse_ext", &module_path)
-        .unwrap_or_else(|message| panic!("failed to load GC traversal C extension: {message}"));
-    assert!(!module.is_null(), "extension loader returned NULL module");
-    let module_name = intern("capi_gc_traverse_ext");
-    let function = module_attr(module_name, intern("drive")).expect("drive registered");
-    let result = unsafe { pon_call(function, ptr::null_mut(), 0) };
-    assert!(
-        !result.is_null(),
-        "drive() returned NULL: {:?}",
-        pon_err_message()
-    );
-    assert_eq!(format_object_for_print(result).as_deref(), Ok("32767"));
+	let module = load_extension_module("capi_gc_traverse_ext", &module_path)
+		.unwrap_or_else(|message| panic!("failed to load GC traversal C extension: {message}"));
+	assert!(!module.is_null(), "extension loader returned NULL module");
+	let module_name = intern("capi_gc_traverse_ext");
+	let function = module_attr(module_name, intern("drive")).expect("drive registered");
+	let result = unsafe { pon_call(function, ptr::null_mut(), 0) };
+	assert!(!result.is_null(), "drive() returned NULL: {:?}", pon_err_message());
+	assert_eq!(format_object_for_print(result).as_deref(), Ok("32767"));
 }
 
 #[test]
 fn c_api_str_subclass_layout_trailing_fields_survive_unicode_probes() {
-    let _guard = test_state_lock();
-    let _reset = ResetImportStateOnDrop;
-    unsafe {
-        assert_eq!(pon_runtime_init(), 0);
-    }
-    pon_err_clear();
-    reset_import_state_for_tests();
+	let _guard = test_state_lock();
+	let _reset = ResetImportStateOnDrop;
+	unsafe {
+		assert_eq!(pon_runtime_init(), 0);
+	}
+	pon_err_clear();
+	reset_import_state_for_tests();
 
-    let temp = TempExtensionRoot::new();
-    let module_path = compile_extension(
-        &temp,
-        "capi_str_subclass_layout_ext",
-        r#"
+	let temp = TempExtensionRoot::new();
+	let module_path = compile_extension(
+		&temp,
+		"capi_str_subclass_layout_ext",
+		r#"
 #include <Python.h>
 #include <string.h>
 
@@ -746,18 +750,15 @@ PyMODINIT_FUNC PyInit_capi_str_subclass_layout_ext(void) {
     return PyModule_Create(&module);
 }
 "#,
-    );
+	);
 
-    let module = load_extension_module("capi_str_subclass_layout_ext", &module_path)
-        .unwrap_or_else(|message| panic!("failed to load str-subclass layout C extension: {message}"));
-    assert!(!module.is_null(), "extension loader returned NULL module");
-    let module_name = intern("capi_str_subclass_layout_ext");
-    let function = module_attr(module_name, intern("drive")).expect("drive registered");
-    let result = unsafe { pon_call(function, ptr::null_mut(), 0) };
-    assert!(
-        !result.is_null(),
-        "drive() returned NULL: {:?}",
-        pon_err_message()
-    );
-    assert_eq!(format_object_for_print(result).as_deref(), Ok("63"));
+	let module = load_extension_module("capi_str_subclass_layout_ext", &module_path).unwrap_or_else(
+		|message| panic!("failed to load str-subclass layout C extension: {message}"),
+	);
+	assert!(!module.is_null(), "extension loader returned NULL module");
+	let module_name = intern("capi_str_subclass_layout_ext");
+	let function = module_attr(module_name, intern("drive")).expect("drive registered");
+	let result = unsafe { pon_call(function, ptr::null_mut(), 0) };
+	assert!(!result.is_null(), "drive() returned NULL: {:?}", pon_err_message());
+	assert_eq!(format_object_for_print(result).as_deref(), Ok("63"));
 }

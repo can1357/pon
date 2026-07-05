@@ -13,21 +13,22 @@ The end goal is the bun/v8 of Python: a runtime that passes the CPython test sui
 ```sh
 # JIT: parse → IR → Cranelift → run, in-process
 printf 'def add(a, b):\n    return a + b\n\nprint("hello, world")\nprint(add(2, 3))\n' > hello.py
-cargo run -p pon-cli -- run hello.py
+cargo run -p pon -- run hello.py
 
 # AoT: same IR through cranelift-object, linked into a native executable
-cargo run -p pon-cli -- build hello.py -o hello
+cargo run -p pon -- build hello.py -o hello
 ./hello
 ```
 
 Both paths print the same bytes CPython would. That property is not aspirational — it is the exit gate of the conformance suite (see [Conformance](#conformance--testing)).
 
 ```
-usage: pon run <file>
-       pon build <file> -o <out> [--allow-dynamic] [--opt] [--target <triple>]
+pon run <file> [args]
+pon build <file> -o <out> [--allow-dynamic] [--opt] [--target <triple>]
+pon repl
+pon -c 'print(40 + 2)'
+pon - < script.py
 ```
-
-`pon repl` is not implemented yet.
 
 ## Architecture
 
@@ -69,8 +70,7 @@ pon-gc       (Green Tea garbage collector)
 | `pon-runtime` | object model, builtins, stdlib native modules, the `pon_*` helper ABI |
 | `pon-gc` | Green Tea garbage collector |
 | `pon-abi` | ABI types shared between codegen and runtime |
-| `pon-cli` | `pon run` / `pon build` entry points (library-first, reused by `pon-pm`) |
-| `pon-pm` | package manager: PyPI index client, resolver, wheel/sdist install |
+| `pon` | the `pon` binary: `run`/`build`/`repl` entry points + package manager (index client, resolver, wheel/sdist install) |
 | `pon-conformance` | differential conformance suites, fuzzing, benchmarks, floor ratchets |
 
 All dependencies are declared once in the root `Cargo.toml` under `[workspace.dependencies]`; member crates only inherit (see [`AGENTS.md`](AGENTS.md)).
@@ -104,10 +104,10 @@ Corpus files are immutable once landed: new coverage is a new module, verified b
 
 ## Package manager
 
-`pon-pm` is a uv-style package manager built on `pubgrub` resolution and the standard `pyproject.toml`, targeting the PyPI simple index, wheels, sdists, editable installs, and VCS requirements. It delegates script execution to the same `pon-cli` library entry points so `pon-pm run` behaves exactly like `pon run` with managed import roots. It is under active development and not yet integrated into the runtime gates.
+`pon` includes a uv-style package manager built on `pubgrub` resolution and the standard `pyproject.toml`, targeting the PyPI simple index, wheels, sdists, editable installs, and VCS requirements. Its `run` command executes through the same runtime path as direct script dispatch while adding managed import roots. It is under active development and not yet integrated into the runtime gates.
 
 ```
-pon-pm init | add | remove | install | lock | run | list | freeze | show | download | check | cache | env
+pon init | add | remove | install | lock | run | list | freeze | show | download | check | cache | env
 ```
 
 ## Pinned toolchain

@@ -9,10 +9,9 @@
 //! Divergence note: CPython's `posix.environ` is bytes-keyed; pon serves the
 //! str-keyed snapshot shared with `os.environ` (see `os::environ_snapshot`).
 
+use super::install_module;
 use crate::object::PyObject;
 
-use super::install_module;
-
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
-    install_module("posix", super::os::build_attrs("posix")?)
+	install_module("posix", super::os::build_attrs("posix")?)
 }

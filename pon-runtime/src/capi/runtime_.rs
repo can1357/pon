@@ -1,27 +1,36 @@
-//! Runtime family: memory-adjacent process services, capsules, imports, modules, and sys access.
+//! Runtime family: memory-adjacent process services, capsules, imports,
+//! modules, and sys access.
 
-use core::ffi::{c_char, c_int, c_void};
-use core::mem;
-use core::ptr;
-use std::collections::HashMap;
-use std::ffi::{CStr, CString};
-use std::sync::{LazyLock, Mutex};
+use core::{
+	ffi::{c_char, c_int, c_void},
+	mem, ptr,
+};
+use std::{
+	collections::HashMap,
+	ffi::{CStr, CString},
+	sync::{LazyLock, Mutex},
+};
 
 use num_traits::ToPrimitive;
 use pon_gc::{GcTypeInfo, TypeId};
 
-use crate::abi;
-use crate::intern::{intern, resolve};
-use crate::object::{PyObject, PyObjectHeader, PyType, is_exact_type};
-use crate::thread_state::{pon_err_clear, pon_err_message, pon_err_occurred};
-use crate::types::exc::ExceptionKind;
-use crate::types::async_generator::ensure_async_generator_type;
-use crate::types::coroutine::ensure_coroutine_type;
-use crate::types::frame::{TYPE_ID_FRAME, ensure_frame_type, finalize_frame, trace_frame};
-use crate::types::generator::ensure_generator_type;
-
-use super::twin::{self, ForeignTypeObject};
-use super::{PyModuleDef, c_string};
+use super::{
+	PyModuleDef, c_string,
+	twin::{self, ForeignTypeObject},
+};
+use crate::{
+	abi,
+	intern::{intern, resolve},
+	object::{PyObject, PyObjectHeader, PyType, is_exact_type},
+	thread_state::{pon_err_clear, pon_err_message, pon_err_occurred},
+	types::{
+		async_generator::ensure_async_generator_type,
+		coroutine::ensure_coroutine_type,
+		exc::ExceptionKind,
+		frame::{TYPE_ID_FRAME, ensure_frame_type, finalize_frame, trace_frame},
+		generator::ensure_generator_type,
+	},
+};
 
 pub(crate) type PyCapsuleDestructor = Option<unsafe extern "C" fn(*mut PyObject)>;
 type PySendResult = c_int;
@@ -29,89 +38,96 @@ const PYGEN_RETURN: PySendResult = 0;
 const PYGEN_ERROR: PySendResult = -1;
 const PYGEN_NEXT: PySendResult = 1;
 
-
 /// C mirror: `include/pon_capi/runtime.h` `PyPonCapiRuntime`.
 #[repr(C)]
 pub(crate) struct PyPonCapiRuntime {
-    eval_save_thread: unsafe extern "C" fn() -> *mut c_void,
-    eval_restore_thread: unsafe extern "C" fn(*mut c_void),
-    capsule_new: unsafe extern "C" fn(*mut c_void, *const c_char, PyCapsuleDestructor) -> *mut PyObject,
-    capsule_get_pointer: unsafe extern "C" fn(*mut PyObject, *const c_char) -> *mut c_void,
-    capsule_is_valid: unsafe extern "C" fn(*mut PyObject, *const c_char) -> c_int,
-    capsule_set_context: unsafe extern "C" fn(*mut PyObject, *mut c_void) -> c_int,
-    capsule_get_context: unsafe extern "C" fn(*mut PyObject) -> *mut c_void,
-    capsule_import: unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void,
-    import_import_module: unsafe extern "C" fn(*const c_char) -> *mut PyObject,
-    import_add_module: unsafe extern "C" fn(*const c_char) -> *mut PyObject,
-    module_get_dict: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
-    module_get_state: unsafe extern "C" fn(*mut PyObject) -> *mut c_void,
-    module_get_name: unsafe extern "C" fn(*mut PyObject) -> *const c_char,
-    sys_get_object: unsafe extern "C" fn(*const c_char) -> *mut PyObject,
-    module_def_init: unsafe extern "C" fn(*mut PyModuleDef) -> *mut PyObject,
-    thread_state_get: unsafe extern "C" fn() -> *mut c_void,
-    thread_state_get_frame: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
-    interpreter_state_main: unsafe extern "C" fn() -> *mut c_void,
-    eval_get_builtins: unsafe extern "C" fn() -> *mut PyObject,
-    frame_get_back: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
-    frame_get_code: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
-    contextvar_new: unsafe extern "C" fn(*const c_char, *mut PyObject) -> *mut PyObject,
-    contextvar_get: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut *mut PyObject) -> c_int,
-    datetime_capi_import: unsafe extern "C" fn() -> *mut c_void,
-    datetime_get_attr_int: unsafe extern "C" fn(*mut PyObject, *const c_char) -> c_int,
-    capsule_set_name: unsafe extern "C" fn(*mut PyObject, *const c_char) -> c_int,
-    import_import: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
-    #[cfg(test)]
-    test_collect_pin_count: unsafe extern "C" fn(*mut PyObject) -> isize,
-    contextvar_set: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    frame_new: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut PyObject, *mut PyObject) -> *mut c_void,
-    traceback_here: unsafe extern "C" fn(*mut c_void) -> c_int,
-    traceback_check: unsafe extern "C" fn(*mut PyObject) -> c_int,
-    code_new_empty: unsafe extern "C" fn(*const c_char, *const c_char, c_int) -> *mut c_void,
-    code_new: unsafe extern "C" fn(
-        c_int,
-        c_int,
-        c_int,
-        c_int,
-        c_int,
-        *mut PyObject,
-        *mut PyObject,
-        *mut PyObject,
-        *mut PyObject,
-        *mut PyObject,
-        *mut PyObject,
-        *mut PyObject,
-        *mut PyObject,
-        *mut PyObject,
-        c_int,
-        *mut PyObject,
-        *mut PyObject,
-    ) -> *mut c_void,
-    code_new_with_posonly_args: unsafe extern "C" fn(
-        c_int,
-        c_int,
-        c_int,
-        c_int,
-        c_int,
-        c_int,
-        *mut PyObject,
-        *mut PyObject,
-        *mut PyObject,
-        *mut PyObject,
-        *mut PyObject,
-        *mut PyObject,
-        *mut PyObject,
-        *mut PyObject,
-        *mut PyObject,
-        c_int,
-        *mut PyObject,
-        *mut PyObject,
-    ) -> *mut c_void,
-    code_get_num_free: unsafe extern "C" fn(*mut c_void) -> c_int,
-    code_has_free_vars: unsafe extern "C" fn(*mut c_void) -> c_int,
-    import_import_module_level:
-        unsafe extern "C" fn(*const c_char, *mut PyObject, *mut PyObject, *mut PyObject, c_int) -> *mut PyObject,
-    iter_send: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut *mut PyObject) -> PySendResult,
-    async_gen_check_exact: unsafe extern "C" fn(*mut PyObject) -> c_int,
+	eval_save_thread:           unsafe extern "C" fn() -> *mut c_void,
+	eval_restore_thread:        unsafe extern "C" fn(*mut c_void),
+	capsule_new:
+		unsafe extern "C" fn(*mut c_void, *const c_char, PyCapsuleDestructor) -> *mut PyObject,
+	capsule_get_pointer:        unsafe extern "C" fn(*mut PyObject, *const c_char) -> *mut c_void,
+	capsule_is_valid:           unsafe extern "C" fn(*mut PyObject, *const c_char) -> c_int,
+	capsule_set_context:        unsafe extern "C" fn(*mut PyObject, *mut c_void) -> c_int,
+	capsule_get_context:        unsafe extern "C" fn(*mut PyObject) -> *mut c_void,
+	capsule_import:             unsafe extern "C" fn(*const c_char, c_int) -> *mut c_void,
+	import_import_module:       unsafe extern "C" fn(*const c_char) -> *mut PyObject,
+	import_add_module:          unsafe extern "C" fn(*const c_char) -> *mut PyObject,
+	module_get_dict:            unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+	module_get_state:           unsafe extern "C" fn(*mut PyObject) -> *mut c_void,
+	module_get_name:            unsafe extern "C" fn(*mut PyObject) -> *const c_char,
+	sys_get_object:             unsafe extern "C" fn(*const c_char) -> *mut PyObject,
+	module_def_init:            unsafe extern "C" fn(*mut PyModuleDef) -> *mut PyObject,
+	thread_state_get:           unsafe extern "C" fn() -> *mut c_void,
+	thread_state_get_frame:     unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+	interpreter_state_main:     unsafe extern "C" fn() -> *mut c_void,
+	eval_get_builtins:          unsafe extern "C" fn() -> *mut PyObject,
+	frame_get_back:             unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+	frame_get_code:             unsafe extern "C" fn(*mut c_void) -> *mut c_void,
+	contextvar_new:             unsafe extern "C" fn(*const c_char, *mut PyObject) -> *mut PyObject,
+	contextvar_get: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut *mut PyObject) -> c_int,
+	datetime_capi_import:       unsafe extern "C" fn() -> *mut c_void,
+	datetime_get_attr_int:      unsafe extern "C" fn(*mut PyObject, *const c_char) -> c_int,
+	capsule_set_name:           unsafe extern "C" fn(*mut PyObject, *const c_char) -> c_int,
+	import_import:              unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+	#[cfg(test)]
+	test_collect_pin_count:     unsafe extern "C" fn(*mut PyObject) -> isize,
+	contextvar_set:             unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	frame_new:
+		unsafe extern "C" fn(*mut c_void, *mut c_void, *mut PyObject, *mut PyObject) -> *mut c_void,
+	traceback_here:             unsafe extern "C" fn(*mut c_void) -> c_int,
+	traceback_check:            unsafe extern "C" fn(*mut PyObject) -> c_int,
+	code_new_empty: unsafe extern "C" fn(*const c_char, *const c_char, c_int) -> *mut c_void,
+	code_new: unsafe extern "C" fn(
+		c_int,
+		c_int,
+		c_int,
+		c_int,
+		c_int,
+		*mut PyObject,
+		*mut PyObject,
+		*mut PyObject,
+		*mut PyObject,
+		*mut PyObject,
+		*mut PyObject,
+		*mut PyObject,
+		*mut PyObject,
+		*mut PyObject,
+		c_int,
+		*mut PyObject,
+		*mut PyObject,
+	) -> *mut c_void,
+	code_new_with_posonly_args: unsafe extern "C" fn(
+		c_int,
+		c_int,
+		c_int,
+		c_int,
+		c_int,
+		c_int,
+		*mut PyObject,
+		*mut PyObject,
+		*mut PyObject,
+		*mut PyObject,
+		*mut PyObject,
+		*mut PyObject,
+		*mut PyObject,
+		*mut PyObject,
+		*mut PyObject,
+		c_int,
+		*mut PyObject,
+		*mut PyObject,
+	) -> *mut c_void,
+	code_get_num_free:          unsafe extern "C" fn(*mut c_void) -> c_int,
+	code_has_free_vars:         unsafe extern "C" fn(*mut c_void) -> c_int,
+	import_import_module_level: unsafe extern "C" fn(
+		*const c_char,
+		*mut PyObject,
+		*mut PyObject,
+		*mut PyObject,
+		c_int,
+	) -> *mut PyObject,
+	iter_send:
+		unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut *mut PyObject) -> PySendResult,
+	async_gen_check_exact:      unsafe extern "C" fn(*mut PyObject) -> c_int,
 }
 
 unsafe impl Send for PyPonCapiRuntime {}
@@ -119,11 +135,11 @@ unsafe impl Sync for PyPonCapiRuntime {}
 
 #[repr(C)]
 struct PyCapsule {
-    ob_base: PyObjectHeader,
-    pointer: *mut c_void,
-    name: *const c_char,
-    destructor: PyCapsuleDestructor,
-    context: *mut c_void,
+	ob_base:    PyObjectHeader,
+	pointer:    *mut c_void,
+	name:       *const c_char,
+	destructor: PyCapsuleDestructor,
+	context:    *mut c_void,
 }
 
 unsafe impl Send for PyCapsule {}
@@ -131,7 +147,7 @@ unsafe impl Sync for PyCapsule {}
 
 #[repr(C)]
 struct PyInterpreterState {
-    _private: u8,
+	_private: u8,
 }
 
 unsafe impl Send for PyInterpreterState {}
@@ -139,8 +155,8 @@ unsafe impl Sync for PyInterpreterState {}
 
 #[repr(C)]
 struct PyErrStackItem {
-    exc_value: *mut PyObject,
-    previous_item: *mut PyErrStackItem,
+	exc_value:     *mut PyObject,
+	previous_item: *mut PyErrStackItem,
 }
 
 unsafe impl Send for PyErrStackItem {}
@@ -148,9 +164,9 @@ unsafe impl Sync for PyErrStackItem {}
 
 #[repr(C)]
 struct PyThreadState {
-    interp: *mut PyInterpreterState,
-    exc_info: *mut PyErrStackItem,
-    exc_state: PyErrStackItem,
+	interp:    *mut PyInterpreterState,
+	exc_info:  *mut PyErrStackItem,
+	exc_state: PyErrStackItem,
 }
 
 unsafe impl Send for PyThreadState {}
@@ -162,13 +178,13 @@ const TYPE_ID_CAPI_CODE: TypeId = TypeId(143);
 
 #[repr(C)]
 struct PyCapiCodeObject {
-    ob_base: PyObjectHeader,
-    _co_firsttraceable: c_int,
-    co_firstlineno: c_int,
-    co_filename: *mut PyObject,
-    co_name: *mut PyObject,
-    co_qualname: *mut PyObject,
-    co_nfreevars: c_int,
+	ob_base:            PyObjectHeader,
+	_co_firsttraceable: c_int,
+	co_firstlineno:     c_int,
+	co_filename:        *mut PyObject,
+	co_name:            *mut PyObject,
+	co_qualname:        *mut PyObject,
+	co_nfreevars:       c_int,
 }
 
 unsafe impl Send for PyCapiCodeObject {}
@@ -176,42 +192,60 @@ unsafe impl Sync for PyCapiCodeObject {}
 
 #[repr(C)]
 struct PyDateTimeCapi {
-    date_type: *mut ForeignTypeObject,
-    datetime_type: *mut ForeignTypeObject,
-    time_type: *mut ForeignTypeObject,
-    delta_type: *mut ForeignTypeObject,
-    tzinfo_type: *mut ForeignTypeObject,
-    timezone_utc: *mut PyObject,
-    date_from_date: unsafe extern "C" fn(c_int, c_int, c_int, *mut ForeignTypeObject) -> *mut PyObject,
-    datetime_from_date_and_time: unsafe extern "C" fn(
-        c_int,
-        c_int,
-        c_int,
-        c_int,
-        c_int,
-        c_int,
-        c_int,
-        *mut PyObject,
-        *mut ForeignTypeObject,
-    ) -> *mut PyObject,
-    time_from_time: unsafe extern "C" fn(c_int, c_int, c_int, c_int, *mut PyObject, *mut ForeignTypeObject) -> *mut PyObject,
-    delta_from_delta: unsafe extern "C" fn(c_int, c_int, c_int, c_int, *mut ForeignTypeObject) -> *mut PyObject,
-    timezone_from_timezone: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    datetime_from_timestamp: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject,
-    date_from_timestamp: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    datetime_from_date_and_time_and_fold: unsafe extern "C" fn(
-        c_int,
-        c_int,
-        c_int,
-        c_int,
-        c_int,
-        c_int,
-        c_int,
-        *mut PyObject,
-        c_int,
-        *mut ForeignTypeObject,
-    ) -> *mut PyObject,
-    time_from_time_and_fold: unsafe extern "C" fn(c_int, c_int, c_int, c_int, *mut PyObject, c_int, *mut ForeignTypeObject) -> *mut PyObject,
+	date_type: *mut ForeignTypeObject,
+	datetime_type: *mut ForeignTypeObject,
+	time_type: *mut ForeignTypeObject,
+	delta_type: *mut ForeignTypeObject,
+	tzinfo_type: *mut ForeignTypeObject,
+	timezone_utc: *mut PyObject,
+	date_from_date:
+		unsafe extern "C" fn(c_int, c_int, c_int, *mut ForeignTypeObject) -> *mut PyObject,
+	datetime_from_date_and_time: unsafe extern "C" fn(
+		c_int,
+		c_int,
+		c_int,
+		c_int,
+		c_int,
+		c_int,
+		c_int,
+		*mut PyObject,
+		*mut ForeignTypeObject,
+	) -> *mut PyObject,
+	time_from_time: unsafe extern "C" fn(
+		c_int,
+		c_int,
+		c_int,
+		c_int,
+		*mut PyObject,
+		*mut ForeignTypeObject,
+	) -> *mut PyObject,
+	delta_from_delta:
+		unsafe extern "C" fn(c_int, c_int, c_int, c_int, *mut ForeignTypeObject) -> *mut PyObject,
+	timezone_from_timezone: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	datetime_from_timestamp:
+		unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject,
+	date_from_timestamp: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	datetime_from_date_and_time_and_fold: unsafe extern "C" fn(
+		c_int,
+		c_int,
+		c_int,
+		c_int,
+		c_int,
+		c_int,
+		c_int,
+		*mut PyObject,
+		c_int,
+		*mut ForeignTypeObject,
+	) -> *mut PyObject,
+	time_from_time_and_fold: unsafe extern "C" fn(
+		c_int,
+		c_int,
+		c_int,
+		c_int,
+		*mut PyObject,
+		c_int,
+		*mut ForeignTypeObject,
+	) -> *mut PyObject,
 }
 
 unsafe impl Send for PyDateTimeCapi {}
@@ -220,499 +254,518 @@ unsafe impl Sync for PyDateTimeCapi {}
 static DATETIME_CAPI: LazyLock<Mutex<Option<usize>>> = LazyLock::new(|| Mutex::new(None));
 const DATETIME_CAPSULE_NAME: &str = "datetime.datetime_CAPI";
 
-static MAIN_INTERPRETER_STATE: LazyLock<PyInterpreterState> = LazyLock::new(|| PyInterpreterState { _private: 0 });
+static MAIN_INTERPRETER_STATE: LazyLock<PyInterpreterState> =
+	LazyLock::new(|| PyInterpreterState { _private: 0 });
 static MAIN_THREAD_STATE: LazyLock<usize> = LazyLock::new(|| {
-    let mut state = Box::new(PyThreadState {
-        interp: interpreter_state_main(),
-        exc_info: ptr::null_mut(),
-        exc_state: PyErrStackItem {
-            exc_value: ptr::null_mut(),
-            previous_item: ptr::null_mut(),
-        },
-    });
-    state.exc_info = &mut state.exc_state;
-    Box::into_raw(state) as usize
+	let mut state = Box::new(PyThreadState {
+		interp:    interpreter_state_main(),
+		exc_info:  ptr::null_mut(),
+		exc_state: PyErrStackItem { exc_value: ptr::null_mut(), previous_item: ptr::null_mut() },
+	});
+	state.exc_info = &mut state.exc_state;
+	Box::into_raw(state) as usize
 });
-static MODULE_STATES: LazyLock<Mutex<HashMap<usize, Box<[u8]>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-
+static MODULE_STATES: LazyLock<Mutex<HashMap<usize, Box<[u8]>>>> =
+	LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(crate) fn build() -> PyPonCapiRuntime {
-    PyPonCapiRuntime {
-        eval_save_thread: capi_eval_save_thread,
-        eval_restore_thread: capi_eval_restore_thread,
-        capsule_new: capi_capsule_new,
-        capsule_get_pointer: capi_capsule_get_pointer,
-        capsule_is_valid: capi_capsule_is_valid,
-        capsule_set_context: capi_capsule_set_context,
-        capsule_get_context: capi_capsule_get_context,
-        capsule_import: capi_capsule_import,
-        import_import_module: capi_import_import_module,
-        import_add_module: capi_import_add_module,
-        module_get_dict: capi_module_get_dict,
-        module_get_state: capi_module_get_state,
-        module_get_name: capi_module_get_name,
-        sys_get_object: capi_sys_get_object,
-        module_def_init: super::py_module_def_init,
-        thread_state_get: capi_thread_state_get,
-        thread_state_get_frame: capi_thread_state_get_frame,
-        interpreter_state_main: capi_interpreter_state_main,
-        eval_get_builtins: capi_eval_get_builtins,
-        frame_get_back: capi_frame_get_back,
-        frame_get_code: capi_frame_get_code,
-        contextvar_new: capi_contextvar_new,
-        contextvar_get: capi_contextvar_get,
-        datetime_capi_import: capi_datetime_capi_import,
-        datetime_get_attr_int: capi_datetime_get_attr_int,
-        capsule_set_name: capi_capsule_set_name,
-        import_import: capi_import_import,
-        #[cfg(test)]
-        test_collect_pin_count: capi_test_collect_pin_count,
-        contextvar_set: capi_contextvar_set,
-        frame_new: capi_frame_new,
-        traceback_here: capi_traceback_here,
-        traceback_check: capi_traceback_check,
-        code_new_empty: capi_code_new_empty,
-        code_new: capi_code_new,
-        code_new_with_posonly_args: capi_code_new_with_posonly_args,
-        code_get_num_free: capi_code_get_num_free,
-        code_has_free_vars: capi_code_has_free_vars,
-        import_import_module_level: capi_import_import_module_level,
-        iter_send: capi_iter_send,
-        async_gen_check_exact: capi_async_gen_check_exact,
-    }
+	PyPonCapiRuntime {
+		eval_save_thread: capi_eval_save_thread,
+		eval_restore_thread: capi_eval_restore_thread,
+		capsule_new: capi_capsule_new,
+		capsule_get_pointer: capi_capsule_get_pointer,
+		capsule_is_valid: capi_capsule_is_valid,
+		capsule_set_context: capi_capsule_set_context,
+		capsule_get_context: capi_capsule_get_context,
+		capsule_import: capi_capsule_import,
+		import_import_module: capi_import_import_module,
+		import_add_module: capi_import_add_module,
+		module_get_dict: capi_module_get_dict,
+		module_get_state: capi_module_get_state,
+		module_get_name: capi_module_get_name,
+		sys_get_object: capi_sys_get_object,
+		module_def_init: super::py_module_def_init,
+		thread_state_get: capi_thread_state_get,
+		thread_state_get_frame: capi_thread_state_get_frame,
+		interpreter_state_main: capi_interpreter_state_main,
+		eval_get_builtins: capi_eval_get_builtins,
+		frame_get_back: capi_frame_get_back,
+		frame_get_code: capi_frame_get_code,
+		contextvar_new: capi_contextvar_new,
+		contextvar_get: capi_contextvar_get,
+		datetime_capi_import: capi_datetime_capi_import,
+		datetime_get_attr_int: capi_datetime_get_attr_int,
+		capsule_set_name: capi_capsule_set_name,
+		import_import: capi_import_import,
+		#[cfg(test)]
+		test_collect_pin_count: capi_test_collect_pin_count,
+		contextvar_set: capi_contextvar_set,
+		frame_new: capi_frame_new,
+		traceback_here: capi_traceback_here,
+		traceback_check: capi_traceback_check,
+		code_new_empty: capi_code_new_empty,
+		code_new: capi_code_new,
+		code_new_with_posonly_args: capi_code_new_with_posonly_args,
+		code_get_num_free: capi_code_get_num_free,
+		code_has_free_vars: capi_code_has_free_vars,
+		import_import_module_level: capi_import_import_module_level,
+		iter_send: capi_iter_send,
+		async_gen_check_exact: capi_async_gen_check_exact,
+	}
 }
 
 #[must_use]
 pub(crate) fn capsule_type() -> *mut PyType {
-    static CAPSULE_TYPE: LazyLock<usize> = LazyLock::new(|| {
-        let ty = PyType::new(ptr::null(), "PyCapsule", mem::size_of::<PyCapsule>());
-        Box::into_raw(Box::new(ty)) as usize
-    });
-    *CAPSULE_TYPE as *mut PyType
+	static CAPSULE_TYPE: LazyLock<usize> = LazyLock::new(|| {
+		let ty = PyType::new(ptr::null(), "PyCapsule", mem::size_of::<PyCapsule>());
+		Box::into_raw(Box::new(ty)) as usize
+	});
+	*CAPSULE_TYPE as *mut PyType
 }
 
 fn interpreter_state_main() -> *mut PyInterpreterState {
-    ptr::from_ref(&*MAIN_INTERPRETER_STATE).cast_mut()
+	ptr::from_ref(&*MAIN_INTERPRETER_STATE).cast_mut()
 }
 
 fn thread_state_singleton() -> *mut PyThreadState {
-    *MAIN_THREAD_STATE as *mut PyThreadState
+	*MAIN_THREAD_STATE as *mut PyThreadState
 }
 pub(super) fn register_module_state(module: *mut PyObject, size: usize) -> Result<(), String> {
-    if module.is_null() {
-        return Err("cannot allocate module state for NULL module".to_owned());
-    }
-    let allocation_len = size.max(1);
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(allocation_len)
-        .map_err(|_| format!("failed to allocate {size} bytes of module state"))?;
-    bytes.resize(allocation_len, 0);
-    MODULE_STATES
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .insert(module as usize, bytes.into_boxed_slice());
-    Ok(())
+	if module.is_null() {
+		return Err("cannot allocate module state for NULL module".to_owned());
+	}
+	let allocation_len = size.max(1);
+	let mut bytes = Vec::new();
+	bytes
+		.try_reserve_exact(allocation_len)
+		.map_err(|_| format!("failed to allocate {size} bytes of module state"))?;
+	bytes.resize(allocation_len, 0);
+	MODULE_STATES
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner())
+		.insert(module as usize, bytes.into_boxed_slice());
+	Ok(())
 }
 
 pub(super) fn unregister_module_state(module: *mut PyObject) {
-    MODULE_STATES
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner())
-        .remove(&(module as usize));
+	MODULE_STATES
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner())
+		.remove(&(module as usize));
 }
 
 fn new_reference(object: *mut PyObject) -> *mut PyObject {
-    super::pin_new_reference(object)
+	super::pin_new_reference(object)
 }
 
-
 unsafe extern "C" fn capi_eval_save_thread() -> *mut c_void {
-    thread_state_singleton().cast::<c_void>()
+	thread_state_singleton().cast::<c_void>()
 }
 
 unsafe extern "C" fn capi_eval_restore_thread(_state: *mut c_void) {}
 
 unsafe extern "C" fn capi_thread_state_get() -> *mut c_void {
-    thread_state_singleton().cast::<c_void>()
+	thread_state_singleton().cast::<c_void>()
 }
 
 /// Pon does not expose materialized frame objects through the C API yet.
 /// CPython documents a NULL return here when no current frame is available, so
 /// this is a semantically valid degenerate result rather than a fake frame.
 unsafe extern "C" fn capi_thread_state_get_frame(_state: *mut c_void) -> *mut c_void {
-    ptr::null_mut()
+	ptr::null_mut()
 }
 
 unsafe extern "C" fn capi_interpreter_state_main() -> *mut c_void {
-    interpreter_state_main().cast::<c_void>()
+	interpreter_state_main().cast::<c_void>()
 }
 
 unsafe extern "C" fn capi_eval_get_builtins() -> *mut PyObject {
-    let builtins = import_module_text("builtins");
-    if builtins.is_null() {
-        return ptr::null_mut();
-    }
-    unsafe { capi_module_get_dict(builtins) }
+	let builtins = import_module_text("builtins");
+	if builtins.is_null() {
+		return ptr::null_mut();
+	}
+	unsafe { capi_module_get_dict(builtins) }
 }
 
 unsafe extern "C" fn capi_frame_get_back(_frame: *mut c_void) -> *mut c_void {
-    raise_system_error("PyFrame_GetBack is not implemented: Pon exposes no C-visible frame objects");
-    ptr::null_mut()
+	raise_system_error("PyFrame_GetBack is not implemented: Pon exposes no C-visible frame objects");
+	ptr::null_mut()
 }
 
 unsafe extern "C" fn capi_frame_get_code(_frame: *mut c_void) -> *mut c_void {
-    raise_system_error("PyFrame_GetCode is not implemented: Pon exposes no C-visible frame objects");
-    ptr::null_mut()
+	raise_system_error("PyFrame_GetCode is not implemented: Pon exposes no C-visible frame objects");
+	ptr::null_mut()
 }
 
 unsafe extern "C" fn capi_frame_new(
-    _tstate: *mut c_void,
-    code: *mut c_void,
-    _globals: *mut PyObject,
-    _locals: *mut PyObject,
+	_tstate: *mut c_void,
+	code: *mut c_void,
+	_globals: *mut PyObject,
+	_locals: *mut PyObject,
 ) -> *mut c_void {
-    if code.is_null() {
-        return raise_system_error_null("PyFrame_New called with NULL code").cast::<c_void>();
-    }
-    let frame_type = ensure_frame_type(abi::runtime_type_type());
-    let info = GcTypeInfo {
-        size: mem::size_of::<abi::PyFrame>(),
-        trace: trace_frame,
-        finalize: Some(finalize_frame),
-    };
-    let block = match abi::alloc_gc_object(TYPE_ID_FRAME, info) {
-        Ok(block) => block,
-        Err(message) => return raise_system_error_null(&message).cast::<c_void>(),
-    };
-    let frame = block.cast::<abi::PyFrame>();
-    let firstlineno = unsafe { (*code.cast::<PyCapiCodeObject>()).co_firstlineno };
-    let line = if firstlineno > 0 { firstlineno as u32 } else { 0 };
-    unsafe {
-        ptr::write(frame, abi::PyFrame::new(frame_type.cast_const(), 0, ptr::null_mut()));
-        (*frame).line = line;
-    }
-    new_reference(frame.cast::<PyObject>()).cast::<c_void>()
+	if code.is_null() {
+		return raise_system_error_null("PyFrame_New called with NULL code").cast::<c_void>();
+	}
+	let frame_type = ensure_frame_type(abi::runtime_type_type());
+	let info = GcTypeInfo {
+		size:     mem::size_of::<abi::PyFrame>(),
+		trace:    trace_frame,
+		finalize: Some(finalize_frame),
+	};
+	let block = match abi::alloc_gc_object(TYPE_ID_FRAME, info) {
+		Ok(block) => block,
+		Err(message) => return raise_system_error_null(&message).cast::<c_void>(),
+	};
+	let frame = block.cast::<abi::PyFrame>();
+	let firstlineno = unsafe { (*code.cast::<PyCapiCodeObject>()).co_firstlineno };
+	let line = if firstlineno > 0 {
+		firstlineno as u32
+	} else {
+		0
+	};
+	unsafe {
+		ptr::write(frame, abi::PyFrame::new(frame_type.cast_const(), 0, ptr::null_mut()));
+		(*frame).line = line;
+	}
+	new_reference(frame.cast::<PyObject>()).cast::<c_void>()
 }
 
 unsafe extern "C" fn capi_traceback_here(frame: *mut c_void) -> c_int {
-    match abi::exc::prepend_traceback_for_frame(frame.cast::<abi::PyFrame>()) {
-        Ok(()) => 0,
-        Err(message) => {
-            raise_system_error(&message);
-            -1
-        }
-    }
+	match abi::exc::prepend_traceback_for_frame(frame.cast::<abi::PyFrame>()) {
+		Ok(()) => 0,
+		Err(message) => {
+			raise_system_error(&message);
+			-1
+		},
+	}
 }
 
 unsafe extern "C" fn capi_traceback_check(object: *mut PyObject) -> c_int {
-    if object.is_null() || !crate::tag::is_heap(object) {
-        return 0;
-    }
-    let traceback_type = crate::traceback::ensure_traceback_type(abi::runtime_type_type());
-    (unsafe { (*object).ob_type } == traceback_type.cast_const()) as c_int
+	if object.is_null() || !crate::tag::is_heap(object) {
+		return 0;
+	}
+	let traceback_type = crate::traceback::ensure_traceback_type(abi::runtime_type_type());
+	(unsafe { (*object).ob_type } == traceback_type.cast_const()) as c_int
 }
 
 unsafe extern "C" fn capi_code_new_empty(
-    filename: *const c_char,
-    funcname: *const c_char,
-    firstlineno: c_int,
+	filename: *const c_char,
+	funcname: *const c_char,
+	firstlineno: c_int,
 ) -> *mut c_void {
-    let Some(filename) = c_string(filename) else {
-        return raise_system_error_null("PyCode_NewEmpty called with invalid filename").cast::<c_void>();
-    };
-    let Some(funcname) = c_string(funcname) else {
-        return raise_system_error_null("PyCode_NewEmpty called with invalid function name").cast::<c_void>();
-    };
-    let Some(filename_object) = unicode_object_from_str(&filename) else {
-        return ptr::null_mut();
-    };
-    let Some(name_object) = unicode_object_from_str(&funcname) else {
-        return ptr::null_mut();
-    };
-    alloc_capi_code_object(filename_object, name_object, name_object, firstlineno, 0)
+	let Some(filename) = c_string(filename) else {
+		return raise_system_error_null("PyCode_NewEmpty called with invalid filename")
+			.cast::<c_void>();
+	};
+	let Some(funcname) = c_string(funcname) else {
+		return raise_system_error_null("PyCode_NewEmpty called with invalid function name")
+			.cast::<c_void>();
+	};
+	let Some(filename_object) = unicode_object_from_str(&filename) else {
+		return ptr::null_mut();
+	};
+	let Some(name_object) = unicode_object_from_str(&funcname) else {
+		return ptr::null_mut();
+	};
+	alloc_capi_code_object(filename_object, name_object, name_object, firstlineno, 0)
 }
 
 unsafe extern "C" fn capi_code_new(
-    _argcount: c_int,
-    _kwonlyargcount: c_int,
-    _nlocals: c_int,
-    _stacksize: c_int,
-    _flags: c_int,
-    _code: *mut PyObject,
-    _consts: *mut PyObject,
-    _names: *mut PyObject,
-    _varnames: *mut PyObject,
-    _freevars: *mut PyObject,
-    _cellvars: *mut PyObject,
-    filename: *mut PyObject,
-    name: *mut PyObject,
-    qualname: *mut PyObject,
-    firstlineno: c_int,
-    _linetable: *mut PyObject,
-    _exceptiontable: *mut PyObject,
+	_argcount: c_int,
+	_kwonlyargcount: c_int,
+	_nlocals: c_int,
+	_stacksize: c_int,
+	_flags: c_int,
+	_code: *mut PyObject,
+	_consts: *mut PyObject,
+	_names: *mut PyObject,
+	_varnames: *mut PyObject,
+	_freevars: *mut PyObject,
+	_cellvars: *mut PyObject,
+	filename: *mut PyObject,
+	name: *mut PyObject,
+	qualname: *mut PyObject,
+	firstlineno: c_int,
+	_linetable: *mut PyObject,
+	_exceptiontable: *mut PyObject,
 ) -> *mut c_void {
-    unsafe { capi_code_new_common(filename, name, qualname, firstlineno) }
+	unsafe { capi_code_new_common(filename, name, qualname, firstlineno) }
 }
 
 unsafe extern "C" fn capi_code_new_with_posonly_args(
-    _argcount: c_int,
-    _posonlyargcount: c_int,
-    _kwonlyargcount: c_int,
-    _nlocals: c_int,
-    _stacksize: c_int,
-    _flags: c_int,
-    _code: *mut PyObject,
-    _consts: *mut PyObject,
-    _names: *mut PyObject,
-    _varnames: *mut PyObject,
-    _freevars: *mut PyObject,
-    _cellvars: *mut PyObject,
-    filename: *mut PyObject,
-    name: *mut PyObject,
-    qualname: *mut PyObject,
-    firstlineno: c_int,
-    _linetable: *mut PyObject,
-    _exceptiontable: *mut PyObject,
+	_argcount: c_int,
+	_posonlyargcount: c_int,
+	_kwonlyargcount: c_int,
+	_nlocals: c_int,
+	_stacksize: c_int,
+	_flags: c_int,
+	_code: *mut PyObject,
+	_consts: *mut PyObject,
+	_names: *mut PyObject,
+	_varnames: *mut PyObject,
+	_freevars: *mut PyObject,
+	_cellvars: *mut PyObject,
+	filename: *mut PyObject,
+	name: *mut PyObject,
+	qualname: *mut PyObject,
+	firstlineno: c_int,
+	_linetable: *mut PyObject,
+	_exceptiontable: *mut PyObject,
 ) -> *mut c_void {
-    unsafe { capi_code_new_common(filename, name, qualname, firstlineno) }
+	unsafe { capi_code_new_common(filename, name, qualname, firstlineno) }
 }
 
 unsafe fn capi_code_new_common(
-    filename: *mut PyObject,
-    name: *mut PyObject,
-    qualname: *mut PyObject,
-    firstlineno: c_int,
+	filename: *mut PyObject,
+	name: *mut PyObject,
+	qualname: *mut PyObject,
+	firstlineno: c_int,
 ) -> *mut c_void {
-    let Some(filename) = (unsafe { code_text_arg(filename, "filename") }) else {
-        return ptr::null_mut();
-    };
-    let Some(name) = (unsafe { code_text_arg(name, "name") }) else {
-        return ptr::null_mut();
-    };
-    let qualname = if qualname.is_null() {
-        name
-    } else {
-        let Some(qualname) = (unsafe { code_text_arg(qualname, "qualname") }) else {
-            return ptr::null_mut();
-        };
-        qualname
-    };
-    alloc_capi_code_object(filename, name, qualname, firstlineno, 0)
+	let Some(filename) = (unsafe { code_text_arg(filename, "filename") }) else {
+		return ptr::null_mut();
+	};
+	let Some(name) = (unsafe { code_text_arg(name, "name") }) else {
+		return ptr::null_mut();
+	};
+	let qualname = if qualname.is_null() {
+		name
+	} else {
+		let Some(qualname) = (unsafe { code_text_arg(qualname, "qualname") }) else {
+			return ptr::null_mut();
+		};
+		qualname
+	};
+	alloc_capi_code_object(filename, name, qualname, firstlineno, 0)
 }
 
 unsafe fn code_text_arg(object: *mut PyObject, label: &str) -> Option<*mut PyObject> {
-    let object = crate::tag::untag_arg(object);
-    if object.is_null() {
-        raise_type_error(&format!("PyCode_New {label} must be str, not NULL"));
-        return None;
-    }
-    if unsafe { crate::types::type_::unicode_text(object) }.is_none() {
-        raise_type_error(&format!("PyCode_New {label} must be str"));
-        return None;
-    }
-    Some(object)
+	let object = crate::tag::untag_arg(object);
+	if object.is_null() {
+		raise_type_error(&format!("PyCode_New {label} must be str, not NULL"));
+		return None;
+	}
+	if unsafe { crate::types::type_::unicode_text(object) }.is_none() {
+		raise_type_error(&format!("PyCode_New {label} must be str"));
+		return None;
+	}
+	Some(object)
 }
 
 fn unicode_object_from_str(text: &str) -> Option<*mut PyObject> {
-    let object = unsafe { abi::pon_const_str(text.as_ptr(), text.len()) };
-    if object.is_null() { None } else { Some(object) }
+	let object = unsafe { abi::pon_const_str(text.as_ptr(), text.len()) };
+	if object.is_null() { None } else { Some(object) }
 }
 
 fn alloc_capi_code_object(
-    filename: *mut PyObject,
-    name: *mut PyObject,
-    qualname: *mut PyObject,
-    firstlineno: c_int,
-    nfreevars: c_int,
+	filename: *mut PyObject,
+	name: *mut PyObject,
+	qualname: *mut PyObject,
+	firstlineno: c_int,
+	nfreevars: c_int,
 ) -> *mut c_void {
-    let info = GcTypeInfo {
-        size: mem::size_of::<PyCapiCodeObject>(),
-        trace: trace_capi_code,
-        finalize: None,
-    };
-    let block = match abi::alloc_gc_object(TYPE_ID_CAPI_CODE, info) {
-        Ok(block) => block,
-        Err(message) => return raise_system_error_null(&message).cast::<c_void>(),
-    };
-    let code = block.cast::<PyCapiCodeObject>();
-    unsafe {
-        ptr::write(
-            code,
-            PyCapiCodeObject {
-                ob_base: PyObjectHeader::new(capi_code_type().cast_const()),
-                _co_firsttraceable: 0,
-                co_firstlineno: firstlineno,
-                co_filename: filename,
-                co_name: name,
-                co_qualname: qualname,
-                co_nfreevars: if nfreevars < 0 { 0 } else { nfreevars },
-            },
-        );
-    }
-    new_reference(code.cast::<PyObject>()).cast::<c_void>()
+	let info = GcTypeInfo {
+		size:     mem::size_of::<PyCapiCodeObject>(),
+		trace:    trace_capi_code,
+		finalize: None,
+	};
+	let block = match abi::alloc_gc_object(TYPE_ID_CAPI_CODE, info) {
+		Ok(block) => block,
+		Err(message) => return raise_system_error_null(&message).cast::<c_void>(),
+	};
+	let code = block.cast::<PyCapiCodeObject>();
+	unsafe {
+		ptr::write(code, PyCapiCodeObject {
+			ob_base:            PyObjectHeader::new(capi_code_type().cast_const()),
+			_co_firsttraceable: 0,
+			co_firstlineno:     firstlineno,
+			co_filename:        filename,
+			co_name:            name,
+			co_qualname:        qualname,
+			co_nfreevars:       if nfreevars < 0 { 0 } else { nfreevars },
+		});
+	}
+	new_reference(code.cast::<PyObject>()).cast::<c_void>()
 }
 
 fn capi_code_type() -> *mut PyType {
-    static CODE_TYPE: LazyLock<usize> = LazyLock::new(|| {
-        let mut ty = PyType::new(abi::runtime_type_type().cast_const(), "code", mem::size_of::<PyCapiCodeObject>());
-        ty.gc_type_id = TYPE_ID_CAPI_CODE.0 as usize;
-        ty.tp_getattro = Some(capi_code_getattro);
-        Box::into_raw(Box::new(ty)) as usize
-    });
-    *CODE_TYPE as *mut PyType
+	static CODE_TYPE: LazyLock<usize> = LazyLock::new(|| {
+		let mut ty = PyType::new(
+			abi::runtime_type_type().cast_const(),
+			"code",
+			mem::size_of::<PyCapiCodeObject>(),
+		);
+		ty.gc_type_id = TYPE_ID_CAPI_CODE.0 as usize;
+		ty.tp_getattro = Some(capi_code_getattro);
+		Box::into_raw(Box::new(ty)) as usize
+	});
+	*CODE_TYPE as *mut PyType
 }
 
-unsafe extern "C" fn capi_code_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
-    let Some(attr) = (unsafe { crate::types::type_::unicode_text(crate::tag::untag_arg(name)) }) else {
-        raise_type_error("code attribute name must be str");
-        return ptr::null_mut();
-    };
-    let code = unsafe { &*object.cast::<PyCapiCodeObject>() };
-    match attr {
-        "co_filename" => new_reference(code.co_filename),
-        "co_name" => new_reference(code.co_name),
-        "co_qualname" => new_reference(code.co_qualname),
-        "co_firstlineno" => unsafe { abi::pon_const_int(i64::from(code.co_firstlineno)) },
-        _ => unsafe { abi::pon_raise_attribute_error(object, intern(attr)) },
-    }
+unsafe extern "C" fn capi_code_getattro(
+	object: *mut PyObject,
+	name: *mut PyObject,
+) -> *mut PyObject {
+	let Some(attr) = (unsafe { crate::types::type_::unicode_text(crate::tag::untag_arg(name)) })
+	else {
+		raise_type_error("code attribute name must be str");
+		return ptr::null_mut();
+	};
+	let code = unsafe { &*object.cast::<PyCapiCodeObject>() };
+	match attr {
+		"co_filename" => new_reference(code.co_filename),
+		"co_name" => new_reference(code.co_name),
+		"co_qualname" => new_reference(code.co_qualname),
+		"co_firstlineno" => unsafe { abi::pon_const_int(i64::from(code.co_firstlineno)) },
+		_ => unsafe { abi::pon_raise_attribute_error(object, intern(attr)) },
+	}
 }
 
 unsafe extern "C" fn trace_capi_code(object: *mut u8, visitor: &mut dyn FnMut(*mut u8)) {
-    if object.is_null() {
-        return;
-    }
-    let code = unsafe { &*object.cast::<PyCapiCodeObject>() };
-    for value in [code.co_filename, code.co_name, code.co_qualname] {
-        if !value.is_null() {
-            visitor(value.cast::<u8>());
-        }
-    }
+	if object.is_null() {
+		return;
+	}
+	let code = unsafe { &*object.cast::<PyCapiCodeObject>() };
+	for value in [code.co_filename, code.co_name, code.co_qualname] {
+		if !value.is_null() {
+			visitor(value.cast::<u8>());
+		}
+	}
 }
 
 unsafe extern "C" fn capi_code_get_num_free(code: *mut c_void) -> c_int {
-    if code.is_null() {
-        raise_system_error("PyCode_GetNumFree called with NULL code");
-        return 0;
-    }
-    unsafe { (*code.cast::<PyCapiCodeObject>()).co_nfreevars }
+	if code.is_null() {
+		raise_system_error("PyCode_GetNumFree called with NULL code");
+		return 0;
+	}
+	unsafe { (*code.cast::<PyCapiCodeObject>()).co_nfreevars }
 }
 
 unsafe extern "C" fn capi_code_has_free_vars(code: *mut c_void) -> c_int {
-    (unsafe { capi_code_get_num_free(code) } > 0) as c_int
+	(unsafe { capi_code_get_num_free(code) } > 0) as c_int
 }
 
-unsafe extern "C" fn capi_contextvar_new(name: *const c_char, default: *mut PyObject) -> *mut PyObject {
-    let Some(name) = c_string(name) else {
-        return raise_system_error_null("PyContextVar_New called with invalid name");
-    };
-    new_reference(crate::native::contextvars::capi_contextvar_new(&name, default))
+unsafe extern "C" fn capi_contextvar_new(
+	name: *const c_char,
+	default: *mut PyObject,
+) -> *mut PyObject {
+	let Some(name) = c_string(name) else {
+		return raise_system_error_null("PyContextVar_New called with invalid name");
+	};
+	new_reference(crate::native::contextvars::capi_contextvar_new(&name, default))
 }
 
 unsafe extern "C" fn capi_contextvar_get(
-    var: *mut PyObject,
-    default: *mut PyObject,
-    value: *mut *mut PyObject,
+	var: *mut PyObject,
+	default: *mut PyObject,
+	value: *mut *mut PyObject,
 ) -> c_int {
-    let status = unsafe { crate::native::contextvars::capi_contextvar_get(var, default, value) };
-    if status == 0 && !value.is_null() {
-        let object = unsafe { *value };
-        if !object.is_null() {
-            super::pin_object(object);
-        }
-    }
-    status
+	let status = unsafe { crate::native::contextvars::capi_contextvar_get(var, default, value) };
+	if status == 0 && !value.is_null() {
+		let object = unsafe { *value };
+		if !object.is_null() {
+			super::pin_object(object);
+		}
+	}
+	status
 }
 
-unsafe extern "C" fn capi_contextvar_set(var: *mut PyObject, value: *mut PyObject) -> *mut PyObject {
-    let method = unsafe { abi::pon_get_attr(var, intern("set"), ptr::null_mut()) };
-    if method.is_null() {
-        return ptr::null_mut();
-    }
-    let value = super::object_::normalize_object_arg(value);
-    let mut argv = [value];
-    new_reference(unsafe { abi::pon_call(method, argv.as_mut_ptr(), argv.len()) })
+unsafe extern "C" fn capi_contextvar_set(
+	var: *mut PyObject,
+	value: *mut PyObject,
+) -> *mut PyObject {
+	let method = unsafe { abi::pon_get_attr(var, intern("set"), ptr::null_mut()) };
+	if method.is_null() {
+		return ptr::null_mut();
+	}
+	let value = super::object_::normalize_object_arg(value);
+	let mut argv = [value];
+	new_reference(unsafe { abi::pon_call(method, argv.as_mut_ptr(), argv.len()) })
 }
 
 unsafe extern "C" fn capi_datetime_capi_import() -> *mut c_void {
-    match datetime_capi_ptr() {
-        Ok(capi) => capi.cast::<c_void>(),
-        Err(message) => raise_import_error_void(&message),
-    }
+	match datetime_capi_ptr() {
+		Ok(capi) => capi.cast::<c_void>(),
+		Err(message) => raise_import_error_void(&message),
+	}
 }
 
-unsafe extern "C" fn capi_datetime_get_attr_int(object: *mut PyObject, name: *const c_char) -> c_int {
-    let Some(name) = c_string(name) else {
-        raise_system_error("PyDateTime attribute accessor called with invalid attribute name");
-        return -1;
-    };
-    match unsafe { datetime_int_attr_raw(object, &name) } {
-        Ok(value) => value,
-        Err(message) => {
-            if !pon_err_occurred() {
-                raise_type_error(&message);
-            }
-            -1
-        }
-    }
+unsafe extern "C" fn capi_datetime_get_attr_int(
+	object: *mut PyObject,
+	name: *const c_char,
+) -> c_int {
+	let Some(name) = c_string(name) else {
+		raise_system_error("PyDateTime attribute accessor called with invalid attribute name");
+		return -1;
+	};
+	match unsafe { datetime_int_attr_raw(object, &name) } {
+		Ok(value) => value,
+		Err(message) => {
+			if !pon_err_occurred() {
+				raise_type_error(&message);
+			}
+			-1
+		},
+	}
 }
 
 fn datetime_capi_ptr() -> Result<*mut PyDateTimeCapi, String> {
-    let mut cached = DATETIME_CAPI.lock().unwrap_or_else(|poison| poison.into_inner());
-    if let Some(ptr) = *cached {
-        return Ok(ptr as *mut PyDateTimeCapi);
-    }
+	let mut cached = DATETIME_CAPI
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner());
+	if let Some(ptr) = *cached {
+		return Ok(ptr as *mut PyDateTimeCapi);
+	}
 
-    let capi = build_datetime_capi()?;
-    let ptr = Box::into_raw(Box::new(capi)) as usize;
-    *cached = Some(ptr);
-    Ok(ptr as *mut PyDateTimeCapi)
+	let capi = build_datetime_capi()?;
+	let ptr = Box::into_raw(Box::new(capi)) as usize;
+	*cached = Some(ptr);
+	Ok(ptr as *mut PyDateTimeCapi)
 }
 
 #[repr(C)]
 struct PonDateObject {
-    ob_base: PyObjectHeader,
-    year: c_int,
-    month: c_int,
-    day: c_int,
+	ob_base: PyObjectHeader,
+	year:    c_int,
+	month:   c_int,
+	day:     c_int,
 }
 
 #[repr(C)]
 struct PonDateTimeObject {
-    ob_base: PyObjectHeader,
-    year: c_int,
-    month: c_int,
-    day: c_int,
-    hour: c_int,
-    minute: c_int,
-    second: c_int,
-    microsecond: c_int,
-    fold: c_int,
-    tzinfo: *mut PyObject,
+	ob_base:     PyObjectHeader,
+	year:        c_int,
+	month:       c_int,
+	day:         c_int,
+	hour:        c_int,
+	minute:      c_int,
+	second:      c_int,
+	microsecond: c_int,
+	fold:        c_int,
+	tzinfo:      *mut PyObject,
 }
 
 #[repr(C)]
 struct PonTimeObject {
-    ob_base: PyObjectHeader,
-    hour: c_int,
-    minute: c_int,
-    second: c_int,
-    microsecond: c_int,
-    fold: c_int,
-    tzinfo: *mut PyObject,
+	ob_base:     PyObjectHeader,
+	hour:        c_int,
+	minute:      c_int,
+	second:      c_int,
+	microsecond: c_int,
+	fold:        c_int,
+	tzinfo:      *mut PyObject,
 }
 
 #[repr(C)]
 struct PonDeltaObject {
-    ob_base: PyObjectHeader,
-    days: c_int,
-    seconds: c_int,
-    microseconds: c_int,
+	ob_base:      PyObjectHeader,
+	days:         c_int,
+	seconds:      c_int,
+	microseconds: c_int,
 }
 
 #[repr(C)]
 struct PonTimezoneObject {
-    ob_base: PyObjectHeader,
+	ob_base: PyObjectHeader,
 }
 
 unsafe impl Send for PonDateObject {}
@@ -727,1123 +780,1317 @@ unsafe impl Send for PonTimezoneObject {}
 unsafe impl Sync for PonTimezoneObject {}
 
 fn build_datetime_capi() -> Result<PyDateTimeCapi, String> {
-    let capi = PyDateTimeCapi {
-        date_type: twin::foreign_of_native(datetime_date_type()),
-        datetime_type: twin::foreign_of_native(datetime_datetime_type()),
-        time_type: twin::foreign_of_native(datetime_time_type()),
-        delta_type: twin::foreign_of_native(datetime_delta_type()),
-        tzinfo_type: twin::foreign_of_native(datetime_tzinfo_type()),
-        timezone_utc: datetime_utc(),
-        date_from_date: capi_datetime_date_from_date,
-        datetime_from_date_and_time: capi_datetime_datetime_from_date_and_time,
-        time_from_time: capi_datetime_time_from_time,
-        delta_from_delta: capi_datetime_delta_from_delta,
-        timezone_from_timezone: capi_datetime_unsupported_timezone_from_timezone,
-        datetime_from_timestamp: capi_datetime_unsupported_datetime_from_timestamp,
-        date_from_timestamp: capi_datetime_unsupported_date_from_timestamp,
-        datetime_from_date_and_time_and_fold: capi_datetime_datetime_from_date_and_time_and_fold,
-        time_from_time_and_fold: capi_datetime_time_from_time_and_fold,
-    };
+	let capi = PyDateTimeCapi {
+		date_type: twin::foreign_of_native(datetime_date_type()),
+		datetime_type: twin::foreign_of_native(datetime_datetime_type()),
+		time_type: twin::foreign_of_native(datetime_time_type()),
+		delta_type: twin::foreign_of_native(datetime_delta_type()),
+		tzinfo_type: twin::foreign_of_native(datetime_tzinfo_type()),
+		timezone_utc: datetime_utc(),
+		date_from_date: capi_datetime_date_from_date,
+		datetime_from_date_and_time: capi_datetime_datetime_from_date_and_time,
+		time_from_time: capi_datetime_time_from_time,
+		delta_from_delta: capi_datetime_delta_from_delta,
+		timezone_from_timezone: capi_datetime_unsupported_timezone_from_timezone,
+		datetime_from_timestamp: capi_datetime_unsupported_datetime_from_timestamp,
+		date_from_timestamp: capi_datetime_unsupported_date_from_timestamp,
+		datetime_from_date_and_time_and_fold: capi_datetime_datetime_from_date_and_time_and_fold,
+		time_from_time_and_fold: capi_datetime_time_from_time_and_fold,
+	};
 
-    verify_datetime_capi(&capi)?;
-    Ok(capi)
+	verify_datetime_capi(&capi)?;
+	Ok(capi)
 }
 
 fn runtime_object_type() -> *mut PyType {
-    abi::runtime_global(intern("object")).map_or(ptr::null_mut(), |object| object.cast::<PyType>())
+	abi::runtime_global(intern("object")).map_or(ptr::null_mut(), |object| object.cast::<PyType>())
 }
 
 fn datetime_date_type() -> *mut PyType {
-    static TYPE: LazyLock<usize> = LazyLock::new(|| {
-        let mut ty = PyType::new(abi::runtime_type_type().cast_const(), "date", mem::size_of::<PonDateObject>());
-        ty.tp_base = runtime_object_type();
-        ty.tp_new = Some(pon_datetime_date_new);
-        ty.tp_getattro = Some(pon_datetime_date_getattro);
-        Box::into_raw(Box::new(ty)) as usize
-    });
-    *TYPE as *mut PyType
+	static TYPE: LazyLock<usize> = LazyLock::new(|| {
+		let mut ty = PyType::new(
+			abi::runtime_type_type().cast_const(),
+			"date",
+			mem::size_of::<PonDateObject>(),
+		);
+		ty.tp_base = runtime_object_type();
+		ty.tp_new = Some(pon_datetime_date_new);
+		ty.tp_getattro = Some(pon_datetime_date_getattro);
+		Box::into_raw(Box::new(ty)) as usize
+	});
+	*TYPE as *mut PyType
 }
 
 fn datetime_datetime_type() -> *mut PyType {
-    static TYPE: LazyLock<usize> = LazyLock::new(|| {
-        let mut ty = PyType::new(abi::runtime_type_type().cast_const(), "datetime", mem::size_of::<PonDateTimeObject>());
-        ty.tp_base = datetime_date_type();
-        ty.tp_new = Some(pon_datetime_datetime_new);
-        ty.tp_getattro = Some(pon_datetime_datetime_getattro);
-        Box::into_raw(Box::new(ty)) as usize
-    });
-    *TYPE as *mut PyType
+	static TYPE: LazyLock<usize> = LazyLock::new(|| {
+		let mut ty = PyType::new(
+			abi::runtime_type_type().cast_const(),
+			"datetime",
+			mem::size_of::<PonDateTimeObject>(),
+		);
+		ty.tp_base = datetime_date_type();
+		ty.tp_new = Some(pon_datetime_datetime_new);
+		ty.tp_getattro = Some(pon_datetime_datetime_getattro);
+		Box::into_raw(Box::new(ty)) as usize
+	});
+	*TYPE as *mut PyType
 }
 
 fn datetime_time_type() -> *mut PyType {
-    static TYPE: LazyLock<usize> = LazyLock::new(|| {
-        let mut ty = PyType::new(abi::runtime_type_type().cast_const(), "time", mem::size_of::<PonTimeObject>());
-        ty.tp_base = runtime_object_type();
-        ty.tp_new = Some(pon_datetime_time_new);
-        ty.tp_getattro = Some(pon_datetime_time_getattro);
-        Box::into_raw(Box::new(ty)) as usize
-    });
-    *TYPE as *mut PyType
+	static TYPE: LazyLock<usize> = LazyLock::new(|| {
+		let mut ty = PyType::new(
+			abi::runtime_type_type().cast_const(),
+			"time",
+			mem::size_of::<PonTimeObject>(),
+		);
+		ty.tp_base = runtime_object_type();
+		ty.tp_new = Some(pon_datetime_time_new);
+		ty.tp_getattro = Some(pon_datetime_time_getattro);
+		Box::into_raw(Box::new(ty)) as usize
+	});
+	*TYPE as *mut PyType
 }
 
 fn datetime_delta_type() -> *mut PyType {
-    static TYPE: LazyLock<usize> = LazyLock::new(|| {
-        let mut ty = PyType::new(abi::runtime_type_type().cast_const(), "timedelta", mem::size_of::<PonDeltaObject>());
-        ty.tp_base = runtime_object_type();
-        ty.tp_new = Some(pon_datetime_delta_new);
-        ty.tp_getattro = Some(pon_datetime_delta_getattro);
-        Box::into_raw(Box::new(ty)) as usize
-    });
-    *TYPE as *mut PyType
+	static TYPE: LazyLock<usize> = LazyLock::new(|| {
+		let mut ty = PyType::new(
+			abi::runtime_type_type().cast_const(),
+			"timedelta",
+			mem::size_of::<PonDeltaObject>(),
+		);
+		ty.tp_base = runtime_object_type();
+		ty.tp_new = Some(pon_datetime_delta_new);
+		ty.tp_getattro = Some(pon_datetime_delta_getattro);
+		Box::into_raw(Box::new(ty)) as usize
+	});
+	*TYPE as *mut PyType
 }
 
 fn datetime_tzinfo_type() -> *mut PyType {
-    static TYPE: LazyLock<usize> = LazyLock::new(|| {
-        let mut ty = PyType::new(abi::runtime_type_type().cast_const(), "tzinfo", mem::size_of::<PyObjectHeader>());
-        ty.tp_base = runtime_object_type();
-        Box::into_raw(Box::new(ty)) as usize
-    });
-    *TYPE as *mut PyType
+	static TYPE: LazyLock<usize> = LazyLock::new(|| {
+		let mut ty = PyType::new(
+			abi::runtime_type_type().cast_const(),
+			"tzinfo",
+			mem::size_of::<PyObjectHeader>(),
+		);
+		ty.tp_base = runtime_object_type();
+		Box::into_raw(Box::new(ty)) as usize
+	});
+	*TYPE as *mut PyType
 }
 
 fn datetime_timezone_type() -> *mut PyType {
-    static TYPE: LazyLock<usize> = LazyLock::new(|| {
-        let mut ty = PyType::new(abi::runtime_type_type().cast_const(), "timezone", mem::size_of::<PonTimezoneObject>());
-        ty.tp_base = datetime_tzinfo_type();
-        Box::into_raw(Box::new(ty)) as usize
-    });
-    *TYPE as *mut PyType
+	static TYPE: LazyLock<usize> = LazyLock::new(|| {
+		let mut ty = PyType::new(
+			abi::runtime_type_type().cast_const(),
+			"timezone",
+			mem::size_of::<PonTimezoneObject>(),
+		);
+		ty.tp_base = datetime_tzinfo_type();
+		Box::into_raw(Box::new(ty)) as usize
+	});
+	*TYPE as *mut PyType
 }
 
 fn datetime_utc() -> *mut PyObject {
-    static UTC: LazyLock<usize> = LazyLock::new(|| {
-        Box::into_raw(Box::new(PonTimezoneObject {
-            ob_base: PyObjectHeader::new(datetime_timezone_type().cast_const()),
-        })) as usize
-    });
-    *UTC as *mut PyObject
+	static UTC: LazyLock<usize> = LazyLock::new(|| {
+		Box::into_raw(Box::new(PonTimezoneObject {
+			ob_base: PyObjectHeader::new(datetime_timezone_type().cast_const()),
+		})) as usize
+	});
+	*UTC as *mut PyObject
 }
 
-unsafe extern "C" fn pon_datetime_date_new(cls: *mut PyType, args: *mut PyObject, _kwargs: *mut PyObject) -> *mut PyObject {
-    let Ok(positional) = (unsafe { datetime_positional_args(args, 3, "date") }) else {
-        return ptr::null_mut();
-    };
-    let Some(year) = (unsafe { datetime_c_int(positional[0], "year") }) else {
-        return ptr::null_mut();
-    };
-    let Some(month) = (unsafe { datetime_c_int(positional[1], "month") }) else {
-        return ptr::null_mut();
-    };
-    let Some(day) = (unsafe { datetime_c_int(positional[2], "day") }) else {
-        return ptr::null_mut();
-    };
-    alloc_datetime_date(cls, year, month, day)
+unsafe extern "C" fn pon_datetime_date_new(
+	cls: *mut PyType,
+	args: *mut PyObject,
+	_kwargs: *mut PyObject,
+) -> *mut PyObject {
+	let Ok(positional) = (unsafe { datetime_positional_args(args, 3, "date") }) else {
+		return ptr::null_mut();
+	};
+	let Some(year) = (unsafe { datetime_c_int(positional[0], "year") }) else {
+		return ptr::null_mut();
+	};
+	let Some(month) = (unsafe { datetime_c_int(positional[1], "month") }) else {
+		return ptr::null_mut();
+	};
+	let Some(day) = (unsafe { datetime_c_int(positional[2], "day") }) else {
+		return ptr::null_mut();
+	};
+	alloc_datetime_date(cls, year, month, day)
 }
 
-unsafe extern "C" fn pon_datetime_datetime_new(cls: *mut PyType, args: *mut PyObject, _kwargs: *mut PyObject) -> *mut PyObject {
-    let Ok(positional) = (unsafe { datetime_positional_args(args, 8, "datetime") }) else {
-        return ptr::null_mut();
-    };
-    let Some(year) = (unsafe { datetime_c_int(positional[0], "year") }) else {
-        return ptr::null_mut();
-    };
-    let Some(month) = (unsafe { datetime_c_int(positional[1], "month") }) else {
-        return ptr::null_mut();
-    };
-    let Some(day) = (unsafe { datetime_c_int(positional[2], "day") }) else {
-        return ptr::null_mut();
-    };
-    let Some(hour) = (unsafe { datetime_c_int(positional[3], "hour") }) else {
-        return ptr::null_mut();
-    };
-    let Some(minute) = (unsafe { datetime_c_int(positional[4], "minute") }) else {
-        return ptr::null_mut();
-    };
-    let Some(second) = (unsafe { datetime_c_int(positional[5], "second") }) else {
-        return ptr::null_mut();
-    };
-    let Some(microsecond) = (unsafe { datetime_c_int(positional[6], "microsecond") }) else {
-        return ptr::null_mut();
-    };
-    alloc_datetime_datetime(cls, year, month, day, hour, minute, second, microsecond, 0, positional[7])
+unsafe extern "C" fn pon_datetime_datetime_new(
+	cls: *mut PyType,
+	args: *mut PyObject,
+	_kwargs: *mut PyObject,
+) -> *mut PyObject {
+	let Ok(positional) = (unsafe { datetime_positional_args(args, 8, "datetime") }) else {
+		return ptr::null_mut();
+	};
+	let Some(year) = (unsafe { datetime_c_int(positional[0], "year") }) else {
+		return ptr::null_mut();
+	};
+	let Some(month) = (unsafe { datetime_c_int(positional[1], "month") }) else {
+		return ptr::null_mut();
+	};
+	let Some(day) = (unsafe { datetime_c_int(positional[2], "day") }) else {
+		return ptr::null_mut();
+	};
+	let Some(hour) = (unsafe { datetime_c_int(positional[3], "hour") }) else {
+		return ptr::null_mut();
+	};
+	let Some(minute) = (unsafe { datetime_c_int(positional[4], "minute") }) else {
+		return ptr::null_mut();
+	};
+	let Some(second) = (unsafe { datetime_c_int(positional[5], "second") }) else {
+		return ptr::null_mut();
+	};
+	let Some(microsecond) = (unsafe { datetime_c_int(positional[6], "microsecond") }) else {
+		return ptr::null_mut();
+	};
+	alloc_datetime_datetime(
+		cls,
+		year,
+		month,
+		day,
+		hour,
+		minute,
+		second,
+		microsecond,
+		0,
+		positional[7],
+	)
 }
 
-unsafe extern "C" fn pon_datetime_time_new(cls: *mut PyType, args: *mut PyObject, _kwargs: *mut PyObject) -> *mut PyObject {
-    let Ok(positional) = (unsafe { datetime_positional_args(args, 5, "time") }) else {
-        return ptr::null_mut();
-    };
-    let Some(hour) = (unsafe { datetime_c_int(positional[0], "hour") }) else {
-        return ptr::null_mut();
-    };
-    let Some(minute) = (unsafe { datetime_c_int(positional[1], "minute") }) else {
-        return ptr::null_mut();
-    };
-    let Some(second) = (unsafe { datetime_c_int(positional[2], "second") }) else {
-        return ptr::null_mut();
-    };
-    let Some(microsecond) = (unsafe { datetime_c_int(positional[3], "microsecond") }) else {
-        return ptr::null_mut();
-    };
-    alloc_datetime_time(cls, hour, minute, second, microsecond, 0, positional[4])
+unsafe extern "C" fn pon_datetime_time_new(
+	cls: *mut PyType,
+	args: *mut PyObject,
+	_kwargs: *mut PyObject,
+) -> *mut PyObject {
+	let Ok(positional) = (unsafe { datetime_positional_args(args, 5, "time") }) else {
+		return ptr::null_mut();
+	};
+	let Some(hour) = (unsafe { datetime_c_int(positional[0], "hour") }) else {
+		return ptr::null_mut();
+	};
+	let Some(minute) = (unsafe { datetime_c_int(positional[1], "minute") }) else {
+		return ptr::null_mut();
+	};
+	let Some(second) = (unsafe { datetime_c_int(positional[2], "second") }) else {
+		return ptr::null_mut();
+	};
+	let Some(microsecond) = (unsafe { datetime_c_int(positional[3], "microsecond") }) else {
+		return ptr::null_mut();
+	};
+	alloc_datetime_time(cls, hour, minute, second, microsecond, 0, positional[4])
 }
 
-unsafe extern "C" fn pon_datetime_delta_new(cls: *mut PyType, args: *mut PyObject, _kwargs: *mut PyObject) -> *mut PyObject {
-    let Ok(positional) = (unsafe { datetime_positional_args(args, 3, "timedelta") }) else {
-        return ptr::null_mut();
-    };
-    let Some(days) = (unsafe { datetime_c_int(positional[0], "days") }) else {
-        return ptr::null_mut();
-    };
-    let Some(seconds) = (unsafe { datetime_c_int(positional[1], "seconds") }) else {
-        return ptr::null_mut();
-    };
-    let Some(microseconds) = (unsafe { datetime_c_int(positional[2], "microseconds") }) else {
-        return ptr::null_mut();
-    };
-    alloc_datetime_delta(cls, days, seconds, microseconds)
+unsafe extern "C" fn pon_datetime_delta_new(
+	cls: *mut PyType,
+	args: *mut PyObject,
+	_kwargs: *mut PyObject,
+) -> *mut PyObject {
+	let Ok(positional) = (unsafe { datetime_positional_args(args, 3, "timedelta") }) else {
+		return ptr::null_mut();
+	};
+	let Some(days) = (unsafe { datetime_c_int(positional[0], "days") }) else {
+		return ptr::null_mut();
+	};
+	let Some(seconds) = (unsafe { datetime_c_int(positional[1], "seconds") }) else {
+		return ptr::null_mut();
+	};
+	let Some(microseconds) = (unsafe { datetime_c_int(positional[2], "microseconds") }) else {
+		return ptr::null_mut();
+	};
+	alloc_datetime_delta(cls, days, seconds, microseconds)
 }
 
 fn alloc_datetime_date(cls: *mut PyType, year: c_int, month: c_int, day: c_int) -> *mut PyObject {
-    let ty = if cls.is_null() { datetime_date_type() } else { cls };
-    Box::into_raw(Box::new(PonDateObject {
-        ob_base: PyObjectHeader::new(ty.cast_const()),
-        year,
-        month,
-        day,
-    }))
-    .cast::<PyObject>()
+	let ty = if cls.is_null() {
+		datetime_date_type()
+	} else {
+		cls
+	};
+	Box::into_raw(Box::new(PonDateObject {
+		ob_base: PyObjectHeader::new(ty.cast_const()),
+		year,
+		month,
+		day,
+	}))
+	.cast::<PyObject>()
 }
 
 fn alloc_datetime_datetime(
-    cls: *mut PyType,
-    year: c_int,
-    month: c_int,
-    day: c_int,
-    hour: c_int,
-    minute: c_int,
-    second: c_int,
-    microsecond: c_int,
-    fold: c_int,
-    tzinfo: *mut PyObject,
+	cls: *mut PyType,
+	year: c_int,
+	month: c_int,
+	day: c_int,
+	hour: c_int,
+	minute: c_int,
+	second: c_int,
+	microsecond: c_int,
+	fold: c_int,
+	tzinfo: *mut PyObject,
 ) -> *mut PyObject {
-    let ty = if cls.is_null() { datetime_datetime_type() } else { cls };
-    let tzinfo = if tzinfo.is_null() { unsafe { abi::pon_none() } } else { tzinfo };
-    if tzinfo.is_null() {
-        return ptr::null_mut();
-    }
-    Box::into_raw(Box::new(PonDateTimeObject {
-        ob_base: PyObjectHeader::new(ty.cast_const()),
-        year,
-        month,
-        day,
-        hour,
-        minute,
-        second,
-        microsecond,
-        fold,
-        tzinfo,
-    }))
-    .cast::<PyObject>()
+	let ty = if cls.is_null() {
+		datetime_datetime_type()
+	} else {
+		cls
+	};
+	let tzinfo = if tzinfo.is_null() {
+		unsafe { abi::pon_none() }
+	} else {
+		tzinfo
+	};
+	if tzinfo.is_null() {
+		return ptr::null_mut();
+	}
+	Box::into_raw(Box::new(PonDateTimeObject {
+		ob_base: PyObjectHeader::new(ty.cast_const()),
+		year,
+		month,
+		day,
+		hour,
+		minute,
+		second,
+		microsecond,
+		fold,
+		tzinfo,
+	}))
+	.cast::<PyObject>()
 }
 
 fn alloc_datetime_time(
-    cls: *mut PyType,
-    hour: c_int,
-    minute: c_int,
-    second: c_int,
-    microsecond: c_int,
-    fold: c_int,
-    tzinfo: *mut PyObject,
+	cls: *mut PyType,
+	hour: c_int,
+	minute: c_int,
+	second: c_int,
+	microsecond: c_int,
+	fold: c_int,
+	tzinfo: *mut PyObject,
 ) -> *mut PyObject {
-    let ty = if cls.is_null() { datetime_time_type() } else { cls };
-    let tzinfo = if tzinfo.is_null() { unsafe { abi::pon_none() } } else { tzinfo };
-    if tzinfo.is_null() {
-        return ptr::null_mut();
-    }
-    Box::into_raw(Box::new(PonTimeObject {
-        ob_base: PyObjectHeader::new(ty.cast_const()),
-        hour,
-        minute,
-        second,
-        microsecond,
-        fold,
-        tzinfo,
-    }))
-    .cast::<PyObject>()
+	let ty = if cls.is_null() {
+		datetime_time_type()
+	} else {
+		cls
+	};
+	let tzinfo = if tzinfo.is_null() {
+		unsafe { abi::pon_none() }
+	} else {
+		tzinfo
+	};
+	if tzinfo.is_null() {
+		return ptr::null_mut();
+	}
+	Box::into_raw(Box::new(PonTimeObject {
+		ob_base: PyObjectHeader::new(ty.cast_const()),
+		hour,
+		minute,
+		second,
+		microsecond,
+		fold,
+		tzinfo,
+	}))
+	.cast::<PyObject>()
 }
 
-fn alloc_datetime_delta(cls: *mut PyType, days: c_int, seconds: c_int, microseconds: c_int) -> *mut PyObject {
-    let ty = if cls.is_null() { datetime_delta_type() } else { cls };
-    Box::into_raw(Box::new(PonDeltaObject {
-        ob_base: PyObjectHeader::new(ty.cast_const()),
-        days,
-        seconds,
-        microseconds,
-    }))
-    .cast::<PyObject>()
+fn alloc_datetime_delta(
+	cls: *mut PyType,
+	days: c_int,
+	seconds: c_int,
+	microseconds: c_int,
+) -> *mut PyObject {
+	let ty = if cls.is_null() {
+		datetime_delta_type()
+	} else {
+		cls
+	};
+	Box::into_raw(Box::new(PonDeltaObject {
+		ob_base: PyObjectHeader::new(ty.cast_const()),
+		days,
+		seconds,
+		microseconds,
+	}))
+	.cast::<PyObject>()
 }
 
-unsafe fn datetime_positional_args(args: *mut PyObject, expected: usize, symbol: &str) -> Result<Vec<*mut PyObject>, ()> {
-    match unsafe { crate::types::type_::positional_args_from_object(args) } {
-        Ok(positional) if positional.len() == expected => Ok(positional),
-        Ok(positional) => {
-            raise_type_error(&format!("{symbol} expected {expected} positional arguments, got {}", positional.len()));
-            Err(())
-        }
-        Err(message) => {
-            raise_type_error(&message);
-            Err(())
-        }
-    }
+unsafe fn datetime_positional_args(
+	args: *mut PyObject,
+	expected: usize,
+	symbol: &str,
+) -> Result<Vec<*mut PyObject>, ()> {
+	match unsafe { crate::types::type_::positional_args_from_object(args) } {
+		Ok(positional) if positional.len() == expected => Ok(positional),
+		Ok(positional) => {
+			raise_type_error(&format!(
+				"{symbol} expected {expected} positional arguments, got {}",
+				positional.len()
+			));
+			Err(())
+		},
+		Err(message) => {
+			raise_type_error(&message);
+			Err(())
+		},
+	}
 }
 
 unsafe fn datetime_c_int(object: *mut PyObject, label: &str) -> Option<c_int> {
-    let object = crate::tag::untag_arg(object);
-    let Some(integer) = (unsafe { crate::types::int::to_bigint_including_bool(object) }) else {
-        raise_type_error(&format!("{label} must be an integer"));
-        return None;
-    };
-    let Some(value) = integer.to_i32() else {
-        raise_type_error(&format!("{label} is outside the C int range"));
-        return None;
-    };
-    Some(value)
+	let object = crate::tag::untag_arg(object);
+	let Some(integer) = (unsafe { crate::types::int::to_bigint_including_bool(object) }) else {
+		raise_type_error(&format!("{label} must be an integer"));
+		return None;
+	};
+	let Some(value) = integer.to_i32() else {
+		raise_type_error(&format!("{label} is outside the C int range"));
+		return None;
+	};
+	Some(value)
 }
 
 unsafe fn datetime_attr_name<'a>(name: *mut PyObject) -> Option<&'a str> {
-    let name = crate::tag::untag_arg(name);
-    let Some(text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
-        raise_type_error("datetime attribute name must be str");
-        return None;
-    };
-    Some(text)
+	let name = crate::tag::untag_arg(name);
+	let Some(text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+		raise_type_error("datetime attribute name must be str");
+		return None;
+	};
+	Some(text)
 }
 
-unsafe extern "C" fn pon_datetime_date_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
-    let Some(name) = (unsafe { datetime_attr_name(name) }) else {
-        return ptr::null_mut();
-    };
-    let date = unsafe { &*object.cast::<PonDateObject>() };
-    match name {
-        "year" => unsafe { abi::pon_const_int(i64::from(date.year)) },
-        "month" => unsafe { abi::pon_const_int(i64::from(date.month)) },
-        "day" => unsafe { abi::pon_const_int(i64::from(date.day)) },
-        _ => datetime_attribute_error(name),
-    }
+unsafe extern "C" fn pon_datetime_date_getattro(
+	object: *mut PyObject,
+	name: *mut PyObject,
+) -> *mut PyObject {
+	let Some(name) = (unsafe { datetime_attr_name(name) }) else {
+		return ptr::null_mut();
+	};
+	let date = unsafe { &*object.cast::<PonDateObject>() };
+	match name {
+		"year" => unsafe { abi::pon_const_int(i64::from(date.year)) },
+		"month" => unsafe { abi::pon_const_int(i64::from(date.month)) },
+		"day" => unsafe { abi::pon_const_int(i64::from(date.day)) },
+		_ => datetime_attribute_error(name),
+	}
 }
 
-unsafe extern "C" fn pon_datetime_datetime_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
-    let Some(name) = (unsafe { datetime_attr_name(name) }) else {
-        return ptr::null_mut();
-    };
-    let datetime = unsafe { &*object.cast::<PonDateTimeObject>() };
-    match name {
-        "year" => unsafe { abi::pon_const_int(i64::from(datetime.year)) },
-        "month" => unsafe { abi::pon_const_int(i64::from(datetime.month)) },
-        "day" => unsafe { abi::pon_const_int(i64::from(datetime.day)) },
-        "hour" => unsafe { abi::pon_const_int(i64::from(datetime.hour)) },
-        "minute" => unsafe { abi::pon_const_int(i64::from(datetime.minute)) },
-        "second" => unsafe { abi::pon_const_int(i64::from(datetime.second)) },
-        "microsecond" => unsafe { abi::pon_const_int(i64::from(datetime.microsecond)) },
-        "fold" => unsafe { abi::pon_const_int(i64::from(datetime.fold)) },
-        "tzinfo" => datetime.tzinfo,
-        _ => datetime_attribute_error(name),
-    }
+unsafe extern "C" fn pon_datetime_datetime_getattro(
+	object: *mut PyObject,
+	name: *mut PyObject,
+) -> *mut PyObject {
+	let Some(name) = (unsafe { datetime_attr_name(name) }) else {
+		return ptr::null_mut();
+	};
+	let datetime = unsafe { &*object.cast::<PonDateTimeObject>() };
+	match name {
+		"year" => unsafe { abi::pon_const_int(i64::from(datetime.year)) },
+		"month" => unsafe { abi::pon_const_int(i64::from(datetime.month)) },
+		"day" => unsafe { abi::pon_const_int(i64::from(datetime.day)) },
+		"hour" => unsafe { abi::pon_const_int(i64::from(datetime.hour)) },
+		"minute" => unsafe { abi::pon_const_int(i64::from(datetime.minute)) },
+		"second" => unsafe { abi::pon_const_int(i64::from(datetime.second)) },
+		"microsecond" => unsafe { abi::pon_const_int(i64::from(datetime.microsecond)) },
+		"fold" => unsafe { abi::pon_const_int(i64::from(datetime.fold)) },
+		"tzinfo" => datetime.tzinfo,
+		_ => datetime_attribute_error(name),
+	}
 }
 
-unsafe extern "C" fn pon_datetime_time_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
-    let Some(name) = (unsafe { datetime_attr_name(name) }) else {
-        return ptr::null_mut();
-    };
-    let time = unsafe { &*object.cast::<PonTimeObject>() };
-    match name {
-        "hour" => unsafe { abi::pon_const_int(i64::from(time.hour)) },
-        "minute" => unsafe { abi::pon_const_int(i64::from(time.minute)) },
-        "second" => unsafe { abi::pon_const_int(i64::from(time.second)) },
-        "microsecond" => unsafe { abi::pon_const_int(i64::from(time.microsecond)) },
-        "fold" => unsafe { abi::pon_const_int(i64::from(time.fold)) },
-        "tzinfo" => time.tzinfo,
-        _ => datetime_attribute_error(name),
-    }
+unsafe extern "C" fn pon_datetime_time_getattro(
+	object: *mut PyObject,
+	name: *mut PyObject,
+) -> *mut PyObject {
+	let Some(name) = (unsafe { datetime_attr_name(name) }) else {
+		return ptr::null_mut();
+	};
+	let time = unsafe { &*object.cast::<PonTimeObject>() };
+	match name {
+		"hour" => unsafe { abi::pon_const_int(i64::from(time.hour)) },
+		"minute" => unsafe { abi::pon_const_int(i64::from(time.minute)) },
+		"second" => unsafe { abi::pon_const_int(i64::from(time.second)) },
+		"microsecond" => unsafe { abi::pon_const_int(i64::from(time.microsecond)) },
+		"fold" => unsafe { abi::pon_const_int(i64::from(time.fold)) },
+		"tzinfo" => time.tzinfo,
+		_ => datetime_attribute_error(name),
+	}
 }
 
-unsafe extern "C" fn pon_datetime_delta_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
-    let Some(name) = (unsafe { datetime_attr_name(name) }) else {
-        return ptr::null_mut();
-    };
-    let delta = unsafe { &*object.cast::<PonDeltaObject>() };
-    match name {
-        "days" => unsafe { abi::pon_const_int(i64::from(delta.days)) },
-        "seconds" => unsafe { abi::pon_const_int(i64::from(delta.seconds)) },
-        "microseconds" => unsafe { abi::pon_const_int(i64::from(delta.microseconds)) },
-        _ => datetime_attribute_error(name),
-    }
+unsafe extern "C" fn pon_datetime_delta_getattro(
+	object: *mut PyObject,
+	name: *mut PyObject,
+) -> *mut PyObject {
+	let Some(name) = (unsafe { datetime_attr_name(name) }) else {
+		return ptr::null_mut();
+	};
+	let delta = unsafe { &*object.cast::<PonDeltaObject>() };
+	match name {
+		"days" => unsafe { abi::pon_const_int(i64::from(delta.days)) },
+		"seconds" => unsafe { abi::pon_const_int(i64::from(delta.seconds)) },
+		"microseconds" => unsafe { abi::pon_const_int(i64::from(delta.microseconds)) },
+		_ => datetime_attribute_error(name),
+	}
 }
 
 fn datetime_attribute_error(name: &str) -> *mut PyObject {
-    let _ = abi::exc::raise_kind_error_text(ExceptionKind::AttributeError, &format!("datetime object has no attribute {name}"));
-    ptr::null_mut()
+	let _ = abi::exc::raise_kind_error_text(
+		ExceptionKind::AttributeError,
+		&format!("datetime object has no attribute {name}"),
+	);
+	ptr::null_mut()
 }
 
 fn verify_datetime_capi(capi: &PyDateTimeCapi) -> Result<(), String> {
-    let date = unsafe { capi_datetime_date_from_date(2020, 1, 2, capi.date_type) };
-    if date.is_null() {
-        let detail = pending_error_detail();
-        pon_err_clear();
-        return Err(format!("PyDateTime_IMPORT datetime.date(2020, 1, 2) failed: {detail}"));
-    }
-    verify_datetime_attr(date, "year", 2020, "datetime.date.year")?;
-    verify_datetime_attr(date, "month", 1, "datetime.date.month")?;
-    verify_datetime_attr(date, "day", 2, "datetime.date.day")?;
+	let date = unsafe { capi_datetime_date_from_date(2020, 1, 2, capi.date_type) };
+	if date.is_null() {
+		let detail = pending_error_detail();
+		pon_err_clear();
+		return Err(format!("PyDateTime_IMPORT datetime.date(2020, 1, 2) failed: {detail}"));
+	}
+	verify_datetime_attr(date, "year", 2020, "datetime.date.year")?;
+	verify_datetime_attr(date, "month", 1, "datetime.date.month")?;
+	verify_datetime_attr(date, "day", 2, "datetime.date.day")?;
 
-    let none = unsafe { abi::pon_none() };
-    let datetime = unsafe { capi_datetime_datetime_from_date_and_time(2020, 1, 2, 3, 4, 5, 6, none, capi.datetime_type) };
-    if datetime.is_null() {
-        let detail = pending_error_detail();
-        pon_err_clear();
-        return Err(format!("PyDateTime_IMPORT datetime.datetime(...) failed: {detail}"));
-    }
-    for (attr, expected) in [
-        ("year", 2020),
-        ("month", 1),
-        ("day", 2),
-        ("hour", 3),
-        ("minute", 4),
-        ("second", 5),
-        ("microsecond", 6),
-    ] {
-        verify_datetime_attr(datetime, attr, expected, &format!("datetime.datetime.{attr}"))?;
-    }
+	let none = unsafe { abi::pon_none() };
+	let datetime = unsafe {
+		capi_datetime_datetime_from_date_and_time(2020, 1, 2, 3, 4, 5, 6, none, capi.datetime_type)
+	};
+	if datetime.is_null() {
+		let detail = pending_error_detail();
+		pon_err_clear();
+		return Err(format!("PyDateTime_IMPORT datetime.datetime(...) failed: {detail}"));
+	}
+	for (attr, expected) in [
+		("year", 2020),
+		("month", 1),
+		("day", 2),
+		("hour", 3),
+		("minute", 4),
+		("second", 5),
+		("microsecond", 6),
+	] {
+		verify_datetime_attr(datetime, attr, expected, &format!("datetime.datetime.{attr}"))?;
+	}
 
-    let delta = unsafe { capi_datetime_delta_from_delta(1, 2, 3, 1, capi.delta_type) };
-    if delta.is_null() {
-        let detail = pending_error_detail();
-        pon_err_clear();
-        return Err(format!("PyDateTime_IMPORT datetime.timedelta(1, 2, 3) failed: {detail}"));
-    }
-    verify_datetime_attr(delta, "days", 1, "datetime.timedelta.days")?;
-    verify_datetime_attr(delta, "seconds", 2, "datetime.timedelta.seconds")?;
-    verify_datetime_attr(delta, "microseconds", 3, "datetime.timedelta.microseconds")?;
+	let delta = unsafe { capi_datetime_delta_from_delta(1, 2, 3, 1, capi.delta_type) };
+	if delta.is_null() {
+		let detail = pending_error_detail();
+		pon_err_clear();
+		return Err(format!("PyDateTime_IMPORT datetime.timedelta(1, 2, 3) failed: {detail}"));
+	}
+	verify_datetime_attr(delta, "days", 1, "datetime.timedelta.days")?;
+	verify_datetime_attr(delta, "seconds", 2, "datetime.timedelta.seconds")?;
+	verify_datetime_attr(delta, "microseconds", 3, "datetime.timedelta.microseconds")?;
 
-    if capi.timezone_utc.is_null() {
-        return Err("PyDateTime_IMPORT datetime.UTC is NULL".to_owned());
-    }
-    Ok(())
+	if capi.timezone_utc.is_null() {
+		return Err("PyDateTime_IMPORT datetime.UTC is NULL".to_owned());
+	}
+	Ok(())
 }
 
-fn verify_datetime_attr(object: *mut PyObject, attr: &str, expected: c_int, label: &str) -> Result<(), String> {
-    match unsafe { datetime_int_attr_raw(object, attr) } {
-        Ok(actual) if actual == expected => Ok(()),
-        Ok(actual) => Err(format!("PyDateTime_IMPORT {label} returned {actual}, expected {expected}")),
-        Err(message) => {
-            pon_err_clear();
-            Err(format!("PyDateTime_IMPORT could not read {label}: {message}"))
-        }
-    }
+fn verify_datetime_attr(
+	object: *mut PyObject,
+	attr: &str,
+	expected: c_int,
+	label: &str,
+) -> Result<(), String> {
+	match unsafe { datetime_int_attr_raw(object, attr) } {
+		Ok(actual) if actual == expected => Ok(()),
+		Ok(actual) => {
+			Err(format!("PyDateTime_IMPORT {label} returned {actual}, expected {expected}"))
+		},
+		Err(message) => {
+			pon_err_clear();
+			Err(format!("PyDateTime_IMPORT could not read {label}: {message}"))
+		},
+	}
 }
 
 unsafe fn datetime_int_attr_raw(object: *mut PyObject, attr: &str) -> Result<c_int, String> {
-    if object.is_null() {
-        return Err(format!("datetime attribute {attr} read received NULL object"));
-    }
-    let value = unsafe { abi::pon_get_attr(object, intern(attr), ptr::null_mut()) };
-    if value.is_null() {
-        return Err(pending_error_detail());
-    }
-    let value = crate::tag::untag_arg(value);
-    let Some(integer) = (unsafe { crate::types::int::to_bigint_including_bool(value) }) else {
-        return Err(format!("datetime attribute {attr} is not an integer"));
-    };
-    integer
-        .to_i32()
-        .ok_or_else(|| format!("datetime attribute {attr} is outside the C int range"))
+	if object.is_null() {
+		return Err(format!("datetime attribute {attr} read received NULL object"));
+	}
+	let value = unsafe { abi::pon_get_attr(object, intern(attr), ptr::null_mut()) };
+	if value.is_null() {
+		return Err(pending_error_detail());
+	}
+	let value = crate::tag::untag_arg(value);
+	let Some(integer) = (unsafe { crate::types::int::to_bigint_including_bool(value) }) else {
+		return Err(format!("datetime attribute {attr} is not an integer"));
+	};
+	integer
+		.to_i32()
+		.ok_or_else(|| format!("datetime attribute {attr} is outside the C int range"))
 }
 
 unsafe extern "C" fn capi_datetime_date_from_date(
-    year: c_int,
-    month: c_int,
-    day: c_int,
-    type_: *mut ForeignTypeObject,
+	year: c_int,
+	month: c_int,
+	day: c_int,
+	type_: *mut ForeignTypeObject,
 ) -> *mut PyObject {
-    let Some(callee) = (unsafe { datetime_constructor_type(type_, "PyDateTimeAPI->Date_FromDate") }) else {
-        return ptr::null_mut();
-    };
-    let Some(mut args) = (unsafe { datetime_int_args3(year, month, day) }) else {
-        return ptr::null_mut();
-    };
-    new_reference(unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) })
+	let Some(callee) = (unsafe { datetime_constructor_type(type_, "PyDateTimeAPI->Date_FromDate") })
+	else {
+		return ptr::null_mut();
+	};
+	let Some(mut args) = (unsafe { datetime_int_args3(year, month, day) }) else {
+		return ptr::null_mut();
+	};
+	new_reference(unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) })
 }
 
 unsafe extern "C" fn capi_datetime_datetime_from_date_and_time(
-    year: c_int,
-    month: c_int,
-    day: c_int,
-    hour: c_int,
-    minute: c_int,
-    second: c_int,
-    usecond: c_int,
-    tzinfo: *mut PyObject,
-    type_: *mut ForeignTypeObject,
+	year: c_int,
+	month: c_int,
+	day: c_int,
+	hour: c_int,
+	minute: c_int,
+	second: c_int,
+	usecond: c_int,
+	tzinfo: *mut PyObject,
+	type_: *mut ForeignTypeObject,
 ) -> *mut PyObject {
-    unsafe { call_datetime_datetime_constructor(year, month, day, hour, minute, second, usecond, tzinfo, None, type_) }
+	unsafe {
+		call_datetime_datetime_constructor(
+			year, month, day, hour, minute, second, usecond, tzinfo, None, type_,
+		)
+	}
 }
 
 unsafe extern "C" fn capi_datetime_datetime_from_date_and_time_and_fold(
-    year: c_int,
-    month: c_int,
-    day: c_int,
-    hour: c_int,
-    minute: c_int,
-    second: c_int,
-    usecond: c_int,
-    tzinfo: *mut PyObject,
-    fold: c_int,
-    type_: *mut ForeignTypeObject,
+	year: c_int,
+	month: c_int,
+	day: c_int,
+	hour: c_int,
+	minute: c_int,
+	second: c_int,
+	usecond: c_int,
+	tzinfo: *mut PyObject,
+	fold: c_int,
+	type_: *mut ForeignTypeObject,
 ) -> *mut PyObject {
-    unsafe { call_datetime_datetime_constructor(year, month, day, hour, minute, second, usecond, tzinfo, Some(fold), type_) }
+	unsafe {
+		call_datetime_datetime_constructor(
+			year,
+			month,
+			day,
+			hour,
+			minute,
+			second,
+			usecond,
+			tzinfo,
+			Some(fold),
+			type_,
+		)
+	}
 }
 
 unsafe fn call_datetime_datetime_constructor(
-    year: c_int,
-    month: c_int,
-    day: c_int,
-    hour: c_int,
-    minute: c_int,
-    second: c_int,
-    usecond: c_int,
-    tzinfo: *mut PyObject,
-    fold: Option<c_int>,
-    type_: *mut ForeignTypeObject,
+	year: c_int,
+	month: c_int,
+	day: c_int,
+	hour: c_int,
+	minute: c_int,
+	second: c_int,
+	usecond: c_int,
+	tzinfo: *mut PyObject,
+	fold: Option<c_int>,
+	type_: *mut ForeignTypeObject,
 ) -> *mut PyObject {
-    let Some(callee) = (unsafe { datetime_constructor_type(type_, "PyDateTimeAPI->DateTime_FromDateAndTime") }) else {
-        return ptr::null_mut();
-    };
-    let Some(tzinfo) = (unsafe { datetime_tzinfo_arg(tzinfo) }) else {
-        return ptr::null_mut();
-    };
-    let Some(mut args) = (unsafe { datetime_int_args7_with_object(year, month, day, hour, minute, second, usecond, tzinfo) }) else {
-        return ptr::null_mut();
-    };
-    if let Some(fold) = fold {
-        let Some(mut fold_values) = (unsafe { datetime_int_args1(fold) }) else {
-            return ptr::null_mut();
-        };
-        let fold_name = [intern("fold")];
-        let result = unsafe {
-            abi::call::pon_call_ex(
-                callee,
-                args.as_mut_ptr(),
-                args.len(),
-                ptr::null_mut(),
-                fold_name.as_ptr(),
-                fold_values.as_mut_ptr(),
-                fold_values.len(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-            )
-        };
-        return new_reference(result);
-    }
-    new_reference(unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) })
+	let Some(callee) =
+		(unsafe { datetime_constructor_type(type_, "PyDateTimeAPI->DateTime_FromDateAndTime") })
+	else {
+		return ptr::null_mut();
+	};
+	let Some(tzinfo) = (unsafe { datetime_tzinfo_arg(tzinfo) }) else {
+		return ptr::null_mut();
+	};
+	let Some(mut args) = (unsafe {
+		datetime_int_args7_with_object(year, month, day, hour, minute, second, usecond, tzinfo)
+	}) else {
+		return ptr::null_mut();
+	};
+	if let Some(fold) = fold {
+		let Some(mut fold_values) = (unsafe { datetime_int_args1(fold) }) else {
+			return ptr::null_mut();
+		};
+		let fold_name = [intern("fold")];
+		let result = unsafe {
+			abi::call::pon_call_ex(
+				callee,
+				args.as_mut_ptr(),
+				args.len(),
+				ptr::null_mut(),
+				fold_name.as_ptr(),
+				fold_values.as_mut_ptr(),
+				fold_values.len(),
+				ptr::null_mut(),
+				ptr::null_mut(),
+			)
+		};
+		return new_reference(result);
+	}
+	new_reference(unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) })
 }
 
 unsafe extern "C" fn capi_datetime_time_from_time(
-    hour: c_int,
-    minute: c_int,
-    second: c_int,
-    usecond: c_int,
-    tzinfo: *mut PyObject,
-    type_: *mut ForeignTypeObject,
+	hour: c_int,
+	minute: c_int,
+	second: c_int,
+	usecond: c_int,
+	tzinfo: *mut PyObject,
+	type_: *mut ForeignTypeObject,
 ) -> *mut PyObject {
-    unsafe { call_datetime_time_constructor(hour, minute, second, usecond, tzinfo, None, type_) }
+	unsafe { call_datetime_time_constructor(hour, minute, second, usecond, tzinfo, None, type_) }
 }
 
 unsafe extern "C" fn capi_datetime_time_from_time_and_fold(
-    hour: c_int,
-    minute: c_int,
-    second: c_int,
-    usecond: c_int,
-    tzinfo: *mut PyObject,
-    fold: c_int,
-    type_: *mut ForeignTypeObject,
+	hour: c_int,
+	minute: c_int,
+	second: c_int,
+	usecond: c_int,
+	tzinfo: *mut PyObject,
+	fold: c_int,
+	type_: *mut ForeignTypeObject,
 ) -> *mut PyObject {
-    unsafe { call_datetime_time_constructor(hour, minute, second, usecond, tzinfo, Some(fold), type_) }
+	unsafe {
+		call_datetime_time_constructor(hour, minute, second, usecond, tzinfo, Some(fold), type_)
+	}
 }
 
 unsafe fn call_datetime_time_constructor(
-    hour: c_int,
-    minute: c_int,
-    second: c_int,
-    usecond: c_int,
-    tzinfo: *mut PyObject,
-    fold: Option<c_int>,
-    type_: *mut ForeignTypeObject,
+	hour: c_int,
+	minute: c_int,
+	second: c_int,
+	usecond: c_int,
+	tzinfo: *mut PyObject,
+	fold: Option<c_int>,
+	type_: *mut ForeignTypeObject,
 ) -> *mut PyObject {
-    let Some(callee) = (unsafe { datetime_constructor_type(type_, "PyDateTimeAPI->Time_FromTime") }) else {
-        return ptr::null_mut();
-    };
-    let Some(tzinfo) = (unsafe { datetime_tzinfo_arg(tzinfo) }) else {
-        return ptr::null_mut();
-    };
-    let Some(mut args) = (unsafe { datetime_int_args4_with_object(hour, minute, second, usecond, tzinfo) }) else {
-        return ptr::null_mut();
-    };
-    if let Some(fold) = fold {
-        let Some(mut fold_values) = (unsafe { datetime_int_args1(fold) }) else {
-            return ptr::null_mut();
-        };
-        let fold_name = [intern("fold")];
-        let result = unsafe {
-            abi::call::pon_call_ex(
-                callee,
-                args.as_mut_ptr(),
-                args.len(),
-                ptr::null_mut(),
-                fold_name.as_ptr(),
-                fold_values.as_mut_ptr(),
-                fold_values.len(),
-                ptr::null_mut(),
-                ptr::null_mut(),
-            )
-        };
-        return new_reference(result);
-    }
-    new_reference(unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) })
+	let Some(callee) = (unsafe { datetime_constructor_type(type_, "PyDateTimeAPI->Time_FromTime") })
+	else {
+		return ptr::null_mut();
+	};
+	let Some(tzinfo) = (unsafe { datetime_tzinfo_arg(tzinfo) }) else {
+		return ptr::null_mut();
+	};
+	let Some(mut args) =
+		(unsafe { datetime_int_args4_with_object(hour, minute, second, usecond, tzinfo) })
+	else {
+		return ptr::null_mut();
+	};
+	if let Some(fold) = fold {
+		let Some(mut fold_values) = (unsafe { datetime_int_args1(fold) }) else {
+			return ptr::null_mut();
+		};
+		let fold_name = [intern("fold")];
+		let result = unsafe {
+			abi::call::pon_call_ex(
+				callee,
+				args.as_mut_ptr(),
+				args.len(),
+				ptr::null_mut(),
+				fold_name.as_ptr(),
+				fold_values.as_mut_ptr(),
+				fold_values.len(),
+				ptr::null_mut(),
+				ptr::null_mut(),
+			)
+		};
+		return new_reference(result);
+	}
+	new_reference(unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) })
 }
 
 unsafe extern "C" fn capi_datetime_delta_from_delta(
-    days: c_int,
-    seconds: c_int,
-    useconds: c_int,
-    normalize: c_int,
-    type_: *mut ForeignTypeObject,
+	days: c_int,
+	seconds: c_int,
+	useconds: c_int,
+	normalize: c_int,
+	type_: *mut ForeignTypeObject,
 ) -> *mut PyObject {
-    if normalize != 1 {
-        raise_not_implemented("PyDateTimeAPI->Delta_FromDelta with normalize=0 is not implemented by Pon's Python-backed datetime shim");
-        return ptr::null_mut();
-    }
-    let Some(callee) = (unsafe { datetime_constructor_type(type_, "PyDateTimeAPI->Delta_FromDelta") }) else {
-        return ptr::null_mut();
-    };
-    let Some(mut args) = (unsafe { datetime_int_args3(days, seconds, useconds) }) else {
-        return ptr::null_mut();
-    };
-    new_reference(unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) })
+	if normalize != 1 {
+		raise_not_implemented(
+			"PyDateTimeAPI->Delta_FromDelta with normalize=0 is not implemented by Pon's \
+			 Python-backed datetime shim",
+		);
+		return ptr::null_mut();
+	}
+	let Some(callee) =
+		(unsafe { datetime_constructor_type(type_, "PyDateTimeAPI->Delta_FromDelta") })
+	else {
+		return ptr::null_mut();
+	};
+	let Some(mut args) = (unsafe { datetime_int_args3(days, seconds, useconds) }) else {
+		return ptr::null_mut();
+	};
+	new_reference(unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) })
 }
 
-unsafe fn datetime_constructor_type(type_: *mut ForeignTypeObject, symbol: &str) -> Option<*mut PyObject> {
-    if type_.is_null() {
-        raise_type_error(&format!("{symbol} received NULL type"));
-        return None;
-    }
-    let Some(native) = twin::native_of_foreign(type_) else {
-        raise_type_error(&format!("{symbol} received a type object that is not registered with Pon"));
-        return None;
-    };
-    Some(native.cast::<PyObject>())
+unsafe fn datetime_constructor_type(
+	type_: *mut ForeignTypeObject,
+	symbol: &str,
+) -> Option<*mut PyObject> {
+	if type_.is_null() {
+		raise_type_error(&format!("{symbol} received NULL type"));
+		return None;
+	}
+	let Some(native) = twin::native_of_foreign(type_) else {
+		raise_type_error(&format!("{symbol} received a type object that is not registered with Pon"));
+		return None;
+	};
+	Some(native.cast::<PyObject>())
 }
 
 unsafe fn datetime_tzinfo_arg(tzinfo: *mut PyObject) -> Option<*mut PyObject> {
-    if tzinfo.is_null() {
-        let none = unsafe { abi::pon_none() };
-        return (!none.is_null()).then_some(none);
-    }
-    Some(crate::tag::untag_arg(tzinfo))
+	if tzinfo.is_null() {
+		let none = unsafe { abi::pon_none() };
+		return (!none.is_null()).then_some(none);
+	}
+	Some(crate::tag::untag_arg(tzinfo))
 }
 
 unsafe fn datetime_int_arg(value: c_int) -> Option<*mut PyObject> {
-    let object = unsafe { abi::pon_const_int(i64::from(value)) };
-    (!object.is_null()).then_some(object)
+	let object = unsafe { abi::pon_const_int(i64::from(value)) };
+	(!object.is_null()).then_some(object)
 }
 
 unsafe fn datetime_int_args1(a: c_int) -> Option<[*mut PyObject; 1]> {
-    Some([unsafe { datetime_int_arg(a) }?])
+	Some([unsafe { datetime_int_arg(a) }?])
 }
 
 unsafe fn datetime_int_args3(a: c_int, b: c_int, c: c_int) -> Option<[*mut PyObject; 3]> {
-    Some([
-        unsafe { datetime_int_arg(a) }?,
-        unsafe { datetime_int_arg(b) }?,
-        unsafe { datetime_int_arg(c) }?,
-    ])
+	Some([unsafe { datetime_int_arg(a) }?, unsafe { datetime_int_arg(b) }?, unsafe {
+		datetime_int_arg(c)
+	}?])
 }
 
 unsafe fn datetime_int_args7_with_object(
-    a: c_int,
-    b: c_int,
-    c: c_int,
-    d: c_int,
-    e: c_int,
-    f: c_int,
-    g: c_int,
-    object: *mut PyObject,
+	a: c_int,
+	b: c_int,
+	c: c_int,
+	d: c_int,
+	e: c_int,
+	f: c_int,
+	g: c_int,
+	object: *mut PyObject,
 ) -> Option<[*mut PyObject; 8]> {
-    Some([
-        unsafe { datetime_int_arg(a) }?,
-        unsafe { datetime_int_arg(b) }?,
-        unsafe { datetime_int_arg(c) }?,
-        unsafe { datetime_int_arg(d) }?,
-        unsafe { datetime_int_arg(e) }?,
-        unsafe { datetime_int_arg(f) }?,
-        unsafe { datetime_int_arg(g) }?,
-        object,
-    ])
+	Some([
+		unsafe { datetime_int_arg(a) }?,
+		unsafe { datetime_int_arg(b) }?,
+		unsafe { datetime_int_arg(c) }?,
+		unsafe { datetime_int_arg(d) }?,
+		unsafe { datetime_int_arg(e) }?,
+		unsafe { datetime_int_arg(f) }?,
+		unsafe { datetime_int_arg(g) }?,
+		object,
+	])
 }
 
 unsafe fn datetime_int_args4_with_object(
-    a: c_int,
-    b: c_int,
-    c: c_int,
-    d: c_int,
-    object: *mut PyObject,
+	a: c_int,
+	b: c_int,
+	c: c_int,
+	d: c_int,
+	object: *mut PyObject,
 ) -> Option<[*mut PyObject; 5]> {
-    Some([
-        unsafe { datetime_int_arg(a) }?,
-        unsafe { datetime_int_arg(b) }?,
-        unsafe { datetime_int_arg(c) }?,
-        unsafe { datetime_int_arg(d) }?,
-        object,
-    ])
+	Some([
+		unsafe { datetime_int_arg(a) }?,
+		unsafe { datetime_int_arg(b) }?,
+		unsafe { datetime_int_arg(c) }?,
+		unsafe { datetime_int_arg(d) }?,
+		object,
+	])
 }
 
-unsafe extern "C" fn capi_datetime_unsupported_timezone_from_timezone(_offset: *mut PyObject, _name: *mut PyObject) -> *mut PyObject {
-    raise_not_implemented("PyDateTimeAPI->TimeZone_FromTimeZone is not implemented by Pon's numpy datetime C-API surface");
-    ptr::null_mut()
+unsafe extern "C" fn capi_datetime_unsupported_timezone_from_timezone(
+	_offset: *mut PyObject,
+	_name: *mut PyObject,
+) -> *mut PyObject {
+	raise_not_implemented(
+		"PyDateTimeAPI->TimeZone_FromTimeZone is not implemented by Pon's numpy datetime C-API \
+		 surface",
+	);
+	ptr::null_mut()
 }
 
 unsafe extern "C" fn capi_datetime_unsupported_datetime_from_timestamp(
-    _cls: *mut PyObject,
-    _args: *mut PyObject,
-    _kwargs: *mut PyObject,
+	_cls: *mut PyObject,
+	_args: *mut PyObject,
+	_kwargs: *mut PyObject,
 ) -> *mut PyObject {
-    raise_not_implemented("PyDateTimeAPI->DateTime_FromTimestamp is not implemented by Pon's numpy datetime C-API surface");
-    ptr::null_mut()
+	raise_not_implemented(
+		"PyDateTimeAPI->DateTime_FromTimestamp is not implemented by Pon's numpy datetime C-API \
+		 surface",
+	);
+	ptr::null_mut()
 }
 
-unsafe extern "C" fn capi_datetime_unsupported_date_from_timestamp(_cls: *mut PyObject, _args: *mut PyObject) -> *mut PyObject {
-    raise_not_implemented("PyDateTimeAPI->Date_FromTimestamp is not implemented by Pon's numpy datetime C-API surface");
-    ptr::null_mut()
+unsafe extern "C" fn capi_datetime_unsupported_date_from_timestamp(
+	_cls: *mut PyObject,
+	_args: *mut PyObject,
+) -> *mut PyObject {
+	raise_not_implemented(
+		"PyDateTimeAPI->Date_FromTimestamp is not implemented by Pon's numpy datetime C-API surface",
+	);
+	ptr::null_mut()
 }
-
 
 unsafe extern "C" fn capi_capsule_new(
-    pointer: *mut c_void,
-    name: *const c_char,
-    destructor: PyCapsuleDestructor,
+	pointer: *mut c_void,
+	name: *const c_char,
+	destructor: PyCapsuleDestructor,
 ) -> *mut PyObject {
-    if pointer.is_null() {
-        raise_value_error("PyCapsule_New called with null pointer");
-        return ptr::null_mut();
-    }
-    new_reference(
-        Box::into_raw(Box::new(PyCapsule {
-            ob_base: PyObjectHeader::new(capsule_type()),
-            pointer,
-            name,
-            destructor,
-            context: ptr::null_mut(),
-        }))
-        .cast::<PyObject>(),
-    )
+	if pointer.is_null() {
+		raise_value_error("PyCapsule_New called with null pointer");
+		return ptr::null_mut();
+	}
+	new_reference(
+		Box::into_raw(Box::new(PyCapsule {
+			ob_base: PyObjectHeader::new(capsule_type()),
+			pointer,
+			name,
+			destructor,
+			context: ptr::null_mut(),
+		}))
+		.cast::<PyObject>(),
+	)
 }
 
-unsafe extern "C" fn capi_capsule_get_pointer(capsule: *mut PyObject, name: *const c_char) -> *mut c_void {
-    let Some(capsule) = (unsafe { checked_capsule(capsule, name, "PyCapsule_GetPointer") }) else {
-        return ptr::null_mut();
-    };
-    capsule.pointer
+unsafe extern "C" fn capi_capsule_get_pointer(
+	capsule: *mut PyObject,
+	name: *const c_char,
+) -> *mut c_void {
+	let Some(capsule) = (unsafe { checked_capsule(capsule, name, "PyCapsule_GetPointer") }) else {
+		return ptr::null_mut();
+	};
+	capsule.pointer
 }
 
 unsafe extern "C" fn capi_capsule_is_valid(capsule: *mut PyObject, name: *const c_char) -> c_int {
-    let Some(capsule) = (unsafe { capsule_ref(capsule) }) else {
-        return 0;
-    };
-    (!capsule.pointer.is_null() && unsafe { capsule_name_matches(capsule.name, name) }) as c_int
+	let Some(capsule) = (unsafe { capsule_ref(capsule) }) else {
+		return 0;
+	};
+	(!capsule.pointer.is_null() && unsafe { capsule_name_matches(capsule.name, name) }) as c_int
 }
 
-unsafe extern "C" fn capi_capsule_set_context(capsule: *mut PyObject, context: *mut c_void) -> c_int {
-    let Some(capsule) = (unsafe { checked_capsule_any_name(capsule, "PyCapsule_SetContext") }) else {
-        return -1;
-    };
-    capsule.context = context;
-    0
+unsafe extern "C" fn capi_capsule_set_context(
+	capsule: *mut PyObject,
+	context: *mut c_void,
+) -> c_int {
+	let Some(capsule) = (unsafe { checked_capsule_any_name(capsule, "PyCapsule_SetContext") })
+	else {
+		return -1;
+	};
+	capsule.context = context;
+	0
 }
 
 unsafe extern "C" fn capi_capsule_get_context(capsule: *mut PyObject) -> *mut c_void {
-    let Some(capsule) = (unsafe { checked_capsule_any_name(capsule, "PyCapsule_GetContext") }) else {
-        return ptr::null_mut();
-    };
-    capsule.context
+	let Some(capsule) = (unsafe { checked_capsule_any_name(capsule, "PyCapsule_GetContext") })
+	else {
+		return ptr::null_mut();
+	};
+	capsule.context
 }
 
 unsafe extern "C" fn capi_capsule_import(name: *const c_char, _no_block: c_int) -> *mut c_void {
-    let Some(full_name) = c_string(name) else {
-        return raise_value_error_null("PyCapsule_Import called with invalid name");
-    };
-    if full_name == DATETIME_CAPSULE_NAME {
-        return unsafe { capi_datetime_capi_import() };
-    }
-    let mut parts = full_name.split('.');
-    let Some(module_name) = parts.next().filter(|part| !part.is_empty()) else {
-        return raise_value_error_null("PyCapsule_Import called with invalid name");
-    };
-    let mut object = import_module_text(module_name);
-    if object.is_null() {
-        return ptr::null_mut();
-    }
-    for attr in parts {
-        if attr.is_empty() {
-            return raise_value_error_null("PyCapsule_Import called with invalid name");
-        }
-        object = unsafe { abi::pon_get_attr(object, intern(attr), ptr::null_mut()) };
-        if object.is_null() {
-            return ptr::null_mut();
-        }
-    }
-    unsafe { capi_capsule_get_pointer(object, name) }
+	let Some(full_name) = c_string(name) else {
+		return raise_value_error_null("PyCapsule_Import called with invalid name");
+	};
+	if full_name == DATETIME_CAPSULE_NAME {
+		return unsafe { capi_datetime_capi_import() };
+	}
+	let mut parts = full_name.split('.');
+	let Some(module_name) = parts.next().filter(|part| !part.is_empty()) else {
+		return raise_value_error_null("PyCapsule_Import called with invalid name");
+	};
+	let mut object = import_module_text(module_name);
+	if object.is_null() {
+		return ptr::null_mut();
+	}
+	for attr in parts {
+		if attr.is_empty() {
+			return raise_value_error_null("PyCapsule_Import called with invalid name");
+		}
+		object = unsafe { abi::pon_get_attr(object, intern(attr), ptr::null_mut()) };
+		if object.is_null() {
+			return ptr::null_mut();
+		}
+	}
+	unsafe { capi_capsule_get_pointer(object, name) }
 }
 
 unsafe extern "C" fn capi_import_import_module(name: *const c_char) -> *mut PyObject {
-    let Some(name) = c_string(name) else {
-        return raise_import_error_null("PyImport_ImportModule called with invalid module name");
-    };
-    new_reference(import_module_text(&name))
+	let Some(name) = c_string(name) else {
+		return raise_import_error_null("PyImport_ImportModule called with invalid module name");
+	};
+	new_reference(import_module_text(&name))
 }
 
 /// `PyImport_Import`: object-name variant of PyImport_ImportModule.
 unsafe extern "C" fn capi_import_import(name: *mut PyObject) -> *mut PyObject {
-    let Some(text) = (unsafe { crate::types::type_::unicode_text(crate::tag::untag_arg(name)) }) else {
-        return raise_import_error_null("PyImport_Import expects a str module name");
-    };
-    new_reference(import_module_text(&text.to_owned()))
+	let Some(text) = (unsafe { crate::types::type_::unicode_text(crate::tag::untag_arg(name)) })
+	else {
+		return raise_import_error_null("PyImport_Import expects a str module name");
+	};
+	new_reference(import_module_text(&text.to_owned()))
 }
 
 unsafe extern "C" fn capi_import_import_module_level(
-    name: *const c_char,
-    _globals: *mut PyObject,
-    _locals: *mut PyObject,
-    fromlist: *mut PyObject,
-    level: c_int,
+	name: *const c_char,
+	_globals: *mut PyObject,
+	_locals: *mut PyObject,
+	fromlist: *mut PyObject,
+	level: c_int,
 ) -> *mut PyObject {
-    let Some(name) = c_string(name) else {
-        return raise_import_error_null("PyImport_ImportModuleLevel called with invalid module name");
-    };
-    let fromlist = crate::tag::untag_arg(fromlist);
-    let none = unsafe { abi::pon_none() };
-    let has_fromlist = !fromlist.is_null() && fromlist != none;
-    let star = [intern("*")];
-    let (fromlist_ptr, fromlist_len) = if has_fromlist {
-        (star.as_ptr(), star.len())
-    } else {
-        (ptr::null(), 0)
-    };
-    let level = if level <= 0 { 0 } else { level as u32 };
-    new_reference(unsafe { crate::import::pon_import_name(intern(&name), fromlist_ptr, fromlist_len, level) })
+	let Some(name) = c_string(name) else {
+		return raise_import_error_null("PyImport_ImportModuleLevel called with invalid module name");
+	};
+	let fromlist = crate::tag::untag_arg(fromlist);
+	let none = unsafe { abi::pon_none() };
+	let has_fromlist = !fromlist.is_null() && fromlist != none;
+	let star = [intern("*")];
+	let (fromlist_ptr, fromlist_len) = if has_fromlist {
+		(star.as_ptr(), star.len())
+	} else {
+		(ptr::null(), 0)
+	};
+	let level = if level <= 0 { 0 } else { level as u32 };
+	new_reference(unsafe {
+		crate::import::pon_import_name(intern(&name), fromlist_ptr, fromlist_len, level)
+	})
 }
 
 /// `PyCapsule_SetName`: replaces the stored name pointer (caller keeps the
 /// storage alive, CPython contract).
 unsafe extern "C" fn capi_capsule_set_name(capsule: *mut PyObject, name: *const c_char) -> c_int {
-    let Some(capsule) = (unsafe { checked_capsule_any_name(capsule, "PyCapsule_SetName") }) else {
-        return -1;
-    };
-    capsule.name = name;
-    0
+	let Some(capsule) = (unsafe { checked_capsule_any_name(capsule, "PyCapsule_SetName") }) else {
+		return -1;
+	};
+	capsule.name = name;
+	0
 }
 
 unsafe extern "C" fn capi_import_add_module(name: *const c_char) -> *mut PyObject {
-    let Some(name) = c_string(name) else {
-        return abi::return_null_with_error("PyImport_AddModule called with invalid module name");
-    };
-    let name_id = intern(&name);
-    if let Some(module) = crate::import::cached_module(name_id) {
-        return module;
-    }
-    match crate::import::install_module(&name, []) {
-        Ok(module) => module,
-        Err(message) => abi::return_null_with_error(message),
-    }
+	let Some(name) = c_string(name) else {
+		return abi::return_null_with_error("PyImport_AddModule called with invalid module name");
+	};
+	let name_id = intern(&name);
+	if let Some(module) = crate::import::cached_module(name_id) {
+		return module;
+	}
+	match crate::import::install_module(&name, []) {
+		Ok(module) => module,
+		Err(message) => abi::return_null_with_error(message),
+	}
 }
 
 unsafe extern "C" fn capi_module_get_dict(module: *mut PyObject) -> *mut PyObject {
-    let Some(module_name) = crate::import::module_object_registry_key(module) else {
-        return raise_system_error_null("PyModule_GetDict called with non-module object");
-    };
-    match crate::dynexec::module_namespace_dict(module_name) {
-        Ok(dict) => dict,
-        Err(message) => abi::return_null_with_error(message),
-    }
+	let Some(module_name) = crate::import::module_object_registry_key(module) else {
+		return raise_system_error_null("PyModule_GetDict called with non-module object");
+	};
+	match crate::dynexec::module_namespace_dict(module_name) {
+		Ok(dict) => dict,
+		Err(message) => abi::return_null_with_error(message),
+	}
 }
 
 unsafe extern "C" fn capi_module_get_state(module: *mut PyObject) -> *mut c_void {
-    {
-        let mut states = MODULE_STATES.lock().unwrap_or_else(|poison| poison.into_inner());
-        if let Some(state) = states.get_mut(&(module as usize)) {
-            return state.as_mut_ptr().cast::<c_void>();
-        }
-    }
-    if module.is_null() || !crate::tag::is_heap(module) || crate::import::module_object_registry_key(module).is_none() {
-        raise_system_error("PyModule_GetState called with non-module object");
-    }
-    ptr::null_mut()
+	{
+		let mut states = MODULE_STATES
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
+		if let Some(state) = states.get_mut(&(module as usize)) {
+			return state.as_mut_ptr().cast::<c_void>();
+		}
+	}
+	if module.is_null()
+		|| !crate::tag::is_heap(module)
+		|| crate::import::module_object_registry_key(module).is_none()
+	{
+		raise_system_error("PyModule_GetState called with non-module object");
+	}
+	ptr::null_mut()
 }
 
 unsafe extern "C" fn capi_module_get_name(module: *mut PyObject) -> *const c_char {
-    let Some(module_name) = crate::import::module_object_registry_key(module) else {
-        raise_system_error("PyModule_GetName called with non-module object");
-        return ptr::null();
-    };
-    let Some(name) = resolve(module_name) else {
-        raise_system_error("PyModule_GetName could not resolve module name");
-        return ptr::null();
-    };
-    cached_c_string(module_name, &name)
+	let Some(module_name) = crate::import::module_object_registry_key(module) else {
+		raise_system_error("PyModule_GetName called with non-module object");
+		return ptr::null();
+	};
+	let Some(name) = resolve(module_name) else {
+		raise_system_error("PyModule_GetName could not resolve module name");
+		return ptr::null();
+	};
+	cached_c_string(module_name, &name)
 }
 
 unsafe extern "C" fn capi_sys_get_object(name: *const c_char) -> *mut PyObject {
-    let Some(name) = c_string(name) else {
-        return ptr::null_mut();
-    };
-    let sys = import_module_text("sys");
-    if sys.is_null() {
-        return ptr::null_mut();
-    }
-    let object = unsafe { abi::pon_get_attr(sys, intern(&name), ptr::null_mut()) };
-    if object.is_null() {
-        pon_err_clear();
-    }
-    object
+	let Some(name) = c_string(name) else {
+		return ptr::null_mut();
+	};
+	let sys = import_module_text("sys");
+	if sys.is_null() {
+		return ptr::null_mut();
+	}
+	let object = unsafe { abi::pon_get_attr(sys, intern(&name), ptr::null_mut()) };
+	if object.is_null() {
+		pon_err_clear();
+	}
+	object
 }
 
 fn import_module_text(name: &str) -> *mut PyObject {
-    let name_id = intern(name);
-    let fromlist = [intern("*")];
-    unsafe { crate::import::pon_import_name(name_id, fromlist.as_ptr(), fromlist.len(), 0) }
+	let name_id = intern(name);
+	let fromlist = [intern("*")];
+	unsafe { crate::import::pon_import_name(name_id, fromlist.as_ptr(), fromlist.len(), 0) }
 }
 
 unsafe fn is_none_object(object: *mut PyObject) -> bool {
-    let object = crate::tag::untag_arg(object);
-    object.is_null() || object == unsafe { abi::pon_none() }
+	let object = crate::tag::untag_arg(object);
+	object.is_null() || object == unsafe { abi::pon_none() }
 }
 
 unsafe fn is_exact_generator_family(object: *mut PyObject) -> bool {
-    let object = crate::tag::untag_arg(object);
-    if object.is_null() || !crate::tag::is_heap(object) {
-        return false;
-    }
-    let type_type = abi::runtime_type_type();
-    if type_type.is_null() {
-        return false;
-    }
-    let generator = ensure_generator_type(type_type).cast_const();
-    let coroutine = ensure_coroutine_type(type_type).cast_const();
-    let async_generator = ensure_async_generator_type(type_type).cast_const();
-    unsafe { is_exact_type(object, generator) || is_exact_type(object, coroutine) || is_exact_type(object, async_generator) }
+	let object = crate::tag::untag_arg(object);
+	if object.is_null() || !crate::tag::is_heap(object) {
+		return false;
+	}
+	let type_type = abi::runtime_type_type();
+	if type_type.is_null() {
+		return false;
+	}
+	let generator = ensure_generator_type(type_type).cast_const();
+	let coroutine = ensure_coroutine_type(type_type).cast_const();
+	let async_generator = ensure_async_generator_type(type_type).cast_const();
+	unsafe {
+		is_exact_type(object, generator)
+			|| is_exact_type(object, coroutine)
+			|| is_exact_type(object, async_generator)
+	}
 }
 
 fn finish_iter_send_return(presult: *mut *mut PyObject) -> PySendResult {
-    if abi::exc::pending_exception_is("StopIteration") {
-        let value = unsafe { abi::r#gen::pon_gen_stop_value() };
-        if value.is_null() {
-            return PYGEN_ERROR;
-        }
-        unsafe { *presult = new_reference(value) };
-        return PYGEN_RETURN;
-    }
-    if abi::exc::pending_exception_is("StopAsyncIteration") {
-        pon_err_clear();
-        let none = unsafe { abi::pon_none() };
-        if none.is_null() {
-            return PYGEN_ERROR;
-        }
-        unsafe { *presult = new_reference(none) };
-        return PYGEN_RETURN;
-    }
-    PYGEN_ERROR
+	if abi::exc::pending_exception_is("StopIteration") {
+		let value = unsafe { abi::r#gen::pon_gen_stop_value() };
+		if value.is_null() {
+			return PYGEN_ERROR;
+		}
+		unsafe { *presult = new_reference(value) };
+		return PYGEN_RETURN;
+	}
+	if abi::exc::pending_exception_is("StopAsyncIteration") {
+		pon_err_clear();
+		let none = unsafe { abi::pon_none() };
+		if none.is_null() {
+			return PYGEN_ERROR;
+		}
+		unsafe { *presult = new_reference(none) };
+		return PYGEN_RETURN;
+	}
+	PYGEN_ERROR
 }
 
-unsafe extern "C" fn capi_iter_send(iter: *mut PyObject, arg: *mut PyObject, presult: *mut *mut PyObject) -> PySendResult {
-    if presult.is_null() {
-        raise_system_error("PyIter_Send result pointer must not be NULL");
-        return PYGEN_ERROR;
-    }
-    unsafe { *presult = ptr::null_mut() };
-    let iter = crate::tag::untag_arg(iter);
-    let arg = if arg.is_null() {
-        unsafe { abi::pon_none() }
-    } else {
-        crate::tag::untag_arg(arg)
-    };
-    if arg.is_null() {
-        return PYGEN_ERROR;
-    }
-    if unsafe { is_exact_generator_family(iter) } {
-        let result = unsafe { abi::r#gen::pon_gen_send(iter, arg) };
-        if !result.is_null() {
-            unsafe { *presult = new_reference(result) };
-            return PYGEN_NEXT;
-        }
-        return finish_iter_send_return(presult);
-    }
-    if !unsafe { is_none_object(arg) } {
-        raise_type_error("PyIter_Send with a non-None value requires a generator or coroutine");
-        return PYGEN_ERROR;
-    }
-    let result = unsafe { abi::pon_iter_next(iter, ptr::null_mut()) };
-    if !result.is_null() {
-        unsafe { *presult = new_reference(result) };
-        return PYGEN_NEXT;
-    }
-    finish_iter_send_return(presult)
+unsafe extern "C" fn capi_iter_send(
+	iter: *mut PyObject,
+	arg: *mut PyObject,
+	presult: *mut *mut PyObject,
+) -> PySendResult {
+	if presult.is_null() {
+		raise_system_error("PyIter_Send result pointer must not be NULL");
+		return PYGEN_ERROR;
+	}
+	unsafe { *presult = ptr::null_mut() };
+	let iter = crate::tag::untag_arg(iter);
+	let arg = if arg.is_null() {
+		unsafe { abi::pon_none() }
+	} else {
+		crate::tag::untag_arg(arg)
+	};
+	if arg.is_null() {
+		return PYGEN_ERROR;
+	}
+	if unsafe { is_exact_generator_family(iter) } {
+		let result = unsafe { abi::r#gen::pon_gen_send(iter, arg) };
+		if !result.is_null() {
+			unsafe { *presult = new_reference(result) };
+			return PYGEN_NEXT;
+		}
+		return finish_iter_send_return(presult);
+	}
+	if !unsafe { is_none_object(arg) } {
+		raise_type_error("PyIter_Send with a non-None value requires a generator or coroutine");
+		return PYGEN_ERROR;
+	}
+	let result = unsafe { abi::pon_iter_next(iter, ptr::null_mut()) };
+	if !result.is_null() {
+		unsafe { *presult = new_reference(result) };
+		return PYGEN_NEXT;
+	}
+	finish_iter_send_return(presult)
 }
 
 unsafe extern "C" fn capi_async_gen_check_exact(object: *mut PyObject) -> c_int {
-    let object = crate::tag::untag_arg(object);
-    if object.is_null() || !crate::tag::is_heap(object) {
-        return 0;
-    }
-    let type_type = abi::runtime_type_type();
-    if type_type.is_null() {
-        return 0;
-    }
-    let async_generator = ensure_async_generator_type(type_type).cast_const();
-    unsafe { is_exact_type(object, async_generator) as c_int }
+	let object = crate::tag::untag_arg(object);
+	if object.is_null() || !crate::tag::is_heap(object) {
+		return 0;
+	}
+	let type_type = abi::runtime_type_type();
+	if type_type.is_null() {
+		return 0;
+	}
+	let async_generator = ensure_async_generator_type(type_type).cast_const();
+	unsafe { is_exact_type(object, async_generator) as c_int }
 }
 
 #[cfg(test)]
 unsafe extern "C" fn capi_test_collect_pin_count(object: *mut PyObject) -> isize {
-    match abi::collect() {
-        Ok(()) => super::pin_count(object) as isize,
-        Err(message) => {
-            raise_system_error(&message);
-            -1
-        }
-    }
+	match abi::collect() {
+		Ok(()) => super::pin_count(object) as isize,
+		Err(message) => {
+			raise_system_error(&message);
+			-1
+		},
+	}
 }
 
 unsafe fn capsule_ref<'a>(capsule: *mut PyObject) -> Option<&'a mut PyCapsule> {
-    if capsule.is_null() || !crate::tag::is_heap(capsule) {
-        return None;
-    }
-    // SAFETY: The heap-tag guard above makes the object header readable.
-    if unsafe { (*capsule).ob_type } != capsule_type() {
-        return None;
-    }
-    // SAFETY: Capsule objects are allocated by `capi_capsule_new` with this layout.
-    Some(unsafe { &mut *capsule.cast::<PyCapsule>() })
+	if capsule.is_null() || !crate::tag::is_heap(capsule) {
+		return None;
+	}
+	// SAFETY: The heap-tag guard above makes the object header readable.
+	if unsafe { (*capsule).ob_type } != capsule_type() {
+		return None;
+	}
+	// SAFETY: Capsule objects are allocated by `capi_capsule_new` with this layout.
+	Some(unsafe { &mut *capsule.cast::<PyCapsule>() })
 }
 
-unsafe fn checked_capsule<'a>(capsule: *mut PyObject, name: *const c_char, api: &str) -> Option<&'a mut PyCapsule> {
-    let capsule_ref = unsafe { checked_capsule_any_name(capsule, api) }?;
-    if unsafe { capsule_name_matches(capsule_ref.name, name) } {
-        return Some(capsule_ref);
-    }
-    raise_value_error(&format!("{api} called with incorrect name"));
-    None
+unsafe fn checked_capsule<'a>(
+	capsule: *mut PyObject,
+	name: *const c_char,
+	api: &str,
+) -> Option<&'a mut PyCapsule> {
+	let capsule_ref = unsafe { checked_capsule_any_name(capsule, api) }?;
+	if unsafe { capsule_name_matches(capsule_ref.name, name) } {
+		return Some(capsule_ref);
+	}
+	raise_value_error(&format!("{api} called with incorrect name"));
+	None
 }
 
-unsafe fn checked_capsule_any_name<'a>(capsule: *mut PyObject, api: &str) -> Option<&'a mut PyCapsule> {
-    let Some(capsule_ref) = (unsafe { capsule_ref(capsule) }) else {
-        raise_value_error(&format!("{api} called with invalid PyCapsule object"));
-        return None;
-    };
-    if capsule_ref.pointer.is_null() {
-        raise_value_error(&format!("{api} called with invalid PyCapsule object"));
-        return None;
-    }
-    Some(capsule_ref)
+unsafe fn checked_capsule_any_name<'a>(
+	capsule: *mut PyObject,
+	api: &str,
+) -> Option<&'a mut PyCapsule> {
+	let Some(capsule_ref) = (unsafe { capsule_ref(capsule) }) else {
+		raise_value_error(&format!("{api} called with invalid PyCapsule object"));
+		return None;
+	};
+	if capsule_ref.pointer.is_null() {
+		raise_value_error(&format!("{api} called with invalid PyCapsule object"));
+		return None;
+	}
+	Some(capsule_ref)
 }
 
 unsafe fn capsule_name_matches(stored: *const c_char, requested: *const c_char) -> bool {
-    if stored.is_null() || requested.is_null() {
-        return stored == requested;
-    }
-    // SAFETY: PyCapsule names are process-lifetime NUL-terminated C strings per CPython's API contract.
-    let stored = unsafe { CStr::from_ptr(stored) }.to_bytes();
-    // SAFETY: Caller supplies a NUL-terminated name pointer for comparison.
-    let requested = unsafe { CStr::from_ptr(requested) }.to_bytes();
-    stored == requested
+	if stored.is_null() || requested.is_null() {
+		return stored == requested;
+	}
+	// SAFETY: PyCapsule names are process-lifetime NUL-terminated C strings per
+	// CPython's API contract.
+	let stored = unsafe { CStr::from_ptr(stored) }.to_bytes();
+	// SAFETY: Caller supplies a NUL-terminated name pointer for comparison.
+	let requested = unsafe { CStr::from_ptr(requested) }.to_bytes();
+	stored == requested
 }
 
 fn cached_c_string(key: u32, text: &str) -> *const c_char {
-    static CACHE: LazyLock<Mutex<HashMap<u32, usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
-    let mut cache = CACHE.lock().unwrap_or_else(|poison| poison.into_inner());
-    if let Some(&ptr) = cache.get(&key) {
-        return ptr as *const c_char;
-    }
-    let Ok(c_string) = CString::new(text) else {
-        return ptr::null();
-    };
-    let ptr = c_string.into_raw() as usize;
-    cache.insert(key, ptr);
-    ptr as *const c_char
+	static CACHE: LazyLock<Mutex<HashMap<u32, usize>>> =
+		LazyLock::new(|| Mutex::new(HashMap::new()));
+	let mut cache = CACHE.lock().unwrap_or_else(|poison| poison.into_inner());
+	if let Some(&ptr) = cache.get(&key) {
+		return ptr as *const c_char;
+	}
+	let Ok(c_string) = CString::new(text) else {
+		return ptr::null();
+	};
+	let ptr = c_string.into_raw() as usize;
+	cache.insert(key, ptr);
+	ptr as *const c_char
 }
 
 fn raise_value_error_null(message: &str) -> *mut c_void {
-    raise_value_error(message);
-    ptr::null_mut()
+	raise_value_error(message);
+	ptr::null_mut()
 }
 
 fn raise_import_error_null(message: &str) -> *mut PyObject {
-    let _ = abi::exc::raise_kind_error_text(ExceptionKind::ImportError, message);
-    ptr::null_mut()
+	let _ = abi::exc::raise_kind_error_text(ExceptionKind::ImportError, message);
+	ptr::null_mut()
 }
 
 fn raise_import_error_void(message: &str) -> *mut c_void {
-    let _ = abi::exc::raise_kind_error_text(ExceptionKind::ImportError, message);
-    ptr::null_mut()
+	let _ = abi::exc::raise_kind_error_text(ExceptionKind::ImportError, message);
+	ptr::null_mut()
 }
 
 fn raise_system_error_null(message: &str) -> *mut PyObject {
-    raise_system_error(message);
-    ptr::null_mut()
+	raise_system_error(message);
+	ptr::null_mut()
 }
 
 fn raise_value_error(message: &str) {
-    let _ = abi::exc::raise_kind_error_text(ExceptionKind::ValueError, message);
+	let _ = abi::exc::raise_kind_error_text(ExceptionKind::ValueError, message);
 }
 
 fn raise_system_error(message: &str) {
-    let _ = abi::exc::raise_kind_error_text(ExceptionKind::SystemError, message);
+	let _ = abi::exc::raise_kind_error_text(ExceptionKind::SystemError, message);
 }
 
 fn raise_type_error(message: &str) {
-    let _ = abi::exc::raise_kind_error_text(ExceptionKind::TypeError, message);
+	let _ = abi::exc::raise_kind_error_text(ExceptionKind::TypeError, message);
 }
 
 fn raise_not_implemented(message: &str) {
-    let _ = abi::exc::raise_kind_error_text(ExceptionKind::NotImplementedError, message);
+	let _ = abi::exc::raise_kind_error_text(ExceptionKind::NotImplementedError, message);
 }
 
 fn pending_error_detail() -> String {
-    pon_err_message().unwrap_or_else(|| "unknown error".to_owned())
+	pon_err_message().unwrap_or_else(|| "unknown error".to_owned())
 }
 
 #[cfg(test)]
 mod tests {
-    use core::ptr;
+	use core::ptr;
 
-    use super::super::tests::{compile_extension, ResetImportStateOnDrop, TempExtensionRoot};
-    use super::super::load_extension_module;
-    use crate::abi::{format_object_for_print, pon_call, pon_runtime_init};
-    use crate::import::{module_attr, reset_import_state_for_tests};
-    use crate::intern::intern;
-    use crate::thread_state::{pon_err_message, test_state_lock};
-    use crate::types::exc::PyBaseException;
+	use super::super::{
+		load_extension_module,
+		tests::{ResetImportStateOnDrop, TempExtensionRoot, compile_extension},
+	};
+	use crate::{
+		abi::{format_object_for_print, pon_call, pon_runtime_init},
+		import::{module_attr, reset_import_state_for_tests},
+		intern::intern,
+		thread_state::{pon_err_message, test_state_lock},
+		types::exc::PyBaseException,
+	};
 
-    #[test]
-    fn runtime_family_c_api_load_test() {
-        let _guard = test_state_lock();
-        let _reset = ResetImportStateOnDrop;
-        unsafe {
-            assert_eq!(pon_runtime_init(), 0);
-        }
+	#[test]
+	fn runtime_family_c_api_load_test() {
+		let _guard = test_state_lock();
+		let _reset = ResetImportStateOnDrop;
+		unsafe {
+			assert_eq!(pon_runtime_init(), 0);
+		}
 
-        let temp = TempExtensionRoot::new();
-        let module_path = compile_extension(
-            &temp,
-            "capi_runtime_test_ext",
-            r#"
+		let temp = TempExtensionRoot::new();
+		let module_path = compile_extension(
+			&temp,
+			"capi_runtime_test_ext",
+			r#"
 #include <Python.h>
 
 static int capsule_payload = 123;
@@ -1986,38 +2233,38 @@ PyMODINIT_FUNC PyInit_capi_runtime_test_ext(void) {
     return PyModule_Create(&module);
 }
 "#,
-        );
+		);
 
-        let module = load_extension_module("capi_runtime_test_ext", &module_path)
-            .unwrap_or_else(|message| panic!("failed to load C extension: {message}"));
-        assert!(!module.is_null(), "extension loader returned NULL module");
+		let module = load_extension_module("capi_runtime_test_ext", &module_path)
+			.unwrap_or_else(|message| panic!("failed to load C extension: {message}"));
+		assert!(!module.is_null(), "extension loader returned NULL module");
 
-        let module_name = intern("capi_runtime_test_ext");
-        assert_noargs_text(module_name, "capsule_roundtrip", "123");
-        assert_noargs_text(module_name, "exception_matches_subclass", "1");
-        assert_noargs_text(module_name, "thread_bracket", "1");
-        assert_noargs_text(module_name, "import_sys_maxsize", "9223372036854775807");
+		let module_name = intern("capi_runtime_test_ext");
+		assert_noargs_text(module_name, "capsule_roundtrip", "123");
+		assert_noargs_text(module_name, "exception_matches_subclass", "1");
+		assert_noargs_text(module_name, "thread_bracket", "1");
+		assert_noargs_text(module_name, "import_sys_maxsize", "9223372036854775807");
 
-        let value = call_noargs(module_name, "format_error_value");
-        let message = unsafe { (*value.cast::<PyBaseException>()).message };
-        assert_eq!(format_object_for_print(message).as_deref(), Ok("bad thing -7 8 9 X %"));
+		let value = call_noargs(module_name, "format_error_value");
+		let message = unsafe { (*value.cast::<PyBaseException>()).message };
+		assert_eq!(format_object_for_print(message).as_deref(), Ok("bad thing -7 8 9 X %"));
 
-        reset_import_state_for_tests();
-    }
+		reset_import_state_for_tests();
+	}
 
-    #[test]
-    fn runtime_structural_c_api_test() {
-        let _guard = test_state_lock();
-        let _reset = ResetImportStateOnDrop;
-        unsafe {
-            assert_eq!(pon_runtime_init(), 0);
-        }
+	#[test]
+	fn runtime_structural_c_api_test() {
+		let _guard = test_state_lock();
+		let _reset = ResetImportStateOnDrop;
+		unsafe {
+			assert_eq!(pon_runtime_init(), 0);
+		}
 
-        let temp = TempExtensionRoot::new();
-        let module_path = compile_extension(
-            &temp,
-            "capi_runtime_structural_ext",
-            r#"
+		let temp = TempExtensionRoot::new();
+		let module_path = compile_extension(
+			&temp,
+			"capi_runtime_structural_ext",
+			r#"
 #include <Python.h>
 
 enum {
@@ -2144,31 +2391,33 @@ PyMODINIT_FUNC PyInit_capi_runtime_structural_ext(void) {
     return PyModule_Create(&module);
 }
 "#,
-        );
+		);
 
-        let module = load_extension_module("capi_runtime_structural_ext", &module_path)
-            .unwrap_or_else(|message| panic!("failed to load structural runtime C extension: {message}"));
-        assert!(!module.is_null(), "extension loader returned NULL module");
+		let module = load_extension_module("capi_runtime_structural_ext", &module_path)
+			.unwrap_or_else(|message| {
+				panic!("failed to load structural runtime C extension: {message}")
+			});
+		assert!(!module.is_null(), "extension loader returned NULL module");
 
-        let module_name = intern("capi_runtime_structural_ext");
-        assert_noargs_text(module_name, "runtime_structural_mask", "4095");
+		let module_name = intern("capi_runtime_structural_ext");
+		assert_noargs_text(module_name, "runtime_structural_mask", "4095");
 
-        reset_import_state_for_tests();
-    }
+		reset_import_state_for_tests();
+	}
 
-    #[test]
-    fn runtime_datetime_c_api_load_test() {
-        let _guard = test_state_lock();
-        let _reset = ResetImportStateOnDrop;
-        unsafe {
-            assert_eq!(pon_runtime_init(), 0);
-        }
+	#[test]
+	fn runtime_datetime_c_api_load_test() {
+		let _guard = test_state_lock();
+		let _reset = ResetImportStateOnDrop;
+		unsafe {
+			assert_eq!(pon_runtime_init(), 0);
+		}
 
-        let temp = TempExtensionRoot::new();
-        let module_path = compile_extension(
-            &temp,
-            "capi_runtime_datetime_ext",
-            r#"
+		let temp = TempExtensionRoot::new();
+		let module_path = compile_extension(
+			&temp,
+			"capi_runtime_datetime_ext",
+			r#"
 #include <Python.h>
 #include <datetime.h>
 
@@ -2355,31 +2604,28 @@ PyMODINIT_FUNC PyInit_capi_runtime_datetime_ext(void) {
     return PyModule_Create(&module);
 }
 "#,
-        );
+		);
 
-        let module = load_extension_module("capi_runtime_datetime_ext", &module_path)
-            .unwrap_or_else(|message| panic!("failed to load datetime C extension: {message}"));
-        assert!(!module.is_null(), "extension loader returned NULL module");
+		let module = load_extension_module("capi_runtime_datetime_ext", &module_path)
+			.unwrap_or_else(|message| panic!("failed to load datetime C extension: {message}"));
+		assert!(!module.is_null(), "extension loader returned NULL module");
 
-        let module_name = intern("capi_runtime_datetime_ext");
-        assert_noargs_text(module_name, "datetime_mask", "262143");
+		let module_name = intern("capi_runtime_datetime_ext");
+		assert_noargs_text(module_name, "datetime_mask", "262143");
 
-        reset_import_state_for_tests();
-    }
+		reset_import_state_for_tests();
+	}
 
-    fn assert_noargs_text(module_name: u32, method_name: &str, expected: &str) {
-        let result = call_noargs(module_name, method_name);
-        assert_eq!(format_object_for_print(result).as_deref(), Ok(expected));
-    }
+	fn assert_noargs_text(module_name: u32, method_name: &str, expected: &str) {
+		let result = call_noargs(module_name, method_name);
+		assert_eq!(format_object_for_print(result).as_deref(), Ok(expected));
+	}
 
-    fn call_noargs(module_name: u32, method_name: &str) -> *mut crate::object::PyObject {
-        let method = module_attr(module_name, intern(method_name)).unwrap_or_else(|| panic!("{method_name} method registered"));
-        let result = unsafe { pon_call(method, ptr::null_mut(), 0) };
-        assert!(
-            !result.is_null(),
-            "{method_name} returned NULL: {:?}",
-            pon_err_message()
-        );
-        result
-    }
+	fn call_noargs(module_name: u32, method_name: &str) -> *mut crate::object::PyObject {
+		let method = module_attr(module_name, intern(method_name))
+			.unwrap_or_else(|| panic!("{method_name} method registered"));
+		let result = unsafe { pon_call(method, ptr::null_mut(), 0) };
+		assert!(!result.is_null(), "{method_name} returned NULL: {:?}", pon_err_message());
+		result
+	}
 }

@@ -1,17 +1,20 @@
 //! Numbers family: int/bool/float/complex construction and extraction.
 
-use core::ffi::{c_char, c_double, c_int, c_long, c_longlong, c_ulong, c_ulonglong, c_void};
-use core::ptr;
+use core::{
+	ffi::{c_char, c_double, c_int, c_long, c_longlong, c_ulong, c_ulonglong, c_void},
+	ptr,
+};
 use std::ffi::CStr;
 
 use num_bigint::{BigInt, Sign};
 use num_traits::{One, ToPrimitive, Zero};
 
-use crate::abi;
-use crate::object::{PyObject, PyType};
-use crate::types::exc::ExceptionKind;
-
 use super::twin::{self, ForeignTypeObject};
+use crate::{
+	abi,
+	object::{PyObject, PyType},
+	types::exc::ExceptionKind,
+};
 
 const PY_ASNATIVEBYTES_DEFAULTS: c_int = -1;
 const PY_ASNATIVEBYTES_LITTLE_ENDIAN: c_int = 1;
@@ -23,206 +26,210 @@ const PY_ASNATIVEBYTES_ALLOW_INDEX: c_int = 16;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PyComplexC {
-    real: c_double,
-    imag: c_double,
+	real: c_double,
+	imag: c_double,
 }
 
 /// C mirror: `include/pon_capi/numbers.h` `PyPonCapiNumbers`.
 #[repr(C)]
 pub(crate) struct PyPonCapiNumbers {
-    long_from_long: unsafe extern "C" fn(c_long) -> *mut PyObject,
-    long_as_long: unsafe extern "C" fn(*mut PyObject) -> c_long,
-    long_from_long_long: unsafe extern "C" fn(c_longlong) -> *mut PyObject,
-    long_from_unsigned_long: unsafe extern "C" fn(c_ulong) -> *mut PyObject,
-    long_from_unsigned_long_long: unsafe extern "C" fn(c_ulonglong) -> *mut PyObject,
-    long_from_ssize_t: unsafe extern "C" fn(isize) -> *mut PyObject,
-    long_from_size_t: unsafe extern "C" fn(usize) -> *mut PyObject,
-    long_from_double: unsafe extern "C" fn(c_double) -> *mut PyObject,
-    long_as_long_long: unsafe extern "C" fn(*mut PyObject) -> c_longlong,
-    long_as_unsigned_long: unsafe extern "C" fn(*mut PyObject) -> c_ulong,
-    long_as_unsigned_long_mask: unsafe extern "C" fn(*mut PyObject) -> c_ulong,
-    long_as_ssize_t: unsafe extern "C" fn(*mut PyObject) -> isize,
-    long_as_size_t: unsafe extern "C" fn(*mut PyObject) -> usize,
-    long_as_double: unsafe extern "C" fn(*mut PyObject) -> c_double,
-    long_as_long_and_overflow: unsafe extern "C" fn(*mut PyObject, *mut c_int) -> c_long,
-    long_from_void_ptr: unsafe extern "C" fn(*mut c_void) -> *mut PyObject,
-    long_as_void_ptr: unsafe extern "C" fn(*mut PyObject) -> *mut c_void,
-    bool_from_long: unsafe extern "C" fn(c_long) -> *mut PyObject,
-    float_from_double: unsafe extern "C" fn(c_double) -> *mut PyObject,
-    float_as_double: unsafe extern "C" fn(*mut PyObject) -> c_double,
-    complex_from_doubles: unsafe extern "C" fn(c_double, c_double) -> *mut PyObject,
-    complex_real_as_double: unsafe extern "C" fn(*mut PyObject) -> c_double,
-    complex_imag_as_double: unsafe extern "C" fn(*mut PyObject) -> c_double,
-    index_check: unsafe extern "C" fn(*mut PyObject) -> c_int,
-    number_index: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
-    number_long: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
-    number_float: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
-    number_as_ssize_t: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> isize,
-    type_check: unsafe extern "C" fn(*mut PyObject, c_int) -> c_int,
-    long_as_unsigned_long_long: unsafe extern "C" fn(*mut PyObject) -> c_ulonglong,
-    long_is_zero: unsafe extern "C" fn(*mut PyObject) -> c_int,
-    long_as_unsigned_long_long_mask: unsafe extern "C" fn(*mut PyObject) -> c_ulonglong,
-    long_as_long_long_and_overflow: unsafe extern "C" fn(*mut PyObject, *mut c_int) -> c_longlong,
-    float_from_string: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
-    os_string_to_double: unsafe extern "C" fn(*const c_char, *mut *mut c_char, *mut PyObject) -> c_double,
-    complex_from_c_complex: unsafe extern "C" fn(PyComplexC) -> *mut PyObject,
-    complex_as_c_complex: unsafe extern "C" fn(*mut PyObject) -> PyComplexC,
-    number_add: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_subtract: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_multiply: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_true_divide: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_floor_divide: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_remainder: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_divmod: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_power: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_negative: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
-    number_positive: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
-    number_absolute: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
-    number_invert: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
-    number_lshift: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_rshift: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_and: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_xor: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_or: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_matrix_multiply: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_inplace_add: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_inplace_subtract: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_inplace_multiply: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_inplace_true_divide: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_inplace_floor_divide: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_inplace_remainder: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_inplace_power: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_inplace_lshift: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_inplace_rshift: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_inplace_and: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_inplace_xor: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_inplace_or: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_inplace_matrix_multiply: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
-    number_check: unsafe extern "C" fn(*mut PyObject) -> c_int,
-    hash_double: unsafe extern "C" fn(*mut PyObject, c_double) -> isize,
-    long_as_native_bytes: unsafe extern "C" fn(*mut PyObject, *mut c_void, isize, c_int) -> isize,
-    long_from_native_bytes: unsafe extern "C" fn(*const c_void, usize, c_int) -> *mut PyObject,
-    long_from_unsigned_native_bytes: unsafe extern "C" fn(*const c_void, usize, c_int) -> *mut PyObject,
-    long_from_string: unsafe extern "C" fn(*const c_char, *mut *mut c_char, c_int) -> *mut PyObject,
+	long_from_long: unsafe extern "C" fn(c_long) -> *mut PyObject,
+	long_as_long: unsafe extern "C" fn(*mut PyObject) -> c_long,
+	long_from_long_long: unsafe extern "C" fn(c_longlong) -> *mut PyObject,
+	long_from_unsigned_long: unsafe extern "C" fn(c_ulong) -> *mut PyObject,
+	long_from_unsigned_long_long: unsafe extern "C" fn(c_ulonglong) -> *mut PyObject,
+	long_from_ssize_t: unsafe extern "C" fn(isize) -> *mut PyObject,
+	long_from_size_t: unsafe extern "C" fn(usize) -> *mut PyObject,
+	long_from_double: unsafe extern "C" fn(c_double) -> *mut PyObject,
+	long_as_long_long: unsafe extern "C" fn(*mut PyObject) -> c_longlong,
+	long_as_unsigned_long: unsafe extern "C" fn(*mut PyObject) -> c_ulong,
+	long_as_unsigned_long_mask: unsafe extern "C" fn(*mut PyObject) -> c_ulong,
+	long_as_ssize_t: unsafe extern "C" fn(*mut PyObject) -> isize,
+	long_as_size_t: unsafe extern "C" fn(*mut PyObject) -> usize,
+	long_as_double: unsafe extern "C" fn(*mut PyObject) -> c_double,
+	long_as_long_and_overflow: unsafe extern "C" fn(*mut PyObject, *mut c_int) -> c_long,
+	long_from_void_ptr: unsafe extern "C" fn(*mut c_void) -> *mut PyObject,
+	long_as_void_ptr: unsafe extern "C" fn(*mut PyObject) -> *mut c_void,
+	bool_from_long: unsafe extern "C" fn(c_long) -> *mut PyObject,
+	float_from_double: unsafe extern "C" fn(c_double) -> *mut PyObject,
+	float_as_double: unsafe extern "C" fn(*mut PyObject) -> c_double,
+	complex_from_doubles: unsafe extern "C" fn(c_double, c_double) -> *mut PyObject,
+	complex_real_as_double: unsafe extern "C" fn(*mut PyObject) -> c_double,
+	complex_imag_as_double: unsafe extern "C" fn(*mut PyObject) -> c_double,
+	index_check: unsafe extern "C" fn(*mut PyObject) -> c_int,
+	number_index: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+	number_long: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+	number_float: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+	number_as_ssize_t: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> isize,
+	type_check: unsafe extern "C" fn(*mut PyObject, c_int) -> c_int,
+	long_as_unsigned_long_long: unsafe extern "C" fn(*mut PyObject) -> c_ulonglong,
+	long_is_zero: unsafe extern "C" fn(*mut PyObject) -> c_int,
+	long_as_unsigned_long_long_mask: unsafe extern "C" fn(*mut PyObject) -> c_ulonglong,
+	long_as_long_long_and_overflow: unsafe extern "C" fn(*mut PyObject, *mut c_int) -> c_longlong,
+	float_from_string: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+	os_string_to_double:
+		unsafe extern "C" fn(*const c_char, *mut *mut c_char, *mut PyObject) -> c_double,
+	complex_from_c_complex: unsafe extern "C" fn(PyComplexC) -> *mut PyObject,
+	complex_as_c_complex: unsafe extern "C" fn(*mut PyObject) -> PyComplexC,
+	number_add: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_subtract: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_multiply: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_true_divide: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_floor_divide: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_remainder: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_divmod: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_power: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_negative: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+	number_positive: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+	number_absolute: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+	number_invert: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+	number_lshift: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_rshift: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_and: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_xor: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_or: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_matrix_multiply: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_inplace_add: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_inplace_subtract: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_inplace_multiply: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_inplace_true_divide: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_inplace_floor_divide: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_inplace_remainder: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_inplace_power:
+		unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_inplace_lshift: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_inplace_rshift: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_inplace_and: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_inplace_xor: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_inplace_or: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_inplace_matrix_multiply:
+		unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	number_check: unsafe extern "C" fn(*mut PyObject) -> c_int,
+	hash_double: unsafe extern "C" fn(*mut PyObject, c_double) -> isize,
+	long_as_native_bytes: unsafe extern "C" fn(*mut PyObject, *mut c_void, isize, c_int) -> isize,
+	long_from_native_bytes: unsafe extern "C" fn(*const c_void, usize, c_int) -> *mut PyObject,
+	long_from_unsigned_native_bytes:
+		unsafe extern "C" fn(*const c_void, usize, c_int) -> *mut PyObject,
+	long_from_string: unsafe extern "C" fn(*const c_char, *mut *mut c_char, c_int) -> *mut PyObject,
 }
 
 unsafe impl Send for PyPonCapiNumbers {}
 unsafe impl Sync for PyPonCapiNumbers {}
 
 pub(crate) fn build() -> PyPonCapiNumbers {
-    PyPonCapiNumbers {
-        long_from_long: capi_long_from_long,
-        long_as_long: capi_long_as_long,
-        long_from_long_long: capi_long_from_long_long,
-        long_from_unsigned_long: capi_long_from_unsigned_long,
-        long_from_unsigned_long_long: capi_long_from_unsigned_long_long,
-        long_from_ssize_t: capi_long_from_ssize_t,
-        long_from_size_t: capi_long_from_size_t,
-        long_from_double: capi_long_from_double,
-        long_as_long_long: capi_long_as_long_long,
-        long_as_unsigned_long: capi_long_as_unsigned_long,
-        long_as_unsigned_long_mask: capi_long_as_unsigned_long_mask,
-        long_as_ssize_t: capi_long_as_ssize_t,
-        long_as_size_t: capi_long_as_size_t,
-        long_as_double: capi_long_as_double,
-        long_as_long_and_overflow: capi_long_as_long_and_overflow,
-        long_from_void_ptr: capi_long_from_void_ptr,
-        long_as_void_ptr: capi_long_as_void_ptr,
-        bool_from_long: capi_bool_from_long,
-        float_from_double: capi_float_from_double,
-        float_as_double: capi_float_as_double,
-        complex_from_doubles: capi_complex_from_doubles,
-        complex_real_as_double: capi_complex_real_as_double,
-        complex_imag_as_double: capi_complex_imag_as_double,
-        index_check: capi_index_check,
-        number_index: capi_number_index,
-        number_long: capi_number_long,
-        number_float: capi_number_float,
-        number_as_ssize_t: capi_number_as_ssize_t,
-        type_check: capi_type_check,
-        long_as_unsigned_long_long: capi_long_as_unsigned_long_long,
-        long_is_zero: capi_long_is_zero,
-        long_as_unsigned_long_long_mask: capi_long_as_unsigned_long_long_mask,
-        long_as_long_long_and_overflow: capi_long_as_long_long_and_overflow,
-        float_from_string: capi_float_from_string,
-        os_string_to_double: capi_os_string_to_double,
-        complex_from_c_complex: capi_complex_from_c_complex,
-        complex_as_c_complex: capi_complex_as_c_complex,
-        number_add: capi_number_add,
-        number_subtract: capi_number_subtract,
-        number_multiply: capi_number_multiply,
-        number_true_divide: capi_number_true_divide,
-        number_floor_divide: capi_number_floor_divide,
-        number_remainder: capi_number_remainder,
-        number_divmod: capi_number_divmod,
-        number_power: capi_number_power,
-        number_negative: capi_number_negative,
-        number_positive: capi_number_positive,
-        number_absolute: capi_number_absolute,
-        number_invert: capi_number_invert,
-        number_lshift: capi_number_lshift,
-        number_rshift: capi_number_rshift,
-        number_and: capi_number_and,
-        number_xor: capi_number_xor,
-        number_or: capi_number_or,
-        number_matrix_multiply: capi_number_matrix_multiply,
-        number_inplace_add: capi_number_inplace_add,
-        number_inplace_subtract: capi_number_inplace_subtract,
-        number_inplace_multiply: capi_number_inplace_multiply,
-        number_inplace_true_divide: capi_number_inplace_true_divide,
-        number_inplace_floor_divide: capi_number_inplace_floor_divide,
-        number_inplace_remainder: capi_number_inplace_remainder,
-        number_inplace_power: capi_number_inplace_power,
-        number_inplace_lshift: capi_number_inplace_lshift,
-        number_inplace_rshift: capi_number_inplace_rshift,
-        number_inplace_and: capi_number_inplace_and,
-        number_inplace_xor: capi_number_inplace_xor,
-        number_inplace_or: capi_number_inplace_or,
-        number_inplace_matrix_multiply: capi_number_inplace_matrix_multiply,
-        number_check: capi_number_check,
-        hash_double: capi_hash_double,
-        long_as_native_bytes: capi_long_as_native_bytes,
-        long_from_native_bytes: capi_long_from_native_bytes,
-        long_from_unsigned_native_bytes: capi_long_from_unsigned_native_bytes,
-        long_from_string: capi_long_from_string,
-    }
+	PyPonCapiNumbers {
+		long_from_long: capi_long_from_long,
+		long_as_long: capi_long_as_long,
+		long_from_long_long: capi_long_from_long_long,
+		long_from_unsigned_long: capi_long_from_unsigned_long,
+		long_from_unsigned_long_long: capi_long_from_unsigned_long_long,
+		long_from_ssize_t: capi_long_from_ssize_t,
+		long_from_size_t: capi_long_from_size_t,
+		long_from_double: capi_long_from_double,
+		long_as_long_long: capi_long_as_long_long,
+		long_as_unsigned_long: capi_long_as_unsigned_long,
+		long_as_unsigned_long_mask: capi_long_as_unsigned_long_mask,
+		long_as_ssize_t: capi_long_as_ssize_t,
+		long_as_size_t: capi_long_as_size_t,
+		long_as_double: capi_long_as_double,
+		long_as_long_and_overflow: capi_long_as_long_and_overflow,
+		long_from_void_ptr: capi_long_from_void_ptr,
+		long_as_void_ptr: capi_long_as_void_ptr,
+		bool_from_long: capi_bool_from_long,
+		float_from_double: capi_float_from_double,
+		float_as_double: capi_float_as_double,
+		complex_from_doubles: capi_complex_from_doubles,
+		complex_real_as_double: capi_complex_real_as_double,
+		complex_imag_as_double: capi_complex_imag_as_double,
+		index_check: capi_index_check,
+		number_index: capi_number_index,
+		number_long: capi_number_long,
+		number_float: capi_number_float,
+		number_as_ssize_t: capi_number_as_ssize_t,
+		type_check: capi_type_check,
+		long_as_unsigned_long_long: capi_long_as_unsigned_long_long,
+		long_is_zero: capi_long_is_zero,
+		long_as_unsigned_long_long_mask: capi_long_as_unsigned_long_long_mask,
+		long_as_long_long_and_overflow: capi_long_as_long_long_and_overflow,
+		float_from_string: capi_float_from_string,
+		os_string_to_double: capi_os_string_to_double,
+		complex_from_c_complex: capi_complex_from_c_complex,
+		complex_as_c_complex: capi_complex_as_c_complex,
+		number_add: capi_number_add,
+		number_subtract: capi_number_subtract,
+		number_multiply: capi_number_multiply,
+		number_true_divide: capi_number_true_divide,
+		number_floor_divide: capi_number_floor_divide,
+		number_remainder: capi_number_remainder,
+		number_divmod: capi_number_divmod,
+		number_power: capi_number_power,
+		number_negative: capi_number_negative,
+		number_positive: capi_number_positive,
+		number_absolute: capi_number_absolute,
+		number_invert: capi_number_invert,
+		number_lshift: capi_number_lshift,
+		number_rshift: capi_number_rshift,
+		number_and: capi_number_and,
+		number_xor: capi_number_xor,
+		number_or: capi_number_or,
+		number_matrix_multiply: capi_number_matrix_multiply,
+		number_inplace_add: capi_number_inplace_add,
+		number_inplace_subtract: capi_number_inplace_subtract,
+		number_inplace_multiply: capi_number_inplace_multiply,
+		number_inplace_true_divide: capi_number_inplace_true_divide,
+		number_inplace_floor_divide: capi_number_inplace_floor_divide,
+		number_inplace_remainder: capi_number_inplace_remainder,
+		number_inplace_power: capi_number_inplace_power,
+		number_inplace_lshift: capi_number_inplace_lshift,
+		number_inplace_rshift: capi_number_inplace_rshift,
+		number_inplace_and: capi_number_inplace_and,
+		number_inplace_xor: capi_number_inplace_xor,
+		number_inplace_or: capi_number_inplace_or,
+		number_inplace_matrix_multiply: capi_number_inplace_matrix_multiply,
+		number_check: capi_number_check,
+		hash_double: capi_hash_double,
+		long_as_native_bytes: capi_long_as_native_bytes,
+		long_from_native_bytes: capi_long_from_native_bytes,
+		long_from_unsigned_native_bytes: capi_long_from_unsigned_native_bytes,
+		long_from_string: capi_long_from_string,
+	}
 }
 
 fn new_reference(object: *mut PyObject) -> *mut PyObject {
-    super::pin_new_reference(object)
+	super::pin_new_reference(object)
 }
 
 /// `PyNumber_Check`: true for objects usable as numbers (CPython: any of the
 /// nb_int/nb_float/nb_index surfaces). Pon: numeric builtins plus anything
 /// exposing `__index__`, `__int__`, or `__float__` through its MRO.
 unsafe extern "C" fn capi_number_check(object: *mut PyObject) -> c_int {
-    if object.is_null() {
-        return 0;
-    }
-    if crate::tag::is_small_int(object) {
-        return 1;
-    }
-    if !crate::tag::is_heap(object) {
-        return 0;
-    }
-    for tid in [
-        super::twin::TID_LONG,
-        super::twin::TID_BOOL,
-        super::twin::TID_FLOAT,
-        super::twin::TID_COMPLEX,
-    ] {
-        if unsafe { capi_type_check(object, tid as c_int) } == 1 {
-            return 1;
-        }
-    }
-    // SAFETY: heap-tagged live object with a readable header.
-    let ty = unsafe { (*object).ob_type }.cast_mut();
-    for dunder in ["__index__", "__int__", "__float__"] {
-        if !unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern(dunder)) }.is_null() {
-            return 1;
-        }
-    }
-    0
+	if object.is_null() {
+		return 0;
+	}
+	if crate::tag::is_small_int(object) {
+		return 1;
+	}
+	if !crate::tag::is_heap(object) {
+		return 0;
+	}
+	for tid in [
+		super::twin::TID_LONG,
+		super::twin::TID_BOOL,
+		super::twin::TID_FLOAT,
+		super::twin::TID_COMPLEX,
+	] {
+		if unsafe { capi_type_check(object, tid as c_int) } == 1 {
+			return 1;
+		}
+	}
+	// SAFETY: heap-tagged live object with a readable header.
+	let ty = unsafe { (*object).ob_type }.cast_mut();
+	for dunder in ["__index__", "__int__", "__float__"] {
+		if !unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern(dunder)) }.is_null() {
+			return 1;
+		}
+	}
+	0
 }
 
 /// `_Py_HashDouble(inst, value)`: CPython 3.10+ contract — NaN hashes to the
@@ -230,1251 +237,1372 @@ unsafe extern "C" fn capi_number_check(object: *mut PyObject) -> c_int {
 /// everything else to the platform float hash (Pon's `hash_f64` matches
 /// CPython's `pyhash.c` algorithm; k3 canaries cover the boundary widths).
 unsafe extern "C" fn capi_hash_double(inst: *mut PyObject, value: c_double) -> isize {
-    if value.is_nan() {
-        // CPython Py_HashPointer: rotate the address right by 4 bits so
-        // allocation alignment does not zero the low hash bits.
-        let bits = inst as usize;
-        let hash = (bits >> 4) | (bits << (usize::BITS as usize - 4));
-        let hash = hash as isize;
-        return if hash == -1 { -2 } else { hash };
-    }
-    crate::types::float::hash_f64(value)
+	if value.is_nan() {
+		// CPython Py_HashPointer: rotate the address right by 4 bits so
+		// allocation alignment does not zero the low hash bits.
+		let bits = inst as usize;
+		let hash = (bits >> 4) | (bits << (usize::BITS as usize - 4));
+		let hash = hash as isize;
+		return if hash == -1 { -2 } else { hash };
+	}
+	crate::types::float::hash_f64(value)
 }
 
 unsafe extern "C" fn capi_long_from_long(value: c_long) -> *mut PyObject {
-    new_reference(crate::types::int::from_bigint(BigInt::from(value)))
+	new_reference(crate::types::int::from_bigint(BigInt::from(value)))
 }
 
 unsafe extern "C" fn capi_long_as_long(object: *mut PyObject) -> c_long {
-    let Some(value) = (unsafe { required_integer(object, "an integer is required") }) else {
-        return -1;
-    };
-    match bigint_to_c_long(&value) {
-        Some(value) => value,
-        None => {
-            raise_overflow("Python int too large to convert to C long");
-            -1
-        }
-    }
+	let Some(value) = (unsafe { required_integer(object, "an integer is required") }) else {
+		return -1;
+	};
+	match bigint_to_c_long(&value) {
+		Some(value) => value,
+		None => {
+			raise_overflow("Python int too large to convert to C long");
+			-1
+		},
+	}
 }
 
 unsafe extern "C" fn capi_long_from_long_long(value: c_longlong) -> *mut PyObject {
-    new_reference(crate::types::int::from_bigint(BigInt::from(value)))
+	new_reference(crate::types::int::from_bigint(BigInt::from(value)))
 }
 
 unsafe extern "C" fn capi_long_from_unsigned_long(value: c_ulong) -> *mut PyObject {
-    new_reference(crate::types::int::from_bigint(BigInt::from(value)))
+	new_reference(crate::types::int::from_bigint(BigInt::from(value)))
 }
 
 unsafe extern "C" fn capi_long_from_unsigned_long_long(value: c_ulonglong) -> *mut PyObject {
-    new_reference(crate::types::int::from_bigint(BigInt::from(value)))
+	new_reference(crate::types::int::from_bigint(BigInt::from(value)))
 }
 
 unsafe extern "C" fn capi_long_from_ssize_t(value: isize) -> *mut PyObject {
-    new_reference(crate::types::int::from_bigint(BigInt::from(value)))
+	new_reference(crate::types::int::from_bigint(BigInt::from(value)))
 }
 
 unsafe extern "C" fn capi_long_from_size_t(value: usize) -> *mut PyObject {
-    new_reference(crate::types::int::from_bigint(BigInt::from(value)))
+	new_reference(crate::types::int::from_bigint(BigInt::from(value)))
 }
 
 unsafe extern "C" fn capi_long_from_double(value: c_double) -> *mut PyObject {
-    if value.is_nan() {
-        raise_value("cannot convert float NaN to integer");
-        return ptr::null_mut();
-    }
-    if value.is_infinite() {
-        raise_overflow("cannot convert float infinity to integer");
-        return ptr::null_mut();
-    }
-    match crate::types::int::bigint_from_f64_trunc(value) {
-        Some(value) => new_reference(crate::types::int::from_bigint(value)),
-        None => {
-            raise_overflow("cannot convert float infinity to integer");
-            ptr::null_mut()
-        }
-    }
+	if value.is_nan() {
+		raise_value("cannot convert float NaN to integer");
+		return ptr::null_mut();
+	}
+	if value.is_infinite() {
+		raise_overflow("cannot convert float infinity to integer");
+		return ptr::null_mut();
+	}
+	match crate::types::int::bigint_from_f64_trunc(value) {
+		Some(value) => new_reference(crate::types::int::from_bigint(value)),
+		None => {
+			raise_overflow("cannot convert float infinity to integer");
+			ptr::null_mut()
+		},
+	}
 }
 
 unsafe extern "C" fn capi_long_as_native_bytes(
-    object: *mut PyObject,
-    buffer: *mut c_void,
-    n_bytes: isize,
-    flags: c_int,
+	object: *mut PyObject,
+	buffer: *mut c_void,
+	n_bytes: isize,
+	flags: c_int,
 ) -> isize {
-    if object.is_null() || n_bytes < 0 || (buffer.is_null() && n_bytes > 0) {
-        raise_system("bad argument to internal function");
-        return -1;
-    }
+	if object.is_null() || n_bytes < 0 || (buffer.is_null() && n_bytes > 0) {
+		raise_system("bad argument to internal function");
+		return -1;
+	}
 
-    let value = match unsafe { native_bytes_integer_arg(object, flags) } {
-        Ok(value) => value,
-        Err(()) => return -1,
-    };
-    if flags != PY_ASNATIVEBYTES_DEFAULTS
-        && (flags & PY_ASNATIVEBYTES_REJECT_NEGATIVE) != 0
-        && value.sign() == Sign::Minus
-    {
-        raise_value("Cannot convert negative int");
-        return -1;
-    }
+	let value = match unsafe { native_bytes_integer_arg(object, flags) } {
+		Ok(value) => value,
+		Err(()) => return -1,
+	};
+	if flags != PY_ASNATIVEBYTES_DEFAULTS
+		&& (flags & PY_ASNATIVEBYTES_REJECT_NEGATIVE) != 0
+		&& value.sign() == Sign::Minus
+	{
+		raise_value("Cannot convert negative int");
+		return -1;
+	}
 
-    let n = n_bytes as usize;
-    let little_endian = native_bytes_little_endian(flags);
-    if n != 0 {
-        let bytes = bigint_to_native_bytes(&value, n, little_endian);
-        unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), n);
-        }
-    }
+	let n = n_bytes as usize;
+	let little_endian = native_bytes_little_endian(flags);
+	if n != 0 {
+		let bytes = bigint_to_native_bytes(&value, n, little_endian);
+		unsafe {
+			ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), n);
+		}
+	}
 
-    native_bytes_len_to_ssize(native_bytes_required_len(
-        &value,
-        native_bytes_unsigned_buffer(flags),
-        n,
-    ))
+	native_bytes_len_to_ssize(native_bytes_required_len(
+		&value,
+		native_bytes_unsigned_buffer(flags),
+		n,
+	))
 }
 
 unsafe extern "C" fn capi_long_from_native_bytes(
-    buffer: *const c_void,
-    n_bytes: usize,
-    flags: c_int,
+	buffer: *const c_void,
+	n_bytes: usize,
+	flags: c_int,
 ) -> *mut PyObject {
-    if buffer.is_null() {
-        raise_system("bad argument to internal function");
-        return ptr::null_mut();
-    }
-    let bytes = unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), n_bytes) };
-    let value = bigint_from_native_bytes(
-        bytes,
-        native_bytes_little_endian(flags),
-        flags == PY_ASNATIVEBYTES_DEFAULTS || (flags & PY_ASNATIVEBYTES_UNSIGNED_BUFFER) == 0,
-    );
-    new_reference(crate::types::int::from_bigint(value))
+	if buffer.is_null() {
+		raise_system("bad argument to internal function");
+		return ptr::null_mut();
+	}
+	let bytes = unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), n_bytes) };
+	let value = bigint_from_native_bytes(
+		bytes,
+		native_bytes_little_endian(flags),
+		flags == PY_ASNATIVEBYTES_DEFAULTS || (flags & PY_ASNATIVEBYTES_UNSIGNED_BUFFER) == 0,
+	);
+	new_reference(crate::types::int::from_bigint(value))
 }
 
 unsafe extern "C" fn capi_long_from_unsigned_native_bytes(
-    buffer: *const c_void,
-    n_bytes: usize,
-    flags: c_int,
+	buffer: *const c_void,
+	n_bytes: usize,
+	flags: c_int,
 ) -> *mut PyObject {
-    if buffer.is_null() {
-        raise_system("bad argument to internal function");
-        return ptr::null_mut();
-    }
-    let bytes = unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), n_bytes) };
-    let value = bigint_from_native_bytes(bytes, native_bytes_little_endian(flags), false);
-    new_reference(crate::types::int::from_bigint(value))
+	if buffer.is_null() {
+		raise_system("bad argument to internal function");
+		return ptr::null_mut();
+	}
+	let bytes = unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), n_bytes) };
+	let value = bigint_from_native_bytes(bytes, native_bytes_little_endian(flags), false);
+	new_reference(crate::types::int::from_bigint(value))
 }
 
 unsafe extern "C" fn capi_long_from_string(
-    text: *const c_char,
-    pend: *mut *mut c_char,
-    base: c_int,
+	text: *const c_char,
+	pend: *mut *mut c_char,
+	base: c_int,
 ) -> *mut PyObject {
-    if text.is_null() {
-        set_parse_end(pend, text, 0);
-        raise_system("bad argument to internal function");
-        return ptr::null_mut();
-    }
+	if text.is_null() {
+		set_parse_end(pend, text, 0);
+		raise_system("bad argument to internal function");
+		return ptr::null_mut();
+	}
 
-    let bytes = unsafe { CStr::from_ptr(text).to_bytes() };
-    match parse_c_long_bytes(bytes, base) {
-        Ok((value, end)) => {
-            set_parse_end(pend, text, end);
-            new_reference(crate::types::int::from_bigint(value))
-        }
-        Err((message, end)) => {
-            set_parse_end(pend, text, end);
-            raise_value(&message);
-            ptr::null_mut()
-        }
-    }
+	let bytes = unsafe { CStr::from_ptr(text).to_bytes() };
+	match parse_c_long_bytes(bytes, base) {
+		Ok((value, end)) => {
+			set_parse_end(pend, text, end);
+			new_reference(crate::types::int::from_bigint(value))
+		},
+		Err((message, end)) => {
+			set_parse_end(pend, text, end);
+			raise_value(&message);
+			ptr::null_mut()
+		},
+	}
 }
 
 unsafe extern "C" fn capi_long_as_long_long(object: *mut PyObject) -> c_longlong {
-    let value = match unsafe { coerce_index_bigint(object) } {
-        Ok(value) => value,
-        Err(()) => return -1,
-    };
-    match bigint_to_c_longlong(&value) {
-        Some(value) => value,
-        None => {
-            raise_overflow("int too big to convert");
-            -1
-        }
-    }
+	let value = match unsafe { coerce_index_bigint(object) } {
+		Ok(value) => value,
+		Err(()) => return -1,
+	};
+	match bigint_to_c_longlong(&value) {
+		Some(value) => value,
+		None => {
+			raise_overflow("int too big to convert");
+			-1
+		},
+	}
 }
 
 unsafe extern "C" fn capi_long_as_unsigned_long(object: *mut PyObject) -> c_ulong {
-    let Some(value) = (unsafe { required_integer(object, "an integer is required") }) else {
-        return c_ulong::MAX;
-    };
-    match bigint_to_c_ulong(&value) {
-        Ok(value) => value,
-        Err(UnsignedError::Negative) => {
-            raise_overflow("can't convert negative value to unsigned int");
-            c_ulong::MAX
-        }
-        Err(UnsignedError::TooLarge) => {
-            raise_overflow("Python int too large to convert to C unsigned long");
-            c_ulong::MAX
-        }
-    }
+	let Some(value) = (unsafe { required_integer(object, "an integer is required") }) else {
+		return c_ulong::MAX;
+	};
+	match bigint_to_c_ulong(&value) {
+		Ok(value) => value,
+		Err(UnsignedError::Negative) => {
+			raise_overflow("can't convert negative value to unsigned int");
+			c_ulong::MAX
+		},
+		Err(UnsignedError::TooLarge) => {
+			raise_overflow("Python int too large to convert to C unsigned long");
+			c_ulong::MAX
+		},
+	}
 }
 
 unsafe extern "C" fn capi_long_as_unsigned_long_long(object: *mut PyObject) -> c_ulonglong {
-    let Some(value) = (unsafe { required_integer(object, "an integer is required") }) else {
-        return c_ulonglong::MAX;
-    };
-    match bigint_to_c_ulonglong(&value) {
-        Ok(value) => value,
-        Err(UnsignedError::Negative) => {
-            raise_overflow("can't convert negative int to unsigned");
-            c_ulonglong::MAX
-        }
-        Err(UnsignedError::TooLarge) => {
-            raise_overflow("int too big to convert");
-            c_ulonglong::MAX
-        }
-    }
+	let Some(value) = (unsafe { required_integer(object, "an integer is required") }) else {
+		return c_ulonglong::MAX;
+	};
+	match bigint_to_c_ulonglong(&value) {
+		Ok(value) => value,
+		Err(UnsignedError::Negative) => {
+			raise_overflow("can't convert negative int to unsigned");
+			c_ulonglong::MAX
+		},
+		Err(UnsignedError::TooLarge) => {
+			raise_overflow("int too big to convert");
+			c_ulonglong::MAX
+		},
+	}
 }
 
 unsafe extern "C" fn capi_long_as_unsigned_long_mask(object: *mut PyObject) -> c_ulong {
-    let Some(value) = (unsafe { required_integer(object, "an integer is required") }) else {
-        return c_ulong::MAX;
-    };
-    bigint_to_c_ulong_mask(&value)
+	let Some(value) = (unsafe { required_integer(object, "an integer is required") }) else {
+		return c_ulong::MAX;
+	};
+	bigint_to_c_ulong_mask(&value)
 }
 
 unsafe extern "C" fn capi_long_as_ssize_t(object: *mut PyObject) -> isize {
-    let value = match unsafe { coerce_index_bigint(object) } {
-        Ok(value) => value,
-        Err(()) => return -1,
-    };
-    match value.to_isize() {
-        Some(value) => value,
-        None => {
-            raise_overflow("Python int too large to convert to C ssize_t");
-            -1
-        }
-    }
+	let value = match unsafe { coerce_index_bigint(object) } {
+		Ok(value) => value,
+		Err(()) => return -1,
+	};
+	match value.to_isize() {
+		Some(value) => value,
+		None => {
+			raise_overflow("Python int too large to convert to C ssize_t");
+			-1
+		},
+	}
 }
 
 unsafe extern "C" fn capi_long_as_size_t(object: *mut PyObject) -> usize {
-    let Some(value) = (unsafe { required_integer(object, "an integer is required") }) else {
-        return usize::MAX;
-    };
-    match bigint_to_usize(&value) {
-        Ok(value) => value,
-        Err(UnsignedError::Negative) => {
-            raise_overflow("can't convert negative value to size_t");
-            usize::MAX
-        }
-        Err(UnsignedError::TooLarge) => {
-            raise_overflow("Python int too large to convert to C size_t");
-            usize::MAX
-        }
-    }
+	let Some(value) = (unsafe { required_integer(object, "an integer is required") }) else {
+		return usize::MAX;
+	};
+	match bigint_to_usize(&value) {
+		Ok(value) => value,
+		Err(UnsignedError::Negative) => {
+			raise_overflow("can't convert negative value to size_t");
+			usize::MAX
+		},
+		Err(UnsignedError::TooLarge) => {
+			raise_overflow("Python int too large to convert to C size_t");
+			usize::MAX
+		},
+	}
 }
 
 unsafe extern "C" fn capi_long_as_double(object: *mut PyObject) -> c_double {
-    let Some(value) = (unsafe { required_integer(object, "an integer is required") }) else {
-        return -1.0;
-    };
-    match bigint_to_f64(&value) {
-        Some(value) => value,
-        None => {
-            raise_overflow("int too large to convert to float");
-            -1.0
-        }
-    }
+	let Some(value) = (unsafe { required_integer(object, "an integer is required") }) else {
+		return -1.0;
+	};
+	match bigint_to_f64(&value) {
+		Some(value) => value,
+		None => {
+			raise_overflow("int too large to convert to float");
+			-1.0
+		},
+	}
 }
 
-unsafe extern "C" fn capi_long_as_long_and_overflow(object: *mut PyObject, overflow: *mut c_int) -> c_long {
-    if !overflow.is_null() {
-        unsafe {
-            *overflow = 0;
-        }
-    }
-    let value = match unsafe { coerce_index_bigint(object) } {
-        Ok(value) => value,
-        Err(()) => return -1,
-    };
-    if let Some(value) = bigint_to_c_long(&value) {
-        return value;
-    }
-    if !overflow.is_null() {
-        unsafe {
-            *overflow = if value.sign() == Sign::Minus { -1 } else { 1 };
-        }
-    }
-    -1
+unsafe extern "C" fn capi_long_as_long_and_overflow(
+	object: *mut PyObject,
+	overflow: *mut c_int,
+) -> c_long {
+	if !overflow.is_null() {
+		unsafe {
+			*overflow = 0;
+		}
+	}
+	let value = match unsafe { coerce_index_bigint(object) } {
+		Ok(value) => value,
+		Err(()) => return -1,
+	};
+	if let Some(value) = bigint_to_c_long(&value) {
+		return value;
+	}
+	if !overflow.is_null() {
+		unsafe {
+			*overflow = if value.sign() == Sign::Minus { -1 } else { 1 };
+		}
+	}
+	-1
 }
 
 unsafe extern "C" fn capi_long_is_zero(object: *mut PyObject) -> c_int {
-    let Some(value) = (unsafe { required_integer(object, "expected int") }) else {
-        return -1;
-    };
-    c_int::from(value.is_zero())
+	let Some(value) = (unsafe { required_integer(object, "expected int") }) else {
+		return -1;
+	};
+	c_int::from(value.is_zero())
 }
 
 unsafe extern "C" fn capi_long_as_unsigned_long_long_mask(object: *mut PyObject) -> c_ulonglong {
-    let value = match unsafe { coerce_index_bigint(object) } {
-        Ok(value) => value,
-        Err(()) => return c_ulonglong::MAX,
-    };
-    bigint_to_c_ulonglong_mask(&value)
+	let value = match unsafe { coerce_index_bigint(object) } {
+		Ok(value) => value,
+		Err(()) => return c_ulonglong::MAX,
+	};
+	bigint_to_c_ulonglong_mask(&value)
 }
 
-unsafe extern "C" fn capi_long_as_long_long_and_overflow(object: *mut PyObject, overflow: *mut c_int) -> c_longlong {
-    if !overflow.is_null() {
-        unsafe {
-            *overflow = 0;
-        }
-    }
-    let value = match unsafe { coerce_index_bigint(object) } {
-        Ok(value) => value,
-        Err(()) => return -1,
-    };
-    if let Some(value) = bigint_to_c_longlong(&value) {
-        return value;
-    }
-    if !overflow.is_null() {
-        unsafe {
-            *overflow = if value.sign() == Sign::Minus { -1 } else { 1 };
-        }
-    }
-    -1
+unsafe extern "C" fn capi_long_as_long_long_and_overflow(
+	object: *mut PyObject,
+	overflow: *mut c_int,
+) -> c_longlong {
+	if !overflow.is_null() {
+		unsafe {
+			*overflow = 0;
+		}
+	}
+	let value = match unsafe { coerce_index_bigint(object) } {
+		Ok(value) => value,
+		Err(()) => return -1,
+	};
+	if let Some(value) = bigint_to_c_longlong(&value) {
+		return value;
+	}
+	if !overflow.is_null() {
+		unsafe {
+			*overflow = if value.sign() == Sign::Minus { -1 } else { 1 };
+		}
+	}
+	-1
 }
 
 unsafe extern "C" fn capi_long_from_void_ptr(value: *mut c_void) -> *mut PyObject {
-    new_reference(crate::types::int::from_bigint(BigInt::from(value as usize)))
+	new_reference(crate::types::int::from_bigint(BigInt::from(value as usize)))
 }
 
 unsafe extern "C" fn capi_long_as_void_ptr(object: *mut PyObject) -> *mut c_void {
-    let Some(value) = (unsafe { required_integer(object, "an integer is required") }) else {
-        return ptr::null_mut();
-    };
-    if value.sign() == Sign::Minus {
-        return match bigint_to_c_long(&value) {
-            Some(value) => (value as isize as usize) as *mut c_void,
-            None => {
-                raise_overflow("Python int too large to convert to C long");
-                ptr::null_mut()
-            }
-        };
-    }
-    match bigint_to_c_ulong(&value) {
-        Ok(value) => (value as usize) as *mut c_void,
-        Err(UnsignedError::Negative) => unreachable!("negative handled above"),
-        Err(UnsignedError::TooLarge) => {
-            raise_overflow("Python int too large to convert to C unsigned long");
-            ptr::null_mut()
-        }
-    }
+	let Some(value) = (unsafe { required_integer(object, "an integer is required") }) else {
+		return ptr::null_mut();
+	};
+	if value.sign() == Sign::Minus {
+		return match bigint_to_c_long(&value) {
+			Some(value) => (value as isize as usize) as *mut c_void,
+			None => {
+				raise_overflow("Python int too large to convert to C long");
+				ptr::null_mut()
+			},
+		};
+	}
+	match bigint_to_c_ulong(&value) {
+		Ok(value) => (value as usize) as *mut c_void,
+		Err(UnsignedError::Negative) => unreachable!("negative handled above"),
+		Err(UnsignedError::TooLarge) => {
+			raise_overflow("Python int too large to convert to C unsigned long");
+			ptr::null_mut()
+		},
+	}
 }
 
 unsafe extern "C" fn capi_bool_from_long(value: c_long) -> *mut PyObject {
-    new_reference(crate::types::bool_::from_bool(value != 0))
+	new_reference(crate::types::bool_::from_bool(value != 0))
 }
 
 unsafe extern "C" fn capi_float_from_double(value: c_double) -> *mut PyObject {
-    new_reference(crate::types::float::from_f64(value))
+	new_reference(crate::types::float::from_f64(value))
 }
 
 unsafe extern "C" fn capi_float_as_double(object: *mut PyObject) -> c_double {
-    let Some(object) = normalize_arg(object) else {
-        return -1.0;
-    };
-    match unsafe { coerce_f64(object) } {
-        Ok(value) => value,
-        Err(()) => -1.0,
-    }
+	let Some(object) = normalize_arg(object) else {
+		return -1.0;
+	};
+	match unsafe { coerce_f64(object) } {
+		Ok(value) => value,
+		Err(()) => -1.0,
+	}
 }
 
 unsafe extern "C" fn capi_float_from_string(object: *mut PyObject) -> *mut PyObject {
-    let Some(object) = normalize_arg(object) else {
-        raise_type("float() argument must be a string or a real number");
-        return ptr::null_mut();
-    };
-    let mut argv = [object];
-    // Verified against `python3.14 -c`: `float("1e3") == 1000.0` and
-    // `math.isnan(float("nan"))`; Pon's float constructor uses the same tokens.
-    new_reference(unsafe { crate::native::builtins_mod::builtin_float(argv.as_mut_ptr(), argv.len()) })
+	let Some(object) = normalize_arg(object) else {
+		raise_type("float() argument must be a string or a real number");
+		return ptr::null_mut();
+	};
+	let mut argv = [object];
+	// Verified against `python3.14 -c`: `float("1e3") == 1000.0` and
+	// `math.isnan(float("nan"))`; Pon's float constructor uses the same tokens.
+	new_reference(unsafe {
+		crate::native::builtins_mod::builtin_float(argv.as_mut_ptr(), argv.len())
+	})
 }
 
 unsafe extern "C" fn capi_os_string_to_double(
-    text: *const c_char,
-    endptr: *mut *mut c_char,
-    overflow_exception: *mut PyObject,
+	text: *const c_char,
+	endptr: *mut *mut c_char,
+	overflow_exception: *mut PyObject,
 ) -> c_double {
-    if text.is_null() {
-        if !endptr.is_null() {
-            unsafe {
-                *endptr = ptr::null_mut();
-            }
-        }
-        raise_value("could not convert string to float: '<NULL>'");
-        return -1.0;
-    }
+	if text.is_null() {
+		if !endptr.is_null() {
+			unsafe {
+				*endptr = ptr::null_mut();
+			}
+		}
+		raise_value("could not convert string to float: '<NULL>'");
+		return -1.0;
+	}
 
-    let bytes = unsafe { std::ffi::CStr::from_ptr(text) }.to_bytes();
-    let mut parsed_end = ptr::null_mut();
-    let value = unsafe { libc::strtod(text, &mut parsed_end) };
-    if !endptr.is_null() {
-        unsafe {
-            *endptr = parsed_end;
-        }
-    }
+	let bytes = unsafe { std::ffi::CStr::from_ptr(text) }.to_bytes();
+	let mut parsed_end = ptr::null_mut();
+	let value = unsafe { libc::strtod(text, &mut parsed_end) };
+	if !endptr.is_null() {
+		unsafe {
+			*endptr = parsed_end;
+		}
+	}
 
-    let parsed_len = (parsed_end as usize).saturating_sub(text as usize);
-    if parsed_end == text.cast_mut() {
-        raise_value(&format!("could not convert string to float: '{}'", c_float_error_text(bytes)));
-        return -1.0;
-    }
-    if endptr.is_null() && bytes.get(parsed_len..).is_some_and(|tail| tail.iter().any(|byte| !byte.is_ascii_whitespace())) {
-        raise_value(&format!("could not convert string to float: '{}'", c_float_error_text(bytes)));
-        return -1.0;
-    }
-    if value.is_infinite()
-        && !overflow_exception.is_null()
-        && !parsed_token_is_infinity(bytes.get(..parsed_len).unwrap_or(bytes))
-    {
-        unsafe {
-            raise_foreign_exception(
-                overflow_exception,
-                &format!("value too large to convert to float: '{}'", c_float_error_text(bytes)),
-            );
-        }
-        return -1.0;
-    }
-    value
+	let parsed_len = (parsed_end as usize).saturating_sub(text as usize);
+	if parsed_end == text.cast_mut() {
+		raise_value(&format!("could not convert string to float: '{}'", c_float_error_text(bytes)));
+		return -1.0;
+	}
+	if endptr.is_null()
+		&& bytes
+			.get(parsed_len..)
+			.is_some_and(|tail| tail.iter().any(|byte| !byte.is_ascii_whitespace()))
+	{
+		raise_value(&format!("could not convert string to float: '{}'", c_float_error_text(bytes)));
+		return -1.0;
+	}
+	if value.is_infinite()
+		&& !overflow_exception.is_null()
+		&& !parsed_token_is_infinity(bytes.get(..parsed_len).unwrap_or(bytes))
+	{
+		unsafe {
+			raise_foreign_exception(
+				overflow_exception,
+				&format!("value too large to convert to float: '{}'", c_float_error_text(bytes)),
+			);
+		}
+		return -1.0;
+	}
+	value
 }
 
 unsafe extern "C" fn capi_complex_from_c_complex(value: PyComplexC) -> *mut PyObject {
-    new_reference(crate::types::complex_::from_f64s(value.real, value.imag))
+	new_reference(crate::types::complex_::from_f64s(value.real, value.imag))
 }
 
 unsafe extern "C" fn capi_complex_as_c_complex(object: *mut PyObject) -> PyComplexC {
-    let Some(object) = normalize_arg(object) else {
-        return PyComplexC { real: -1.0, imag: 0.0 };
-    };
-    if let Some((real, imag)) = unsafe { crate::types::complex_::to_f64s(object) } {
-        return PyComplexC { real, imag };
-    }
-    match unsafe { coerce_f64(object) } {
-        Ok(real) => PyComplexC { real, imag: 0.0 },
-        Err(()) => PyComplexC { real: -1.0, imag: 0.0 },
-    }
+	let Some(object) = normalize_arg(object) else {
+		return PyComplexC { real: -1.0, imag: 0.0 };
+	};
+	if let Some((real, imag)) = unsafe { crate::types::complex_::to_f64s(object) } {
+		return PyComplexC { real, imag };
+	}
+	match unsafe { coerce_f64(object) } {
+		Ok(real) => PyComplexC { real, imag: 0.0 },
+		Err(()) => PyComplexC { real: -1.0, imag: 0.0 },
+	}
 }
 
 unsafe extern "C" fn capi_complex_from_doubles(real: c_double, imag: c_double) -> *mut PyObject {
-    new_reference(crate::types::complex_::from_f64s(real, imag))
+	new_reference(crate::types::complex_::from_f64s(real, imag))
 }
 
 unsafe extern "C" fn capi_complex_real_as_double(object: *mut PyObject) -> c_double {
-    let Some(object) = normalize_arg(object) else {
-        return -1.0;
-    };
-    if let Some((real, _)) = unsafe { crate::types::complex_::to_f64s(object) } {
-        return real;
-    }
-    match unsafe { coerce_f64(object) } {
-        Ok(value) => value,
-        Err(()) => -1.0,
-    }
+	let Some(object) = normalize_arg(object) else {
+		return -1.0;
+	};
+	if let Some((real, _)) = unsafe { crate::types::complex_::to_f64s(object) } {
+		return real;
+	}
+	match unsafe { coerce_f64(object) } {
+		Ok(value) => value,
+		Err(()) => -1.0,
+	}
 }
 
 unsafe extern "C" fn capi_complex_imag_as_double(object: *mut PyObject) -> c_double {
-    let Some(object) = normalize_arg(object) else {
-        return -1.0;
-    };
-    if let Some((_, imag)) = unsafe { crate::types::complex_::to_f64s(object) } {
-        return imag;
-    }
-    match unsafe { coerce_f64(object) } {
-        Ok(_) => 0.0,
-        Err(()) => -1.0,
-    }
+	let Some(object) = normalize_arg(object) else {
+		return -1.0;
+	};
+	if let Some((_, imag)) = unsafe { crate::types::complex_::to_f64s(object) } {
+		return imag;
+	}
+	match unsafe { coerce_f64(object) } {
+		Ok(_) => 0.0,
+		Err(()) => -1.0,
+	}
 }
 
 unsafe extern "C" fn capi_index_check(object: *mut PyObject) -> c_int {
-    let Some(object) = normalize_arg(object) else {
-        return 0;
-    };
-    if object.is_null() {
-        return 0;
-    }
-    if unsafe { crate::types::int::to_bigint_including_bool(object) }.is_some() {
-        return 1;
-    }
-    if !crate::tag::is_heap(object) {
-        return 0;
-    }
-    let slot = unsafe {
-        object
-            .as_ref()
-            .and_then(|object| object.ob_type.as_ref())
-            .and_then(|ty| ty.tp_as_number.as_ref())
-            .and_then(|methods| methods.nb_index)
-    };
-    c_int::from(slot.is_some() || unsafe { has_attr(object, "__index__") })
+	let Some(object) = normalize_arg(object) else {
+		return 0;
+	};
+	if object.is_null() {
+		return 0;
+	}
+	if unsafe { crate::types::int::to_bigint_including_bool(object) }.is_some() {
+		return 1;
+	}
+	if !crate::tag::is_heap(object) {
+		return 0;
+	}
+	let slot = unsafe {
+		object
+			.as_ref()
+			.and_then(|object| object.ob_type.as_ref())
+			.and_then(|ty| ty.tp_as_number.as_ref())
+			.and_then(|methods| methods.nb_index)
+	};
+	c_int::from(slot.is_some() || unsafe { has_attr(object, "__index__") })
 }
 
 unsafe extern "C" fn capi_number_index(object: *mut PyObject) -> *mut PyObject {
-    let Some(object) = normalize_arg(object) else {
-        return ptr::null_mut();
-    };
-    match unsafe { coerce_index_bigint(object) } {
-        Ok(value) => new_reference(crate::types::int::from_bigint(value)),
-        Err(()) => ptr::null_mut(),
-    }
+	let Some(object) = normalize_arg(object) else {
+		return ptr::null_mut();
+	};
+	match unsafe { coerce_index_bigint(object) } {
+		Ok(value) => new_reference(crate::types::int::from_bigint(value)),
+		Err(()) => ptr::null_mut(),
+	}
 }
 
 unsafe extern "C" fn capi_number_long(object: *mut PyObject) -> *mut PyObject {
-    let Some(object) = normalize_arg(object) else {
-        return ptr::null_mut();
-    };
-    new_reference(crate::types::int::construct_from_args(&[object]))
+	let Some(object) = normalize_arg(object) else {
+		return ptr::null_mut();
+	};
+	new_reference(crate::types::int::construct_from_args(&[object]))
 }
 
 unsafe extern "C" fn capi_number_float(object: *mut PyObject) -> *mut PyObject {
-    let Some(object) = normalize_arg(object) else {
-        return ptr::null_mut();
-    };
-    match unsafe { coerce_f64(object) } {
-        Ok(value) => new_reference(crate::types::float::from_f64(value)),
-        Err(()) => ptr::null_mut(),
-    }
+	let Some(object) = normalize_arg(object) else {
+		return ptr::null_mut();
+	};
+	match unsafe { coerce_f64(object) } {
+		Ok(value) => new_reference(crate::types::float::from_f64(value)),
+		Err(()) => ptr::null_mut(),
+	}
 }
 
 unsafe extern "C" fn capi_number_as_ssize_t(object: *mut PyObject, exc: *mut PyObject) -> isize {
-    let Some(object) = normalize_arg(object) else {
-        return -1;
-    };
-    let value = match unsafe { coerce_index_bigint(object) } {
-        Ok(value) => value,
-        Err(()) => return -1,
-    };
-    if let Some(value) = value.to_isize() {
-        return value;
-    }
-    if exc.is_null() {
-        if value.sign() == Sign::Minus {
-            isize::MIN
-        } else {
-            isize::MAX
-        }
-    } else {
-        unsafe { raise_foreign_exception(exc, "cannot fit 'int' into an index-sized integer") };
-        -1
-    }
+	let Some(object) = normalize_arg(object) else {
+		return -1;
+	};
+	let value = match unsafe { coerce_index_bigint(object) } {
+		Ok(value) => value,
+		Err(()) => return -1,
+	};
+	if let Some(value) = value.to_isize() {
+		return value;
+	}
+	if exc.is_null() {
+		if value.sign() == Sign::Minus {
+			isize::MIN
+		} else {
+			isize::MAX
+		}
+	} else {
+		unsafe { raise_foreign_exception(exc, "cannot fit 'int' into an index-sized integer") };
+		-1
+	}
 }
 
 unsafe fn capi_number_binary(op: u8, left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    new_reference(unsafe { abi::number::pon_binary_op(op, left, right, ptr::null_mut()) })
+	new_reference(unsafe { abi::number::pon_binary_op(op, left, right, ptr::null_mut()) })
 }
 
-unsafe fn capi_number_inplace_binary(op: u8, left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    new_reference(unsafe { abi::number::pon_number_inplace(op, left, right, ptr::null_mut()) })
+unsafe fn capi_number_inplace_binary(
+	op: u8,
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	new_reference(unsafe { abi::number::pon_number_inplace(op, left, right, ptr::null_mut()) })
 }
 
 unsafe fn modulo_is_none(modulo: *mut PyObject) -> bool {
-    let modulo = crate::tag::untag_arg(modulo);
-    modulo.is_null() || modulo == unsafe { abi::pon_none() }
+	let modulo = crate::tag::untag_arg(modulo);
+	modulo.is_null() || modulo == unsafe { abi::pon_none() }
 }
 
 unsafe extern "C" fn capi_number_add(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_binary(abi::number::BINARY_ADD, left, right) }
+	unsafe { capi_number_binary(abi::number::BINARY_ADD, left, right) }
 }
 
-unsafe extern "C" fn capi_number_subtract(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_binary(abi::number::BINARY_SUB, left, right) }
+unsafe extern "C" fn capi_number_subtract(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_binary(abi::number::BINARY_SUB, left, right) }
 }
 
-unsafe extern "C" fn capi_number_multiply(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_binary(abi::number::BINARY_MUL, left, right) }
+unsafe extern "C" fn capi_number_multiply(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_binary(abi::number::BINARY_MUL, left, right) }
 }
 
-unsafe extern "C" fn capi_number_true_divide(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_binary(abi::number::BINARY_DIV, left, right) }
+unsafe extern "C" fn capi_number_true_divide(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_binary(abi::number::BINARY_DIV, left, right) }
 }
 
-unsafe extern "C" fn capi_number_floor_divide(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_binary(abi::number::BINARY_FLOORDIV, left, right) }
+unsafe extern "C" fn capi_number_floor_divide(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_binary(abi::number::BINARY_FLOORDIV, left, right) }
 }
 
-unsafe extern "C" fn capi_number_remainder(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_binary(abi::number::BINARY_MOD, left, right) }
+unsafe extern "C" fn capi_number_remainder(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_binary(abi::number::BINARY_MOD, left, right) }
 }
 
-unsafe extern "C" fn capi_number_divmod(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    new_reference(abi::number::divmod_objects(left, right))
+unsafe extern "C" fn capi_number_divmod(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	new_reference(abi::number::divmod_objects(left, right))
 }
 
-unsafe extern "C" fn capi_number_power(left: *mut PyObject, right: *mut PyObject, modulo: *mut PyObject) -> *mut PyObject {
-    if unsafe { !modulo_is_none(modulo) } {
-        raise_type("PyNumber_Power with non-None modulo is not supported");
-        return ptr::null_mut();
-    }
-    unsafe { capi_number_binary(abi::number::BINARY_POW, left, right) }
+unsafe extern "C" fn capi_number_power(
+	left: *mut PyObject,
+	right: *mut PyObject,
+	modulo: *mut PyObject,
+) -> *mut PyObject {
+	if unsafe { !modulo_is_none(modulo) } {
+		raise_type("PyNumber_Power with non-None modulo is not supported");
+		return ptr::null_mut();
+	}
+	unsafe { capi_number_binary(abi::number::BINARY_POW, left, right) }
 }
 
 unsafe extern "C" fn capi_number_negative(object: *mut PyObject) -> *mut PyObject {
-    new_reference(unsafe { abi::number::pon_unary_op(abi::number::UNARY_NEG, object, ptr::null_mut()) })
+	new_reference(unsafe {
+		abi::number::pon_unary_op(abi::number::UNARY_NEG, object, ptr::null_mut())
+	})
 }
 
 unsafe extern "C" fn capi_number_positive(object: *mut PyObject) -> *mut PyObject {
-    new_reference(unsafe { abi::number::pon_unary_op(abi::number::UNARY_POS, object, ptr::null_mut()) })
+	new_reference(unsafe {
+		abi::number::pon_unary_op(abi::number::UNARY_POS, object, ptr::null_mut())
+	})
 }
 
 unsafe extern "C" fn capi_number_absolute(object: *mut PyObject) -> *mut PyObject {
-    let object = crate::tag::untag_arg(object);
-    if object.is_null() {
-        raise_type("bad operand type for abs()");
-        return ptr::null_mut();
-    }
-    unsafe {
-        crate::types::int::install_slots_for_object(object);
-    }
-    if crate::tag::is_heap(object) {
-        let slot = unsafe {
-            object
-                .as_ref()
-                .and_then(|object| object.ob_type.as_ref())
-                .and_then(|ty| ty.tp_as_number.as_ref())
-                .and_then(|methods| methods.nb_absolute)
-        };
-        if let Some(slot) = slot {
-            let result = unsafe { slot(object) };
-            if result.is_null() {
-                return ptr::null_mut();
-            }
-            if unsafe { crate::abstract_op::is_not_implemented(result) } {
-                super::unpin_object(result);
-                raise_type("bad operand type for abs()");
-                return ptr::null_mut();
-            }
-            return new_reference(result);
-        }
-    }
-    new_reference(abi::number::abs_object(object))
+	let object = crate::tag::untag_arg(object);
+	if object.is_null() {
+		raise_type("bad operand type for abs()");
+		return ptr::null_mut();
+	}
+	unsafe {
+		crate::types::int::install_slots_for_object(object);
+	}
+	if crate::tag::is_heap(object) {
+		let slot = unsafe {
+			object
+				.as_ref()
+				.and_then(|object| object.ob_type.as_ref())
+				.and_then(|ty| ty.tp_as_number.as_ref())
+				.and_then(|methods| methods.nb_absolute)
+		};
+		if let Some(slot) = slot {
+			let result = unsafe { slot(object) };
+			if result.is_null() {
+				return ptr::null_mut();
+			}
+			if unsafe { crate::abstract_op::is_not_implemented(result) } {
+				super::unpin_object(result);
+				raise_type("bad operand type for abs()");
+				return ptr::null_mut();
+			}
+			return new_reference(result);
+		}
+	}
+	new_reference(abi::number::abs_object(object))
 }
 
 unsafe extern "C" fn capi_number_invert(object: *mut PyObject) -> *mut PyObject {
-    new_reference(unsafe { abi::number::pon_unary_op(abi::number::UNARY_INVERT, object, ptr::null_mut()) })
+	new_reference(unsafe {
+		abi::number::pon_unary_op(abi::number::UNARY_INVERT, object, ptr::null_mut())
+	})
 }
 
-unsafe extern "C" fn capi_number_lshift(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_binary(abi::number::BINARY_LSHIFT, left, right) }
+unsafe extern "C" fn capi_number_lshift(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_binary(abi::number::BINARY_LSHIFT, left, right) }
 }
 
-unsafe extern "C" fn capi_number_rshift(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_binary(abi::number::BINARY_RSHIFT, left, right) }
+unsafe extern "C" fn capi_number_rshift(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_binary(abi::number::BINARY_RSHIFT, left, right) }
 }
 
 unsafe extern "C" fn capi_number_and(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_binary(abi::number::BINARY_AND, left, right) }
+	unsafe { capi_number_binary(abi::number::BINARY_AND, left, right) }
 }
 
 unsafe extern "C" fn capi_number_xor(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_binary(abi::number::BINARY_XOR, left, right) }
+	unsafe { capi_number_binary(abi::number::BINARY_XOR, left, right) }
 }
 
 unsafe extern "C" fn capi_number_or(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_binary(abi::number::BINARY_OR, left, right) }
+	unsafe { capi_number_binary(abi::number::BINARY_OR, left, right) }
 }
 
-unsafe extern "C" fn capi_number_matrix_multiply(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_binary(abi::number::BINARY_MATMUL, left, right) }
+unsafe extern "C" fn capi_number_matrix_multiply(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_binary(abi::number::BINARY_MATMUL, left, right) }
 }
 
-unsafe extern "C" fn capi_number_inplace_add(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_inplace_binary(abi::number::BINARY_ADD, left, right) }
+unsafe extern "C" fn capi_number_inplace_add(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_inplace_binary(abi::number::BINARY_ADD, left, right) }
 }
 
-unsafe extern "C" fn capi_number_inplace_subtract(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_inplace_binary(abi::number::BINARY_SUB, left, right) }
+unsafe extern "C" fn capi_number_inplace_subtract(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_inplace_binary(abi::number::BINARY_SUB, left, right) }
 }
 
-unsafe extern "C" fn capi_number_inplace_multiply(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_inplace_binary(abi::number::BINARY_MUL, left, right) }
+unsafe extern "C" fn capi_number_inplace_multiply(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_inplace_binary(abi::number::BINARY_MUL, left, right) }
 }
 
-unsafe extern "C" fn capi_number_inplace_true_divide(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_inplace_binary(abi::number::BINARY_DIV, left, right) }
+unsafe extern "C" fn capi_number_inplace_true_divide(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_inplace_binary(abi::number::BINARY_DIV, left, right) }
 }
 
-unsafe extern "C" fn capi_number_inplace_floor_divide(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_inplace_binary(abi::number::BINARY_FLOORDIV, left, right) }
+unsafe extern "C" fn capi_number_inplace_floor_divide(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_inplace_binary(abi::number::BINARY_FLOORDIV, left, right) }
 }
 
-unsafe extern "C" fn capi_number_inplace_remainder(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_inplace_binary(abi::number::BINARY_MOD, left, right) }
+unsafe extern "C" fn capi_number_inplace_remainder(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_inplace_binary(abi::number::BINARY_MOD, left, right) }
 }
 
-unsafe extern "C" fn capi_number_inplace_power(left: *mut PyObject, right: *mut PyObject, modulo: *mut PyObject) -> *mut PyObject {
-    if unsafe { !modulo_is_none(modulo) } {
-        raise_type("PyNumber_InPlacePower with non-None modulo is not supported");
-        return ptr::null_mut();
-    }
-    unsafe { capi_number_inplace_binary(abi::number::BINARY_POW, left, right) }
+unsafe extern "C" fn capi_number_inplace_power(
+	left: *mut PyObject,
+	right: *mut PyObject,
+	modulo: *mut PyObject,
+) -> *mut PyObject {
+	if unsafe { !modulo_is_none(modulo) } {
+		raise_type("PyNumber_InPlacePower with non-None modulo is not supported");
+		return ptr::null_mut();
+	}
+	unsafe { capi_number_inplace_binary(abi::number::BINARY_POW, left, right) }
 }
 
-unsafe extern "C" fn capi_number_inplace_lshift(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_inplace_binary(abi::number::BINARY_LSHIFT, left, right) }
+unsafe extern "C" fn capi_number_inplace_lshift(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_inplace_binary(abi::number::BINARY_LSHIFT, left, right) }
 }
 
-unsafe extern "C" fn capi_number_inplace_rshift(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_inplace_binary(abi::number::BINARY_RSHIFT, left, right) }
+unsafe extern "C" fn capi_number_inplace_rshift(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_inplace_binary(abi::number::BINARY_RSHIFT, left, right) }
 }
 
-unsafe extern "C" fn capi_number_inplace_and(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_inplace_binary(abi::number::BINARY_AND, left, right) }
+unsafe extern "C" fn capi_number_inplace_and(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_inplace_binary(abi::number::BINARY_AND, left, right) }
 }
 
-unsafe extern "C" fn capi_number_inplace_xor(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_inplace_binary(abi::number::BINARY_XOR, left, right) }
+unsafe extern "C" fn capi_number_inplace_xor(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_inplace_binary(abi::number::BINARY_XOR, left, right) }
 }
 
-unsafe extern "C" fn capi_number_inplace_or(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_inplace_binary(abi::number::BINARY_OR, left, right) }
+unsafe extern "C" fn capi_number_inplace_or(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_inplace_binary(abi::number::BINARY_OR, left, right) }
 }
 
-unsafe extern "C" fn capi_number_inplace_matrix_multiply(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
-    unsafe { capi_number_inplace_binary(abi::number::BINARY_MATMUL, left, right) }
+unsafe extern "C" fn capi_number_inplace_matrix_multiply(
+	left: *mut PyObject,
+	right: *mut PyObject,
+) -> *mut PyObject {
+	unsafe { capi_number_inplace_binary(abi::number::BINARY_MATMUL, left, right) }
 }
 
 unsafe extern "C" fn capi_type_check(object: *mut PyObject, tid: c_int) -> c_int {
-    if object.is_null() {
-        return 0;
-    }
-    if crate::tag::is_small_int(object) {
-        return c_int::from(tid == twin::TID_LONG as c_int);
-    }
-    if !crate::tag::is_heap(object) {
-        return 0;
-    }
-    if exact_builtin_type_id(object) == Some(tid as usize) {
-        return 1;
-    }
-    let Some(base) = native_builtin_type(tid) else {
-        return 0;
-    };
-    let Some(ty) = (unsafe { object.as_ref().and_then(|object| object.ob_type.as_ref()) }) else {
-        return 0;
-    };
-    c_int::from(unsafe { crate::mro::is_subtype((ty as *const PyType).cast_mut(), base) })
+	if object.is_null() {
+		return 0;
+	}
+	if crate::tag::is_small_int(object) {
+		return c_int::from(tid == twin::TID_LONG as c_int);
+	}
+	if !crate::tag::is_heap(object) {
+		return 0;
+	}
+	if exact_builtin_type_id(object) == Some(tid as usize) {
+		return 1;
+	}
+	let Some(base) = native_builtin_type(tid) else {
+		return 0;
+	};
+	let Some(ty) = (unsafe { object.as_ref().and_then(|object| object.ob_type.as_ref()) }) else {
+		return 0;
+	};
+	c_int::from(unsafe { crate::mro::is_subtype((ty as *const PyType).cast_mut(), base) })
 }
 
 unsafe fn required_integer(object: *mut PyObject, type_error: &str) -> Option<BigInt> {
-    let object = normalize_arg(object)?;
-    match unsafe { crate::types::int::to_bigint_including_bool(object) } {
-        Some(value) => Some(value),
-        None => {
-            raise_type(type_error);
-            None
-        }
-    }
+	let object = normalize_arg(object)?;
+	match unsafe { crate::types::int::to_bigint_including_bool(object) } {
+		Some(value) => Some(value),
+		None => {
+			raise_type(type_error);
+			None
+		},
+	}
 }
 
 fn normalize_arg(object: *mut PyObject) -> Option<*mut PyObject> {
-    let normalized = crate::tag::untag_arg(object);
-    if crate::tag::is_small_int(object) && normalized.is_null() {
-        None
-    } else {
-        Some(normalized)
-    }
+	let normalized = crate::tag::untag_arg(object);
+	if crate::tag::is_small_int(object) && normalized.is_null() {
+		None
+	} else {
+		Some(normalized)
+	}
 }
 
 fn bigint_to_c_long(value: &BigInt) -> Option<c_long> {
-    if value < &BigInt::from(c_long::MIN) || value > &BigInt::from(c_long::MAX) {
-        return None;
-    }
-    value.to_i64().map(|value| value as c_long)
+	if value < &BigInt::from(c_long::MIN) || value > &BigInt::from(c_long::MAX) {
+		return None;
+	}
+	value.to_i64().map(|value| value as c_long)
 }
 
 fn bigint_to_c_longlong(value: &BigInt) -> Option<c_longlong> {
-    if value < &BigInt::from(c_longlong::MIN) || value > &BigInt::from(c_longlong::MAX) {
-        return None;
-    }
-    value.to_i64().map(|value| value as c_longlong)
+	if value < &BigInt::from(c_longlong::MIN) || value > &BigInt::from(c_longlong::MAX) {
+		return None;
+	}
+	value.to_i64().map(|value| value as c_longlong)
 }
 
 enum UnsignedError {
-    Negative,
-    TooLarge,
+	Negative,
+	TooLarge,
 }
 
 fn bigint_to_c_ulong(value: &BigInt) -> Result<c_ulong, UnsignedError> {
-    if value.sign() == Sign::Minus {
-        return Err(UnsignedError::Negative);
-    }
-    if value > &BigInt::from(c_ulong::MAX) {
-        return Err(UnsignedError::TooLarge);
-    }
-    value.to_u64().map(|value| value as c_ulong).ok_or(UnsignedError::TooLarge)
+	if value.sign() == Sign::Minus {
+		return Err(UnsignedError::Negative);
+	}
+	if value > &BigInt::from(c_ulong::MAX) {
+		return Err(UnsignedError::TooLarge);
+	}
+	value
+		.to_u64()
+		.map(|value| value as c_ulong)
+		.ok_or(UnsignedError::TooLarge)
 }
 
 fn bigint_to_c_ulonglong(value: &BigInt) -> Result<c_ulonglong, UnsignedError> {
-    if value.sign() == Sign::Minus {
-        return Err(UnsignedError::Negative);
-    }
-    if value > &BigInt::from(c_ulonglong::MAX) {
-        return Err(UnsignedError::TooLarge);
-    }
-    value.to_u64().map(|value| value as c_ulonglong).ok_or(UnsignedError::TooLarge)
+	if value.sign() == Sign::Minus {
+		return Err(UnsignedError::Negative);
+	}
+	if value > &BigInt::from(c_ulonglong::MAX) {
+		return Err(UnsignedError::TooLarge);
+	}
+	value
+		.to_u64()
+		.map(|value| value as c_ulonglong)
+		.ok_or(UnsignedError::TooLarge)
 }
 
 fn bigint_to_usize(value: &BigInt) -> Result<usize, UnsignedError> {
-    if value.sign() == Sign::Minus {
-        return Err(UnsignedError::Negative);
-    }
-    value.to_usize().ok_or(UnsignedError::TooLarge)
+	if value.sign() == Sign::Minus {
+		return Err(UnsignedError::Negative);
+	}
+	value.to_usize().ok_or(UnsignedError::TooLarge)
 }
 
 fn bigint_to_c_ulong_mask(value: &BigInt) -> c_ulong {
-    let bits = core::mem::size_of::<c_ulong>() * 8;
-    let modulus = BigInt::one() << bits;
-    let mut masked = value % &modulus;
-    if masked.sign() == Sign::Minus {
-        masked += modulus;
-    }
-    masked.to_u64().unwrap_or(0) as c_ulong
+	let bits = core::mem::size_of::<c_ulong>() * 8;
+	let modulus = BigInt::one() << bits;
+	let mut masked = value % &modulus;
+	if masked.sign() == Sign::Minus {
+		masked += modulus;
+	}
+	masked.to_u64().unwrap_or(0) as c_ulong
 }
 
 fn bigint_to_c_ulonglong_mask(value: &BigInt) -> c_ulonglong {
-    let modulus = BigInt::one() << 64_usize;
-    let mut masked = value % &modulus;
-    if masked.sign() == Sign::Minus {
-        masked += modulus;
-    }
-    masked.to_u64().unwrap_or(0) as c_ulonglong
+	let modulus = BigInt::one() << 64_usize;
+	let mut masked = value % &modulus;
+	if masked.sign() == Sign::Minus {
+		masked += modulus;
+	}
+	masked.to_u64().unwrap_or(0) as c_ulonglong
 }
 
 unsafe fn native_bytes_integer_arg(object: *mut PyObject, flags: c_int) -> Result<BigInt, ()> {
-    if flags != PY_ASNATIVEBYTES_DEFAULTS && (flags & PY_ASNATIVEBYTES_ALLOW_INDEX) != 0 {
-        return unsafe { coerce_index_bigint(object) };
-    }
-    let Some(object) = normalize_arg(object) else {
-        raise_type("expect int, got object");
-        return Err(());
-    };
-    match unsafe { crate::types::int::to_bigint_including_bool(object) } {
-        Some(value) => Ok(value),
-        None => {
-            raise_type(&format!("expect int, got {}", type_name(object)));
-            Err(())
-        }
-    }
+	if flags != PY_ASNATIVEBYTES_DEFAULTS && (flags & PY_ASNATIVEBYTES_ALLOW_INDEX) != 0 {
+		return unsafe { coerce_index_bigint(object) };
+	}
+	let Some(object) = normalize_arg(object) else {
+		raise_type("expect int, got object");
+		return Err(());
+	};
+	match unsafe { crate::types::int::to_bigint_including_bool(object) } {
+		Some(value) => Ok(value),
+		None => {
+			raise_type(&format!("expect int, got {}", type_name(object)));
+			Err(())
+		},
+	}
 }
 
 fn native_bytes_little_endian(flags: c_int) -> bool {
-    if flags == PY_ASNATIVEBYTES_DEFAULTS || (flags & (PY_ASNATIVEBYTES_NATIVE_ENDIAN - PY_ASNATIVEBYTES_LITTLE_ENDIAN)) != 0 {
-        cfg!(target_endian = "little")
-    } else {
-        (flags & PY_ASNATIVEBYTES_LITTLE_ENDIAN) != 0
-    }
+	if flags == PY_ASNATIVEBYTES_DEFAULTS
+		|| (flags & (PY_ASNATIVEBYTES_NATIVE_ENDIAN - PY_ASNATIVEBYTES_LITTLE_ENDIAN)) != 0
+	{
+		cfg!(target_endian = "little")
+	} else {
+		(flags & PY_ASNATIVEBYTES_LITTLE_ENDIAN) != 0
+	}
 }
 
 fn native_bytes_unsigned_buffer(flags: c_int) -> bool {
-    flags == PY_ASNATIVEBYTES_DEFAULTS || (flags & PY_ASNATIVEBYTES_UNSIGNED_BUFFER) != 0
+	flags == PY_ASNATIVEBYTES_DEFAULTS || (flags & PY_ASNATIVEBYTES_UNSIGNED_BUFFER) != 0
 }
 
 fn native_bytes_required_len(value: &BigInt, unsigned_buffer: bool, n_bytes: usize) -> usize {
-    let required = match value.sign() {
-        Sign::NoSign => 1,
-        Sign::Minus => value.to_signed_bytes_le().len().max(1),
-        Sign::Plus if unsigned_buffer => value.to_bytes_le().1.len().max(1),
-        Sign::Plus => value.to_signed_bytes_le().len().max(1),
-    };
-    if n_bytes != 0 && required <= n_bytes {
-        n_bytes
-    } else {
-        required
-    }
+	let required = match value.sign() {
+		Sign::NoSign => 1,
+		Sign::Minus => value.to_signed_bytes_le().len().max(1),
+		Sign::Plus if unsigned_buffer => value.to_bytes_le().1.len().max(1),
+		Sign::Plus => value.to_signed_bytes_le().len().max(1),
+	};
+	if n_bytes != 0 && required <= n_bytes {
+		n_bytes
+	} else {
+		required
+	}
 }
 
 fn native_bytes_len_to_ssize(len: usize) -> isize {
-    match isize::try_from(len) {
-        Ok(len) => len,
-        Err(_) => {
-            raise_overflow("int has too many bits to express in a platform Py_ssize_t");
-            -1
-        }
-    }
+	match isize::try_from(len) {
+		Ok(len) => len,
+		Err(_) => {
+			raise_overflow("int has too many bits to express in a platform Py_ssize_t");
+			-1
+		},
+	}
 }
 
 fn bigint_to_native_bytes(value: &BigInt, n_bytes: usize, little_endian: bool) -> Vec<u8> {
-    let mut bytes = if value.sign() == Sign::Minus {
-        value.to_signed_bytes_le()
-    } else {
-        let (_, bytes) = value.to_bytes_le();
-        if bytes.is_empty() {
-            vec![0]
-        } else {
-            bytes
-        }
-    };
-    let fill = if value.sign() == Sign::Minus { 0xff } else { 0x00 };
-    bytes.resize(n_bytes, fill);
-    if !little_endian {
-        bytes.reverse();
-    }
-    bytes
+	let mut bytes = if value.sign() == Sign::Minus {
+		value.to_signed_bytes_le()
+	} else {
+		let (_, bytes) = value.to_bytes_le();
+		if bytes.is_empty() { vec![0] } else { bytes }
+	};
+	let fill = if value.sign() == Sign::Minus {
+		0xff
+	} else {
+		0x00
+	};
+	bytes.resize(n_bytes, fill);
+	if !little_endian {
+		bytes.reverse();
+	}
+	bytes
 }
 
 fn bigint_from_native_bytes(bytes: &[u8], little_endian: bool, signed: bool) -> BigInt {
-    match (little_endian, signed) {
-        (true, true) => BigInt::from_signed_bytes_le(bytes),
-        (false, true) => BigInt::from_signed_bytes_be(bytes),
-        (true, false) => BigInt::from_bytes_le(Sign::Plus, bytes),
-        (false, false) => BigInt::from_bytes_be(Sign::Plus, bytes),
-    }
+	match (little_endian, signed) {
+		(true, true) => BigInt::from_signed_bytes_le(bytes),
+		(false, true) => BigInt::from_signed_bytes_be(bytes),
+		(true, false) => BigInt::from_bytes_le(Sign::Plus, bytes),
+		(false, false) => BigInt::from_bytes_be(Sign::Plus, bytes),
+	}
 }
 
 fn set_parse_end(pend: *mut *mut c_char, text: *const c_char, offset: usize) {
-    if !pend.is_null() {
-        unsafe {
-            *pend = text.wrapping_add(offset).cast_mut();
-        }
-    }
+	if !pend.is_null() {
+		unsafe {
+			*pend = text.wrapping_add(offset).cast_mut();
+		}
+	}
 }
 
-fn parse_c_long_bytes(bytes: &[u8], requested_base: c_int) -> Result<(BigInt, usize), (String, usize)> {
-    if requested_base != 0 && !(2..=36).contains(&requested_base) {
-        return Err(("int() base must be >= 2 and <= 36, or 0".to_owned(), 0));
-    }
+fn parse_c_long_bytes(
+	bytes: &[u8],
+	requested_base: c_int,
+) -> Result<(BigInt, usize), (String, usize)> {
+	if requested_base != 0 && !(2..=36).contains(&requested_base) {
+		return Err(("int() base must be >= 2 and <= 36, or 0".to_owned(), 0));
+	}
 
-    let invalid = |offset| (invalid_c_int_literal(bytes, requested_base), offset);
-    let mut index = 0usize;
-    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-        index += 1;
-    }
+	let invalid = |offset| (invalid_c_int_literal(bytes, requested_base), offset);
+	let mut index = 0usize;
+	while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+		index += 1;
+	}
 
-    let mut negative = false;
-    if index < bytes.len() {
-        if bytes[index] == b'+' {
-            index += 1;
-        } else if bytes[index] == b'-' {
-            negative = true;
-            index += 1;
-        }
-    }
+	let mut negative = false;
+	if index < bytes.len() {
+		if bytes[index] == b'+' {
+			index += 1;
+		} else if bytes[index] == b'-' {
+			negative = true;
+			index += 1;
+		}
+	}
 
-    let mut base = if requested_base == 0 { 10 } else { requested_base as u32 };
-    let mut prefixed = false;
-    if index + 1 < bytes.len() && bytes[index] == b'0' {
-        let prefix_base = match bytes[index + 1].to_ascii_lowercase() {
-            b'b' => Some(2),
-            b'o' => Some(8),
-            b'x' => Some(16),
-            _ => None,
-        };
-        if let Some(detected) = prefix_base {
-            if requested_base == 0 || requested_base as u32 == detected {
-                base = detected;
-                prefixed = true;
-                index += 2;
-            }
-        }
-    }
+	let mut base = if requested_base == 0 {
+		10
+	} else {
+		requested_base as u32
+	};
+	let mut prefixed = false;
+	if index + 1 < bytes.len() && bytes[index] == b'0' {
+		let prefix_base = match bytes[index + 1].to_ascii_lowercase() {
+			b'b' => Some(2),
+			b'o' => Some(8),
+			b'x' => Some(16),
+			_ => None,
+		};
+		if let Some(detected) = prefix_base {
+			if requested_base == 0 || requested_base as u32 == detected {
+				base = detected;
+				prefixed = true;
+				index += 2;
+			}
+		}
+	}
 
-    let mut value = BigInt::zero();
-    let mut saw_digit = false;
-    let mut previous_digit = false;
-    let mut after_prefix = prefixed;
-    let mut first_digit = None;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if byte == b'_' {
-            if !previous_digit && !after_prefix {
-                return Err(invalid(index));
-            }
-            previous_digit = false;
-            after_prefix = false;
-            index += 1;
-            continue;
-        }
-        let Some(digit) = native_digit_value(byte) else {
-            break;
-        };
-        if digit >= base {
-            break;
-        }
-        if first_digit.is_none() {
-            first_digit = Some(digit);
-        }
-        value = value * base + digit;
-        saw_digit = true;
-        previous_digit = true;
-        after_prefix = false;
-        index += 1;
-    }
+	let mut value = BigInt::zero();
+	let mut saw_digit = false;
+	let mut previous_digit = false;
+	let mut after_prefix = prefixed;
+	let mut first_digit = None;
+	while index < bytes.len() {
+		let byte = bytes[index];
+		if byte == b'_' {
+			if !previous_digit && !after_prefix {
+				return Err(invalid(index));
+			}
+			previous_digit = false;
+			after_prefix = false;
+			index += 1;
+			continue;
+		}
+		let Some(digit) = native_digit_value(byte) else {
+			break;
+		};
+		if digit >= base {
+			break;
+		}
+		if first_digit.is_none() {
+			first_digit = Some(digit);
+		}
+		value = value * base + digit;
+		saw_digit = true;
+		previous_digit = true;
+		after_prefix = false;
+		index += 1;
+	}
 
-    if !saw_digit {
-        return Err(invalid(index));
-    }
-    if !previous_digit {
-        return Err(invalid(index.saturating_sub(1)));
-    }
-    if requested_base == 0 && !prefixed && first_digit == Some(0) && !value.is_zero() {
-        return Err(invalid(index));
-    }
+	if !saw_digit {
+		return Err(invalid(index));
+	}
+	if !previous_digit {
+		return Err(invalid(index.saturating_sub(1)));
+	}
+	if requested_base == 0 && !prefixed && first_digit == Some(0) && !value.is_zero() {
+		return Err(invalid(index));
+	}
 
-    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-        index += 1;
-    }
-    if index != bytes.len() {
-        return Err(invalid(index));
-    }
+	while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+		index += 1;
+	}
+	if index != bytes.len() {
+		return Err(invalid(index));
+	}
 
-    Ok((if negative { -value } else { value }, index))
+	Ok((if negative { -value } else { value }, index))
 }
 
 fn native_digit_value(byte: u8) -> Option<u32> {
-    match byte {
-        b'0'..=b'9' => Some(u32::from(byte - b'0')),
-        b'a'..=b'z' => Some(u32::from(byte - b'a') + 10),
-        b'A'..=b'Z' => Some(u32::from(byte - b'A') + 10),
-        _ => None,
-    }
+	match byte {
+		b'0'..=b'9' => Some(u32::from(byte - b'0')),
+		b'a'..=b'z' => Some(u32::from(byte - b'a') + 10),
+		b'A'..=b'Z' => Some(u32::from(byte - b'A') + 10),
+		_ => None,
+	}
 }
 
 fn invalid_c_int_literal(bytes: &[u8], base: c_int) -> String {
-    format!("invalid literal for int() with base {base}: {}", c_bytes_repr(bytes))
+	format!("invalid literal for int() with base {base}: {}", c_bytes_repr(bytes))
 }
 
 fn c_bytes_repr(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() + 2);
-    out.push('\'');
-    for &byte in bytes {
-        match byte {
-            b'\\' => out.push_str("\\\\"),
-            b'\'' => out.push_str("\\'"),
-            b'\n' => out.push_str("\\n"),
-            b'\r' => out.push_str("\\r"),
-            b'\t' => out.push_str("\\t"),
-            0x20..=0x7e => out.push(byte as char),
-            _ => out.push_str(&format!("\\x{byte:02x}")),
-        }
-    }
-    out.push('\'');
-    out
+	let mut out = String::with_capacity(bytes.len() + 2);
+	out.push('\'');
+	for &byte in bytes {
+		match byte {
+			b'\\' => out.push_str("\\\\"),
+			b'\'' => out.push_str("\\'"),
+			b'\n' => out.push_str("\\n"),
+			b'\r' => out.push_str("\\r"),
+			b'\t' => out.push_str("\\t"),
+			0x20..=0x7e => out.push(byte as char),
+			_ => out.push_str(&format!("\\x{byte:02x}")),
+		}
+	}
+	out.push('\'');
+	out
 }
 
 fn c_float_error_text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).replace('\\', "\\\\").replace('\'', "\\'")
+	String::from_utf8_lossy(bytes)
+		.replace('\\', "\\\\")
+		.replace('\'', "\\'")
 }
 
 fn parsed_token_is_infinity(mut token: &[u8]) -> bool {
-    token = trim_ascii(token);
-    if let Some(rest) = token.strip_prefix(b"+").or_else(|| token.strip_prefix(b"-")) {
-        token = rest;
-    }
-    token.eq_ignore_ascii_case(b"inf") || token.eq_ignore_ascii_case(b"infinity")
+	token = trim_ascii(token);
+	if let Some(rest) = token
+		.strip_prefix(b"+")
+		.or_else(|| token.strip_prefix(b"-"))
+	{
+		token = rest;
+	}
+	token.eq_ignore_ascii_case(b"inf") || token.eq_ignore_ascii_case(b"infinity")
 }
 
 fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
-    while matches!(bytes.first(), Some(byte) if byte.is_ascii_whitespace()) {
-        bytes = &bytes[1..];
-    }
-    while matches!(bytes.last(), Some(byte) if byte.is_ascii_whitespace()) {
-        bytes = &bytes[..bytes.len() - 1];
-    }
-    bytes
+	while matches!(bytes.first(), Some(byte) if byte.is_ascii_whitespace()) {
+		bytes = &bytes[1..];
+	}
+	while matches!(bytes.last(), Some(byte) if byte.is_ascii_whitespace()) {
+		bytes = &bytes[..bytes.len() - 1];
+	}
+	bytes
 }
 
 fn bigint_to_f64(value: &BigInt) -> Option<f64> {
-    match value.to_f64() {
-        Some(value) if value.is_finite() => Some(value),
-        _ => None,
-    }
+	match value.to_f64() {
+		Some(value) if value.is_finite() => Some(value),
+		_ => None,
+	}
 }
 
 unsafe fn coerce_f64(object: *mut PyObject) -> Result<f64, ()> {
-    if object.is_null() || !crate::tag::is_heap(object) {
-        raise_type("must be real number, not object");
-        return Err(());
-    }
-    if let Some(value) = unsafe { crate::types::float::to_f64(object) } {
-        return Ok(value);
-    }
-    if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(object) } {
-        return bigint_to_f64(&value).ok_or_else(|| {
-            raise_overflow("int too large to convert to float");
-        });
-    }
-    if let Some(method) = unsafe { try_get_attr(object, "__float__") } {
-        let result = crate::tag::untag_arg(unsafe { abi::pon_call(method, ptr::null_mut(), 0) });
-        if result.is_null() {
-            return Err(());
-        }
-        if let Some(value) = unsafe { crate::types::float::to_f64(result) } {
-            return Ok(value);
-        }
-        raise_type(&format!("{}.__float__ returned non-float (type {})", type_name(object), type_name(result)));
-        return Err(());
-    }
-    raise_type(&format!("must be real number, not {}", type_name(object)));
-    Err(())
+	if object.is_null() || !crate::tag::is_heap(object) {
+		raise_type("must be real number, not object");
+		return Err(());
+	}
+	if let Some(value) = unsafe { crate::types::float::to_f64(object) } {
+		return Ok(value);
+	}
+	if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(object) } {
+		return bigint_to_f64(&value).ok_or_else(|| {
+			raise_overflow("int too large to convert to float");
+		});
+	}
+	if let Some(method) = unsafe { try_get_attr(object, "__float__") } {
+		let result = crate::tag::untag_arg(unsafe { abi::pon_call(method, ptr::null_mut(), 0) });
+		if result.is_null() {
+			return Err(());
+		}
+		if let Some(value) = unsafe { crate::types::float::to_f64(result) } {
+			return Ok(value);
+		}
+		raise_type(&format!(
+			"{}.__float__ returned non-float (type {})",
+			type_name(object),
+			type_name(result)
+		));
+		return Err(());
+	}
+	raise_type(&format!("must be real number, not {}", type_name(object)));
+	Err(())
 }
 
 unsafe fn coerce_index_bigint(object: *mut PyObject) -> Result<BigInt, ()> {
-    if object.is_null() || !crate::tag::is_heap(object) {
-        raise_type("'object' object cannot be interpreted as an integer");
-        return Err(());
-    }
-    if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(object) } {
-        return Ok(value);
-    }
-    let slot = unsafe {
-        object
-            .as_ref()
-            .and_then(|object| object.ob_type.as_ref())
-            .and_then(|ty| ty.tp_as_number.as_ref())
-            .and_then(|methods| methods.nb_index)
-    };
-    if let Some(slot) = slot {
-        let result = crate::tag::untag_arg(unsafe { slot(object) });
-        if result.is_null() {
-            return Err(());
-        }
-        if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(result) } {
-            return Ok(value);
-        }
-        raise_type(&format!("__index__ returned non-int (type {})", type_name(result)));
-        return Err(());
-    }
-    if let Some(method) = unsafe { try_get_attr(object, "__index__") } {
-        let result = crate::tag::untag_arg(unsafe { abi::pon_call(method, ptr::null_mut(), 0) });
-        if result.is_null() {
-            return Err(());
-        }
-        if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(result) } {
-            return Ok(value);
-        }
-        raise_type(&format!("__index__ returned non-int (type {})", type_name(result)));
-        return Err(());
-    }
-    raise_type(&format!("'{}' object cannot be interpreted as an integer", type_name(object)));
-    Err(())
+	if object.is_null() || !crate::tag::is_heap(object) {
+		raise_type("'object' object cannot be interpreted as an integer");
+		return Err(());
+	}
+	if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(object) } {
+		return Ok(value);
+	}
+	let slot = unsafe {
+		object
+			.as_ref()
+			.and_then(|object| object.ob_type.as_ref())
+			.and_then(|ty| ty.tp_as_number.as_ref())
+			.and_then(|methods| methods.nb_index)
+	};
+	if let Some(slot) = slot {
+		let result = crate::tag::untag_arg(unsafe { slot(object) });
+		if result.is_null() {
+			return Err(());
+		}
+		if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(result) } {
+			return Ok(value);
+		}
+		raise_type(&format!("__index__ returned non-int (type {})", type_name(result)));
+		return Err(());
+	}
+	if let Some(method) = unsafe { try_get_attr(object, "__index__") } {
+		let result = crate::tag::untag_arg(unsafe { abi::pon_call(method, ptr::null_mut(), 0) });
+		if result.is_null() {
+			return Err(());
+		}
+		if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(result) } {
+			return Ok(value);
+		}
+		raise_type(&format!("__index__ returned non-int (type {})", type_name(result)));
+		return Err(());
+	}
+	raise_type(&format!("'{}' object cannot be interpreted as an integer", type_name(object)));
+	Err(())
 }
 
 unsafe fn try_get_attr(object: *mut PyObject, name: &str) -> Option<*mut PyObject> {
-    let result = unsafe { crate::abstract_op::get_attr(object, crate::intern::intern(name)) };
-    if result.is_null() {
-        crate::thread_state::pon_err_clear();
-        None
-    } else {
-        Some(crate::tag::untag_arg(result))
-    }
+	let result = unsafe { crate::abstract_op::get_attr(object, crate::intern::intern(name)) };
+	if result.is_null() {
+		crate::thread_state::pon_err_clear();
+		None
+	} else {
+		Some(crate::tag::untag_arg(result))
+	}
 }
 
 unsafe fn has_attr(object: *mut PyObject, name: &str) -> bool {
-    unsafe { try_get_attr(object, name) }.is_some()
+	unsafe { try_get_attr(object, name) }.is_some()
 }
 
 fn type_name(object: *mut PyObject) -> &'static str {
-    unsafe { crate::types::dict::type_name(object) }.unwrap_or("object")
+	unsafe { crate::types::dict::type_name(object) }.unwrap_or("object")
 }
 
 fn raise_type(message: &str) {
-    let _ = abi::exc::raise_kind_error_text(ExceptionKind::TypeError, message);
+	let _ = abi::exc::raise_kind_error_text(ExceptionKind::TypeError, message);
 }
 
 fn raise_value(message: &str) {
-    let _ = abi::exc::raise_kind_error_text(ExceptionKind::ValueError, message);
+	let _ = abi::exc::raise_kind_error_text(ExceptionKind::ValueError, message);
 }
 
 fn raise_overflow(message: &str) {
-    let _ = abi::exc::raise_kind_error_text(ExceptionKind::OverflowError, message);
+	let _ = abi::exc::raise_kind_error_text(ExceptionKind::OverflowError, message);
 }
 
 fn raise_system(message: &str) {
-    let _ = abi::exc::raise_kind_error_text(ExceptionKind::SystemError, message);
+	let _ = abi::exc::raise_kind_error_text(ExceptionKind::SystemError, message);
 }
 
 unsafe fn raise_foreign_exception(exception: *mut PyObject, message: &str) {
-    let Some(class) = twin::native_of_foreign(exception.cast::<ForeignTypeObject>()) else {
-        raise_type(message);
-        return;
-    };
-    let message = unsafe { abi::pon_const_str(message.as_ptr(), message.len()) };
-    if message.is_null() {
-        return;
-    }
-    let mut argv = [message];
-    let instance = unsafe { abi::pon_call(class.cast::<PyObject>(), argv.as_mut_ptr(), argv.len()) };
-    if instance.is_null() {
-        return;
-    }
-    let _ = unsafe { abi::exc::pon_raise(instance, ptr::null_mut()) };
+	let Some(class) = twin::native_of_foreign(exception.cast::<ForeignTypeObject>()) else {
+		raise_type(message);
+		return;
+	};
+	let message = unsafe { abi::pon_const_str(message.as_ptr(), message.len()) };
+	if message.is_null() {
+		return;
+	}
+	let mut argv = [message];
+	let instance = unsafe { abi::pon_call(class.cast::<PyObject>(), argv.as_mut_ptr(), argv.len()) };
+	if instance.is_null() {
+		return;
+	}
+	let _ = unsafe { abi::exc::pon_raise(instance, ptr::null_mut()) };
 }
 
 fn exact_builtin_type_id(object: *mut PyObject) -> Option<usize> {
-    if crate::tag::is_small_int(object) {
-        return Some(twin::TID_LONG);
-    }
-    if object.is_null() || !crate::tag::is_heap(object) {
-        return None;
-    }
-    let ty = unsafe { (*object).ob_type.cast_mut() };
-    native_tid(ty)
+	if crate::tag::is_small_int(object) {
+		return Some(twin::TID_LONG);
+	}
+	if object.is_null() || !crate::tag::is_heap(object) {
+		return None;
+	}
+	let ty = unsafe { (*object).ob_type.cast_mut() };
+	native_tid(ty)
 }
 
 fn native_tid(ty: *mut PyType) -> Option<usize> {
-    if ty.is_null() {
-        return None;
-    }
-    for (tid, native) in [
-        (twin::TID_LONG, abi::runtime_long_type()),
-        (twin::TID_BOOL, crate::types::bool_::bool_type()),
-        (twin::TID_FLOAT, crate::types::float::float_type()),
-        (twin::TID_COMPLEX, crate::types::complex_::complex_type()),
-    ] {
-        if ty == native {
-            return Some(tid);
-        }
-    }
-    None
+	if ty.is_null() {
+		return None;
+	}
+	for (tid, native) in [
+		(twin::TID_LONG, abi::runtime_long_type()),
+		(twin::TID_BOOL, crate::types::bool_::bool_type()),
+		(twin::TID_FLOAT, crate::types::float::float_type()),
+		(twin::TID_COMPLEX, crate::types::complex_::complex_type()),
+	] {
+		if ty == native {
+			return Some(tid);
+		}
+	}
+	None
 }
 
 fn native_builtin_type(tid: c_int) -> Option<*mut PyType> {
-    match tid as usize {
-        twin::TID_LONG => Some(abi::runtime_long_type()),
-        twin::TID_BOOL => Some(crate::types::bool_::bool_type()),
-        twin::TID_FLOAT => Some(crate::types::float::float_type()),
-        twin::TID_COMPLEX => Some(crate::types::complex_::complex_type()),
-        _ => None,
-    }
+	match tid as usize {
+		twin::TID_LONG => Some(abi::runtime_long_type()),
+		twin::TID_BOOL => Some(crate::types::bool_::bool_type()),
+		twin::TID_FLOAT => Some(crate::types::float::float_type()),
+		twin::TID_COMPLEX => Some(crate::types::complex_::complex_type()),
+		_ => None,
+	}
 }
 
 #[cfg(test)]
 mod tests {
-    use std::ptr;
+	use std::ptr;
 
-    use super::super::load_extension_module;
-    use super::super::tests::{compile_extension, ResetImportStateOnDrop, TempExtensionRoot};
-    use crate::abi::{format_object_for_print, pon_call, pon_runtime_init};
-    use crate::import::module_attr;
-    use crate::intern::intern;
-    use crate::thread_state::{pon_err_message, test_state_lock};
+	use super::super::{
+		load_extension_module,
+		tests::{ResetImportStateOnDrop, TempExtensionRoot, compile_extension},
+	};
+	use crate::{
+		abi::{format_object_for_print, pon_call, pon_runtime_init},
+		import::module_attr,
+		intern::intern,
+		thread_state::{pon_err_message, test_state_lock},
+	};
 
-    #[test]
-    fn numbers_c_api_round_trips_and_errors() {
-        let _guard = test_state_lock();
-        let _reset = ResetImportStateOnDrop;
-        unsafe {
-            assert_eq!(pon_runtime_init(), 0);
-        }
+	#[test]
+	fn numbers_c_api_round_trips_and_errors() {
+		let _guard = test_state_lock();
+		let _reset = ResetImportStateOnDrop;
+		unsafe {
+			assert_eq!(pon_runtime_init(), 0);
+		}
 
-        let temp = TempExtensionRoot::new();
-        let module_path = compile_extension(
-            &temp,
-            "capi_numbers_test_ext",
-            r#"
+		let temp = TempExtensionRoot::new();
+		let module_path = compile_extension(
+			&temp,
+			"capi_numbers_test_ext",
+			r#"
 #include <Python.h>
 #include <limits.h>
 #include <stdint.h>
@@ -1788,29 +1916,26 @@ PyMODINIT_FUNC PyInit_capi_numbers_test_ext(void) {
     return PyModule_Create(&module);
 }
 "#,
-        );
+		);
 
-        let module = load_extension_module("capi_numbers_test_ext", &module_path)
-            .unwrap_or_else(|message| panic!("failed to load numbers C extension: {message}"));
-        assert!(!module.is_null(), "extension loader returned NULL module");
+		let module = load_extension_module("capi_numbers_test_ext", &module_path)
+			.unwrap_or_else(|message| panic!("failed to load numbers C extension: {message}"));
+		assert!(!module.is_null(), "extension loader returned NULL module");
 
-        let module_name = intern("capi_numbers_test_ext");
-        for (method_name, expected) in [
-            ("long_roundtrips", "1"),
-            ("overflow_branch", "1"),
-            ("float_complex_roundtrips", "1"),
-            ("index_and_number_protocol", "1"),
-            ("type_check_macros", "1"),
-            ("abstract_number_surface", "4095"),
-        ] {
-            let method = module_attr(module_name, intern(method_name)).unwrap_or_else(|| panic!("{method_name} method registered"));
-            let result = unsafe { pon_call(method, ptr::null_mut(), 0) };
-            assert!(
-                !result.is_null(),
-                "{method_name} returned NULL: {:?}",
-                pon_err_message()
-            );
-            assert_eq!(format_object_for_print(result).as_deref(), Ok(expected));
-        }
-    }
+		let module_name = intern("capi_numbers_test_ext");
+		for (method_name, expected) in [
+			("long_roundtrips", "1"),
+			("overflow_branch", "1"),
+			("float_complex_roundtrips", "1"),
+			("index_and_number_protocol", "1"),
+			("type_check_macros", "1"),
+			("abstract_number_surface", "4095"),
+		] {
+			let method = module_attr(module_name, intern(method_name))
+				.unwrap_or_else(|| panic!("{method_name} method registered"));
+			let result = unsafe { pon_call(method, ptr::null_mut(), 0) };
+			assert!(!result.is_null(), "{method_name} returned NULL: {:?}", pon_err_message());
+			assert_eq!(format_object_for_print(result).as_deref(), Ok(expected));
+		}
+	}
 }

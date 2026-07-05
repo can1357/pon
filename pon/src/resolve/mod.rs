@@ -3,4 +3,4 @@ pub mod provider;
 pub mod source;
 pub mod versionset;
 
-pub use provider::{resolve_root, Resolution, ResolvedArtifact, ResolvedDist};
+pub use provider::{Resolution, ResolvedArtifact, ResolvedDist, resolve_root};

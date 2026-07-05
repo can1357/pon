@@ -55,81 +55,83 @@
 //! even consulted).  Both surface as honest per-test vectors instead of an
 //! import-time death of the whole unit.
 
-use crate::abi;
-use crate::intern::intern;
-use crate::object::{PyObject, PyType};
-use crate::types::exc::ExceptionKind;
-use crate::types::type_::TYPE_ID_HEAP_INSTANCE;
-
-use super::builtins_mod::VARIADIC_ARITY;
-use super::install_module;
+use super::{builtins_mod::VARIADIC_ARITY, install_module};
+use crate::{
+	abi,
+	intern::intern,
+	object::{PyObject, PyType},
+	types::{exc::ExceptionKind, type_::TYPE_ID_HEAP_INSTANCE},
+};
 
 /// Type of `object`, or NULL for NULL/tagged immediates (module-local copy
 /// of the runtime-wide helper convention; immediates carry no
 /// dereferenceable type).
 unsafe fn object_type(object: *mut PyObject) -> *mut PyType {
-    if object.is_null() || !crate::tag::is_heap(object) {
-        core::ptr::null_mut()
-    } else {
-        unsafe { (*object).ob_type.cast_mut() }
-    }
+	if object.is_null() || !crate::tag::is_heap(object) {
+		core::ptr::null_mut()
+	} else {
+		unsafe { (*object).ob_type.cast_mut() }
+	}
 }
 
 /// `has_inline_values(obj)`: whether `obj`'s attribute values live in
 /// instance-owned managed storage (see the module docs for the full mapping
 /// onto CPython's inline-values state).
-unsafe extern "C" fn has_inline_values_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    if argc != 1 {
-        return abi::exc::raise_kind_error_text(
-            ExceptionKind::TypeError,
-            &format!("_testinternalcapi.has_inline_values expected 1 argument, got {argc}"),
-        );
-    }
-    if argv.is_null() {
-        return abi::exc::raise_kind_error_text(
-            ExceptionKind::TypeError,
-            "_testinternalcapi.has_inline_values received a NULL argument buffer",
-        );
-    }
-    // SAFETY: `argv` holds `argc` live argument pointers (checked above).
-    let object = unsafe { *argv };
-    let ty = unsafe { object_type(object) };
-    let managed = !ty.is_null()
-        && unsafe { (*ty).gc_type_id } == TYPE_ID_HEAP_INSTANCE.0 as usize
-        && unsafe { (*ty).tp_dictoffset } != 0;
-    // SAFETY: Bool constructor returns the shared singleton.
-    unsafe { abi::number::pon_const_bool(i32::from(managed)) }
+unsafe extern "C" fn has_inline_values_entry(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	if argc != 1 {
+		return abi::exc::raise_kind_error_text(
+			ExceptionKind::TypeError,
+			&format!("_testinternalcapi.has_inline_values expected 1 argument, got {argc}"),
+		);
+	}
+	if argv.is_null() {
+		return abi::exc::raise_kind_error_text(
+			ExceptionKind::TypeError,
+			"_testinternalcapi.has_inline_values received a NULL argument buffer",
+		);
+	}
+	// SAFETY: `argv` holds `argc` live argument pointers (checked above).
+	let object = unsafe { *argv };
+	let ty = unsafe { object_type(object) };
+	let managed = !ty.is_null()
+		&& unsafe { (*ty).gc_type_id } == TYPE_ID_HEAP_INSTANCE.0 as usize
+		&& unsafe { (*ty).tp_dictoffset } != 0;
+	// SAFETY: Bool constructor returns the shared singleton.
+	unsafe { abi::number::pon_const_bool(i32::from(managed)) }
 }
 
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
-    let name = "_testinternalcapi";
-    // SAFETY: Runtime allocation helper; NULL is checked below.
-    let name_obj = unsafe { abi::pon_const_str(name.as_ptr(), name.len()) };
-    if name_obj.is_null() {
-        return Err("failed to allocate _testinternalcapi.__name__".to_owned());
-    }
-    let doc = "pon-native shim for CPython's _testinternalcapi C test extension: \
-               serves has_inline_values (mapped honestly onto pon's instance \
-               layout) for test_class; every other internals probe is \
-               deliberately absent — see native/testinternalcapi.rs.";
-    // SAFETY: Runtime allocation helper; NULL is checked below.
-    let doc_obj = unsafe { abi::pon_const_str(doc.as_ptr(), doc.len()) };
-    if doc_obj.is_null() {
-        return Err("failed to allocate _testinternalcapi.__doc__".to_owned());
-    }
-    let mut attrs: Vec<(u32, *mut PyObject)> = vec![(intern("__name__"), name_obj), (intern("__doc__"), doc_obj)];
-    // SAFETY: `has_inline_values_entry` is a live builtin entry point with
-    // the runtime calling convention.
-    let function = unsafe {
-        abi::pon_make_function(
-            has_inline_values_entry as *const u8,
-            VARIADIC_ARITY,
-            intern("has_inline_values"),
-        )
-    };
-    if function.is_null() {
-        return Err("failed to allocate _testinternalcapi.has_inline_values".to_owned());
-    }
-    attrs.push((intern("has_inline_values"), function));
-    install_module(name, attrs)
+	let name = "_testinternalcapi";
+	// SAFETY: Runtime allocation helper; NULL is checked below.
+	let name_obj = unsafe { abi::pon_const_str(name.as_ptr(), name.len()) };
+	if name_obj.is_null() {
+		return Err("failed to allocate _testinternalcapi.__name__".to_owned());
+	}
+	let doc = "pon-native shim for CPython's _testinternalcapi C test extension: serves \
+	           has_inline_values (mapped honestly onto pon's instance layout) for test_class; \
+	           every other internals probe is deliberately absent — see native/testinternalcapi.rs.";
+	// SAFETY: Runtime allocation helper; NULL is checked below.
+	let doc_obj = unsafe { abi::pon_const_str(doc.as_ptr(), doc.len()) };
+	if doc_obj.is_null() {
+		return Err("failed to allocate _testinternalcapi.__doc__".to_owned());
+	}
+	let mut attrs: Vec<(u32, *mut PyObject)> =
+		vec![(intern("__name__"), name_obj), (intern("__doc__"), doc_obj)];
+	// SAFETY: `has_inline_values_entry` is a live builtin entry point with
+	// the runtime calling convention.
+	let function = unsafe {
+		abi::pon_make_function(
+			has_inline_values_entry as *const u8,
+			VARIADIC_ARITY,
+			intern("has_inline_values"),
+		)
+	};
+	if function.is_null() {
+		return Err("failed to allocate _testinternalcapi.has_inline_values".to_owned());
+	}
+	attrs.push((intern("has_inline_values"), function));
+	install_module(name, attrs)
 }

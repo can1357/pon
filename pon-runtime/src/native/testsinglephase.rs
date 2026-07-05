@@ -28,27 +28,26 @@
 //!   different"`).
 //! * `initialized()`/`initialized_count()` answer with pon's real module
 //!   lifecycle: the wall-clock time the factory first ran and the number of
-//!   factory runs.  pon creates a native module once per process and caches
-//!   it, so the count is `1` — honestly reflecting that pon has no
-//!   extension re-initialization machinery (CPython's counter exists to
-//!   observe repeated single-phase init).
-//! * Everything else (`sum`, `look_up_self`, `state_initialized`, `error`,
-//!   the `_with_reinit`/`_with_state` variants) is deliberately absent:
-//!   those names only matter to the excluded `c-abi-boundary` families, and
-//!   an un-shimmed access must fail loudly as `AttributeError` naming this
-//!   module rather than return a fabricated value.
+//!   factory runs.  pon creates a native module once per process and caches it,
+//!   so the count is `1` — honestly reflecting that pon has no extension
+//!   re-initialization machinery (CPython's counter exists to observe repeated
+//!   single-phase init).
+//! * Everything else (`sum`, `look_up_self`, `state_initialized`, `error`, the
+//!   `_with_reinit`/`_with_state` variants) is deliberately absent: those names
+//!   only matter to the excluded `c-abi-boundary` families, and an un-shimmed
+//!   access must fail loudly as `AttributeError` naming this module rather than
+//!   return a fabricated value.
 
-use std::sync::LazyLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+	sync::{
+		LazyLock,
+		atomic::{AtomicU64, Ordering},
+	},
+	time::{SystemTime, UNIX_EPOCH},
+};
 
-use crate::abi;
-use crate::intern::intern;
-use crate::object::PyObject;
-use crate::types::exc::ExceptionKind;
-
-use super::builtins_mod::VARIADIC_ARITY;
-use super::install_module;
+use super::{builtins_mod::VARIADIC_ARITY, install_module};
+use crate::{abi, intern::intern, object::PyObject, types::exc::ExceptionKind};
 
 type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
 
@@ -62,92 +61,96 @@ static INIT_TIME: LazyLock<f64> = LazyLock::new(now_seconds);
 static INIT_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn now_seconds() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs_f64())
-        .unwrap_or(0.0)
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map(|elapsed| elapsed.as_secs_f64())
+		.unwrap_or(0.0)
 }
 
 /// Zero-argument entry points sharing the arity contract.
 macro_rules! noargs_guard {
-    ($name:literal, $argc:expr) => {
-        if $argc != 0 {
-            return abi::exc::raise_kind_error_text(
-                ExceptionKind::TypeError,
-                &format!(concat!("_testsinglephase.", $name, " expected 0 arguments, got {}"), $argc),
-            );
-        }
-    };
+	($name:literal, $argc:expr) => {
+		if $argc != 0 {
+			return abi::exc::raise_kind_error_text(
+				ExceptionKind::TypeError,
+				&format!(concat!("_testsinglephase.", $name, " expected 0 arguments, got {}"), $argc),
+			);
+		}
+	};
 }
 
 /// `initialized()`: wall-clock time (seconds since the epoch) recorded when
 /// the module factory ran.  CPython returns its module-state init timestamp;
 /// pon's analogue is the factory-run instant.
 unsafe extern "C" fn initialized_entry(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    noargs_guard!("initialized", argc);
-    // SAFETY: Float constant allocator; NULL propagates with the error set.
-    unsafe { abi::number::pon_const_float(*INIT_TIME) }
+	noargs_guard!("initialized", argc);
+	// SAFETY: Float constant allocator; NULL propagates with the error set.
+	unsafe { abi::number::pon_const_float(*INIT_TIME) }
 }
 
 /// `initialized_count()`: how many times this module initialized.  pon
 /// native modules initialize exactly once per process (the import cache
 /// serves every later import), so the honest answer is the factory-run
 /// count — `1`.
-unsafe extern "C" fn initialized_count_entry(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-    noargs_guard!("initialized_count", argc);
-    let count = i64::try_from(INIT_COUNT.load(Ordering::Relaxed)).unwrap_or(i64::MAX);
-    // SAFETY: Int constant allocator; NULL propagates with the error set.
-    unsafe { abi::pon_const_int(count) }
+unsafe extern "C" fn initialized_count_entry(
+	_argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	noargs_guard!("initialized_count", argc);
+	let count = i64::try_from(INIT_COUNT.load(Ordering::Relaxed)).unwrap_or(i64::MAX);
+	// SAFETY: Int constant allocator; NULL propagates with the error set.
+	unsafe { abi::pon_const_int(count) }
 }
 
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
-    INIT_COUNT.fetch_add(1, Ordering::Relaxed);
-    // Pin the init timestamp to the first factory run.
-    let _ = *INIT_TIME;
+	INIT_COUNT.fetch_add(1, Ordering::Relaxed);
+	// Pin the init timestamp to the first factory run.
+	let _ = *INIT_TIME;
 
-    let name = "_testsinglephase";
-    // SAFETY: Runtime allocation helper; NULL is checked below.
-    let name_obj = unsafe { abi::pon_const_str(name.as_ptr(), name.len()) };
-    if name_obj.is_null() {
-        return Err("failed to allocate _testsinglephase.__name__".to_owned());
-    }
-    let doc = "pon-native shim for CPython's _testsinglephase C test extension: \
-               presents the minimal honest surface (existence, definition-time \
-               constants, real init lifecycle) so the pure-Python importlib test \
-               family imports; see native/testsinglephase.rs.";
-    // SAFETY: Runtime allocation helper; NULL is checked below.
-    let doc_obj = unsafe { abi::pon_const_str(doc.as_ptr(), doc.len()) };
-    if doc_obj.is_null() {
-        return Err("failed to allocate _testsinglephase.__doc__".to_owned());
-    }
-    let mut attrs: Vec<(u32, *mut PyObject)> = vec![(intern("__name__"), name_obj), (intern("__doc__"), doc_obj)];
+	let name = "_testsinglephase";
+	// SAFETY: Runtime allocation helper; NULL is checked below.
+	let name_obj = unsafe { abi::pon_const_str(name.as_ptr(), name.len()) };
+	if name_obj.is_null() {
+		return Err("failed to allocate _testsinglephase.__name__".to_owned());
+	}
+	let doc = "pon-native shim for CPython's _testsinglephase C test extension: presents the \
+	           minimal honest surface (existence, definition-time constants, real init lifecycle) \
+	           so the pure-Python importlib test family imports; see native/testsinglephase.rs.";
+	// SAFETY: Runtime allocation helper; NULL is checked below.
+	let doc_obj = unsafe { abi::pon_const_str(doc.as_ptr(), doc.len()) };
+	if doc_obj.is_null() {
+		return Err("failed to allocate _testsinglephase.__doc__".to_owned());
+	}
+	let mut attrs: Vec<(u32, *mut PyObject)> =
+		vec![(intern("__name__"), name_obj), (intern("__doc__"), doc_obj)];
 
-    // Definition-time constants, verbatim from `Modules/_testsinglephase.c`.
-    // SAFETY: Int constant allocator; NULL is checked below.
-    let int_const = unsafe { abi::pon_const_int(1969) };
-    if int_const.is_null() {
-        return Err("failed to allocate _testsinglephase.int_const".to_owned());
-    }
-    attrs.push((intern("int_const"), int_const));
-    let str_const = "something different";
-    // SAFETY: String allocation helper; NULL is checked below.
-    let str_const_obj = unsafe { abi::pon_const_str(str_const.as_ptr(), str_const.len()) };
-    if str_const_obj.is_null() {
-        return Err("failed to allocate _testsinglephase.str_const".to_owned());
-    }
-    attrs.push((intern("str_const"), str_const_obj));
+	// Definition-time constants, verbatim from `Modules/_testsinglephase.c`.
+	// SAFETY: Int constant allocator; NULL is checked below.
+	let int_const = unsafe { abi::pon_const_int(1969) };
+	if int_const.is_null() {
+		return Err("failed to allocate _testsinglephase.int_const".to_owned());
+	}
+	attrs.push((intern("int_const"), int_const));
+	let str_const = "something different";
+	// SAFETY: String allocation helper; NULL is checked below.
+	let str_const_obj = unsafe { abi::pon_const_str(str_const.as_ptr(), str_const.len()) };
+	if str_const_obj.is_null() {
+		return Err("failed to allocate _testsinglephase.str_const".to_owned());
+	}
+	attrs.push((intern("str_const"), str_const_obj));
 
-    for (fn_name, entry) in [
-        ("initialized", initialized_entry as BuiltinFn),
-        ("initialized_count", initialized_count_entry),
-    ] {
-        // SAFETY: `entry` is a live builtin entry point with the runtime
-        // calling convention.
-        let function = unsafe { abi::pon_make_function(entry as *const u8, VARIADIC_ARITY, intern(fn_name)) };
-        if function.is_null() {
-            return Err(format!("failed to allocate _testsinglephase.{fn_name}"));
-        }
-        attrs.push((intern(fn_name), function));
-    }
-    install_module(name, attrs)
+	for (fn_name, entry) in [
+		("initialized", initialized_entry as BuiltinFn),
+		("initialized_count", initialized_count_entry),
+	] {
+		// SAFETY: `entry` is a live builtin entry point with the runtime
+		// calling convention.
+		let function =
+			unsafe { abi::pon_make_function(entry as *const u8, VARIADIC_ARITY, intern(fn_name)) };
+		if function.is_null() {
+			return Err(format!("failed to allocate _testsinglephase.{fn_name}"));
+		}
+		attrs.push((intern(fn_name), function));
+	}
+	install_module(name, attrs)
 }

@@ -2,8 +2,8 @@
 //!
 //! Phase A lowers the accepted Python subset directly, so there are no
 //! source-to-IR rewrites to perform yet. Keeping this explicit pass in the
-//! pipeline gives later phases a stable home for transformations that should run
-//! after AST lowering and before code generation.
+//! pipeline gives later phases a stable home for transformations that should
+//! run after AST lowering and before code generation.
 
 use crate::Module;
 
@@ -14,5 +14,5 @@ use crate::Module;
 /// the lowerer.
 #[must_use]
 pub fn desugar_module(module: Module) -> Module {
-    module
+	module
 }

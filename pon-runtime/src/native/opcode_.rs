@@ -20,8 +20,8 @@
 //! * `get_specialization_stats` returns `None`, exactly like a CPython build
 //!   without `Py_STATS`.
 //! * `stack_effect` (bound by name in `opcode.py`), `get_executor` (bound by
-//!   name in `dis.py`), and `is_valid` exist so the imports succeed, and
-//!   raise a typed `NotImplementedError` naming the gap when actually called.
+//!   name in `dis.py`), and `is_valid` exist so the imports succeed, and raise
+//!   a typed `NotImplementedError` naming the gap when actually called.
 //! * `ENABLE_SPECIALIZATION`/`ENABLE_SPECIALIZATION_FT` are `0`: pon never
 //!   specializes, so `test.support.requires_specialization{,_ft}` skips.
 //!
@@ -29,13 +29,11 @@
 //! `HAVE_ARGUMENT`, `EXTENDED_ARG`, ...) comes from the vendored pure-Python
 //! `Lib/_opcode_metadata.py` via `opcode.py` and needs nothing from here.
 
-use crate::abi;
-use crate::intern::intern;
-use crate::object::PyObject;
-use crate::types::exc::ExceptionKind;
-
-use super::builtins_mod::{alloc_list, VARIADIC_ARITY};
-use super::install_module;
+use super::{
+	builtins_mod::{VARIADIC_ARITY, alloc_list},
+	install_module,
+};
+use crate::{abi, intern::intern, object::PyObject, types::exc::ExceptionKind};
 
 type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
 
@@ -60,13 +58,13 @@ macro_rules! category_predicate_fns {
 }
 
 category_predicate_fns!(
-    (has_arg_entry, "has_arg"),
-    (has_const_entry, "has_const"),
-    (has_name_entry, "has_name"),
-    (has_jump_entry, "has_jump"),
-    (has_free_entry, "has_free"),
-    (has_local_entry, "has_local"),
-    (has_exc_entry, "has_exc"),
+	(has_arg_entry, "has_arg"),
+	(has_const_entry, "has_const"),
+	(has_name_entry, "has_name"),
+	(has_jump_entry, "has_jump"),
+	(has_free_entry, "has_free"),
+	(has_local_entry, "has_local"),
+	(has_exc_entry, "has_exc"),
 );
 
 /// Zero-argument table getters, *called* at `import opcode` time.  CPython
@@ -89,10 +87,10 @@ macro_rules! empty_table_fns {
 }
 
 empty_table_fns!(
-    (get_nb_ops_entry, "get_nb_ops"),
-    (get_intrinsic1_descs_entry, "get_intrinsic1_descs"),
-    (get_intrinsic2_descs_entry, "get_intrinsic2_descs"),
-    (get_special_method_names_entry, "get_special_method_names"),
+	(get_nb_ops_entry, "get_nb_ops"),
+	(get_intrinsic1_descs_entry, "get_intrinsic1_descs"),
+	(get_intrinsic2_descs_entry, "get_intrinsic2_descs"),
+	(get_special_method_names_entry, "get_special_method_names"),
 );
 
 /// Entry points whose real semantics require CPython bytecode (stack
@@ -113,71 +111,71 @@ macro_rules! bytecode_stub_fns {
 }
 
 bytecode_stub_fns!(
-    (stack_effect_entry, "stack_effect"),
-    (is_valid_entry, "is_valid"),
-    (get_executor_entry, "get_executor"),
+	(stack_effect_entry, "stack_effect"),
+	(is_valid_entry, "is_valid"),
+	(get_executor_entry, "get_executor"),
 );
 
 /// `get_specialization_stats()`: a CPython build without `Py_STATS` returns
 /// `None`; so does pon (it collects no specialization stats).
 unsafe extern "C" fn get_specialization_stats_entry(
-    _argv: *mut *mut PyObject,
-    argc: usize,
+	_argv: *mut *mut PyObject,
+	argc: usize,
 ) -> *mut PyObject {
-    if argc != 0 {
-        return abi::exc::raise_kind_error_text(
-            ExceptionKind::TypeError,
-            &format!("_opcode.get_specialization_stats expected 0 arguments, got {argc}"),
-        );
-    }
-    // SAFETY: Singleton accessor.
-    unsafe { abi::pon_none() }
+	if argc != 0 {
+		return abi::exc::raise_kind_error_text(
+			ExceptionKind::TypeError,
+			&format!("_opcode.get_specialization_stats expected 0 arguments, got {argc}"),
+		);
+	}
+	// SAFETY: Singleton accessor.
+	unsafe { abi::pon_none() }
 }
 
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
-    let name = "_opcode";
-    // SAFETY: Runtime allocation helper; NULL is checked below.
-    let name_obj = unsafe { abi::pon_const_str(name.as_ptr(), name.len()) };
-    if name_obj.is_null() {
-        return Err("failed to allocate _opcode.__name__".to_owned());
-    }
-    let mut attrs: Vec<(u32, *mut PyObject)> = vec![(intern("__name__"), name_obj)];
-    // pon never specializes (it has no bytecode to specialize): both flags
-    // are 0, which makes `test.support.requires_specialization{,_ft}` skip.
-    for const_name in ["ENABLE_SPECIALIZATION", "ENABLE_SPECIALIZATION_FT"] {
-        // SAFETY: Int constant allocator; NULL on failure with the error set.
-        let zero = unsafe { abi::pon_const_int(0) };
-        if zero.is_null() {
-            return Err(format!("failed to allocate _opcode.{const_name}"));
-        }
-        attrs.push((intern(const_name), zero));
-    }
-    // Method-table order mirrors CPython's `Modules/_opcode.c`.
-    for (fn_name, entry) in [
-        ("stack_effect", stack_effect_entry as BuiltinFn),
-        ("is_valid", is_valid_entry),
-        ("has_arg", has_arg_entry),
-        ("has_const", has_const_entry),
-        ("has_name", has_name_entry),
-        ("has_jump", has_jump_entry),
-        ("has_free", has_free_entry),
-        ("has_local", has_local_entry),
-        ("has_exc", has_exc_entry),
-        ("get_specialization_stats", get_specialization_stats_entry),
-        ("get_nb_ops", get_nb_ops_entry),
-        ("get_intrinsic1_descs", get_intrinsic1_descs_entry),
-        ("get_intrinsic2_descs", get_intrinsic2_descs_entry),
-        ("get_special_method_names", get_special_method_names_entry),
-        ("get_executor", get_executor_entry),
-    ] {
-        // SAFETY: `entry` is a live builtin entry point with the runtime
-        // calling convention.
-        let function =
-            unsafe { abi::pon_make_function(entry as *const u8, VARIADIC_ARITY, intern(fn_name)) };
-        if function.is_null() {
-            return Err(format!("failed to allocate _opcode.{fn_name}"));
-        }
-        attrs.push((intern(fn_name), function));
-    }
-    install_module(name, attrs)
+	let name = "_opcode";
+	// SAFETY: Runtime allocation helper; NULL is checked below.
+	let name_obj = unsafe { abi::pon_const_str(name.as_ptr(), name.len()) };
+	if name_obj.is_null() {
+		return Err("failed to allocate _opcode.__name__".to_owned());
+	}
+	let mut attrs: Vec<(u32, *mut PyObject)> = vec![(intern("__name__"), name_obj)];
+	// pon never specializes (it has no bytecode to specialize): both flags
+	// are 0, which makes `test.support.requires_specialization{,_ft}` skip.
+	for const_name in ["ENABLE_SPECIALIZATION", "ENABLE_SPECIALIZATION_FT"] {
+		// SAFETY: Int constant allocator; NULL on failure with the error set.
+		let zero = unsafe { abi::pon_const_int(0) };
+		if zero.is_null() {
+			return Err(format!("failed to allocate _opcode.{const_name}"));
+		}
+		attrs.push((intern(const_name), zero));
+	}
+	// Method-table order mirrors CPython's `Modules/_opcode.c`.
+	for (fn_name, entry) in [
+		("stack_effect", stack_effect_entry as BuiltinFn),
+		("is_valid", is_valid_entry),
+		("has_arg", has_arg_entry),
+		("has_const", has_const_entry),
+		("has_name", has_name_entry),
+		("has_jump", has_jump_entry),
+		("has_free", has_free_entry),
+		("has_local", has_local_entry),
+		("has_exc", has_exc_entry),
+		("get_specialization_stats", get_specialization_stats_entry),
+		("get_nb_ops", get_nb_ops_entry),
+		("get_intrinsic1_descs", get_intrinsic1_descs_entry),
+		("get_intrinsic2_descs", get_intrinsic2_descs_entry),
+		("get_special_method_names", get_special_method_names_entry),
+		("get_executor", get_executor_entry),
+	] {
+		// SAFETY: `entry` is a live builtin entry point with the runtime
+		// calling convention.
+		let function =
+			unsafe { abi::pon_make_function(entry as *const u8, VARIADIC_ARITY, intern(fn_name)) };
+		if function.is_null() {
+			return Err(format!("failed to allocate _opcode.{fn_name}"));
+		}
+		attrs.push((intern(fn_name), function));
+	}
+	install_module(name, attrs)
 }

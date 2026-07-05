@@ -1,7 +1,6 @@
 //! Builtin helper family namespace.
 
-use crate::intern::resolve;
-use crate::object::PyObject;
+use crate::{intern::resolve, object::PyObject};
 
 /// Interned builtin selector used by future compact dispatch helpers.
 pub type BuiltinId = u16;
@@ -17,16 +16,19 @@ pub type BuiltinId = u16;
 /// flat map serving genuine builtins last.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_load_builtin(name_interned: u32) -> *mut PyObject {
-    super::catch_object_helper(|| {
-        if let Err(message) = super::ensure_runtime_initialized() {
-            return super::return_null_with_error(message);
-        }
-        super::defining_module_attr(name_interned)
-            .or_else(|| crate::import::active_module_attr(name_interned))
-            .or_else(|| super::with_runtime(|runtime| runtime.globals.get(&name_interned).copied()).flatten())
-            .unwrap_or_else(|| {
-                let name = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
-                super::exc::raise_name_error_text(&format!("name '{name}' is not defined"))
-            })
-    })
+	super::catch_object_helper(|| {
+		if let Err(message) = super::ensure_runtime_initialized() {
+			return super::return_null_with_error(message);
+		}
+		super::defining_module_attr(name_interned)
+			.or_else(|| crate::import::active_module_attr(name_interned))
+			.or_else(|| {
+				super::with_runtime(|runtime| runtime.globals.get(&name_interned).copied()).flatten()
+			})
+			.unwrap_or_else(|| {
+				let name =
+					resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
+				super::exc::raise_name_error_text(&format!("name '{name}' is not defined"))
+			})
+	})
 }

@@ -1,4 +1,4 @@
-#![doc = "Pon: Python runtime, AoT compiler, and package manager in one binary."]
+//!Pon: Python runtime, AoT compiler, and package manager in one binary.
 
 pub(crate) mod astconv;
 pub mod cli;

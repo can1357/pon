@@ -6,7 +6,7 @@
 # get_config_var returns a str for CFLAGS, an int for Py_GIL_DISABLED, and
 # None for keys absent from a build's Makefile. pon's concrete values are
 # pinned by pon-runtime/src/native/sysconfigdata.rs unit tests and the
-# pon-cli run_cli.rs E2E test.
+# pon run_cli.rs E2E test.
 import sysconfig
 
 print(type(sysconfig.get_config_var('CFLAGS')).__name__)

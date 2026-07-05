@@ -12,216 +12,212 @@ use core::{cell::Cell, ptr};
 use pon_gc::GcTypeInfo;
 
 use super::exc::pending_exception_object;
-use crate::abstract_op;
-use crate::feedback::FeedbackCell;
-use crate::object::{PyObject, PyType, is_exact_type};
-use crate::thread_state::{pon_err_clear, pon_err_occurred, thread_state_lock};
-use crate::types::coroutine::{TYPE_ID_COROUTINE, ensure_coroutine_type};
-use crate::types::async_generator::{
-    AWAITABLE_MODE_CLOSE, AWAITABLE_MODE_SEND, AWAITABLE_MODE_THROW, AWAITABLE_STATE_CLOSED,
-    AWAITABLE_STATE_ITER, AWAITABLE_STATE_START, PyAsyncGenAwaitable, PyAsyncGenWrappedValue,
-    TYPE_ID_ASYNC_GEN_AWAITABLE, TYPE_ID_ASYNC_GEN_WRAPPED, TYPE_ID_ASYNC_GENERATOR,
-    ensure_asend_type, ensure_async_generator_type, ensure_athrow_type,
-    ensure_wrapped_value_type, trace_async_gen_awaitable, trace_async_gen_wrapped,
-};
-use crate::types::exc::{ExceptionKind, PyBaseException, is_exception_instance, is_exception_subclass};
-use crate::types::frame::{TYPE_ID_FRAME, ensure_frame_type, finalize_frame, trace_frame};
-use crate::types::generator::{
-    GenFrame, GeneratorKind, PyGenerator, RESUME_FINISHED, RESUME_RUNNING,
-    RESUME_START, TYPE_ID_GEN_FRAME, TYPE_ID_GENERATOR, as_generator_mut, as_generator_object,
-    ensure_generator_type, gen_frame_alloc_size, trace_gen_frame, trace_generator,
-};
-
-/// Compiled resumable-body ABI (pin J0.1 §2): one argument, payload in the frame.
+/// Compiled resumable-body ABI (pin J0.1 §2): one argument, payload in the
+/// frame.
 pub use crate::types::generator::GenResumeBodyFn;
+use crate::{
+	abstract_op,
+	feedback::FeedbackCell,
+	object::{PyObject, PyType, is_exact_type},
+	thread_state::{pon_err_clear, pon_err_occurred, thread_state_lock},
+	types::{
+		async_generator::{
+			AWAITABLE_MODE_CLOSE, AWAITABLE_MODE_SEND, AWAITABLE_MODE_THROW, AWAITABLE_STATE_CLOSED,
+			AWAITABLE_STATE_ITER, AWAITABLE_STATE_START, PyAsyncGenAwaitable, PyAsyncGenWrappedValue,
+			TYPE_ID_ASYNC_GEN_AWAITABLE, TYPE_ID_ASYNC_GEN_WRAPPED, TYPE_ID_ASYNC_GENERATOR,
+			ensure_asend_type, ensure_async_generator_type, ensure_athrow_type,
+			ensure_wrapped_value_type, trace_async_gen_awaitable, trace_async_gen_wrapped,
+		},
+		coroutine::{TYPE_ID_COROUTINE, ensure_coroutine_type},
+		exc::{ExceptionKind, PyBaseException, is_exception_instance, is_exception_subclass},
+		frame::{TYPE_ID_FRAME, ensure_frame_type, finalize_frame, trace_frame},
+		generator::{
+			GenFrame, GeneratorKind, PyGenerator, RESUME_FINISHED, RESUME_RUNNING, RESUME_START,
+			TYPE_ID_GEN_FRAME, TYPE_ID_GENERATOR, as_generator_mut, as_generator_object,
+			ensure_generator_type, gen_frame_alloc_size, trace_gen_frame, trace_generator,
+		},
+	},
+};
 
 thread_local! {
-    /// `StopIteration.value` of the last delegation/loop finish consumed by
-    /// [`pon_gen_stop_value`]; read back by [`pon_gen_last_stop_value`] as the
-    /// `yield from` expression result.  Rooted via [`last_stop_value_root`].
-    static LAST_STOP_VALUE: Cell<*mut PyObject> = const { Cell::new(ptr::null_mut()) };
+	 /// `StopIteration.value` of the last delegation/loop finish consumed by
+	 /// [`pon_gen_stop_value`]; read back by [`pon_gen_last_stop_value`] as the
+	 /// `yield from` expression result.  Rooted via [`last_stop_value_root`].
+	 static LAST_STOP_VALUE: Cell<*mut PyObject> = const { Cell::new(ptr::null_mut()) };
 }
 
 thread_local! {
-    /// True while the value about to be returned by the innermost resuming
-    /// body came from a [`pon_gen_delegate_step`] passthrough (an inner
-    /// `await`/`yield from` delegate suspended).  Cleared by the resume driver
-    /// before each body call and re-armed by every non-NULL delegate step, so
-    /// an async-generator resume can tell a genuine async `yield` (which must
-    /// be wrapped, PEP 525) from a transparent delegation yield.  Sound under
-    /// nesting: a delegate step re-arms the flag AFTER its nested resume
-    /// returns, and the compiled delegation loop suspends with that exact
-    /// value before any further runtime call.
-    static DELEGATION_YIELD: Cell<bool> = const { Cell::new(false) };
+	 /// True while the value about to be returned by the innermost resuming
+	 /// body came from a [`pon_gen_delegate_step`] passthrough (an inner
+	 /// `await`/`yield from` delegate suspended).  Cleared by the resume driver
+	 /// before each body call and re-armed by every non-NULL delegate step, so
+	 /// an async-generator resume can tell a genuine async `yield` (which must
+	 /// be wrapped, PEP 525) from a transparent delegation yield.  Sound under
+	 /// nesting: a delegate step re-arms the flag AFTER its nested resume
+	 /// returns, and the compiled delegation loop suspends with that exact
+	 /// value before any further runtime call.
+	 static DELEGATION_YIELD: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Current thread's stashed delegation finish value, for GC rooting.
 pub(crate) fn last_stop_value_root() -> *mut PyObject {
-    LAST_STOP_VALUE.with(Cell::get)
+	LAST_STOP_VALUE.with(Cell::get)
 }
 
 #[derive(Clone, Copy)]
 struct GenTypes {
-    frame: *mut PyType,
-    generator: *mut PyType,
-    coroutine: *mut PyType,
-    async_generator: *mut PyType,
-    asend: *mut PyType,
-    athrow: *mut PyType,
-    wrapped: *mut PyType,
+	frame:           *mut PyType,
+	generator:       *mut PyType,
+	coroutine:       *mut PyType,
+	async_generator: *mut PyType,
+	asend:           *mut PyType,
+	athrow:          *mut PyType,
+	wrapped:         *mut PyType,
 }
 
 fn ensure_gen_runtime() -> Result<GenTypes, String> {
-    super::ensure_runtime_initialized()?;
-    super::with_runtime(|runtime| {
-        runtime.heap.register_type(
-            TYPE_ID_GENERATOR,
-            GcTypeInfo {
-                size: core::mem::size_of::<PyGenerator>(),
-                trace: trace_generator,
-                finalize: None,
-            },
-        );
-        runtime.heap.register_type(
-            TYPE_ID_COROUTINE,
-            GcTypeInfo {
-                size: core::mem::size_of::<PyGenerator>(),
-                trace: trace_generator,
-                finalize: None,
-            },
-        );
-        // Legacy PyFrame registration: `frame_stack`/tracebacks may still hold
-        // PyFrame-typed pointers from non-generator paths.
-        runtime.heap.register_type(
-            TYPE_ID_FRAME,
-            GcTypeInfo {
-                size: core::mem::size_of::<crate::abi::PyFrame>(),
-                trace: trace_frame,
-                finalize: Some(finalize_frame),
-            },
-        );
-        // Pin J0.1 §1.1: nominal size only — real size is recorded per
-        // allocation (trailing slot array); one allocation, no finalizer.
-        runtime.heap.register_type(
-            TYPE_ID_GEN_FRAME,
-            GcTypeInfo {
-                size: core::mem::size_of::<GenFrame>(),
-                trace: trace_gen_frame,
-                finalize: None,
-            },
-        );
-        runtime.heap.register_type(
-            TYPE_ID_ASYNC_GENERATOR,
-            GcTypeInfo {
-                size: core::mem::size_of::<PyGenerator>(),
-                trace: trace_generator,
-                finalize: None,
-            },
-        );
-        runtime.heap.register_type(
-            TYPE_ID_ASYNC_GEN_AWAITABLE,
-            GcTypeInfo {
-                size: core::mem::size_of::<PyAsyncGenAwaitable>(),
-                trace: trace_async_gen_awaitable,
-                finalize: None,
-            },
-        );
-        runtime.heap.register_type(
-            TYPE_ID_ASYNC_GEN_WRAPPED,
-            GcTypeInfo {
-                size: core::mem::size_of::<PyAsyncGenWrappedValue>(),
-                trace: trace_async_gen_wrapped,
-                finalize: None,
-            },
-        );
+	super::ensure_runtime_initialized()?;
+	super::with_runtime(|runtime| {
+		runtime.heap.register_type(TYPE_ID_GENERATOR, GcTypeInfo {
+			size:     core::mem::size_of::<PyGenerator>(),
+			trace:    trace_generator,
+			finalize: None,
+		});
+		runtime.heap.register_type(TYPE_ID_COROUTINE, GcTypeInfo {
+			size:     core::mem::size_of::<PyGenerator>(),
+			trace:    trace_generator,
+			finalize: None,
+		});
+		// Legacy PyFrame registration: `frame_stack`/tracebacks may still hold
+		// PyFrame-typed pointers from non-generator paths.
+		runtime.heap.register_type(TYPE_ID_FRAME, GcTypeInfo {
+			size:     core::mem::size_of::<crate::abi::PyFrame>(),
+			trace:    trace_frame,
+			finalize: Some(finalize_frame),
+		});
+		// Pin J0.1 §1.1: nominal size only — real size is recorded per
+		// allocation (trailing slot array); one allocation, no finalizer.
+		runtime.heap.register_type(TYPE_ID_GEN_FRAME, GcTypeInfo {
+			size:     core::mem::size_of::<GenFrame>(),
+			trace:    trace_gen_frame,
+			finalize: None,
+		});
+		runtime
+			.heap
+			.register_type(TYPE_ID_ASYNC_GENERATOR, GcTypeInfo {
+				size:     core::mem::size_of::<PyGenerator>(),
+				trace:    trace_generator,
+				finalize: None,
+			});
+		runtime
+			.heap
+			.register_type(TYPE_ID_ASYNC_GEN_AWAITABLE, GcTypeInfo {
+				size:     core::mem::size_of::<PyAsyncGenAwaitable>(),
+				trace:    trace_async_gen_awaitable,
+				finalize: None,
+			});
+		runtime
+			.heap
+			.register_type(TYPE_ID_ASYNC_GEN_WRAPPED, GcTypeInfo {
+				size:     core::mem::size_of::<PyAsyncGenWrappedValue>(),
+				trace:    trace_async_gen_wrapped,
+				finalize: None,
+			});
 
-        GenTypes {
-            frame: ensure_frame_type(runtime._type_type),
-            generator: ensure_generator_type(runtime._type_type),
-            coroutine: ensure_coroutine_type(runtime._type_type),
-            async_generator: ensure_async_generator_type(runtime._type_type),
-            asend: ensure_asend_type(runtime._type_type),
-            athrow: ensure_athrow_type(runtime._type_type),
-            wrapped: ensure_wrapped_value_type(runtime._type_type),
-        }
-    })
-    .ok_or_else(|| "runtime is not initialized".to_owned())
+		GenTypes {
+			frame:           ensure_frame_type(runtime._type_type),
+			generator:       ensure_generator_type(runtime._type_type),
+			coroutine:       ensure_coroutine_type(runtime._type_type),
+			async_generator: ensure_async_generator_type(runtime._type_type),
+			asend:           ensure_asend_type(runtime._type_type),
+			athrow:          ensure_athrow_type(runtime._type_type),
+			wrapped:         ensure_wrapped_value_type(runtime._type_type),
+		}
+	})
+	.ok_or_else(|| "runtime is not initialized".to_owned())
 }
 
 fn kind_type(types: GenTypes, kind: GeneratorKind) -> *mut PyType {
-    match kind {
-        GeneratorKind::Generator => types.generator,
-        GeneratorKind::Coroutine => types.coroutine,
-        GeneratorKind::AsyncGenerator => types.async_generator,
-    }
+	match kind {
+		GeneratorKind::Generator => types.generator,
+		GeneratorKind::Coroutine => types.coroutine,
+		GeneratorKind::AsyncGenerator => types.async_generator,
+	}
 }
 
 /// English noun for `kind` used in driver diagnostics (CPython wording).
 const fn kind_noun(kind: GeneratorKind) -> &'static str {
-    match kind {
-        GeneratorKind::Generator => "generator",
-        GeneratorKind::Coroutine => "coroutine",
-        GeneratorKind::AsyncGenerator => "async generator",
-    }
+	match kind {
+		GeneratorKind::Generator => "generator",
+		GeneratorKind::Coroutine => "coroutine",
+		GeneratorKind::AsyncGenerator => "async generator",
+	}
 }
 
-unsafe fn generator_kind_for(runtime_generator: *mut PyObject, types: GenTypes) -> Option<GeneratorKind> {
-    if runtime_generator.is_null() {
-        return None;
-    }
-    // SAFETY: Caller promises non-NULL object pointer; exact-type checks only read the header.
-    if unsafe {
-        is_exact_type(runtime_generator, types.generator.cast_const())
-            || is_exact_type(runtime_generator, types.coroutine.cast_const())
-            || is_exact_type(runtime_generator, types.async_generator.cast_const())
-    } {
-        // SAFETY: Exact type checks prove this object uses the PyGenerator layout.
-        return GeneratorKind::from_u8(unsafe { (*runtime_generator.cast::<PyGenerator>()).kind });
-    }
-    None
+unsafe fn generator_kind_for(
+	runtime_generator: *mut PyObject,
+	types: GenTypes,
+) -> Option<GeneratorKind> {
+	if runtime_generator.is_null() {
+		return None;
+	}
+	// SAFETY: Caller promises non-NULL object pointer; exact-type checks only read
+	// the header.
+	if unsafe {
+		is_exact_type(runtime_generator, types.generator.cast_const())
+			|| is_exact_type(runtime_generator, types.coroutine.cast_const())
+			|| is_exact_type(runtime_generator, types.async_generator.cast_const())
+	} {
+		// SAFETY: Exact type checks prove this object uses the PyGenerator layout.
+		return GeneratorKind::from_u8(unsafe { (*runtime_generator.cast::<PyGenerator>()).kind });
+	}
+	None
 }
 
 unsafe fn expect_generator(object: *mut PyObject) -> Result<(*mut PyGenerator, GenTypes), String> {
-    let types = ensure_gen_runtime()?;
-    // SAFETY: `generator_kind_for` only reads object headers/layout after exact-type checks.
-    if unsafe { generator_kind_for(object, types) }.is_none() {
-        return Err("object is not a generator or coroutine".to_owned());
-    }
-    // SAFETY: The exact-type check above proves the layout.
-    Ok((unsafe { as_generator_mut(object) }, types))
+	let types = ensure_gen_runtime()?;
+	// SAFETY: `generator_kind_for` only reads object headers/layout after
+	// exact-type checks.
+	if unsafe { generator_kind_for(object, types) }.is_none() {
+		return Err("object is not a generator or coroutine".to_owned());
+	}
+	// SAFETY: The exact-type check above proves the layout.
+	Ok((unsafe { as_generator_mut(object) }, types))
 }
 
 fn raise_type_error(message: &str) -> *mut PyObject {
-    // SAFETY: The exception helper copies the byte message under the runtime error discipline.
-    unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) }
+	// SAFETY: The exception helper copies the byte message under the runtime error
+	// discipline.
+	unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) }
 }
 
 fn raise_value_error(message: &str) -> *mut PyObject {
-    // SAFETY: The exception helper copies the byte message under the runtime error discipline.
-    unsafe { super::exc::pon_raise_value_error(message.as_ptr(), message.len()) }
+	// SAFETY: The exception helper copies the byte message under the runtime error
+	// discipline.
+	unsafe { super::exc::pon_raise_value_error(message.as_ptr(), message.len()) }
 }
 
 fn current_stop_iteration_value() -> Option<*mut PyObject> {
-    let current = pending_exception_object()?;
+	let current = pending_exception_object()?;
 
-    let is_stop = super::with_runtime(|runtime| {
-        // SAFETY: `current` is the thread state's active exception pointer.
-        unsafe { is_exception_instance(current, runtime.exception_types.stop_iteration.cast_const()) }
-    })
-    .unwrap_or(false);
+	let is_stop = super::with_runtime(|runtime| {
+		// SAFETY: `current` is the thread state's active exception pointer.
+		unsafe { is_exception_instance(current, runtime.exception_types.stop_iteration.cast_const()) }
+	})
+	.unwrap_or(false);
 
-    if !is_stop {
-        return None;
-    }
+	if !is_stop {
+		return None;
+	}
 
-    // SAFETY: The type check above proves BaseException-compatible layout.
-    Some(unsafe { (*current.cast::<PyBaseException>()).message })
+	// SAFETY: The type check above proves BaseException-compatible layout.
+	Some(unsafe { (*current.cast::<PyBaseException>()).message })
 }
 
 fn stop_iteration_value_and_clear() -> Option<*mut PyObject> {
-    let value = current_stop_iteration_value()?;
-    pon_err_clear();
-    Some(value)
+	let value = current_stop_iteration_value()?;
+	pon_err_clear();
+	Some(value)
 }
 
 /// True when the pending exception matches builtin `kind`.
@@ -229,121 +225,130 @@ fn stop_iteration_value_and_clear() -> Option<*mut PyObject> {
 /// Message-only diagnostics (dangling `current_exc` sentinel) never match:
 /// they carry no exception object to test.
 fn pending_exception_matches(kind: ExceptionKind) -> bool {
-    let Some(current) = pending_exception_object() else {
-        return false;
-    };
-    super::with_runtime(|runtime| {
-        // SAFETY: `current` is the thread state's active exception pointer.
-        unsafe { is_exception_instance(current, runtime.exception_types.get(kind).cast_const()) }
-    })
-    .unwrap_or(false)
+	let Some(current) = pending_exception_object() else {
+		return false;
+	};
+	super::with_runtime(|runtime| {
+		// SAFETY: `current` is the thread state's active exception pointer.
+		unsafe { is_exception_instance(current, runtime.exception_types.get(kind).cast_const()) }
+	})
+	.unwrap_or(false)
 }
 
 unsafe fn is_none_value(object: *mut PyObject) -> bool {
-    if object.is_null() {
-        return false;
-    }
-    super::with_runtime(|runtime| unsafe { is_exact_type(object, runtime.none_type.cast_const()) }).unwrap_or(false)
+	if object.is_null() {
+		return false;
+	}
+	super::with_runtime(|runtime| unsafe { is_exact_type(object, runtime.none_type.cast_const()) })
+		.unwrap_or(false)
 }
 
 /// True when `object` is the `GeneratorExit` type or one of its instances.
 unsafe fn is_generator_exit(object: *mut PyObject) -> bool {
-    if object.is_null() {
-        return false;
-    }
-    super::with_runtime(|runtime| {
-        let exit_ty = runtime.exception_types.generator_exit.cast_const();
-        if super::exc::is_type_object(runtime, object) {
-            // SAFETY: `object` is a live type object.
-            return unsafe { is_exception_subclass(object.cast::<PyType>().cast_const(), exit_ty) };
-        }
-        // SAFETY: Non-type objects are checked as instances.
-        unsafe { is_exception_instance(object, exit_ty) }
-    })
-    .unwrap_or(false)
+	if object.is_null() {
+		return false;
+	}
+	super::with_runtime(|runtime| {
+		let exit_ty = runtime.exception_types.generator_exit.cast_const();
+		if super::exc::is_type_object(runtime, object) {
+			// SAFETY: `object` is a live type object.
+			return unsafe { is_exception_subclass(object.cast::<PyType>().cast_const(), exit_ty) };
+		}
+		// SAFETY: Non-type objects are checked as instances.
+		unsafe { is_exception_instance(object, exit_ty) }
+	})
+	.unwrap_or(false)
 }
 
 /// Stores `RESUME_FINISHED` and zeroes the payload fields and every spill slot
 /// (pin J0.1 §4.4 GC hygiene: a finished frame pins nothing).
 unsafe fn finish_frame(frame: *mut GenFrame) {
-    let _guard = crate::sync::begin_critical_section(frame.cast::<PyObject>());
-    // SAFETY: Caller supplies a live frame pointer.
-    unsafe {
-        (*frame).resume_state = RESUME_FINISHED;
-        crate::sync::store_heap_pointer(ptr::addr_of_mut!((*frame).sent_value), ptr::null_mut());
-        crate::sync::store_heap_pointer(ptr::addr_of_mut!((*frame).thrown_exc), ptr::null_mut());
-        let slot_count = (*frame).slot_count;
-        for index in 0..slot_count {
-            GenFrame::set_slot(frame, index, ptr::null_mut());
-        }
-    }
+	let _guard = crate::sync::begin_critical_section(frame.cast::<PyObject>());
+	// SAFETY: Caller supplies a live frame pointer.
+	unsafe {
+		(*frame).resume_state = RESUME_FINISHED;
+		crate::sync::store_heap_pointer(ptr::addr_of_mut!((*frame).sent_value), ptr::null_mut());
+		crate::sync::store_heap_pointer(ptr::addr_of_mut!((*frame).thrown_exc), ptr::null_mut());
+		let slot_count = (*frame).slot_count;
+		for index in 0..slot_count {
+			GenFrame::set_slot(frame, index, ptr::null_mut());
+		}
+	}
 }
 
 /// Allocates a zeroed resumable generator frame with `slot_count` spill slots
 /// (pin J0.1 §1.1).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_gen_frame_alloc(slot_count: u32) -> *mut GenFrame {
-    super::catch_object_helper(|| {
-        let types = match ensure_gen_runtime() {
-            Ok(types) => types,
-            Err(message) => return super::return_null_with_error(message),
-        };
-        match super::with_runtime(|runtime| {
-            let frame = runtime
-                .heap
-                .alloc(gen_frame_alloc_size(slot_count), TYPE_ID_GEN_FRAME)
-                .cast::<GenFrame>();
-            // SAFETY: `frame` points to a zeroed block of `gen_frame_alloc_size`
-            // bytes: zeroed memory already encodes RESUME_START, NULL payload
-            // fields, and NULL slots.  Only the header and slot_count need writes.
-            unsafe {
-                (*frame).header = crate::object::PyObjectHeader::new(types.frame.cast_const());
-                (*frame).slot_count = slot_count;
-            }
-            frame
-        }) {
-            Some(frame) => frame.cast::<PyObject>(),
-            None => super::return_null_with_error("runtime is not initialized"),
-        }
-    })
-    .cast::<GenFrame>()
+	super::catch_object_helper(|| {
+		let types = match ensure_gen_runtime() {
+			Ok(types) => types,
+			Err(message) => return super::return_null_with_error(message),
+		};
+		match super::with_runtime(|runtime| {
+			let frame = runtime
+				.heap
+				.alloc(gen_frame_alloc_size(slot_count), TYPE_ID_GEN_FRAME)
+				.cast::<GenFrame>();
+			// SAFETY: `frame` points to a zeroed block of `gen_frame_alloc_size`
+			// bytes: zeroed memory already encodes RESUME_START, NULL payload
+			// fields, and NULL slots.  Only the header and slot_count need writes.
+			unsafe {
+				(*frame).header = crate::object::PyObjectHeader::new(types.frame.cast_const());
+				(*frame).slot_count = slot_count;
+			}
+			frame
+		}) {
+			Some(frame) => frame.cast::<PyObject>(),
+			None => super::return_null_with_error("runtime is not initialized"),
+		}
+	})
+	.cast::<GenFrame>()
 }
 
 /// Allocates a boxed generator/coroutine object around an existing resumable
 /// frame.  Captures the current function object (when a call is active) so the
 /// suspended body keeps its closure-cell context across resumptions.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pon_make_generator(body: GenResumeBodyFn, frame: *mut GenFrame, kind: u8) -> *mut PyObject {
-    super::catch_object_helper(|| {
-        if frame.is_null() {
-            return super::return_null_with_error("generator frame pointer is null");
-        }
-        let Some(kind) = GeneratorKind::from_u8(kind) else {
-            return super::return_null_with_error("unknown generator kind");
-        };
-        let types = match ensure_gen_runtime() {
-            Ok(types) => types,
-            Err(message) => return super::return_null_with_error(message),
-        };
-        let ty = kind_type(types, kind);
-        let type_id = match kind {
-            GeneratorKind::Coroutine => TYPE_ID_COROUTINE,
-            GeneratorKind::AsyncGenerator => TYPE_ID_ASYNC_GENERATOR,
-            GeneratorKind::Generator => TYPE_ID_GENERATOR,
-        };
-        let function = super::current_function_object();
-        match super::with_runtime(|runtime| {
-            let object = runtime.heap.alloc(core::mem::size_of::<PyGenerator>(), type_id).cast::<PyGenerator>();
-            // SAFETY: `object` points to a freshly allocated zeroed block of the right size.
-            unsafe {
-                ptr::write(object, PyGenerator::new(ty.cast_const(), body, frame, function, kind));
-            }
-            as_generator_object(object)
-        }) {
-            Some(object) => object,
-            None => super::return_null_with_error("runtime is not initialized"),
-        }
-    })
+pub unsafe extern "C" fn pon_make_generator(
+	body: GenResumeBodyFn,
+	frame: *mut GenFrame,
+	kind: u8,
+) -> *mut PyObject {
+	super::catch_object_helper(|| {
+		if frame.is_null() {
+			return super::return_null_with_error("generator frame pointer is null");
+		}
+		let Some(kind) = GeneratorKind::from_u8(kind) else {
+			return super::return_null_with_error("unknown generator kind");
+		};
+		let types = match ensure_gen_runtime() {
+			Ok(types) => types,
+			Err(message) => return super::return_null_with_error(message),
+		};
+		let ty = kind_type(types, kind);
+		let type_id = match kind {
+			GeneratorKind::Coroutine => TYPE_ID_COROUTINE,
+			GeneratorKind::AsyncGenerator => TYPE_ID_ASYNC_GENERATOR,
+			GeneratorKind::Generator => TYPE_ID_GENERATOR,
+		};
+		let function = super::current_function_object();
+		match super::with_runtime(|runtime| {
+			let object = runtime
+				.heap
+				.alloc(core::mem::size_of::<PyGenerator>(), type_id)
+				.cast::<PyGenerator>();
+			// SAFETY: `object` points to a freshly allocated zeroed block of the right
+			// size.
+			unsafe {
+				ptr::write(object, PyGenerator::new(ty.cast_const(), body, frame, function, kind));
+			}
+			as_generator_object(object)
+		}) {
+			Some(object) => object,
+			None => super::return_null_with_error("runtime is not initialized"),
+		}
+	})
 }
 
 /// Resumes a generator/coroutine/async-generator body once: the shared driver
@@ -359,179 +364,212 @@ pub unsafe extern "C" fn pon_make_generator(body: GenResumeBodyFn, frame: *mut G
 /// # Safety
 /// `generator` must be a boxed generator/coroutine/async-generator object;
 /// `sent` and `thrown` must each be a valid boxed object or NULL.
-unsafe fn pon_gen_resume(generator: *mut PyObject, sent: *mut PyObject, thrown: *mut PyObject) -> *mut PyObject {
-    // 1. Validate the generator object; enter its critical section.
-    let (generator, _types) = match unsafe { expect_generator(generator) } {
-        Ok(pair) => pair,
-        Err(message) => return raise_type_error(&message),
-    };
-    let _guard = crate::sync::begin_critical_section(as_generator_object(generator));
-    // SAFETY: `expect_generator` proved the layout.
-    let generator_ref = unsafe { &mut *generator };
-    let kind = GeneratorKind::from_u8(generator_ref.kind).unwrap_or(GeneratorKind::Generator);
-    let is_coroutine = kind == GeneratorKind::Coroutine;
-    let frame = generator_ref.frame;
-    if frame.is_null() {
-        return super::return_null_with_error("generator frame pointer is null");
-    }
+unsafe fn pon_gen_resume(
+	generator: *mut PyObject,
+	sent: *mut PyObject,
+	thrown: *mut PyObject,
+) -> *mut PyObject {
+	// 1. Validate the generator object; enter its critical section.
+	let (generator, _types) = match unsafe { expect_generator(generator) } {
+		Ok(pair) => pair,
+		Err(message) => return raise_type_error(&message),
+	};
+	let _guard = crate::sync::begin_critical_section(as_generator_object(generator));
+	// SAFETY: `expect_generator` proved the layout.
+	let generator_ref = unsafe { &mut *generator };
+	let kind = GeneratorKind::from_u8(generator_ref.kind).unwrap_or(GeneratorKind::Generator);
+	let is_coroutine = kind == GeneratorKind::Coroutine;
+	let frame = generator_ref.frame;
+	if frame.is_null() {
+		return super::return_null_with_error("generator frame pointer is null");
+	}
 
-    // 2-3. RUNNING guard (single-writer discipline: the body wrote this).
-    // SAFETY: `frame` is non-NULL and owned by this generator.
-    let state = unsafe { (*frame).resume_state };
-    if state == RESUME_RUNNING {
-        return raise_value_error(&format!("{} already executing", kind_noun(kind)));
-    }
+	// 2-3. RUNNING guard (single-writer discipline: the body wrote this).
+	// SAFETY: `frame` is non-NULL and owned by this generator.
+	let state = unsafe { (*frame).resume_state };
+	if state == RESUME_RUNNING {
+		return raise_value_error(&format!("{} already executing", kind_noun(kind)));
+	}
 
-    // 4. Finished/closed guard.
-    if state == RESUME_FINISHED || generator_ref.closed {
-        if !thrown.is_null() {
-            // throw into a finished generator re-raises the exception.
-            // SAFETY: `thrown` is a boxed exception instance or type.
-            return unsafe { super::exc::pon_raise(thrown, ptr::null_mut()) };
-        }
-        if is_coroutine {
-            let message = "cannot reuse already awaited coroutine";
-            return super::return_null_with_error(message);
-        }
-        // SAFETY: `pon_none` and `pon_raise_stop_iteration` follow the NULL-sentinel ABI.
-        let none = unsafe { super::pon_none() };
-        return unsafe { super::exc::pon_raise_stop_iteration(none) };
-    }
+	// 4. Finished/closed guard.
+	if state == RESUME_FINISHED || generator_ref.closed {
+		if !thrown.is_null() {
+			// throw into a finished generator re-raises the exception.
+			// SAFETY: `thrown` is a boxed exception instance or type.
+			return unsafe { super::exc::pon_raise(thrown, ptr::null_mut()) };
+		}
+		if is_coroutine {
+			let message = "cannot reuse already awaited coroutine";
+			return super::return_null_with_error(message);
+		}
+		// SAFETY: `pon_none` and `pon_raise_stop_iteration` follow the NULL-sentinel
+		// ABI.
+		let none = unsafe { super::pon_none() };
+		return unsafe { super::exc::pon_raise_stop_iteration(none) };
+	}
 
-    // 5. Non-None send into a just-started generator.
-    if state == RESUME_START && !sent.is_null() && !unsafe { is_none_value(sent) } && thrown.is_null() {
-        return raise_type_error(&format!(
-            "can't send non-None value to a just-started {}",
-            kind_noun(kind)
-        ));
-    }
+	// 5. Non-None send into a just-started generator.
+	if state == RESUME_START
+		&& !sent.is_null()
+		&& !unsafe { is_none_value(sent) }
+		&& thrown.is_null()
+	{
+		return raise_type_error(&format!(
+			"can't send non-None value to a just-started {}",
+			kind_noun(kind)
+		));
+	}
 
-    // 6. Write the payload through the frame (write-barriered).
-    unsafe {
-        let _frame_guard = crate::sync::begin_critical_section(frame.cast::<PyObject>());
-        crate::sync::store_heap_pointer(ptr::addr_of_mut!((*frame).sent_value), sent);
-        crate::sync::store_heap_pointer(ptr::addr_of_mut!((*frame).thrown_exc), thrown);
-    }
+	// 6. Write the payload through the frame (write-barriered).
+	unsafe {
+		let _frame_guard = crate::sync::begin_critical_section(frame.cast::<PyObject>());
+		crate::sync::store_heap_pointer(ptr::addr_of_mut!((*frame).sent_value), sent);
+		crate::sync::store_heap_pointer(ptr::addr_of_mut!((*frame).thrown_exc), thrown);
+	}
 
-    // 7. Root the frame for GC + traceback identity; clear stale errors.
-    // The cast is sound: frame_stack consumers treat entries as opaque
-    // identity pointers and never read past the shared PyObjectHeader.
-    thread_state_lock().push_frame(frame.cast::<crate::abi::PyFrame>());
-    let _handled_guard = super::HandledExcGuard::enter_clearing_pending();
+	// 7. Root the frame for GC + traceback identity; clear stale errors.
+	// The cast is sound: frame_stack consumers treat entries as opaque
+	// identity pointers and never read past the shared PyObjectHeader.
+	thread_state_lock().push_frame(frame.cast::<crate::abi::PyFrame>());
+	let _handled_guard = super::HandledExcGuard::enter_clearing_pending();
 
-    // 8. Call the compiled body — the ONLY body call site.  The generator's
-    // captured function object is pushed as the current call so closure-cell
-    // loads inside the body resolve across resumptions.  The delegation flag
-    // is cleared here and (re-)armed by `pon_gen_delegate_step`, so on return
-    // it tells a genuine async yield from a delegation passthrough.
-    DELEGATION_YIELD.with(|flag| flag.set(false));
-    let body = generator_ref.body;
-    let call_guard = super::push_current_call(generator_ref.function.cast::<crate::object::PyFunction>(), ptr::null_mut(), 0);
-    // SAFETY: `body` was supplied by codegen with the GenResumeBodyFn ABI; `frame` is live.
-    let result = unsafe { body(frame) };
-    drop(call_guard);
+	// 8. Call the compiled body — the ONLY body call site.  The generator's
+	// captured function object is pushed as the current call so closure-cell
+	// loads inside the body resolve across resumptions.  The delegation flag
+	// is cleared here and (re-)armed by `pon_gen_delegate_step`, so on return
+	// it tells a genuine async yield from a delegation passthrough.
+	DELEGATION_YIELD.with(|flag| flag.set(false));
+	let body = generator_ref.body;
+	let call_guard = super::push_current_call(
+		generator_ref.function.cast::<crate::object::PyFunction>(),
+		ptr::null_mut(),
+		0,
+	);
+	// SAFETY: `body` was supplied by codegen with the GenResumeBodyFn ABI; `frame`
+	// is live.
+	let result = unsafe { body(frame) };
+	drop(call_guard);
 
-    // 9. Unroot.
-    let _ = thread_state_lock().pop_frame();
+	// 9. Unroot.
+	let _ = thread_state_lock().pop_frame();
 
-    // 10. NULL ⇒ pending exception (StopIteration = normal exhaustion).
-    if result.is_null() && !pon_err_occurred() {
-        return super::return_null_with_error("generator body returned NULL without setting an exception");
-    }
+	// 10. NULL ⇒ pending exception (StopIteration = normal exhaustion).
+	if result.is_null() && !pon_err_occurred() {
+		return super::return_null_with_error(
+			"generator body returned NULL without setting an exception",
+		);
+	}
 
-    // 11. PEP 525: box a genuine async yield so the awaitable drivers can
-    // tell it apart from a passthrough yield of a delegated inner awaitable.
-    if !result.is_null() && kind == GeneratorKind::AsyncGenerator && !DELEGATION_YIELD.with(Cell::get) {
-        return wrap_async_gen_value(result);
-    }
-    result
+	// 11. PEP 525: box a genuine async yield so the awaitable drivers can
+	// tell it apart from a passthrough yield of a delegated inner awaitable.
+	if !result.is_null()
+		&& kind == GeneratorKind::AsyncGenerator
+		&& !DELEGATION_YIELD.with(Cell::get)
+	{
+		return wrap_async_gen_value(result);
+	}
+	result
 }
 
 /// Sends a value into a generator/coroutine and returns the next yielded value.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pon_gen_send(generator: *mut PyObject, value: *mut PyObject) -> *mut PyObject {
-    crate::untag_prelude!(generator, value);
-    super::catch_object_helper(|| unsafe { pon_gen_resume(generator, value, ptr::null_mut()) })
+pub unsafe extern "C" fn pon_gen_send(
+	generator: *mut PyObject,
+	value: *mut PyObject,
+) -> *mut PyObject {
+	crate::untag_prelude!(generator, value);
+	super::catch_object_helper(|| unsafe { pon_gen_resume(generator, value, ptr::null_mut()) })
 }
 
 /// Throws an exception into a generator/coroutine at its suspend point.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pon_gen_throw(generator: *mut PyObject, exc: *mut PyObject) -> *mut PyObject {
-    crate::untag_prelude!(generator, exc);
-    super::catch_object_helper(|| {
-        if exc.is_null() {
-            return raise_type_error("generator throw exception is null");
-        }
-        unsafe { pon_gen_resume(generator, ptr::null_mut(), exc) }
-    })
+pub unsafe extern "C" fn pon_gen_throw(
+	generator: *mut PyObject,
+	exc: *mut PyObject,
+) -> *mut PyObject {
+	crate::untag_prelude!(generator, exc);
+	super::catch_object_helper(|| {
+		if exc.is_null() {
+			return raise_type_error("generator throw exception is null");
+		}
+		unsafe { pon_gen_resume(generator, ptr::null_mut(), exc) }
+	})
 }
 
 /// Closes a generator/coroutine: throw `GeneratorExit`, expect
 /// `StopIteration`/`GeneratorExit` back (pin J0.1 §4.5).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_gen_close(generator: *mut PyObject) -> *mut PyObject {
-    crate::untag_prelude!(generator);
-    super::catch_object_helper(|| {
-        let (generator, _types) = match unsafe { expect_generator(generator) } {
-            Ok(pair) => pair,
-            Err(message) => return raise_type_error(&message),
-        };
-        // 1-2. Validate state; close-on-START/FINISHED never runs the body.
-        {
-            let _guard = crate::sync::begin_critical_section(as_generator_object(generator));
-            // SAFETY: `expect_generator` proved the layout.
-            let generator_ref = unsafe { &mut *generator };
-            let frame = generator_ref.frame;
-            if frame.is_null() {
-                return super::return_null_with_error("generator frame pointer is null");
-            }
-            // SAFETY: `frame` is non-NULL and owned by this generator.
-            let state = unsafe { (*frame).resume_state };
-            if state == RESUME_RUNNING {
-                return raise_value_error("generator already executing");
-            }
-            if generator_ref.closed || state == RESUME_FINISHED || state == RESUME_START {
-                generator_ref.closed = true;
-                if state != RESUME_FINISHED {
-                    // SAFETY: `frame` is live; finishing zeroes payload+slots.
-                    unsafe { finish_frame(frame) };
-                }
-                // SAFETY: `pon_none` returns the initialized immortal singleton.
-                return unsafe { super::pon_none() };
-            }
-        }
+	crate::untag_prelude!(generator);
+	super::catch_object_helper(|| {
+		let (generator, _types) = match unsafe { expect_generator(generator) } {
+			Ok(pair) => pair,
+			Err(message) => return raise_type_error(&message),
+		};
+		// 1-2. Validate state; close-on-START/FINISHED never runs the body.
+		{
+			let _guard = crate::sync::begin_critical_section(as_generator_object(generator));
+			// SAFETY: `expect_generator` proved the layout.
+			let generator_ref = unsafe { &mut *generator };
+			let frame = generator_ref.frame;
+			if frame.is_null() {
+				return super::return_null_with_error("generator frame pointer is null");
+			}
+			// SAFETY: `frame` is non-NULL and owned by this generator.
+			let state = unsafe { (*frame).resume_state };
+			if state == RESUME_RUNNING {
+				return raise_value_error("generator already executing");
+			}
+			if generator_ref.closed || state == RESUME_FINISHED || state == RESUME_START {
+				generator_ref.closed = true;
+				if state != RESUME_FINISHED {
+					// SAFETY: `frame` is live; finishing zeroes payload+slots.
+					unsafe { finish_frame(frame) };
+				}
+				// SAFETY: `pon_none` returns the initialized immortal singleton.
+				return unsafe { super::pon_none() };
+			}
+		}
 
-        // 3. Build a GeneratorExit instance.
-        let exit_exc = match super::with_runtime(|runtime| {
-            super::exc::alloc_exception_object(runtime, runtime.exception_types.generator_exit, ptr::null_mut(), ptr::null_mut())
-        }) {
-            Some(Ok(exception)) => exception,
-            Some(Err(message)) => return super::return_null_with_error(message),
-            None => return super::return_null_with_error("runtime is not initialized"),
-        };
+		// 3. Build a GeneratorExit instance.
+		let exit_exc = match super::with_runtime(|runtime| {
+			super::exc::alloc_exception_object(
+				runtime,
+				runtime.exception_types.generator_exit,
+				ptr::null_mut(),
+				ptr::null_mut(),
+			)
+		}) {
+			Some(Ok(exception)) => exception,
+			Some(Err(message)) => return super::return_null_with_error(message),
+			None => return super::return_null_with_error("runtime is not initialized"),
+		};
 
-        // 4. Deliver it at the suspend point.
-        let result = unsafe { pon_gen_resume(as_generator_object(generator), ptr::null_mut(), exit_exc) };
+		// 4. Deliver it at the suspend point.
+		let result =
+			unsafe { pon_gen_resume(as_generator_object(generator), ptr::null_mut(), exit_exc) };
 
-        // 5. The body caught GeneratorExit and yielded again.
-        if !result.is_null() {
-            let message = "generator ignored GeneratorExit";
-            return super::return_null_with_error(message);
-        }
+		// 5. The body caught GeneratorExit and yielded again.
+		if !result.is_null() {
+			let message = "generator ignored GeneratorExit";
+			return super::return_null_with_error(message);
+		}
 
-        // 6. GeneratorExit/StopIteration ⇒ swallowed; anything else propagates.
-        if pending_exception_matches(ExceptionKind::GeneratorExit) || pending_exception_matches(ExceptionKind::StopIteration) {
-            pon_err_clear();
-            // SAFETY: `expect_generator` proved the layout; mark idempotent-closed.
-            unsafe {
-                let _guard = crate::sync::begin_critical_section(as_generator_object(generator));
-                (*generator).closed = true;
-            }
-            // SAFETY: `pon_none` returns the initialized immortal singleton.
-            return unsafe { super::pon_none() };
-        }
-        ptr::null_mut()
-    })
+		// 6. GeneratorExit/StopIteration ⇒ swallowed; anything else propagates.
+		if pending_exception_matches(ExceptionKind::GeneratorExit)
+			|| pending_exception_matches(ExceptionKind::StopIteration)
+		{
+			pon_err_clear();
+			// SAFETY: `expect_generator` proved the layout; mark idempotent-closed.
+			unsafe {
+				let _guard = crate::sync::begin_critical_section(as_generator_object(generator));
+				(*generator).closed = true;
+			}
+			// SAFETY: `pon_none` returns the initialized immortal singleton.
+			return unsafe { super::pon_none() };
+		}
+		ptr::null_mut()
+	})
 }
 
 /// Consumes the resume payload of `frame` at a dispatched resume point
@@ -542,60 +580,66 @@ pub unsafe extern "C" fn pon_gen_close(generator: *mut PyObject) -> *mut PyObjec
 /// absent) is returned as the yield-expression result.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_gen_consume_payload(frame: *mut GenFrame) -> *mut PyObject {
-    super::catch_object_helper(|| {
-        if frame.is_null() {
-            return super::return_null_with_error("generator frame pointer is null");
-        }
-        // SAFETY: Compiled bodies pass their own live frame.
-        let thrown = unsafe { (*frame).thrown_exc };
-        if !thrown.is_null() {
-            // Clear BEFORE raising: the frame must not keep the exception
-            // alive past its delivery.
-            unsafe {
-                let _guard = crate::sync::begin_critical_section(frame.cast::<PyObject>());
-                crate::sync::store_heap_pointer(ptr::addr_of_mut!((*frame).thrown_exc), ptr::null_mut());
-            }
-            // SAFETY: `thrown` is the boxed exception scheduled by the driver.
-            return unsafe { super::exc::pon_raise(thrown, ptr::null_mut()) };
-        }
-        // SAFETY: Same live-frame contract as above.
-        let sent = unsafe { (*frame).sent_value };
-        unsafe {
-            let _guard = crate::sync::begin_critical_section(frame.cast::<PyObject>());
-            crate::sync::store_heap_pointer(ptr::addr_of_mut!((*frame).sent_value), ptr::null_mut());
-        }
-        if sent.is_null() {
-            // NULL-means-None keeps the body total (pin §4.2).
-            // SAFETY: `pon_none` returns the initialized immortal singleton.
-            unsafe { super::pon_none() }
-        } else {
-            sent
-        }
-    })
+	super::catch_object_helper(|| {
+		if frame.is_null() {
+			return super::return_null_with_error("generator frame pointer is null");
+		}
+		// SAFETY: Compiled bodies pass their own live frame.
+		let thrown = unsafe { (*frame).thrown_exc };
+		if !thrown.is_null() {
+			// Clear BEFORE raising: the frame must not keep the exception
+			// alive past its delivery.
+			unsafe {
+				let _guard = crate::sync::begin_critical_section(frame.cast::<PyObject>());
+				crate::sync::store_heap_pointer(
+					ptr::addr_of_mut!((*frame).thrown_exc),
+					ptr::null_mut(),
+				);
+			}
+			// SAFETY: `thrown` is the boxed exception scheduled by the driver.
+			return unsafe { super::exc::pon_raise(thrown, ptr::null_mut()) };
+		}
+		// SAFETY: Same live-frame contract as above.
+		let sent = unsafe { (*frame).sent_value };
+		unsafe {
+			let _guard = crate::sync::begin_critical_section(frame.cast::<PyObject>());
+			crate::sync::store_heap_pointer(ptr::addr_of_mut!((*frame).sent_value), ptr::null_mut());
+		}
+		if sent.is_null() {
+			// NULL-means-None keeps the body total (pin §4.2).
+			// SAFETY: `pon_none` returns the initialized immortal singleton.
+			unsafe { super::pon_none() }
+		} else {
+			sent
+		}
+	})
 }
 
 /// Compiled `return v` epilogue for generator bodies (pin J0.1 §4.4): finish
 /// the frame and leave `StopIteration(v)` pending.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pon_gen_finish(frame: *mut GenFrame, retval: *mut PyObject) -> *mut PyObject {
-    crate::untag_prelude!(retval);
-    if frame.is_null() {
-        return super::return_null_with_error("generator frame pointer is null");
-    }
-    // SAFETY: Compiled bodies pass their own live frame.
-    unsafe { finish_frame(frame) };
-    let value = if retval.is_null() {
-        // SAFETY: `pon_none` returns the initialized immortal singleton.
-        let none = unsafe { super::pon_none() };
-        if none.is_null() {
-            return ptr::null_mut();
-        }
-        none
-    } else {
-        retval
-    };
-    // SAFETY: Installs StopIteration(value) and returns NULL per the sentinel ABI.
-    unsafe { super::exc::pon_raise_stop_iteration(value) }
+pub unsafe extern "C" fn pon_gen_finish(
+	frame: *mut GenFrame,
+	retval: *mut PyObject,
+) -> *mut PyObject {
+	crate::untag_prelude!(retval);
+	if frame.is_null() {
+		return super::return_null_with_error("generator frame pointer is null");
+	}
+	// SAFETY: Compiled bodies pass their own live frame.
+	unsafe { finish_frame(frame) };
+	let value = if retval.is_null() {
+		// SAFETY: `pon_none` returns the initialized immortal singleton.
+		let none = unsafe { super::pon_none() };
+		if none.is_null() {
+			return ptr::null_mut();
+		}
+		none
+	} else {
+		retval
+	};
+	// SAFETY: Installs StopIteration(value) and returns NULL per the sentinel ABI.
+	unsafe { super::exc::pon_raise_stop_iteration(value) }
 }
 
 /// Function-level exception exit for generator bodies (pin J0.1 §4.4): finish
@@ -606,49 +650,59 @@ pub unsafe extern "C" fn pon_gen_finish(frame: *mut GenFrame, retval: *mut PyObj
 /// `StopAsyncIteration` into the same `RuntimeError` shape.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_gen_unwind(frame: *mut GenFrame, kind: u8) -> *mut PyObject {
-    if frame.is_null() {
-        return super::return_null_with_error("generator frame pointer is null");
-    }
-    // SAFETY: Compiled bodies pass their own live frame.
-    unsafe { finish_frame(frame) };
-    if !pon_err_occurred() {
-        return super::return_null_with_error("generator unwound without a pending exception");
-    }
-    let kind = GeneratorKind::from_u8(kind).unwrap_or(GeneratorKind::Generator);
-    // PEP 479: StopIteration escaping a generator body becomes RuntimeError
-    // with the original exception as __cause__.  PEP 525 extends this to
-    // StopAsyncIteration escaping an async generator body.
-    let stop_iteration = pending_exception_matches(ExceptionKind::StopIteration);
-    let stop_async_iteration = kind == GeneratorKind::AsyncGenerator
-        && !stop_iteration
-        && pending_exception_matches(ExceptionKind::StopAsyncIteration);
-    if stop_iteration || stop_async_iteration {
-        // Keep the original PENDING (and therefore GC-rooted via
-        // `current_exc`) while the replacement message and RuntimeError are
-        // allocated: a collection inside those allocations would otherwise
-        // free the original and leave `__cause__`/`__context__` dangling.
-        // The still-pending original also supplies `__context__` at
-        // allocation time — CPython sets both links on the PEP 479
-        // RuntimeError (`_PyGen_SetStopIterationValue` path).
-        let original = thread_state_lock().current_exc;
-        let text: String = format!(
-            "{} raised {}",
-            kind_noun(kind),
-            if stop_async_iteration { "StopAsyncIteration" } else { "StopIteration" }
-        );
-        let runtime_error = match super::with_runtime(|runtime| match super::alloc_unicode(runtime, text.as_bytes()) {
-            Ok(message) => super::exc::alloc_exception_object(runtime, runtime.exception_types.runtime_error, message, original),
-            Err(message) => Err(message),
-        }) {
-            Some(Ok(exception)) => exception,
-            Some(Err(message)) => return super::return_null_with_error(message),
-            None => return super::return_null_with_error("runtime is not initialized"),
-        };
-        // SAFETY: `pon_raise` links __cause__/__context__ from the
-        // still-pending original, then replaces it as the current exception.
-        return unsafe { super::exc::pon_raise(runtime_error, original) };
-    }
-    ptr::null_mut()
+	if frame.is_null() {
+		return super::return_null_with_error("generator frame pointer is null");
+	}
+	// SAFETY: Compiled bodies pass their own live frame.
+	unsafe { finish_frame(frame) };
+	if !pon_err_occurred() {
+		return super::return_null_with_error("generator unwound without a pending exception");
+	}
+	let kind = GeneratorKind::from_u8(kind).unwrap_or(GeneratorKind::Generator);
+	// PEP 479: StopIteration escaping a generator body becomes RuntimeError
+	// with the original exception as __cause__.  PEP 525 extends this to
+	// StopAsyncIteration escaping an async generator body.
+	let stop_iteration = pending_exception_matches(ExceptionKind::StopIteration);
+	let stop_async_iteration = kind == GeneratorKind::AsyncGenerator
+		&& !stop_iteration
+		&& pending_exception_matches(ExceptionKind::StopAsyncIteration);
+	if stop_iteration || stop_async_iteration {
+		// Keep the original PENDING (and therefore GC-rooted via
+		// `current_exc`) while the replacement message and RuntimeError are
+		// allocated: a collection inside those allocations would otherwise
+		// free the original and leave `__cause__`/`__context__` dangling.
+		// The still-pending original also supplies `__context__` at
+		// allocation time — CPython sets both links on the PEP 479
+		// RuntimeError (`_PyGen_SetStopIterationValue` path).
+		let original = thread_state_lock().current_exc;
+		let text: String = format!(
+			"{} raised {}",
+			kind_noun(kind),
+			if stop_async_iteration {
+				"StopAsyncIteration"
+			} else {
+				"StopIteration"
+			}
+		);
+		let runtime_error =
+			match super::with_runtime(|runtime| match super::alloc_unicode(runtime, text.as_bytes()) {
+				Ok(message) => super::exc::alloc_exception_object(
+					runtime,
+					runtime.exception_types.runtime_error,
+					message,
+					original,
+				),
+				Err(message) => Err(message),
+			}) {
+				Some(Ok(exception)) => exception,
+				Some(Err(message)) => return super::return_null_with_error(message),
+				None => return super::return_null_with_error("runtime is not initialized"),
+			};
+		// SAFETY: `pon_raise` links __cause__/__context__ from the
+		// still-pending original, then replaces it as the current exception.
+		return unsafe { super::exc::pon_raise(runtime_error, original) };
+	}
+	ptr::null_mut()
 }
 
 /// Returns and clears the current `StopIteration.value`.
@@ -659,41 +713,44 @@ pub unsafe extern "C" fn pon_gen_unwind(frame: *mut GenFrame, kind: u8) -> *mut 
 /// explicit value (`message == NULL`); normalize that case to boxed `None`.
 /// The consumed value is also stashed for [`pon_gen_last_stop_value`] so
 /// `yield from`/`await` lowering can read the delegation result.
-/// If a non-`StopIteration` exception is pending, return NULL without clearing it;
-/// if no exception is pending at all, report helper misuse as a runtime error.
+/// If a non-`StopIteration` exception is pending, return NULL without clearing
+/// it; if no exception is pending at all, report helper misuse as a runtime
+/// error.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_gen_stop_value() -> *mut PyObject {
-    super::catch_object_helper(|| match stop_iteration_value_and_clear() {
-        Some(value) => {
-            let value = if value.is_null() {
-                // SAFETY: `pon_none` returns the initialized immortal singleton.
-                unsafe { super::pon_none() }
-            } else {
-                value
-            };
-            LAST_STOP_VALUE.with(|stash| stash.set(value));
-            value
-        }
-        None if pon_err_occurred() => ptr::null_mut(),
-        None => super::return_null_with_error("generator stop value requested without pending StopIteration"),
-    })
+	super::catch_object_helper(|| match stop_iteration_value_and_clear() {
+		Some(value) => {
+			let value = if value.is_null() {
+				// SAFETY: `pon_none` returns the initialized immortal singleton.
+				unsafe { super::pon_none() }
+			} else {
+				value
+			};
+			LAST_STOP_VALUE.with(|stash| stash.set(value));
+			value
+		},
+		None if pon_err_occurred() => ptr::null_mut(),
+		None => super::return_null_with_error(
+			"generator stop value requested without pending StopIteration",
+		),
+	})
 }
 
 /// Produces the stashed `StopIteration.value` of the last finished delegation
 /// (`yield from`/`await` expression result).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_gen_last_stop_value() -> *mut PyObject {
-    super::catch_object_helper(|| {
-        let value = LAST_STOP_VALUE.with(|stash| stash.replace(ptr::null_mut()));
-        if value.is_null() {
-            // A finished delegate always went through pon_gen_stop_value, but
-            // stay total: a missing stash decodes as None.
-            // SAFETY: `pon_none` returns the initialized immortal singleton.
-            unsafe { super::pon_none() }
-        } else {
-            value
-        }
-    })
+	super::catch_object_helper(|| {
+		let value = LAST_STOP_VALUE.with(|stash| stash.replace(ptr::null_mut()));
+		if value.is_null() {
+			// A finished delegate always went through pon_gen_stop_value, but
+			// stay total: a missing stash decodes as None.
+			// SAFETY: `pon_none` returns the initialized immortal singleton.
+			unsafe { super::pon_none() }
+		} else {
+			value
+		}
+	})
 }
 
 /// Forwards the enclosing frame's resume payload to a `yield from`/`await`
@@ -703,192 +760,219 @@ pub unsafe extern "C" fn pon_gen_last_stop_value() -> *mut PyObject {
 /// pending when the delegation finished (decoded by the `ForLoop` terminator
 /// via [`pon_gen_stop_value`]); other exceptions propagate as plain NULL.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pon_gen_delegate_step(frame: *mut GenFrame, delegate: *mut PyObject) -> *mut PyObject {
-    crate::untag_prelude!(delegate);
-    let result = super::catch_object_helper(|| {
-        if frame.is_null() {
-            return super::return_null_with_error("generator frame pointer is null");
-        }
-        if delegate.is_null() {
-            return raise_type_error("yield-from delegate is null");
-        }
-        // Read-and-clear the payload (the delegate consumes it, not this body).
-        // SAFETY: Compiled bodies pass their own live frame.
-        let (thrown, sent) = unsafe { ((*frame).thrown_exc, (*frame).sent_value) };
-        unsafe {
-            let _guard = crate::sync::begin_critical_section(frame.cast::<PyObject>());
-            crate::sync::store_heap_pointer(ptr::addr_of_mut!((*frame).thrown_exc), ptr::null_mut());
-            crate::sync::store_heap_pointer(ptr::addr_of_mut!((*frame).sent_value), ptr::null_mut());
-        }
+pub unsafe extern "C" fn pon_gen_delegate_step(
+	frame: *mut GenFrame,
+	delegate: *mut PyObject,
+) -> *mut PyObject {
+	crate::untag_prelude!(delegate);
+	let result = super::catch_object_helper(|| {
+		if frame.is_null() {
+			return super::return_null_with_error("generator frame pointer is null");
+		}
+		if delegate.is_null() {
+			return raise_type_error("yield-from delegate is null");
+		}
+		// Read-and-clear the payload (the delegate consumes it, not this body).
+		// SAFETY: Compiled bodies pass their own live frame.
+		let (thrown, sent) = unsafe { ((*frame).thrown_exc, (*frame).sent_value) };
+		unsafe {
+			let _guard = crate::sync::begin_critical_section(frame.cast::<PyObject>());
+			crate::sync::store_heap_pointer(ptr::addr_of_mut!((*frame).thrown_exc), ptr::null_mut());
+			crate::sync::store_heap_pointer(ptr::addr_of_mut!((*frame).sent_value), ptr::null_mut());
+		}
 
-        let types = match ensure_gen_runtime() {
-            Ok(types) => types,
-            Err(message) => return super::return_null_with_error(message),
-        };
-        let delegate_is_gen = unsafe { generator_kind_for(delegate, types) }.is_some();
+		let types = match ensure_gen_runtime() {
+			Ok(types) => types,
+			Err(message) => return super::return_null_with_error(message),
+		};
+		let delegate_is_gen = unsafe { generator_kind_for(delegate, types) }.is_some();
 
-        if !thrown.is_null() {
-            // GeneratorExit: close the delegate, then re-raise (PEP 342/380).
-            if unsafe { is_generator_exit(thrown) } {
-                if delegate_is_gen {
-                    // SAFETY: `delegate` is one of our generators/coroutines.
-                    let closed = unsafe { pon_gen_close(delegate) };
-                    if closed.is_null() {
-                        return ptr::null_mut();
-                    }
-                } else {
-                    // Foreign delegate: call close() when present, ignore absence.
-                    let close_method = unsafe { abstract_op::get_attr(delegate, crate::intern::intern("close")) };
-                    if close_method.is_null() {
-                        pon_err_clear();
-                    } else {
-                        // SAFETY: Bound method invoked through the call ABI.
-                        let closed = unsafe { super::pon_call(close_method, ptr::null_mut(), 0) };
-                        if closed.is_null() {
-                            return ptr::null_mut();
-                        }
-                    }
-                }
-                // SAFETY: Re-raises the caller-scheduled GeneratorExit.
-                return unsafe { super::exc::pon_raise(thrown, ptr::null_mut()) };
-            }
-            // Forward the throw when the delegate supports it.
-            if delegate_is_gen {
-                // SAFETY: `delegate` is one of our generators/coroutines.
-                return unsafe { pon_gen_throw(delegate, thrown) };
-            }
-            let throw_method = unsafe { abstract_op::get_attr(delegate, crate::intern::intern("throw")) };
-            if throw_method.is_null() {
-                // No throw(): the delegation ends; re-raise here (the delegate
-                // is NOT closed, matching CPython).
-                pon_err_clear();
-                // SAFETY: Re-raises the caller-scheduled exception.
-                return unsafe { super::exc::pon_raise(thrown, ptr::null_mut()) };
-            }
-            let mut argv = [thrown];
-            // SAFETY: Bound method invoked through the call ABI.
-            return unsafe { super::pon_call(throw_method, argv.as_mut_ptr(), argv.len()) };
-        }
+		if !thrown.is_null() {
+			// GeneratorExit: close the delegate, then re-raise (PEP 342/380).
+			if unsafe { is_generator_exit(thrown) } {
+				if delegate_is_gen {
+					// SAFETY: `delegate` is one of our generators/coroutines.
+					let closed = unsafe { pon_gen_close(delegate) };
+					if closed.is_null() {
+						return ptr::null_mut();
+					}
+				} else {
+					// Foreign delegate: call close() when present, ignore absence.
+					let close_method =
+						unsafe { abstract_op::get_attr(delegate, crate::intern::intern("close")) };
+					if close_method.is_null() {
+						pon_err_clear();
+					} else {
+						// SAFETY: Bound method invoked through the call ABI.
+						let closed = unsafe { super::pon_call(close_method, ptr::null_mut(), 0) };
+						if closed.is_null() {
+							return ptr::null_mut();
+						}
+					}
+				}
+				// SAFETY: Re-raises the caller-scheduled GeneratorExit.
+				return unsafe { super::exc::pon_raise(thrown, ptr::null_mut()) };
+			}
+			// Forward the throw when the delegate supports it.
+			if delegate_is_gen {
+				// SAFETY: `delegate` is one of our generators/coroutines.
+				return unsafe { pon_gen_throw(delegate, thrown) };
+			}
+			let throw_method =
+				unsafe { abstract_op::get_attr(delegate, crate::intern::intern("throw")) };
+			if throw_method.is_null() {
+				// No throw(): the delegation ends; re-raise here (the delegate
+				// is NOT closed, matching CPython).
+				pon_err_clear();
+				// SAFETY: Re-raises the caller-scheduled exception.
+				return unsafe { super::exc::pon_raise(thrown, ptr::null_mut()) };
+			}
+			let mut argv = [thrown];
+			// SAFETY: Bound method invoked through the call ABI.
+			return unsafe { super::pon_call(throw_method, argv.as_mut_ptr(), argv.len()) };
+		}
 
-        // Plain step: None ⇒ __next__, real value ⇒ send().
-        let _stop_guard = super::exc::suppress_stop_iteration_traceback();
-        if sent.is_null() || unsafe { is_none_value(sent) } {
-            // SAFETY: One nullable iterator step preserving StopIteration.
-            return unsafe { abstract_op::iter_next(delegate) };
-        }
-        if delegate_is_gen {
-            // SAFETY: `delegate` is one of our generators/coroutines.
-            return unsafe { pon_gen_send(delegate, sent) };
-        }
-        let send_method = unsafe { abstract_op::get_attr(delegate, crate::intern::intern("send")) };
-        if send_method.is_null() {
-            return ptr::null_mut();
-        }
-        let mut argv = [sent];
-        // SAFETY: Bound method invoked through the call ABI.
-        unsafe { super::pon_call(send_method, argv.as_mut_ptr(), argv.len()) }
-    });
-    // Arm the delegation flag: on a non-NULL step the compiled delegation
-    // loop suspends with this exact value, so the enclosing resume driver
-    // must treat its body's return as a passthrough yield (PEP 525 wrapping
-    // stays off for it).
-    if !result.is_null() {
-        DELEGATION_YIELD.with(|flag| flag.set(true));
-    }
-    result
+		// Plain step: None ⇒ __next__, real value ⇒ send().
+		let _stop_guard = super::exc::suppress_stop_iteration_traceback();
+		if sent.is_null() || unsafe { is_none_value(sent) } {
+			// SAFETY: One nullable iterator step preserving StopIteration.
+			return unsafe { abstract_op::iter_next(delegate) };
+		}
+		if delegate_is_gen {
+			// SAFETY: `delegate` is one of our generators/coroutines.
+			return unsafe { pon_gen_send(delegate, sent) };
+		}
+		let send_method = unsafe { abstract_op::get_attr(delegate, crate::intern::intern("send")) };
+		if send_method.is_null() {
+			return ptr::null_mut();
+		}
+		let mut argv = [sent];
+		// SAFETY: Bound method invoked through the call ABI.
+		unsafe { super::pon_call(send_method, argv.as_mut_ptr(), argv.len()) }
+	});
+	// Arm the delegation flag: on a non-NULL step the compiled delegation
+	// loop suspends with this exact value, so the enclosing resume driver
+	// must treat its body's return as a passthrough yield (PEP 525 wrapping
+	// stays off for it).
+	if !result.is_null() {
+		DELEGATION_YIELD.with(|flag| flag.set(true));
+	}
+	result
 }
 
 /// Returns an asynchronous iterator via `am_aiter`, falling back to the
 /// `__aiter__` method for user classes that define the protocol in Python
 /// (mirroring [`pon_await`]'s `__await__` fallback).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pon_get_aiter(object: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
-    crate::untag_prelude!(object);
-    unsafe { super::record_feedback_unary(feedback, object) };
-    super::catch_object_helper(|| {
-        if object.is_null() {
-            return raise_type_error("async iterable operand is null");
-        }
-        // SAFETY: Non-NULL boxed object pointer supplied by caller.
-        let ty = unsafe { (*object).ob_type };
-        if ty.is_null() {
-            return raise_type_error("async iterable has null type");
-        }
-        // SAFETY: `ty` is the object's live type descriptor.
-        let slot = unsafe { (*ty).tp_as_async.as_ref().and_then(|methods| methods.am_aiter) };
-        let result = if let Some(slot) = slot {
-            // SAFETY: Slot follows the unary object ABI.
-            unsafe { slot(object) }
-        } else {
-            let method = unsafe { abstract_op::get_attr(object, crate::intern::intern("__aiter__")) };
-            if method.is_null() {
-                // CPython GET_AITER parity: a missing `__aiter__` is a
-                // TypeError naming the protocol, not an AttributeError.
-                pon_err_clear();
-                // SAFETY: `ty` is the object's live type descriptor.
-                let type_name = unsafe { (*ty).name() };
-                return raise_type_error(&format!(
-                    "'async for' requires an object with __aiter__ method, got {type_name}"
-                ));
-            }
-            // SAFETY: Bound method invoked through the call ABI.
-            unsafe { super::pon_call(method, ptr::null_mut(), 0) }
-        };
-        if result.is_null() && !pon_err_occurred() {
-            return super::return_null_with_error("am_aiter returned NULL without setting an exception");
-        }
-        result
-    })
+pub unsafe extern "C" fn pon_get_aiter(
+	object: *mut PyObject,
+	feedback: *mut FeedbackCell,
+) -> *mut PyObject {
+	crate::untag_prelude!(object);
+	unsafe { super::record_feedback_unary(feedback, object) };
+	super::catch_object_helper(|| {
+		if object.is_null() {
+			return raise_type_error("async iterable operand is null");
+		}
+		// SAFETY: Non-NULL boxed object pointer supplied by caller.
+		let ty = unsafe { (*object).ob_type };
+		if ty.is_null() {
+			return raise_type_error("async iterable has null type");
+		}
+		// SAFETY: `ty` is the object's live type descriptor.
+		let slot = unsafe {
+			(*ty)
+				.tp_as_async
+				.as_ref()
+				.and_then(|methods| methods.am_aiter)
+		};
+		let result = if let Some(slot) = slot {
+			// SAFETY: Slot follows the unary object ABI.
+			unsafe { slot(object) }
+		} else {
+			let method = unsafe { abstract_op::get_attr(object, crate::intern::intern("__aiter__")) };
+			if method.is_null() {
+				// CPython GET_AITER parity: a missing `__aiter__` is a
+				// TypeError naming the protocol, not an AttributeError.
+				pon_err_clear();
+				// SAFETY: `ty` is the object's live type descriptor.
+				let type_name = unsafe { (*ty).name() };
+				return raise_type_error(&format!(
+					"'async for' requires an object with __aiter__ method, got {type_name}"
+				));
+			}
+			// SAFETY: Bound method invoked through the call ABI.
+			unsafe { super::pon_call(method, ptr::null_mut(), 0) }
+		};
+		if result.is_null() && !pon_err_occurred() {
+			return super::return_null_with_error(
+				"am_aiter returned NULL without setting an exception",
+			);
+		}
+		result
+	})
 }
 
 /// Advances a synchronous iterator for `for` lowering.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pon_for_next(iterator: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
-    crate::untag_prelude!(iterator);
-    // SAFETY: Delegates to the sync iterator helper, preserving NULL+StopIteration.
-    let _stop_guard = super::exc::suppress_stop_iteration_traceback();
-    unsafe { super::iter::pon_iter_next(iterator, feedback) }
+pub unsafe extern "C" fn pon_for_next(
+	iterator: *mut PyObject,
+	feedback: *mut FeedbackCell,
+) -> *mut PyObject {
+	crate::untag_prelude!(iterator);
+	// SAFETY: Delegates to the sync iterator helper, preserving NULL+StopIteration.
+	let _stop_guard = super::exc::suppress_stop_iteration_traceback();
+	unsafe { super::iter::pon_iter_next(iterator, feedback) }
 }
 
 /// Converts an awaitable to its await iterator.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pon_await(awaitable: *mut PyObject, feedback: *mut FeedbackCell) -> *mut PyObject {
-    crate::untag_prelude!(awaitable);
-    unsafe { super::record_feedback_unary(feedback, awaitable) };
-    super::catch_object_helper(|| {
-        if awaitable.is_null() {
-            return raise_type_error("awaitable operand is null");
-        }
-        // SAFETY: Non-NULL boxed object pointer supplied by caller.
-        let ty = unsafe { (*awaitable).ob_type };
-        if ty.is_null() {
-            return raise_type_error("awaitable has null type");
-        }
-        // SAFETY: `ty` is the object's live type descriptor.
-        let slot = unsafe { (*ty).tp_as_async.as_ref().and_then(|methods| methods.am_await) };
-        let iterator = if let Some(slot) = slot {
-            // SAFETY: Slot follows the unary object ABI.
-            unsafe { slot(awaitable) }
-        } else {
-            let method = unsafe { abstract_op::get_attr(awaitable, crate::intern::intern("__await__")) };
-            if method.is_null() {
-                return ptr::null_mut();
-            }
-            unsafe { super::pon_call(method, ptr::null_mut(), 0) }
-        };
-        if iterator.is_null() {
-            return ptr::null_mut();
-        }
-        let types = match ensure_gen_runtime() {
-            Ok(types) => types,
-            Err(message) => return super::return_null_with_error(message),
-        };
-        if unsafe { generator_kind_for(iterator, types) } == Some(GeneratorKind::Coroutine) {
-            return iterator;
-        }
-        // SAFETY: Get an iterator from the await result.
-        unsafe { abstract_op::get_iter(iterator) }
-    })
+pub unsafe extern "C" fn pon_await(
+	awaitable: *mut PyObject,
+	feedback: *mut FeedbackCell,
+) -> *mut PyObject {
+	crate::untag_prelude!(awaitable);
+	unsafe { super::record_feedback_unary(feedback, awaitable) };
+	super::catch_object_helper(|| {
+		if awaitable.is_null() {
+			return raise_type_error("awaitable operand is null");
+		}
+		// SAFETY: Non-NULL boxed object pointer supplied by caller.
+		let ty = unsafe { (*awaitable).ob_type };
+		if ty.is_null() {
+			return raise_type_error("awaitable has null type");
+		}
+		// SAFETY: `ty` is the object's live type descriptor.
+		let slot = unsafe {
+			(*ty)
+				.tp_as_async
+				.as_ref()
+				.and_then(|methods| methods.am_await)
+		};
+		let iterator = if let Some(slot) = slot {
+			// SAFETY: Slot follows the unary object ABI.
+			unsafe { slot(awaitable) }
+		} else {
+			let method =
+				unsafe { abstract_op::get_attr(awaitable, crate::intern::intern("__await__")) };
+			if method.is_null() {
+				return ptr::null_mut();
+			}
+			unsafe { super::pon_call(method, ptr::null_mut(), 0) }
+		};
+		if iterator.is_null() {
+			return ptr::null_mut();
+		}
+		let types = match ensure_gen_runtime() {
+			Ok(types) => types,
+			Err(message) => return super::return_null_with_error(message),
+		};
+		if unsafe { generator_kind_for(iterator, types) } == Some(GeneratorKind::Coroutine) {
+			return iterator;
+		}
+		// SAFETY: Get an iterator from the await result.
+		unsafe { abstract_op::get_iter(iterator) }
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -904,120 +988,135 @@ pub unsafe extern "C" fn pon_await(awaitable: *mut PyObject, feedback: *mut Feed
 /// Raises a fresh `kind` exception instance carrying `message` (when given),
 /// returning NULL per the sentinel ABI.
 fn raise_exception_of_kind(kind: ExceptionKind, message: Option<&str>) -> *mut PyObject {
-    let exception = match super::with_runtime(|runtime| {
-        let message_obj = match message {
-            Some(text) => match super::alloc_unicode(runtime, text.as_bytes()) {
-                Ok(object) => object,
-                Err(error) => return Err(error),
-            },
-            None => ptr::null_mut(),
-        };
-        super::exc::alloc_exception_object(runtime, runtime.exception_types.get(kind), message_obj, ptr::null_mut())
-    }) {
-        Some(Ok(exception)) => exception,
-        Some(Err(message)) => return super::return_null_with_error(message),
-        None => return super::return_null_with_error("runtime is not initialized"),
-    };
-    // SAFETY: `pon_raise` installs the freshly allocated instance.
-    unsafe { super::exc::pon_raise(exception, ptr::null_mut()) }
+	let exception = match super::with_runtime(|runtime| {
+		let message_obj = match message {
+			Some(text) => match super::alloc_unicode(runtime, text.as_bytes()) {
+				Ok(object) => object,
+				Err(error) => return Err(error),
+			},
+			None => ptr::null_mut(),
+		};
+		super::exc::alloc_exception_object(
+			runtime,
+			runtime.exception_types.get(kind),
+			message_obj,
+			ptr::null_mut(),
+		)
+	}) {
+		Some(Ok(exception)) => exception,
+		Some(Err(message)) => return super::return_null_with_error(message),
+		None => return super::return_null_with_error("runtime is not initialized"),
+	};
+	// SAFETY: `pon_raise` installs the freshly allocated instance.
+	unsafe { super::exc::pon_raise(exception, ptr::null_mut()) }
 }
 
 /// Boxes a genuine async `yield` value in the PEP 525 marker wrapper.
 fn wrap_async_gen_value(value: *mut PyObject) -> *mut PyObject {
-    crate::untag_prelude!(value);
-    let types = match ensure_gen_runtime() {
-        Ok(types) => types,
-        Err(message) => return super::return_null_with_error(message),
-    };
-    match super::with_runtime(|runtime| {
-        let object = runtime
-            .heap
-            .alloc(core::mem::size_of::<PyAsyncGenWrappedValue>(), TYPE_ID_ASYNC_GEN_WRAPPED)
-            .cast::<PyAsyncGenWrappedValue>();
-        // SAFETY: `object` points to a freshly allocated zeroed block of the right size.
-        unsafe {
-            ptr::write(
-                object,
-                PyAsyncGenWrappedValue {
-                    header: crate::object::PyObjectHeader::new(types.wrapped.cast_const()),
-                    value,
-                },
-            );
-        }
-        object.cast::<PyObject>()
-    }) {
-        Some(object) => object,
-        None => super::return_null_with_error("runtime is not initialized"),
-    }
+	crate::untag_prelude!(value);
+	let types = match ensure_gen_runtime() {
+		Ok(types) => types,
+		Err(message) => return super::return_null_with_error(message),
+	};
+	match super::with_runtime(|runtime| {
+		let object = runtime
+			.heap
+			.alloc(core::mem::size_of::<PyAsyncGenWrappedValue>(), TYPE_ID_ASYNC_GEN_WRAPPED)
+			.cast::<PyAsyncGenWrappedValue>();
+		// SAFETY: `object` points to a freshly allocated zeroed block of the right
+		// size.
+		unsafe {
+			ptr::write(object, PyAsyncGenWrappedValue {
+				header: crate::object::PyObjectHeader::new(types.wrapped.cast_const()),
+				value,
+			});
+		}
+		object.cast::<PyObject>()
+	}) {
+		Some(object) => object,
+		None => super::return_null_with_error("runtime is not initialized"),
+	}
 }
 
 /// Returns the payload when `object` is a PEP 525 wrapped async-yield marker.
 unsafe fn unwrap_async_gen_value(object: *mut PyObject, types: GenTypes) -> Option<*mut PyObject> {
-    if object.is_null() {
-        return None;
-    }
-    // SAFETY: The exact-type check only reads the object header.
-    if unsafe { is_exact_type(object, types.wrapped.cast_const()) } {
-        // SAFETY: The exact-type check proves the layout.
-        Some(unsafe { (*object.cast::<PyAsyncGenWrappedValue>()).value })
-    } else {
-        None
-    }
+	if object.is_null() {
+		return None;
+	}
+	// SAFETY: The exact-type check only reads the object header.
+	if unsafe { is_exact_type(object, types.wrapped.cast_const()) } {
+		// SAFETY: The exact-type check proves the layout.
+		Some(unsafe { (*object.cast::<PyAsyncGenWrappedValue>()).value })
+	} else {
+		None
+	}
 }
 
 /// Casts `object` to the awaitable payload when it is an asend/athrow object.
-unsafe fn expect_awaitable(object: *mut PyObject, types: GenTypes) -> Option<*mut PyAsyncGenAwaitable> {
-    if object.is_null() {
-        return None;
-    }
-    // SAFETY: The exact-type checks only read the object header.
-    if unsafe { is_exact_type(object, types.asend.cast_const()) || is_exact_type(object, types.athrow.cast_const()) } {
-        Some(object.cast::<PyAsyncGenAwaitable>())
-    } else {
-        None
-    }
+unsafe fn expect_awaitable(
+	object: *mut PyObject,
+	types: GenTypes,
+) -> Option<*mut PyAsyncGenAwaitable> {
+	if object.is_null() {
+		return None;
+	}
+	// SAFETY: The exact-type checks only read the object header.
+	if unsafe {
+		is_exact_type(object, types.asend.cast_const())
+			|| is_exact_type(object, types.athrow.cast_const())
+	} {
+		Some(object.cast::<PyAsyncGenAwaitable>())
+	} else {
+		None
+	}
 }
 
 /// Allocates the awaitable returned by `__anext__`/`asend`/`athrow`/`aclose`.
 ///
 /// # Safety
 /// `agen` must be a boxed async generator; `payload` a boxed object or NULL.
-pub(crate) unsafe fn async_gen_make_awaitable(agen: *mut PyObject, payload: *mut PyObject, mode: u8) -> *mut PyObject {
-    crate::untag_prelude!(agen, payload);
-    super::catch_object_helper(|| {
-        let types = match ensure_gen_runtime() {
-            Ok(types) => types,
-            Err(message) => return super::return_null_with_error(message),
-        };
-        // SAFETY: `generator_kind_for` only reads headers after exact-type checks.
-        if unsafe { generator_kind_for(agen, types) } != Some(GeneratorKind::AsyncGenerator) {
-            return raise_type_error("expected an async generator");
-        }
-        let ty = if mode == AWAITABLE_MODE_SEND { types.asend } else { types.athrow };
-        match super::with_runtime(|runtime| {
-            let object = runtime
-                .heap
-                .alloc(core::mem::size_of::<PyAsyncGenAwaitable>(), TYPE_ID_ASYNC_GEN_AWAITABLE)
-                .cast::<PyAsyncGenAwaitable>();
-            // SAFETY: `object` points to a freshly allocated zeroed block of the right size.
-            unsafe {
-                ptr::write(
-                    object,
-                    PyAsyncGenAwaitable {
-                        header: crate::object::PyObjectHeader::new(ty.cast_const()),
-                        agen,
-                        payload,
-                        mode,
-                        state: AWAITABLE_STATE_START,
-                    },
-                );
-            }
-            object.cast::<PyObject>()
-        }) {
-            Some(object) => object,
-            None => super::return_null_with_error("runtime is not initialized"),
-        }
-    })
+pub(crate) unsafe fn async_gen_make_awaitable(
+	agen: *mut PyObject,
+	payload: *mut PyObject,
+	mode: u8,
+) -> *mut PyObject {
+	crate::untag_prelude!(agen, payload);
+	super::catch_object_helper(|| {
+		let types = match ensure_gen_runtime() {
+			Ok(types) => types,
+			Err(message) => return super::return_null_with_error(message),
+		};
+		// SAFETY: `generator_kind_for` only reads headers after exact-type checks.
+		if unsafe { generator_kind_for(agen, types) } != Some(GeneratorKind::AsyncGenerator) {
+			return raise_type_error("expected an async generator");
+		}
+		let ty = if mode == AWAITABLE_MODE_SEND {
+			types.asend
+		} else {
+			types.athrow
+		};
+		match super::with_runtime(|runtime| {
+			let object = runtime
+				.heap
+				.alloc(core::mem::size_of::<PyAsyncGenAwaitable>(), TYPE_ID_ASYNC_GEN_AWAITABLE)
+				.cast::<PyAsyncGenAwaitable>();
+			// SAFETY: `object` points to a freshly allocated zeroed block of the right
+			// size.
+			unsafe {
+				ptr::write(object, PyAsyncGenAwaitable {
+					header: crate::object::PyObjectHeader::new(ty.cast_const()),
+					agen,
+					payload,
+					mode,
+					state: AWAITABLE_STATE_START,
+				});
+			}
+			object.cast::<PyObject>()
+		}) {
+			Some(object) => object,
+			None => super::return_null_with_error("runtime is not initialized"),
+		}
+	})
 }
 
 /// Advances an asend/athrow/aclose awaitable one step (PEP 525).
@@ -1031,62 +1130,75 @@ pub(crate) unsafe fn async_gen_make_awaitable(agen: *mut PyObject, payload: *mut
 /// # Safety
 /// `awaitable` must be a boxed asend/athrow object; `sent` and `thrown` must
 /// each be a valid boxed object or NULL.
-pub(crate) unsafe fn async_gen_awaitable_step(awaitable: *mut PyObject, sent: *mut PyObject, thrown: *mut PyObject) -> *mut PyObject {
-    crate::untag_prelude!(awaitable, sent, thrown);
-    super::catch_object_helper(|| {
-        let types = match ensure_gen_runtime() {
-            Ok(types) => types,
-            Err(message) => return super::return_null_with_error(message),
-        };
-        let Some(awaitable) = (unsafe { expect_awaitable(awaitable, types) }) else {
-            return raise_type_error("expected an async generator asend/athrow awaitable");
-        };
-        let _guard = crate::sync::begin_critical_section(awaitable.cast::<PyObject>());
-        // SAFETY: `expect_awaitable` proved the layout.
-        let awaitable_ref = unsafe { &mut *awaitable };
-        if awaitable_ref.state == AWAITABLE_STATE_CLOSED {
-            let message = if awaitable_ref.mode == AWAITABLE_MODE_SEND {
-                "cannot reuse already awaited __anext__()/asend()"
-            } else {
-                "cannot reuse already awaited aclose()/athrow()"
-            };
-            return raise_exception_of_kind(ExceptionKind::RuntimeError, Some(message));
-        }
-        let agen = awaitable_ref.agen;
-        let first = awaitable_ref.state == AWAITABLE_STATE_START;
-        awaitable_ref.state = AWAITABLE_STATE_ITER;
-        let mode = awaitable_ref.mode;
-        let payload = awaitable_ref.payload;
+pub(crate) unsafe fn async_gen_awaitable_step(
+	awaitable: *mut PyObject,
+	sent: *mut PyObject,
+	thrown: *mut PyObject,
+) -> *mut PyObject {
+	crate::untag_prelude!(awaitable, sent, thrown);
+	super::catch_object_helper(|| {
+		let types = match ensure_gen_runtime() {
+			Ok(types) => types,
+			Err(message) => return super::return_null_with_error(message),
+		};
+		let Some(awaitable) = (unsafe { expect_awaitable(awaitable, types) }) else {
+			return raise_type_error("expected an async generator asend/athrow awaitable");
+		};
+		let _guard = crate::sync::begin_critical_section(awaitable.cast::<PyObject>());
+		// SAFETY: `expect_awaitable` proved the layout.
+		let awaitable_ref = unsafe { &mut *awaitable };
+		if awaitable_ref.state == AWAITABLE_STATE_CLOSED {
+			let message = if awaitable_ref.mode == AWAITABLE_MODE_SEND {
+				"cannot reuse already awaited __anext__()/asend()"
+			} else {
+				"cannot reuse already awaited aclose()/athrow()"
+			};
+			return raise_exception_of_kind(ExceptionKind::RuntimeError, Some(message));
+		}
+		let agen = awaitable_ref.agen;
+		let first = awaitable_ref.state == AWAITABLE_STATE_START;
+		awaitable_ref.state = AWAITABLE_STATE_ITER;
+		let mode = awaitable_ref.mode;
+		let payload = awaitable_ref.payload;
 
-        let result = if !thrown.is_null() {
-            // throw() into the awaitable forwards into the generator.
-            // SAFETY: `agen` layout proven at allocation; driver validates state.
-            unsafe { pon_gen_throw(agen, thrown) }
-        } else if first && mode == AWAITABLE_MODE_THROW {
-            // SAFETY: As above; the stored payload is the athrow exception.
-            unsafe { pon_gen_throw(agen, payload) }
-        } else if first && mode == AWAITABLE_MODE_CLOSE {
-            let exit_exc = match super::with_runtime(|runtime| {
-                super::exc::alloc_exception_object(runtime, runtime.exception_types.generator_exit, ptr::null_mut(), ptr::null_mut())
-            }) {
-                Some(Ok(exception)) => exception,
-                Some(Err(message)) => return super::return_null_with_error(message),
-                None => return super::return_null_with_error("runtime is not initialized"),
-            };
-            // SAFETY: Delivers GeneratorExit at the suspend point.
-            unsafe { pon_gen_throw(agen, exit_exc) }
-        } else if first {
-            // asend payload: an explicit non-None send() overrides it.
-            let to_send = if sent.is_null() || unsafe { is_none_value(sent) } { payload } else { sent };
-            // SAFETY: As above.
-            unsafe { pon_gen_send(agen, to_send) }
-        } else {
-            // SAFETY: As above.
-            unsafe { pon_gen_send(agen, sent) }
-        };
-        // SAFETY: `awaitable_ref` stays live; `result` follows the sentinel ABI.
-        unsafe { classify_agen_step(awaitable_ref, types, result) }
-    })
+		let result = if !thrown.is_null() {
+			// throw() into the awaitable forwards into the generator.
+			// SAFETY: `agen` layout proven at allocation; driver validates state.
+			unsafe { pon_gen_throw(agen, thrown) }
+		} else if first && mode == AWAITABLE_MODE_THROW {
+			// SAFETY: As above; the stored payload is the athrow exception.
+			unsafe { pon_gen_throw(agen, payload) }
+		} else if first && mode == AWAITABLE_MODE_CLOSE {
+			let exit_exc = match super::with_runtime(|runtime| {
+				super::exc::alloc_exception_object(
+					runtime,
+					runtime.exception_types.generator_exit,
+					ptr::null_mut(),
+					ptr::null_mut(),
+				)
+			}) {
+				Some(Ok(exception)) => exception,
+				Some(Err(message)) => return super::return_null_with_error(message),
+				None => return super::return_null_with_error("runtime is not initialized"),
+			};
+			// SAFETY: Delivers GeneratorExit at the suspend point.
+			unsafe { pon_gen_throw(agen, exit_exc) }
+		} else if first {
+			// asend payload: an explicit non-None send() overrides it.
+			let to_send = if sent.is_null() || unsafe { is_none_value(sent) } {
+				payload
+			} else {
+				sent
+			};
+			// SAFETY: As above.
+			unsafe { pon_gen_send(agen, to_send) }
+		} else {
+			// SAFETY: As above.
+			unsafe { pon_gen_send(agen, sent) }
+		};
+		// SAFETY: `awaitable_ref` stays live; `result` follows the sentinel ABI.
+		unsafe { classify_agen_step(awaitable_ref, types, result) }
+	})
 }
 
 /// Classifies one async-generator resume outcome for an awaitable driver.
@@ -1094,57 +1206,61 @@ pub(crate) unsafe fn async_gen_awaitable_step(awaitable: *mut PyObject, sent: *m
 /// # Safety
 /// `awaitable` must point into a live awaitable payload whose critical section
 /// the caller holds; `result` must follow the NULL-sentinel ABI.
-unsafe fn classify_agen_step(awaitable: &mut PyAsyncGenAwaitable, types: GenTypes, result: *mut PyObject) -> *mut PyObject {
-    if !result.is_null() {
-        if let Some(value) = unsafe { unwrap_async_gen_value(result, types) } {
-            // Genuine async yield: this awaitable is finished.
-            awaitable.state = AWAITABLE_STATE_CLOSED;
-            if awaitable.mode == AWAITABLE_MODE_CLOSE {
-                return raise_exception_of_kind(
-                    ExceptionKind::RuntimeError,
-                    Some("async generator ignored GeneratorExit"),
-                );
-            }
-            // Complete the await: StopIteration(value).
-            // SAFETY: Installs StopIteration(value) per the sentinel ABI.
-            return unsafe { super::exc::pon_raise_stop_iteration(value) };
-        }
-        // Passthrough: the generator suspended in an inner await; surface the
-        // delegate's yield verbatim and stay resumable.
-        return result;
-    }
+unsafe fn classify_agen_step(
+	awaitable: &mut PyAsyncGenAwaitable,
+	types: GenTypes,
+	result: *mut PyObject,
+) -> *mut PyObject {
+	if !result.is_null() {
+		if let Some(value) = unsafe { unwrap_async_gen_value(result, types) } {
+			// Genuine async yield: this awaitable is finished.
+			awaitable.state = AWAITABLE_STATE_CLOSED;
+			if awaitable.mode == AWAITABLE_MODE_CLOSE {
+				return raise_exception_of_kind(
+					ExceptionKind::RuntimeError,
+					Some("async generator ignored GeneratorExit"),
+				);
+			}
+			// Complete the await: StopIteration(value).
+			// SAFETY: Installs StopIteration(value) per the sentinel ABI.
+			return unsafe { super::exc::pon_raise_stop_iteration(value) };
+		}
+		// Passthrough: the generator suspended in an inner await; surface the
+		// delegate's yield verbatim and stay resumable.
+		return result;
+	}
 
-    // The generator finished or raised: this awaitable is finished.
-    awaitable.state = AWAITABLE_STATE_CLOSED;
-    if awaitable.mode == AWAITABLE_MODE_CLOSE {
-        if pending_exception_matches(ExceptionKind::StopIteration)
-            || pending_exception_matches(ExceptionKind::StopAsyncIteration)
-            || pending_exception_matches(ExceptionKind::GeneratorExit)
-        {
-            pon_err_clear();
-            let agen = awaitable.agen;
-            // SAFETY: `agen` was validated as an async generator at allocation;
-            // marking it closed makes later resumes exhausted, like gen close.
-            if unsafe { generator_kind_for(agen, types) }.is_some() {
-                unsafe {
-                    let _guard = crate::sync::begin_critical_section(agen);
-                    (*as_generator_mut(agen)).closed = true;
-                }
-            }
-            // `await agen.aclose()` evaluates to None.
-            // SAFETY: `pon_none` returns the initialized immortal singleton.
-            let none = unsafe { super::pon_none() };
-            // SAFETY: Installs StopIteration(None) per the sentinel ABI.
-            return unsafe { super::exc::pon_raise_stop_iteration(none) };
-        }
-        return ptr::null_mut();
-    }
-    if pending_exception_matches(ExceptionKind::StopIteration) {
-        // Exhaustion: the driver's StopIteration becomes StopAsyncIteration.
-        pon_err_clear();
-        return raise_exception_of_kind(ExceptionKind::StopAsyncIteration, None);
-    }
-    ptr::null_mut()
+	// The generator finished or raised: this awaitable is finished.
+	awaitable.state = AWAITABLE_STATE_CLOSED;
+	if awaitable.mode == AWAITABLE_MODE_CLOSE {
+		if pending_exception_matches(ExceptionKind::StopIteration)
+			|| pending_exception_matches(ExceptionKind::StopAsyncIteration)
+			|| pending_exception_matches(ExceptionKind::GeneratorExit)
+		{
+			pon_err_clear();
+			let agen = awaitable.agen;
+			// SAFETY: `agen` was validated as an async generator at allocation;
+			// marking it closed makes later resumes exhausted, like gen close.
+			if unsafe { generator_kind_for(agen, types) }.is_some() {
+				unsafe {
+					let _guard = crate::sync::begin_critical_section(agen);
+					(*as_generator_mut(agen)).closed = true;
+				}
+			}
+			// `await agen.aclose()` evaluates to None.
+			// SAFETY: `pon_none` returns the initialized immortal singleton.
+			let none = unsafe { super::pon_none() };
+			// SAFETY: Installs StopIteration(None) per the sentinel ABI.
+			return unsafe { super::exc::pon_raise_stop_iteration(none) };
+		}
+		return ptr::null_mut();
+	}
+	if pending_exception_matches(ExceptionKind::StopIteration) {
+		// Exhaustion: the driver's StopIteration becomes StopAsyncIteration.
+		pon_err_clear();
+		return raise_exception_of_kind(ExceptionKind::StopAsyncIteration, None);
+	}
+	ptr::null_mut()
 }
 
 /// `asend/athrow.close()`: mark the awaitable consumed and return None.
@@ -1152,408 +1268,470 @@ unsafe fn classify_agen_step(awaitable: &mut PyAsyncGenAwaitable, types: GenType
 /// # Safety
 /// `awaitable` must be a boxed asend/athrow object.
 pub(crate) unsafe fn async_gen_awaitable_close(awaitable: *mut PyObject) -> *mut PyObject {
-    crate::untag_prelude!(awaitable);
-    super::catch_object_helper(|| {
-        let types = match ensure_gen_runtime() {
-            Ok(types) => types,
-            Err(message) => return super::return_null_with_error(message),
-        };
-        let Some(awaitable) = (unsafe { expect_awaitable(awaitable, types) }) else {
-            return raise_type_error("expected an async generator asend/athrow awaitable");
-        };
-        // SAFETY: `expect_awaitable` proved the layout.
-        unsafe {
-            let _guard = crate::sync::begin_critical_section(awaitable.cast::<PyObject>());
-            (*awaitable).state = AWAITABLE_STATE_CLOSED;
-        }
-        // SAFETY: `pon_none` returns the initialized immortal singleton.
-        unsafe { super::pon_none() }
-    })
+	crate::untag_prelude!(awaitable);
+	super::catch_object_helper(|| {
+		let types = match ensure_gen_runtime() {
+			Ok(types) => types,
+			Err(message) => return super::return_null_with_error(message),
+		};
+		let Some(awaitable) = (unsafe { expect_awaitable(awaitable, types) }) else {
+			return raise_type_error("expected an async generator asend/athrow awaitable");
+		};
+		// SAFETY: `expect_awaitable` proved the layout.
+		unsafe {
+			let _guard = crate::sync::begin_critical_section(awaitable.cast::<PyObject>());
+			(*awaitable).state = AWAITABLE_STATE_CLOSED;
+		}
+		// SAFETY: `pon_none` returns the initialized immortal singleton.
+		unsafe { super::pon_none() }
+	})
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::abi::{format_object_for_print, pon_const_int, pon_get_iter, pon_none, pon_runtime_init};
-    use crate::abi::seq::pon_build_range;
-    use crate::thread_state::{pon_err_clear, pon_err_message, pon_err_occurred, pon_err_set, test_state_lock};
+	use super::*;
+	use crate::{
+		abi::{
+			format_object_for_print, pon_const_int, pon_get_iter, pon_none, pon_runtime_init,
+			seq::pon_build_range,
+		},
+		thread_state::{
+			pon_err_clear, pon_err_message, pon_err_occurred, pon_err_set, test_state_lock,
+		},
+	};
 
-    /// Hand-written body mirroring pin J0.1 §4.6: two yields, `a` spilled in
-    /// slot 0 across suspend point 2, `StopIteration(a + b)` on finish.
-    unsafe extern "C" fn two_yields_body(frame: *mut GenFrame) -> *mut PyObject {
-        // SAFETY: Tests pass a live frame allocated with slot_count >= 1.
-        unsafe {
-            let state = (*frame).resume_state;
-            (*frame).resume_state = RESUME_RUNNING;
-            match state {
-                RESUME_START => {
-                    let payload = pon_gen_consume_payload(frame);
-                    if payload.is_null() {
-                        return pon_gen_unwind(frame, 0);
-                    }
-                    (*frame).resume_state = 1;
-                    pon_const_int(1)
-                }
-                1 => {
-                    let sent = pon_gen_consume_payload(frame);
-                    if sent.is_null() {
-                        return pon_gen_unwind(frame, 0);
-                    }
-                    GenFrame::set_slot(frame, 0, sent); // spill `a`
-                    (*frame).resume_state = 2;
-                    pon_const_int(2)
-                }
-                2 => {
-                    let a = GenFrame::slot(frame, 0);
-                    let sent = pon_gen_consume_payload(frame);
-                    if sent.is_null() {
-                        return pon_gen_unwind(frame, 0);
-                    }
-                    let _ = sent;
-                    pon_gen_finish(frame, a)
-                }
-                _ => pon_gen_finish(frame, ptr::null_mut()),
-            }
-        }
-    }
+	/// Hand-written body mirroring pin J0.1 §4.6: two yields, `a` spilled in
+	/// slot 0 across suspend point 2, `StopIteration(a + b)` on finish.
+	unsafe extern "C" fn two_yields_body(frame: *mut GenFrame) -> *mut PyObject {
+		// SAFETY: Tests pass a live frame allocated with slot_count >= 1.
+		unsafe {
+			let state = (*frame).resume_state;
+			(*frame).resume_state = RESUME_RUNNING;
+			match state {
+				RESUME_START => {
+					let payload = pon_gen_consume_payload(frame);
+					if payload.is_null() {
+						return pon_gen_unwind(frame, 0);
+					}
+					(*frame).resume_state = 1;
+					pon_const_int(1)
+				},
+				1 => {
+					let sent = pon_gen_consume_payload(frame);
+					if sent.is_null() {
+						return pon_gen_unwind(frame, 0);
+					}
+					GenFrame::set_slot(frame, 0, sent); // spill `a`
+					(*frame).resume_state = 2;
+					pon_const_int(2)
+				},
+				2 => {
+					let a = GenFrame::slot(frame, 0);
+					let sent = pon_gen_consume_payload(frame);
+					if sent.is_null() {
+						return pon_gen_unwind(frame, 0);
+					}
+					let _ = sent;
+					pon_gen_finish(frame, a)
+				},
+				_ => pon_gen_finish(frame, ptr::null_mut()),
+			}
+		}
+	}
 
-    #[test]
-    fn generator_send_and_exhaustion_follow_null_sentinel() {
-        let _guard = test_state_lock();
-        unsafe {
-            assert_eq!(pon_runtime_init(), 0);
-            pon_err_clear();
-            let frame = pon_gen_frame_alloc(1);
-            assert!(!frame.is_null());
-            assert_eq!((*frame).resume_state, RESUME_START);
-            assert_eq!((*frame).slot_count, 1);
-            let generator = pon_make_generator(two_yields_body, frame, GeneratorKind::Generator.as_u8());
-            assert!(!generator.is_null());
+	#[test]
+	fn generator_send_and_exhaustion_follow_null_sentinel() {
+		let _guard = test_state_lock();
+		unsafe {
+			assert_eq!(pon_runtime_init(), 0);
+			pon_err_clear();
+			let frame = pon_gen_frame_alloc(1);
+			assert!(!frame.is_null());
+			assert_eq!((*frame).resume_state, RESUME_START);
+			assert_eq!((*frame).slot_count, 1);
+			let generator =
+				pon_make_generator(two_yields_body, frame, GeneratorKind::Generator.as_u8());
+			assert!(!generator.is_null());
 
-            let first = pon_gen_send(generator, ptr::null_mut());
-            assert_eq!(format_object_for_print(first).as_deref(), Ok("1"));
-            assert_eq!((*frame).resume_state, 1);
+			let first = pon_gen_send(generator, ptr::null_mut());
+			assert_eq!(format_object_for_print(first).as_deref(), Ok("1"));
+			assert_eq!((*frame).resume_state, 1);
 
-            let sent = pon_const_int(41);
-            let second = pon_gen_send(generator, sent);
-            assert_eq!(format_object_for_print(second).as_deref(), Ok("2"));
-            assert_eq!((*frame).resume_state, 2);
-            assert_eq!(GenFrame::slot(frame, 0), sent);
+			let sent = pon_const_int(41);
+			let second = pon_gen_send(generator, sent);
+			assert_eq!(format_object_for_print(second).as_deref(), Ok("2"));
+			assert_eq!((*frame).resume_state, 2);
+			assert_eq!(GenFrame::slot(frame, 0), sent);
 
-            // Finish: StopIteration(41) pending, frame finished, slots zeroed.
-            let done = pon_gen_send(generator, pon_none());
-            assert!(done.is_null());
-            assert!(pon_err_occurred());
-            let value = pon_gen_stop_value();
-            assert_eq!(value, sent, "StopIteration.value must carry the return value");
-            assert_eq!((*frame).resume_state, RESUME_FINISHED);
-            assert_eq!(GenFrame::slot(frame, 0), ptr::null_mut(), "finished frame must pin nothing");
+			// Finish: StopIteration(41) pending, frame finished, slots zeroed.
+			let done = pon_gen_send(generator, pon_none());
+			assert!(done.is_null());
+			assert!(pon_err_occurred());
+			let value = pon_gen_stop_value();
+			assert_eq!(value, sent, "StopIteration.value must carry the return value");
+			assert_eq!((*frame).resume_state, RESUME_FINISHED);
+			assert_eq!(GenFrame::slot(frame, 0), ptr::null_mut(), "finished frame must pin nothing");
 
-            // Late send: StopIteration(None) without running the body.
-            let late = pon_gen_send(generator, pon_none());
-            assert!(late.is_null());
-            assert!(pon_err_occurred());
-            pon_err_clear();
-        }
-    }
+			// Late send: StopIteration(None) without running the body.
+			let late = pon_gen_send(generator, pon_none());
+			assert!(late.is_null());
+			assert!(pon_err_occurred());
+			pon_err_clear();
+		}
+	}
 
-    #[test]
-    fn send_non_none_to_fresh_generator_raises_type_error() {
-        let _guard = test_state_lock();
-        unsafe {
-            assert_eq!(pon_runtime_init(), 0);
-            pon_err_clear();
-            let frame = pon_gen_frame_alloc(1);
-            let generator = pon_make_generator(two_yields_body, frame, GeneratorKind::Generator.as_u8());
-            let result = pon_gen_send(generator, pon_const_int(3));
-            assert!(result.is_null());
-            let message = pon_err_message().unwrap_or_default();
-            assert!(message.contains("just-started"), "got {message:?}");
-            assert_eq!((*frame).resume_state, RESUME_START, "guard must reject before running the body");
-            pon_err_clear();
-        }
-    }
+	#[test]
+	fn send_non_none_to_fresh_generator_raises_type_error() {
+		let _guard = test_state_lock();
+		unsafe {
+			assert_eq!(pon_runtime_init(), 0);
+			pon_err_clear();
+			let frame = pon_gen_frame_alloc(1);
+			let generator =
+				pon_make_generator(two_yields_body, frame, GeneratorKind::Generator.as_u8());
+			let result = pon_gen_send(generator, pon_const_int(3));
+			assert!(result.is_null());
+			let message = pon_err_message().unwrap_or_default();
+			assert!(message.contains("just-started"), "got {message:?}");
+			assert_eq!(
+				(*frame).resume_state,
+				RESUME_START,
+				"guard must reject before running the body"
+			);
+			pon_err_clear();
+		}
+	}
 
-    #[test]
-    fn throw_into_suspended_generator_unwinds_and_finishes() {
-        let _guard = test_state_lock();
-        unsafe {
-            assert_eq!(pon_runtime_init(), 0);
-            pon_err_clear();
-            let frame = pon_gen_frame_alloc(1);
-            let generator = pon_make_generator(two_yields_body, frame, GeneratorKind::Generator.as_u8());
-            assert_eq!(format_object_for_print(pon_gen_send(generator, ptr::null_mut())).as_deref(), Ok("1"));
+	#[test]
+	fn throw_into_suspended_generator_unwinds_and_finishes() {
+		let _guard = test_state_lock();
+		unsafe {
+			assert_eq!(pon_runtime_init(), 0);
+			pon_err_clear();
+			let frame = pon_gen_frame_alloc(1);
+			let generator =
+				pon_make_generator(two_yields_body, frame, GeneratorKind::Generator.as_u8());
+			assert_eq!(
+				format_object_for_print(pon_gen_send(generator, ptr::null_mut())).as_deref(),
+				Ok("1")
+			);
 
-            // Build a KeyError instance and throw it in at suspend point 1.
-            let exc = crate::abi::with_runtime(|runtime| {
-                crate::abi::exc::alloc_exception_object(runtime, runtime.exception_types.key_error, ptr::null_mut(), ptr::null_mut()).unwrap()
-            })
-            .unwrap();
-            let result = pon_gen_throw(generator, exc);
-            assert!(result.is_null());
-            assert!(pon_err_occurred());
-            assert_eq!((*frame).resume_state, RESUME_FINISHED);
-            pon_err_clear();
+			// Build a KeyError instance and throw it in at suspend point 1.
+			let exc = crate::abi::with_runtime(|runtime| {
+				crate::abi::exc::alloc_exception_object(
+					runtime,
+					runtime.exception_types.key_error,
+					ptr::null_mut(),
+					ptr::null_mut(),
+				)
+				.unwrap()
+			})
+			.unwrap();
+			let result = pon_gen_throw(generator, exc);
+			assert!(result.is_null());
+			assert!(pon_err_occurred());
+			assert_eq!((*frame).resume_state, RESUME_FINISHED);
+			pon_err_clear();
 
-            // Late send after unwind: StopIteration(None).
-            assert!(pon_gen_send(generator, pon_none()).is_null());
-            assert!(pon_err_occurred());
-            pon_err_clear();
-        }
-    }
+			// Late send after unwind: StopIteration(None).
+			assert!(pon_gen_send(generator, pon_none()).is_null());
+			assert!(pon_err_occurred());
+			pon_err_clear();
+		}
+	}
 
-    #[test]
-    fn close_on_suspended_generator_swallows_generator_exit() {
-        let _guard = test_state_lock();
-        unsafe {
-            assert_eq!(pon_runtime_init(), 0);
-            pon_err_clear();
-            let frame = pon_gen_frame_alloc(1);
-            let generator = pon_make_generator(two_yields_body, frame, GeneratorKind::Generator.as_u8());
-            assert_eq!(format_object_for_print(pon_gen_send(generator, ptr::null_mut())).as_deref(), Ok("1"));
+	#[test]
+	fn close_on_suspended_generator_swallows_generator_exit() {
+		let _guard = test_state_lock();
+		unsafe {
+			assert_eq!(pon_runtime_init(), 0);
+			pon_err_clear();
+			let frame = pon_gen_frame_alloc(1);
+			let generator =
+				pon_make_generator(two_yields_body, frame, GeneratorKind::Generator.as_u8());
+			assert_eq!(
+				format_object_for_print(pon_gen_send(generator, ptr::null_mut())).as_deref(),
+				Ok("1")
+			);
 
-            let closed = pon_gen_close(generator);
-            assert_eq!(closed, pon_none());
-            assert!(!pon_err_occurred(), "close must swallow GeneratorExit");
-            assert_eq!((*frame).resume_state, RESUME_FINISHED);
+			let closed = pon_gen_close(generator);
+			assert_eq!(closed, pon_none());
+			assert!(!pon_err_occurred(), "close must swallow GeneratorExit");
+			assert_eq!((*frame).resume_state, RESUME_FINISHED);
 
-            assert!(pon_gen_send(generator, pon_none()).is_null());
-            assert!(pon_err_occurred());
-            pon_err_clear();
-        }
-    }
+			assert!(pon_gen_send(generator, pon_none()).is_null());
+			assert!(pon_err_occurred());
+			pon_err_clear();
+		}
+	}
 
-    #[test]
-    fn close_on_fresh_generator_never_runs_the_body() {
-        let _guard = test_state_lock();
-        unsafe {
-            assert_eq!(pon_runtime_init(), 0);
-            pon_err_clear();
-            let frame = pon_gen_frame_alloc(0);
-            let generator = pon_make_generator(two_yields_body, frame, GeneratorKind::Generator.as_u8());
-            assert_eq!(pon_gen_close(generator), pon_none());
-            assert_eq!((*frame).resume_state, RESUME_FINISHED);
-            assert!(pon_gen_send(generator, pon_none()).is_null());
-            assert!(pon_err_occurred());
-            pon_err_clear();
-        }
-    }
+	#[test]
+	fn close_on_fresh_generator_never_runs_the_body() {
+		let _guard = test_state_lock();
+		unsafe {
+			assert_eq!(pon_runtime_init(), 0);
+			pon_err_clear();
+			let frame = pon_gen_frame_alloc(0);
+			let generator =
+				pon_make_generator(two_yields_body, frame, GeneratorKind::Generator.as_u8());
+			assert_eq!(pon_gen_close(generator), pon_none());
+			assert_eq!((*frame).resume_state, RESUME_FINISHED);
+			assert!(pon_gen_send(generator, pon_none()).is_null());
+			assert!(pon_err_occurred());
+			pon_err_clear();
+		}
+	}
 
-    #[test]
-    fn pep479_stop_iteration_escaping_body_becomes_runtime_error() {
-        unsafe extern "C" fn raises_stop_iteration(frame: *mut GenFrame) -> *mut PyObject {
-            // SAFETY: Tests pass a live frame.
-            unsafe {
-                (*frame).resume_state = RESUME_RUNNING;
-                let payload = pon_gen_consume_payload(frame);
-                if payload.is_null() {
-                    return pon_gen_unwind(frame, 0);
-                }
-                // Body raises StopIteration itself -> unwind must PEP 479 it.
-                let none = pon_none();
-                let _ = crate::abi::exc::pon_raise_stop_iteration(none);
-                pon_gen_unwind(frame, 0)
-            }
-        }
+	#[test]
+	fn pep479_stop_iteration_escaping_body_becomes_runtime_error() {
+		unsafe extern "C" fn raises_stop_iteration(frame: *mut GenFrame) -> *mut PyObject {
+			// SAFETY: Tests pass a live frame.
+			unsafe {
+				(*frame).resume_state = RESUME_RUNNING;
+				let payload = pon_gen_consume_payload(frame);
+				if payload.is_null() {
+					return pon_gen_unwind(frame, 0);
+				}
+				// Body raises StopIteration itself -> unwind must PEP 479 it.
+				let none = pon_none();
+				let _ = crate::abi::exc::pon_raise_stop_iteration(none);
+				pon_gen_unwind(frame, 0)
+			}
+		}
 
-        let _guard = test_state_lock();
-        unsafe {
-            assert_eq!(pon_runtime_init(), 0);
-            pon_err_clear();
-            let frame = pon_gen_frame_alloc(0);
-            let generator = pon_make_generator(raises_stop_iteration, frame, GeneratorKind::Generator.as_u8());
-            let result = pon_gen_send(generator, ptr::null_mut());
-            assert!(result.is_null());
-            assert!(pon_err_occurred());
-            let message = pon_err_message().unwrap_or_default();
-            assert!(message.contains("RuntimeError"), "PEP 479 must convert to RuntimeError, got {message:?}");
-            assert!(!pending_exception_matches(ExceptionKind::StopIteration), "StopIteration must not survive PEP 479");
-            pon_err_clear();
-        }
-    }
+		let _guard = test_state_lock();
+		unsafe {
+			assert_eq!(pon_runtime_init(), 0);
+			pon_err_clear();
+			let frame = pon_gen_frame_alloc(0);
+			let generator =
+				pon_make_generator(raises_stop_iteration, frame, GeneratorKind::Generator.as_u8());
+			let result = pon_gen_send(generator, ptr::null_mut());
+			assert!(result.is_null());
+			assert!(pon_err_occurred());
+			let message = pon_err_message().unwrap_or_default();
+			assert!(
+				message.contains("RuntimeError"),
+				"PEP 479 must convert to RuntimeError, got {message:?}"
+			);
+			assert!(
+				!pending_exception_matches(ExceptionKind::StopIteration),
+				"StopIteration must not survive PEP 479"
+			);
+			pon_err_clear();
+		}
+	}
 
-    #[test]
-    fn for_next_exhaustion_stop_value_returns_boxed_none_sentinel() {
-        let _guard = test_state_lock();
-        unsafe {
-            assert_eq!(pon_runtime_init(), 0);
-            pon_err_clear();
-            let range = pon_build_range(pon_none(), pon_const_int(0), pon_none());
-            assert!(!range.is_null(), "pon_build_range(0, 0) returned NULL");
-            assert!(!pon_err_occurred(), "pon_build_range(0, 0) left an exception pending");
-            let iterator = pon_get_iter(range, ptr::null_mut());
-            assert!(!iterator.is_null(), "iter(range(0)) returned NULL");
-            assert!(!pon_err_occurred(), "iter(range(0)) left an exception pending");
+	#[test]
+	fn for_next_exhaustion_stop_value_returns_boxed_none_sentinel() {
+		let _guard = test_state_lock();
+		unsafe {
+			assert_eq!(pon_runtime_init(), 0);
+			pon_err_clear();
+			let range = pon_build_range(pon_none(), pon_const_int(0), pon_none());
+			assert!(!range.is_null(), "pon_build_range(0, 0) returned NULL");
+			assert!(!pon_err_occurred(), "pon_build_range(0, 0) left an exception pending");
+			let iterator = pon_get_iter(range, ptr::null_mut());
+			assert!(!iterator.is_null(), "iter(range(0)) returned NULL");
+			assert!(!pon_err_occurred(), "iter(range(0)) left an exception pending");
 
-            let item = pon_for_next(iterator, ptr::null_mut());
-            assert!(item.is_null(), "exhausted range iterator should return the NULL sentinel");
-            assert!(pon_err_occurred(), "exhausted range iterator should leave StopIteration pending");
+			let item = pon_for_next(iterator, ptr::null_mut());
+			assert!(item.is_null(), "exhausted range iterator should return the NULL sentinel");
+			assert!(pon_err_occurred(), "exhausted range iterator should leave StopIteration pending");
 
-            let stop_value = pon_gen_stop_value();
-            assert!(
-                !stop_value.is_null(),
-                "loop terminator must receive a boxed sentinel for StopIteration(None), not NULL",
-            );
-            assert_eq!(stop_value, pon_none(), "StopIteration(None) should normalize to boxed None");
-            assert_eq!(format_object_for_print(stop_value).as_deref(), Ok("None"));
-            assert!(
-                !pon_err_occurred(),
-                "pon_gen_stop_value should consume StopIteration after returning the boxed sentinel",
-            );
-        }
-    }
+			let stop_value = pon_gen_stop_value();
+			assert!(
+				!stop_value.is_null(),
+				"loop terminator must receive a boxed sentinel for StopIteration(None), not NULL",
+			);
+			assert_eq!(stop_value, pon_none(), "StopIteration(None) should normalize to boxed None");
+			assert_eq!(format_object_for_print(stop_value).as_deref(), Ok("None"));
+			assert!(
+				!pon_err_occurred(),
+				"pon_gen_stop_value should consume StopIteration after returning the boxed sentinel",
+			);
+		}
+	}
 
-    #[test]
-    fn gen_stop_value_preserves_real_iterator_errors() {
-        let _guard = test_state_lock();
-        unsafe {
-            assert_eq!(pon_runtime_init(), 0);
-            pon_err_clear();
-            let not_an_iterator = pon_const_int(1);
+	#[test]
+	fn gen_stop_value_preserves_real_iterator_errors() {
+		let _guard = test_state_lock();
+		unsafe {
+			assert_eq!(pon_runtime_init(), 0);
+			pon_err_clear();
+			let not_an_iterator = pon_const_int(1);
 
-            let item = pon_for_next(not_an_iterator, ptr::null_mut());
-            assert!(item.is_null(), "pon_for_next(non-iterator) should fail with NULL");
-            assert!(pon_err_occurred(), "pon_for_next(non-iterator) should leave an exception pending");
-            let original_error = pon_err_message().unwrap_or_default();
-            assert!(
-                original_error.to_ascii_lowercase().contains("iterator"),
-                "expected iterator diagnostic, got {original_error:?}",
-            );
+			let item = pon_for_next(not_an_iterator, ptr::null_mut());
+			assert!(item.is_null(), "pon_for_next(non-iterator) should fail with NULL");
+			assert!(
+				pon_err_occurred(),
+				"pon_for_next(non-iterator) should leave an exception pending"
+			);
+			let original_error = pon_err_message().unwrap_or_default();
+			assert!(
+				original_error.to_ascii_lowercase().contains("iterator"),
+				"expected iterator diagnostic, got {original_error:?}",
+			);
 
-            let stop_value = pon_gen_stop_value();
-            assert!(
-                stop_value.is_null(),
-                "loop terminator helper must not convert non-StopIteration errors into exhaustion",
-            );
-            assert!(
-                pon_err_occurred(),
-                "non-StopIteration error should remain pending after pon_gen_stop_value",
-            );
-            assert_eq!(pon_err_message().as_deref(), Some(original_error.as_str()));
-            pon_err_clear();
-        }
-    }
+			let stop_value = pon_gen_stop_value();
+			assert!(
+				stop_value.is_null(),
+				"loop terminator helper must not convert non-StopIteration errors into exhaustion",
+			);
+			assert!(
+				pon_err_occurred(),
+				"non-StopIteration error should remain pending after pon_gen_stop_value",
+			);
+			assert_eq!(pon_err_message().as_deref(), Some(original_error.as_str()));
+			pon_err_clear();
+		}
+	}
 
-    #[test]
-    fn generator_object_is_its_own_iterator() {
-        let _guard = test_state_lock();
-        unsafe {
-            assert_eq!(pon_runtime_init(), 0);
-            pon_err_clear();
-            let frame = pon_gen_frame_alloc(1);
-            let generator = pon_make_generator(two_yields_body, frame, GeneratorKind::Generator.as_u8());
-            assert_eq!(pon_get_iter(generator, ptr::null_mut()), generator);
-            assert_eq!(format_object_for_print(pon_gen_send(generator, ptr::null_mut())).as_deref(), Ok("1"));
-            assert_eq!(format_object_for_print(pon_gen_send(generator, pon_none())).as_deref(), Ok("2"));
-            assert!(pon_gen_send(generator, pon_none()).is_null());
-            assert!(pon_err_occurred());
-            pon_err_clear();
-        }
-    }
+	#[test]
+	fn generator_object_is_its_own_iterator() {
+		let _guard = test_state_lock();
+		unsafe {
+			assert_eq!(pon_runtime_init(), 0);
+			pon_err_clear();
+			let frame = pon_gen_frame_alloc(1);
+			let generator =
+				pon_make_generator(two_yields_body, frame, GeneratorKind::Generator.as_u8());
+			assert_eq!(pon_get_iter(generator, ptr::null_mut()), generator);
+			assert_eq!(
+				format_object_for_print(pon_gen_send(generator, ptr::null_mut())).as_deref(),
+				Ok("1")
+			);
+			assert_eq!(
+				format_object_for_print(pon_gen_send(generator, pon_none())).as_deref(),
+				Ok("2")
+			);
+			assert!(pon_gen_send(generator, pon_none()).is_null());
+			assert!(pon_err_occurred());
+			pon_err_clear();
+		}
+	}
 
-    #[test]
-    fn delegate_step_forwards_next_send_and_finish() {
-        let _guard = test_state_lock();
-        unsafe {
-            assert_eq!(pon_runtime_init(), 0);
-            pon_err_clear();
+	#[test]
+	fn delegate_step_forwards_next_send_and_finish() {
+		let _guard = test_state_lock();
+		unsafe {
+			assert_eq!(pon_runtime_init(), 0);
+			pon_err_clear();
 
-            // Outer frame supplies the payload; inner generator is the delegate.
-            let outer = pon_gen_frame_alloc(0);
-            let inner_frame = pon_gen_frame_alloc(1);
-            let delegate = pon_make_generator(two_yields_body, inner_frame, GeneratorKind::Generator.as_u8());
+			// Outer frame supplies the payload; inner generator is the delegate.
+			let outer = pon_gen_frame_alloc(0);
+			let inner_frame = pon_gen_frame_alloc(1);
+			let delegate =
+				pon_make_generator(two_yields_body, inner_frame, GeneratorKind::Generator.as_u8());
 
-            // First step: no payload => __next__.
-            let first = pon_gen_delegate_step(outer, delegate);
-            assert_eq!(format_object_for_print(first).as_deref(), Ok("1"));
+			// First step: no payload => __next__.
+			let first = pon_gen_delegate_step(outer, delegate);
+			assert_eq!(format_object_for_print(first).as_deref(), Ok("1"));
 
-            // Sent payload forwards to delegate.send().
-            let sent = pon_const_int(9);
-            {
-                let _g = crate::sync::begin_critical_section(outer.cast::<PyObject>());
-                crate::sync::store_heap_pointer(ptr::addr_of_mut!((*outer).sent_value), sent);
-            }
-            let second = pon_gen_delegate_step(outer, delegate);
-            assert_eq!(format_object_for_print(second).as_deref(), Ok("2"));
+			// Sent payload forwards to delegate.send().
+			let sent = pon_const_int(9);
+			{
+				let _g = crate::sync::begin_critical_section(outer.cast::<PyObject>());
+				crate::sync::store_heap_pointer(ptr::addr_of_mut!((*outer).sent_value), sent);
+			}
+			let second = pon_gen_delegate_step(outer, delegate);
+			assert_eq!(format_object_for_print(second).as_deref(), Ok("2"));
 
-            // Delegate finish: NULL + StopIteration(9); stop_value stashes it.
-            let done = pon_gen_delegate_step(outer, delegate);
-            assert!(done.is_null());
-            let finish = pon_gen_stop_value();
-            assert_eq!(finish, sent);
-            assert_eq!(pon_gen_last_stop_value(), sent, "yield-from result must decode the delegation finish value");
-            assert!(!pon_err_occurred());
-        }
-    }
+			// Delegate finish: NULL + StopIteration(9); stop_value stashes it.
+			let done = pon_gen_delegate_step(outer, delegate);
+			assert!(done.is_null());
+			let finish = pon_gen_stop_value();
+			assert_eq!(finish, sent);
+			assert_eq!(
+				pon_gen_last_stop_value(),
+				sent,
+				"yield-from result must decode the delegation finish value"
+			);
+			assert!(!pon_err_occurred());
+		}
+	}
 
-    #[test]
-    fn delegate_step_generator_exit_closes_delegate_and_reraises() {
-        let _guard = test_state_lock();
-        unsafe {
-            assert_eq!(pon_runtime_init(), 0);
-            pon_err_clear();
+	#[test]
+	fn delegate_step_generator_exit_closes_delegate_and_reraises() {
+		let _guard = test_state_lock();
+		unsafe {
+			assert_eq!(pon_runtime_init(), 0);
+			pon_err_clear();
 
-            let outer = pon_gen_frame_alloc(0);
-            let inner_frame = pon_gen_frame_alloc(1);
-            let delegate = pon_make_generator(two_yields_body, inner_frame, GeneratorKind::Generator.as_u8());
-            assert_eq!(format_object_for_print(pon_gen_delegate_step(outer, delegate)).as_deref(), Ok("1"));
+			let outer = pon_gen_frame_alloc(0);
+			let inner_frame = pon_gen_frame_alloc(1);
+			let delegate =
+				pon_make_generator(two_yields_body, inner_frame, GeneratorKind::Generator.as_u8());
+			assert_eq!(
+				format_object_for_print(pon_gen_delegate_step(outer, delegate)).as_deref(),
+				Ok("1")
+			);
 
-            let exit_exc = crate::abi::with_runtime(|runtime| {
-                crate::abi::exc::alloc_exception_object(runtime, runtime.exception_types.generator_exit, ptr::null_mut(), ptr::null_mut()).unwrap()
-            })
-            .unwrap();
-            {
-                let _g = crate::sync::begin_critical_section(outer.cast::<PyObject>());
-                crate::sync::store_heap_pointer(ptr::addr_of_mut!((*outer).thrown_exc), exit_exc);
-            }
-            let result = pon_gen_delegate_step(outer, delegate);
-            assert!(result.is_null());
-            assert!(pending_exception_matches(ExceptionKind::GeneratorExit), "GeneratorExit must re-raise after closing the delegate");
-            assert_eq!((*inner_frame).resume_state, RESUME_FINISHED, "delegate must be closed");
-            pon_err_clear();
-        }
-    }
+			let exit_exc = crate::abi::with_runtime(|runtime| {
+				crate::abi::exc::alloc_exception_object(
+					runtime,
+					runtime.exception_types.generator_exit,
+					ptr::null_mut(),
+					ptr::null_mut(),
+				)
+				.unwrap()
+			})
+			.unwrap();
+			{
+				let _g = crate::sync::begin_critical_section(outer.cast::<PyObject>());
+				crate::sync::store_heap_pointer(ptr::addr_of_mut!((*outer).thrown_exc), exit_exc);
+			}
+			let result = pon_gen_delegate_step(outer, delegate);
+			assert!(result.is_null());
+			assert!(
+				pending_exception_matches(ExceptionKind::GeneratorExit),
+				"GeneratorExit must re-raise after closing the delegate"
+			);
+			assert_eq!((*inner_frame).resume_state, RESUME_FINISHED, "delegate must be closed");
+			pon_err_clear();
+		}
+	}
 
-    #[test]
-    fn stop_iteration_queries_ignore_message_only_diagnostic_sentinel() {
-        let _guard = test_state_lock();
-        unsafe {
-            assert_eq!(pon_runtime_init(), 0);
-            pon_err_clear();
-            pon_err_set("message-only diagnostic");
-            assert!(pon_err_occurred());
+	#[test]
+	fn stop_iteration_queries_ignore_message_only_diagnostic_sentinel() {
+		let _guard = test_state_lock();
+		unsafe {
+			assert_eq!(pon_runtime_init(), 0);
+			pon_err_clear();
+			pon_err_set("message-only diagnostic");
+			assert!(pon_err_occurred());
 
-            // Regression: pre-fix these dereferenced the dangling `current_exc`
-            // sentinel installed by `pon_err_set` and crashed (EXC_BAD_ACCESS).
-            assert!(
-                !pending_exception_matches(ExceptionKind::StopIteration),
-                "a message-only diagnostic carries no exception object to match",
-            );
-            assert_eq!(current_stop_iteration_value(), None);
+			// Regression: pre-fix these dereferenced the dangling `current_exc`
+			// sentinel installed by `pon_err_set` and crashed (EXC_BAD_ACCESS).
+			assert!(
+				!pending_exception_matches(ExceptionKind::StopIteration),
+				"a message-only diagnostic carries no exception object to match",
+			);
+			assert_eq!(current_stop_iteration_value(), None);
 
-            assert!(pon_err_occurred(), "queries must not consume the pending diagnostic");
-            assert_eq!(pon_err_message().as_deref(), Some("message-only diagnostic"));
-            pon_err_clear();
-        }
-    }
+			assert!(pon_err_occurred(), "queries must not consume the pending diagnostic");
+			assert_eq!(pon_err_message().as_deref(), Some("message-only diagnostic"));
+			pon_err_clear();
+		}
+	}
 
-    #[test]
-    fn stop_iteration_queries_observe_real_raised_stop_iteration() {
-        let _guard = test_state_lock();
-        unsafe {
-            assert_eq!(pon_runtime_init(), 0);
-            pon_err_clear();
-            let value = pon_const_int(7);
-            assert!(crate::abi::exc::pon_raise_stop_iteration(value).is_null());
+	#[test]
+	fn stop_iteration_queries_observe_real_raised_stop_iteration() {
+		let _guard = test_state_lock();
+		unsafe {
+			assert_eq!(pon_runtime_init(), 0);
+			pon_err_clear();
+			let value = pon_const_int(7);
+			assert!(crate::abi::exc::pon_raise_stop_iteration(value).is_null());
 
-            assert!(pending_exception_matches(ExceptionKind::StopIteration));
-            assert_eq!(
-                current_stop_iteration_value(),
-                Some(value),
-                "StopIteration.value must be readable without clearing",
-            );
-            assert!(pon_err_occurred(), "the current-value query must leave StopIteration pending");
-            pon_err_clear();
-        }
-    }
+			assert!(pending_exception_matches(ExceptionKind::StopIteration));
+			assert_eq!(
+				current_stop_iteration_value(),
+				Some(value),
+				"StopIteration.value must be readable without clearing",
+			);
+			assert!(pon_err_occurred(), "the current-value query must leave StopIteration pending");
+			pon_err_clear();
+		}
+	}
 }
