@@ -6,13 +6,13 @@ use core::ptr;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
-use pon_gc::TypeId;
+use pon_gc::{GcTypeInfo, TypeId};
 
 use crate::abi;
 use crate::descr;
 use crate::intern;
 use crate::mro;
-use crate::object::{NewFunc, PyObject, PyObjectHeader, PyType, PyUnicode, as_object_ptr, update_slot_from_dunder};
+use crate::object::{NewFunc, PyMappingMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType, PyUnicode, as_object_ptr, update_slot_from_dunder};
 use crate::types::{dict, function, list::PyList, tuple::PyTuple};
 use crate::thread_state::pon_err_set;
 
@@ -76,6 +76,326 @@ impl Default for PyClassDict {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// GC type id for C-facing live views over class namespaces.
+pub const TYPE_ID_CLASS_DICT_VIEW: TypeId = TypeId(14);
+
+/// Dict-shaped object handed to C as `PyTypeObject.tp_dict`.
+#[repr(C)]
+pub(crate) struct PyClassDictView {
+    ob_base: PyObjectHeader,
+    /// Native type whose `tp_dict` is reflected by this view.
+    owner: *mut PyType,
+}
+
+static CLASS_DICT_VIEW_MAPPING: PyMappingMethods = PyMappingMethods {
+    mp_length: Some(class_dict_view_len_slot),
+    mp_subscript: Some(class_dict_view_subscript_slot),
+    mp_ass_subscript: Some(class_dict_view_ass_subscript_slot),
+};
+
+static CLASS_DICT_VIEW_SEQUENCE: PySequenceMethods = PySequenceMethods {
+    sq_length: Some(class_dict_view_len_slot),
+    sq_contains: Some(class_dict_view_contains_slot),
+    ..PySequenceMethods::EMPTY
+};
+
+static CLASS_DICT_VIEW_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let mut ty = PyType::new(
+        abi::runtime_type_type().cast_const(),
+        "type_dict",
+        mem::size_of::<PyClassDictView>(),
+    );
+    ty.gc_type_id = TYPE_ID_CLASS_DICT_VIEW.0 as usize;
+    ty.tp_as_mapping = ptr::addr_of!(CLASS_DICT_VIEW_MAPPING).cast_mut();
+    ty.tp_as_sequence = ptr::addr_of!(CLASS_DICT_VIEW_SEQUENCE).cast_mut();
+    ty.tp_repr = Some(class_dict_view_repr_slot);
+    Box::into_raw(Box::new(ty)) as usize
+});
+
+unsafe extern "C" fn trace_class_dict_view(_object: *mut u8, _visitor: &mut dyn FnMut(*mut u8)) {}
+
+/// Allocate a live view over `owner.tp_dict` for exposure through C `tp_dict`.
+///
+/// The backing namespace remains the native `PyClassDict`; this PyObject only
+/// supplies a real header and dict-like protocol surface for C API calls.
+#[must_use]
+pub(crate) unsafe fn new_class_dict_view(owner: *mut PyType) -> *mut PyObject {
+    if owner.is_null() {
+        return raise_object("class dict view owner is NULL");
+    }
+    if unsafe { (*owner).tp_dict }.is_null() {
+        return raise_object("class dict view owner has no namespace");
+    }
+    let info = GcTypeInfo {
+        size: mem::size_of::<PyClassDictView>(),
+        trace: trace_class_dict_view,
+        finalize: None,
+    };
+    let object = match abi::alloc_gc_object(TYPE_ID_CLASS_DICT_VIEW, info) {
+        Ok(object) => object.cast::<PyClassDictView>(),
+        Err(message) => return raise_object(message),
+    };
+    unsafe {
+        ptr::write(
+            object,
+            PyClassDictView {
+                ob_base: PyObjectHeader::new(*CLASS_DICT_VIEW_TYPE as *mut PyType),
+                owner,
+            },
+        );
+    }
+    object.cast::<PyObject>()
+}
+
+unsafe fn as_class_dict_view<'a>(object: *mut PyObject) -> Option<&'a PyClassDictView> {
+    let object = crate::tag::untag_arg(object);
+    if object.is_null() || !crate::tag::is_heap(object) {
+        return None;
+    }
+    let Some(&view_type) = LazyLock::get(&CLASS_DICT_VIEW_TYPE) else {
+        return None;
+    };
+    if unsafe { (*object).ob_type } != (view_type as *mut PyType).cast_const() {
+        return None;
+    }
+    Some(unsafe { &*object.cast::<PyClassDictView>() })
+}
+
+#[must_use]
+pub(crate) unsafe fn is_class_dict_view(object: *mut PyObject) -> bool {
+    unsafe { as_class_dict_view(object) }.is_some()
+}
+
+unsafe fn class_dict_view_parts(object: *mut PyObject) -> Result<(*mut PyType, *mut PyClassDict), String> {
+    let Some(view) = (unsafe { as_class_dict_view(object) }) else {
+        return Err("expected C type tp_dict view".to_owned());
+    };
+    if view.owner.is_null() {
+        return Err("C type tp_dict view owner is NULL".to_owned());
+    }
+    let dict = unsafe { (*view.owner).tp_dict }.cast::<PyClassDict>();
+    if dict.is_null() {
+        return Err("C type tp_dict backing namespace is NULL".to_owned());
+    }
+    Ok((view.owner, dict))
+}
+
+unsafe fn class_dict_key_id(key: *mut PyObject) -> Result<u32, String> {
+    let key = crate::tag::untag_arg(key);
+    let Some(text) = (unsafe { unicode_text(key) }) else {
+        return Err("C type tp_dict keys must be strings".to_owned());
+    };
+    Ok(intern::intern(text))
+}
+
+fn class_dict_key_object(name: u32) -> Result<*mut PyObject, String> {
+    let spelling = intern::resolve(name).ok_or_else(|| format!("unresolved interned class dict key {name}"))?;
+    let key = unsafe { abi::pon_const_str(spelling.as_ptr(), spelling.len()) };
+    if key.is_null() {
+        Err("failed to allocate class dict key object".to_owned())
+    } else {
+        Ok(key)
+    }
+}
+
+unsafe fn class_dict_view_set_id(owner: *mut PyType, dict: *mut PyClassDict, name: u32, value: *mut PyObject) {
+    unsafe { (&mut *dict).set(name, value) };
+    let _ = update_slot_from_dunder(owner, name, value);
+    crate::sync::type_modified(owner);
+}
+
+unsafe fn class_dict_view_del_id(owner: *mut PyType, dict: *mut PyClassDict, name: u32) -> bool {
+    let removed = unsafe { (&mut *dict).del(name) };
+    if removed {
+        let _ = update_slot_from_dunder(owner, name, ptr::null_mut());
+        crate::sync::type_modified(owner);
+    }
+    removed
+}
+
+pub(crate) unsafe fn class_dict_view_get_item(object: *mut PyObject, key: *mut PyObject) -> Result<Option<*mut PyObject>, String> {
+    let (_, dict) = unsafe { class_dict_view_parts(object) }?;
+    let name = unsafe { class_dict_key_id(key) }?;
+    Ok(unsafe { (&*dict).get(name) })
+}
+
+pub(crate) unsafe fn class_dict_view_set_item(
+    object: *mut PyObject,
+    key: *mut PyObject,
+    value: *mut PyObject,
+) -> Result<(), String> {
+    if value.is_null() {
+        return Err("C type tp_dict value must not be NULL".to_owned());
+    }
+    let (owner, dict) = unsafe { class_dict_view_parts(object) }?;
+    let name = unsafe { class_dict_key_id(key) }?;
+    unsafe { class_dict_view_set_id(owner, dict, name, value) };
+    Ok(())
+}
+
+pub(crate) unsafe fn class_dict_view_del_item(object: *mut PyObject, key: *mut PyObject) -> Result<bool, String> {
+    let (owner, dict) = unsafe { class_dict_view_parts(object) }?;
+    let name = unsafe { class_dict_key_id(key) }?;
+    Ok(unsafe { class_dict_view_del_id(owner, dict, name) })
+}
+
+pub(crate) unsafe fn class_dict_view_contains(object: *mut PyObject, key: *mut PyObject) -> Result<bool, String> {
+    let (_, dict) = unsafe { class_dict_view_parts(object) }?;
+    let key = crate::tag::untag_arg(key);
+    let Some(text) = (unsafe { unicode_text(key) }) else {
+        return Ok(false);
+    };
+    Ok(unsafe { (&*dict).get(intern::intern(text)).is_some() })
+}
+
+pub(crate) unsafe fn class_dict_view_len(object: *mut PyObject) -> Result<usize, String> {
+    let (_, dict) = unsafe { class_dict_view_parts(object) }?;
+    Ok(unsafe { (&*dict).iter().count() })
+}
+
+pub(crate) unsafe fn class_dict_view_entries_snapshot(object: *mut PyObject) -> Result<Vec<dict::DictEntry>, String> {
+    let (_, dict) = unsafe { class_dict_view_parts(object) }?;
+    let pairs = unsafe { (&*dict).iter().collect::<Vec<_>>() };
+    let mut entries = Vec::with_capacity(pairs.len());
+    for (name, value) in pairs {
+        entries.push(dict::DictEntry {
+            key: class_dict_key_object(name)?,
+            value,
+            hash: 0,
+        });
+    }
+    Ok(entries)
+}
+
+pub(crate) unsafe fn class_dict_view_clear(object: *mut PyObject) -> Result<(), String> {
+    let (owner, dict) = unsafe { class_dict_view_parts(object) }?;
+    let keys = unsafe { (&*dict).iter().map(|(name, _)| name).collect::<Vec<_>>() };
+    for name in keys {
+        unsafe { class_dict_view_del_id(owner, dict, name) };
+    }
+    Ok(())
+}
+
+pub(crate) unsafe fn merge_tp_dict_into_class(owner: *mut PyType, source: *mut PyObject) -> bool {
+    if owner.is_null() || source.is_null() {
+        return true;
+    }
+    let source = crate::tag::untag_arg(source);
+    let entries = if unsafe { is_class_dict_view(source) } {
+        match unsafe { class_dict_view_entries_snapshot(source) } {
+            Ok(entries) => entries,
+            Err(message) => {
+                pon_err_set(message);
+                return false;
+            }
+        }
+    } else if unsafe { dict::has_dict_storage(source) } {
+        match unsafe { dict::dict_entries_snapshot(source) } {
+            Ok(entries) => entries,
+            Err(message) => {
+                pon_err_set(message);
+                return false;
+            }
+        }
+    } else {
+        pon_err_set("PyType_Ready: tp_dict must be a dict");
+        return false;
+    };
+    let class_dict = unsafe { (*owner).tp_dict }.cast::<PyClassDict>();
+    if class_dict.is_null() {
+        pon_err_set("PyType_Ready: native class namespace is NULL");
+        return false;
+    }
+    for entry in entries {
+        let name = match unsafe { class_dict_key_id(entry.key) } {
+            Ok(name) => name,
+            Err(message) => {
+                pon_err_set(format!("PyType_Ready: {message}"));
+                return false;
+            }
+        };
+        unsafe { class_dict_view_set_id(owner, class_dict, name, entry.value) };
+    }
+    true
+}
+
+unsafe extern "C" fn class_dict_view_len_slot(object: *mut PyObject) -> isize {
+    match unsafe { class_dict_view_len(object) } {
+        Ok(len) => isize::try_from(len).unwrap_or_else(|_| {
+            pon_err_set("C type tp_dict is too large");
+            -1
+        }),
+        Err(message) => {
+            pon_err_set(message);
+            -1
+        }
+    }
+}
+
+unsafe extern "C" fn class_dict_view_subscript_slot(object: *mut PyObject, key: *mut PyObject) -> *mut PyObject {
+    match unsafe { class_dict_view_get_item(object, key) } {
+        Ok(Some(value)) => value,
+        Ok(None) => unsafe { abi::exc::pon_raise_key_error(key) },
+        Err(message) => raise_object(message),
+    }
+}
+
+unsafe extern "C" fn class_dict_view_ass_subscript_slot(
+    object: *mut PyObject,
+    key: *mut PyObject,
+    value: *mut PyObject,
+) -> c_int {
+    if value.is_null() {
+        match unsafe { class_dict_view_del_item(object, key) } {
+            Ok(true) => 0,
+            Ok(false) => {
+                unsafe { abi::exc::pon_raise_key_error(key) };
+                -1
+            }
+            Err(message) => {
+                pon_err_set(message);
+                -1
+            }
+        }
+    } else {
+        match unsafe { class_dict_view_set_item(object, key, value) } {
+            Ok(()) => 0,
+            Err(message) => {
+                pon_err_set(message);
+                -1
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn class_dict_view_contains_slot(object: *mut PyObject, key: *mut PyObject) -> c_int {
+    match unsafe { class_dict_view_contains(object, key) } {
+        Ok(present) => c_int::from(present),
+        Err(message) => {
+            pon_err_set(message);
+            -1
+        }
+    }
+}
+
+unsafe extern "C" fn class_dict_view_repr_slot(object: *mut PyObject) -> *mut PyObject {
+    let entries = match unsafe { class_dict_view_entries_snapshot(object) } {
+        Ok(entries) => entries,
+        Err(message) => return raise_object(message),
+    };
+    let mut out = String::from("{");
+    for (index, entry) in entries.into_iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        let key_text = unsafe { unicode_text(entry.key) }.unwrap_or("<non-string>");
+        out.push_str(&format!("'{}': ", key_text));
+        out.push_str(&crate::native::builtins_mod::repr_text(entry.value));
+    }
+    out.push('}');
+    unsafe { abi::pon_const_str(out.as_ptr(), out.len()) }
 }
 
 /// One heap-instance slot value configured by `__slots__`.
@@ -1568,19 +1888,20 @@ unsafe fn construct_class(
 /// C-extension instances have their own `tp_basicsize` layout and no
 /// instance dict).
 ///
-/// The type gets the plain `type` metaclass; callers must reject foreign
-/// statics carrying a custom metatype BEFORE calling this. Slot bridging
-/// (`tp_new`/`tp_init`/`tp_repr`/...) is the caller's follow-up; entries
-/// already in `namespace` participate in attribute lookup immediately.
+/// The type gets `metaclass` as its native `ob_type` (NULL means plain
+/// `type`). Slot bridging (`tp_new`/`tp_init`/`tp_repr`/...) is the caller's
+/// follow-up; entries already in `namespace` participate in attribute lookup
+/// immediately.
 ///
 /// `PyType_Ready` parity: `__set_name__`/`__init_subclass__` do NOT run for
 /// C-defined types.
 ///
 /// # Safety
 ///
-/// `base_types` entries must be live type objects and `namespace` a live
-/// class dict; the runtime must be initialized.
+/// `metaclass` (when non-NULL) and `base_types` entries must be live type
+/// objects and `namespace` a live class dict; the runtime must be initialized.
 pub(crate) unsafe fn construct_capi_class(
+    metaclass: *mut PyType,
     name: &str,
     base_types: &[*mut PyType],
     namespace: *mut PyClassDict,
@@ -1600,8 +1921,9 @@ pub(crate) unsafe fn construct_capi_class(
             }
         }
     }
+    let metaclass = if metaclass.is_null() { abi::runtime_type_type() } else { metaclass };
     let static_name = leak_type_name(name);
-    let mut ty = PyType::new(abi::runtime_type_type(), static_name, basicsize);
+    let mut ty = PyType::new(metaclass, static_name, basicsize);
     ty.tp_base = base_types.first().copied().unwrap_or(ptr::null_mut());
     ty.tp_dict = namespace.cast::<PyObject>();
     ty.tp_dictoffset = 0;

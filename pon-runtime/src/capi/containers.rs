@@ -1,23 +1,24 @@
 //! Containers family: tuple/list/dict/set/slice and abstract container helpers.
 
 use core::ffi::{c_char, c_int};
-use core::ptr;
+use core::{mem, ptr};
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{LazyLock, Mutex};
 
 use num_bigint::Sign;
 use num_traits::ToPrimitive;
+use pon_gc::{GcTypeInfo, TypeId};
 
 use crate::abi;
 use crate::intern::intern;
-use crate::object::PyObject;
+use crate::object::{PyMappingMethods, PyObject, PyObjectHeader, PyType};
 use crate::thread_state::{pon_err_clear, pon_err_occurred};
 use crate::types::dict::DictEntry;
 use crate::types::exc::ExceptionKind;
-use crate::types::{dict, frozenset, list, set_, tuple};
+use crate::types::{dict, frozenset, list, set_, tuple, type_};
 
-use super::c_string;
+use super::{c_string, twin::ForeignTypeObject};
 
 /// C mirror: `include/pon_capi/containers.h` `PyPonCapiContainers`.
 #[repr(C)]
@@ -74,6 +75,13 @@ pub(crate) struct PyPonCapiContainers {
     mapping_get_item_string: unsafe extern "C" fn(*mut PyObject, *const c_char) -> *mut PyObject,
     mapping_set_item_string: unsafe extern "C" fn(*mut PyObject, *const c_char, *mut PyObject) -> c_int,
     dict_get_item_ref: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut *mut PyObject) -> c_int,
+    dict_del_item_string: unsafe extern "C" fn(*mut PyObject, *const c_char) -> c_int,
+    dict_contains_string: unsafe extern "C" fn(*mut PyObject, *const c_char) -> c_int,
+    dict_set_default_ref: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject, *mut *mut PyObject) -> c_int,
+    dict_get_item_string_ref: unsafe extern "C" fn(*mut PyObject, *const c_char, *mut *mut PyObject) -> c_int,
+    dict_proxy_new: unsafe extern "C" fn(*mut PyObject) -> *mut PyObject,
+    dict_proxy_type: unsafe extern "C" fn() -> *mut ForeignTypeObject,
+    sequence_concat: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
 }
 
 unsafe impl Send for PyPonCapiContainers {}
@@ -133,6 +141,13 @@ pub(crate) fn build() -> PyPonCapiContainers {
         mapping_get_item_string: capi_mapping_get_item_string,
         mapping_set_item_string: capi_mapping_set_item_string,
         dict_get_item_ref: capi_dict_get_item_ref,
+        dict_del_item_string: capi_dict_del_item_string,
+        dict_contains_string: capi_dict_contains_string,
+        dict_set_default_ref: capi_dict_set_default_ref,
+        dict_get_item_string_ref: capi_dict_get_item_string_ref,
+        dict_proxy_new: capi_dict_proxy_new,
+        dict_proxy_type: capi_dict_proxy_type,
+        sequence_concat: capi_sequence_concat,
     }
 }
 
@@ -141,6 +156,27 @@ type DictNextSnapshot = Vec<(usize, usize)>;
 
 static DICT_NEXT_SNAPSHOTS: LazyLock<Mutex<HashMap<DictNextKey, DictNextSnapshot>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const TYPE_ID_DICT_PROXY: TypeId = TypeId(112);
+
+#[repr(C)]
+struct PyDictProxy {
+    ob_base: PyObjectHeader,
+    mapping: *mut PyObject,
+}
+
+static DICT_PROXY_MAPPING: PyMappingMethods = PyMappingMethods {
+    mp_length: Some(dict_proxy_len_slot),
+    mp_subscript: Some(dict_proxy_subscript_slot),
+    mp_ass_subscript: Some(dict_proxy_ass_subscript_slot),
+};
+
+static DICT_PROXY_TYPE: LazyLock<usize> = LazyLock::new(|| {
+    let mut ty = PyType::new(abi::runtime_type_type(), "mappingproxy", mem::size_of::<PyDictProxy>());
+    ty.gc_type_id = TYPE_ID_DICT_PROXY.0 as usize;
+    ty.tp_as_mapping = ptr::addr_of!(DICT_PROXY_MAPPING).cast_mut();
+    Box::into_raw(Box::new(ty)) as usize
+});
 
 fn catch_object(f: impl FnOnce() -> *mut PyObject) -> *mut PyObject {
     match catch_unwind(AssertUnwindSafe(f)) {
@@ -535,7 +571,7 @@ unsafe extern "C" fn capi_dict_set_item(dict: *mut PyObject, key: *mut PyObject,
         let dict = crate::tag::untag_arg(dict);
         let key = crate::tag::untag_arg(key);
         let value = crate::tag::untag_arg(value);
-        unsafe { abi::map::pon_dict_set_item_status(dict, key, value) }
+        dict_set_item_capi(dict, key, value)
     })
 }
 
@@ -577,9 +613,7 @@ unsafe extern "C" fn capi_dict_get_item_ref(
         unsafe {
             *result = ptr::null_mut();
         }
-        let dict = crate::tag::untag_arg(dict);
-        let key = crate::tag::untag_arg(key);
-        match unsafe { dict::dict_get(dict, key) } {
+        match dict_get_result(dict, key) {
             Ok(Some(value)) => {
                 super::pin_object(value);
                 unsafe {
@@ -599,9 +633,7 @@ unsafe extern "C" fn capi_dict_get_item_ref(
 }
 
 fn dict_get_impl(dict: *mut PyObject, key: *mut PyObject, clear_miss: bool) -> *mut PyObject {
-    let dict = crate::tag::untag_arg(dict);
-    let key = crate::tag::untag_arg(key);
-    match unsafe { dict::dict_get(dict, key) } {
+    match dict_get_result(dict, key) {
         Ok(Some(value)) => value,
         Ok(None) => {
             if clear_miss || pon_err_occurred() {
@@ -613,13 +645,58 @@ fn dict_get_impl(dict: *mut PyObject, key: *mut PyObject, clear_miss: bool) -> *
     }
 }
 
+fn dict_get_result(dict: *mut PyObject, key: *mut PyObject) -> Result<Option<*mut PyObject>, String> {
+    let dict = crate::tag::untag_arg(dict);
+    let key = crate::tag::untag_arg(key);
+    if unsafe { type_::is_class_dict_view(dict) } {
+        unsafe { type_::class_dict_view_get_item(dict, key) }
+    } else {
+        unsafe { dict::dict_get(dict, key) }
+    }
+}
+
+fn dict_set_item_capi(dict: *mut PyObject, key: *mut PyObject, value: *mut PyObject) -> c_int {
+    if unsafe { type_::is_class_dict_view(dict) } {
+        match unsafe { type_::class_dict_view_set_item(dict, key, value) } {
+            Ok(()) => 0,
+            Err(message) => status_error(message),
+        }
+    } else {
+        unsafe { abi::map::pon_dict_set_item_status(dict, key, value) }
+    }
+}
+
+fn dict_remove_capi(dict: *mut PyObject, key: *mut PyObject) -> Result<bool, String> {
+    if unsafe { type_::is_class_dict_view(dict) } {
+        unsafe { type_::class_dict_view_del_item(dict, key) }
+    } else {
+        unsafe { dict::dict_remove(dict, key).map(|removed| removed.is_some()) }
+    }
+}
+
+fn dict_contains_capi(dict: *mut PyObject, key: *mut PyObject) -> Result<bool, String> {
+    if unsafe { type_::is_class_dict_view(dict) } {
+        unsafe { type_::class_dict_view_contains(dict, key) }
+    } else {
+        unsafe { dict::dict_contains(dict, key) }
+    }
+}
+
+fn dict_entries_snapshot_capi(dict: *mut PyObject) -> Result<Vec<DictEntry>, String> {
+    if unsafe { type_::is_class_dict_view(dict) } {
+        unsafe { type_::class_dict_view_entries_snapshot(dict) }
+    } else {
+        unsafe { dict::dict_entries_snapshot(dict) }
+    }
+}
+
 unsafe extern "C" fn capi_dict_del_item(dict: *mut PyObject, key: *mut PyObject) -> c_int {
     catch_status(|| {
         let dict = crate::tag::untag_arg(dict);
         let key = crate::tag::untag_arg(key);
-        match unsafe { dict::dict_remove(dict, key) } {
-            Ok(Some(_)) => 0,
-            Ok(None) => {
+        match dict_remove_capi(dict, key) {
+            Ok(true) => 0,
+            Ok(false) => {
                 let _ = unsafe { abi::exc::pon_raise_key_error(key) };
                 -1
             }
@@ -632,7 +709,7 @@ unsafe extern "C" fn capi_dict_contains(dict: *mut PyObject, key: *mut PyObject)
     catch_status(|| {
         let dict = crate::tag::untag_arg(dict);
         let key = crate::tag::untag_arg(key);
-        match unsafe { dict::dict_contains(dict, key) } {
+        match dict_contains_capi(dict, key) {
             Ok(true) => 1,
             Ok(false) => 0,
             Err(message) => status_error(message),
@@ -643,6 +720,15 @@ unsafe extern "C" fn capi_dict_contains(dict: *mut PyObject, key: *mut PyObject)
 unsafe extern "C" fn capi_dict_size(dict: *mut PyObject) -> isize {
     catch_size(|| {
         let dict = crate::tag::untag_arg(dict);
+        if unsafe { type_::is_class_dict_view(dict) } {
+            return match unsafe { type_::class_dict_view_len(dict) } {
+                Ok(len) => checked_len(len),
+                Err(message) => {
+                    let _ = type_error(&message);
+                    -1
+                }
+            };
+        }
         match unsafe { dict::dict_ref(dict) } {
             Ok(storage) => checked_len(storage.entries.len()),
             Err(message) => {
@@ -674,7 +760,7 @@ enum DictProjection {
 
 fn dict_projection_list(dict: *mut PyObject, projection: DictProjection) -> *mut PyObject {
     let dict = crate::tag::untag_arg(dict);
-    let entries = match unsafe { dict::dict_entries_snapshot(dict) } {
+    let entries = match dict_entries_snapshot_capi(dict) {
         Ok(entries) => entries,
         Err(message) => return abi::return_null_with_error(message),
     };
@@ -714,7 +800,7 @@ unsafe extern "C" fn capi_dict_next(
         let snapshot_key = (dict as usize, pos as usize);
         let mut snapshots = DICT_NEXT_SNAPSHOTS.lock().expect("dict next snapshot lock poisoned");
         if cursor == 0 {
-            let entries = match unsafe { dict::dict_entries_snapshot(dict) } {
+            let entries = match dict_entries_snapshot_capi(dict) {
                 Ok(entries) => entries,
                 Err(_) => return 0,
             };
@@ -751,8 +837,8 @@ unsafe extern "C" fn capi_dict_merge(dict: *mut PyObject, other: *mut PyObject, 
     catch_status(|| {
         let dict = crate::tag::untag_arg(dict);
         let other = crate::tag::untag_arg(other);
-        if unsafe { dict::has_dict_storage(other) } {
-            return merge_entries(dict, unsafe { dict::dict_entries_snapshot(other) }, override_flag != 0);
+        if unsafe { dict::has_dict_storage(other) } || unsafe { type_::is_class_dict_view(other) } {
+            return merge_entries(dict, dict_entries_snapshot_capi(other), override_flag != 0);
         }
         let keys = unsafe { capi_mapping_keys(other) };
         if keys.is_null() {
@@ -763,14 +849,14 @@ unsafe extern "C" fn capi_dict_merge(dict: *mut PyObject, other: *mut PyObject, 
             Err(message) => return status_error(message),
         };
         for key in keys {
-            if override_flag == 0 && unsafe { dict::dict_contains(dict, key) }.unwrap_or(false) {
+            if override_flag == 0 && dict_contains_capi(dict, key).unwrap_or(false) {
                 continue;
             }
             let value = unsafe { abi::pon_subscript_get(other, key, ptr::null_mut()) };
             if value.is_null() {
                 return -1;
             }
-            if unsafe { abi::map::pon_dict_set_item_status(dict, key, value) } < 0 {
+            if dict_set_item_capi(dict, key, value) < 0 {
                 return -1;
             }
         }
@@ -785,13 +871,13 @@ fn merge_entries(dict: *mut PyObject, entries: Result<Vec<DictEntry>, String>, o
     };
     for entry in entries {
         if !override_existing {
-            match unsafe { dict::dict_contains(dict, entry.key) } {
+            match dict_contains_capi(dict, entry.key) {
                 Ok(true) => continue,
                 Ok(false) => {}
                 Err(message) => return status_error(message),
             }
         }
-        if unsafe { abi::map::pon_dict_set_item_status(dict, entry.key, entry.value) } < 0 {
+        if dict_set_item_capi(dict, entry.key, entry.value) < 0 {
             return -1;
         }
     }
@@ -802,6 +888,9 @@ unsafe extern "C" fn capi_dict_update(dict: *mut PyObject, other: *mut PyObject)
     catch_status(|| {
         let dict = crate::tag::untag_arg(dict);
         let other = crate::tag::untag_arg(other);
+        if unsafe { type_::is_class_dict_view(dict) } || unsafe { type_::is_class_dict_view(other) } {
+            return merge_entries(dict, dict_entries_snapshot_capi(other), true);
+        }
         let result = unsafe { abi::map::pon_dict_update(dict, other) };
         if result.is_null() { -1 } else { 0 }
     })
@@ -810,7 +899,7 @@ unsafe extern "C" fn capi_dict_update(dict: *mut PyObject, other: *mut PyObject)
 unsafe extern "C" fn capi_dict_copy(dict: *mut PyObject) -> *mut PyObject {
     catch_object(|| {
         let dict = crate::tag::untag_arg(dict);
-        let entries = match unsafe { dict::dict_entries_snapshot(dict) } {
+        let entries = match dict_entries_snapshot_capi(dict) {
             Ok(entries) => entries,
             Err(message) => return abi::return_null_with_error(message),
         };
@@ -826,10 +915,186 @@ unsafe extern "C" fn capi_dict_copy(dict: *mut PyObject) -> *mut PyObject {
 unsafe extern "C" fn capi_dict_clear(dict: *mut PyObject) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let dict = crate::tag::untag_arg(dict);
+        if unsafe { type_::is_class_dict_view(dict) } {
+            if let Err(message) = unsafe { type_::class_dict_view_clear(dict) } {
+                let _ = type_error(&message);
+            }
+            return;
+        }
         if let Err(message) = unsafe { dict::dict_clear(dict) } {
             let _ = type_error(&message);
         }
     }));
+}
+
+unsafe extern "C" fn capi_dict_del_item_string(dict: *mut PyObject, key: *const c_char) -> c_int {
+    catch_status(|| {
+        let Some(key) = string_key(key) else {
+            return -1;
+        };
+        unsafe { capi_dict_del_item(dict, key) }
+    })
+}
+
+unsafe extern "C" fn capi_dict_contains_string(dict: *mut PyObject, key: *const c_char) -> c_int {
+    catch_status(|| {
+        let Some(key) = string_key(key) else {
+            return -1;
+        };
+        unsafe { capi_dict_contains(dict, key) }
+    })
+}
+
+unsafe extern "C" fn capi_dict_set_default_ref(
+    dict: *mut PyObject,
+    key: *mut PyObject,
+    default_value: *mut PyObject,
+    result: *mut *mut PyObject,
+) -> c_int {
+    catch_status(|| {
+        if !result.is_null() {
+            unsafe { *result = ptr::null_mut() };
+        }
+        if default_value.is_null() {
+            return status_type_error("PyDict_SetDefaultRef default value must not be NULL");
+        }
+        match dict_get_result(dict, key) {
+            Ok(Some(value)) => {
+                if !result.is_null() {
+                    super::pin_object(value);
+                    unsafe { *result = value };
+                }
+                1
+            }
+            Ok(None) => {
+                if pon_err_occurred() {
+                    pon_err_clear();
+                }
+                let dict = crate::tag::untag_arg(dict);
+                let key = crate::tag::untag_arg(key);
+                let default_value = crate::tag::untag_arg(default_value);
+                let status = dict_set_item_capi(dict, key, default_value);
+                if status < 0 {
+                    return -1;
+                }
+                if !result.is_null() {
+                    super::pin_object(default_value);
+                    unsafe { *result = default_value };
+                }
+                0
+            }
+            Err(message) => status_error(message),
+        }
+    })
+}
+
+unsafe extern "C" fn capi_dict_get_item_string_ref(
+    dict: *mut PyObject,
+    key: *const c_char,
+    result: *mut *mut PyObject,
+) -> c_int {
+    catch_status(|| {
+        let Some(key) = string_key(key) else {
+            if !result.is_null() {
+                unsafe { *result = ptr::null_mut() };
+            }
+            return -1;
+        };
+        unsafe { capi_dict_get_item_ref(dict, key, result) }
+    })
+}
+
+fn dict_proxy_type() -> *mut PyType {
+    *DICT_PROXY_TYPE as *mut PyType
+}
+
+unsafe fn dict_proxy_ref<'a>(object: *mut PyObject) -> Option<&'a PyDictProxy> {
+    let object = crate::tag::untag_arg(object);
+    if object.is_null() || !crate::tag::is_heap(object) {
+        return None;
+    }
+    if unsafe { (*object).ob_type } != dict_proxy_type().cast_const() {
+        return None;
+    }
+    Some(unsafe { &*object.cast::<PyDictProxy>() })
+}
+
+unsafe extern "C" fn trace_dict_proxy(object: *mut u8, visitor: &mut dyn FnMut(*mut u8)) {
+    if object.is_null() {
+        return;
+    }
+    let mapping = unsafe { (*object.cast::<PyDictProxy>()).mapping };
+    if !mapping.is_null() && crate::tag::is_heap(mapping) {
+        visitor(mapping.cast::<u8>());
+    }
+}
+
+unsafe extern "C" fn dict_proxy_len_slot(object: *mut PyObject) -> isize {
+    let Some(proxy) = (unsafe { dict_proxy_ref(object) }) else {
+        let _ = type_error("mappingproxy receiver is invalid");
+        return -1;
+    };
+    let mapping = crate::tag::untag_arg(proxy.mapping);
+    if mapping.is_null() || !crate::tag::is_heap(mapping) {
+        let _ = type_error("mappingproxy wrapped mapping is invalid");
+        return -1;
+    }
+    if unsafe { dict::has_dict_storage(mapping) } || unsafe { type_::is_class_dict_view(mapping) } {
+        return unsafe { capi_dict_size(mapping) };
+    }
+    let ty = unsafe { (*mapping).ob_type };
+    if let Some(slot) = unsafe { ty.as_ref().and_then(|ty| ty.tp_as_mapping.as_ref()).and_then(|methods| methods.mp_length) } {
+        return unsafe { slot(mapping) };
+    }
+    let _ = type_error("mappingproxy wrapped object has no mapping length");
+    -1
+}
+
+unsafe extern "C" fn dict_proxy_subscript_slot(object: *mut PyObject, key: *mut PyObject) -> *mut PyObject {
+    let Some(proxy) = (unsafe { dict_proxy_ref(object) }) else {
+        return type_error("mappingproxy receiver is invalid");
+    };
+    unsafe { abi::pon_subscript_get(proxy.mapping, key, ptr::null_mut()) }
+}
+
+unsafe extern "C" fn dict_proxy_ass_subscript_slot(
+    _object: *mut PyObject,
+    _key: *mut PyObject,
+    _value: *mut PyObject,
+) -> c_int {
+    status_type_error("'mappingproxy' object does not support item assignment")
+}
+
+unsafe extern "C" fn capi_dict_proxy_new(mapping: *mut PyObject) -> *mut PyObject {
+    catch_object(|| {
+        let mapping = crate::tag::untag_arg(mapping);
+        if mapping.is_null() {
+            return type_error("PyDictProxy_New received NULL mapping");
+        }
+        let info = GcTypeInfo {
+            size: mem::size_of::<PyDictProxy>(),
+            trace: trace_dict_proxy,
+            finalize: None,
+        };
+        let object = match abi::alloc_gc_object(TYPE_ID_DICT_PROXY, info) {
+            Ok(object) => object.cast::<PyDictProxy>(),
+            Err(message) => return abi::return_null_with_error(message),
+        };
+        unsafe {
+            ptr::write(
+                object,
+                PyDictProxy {
+                    ob_base: PyObjectHeader::new(dict_proxy_type()),
+                    mapping,
+                },
+            );
+        }
+        object.cast::<PyObject>()
+    })
+}
+
+unsafe extern "C" fn capi_dict_proxy_type() -> *mut ForeignTypeObject {
+    super::twin::foreign_of_native(dict_proxy_type())
 }
 
 unsafe extern "C" fn capi_set_new(iterable: *mut PyObject) -> *mut PyObject {
@@ -1033,6 +1298,14 @@ unsafe extern "C" fn capi_sequence_contains(object: *mut PyObject, value: *mut P
         let object = crate::tag::untag_arg(object);
         let value = crate::tag::untag_arg(value);
         unsafe { abi::map::pon_contains(object, value) }
+    })
+}
+
+unsafe extern "C" fn capi_sequence_concat(left: *mut PyObject, right: *mut PyObject) -> *mut PyObject {
+    catch_object(|| {
+        let left = crate::tag::untag_arg(left);
+        let right = crate::tag::untag_arg(right);
+        unsafe { crate::abstract_op::binary_op(crate::abstract_op::BINARY_ADD, left, right) }
     })
 }
 

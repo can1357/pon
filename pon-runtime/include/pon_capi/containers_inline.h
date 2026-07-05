@@ -65,9 +65,7 @@ static inline PyObject *PyTuple_GetItem(PyObject *tuple, Py_ssize_t index) {
     return PyPon_Capi()->containers->tuple_get_item(tuple, index);
 }
 
-static inline PyObject *PyTuple_GET_ITEM(PyObject *tuple, Py_ssize_t index) {
-    return PyTuple_GetItem(tuple, index);
-}
+#define PyTuple_GET_ITEM(tuple, index) (((PyTupleObject *)(tuple))->items[(index)])
 
 static inline int PyTuple_SetItem(PyObject *tuple, Py_ssize_t index, PyObject *item) {
     return PyPon_Capi()->containers->tuple_set_item(tuple, index, item);
@@ -163,16 +161,34 @@ static inline int PyDict_GetItemRef(PyObject *dict, PyObject *key, PyObject **re
     return PyPon_Capi()->containers->dict_get_item_ref(dict, key, result);
 }
 
+static inline int PyDict_GetItemStringRef(PyObject *dict, const char *key, PyObject **result) {
+    return PyPon_Capi()->containers->dict_get_item_string_ref(dict, key, result);
+}
+
 static inline int PyDict_DelItem(PyObject *dict, PyObject *key) {
     return PyPon_Capi()->containers->dict_del_item(dict, key);
+}
+
+static inline int PyDict_DelItemString(PyObject *dict, const char *key) {
+    return PyPon_Capi()->containers->dict_del_item_string(dict, key);
 }
 
 static inline int PyDict_Contains(PyObject *dict, PyObject *key) {
     return PyPon_Capi()->containers->dict_contains(dict, key);
 }
 
+static inline int PyDict_ContainsString(PyObject *dict, const char *key) {
+    return PyPon_Capi()->containers->dict_contains_string(dict, key);
+}
+
 static inline Py_ssize_t PyDict_Size(PyObject *dict) {
     return PyPon_Capi()->containers->dict_size(dict);
+}
+
+#define PyDict_GET_SIZE(dict) PyDict_Size((PyObject *)(dict))
+
+static inline int PyDict_SetDefaultRef(PyObject *dict, PyObject *key, PyObject *default_value, PyObject **result) {
+    return PyPon_Capi()->containers->dict_set_default_ref(dict, key, default_value, result);
 }
 
 static inline PyObject *PyDict_Keys(PyObject *dict) {
@@ -207,6 +223,16 @@ static inline void PyDict_Clear(PyObject *dict) {
     PyPon_Capi()->containers->dict_clear(dict);
 }
 
+#define PyDictProxy_Type (*PyPon_Capi()->containers->dict_proxy_type())
+
+static inline int PyDictProxy_Check(PyObject *object) {
+    return object != NULL && Py_TYPE(object) == &PyDictProxy_Type;
+}
+
+static inline PyObject *PyDictProxy_New(PyObject *mapping) {
+    return PyPon_Capi()->containers->dict_proxy_new(mapping);
+}
+
 static inline PyObject *PySet_New(PyObject *iterable) {
     return PyPon_Capi()->containers->set_new(iterable);
 }
@@ -235,6 +261,18 @@ static inline Py_ssize_t PySlice_AdjustIndices(Py_ssize_t length, Py_ssize_t *st
     return PyPon_Capi()->containers->slice_adjust_indices(length, start, stop, step);
 }
 
+static inline int PySlice_GetIndicesEx(PyObject *slice, Py_ssize_t length, Py_ssize_t *start, Py_ssize_t *stop, Py_ssize_t *step, Py_ssize_t *slicelength) {
+    if (PySlice_Unpack(slice, start, stop, step) < 0) {
+        return -1;
+    }
+    if (slicelength == NULL) {
+        PyErr_SetString(PyExc_TypeError, "PySlice_GetIndicesEx received NULL slicelength pointer");
+        return -1;
+    }
+    *slicelength = PySlice_AdjustIndices(length, start, stop, *step);
+    return 0;
+}
+
 static inline int PySequence_Check(PyObject *object) {
     return PyPon_Capi()->containers->sequence_check(object);
 }
@@ -245,6 +283,10 @@ static inline Py_ssize_t PySequence_Size(PyObject *object) {
 
 static inline Py_ssize_t PySequence_Length(PyObject *object) {
     return PySequence_Size(object);
+}
+
+static inline PyObject *PySequence_Concat(PyObject *left, PyObject *right) {
+    return PyPon_Capi()->containers->sequence_concat(left, right);
 }
 
 static inline PyObject *PySequence_GetItem(PyObject *object, Py_ssize_t index) {

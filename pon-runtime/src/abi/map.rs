@@ -774,19 +774,38 @@ let receiver = match ensure_dict_method_receiver(args, "update") {
     Ok(receiver) => receiver,
     Err(raised) => return raised,
 };
+// `dict.update(other, **kwargs)`: keyword entries ride a trailing marker
+// appended by the keyword binder and merge AFTER the positional source
+// (later duplicates win, matching CPython's update order).
+let (args, kw_pairs) = match args.split_last() {
+    Some((&last, rest)) => match unsafe { crate::types::lazy_iter::kw_marker_pairs(last) } {
+        Some(pairs) => (rest, pairs),
+        None => (args, &[][..]),
+    },
+    None => (args, &[][..]),
+};
 if args.len() > 2 {
     return raise_map_type_error(format!("update expected at most 1 argument, got {}", args.len().saturating_sub(1)));
 }
-let updated = match args.get(1) {
-    Some(&other) => unsafe { pon_dict_update(receiver, other) },
-    None => receiver,
-};
-if updated.is_null() {
-    updated
-} else {
-    crate::dynexec::sync_globals_dict_bulk(receiver);
-    map_none()
-} }
+if let Some(&other) = args.get(1) {
+    if unsafe { pon_dict_update(receiver, other) }.is_null() {
+        return ptr::null_mut();
+    }
+}
+for &(name, value) in kw_pairs {
+    let Some(text) = crate::intern::resolve(name) else {
+        return raise_map_type_error("dict.update() keyword name is not interned".to_owned());
+    };
+    let key = unsafe { crate::abi::pon_const_str(text.as_ptr(), text.len()) };
+    if key.is_null() {
+        return ptr::null_mut();
+    }
+    if unsafe { pon_dict_set_item_status(receiver, key, value) } < 0 {
+        return ptr::null_mut();
+    }
+}
+crate::dynexec::sync_globals_dict_bulk(receiver);
+map_none() }
 pub(crate) unsafe extern "C" fn dict_popitem_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject { let args = match map_method_args(argv, argc, "dict.popitem") {
     Ok(args) => args,
     Err(message) => return null_error(message),

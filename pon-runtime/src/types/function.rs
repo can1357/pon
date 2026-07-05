@@ -2000,6 +2000,17 @@ pub(crate) fn bind_native_keywords_for_name(
         // after the positional mapping/iterable (argparse's
         // `dict(kwargs, dest=..., option_strings=...)` shape).
         "dict" => bind_any_keywords(positional, keywords, "dict"),
+        // `dict.update(other, **kwargs)`: arbitrary keyword names become
+        // entries merged after the positional mapping; the marker is peeled
+        // by `dict_update_method_trampoline`. Gated on dict receivers: other
+        // natives named `update` (set/hashlib) reject keywords per CPython.
+        "update"
+            if positional
+                .first()
+                .is_some_and(|&receiver| unsafe { crate::types::dict::is_dict(receiver) }) =>
+        {
+            bind_any_keywords(positional, keywords, "update")
+        }
         // `type.__prepare__(*args, **kwds)` ignores everything it receives,
         // so keyword binding degenerates to dropping the keywords.
         "__prepare__" => Ok(positional.to_vec()),
