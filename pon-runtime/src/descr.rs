@@ -782,6 +782,10 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
         if !fallback.is_null() {
             return fallback;
         }
+        let native_method = unsafe { abi::map::builtin_set_type_method(object.cast::<PyType>(), name_id) };
+        if !native_method.is_null() {
+            return native_method;
+        }
         return unsafe { abi::pon_raise_attribute_error(object, name_id) };
     }
 

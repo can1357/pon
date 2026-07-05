@@ -1772,6 +1772,7 @@ pub fn ensure_dict_subclass_methods_installed() {
         let interned = crate::intern::intern(name);
         let function = unsafe { crate::abi::pon_make_function(*code, crate::builtins::variadic_arity(), interned) };
         if !function.is_null() {
+            crate::types::function::mark_native_method_descriptor(function);
             unsafe { (&mut *namespace).set(interned, function) };
         }
     }

@@ -489,6 +489,7 @@ pub(crate) fn ensure_int_type_methods_installed(ty: *mut PyType) {
         let function =
             unsafe { crate::abi::pon_make_function(*entry as *const u8, crate::builtins::variadic_arity(), interned) };
         if !function.is_null() {
+            crate::types::function::mark_native_method_descriptor(function);
             unsafe { (&mut *namespace).set(interned, function) };
         }
     }

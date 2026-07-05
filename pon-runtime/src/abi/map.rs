@@ -2257,6 +2257,251 @@ unsafe extern "C" fn set_clear_method_trampoline(argv: *mut *mut PyObject, argc:
     }
 }
 
+type SetNativeEntry = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
+
+fn set_type_receiver_name(receiver: *mut PyObject) -> String {
+    if receiver.is_null() {
+        return "NULL".to_owned();
+    }
+    if !crate::tag::is_heap(receiver) {
+        return "object".to_owned();
+    }
+    let ty = unsafe { (*receiver).ob_type };
+    if ty.is_null() {
+        "object".to_owned()
+    } else {
+        unsafe { (*ty).name().to_owned() }
+    }
+}
+
+fn exact_builtin_set_receiver(receiver: *mut PyObject, owner: &str) -> bool {
+    if receiver.is_null() || !crate::tag::is_heap(receiver) {
+        return false;
+    }
+    let type_type = super::runtime_type_type();
+    if type_type.is_null() {
+        return false;
+    }
+    let expected = match owner {
+        "set" => set_::set_type(type_type),
+        "frozenset" => frozenset::frozenset_type(type_type),
+        _ => ptr::null_mut(),
+    };
+    !expected.is_null() && unsafe { (*receiver).ob_type == expected.cast_const() }
+}
+
+fn ensure_builtin_set_type_receiver(
+    argv: *mut *mut PyObject,
+    argc: usize,
+    owner: &str,
+    method: &str,
+) -> Result<(), *mut PyObject> {
+    if argv.is_null() && argc != 0 {
+        return Err(null_error(format!("{owner}.{method} received a NULL argv pointer")));
+    }
+    if argc == 0 {
+        return Err(raise_map_type_error(format!("unbound method {owner}.{method}() needs an argument")));
+    }
+    let receiver = crate::tag::untag_arg(unsafe { *argv });
+    if receiver.is_null() {
+        return Err(ptr::null_mut());
+    }
+    if exact_builtin_set_receiver(receiver, owner) {
+        return Ok(());
+    }
+    let got = set_type_receiver_name(receiver);
+    Err(raise_map_type_error(format!(
+        "descriptor '{method}' for '{owner}' objects doesn't apply to a '{got}' object"
+    )))
+}
+
+fn call_checked_set_type_method(
+    argv: *mut *mut PyObject,
+    argc: usize,
+    owner: &str,
+    method: &str,
+    entry: SetNativeEntry,
+) -> *mut PyObject {
+    if let Err(raised) = ensure_builtin_set_type_receiver(argv, argc, owner, method) {
+        return raised;
+    }
+    unsafe { entry(argv, argc) }
+}
+
+macro_rules! checked_set_type_method {
+    ($wrapper:ident, $owner:literal, $method:literal, $entry:ident) => {
+        unsafe extern "C" fn $wrapper(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+            call_checked_set_type_method(argv, argc, $owner, $method, $entry)
+        }
+    };
+}
+
+checked_set_type_method!(set_type_add_method_trampoline, "set", "add", set_add_method_trampoline);
+checked_set_type_method!(set_type_discard_method_trampoline, "set", "discard", set_discard_method_trampoline);
+checked_set_type_method!(set_type_union_method_trampoline, "set", "union", set_union_method_trampoline);
+checked_set_type_method!(set_type_intersection_method_trampoline, "set", "intersection", set_intersection_method_trampoline);
+checked_set_type_method!(
+    set_type_intersection_update_method_trampoline,
+    "set",
+    "intersection_update",
+    set_intersection_update_method_trampoline
+);
+checked_set_type_method!(set_type_difference_method_trampoline, "set", "difference", set_difference_method_trampoline);
+checked_set_type_method!(
+    set_type_difference_update_method_trampoline,
+    "set",
+    "difference_update",
+    set_difference_update_method_trampoline
+);
+checked_set_type_method!(
+    set_type_symmetric_difference_method_trampoline,
+    "set",
+    "symmetric_difference",
+    set_symmetric_difference_method_trampoline
+);
+checked_set_type_method!(
+    set_type_symmetric_difference_update_method_trampoline,
+    "set",
+    "symmetric_difference_update",
+    set_symmetric_difference_update_method_trampoline
+);
+checked_set_type_method!(set_type_update_method_trampoline, "set", "update", set_update_method_trampoline);
+checked_set_type_method!(set_type_issubset_method_trampoline, "set", "issubset", set_issubset_method_trampoline);
+checked_set_type_method!(set_type_issuperset_method_trampoline, "set", "issuperset", set_issuperset_method_trampoline);
+checked_set_type_method!(set_type_isdisjoint_method_trampoline, "set", "isdisjoint", set_isdisjoint_method_trampoline);
+checked_set_type_method!(set_type_contains_method_trampoline, "set", "__contains__", set_contains_method_trampoline);
+checked_set_type_method!(set_type_copy_method_trampoline, "set", "copy", set_copy_method_trampoline);
+checked_set_type_method!(set_type_remove_method_trampoline, "set", "remove", set_remove_method_trampoline);
+checked_set_type_method!(set_type_clear_method_trampoline, "set", "clear", set_clear_method_trampoline);
+checked_set_type_method!(set_type_pop_method_trampoline, "set", "pop", set_pop_method_trampoline);
+
+checked_set_type_method!(
+    frozenset_type_union_method_trampoline,
+    "frozenset",
+    "union",
+    set_union_method_trampoline
+);
+checked_set_type_method!(
+    frozenset_type_intersection_method_trampoline,
+    "frozenset",
+    "intersection",
+    set_intersection_method_trampoline
+);
+checked_set_type_method!(
+    frozenset_type_difference_method_trampoline,
+    "frozenset",
+    "difference",
+    set_difference_method_trampoline
+);
+checked_set_type_method!(
+    frozenset_type_symmetric_difference_method_trampoline,
+    "frozenset",
+    "symmetric_difference",
+    set_symmetric_difference_method_trampoline
+);
+checked_set_type_method!(
+    frozenset_type_issubset_method_trampoline,
+    "frozenset",
+    "issubset",
+    set_issubset_method_trampoline
+);
+checked_set_type_method!(
+    frozenset_type_issuperset_method_trampoline,
+    "frozenset",
+    "issuperset",
+    set_issuperset_method_trampoline
+);
+checked_set_type_method!(
+    frozenset_type_isdisjoint_method_trampoline,
+    "frozenset",
+    "isdisjoint",
+    set_isdisjoint_method_trampoline
+);
+checked_set_type_method!(
+    frozenset_type_contains_method_trampoline,
+    "frozenset",
+    "__contains__",
+    set_contains_method_trampoline
+);
+checked_set_type_method!(
+    frozenset_type_copy_method_trampoline,
+    "frozenset",
+    "copy",
+    set_copy_method_trampoline
+);
+
+fn builtin_set_type_kind(ty: *mut PyType) -> Option<&'static str> {
+    if ty.is_null() {
+        return None;
+    }
+    let type_type = super::runtime_type_type();
+    if type_type.is_null() {
+        return None;
+    }
+    if ty == set_::set_type(type_type) {
+        Some("set")
+    } else if ty == frozenset::frozenset_type(type_type) {
+        Some("frozenset")
+    } else {
+        None
+    }
+}
+
+fn builtin_set_type_entry(kind: &str, name: &str) -> Option<SetNativeEntry> {
+    match (kind, name) {
+        ("set", "add") => Some(set_type_add_method_trampoline),
+        ("set", "discard") => Some(set_type_discard_method_trampoline),
+        ("set", "union") => Some(set_type_union_method_trampoline),
+        ("set", "intersection") => Some(set_type_intersection_method_trampoline),
+        ("set", "intersection_update") => Some(set_type_intersection_update_method_trampoline),
+        ("set", "difference") => Some(set_type_difference_method_trampoline),
+        ("set", "difference_update") => Some(set_type_difference_update_method_trampoline),
+        ("set", "symmetric_difference") => Some(set_type_symmetric_difference_method_trampoline),
+        ("set", "symmetric_difference_update") => Some(set_type_symmetric_difference_update_method_trampoline),
+        ("set", "update") => Some(set_type_update_method_trampoline),
+        ("set", "issubset") => Some(set_type_issubset_method_trampoline),
+        ("set", "issuperset") => Some(set_type_issuperset_method_trampoline),
+        ("set", "isdisjoint") => Some(set_type_isdisjoint_method_trampoline),
+        ("set", "__contains__") => Some(set_type_contains_method_trampoline),
+        ("set", "copy") => Some(set_type_copy_method_trampoline),
+        ("set", "remove") => Some(set_type_remove_method_trampoline),
+        ("set", "clear") => Some(set_type_clear_method_trampoline),
+        ("set", "pop") => Some(set_type_pop_method_trampoline),
+        ("frozenset", "union") => Some(frozenset_type_union_method_trampoline),
+        ("frozenset", "intersection") => Some(frozenset_type_intersection_method_trampoline),
+        ("frozenset", "difference") => Some(frozenset_type_difference_method_trampoline),
+        ("frozenset", "symmetric_difference") => Some(frozenset_type_symmetric_difference_method_trampoline),
+        ("frozenset", "issubset") => Some(frozenset_type_issubset_method_trampoline),
+        ("frozenset", "issuperset") => Some(frozenset_type_issuperset_method_trampoline),
+        ("frozenset", "isdisjoint") => Some(frozenset_type_isdisjoint_method_trampoline),
+        ("frozenset", "__contains__") => Some(frozenset_type_contains_method_trampoline),
+        ("frozenset", "copy") => Some(frozenset_type_copy_method_trampoline),
+        _ => None,
+    }
+}
+
+/// Type-level fallback for `set.union` / `frozenset.union`-style unbound
+/// native methods.  It is intentionally NOT installed into `tp_dict`: exact
+/// builtin type receivers get a first-class callable after ordinary
+/// type-attribute resolution has missed, while heap/user classes named like a
+/// builtin are left untouched.
+pub(crate) unsafe fn builtin_set_type_method(ty: *mut PyType, name_id: u32) -> *mut PyObject {
+    let Some(kind) = builtin_set_type_kind(ty) else {
+        return ptr::null_mut();
+    };
+    let Some(name) = crate::intern::resolve(name_id) else {
+        return ptr::null_mut();
+    };
+    let Some(entry) = builtin_set_type_entry(kind, &name) else {
+        return ptr::null_mut();
+    };
+    let function = unsafe { super::pon_make_function(entry as *const u8, crate::builtins::variadic_arity(), name_id) };
+    if !function.is_null() {
+        crate::types::function::mark_native_method_descriptor(function);
+    }
+    function
+}
+
 /// Returns a bound set method object for attribute lookup.
 pub unsafe fn pon_set_bound_method(set: *mut PyObject, name: &str) -> *mut PyObject {
     match name {
