@@ -2139,6 +2139,10 @@ fn register_builtin_type_globals(runtime: &mut Runtime) {
         // never pass `descr::synthetic_type_attr`'s lazy type-level trigger.
         install_int_dunder_format(runtime, runtime.long_type);
         install_builtin_type(runtime, "str", runtime.unicode_type, Some(builtin_str_new), object_type);
+        // Eager: `pon_const_str`/`alloc_unicode` construction paths bypass
+        // the lazy `install_str_slots`, and `str(x) * n` dispatch needs
+        // `sq_repeat` on the type from the first instruction.
+        str_::install_str_slot_tables(runtime);
 
         let bool_type = (*bool_::from_bool(false)).ob_type.cast_mut();
         // CPython: `bool` subclasses `int` (`bool.__mro__ == (bool, int,
@@ -3810,11 +3814,171 @@ enum CallTarget {
     DunderCall,
 }
 
+/// Cached raw pointer to the runtime heap for lock-free allocation-pressure
+/// reads. The runtime slot is never cleared after initialization, so the
+/// address stays valid for the process lifetime.
+static AUTO_COLLECT_HEAP: AtomicPtr<Heap> = AtomicPtr::new(ptr::null_mut());
+/// Re-entrancy guard: finalizers running inside a collection call back into
+/// `pon_call`, which must not trigger a nested automatic collection.
+static AUTO_COLLECT_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Minimum allocation debt before an automatic collection is considered.
+const AUTO_COLLECT_MIN_DEBT: usize = 64 << 20;
+
+thread_local! {
+    /// Every in-flight `pon_call`'s operands (callee, argv, argc), pushed
+    /// for EVERY call target. Rust-mediated callers keep argv in heap-backed
+    /// Vecs the conservative stack scan cannot see; the collector roots the
+    /// callee and every argv element of every level (`collect_impl`).
+    static ACTIVE_CALL_OPERANDS: std::cell::RefCell<Vec<(*mut PyObject, *mut *mut PyObject, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Root sources registered by suspended Rust helper frames that hold GC
+    /// pointers in heap-backed buffers across pon re-entry (`sorted` key
+    /// buffers, iterable accumulators). Thin `(addr, thunk)` pairs;
+    /// dereferenced ONLY during a collection, while every owning frame is
+    /// blocked in a nested call.
+    static SCOPED_ROOT_SOURCES: std::cell::RefCell<Vec<(usize, ScopedRootsFn)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Implemented by helper-owned buffers whose GC pointers must survive a
+/// collection while their frame re-enters Python. Register with
+/// [`scoped_roots`]; the guard unregisters on drop.
+pub(crate) trait ScopedRootSource {
+    fn push_roots(&self, push: &mut dyn FnMut(*mut PyObject));
+}
+
+impl ScopedRootSource for Vec<*mut PyObject> {
+    fn push_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        for &value in self {
+            push(value);
+        }
+    }
+}
+
+impl ScopedRootSource for Vec<(*mut PyObject, *mut PyObject)> {
+    fn push_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        for &(first, second) in self {
+            push(first);
+            push(second);
+        }
+    }
+}
+
+/// Type-erased [`ScopedRootSource::push_roots`] entry (thin `(addr, thunk)`
+/// pairs, the `gcroot::RootRegistry` pattern): callers register a RAW
+/// pointer and never hold a shared borrow of a buffer they keep mutating.
+type ScopedRootsFn = unsafe fn(usize, &mut dyn FnMut(*mut PyObject));
+
+unsafe fn scoped_roots_thunk<T: ScopedRootSource>(addr: usize, push: &mut dyn FnMut(*mut PyObject)) {
+    // SAFETY: the guard's contract — the source outlives the guard at a
+    // stable address; dereferenced only while the owning frame is suspended
+    // in a nested call during a stop-the-world collection.
+    unsafe { (*(addr as *const T)).push_roots(push) };
+}
+
+/// Registers the buffer at `source` as a collection root provider for this
+/// thread until the returned guard drops. The buffer must stay at a stable
+/// address for the guard's lifetime (its CONTENTS may change freely).
+pub(crate) fn scoped_roots<T: ScopedRootSource>(source: *const T) -> ScopedRootsGuard {
+    let addr = source as usize;
+    SCOPED_ROOT_SOURCES.with(|cell| cell.borrow_mut().push((addr, scoped_roots_thunk::<T>)));
+    ScopedRootsGuard { addr }
+}
+
+pub(crate) struct ScopedRootsGuard {
+    addr: usize,
+}
+
+impl Drop for ScopedRootsGuard {
+    fn drop(&mut self) {
+        SCOPED_ROOT_SOURCES.with(|cell| {
+            let mut sources = cell.borrow_mut();
+            if let Some(position) = sources.iter().rposition(|&(addr, _)| addr == self.addr) {
+                sources.remove(position);
+            }
+        });
+    }
+}
+
+/// This thread's helper-frame roots: all active call operands plus every
+/// registered scoped source's held pointers. Consumed by `collect_impl`.
+pub(crate) fn helper_frame_roots() -> Vec<*mut PyObject> {
+    let mut roots = Vec::new();
+    ACTIVE_CALL_OPERANDS.with(|cell| {
+        for &(callee, argv, argc) in cell.borrow().iter() {
+            roots.push(callee);
+            if argv.is_null() {
+                continue;
+            }
+            for index in 0..argc {
+                // SAFETY: recorded argv arrays outlive their call frame.
+                roots.push(unsafe { *argv.add(index) });
+            }
+        }
+    });
+    SCOPED_ROOT_SOURCES.with(|cell| {
+        for &(addr, thunk) in cell.borrow().iter() {
+            // SAFETY: guards unregister before their source moves/drops.
+            unsafe { thunk(addr, &mut |value| roots.push(value)) };
+        }
+    });
+    roots
+}
+
+struct CallOperandsGuard;
+
+impl CallOperandsGuard {
+    fn push(callee: *mut PyObject, argv: *mut *mut PyObject, argc: usize) -> Self {
+        ACTIVE_CALL_OPERANDS.with(|cell| cell.borrow_mut().push((callee, argv, argc)));
+        Self
+    }
+}
+
+impl Drop for CallOperandsGuard {
+    fn drop(&mut self) {
+        ACTIVE_CALL_OPERANDS.with(|cell| {
+            cell.borrow_mut().pop();
+        });
+    }
+}
+
+/// Allocation-pressure automatic collection (CPython's GC-on-allocation
+/// analogue). Runs at the `pon_call` boundary: no runtime or thread-state
+/// locks are held there; in-flight call operands are rooted via
+/// [`ACTIVE_CALL_OPERANDS`] at every level; helper-held buffers register
+/// through [`scoped_roots`]; blocks younger than one collection epoch are
+/// never reclaimed (see pon-gc's age gate). Policy: collect when the debt
+/// since the last collection exceeds max(64 MiB, live bytes) — the classic
+/// doubling bound.
+fn maybe_auto_collect() {
+    let mut heap = AUTO_COLLECT_HEAP.load(Ordering::Acquire);
+    if heap.is_null() {
+        let Some(resolved) = with_runtime(|runtime| (&runtime.heap) as *const Heap as *mut Heap) else {
+            return;
+        };
+        AUTO_COLLECT_HEAP.store(resolved, Ordering::Release);
+        heap = resolved;
+    }
+    // SAFETY: the runtime slot (and its heap) lives for the process.
+    let heap = unsafe { &*heap };
+    let debt = heap.allocation_debt();
+    if debt < AUTO_COLLECT_MIN_DEBT || debt < heap.live_bytes() {
+        return;
+    }
+    if AUTO_COLLECT_ACTIVE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let _ = collect();
+    AUTO_COLLECT_ACTIVE.store(false, Ordering::Release);
+}
+
 /// Calls a boxed callable, including native builtins, heap types, and bound methods.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_call(callee: *mut PyObject, argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     crate::untag_prelude!(callee);
     catch_object_helper(|| {
+        let _operands = CallOperandsGuard::push(callee, argv, argc);
+        maybe_auto_collect();
         if let Err(message) = ensure_runtime_initialized() {
             return return_null_with_error(message);
         }
@@ -4086,6 +4250,31 @@ pub(crate) fn current_call_snapshots() -> Vec<(*mut PyObject, *mut PyObject)> {
                 (!first_arg.is_null()).then_some((call.function.cast::<PyObject>(), first_arg))
             })
             .collect()
+    })
+}
+/// Every in-flight call's FULL operand set (function + all argv elements),
+/// for collection rooting: `current_call_snapshots` keeps its (function,
+/// self) shape for callers that only bind receivers, but the collector must
+/// root every positional argument of every active frame — argv arrays may
+/// live in heap-backed Vecs the conservative stack scan cannot see.
+pub(crate) fn current_call_argument_roots() -> Vec<*mut PyObject> {
+    CURRENT_FUNCTION_STACK.with(|stack| {
+        let stack = stack.borrow();
+        let mut roots = Vec::new();
+        for call in stack.iter() {
+            roots.push(call.function.cast::<PyObject>());
+            if call.argv.is_null() {
+                continue;
+            }
+            for index in 0..call.argc {
+                // SAFETY: the recorded argv array outlives the call frame.
+                let value = unsafe { *call.argv.add(index) };
+                if !value.is_null() {
+                    roots.push(value);
+                }
+            }
+        }
+        roots
     })
 }
 
@@ -5633,6 +5822,20 @@ fn collect_impl() -> Result<(), String> {
     // dict: every module-scope binding in every module.
     for value in crate::import::gc_held_roots() {
         push_namespace_value_roots(value, &mut roots);
+    }
+    // Rust helper-frame roots: every in-flight `pon_call`'s callee + argv
+    // (ALL call targets), Phase-B call records' full argument sets, and
+    // scoped helper buffers registered via `scoped_roots` — all of which
+    // may live in heap-backed Vecs invisible to the conservative scan.
+    for value in helper_frame_roots() {
+        if !value.is_null() {
+            roots.push(value.cast::<u8>());
+        }
+    }
+    for value in current_call_argument_roots() {
+        if !value.is_null() {
+            roots.push(value.cast::<u8>());
+        }
     }
     // Objects held by recompiled C extensions through `Py_INCREF` pins.
     for value in crate::capi::gc_held_roots() {
