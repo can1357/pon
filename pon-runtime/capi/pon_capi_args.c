@@ -1072,8 +1072,9 @@ static PyObject *pypon_build_one(const char **format, va_list *vargs) {
                 return PyUnicode_FromStringAndSize(value, length);
             }
             if (value == NULL) {
-                PyErr_SetString(PyExc_TypeError, "NULL string passed to Py_BuildValue");
-                return NULL;
+                /* CPython: a NULL C string for 's' builds None. */
+                Py_INCREF(Py_None);
+                return Py_None;
             }
             return PyUnicode_FromString(value);
         }

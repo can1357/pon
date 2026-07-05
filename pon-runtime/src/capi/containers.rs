@@ -196,7 +196,7 @@ fn catch_object(f: impl FnOnce() -> *mut PyObject) -> *mut PyObject {
 
 fn catch_borrowed_object(f: impl FnOnce() -> *mut PyObject) -> *mut PyObject {
     match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(object) => object,
+        Ok(object) => super::foreignize_type_result(object),
         Err(_) => abi::return_null_with_error("container C-API helper panicked"),
     }
 }
@@ -223,6 +223,13 @@ fn tuple_slice(object: *mut PyObject) -> Option<&'static [*mut PyObject]> {
         return None;
     }
     unsafe { abi::seq::tuple_storage_slice(object) }
+}
+
+/// TEMP diagnostic for numpy bring-up: identify non-tuple operands.
+fn tuple_expected_diag(object: *mut PyObject) {
+    let ty_name = unsafe { crate::types::dict::type_name(object) }.unwrap_or("<null-or-untyped>");
+    eprintln!("[pon-diag] expected tuple, got {:p} type '{}'", object, ty_name);
+    eprintln!("[pon-diag] backtrace:\n{}", std::backtrace::Backtrace::force_capture());
 }
 
 fn exact_tuple_mut(object: *mut PyObject) -> Option<&'static mut tuple::PyTuple> {
@@ -372,6 +379,7 @@ unsafe extern "C" fn capi_tuple_size(tuple: *mut PyObject) -> isize {
     catch_size(|| {
         let tuple = crate::tag::untag_arg(tuple);
         let Some(items) = tuple_slice(tuple) else {
+            tuple_expected_diag(tuple);
             let _ = type_error("expected tuple object");
             return -1;
         };
@@ -383,6 +391,7 @@ unsafe extern "C" fn capi_tuple_get_item(tuple: *mut PyObject, index: isize) -> 
     catch_borrowed_object(|| {
         let tuple = crate::tag::untag_arg(tuple);
         let Some(items) = tuple_slice(tuple) else {
+            tuple_expected_diag(tuple);
             return type_error("expected tuple object");
         };
         let index = match checked_index(index, items.len(), "tuple") {
@@ -444,6 +453,7 @@ unsafe extern "C" fn capi_tuple_get_slice(tuple: *mut PyObject, start: isize, st
     catch_object(|| {
         let tuple = crate::tag::untag_arg(tuple);
         let Some(items) = tuple_slice(tuple) else {
+            tuple_expected_diag(tuple);
             return type_error("expected tuple object");
         };
         let len = items.len() as isize;
@@ -685,7 +695,7 @@ unsafe extern "C" fn capi_dict_get_item_ref(
             Ok(Some(value)) => {
                 super::pin_object(value);
                 unsafe {
-                    *result = value;
+                    *result = super::foreignize_type_result(value);
                 }
                 1
             }
@@ -715,7 +725,10 @@ fn dict_get_impl(dict: *mut PyObject, key: *mut PyObject, clear_miss: bool) -> *
 
 fn dict_get_result(dict: *mut PyObject, key: *mut PyObject) -> Result<Option<*mut PyObject>, String> {
     let dict = crate::tag::untag_arg(dict);
-    let key = crate::tag::untag_arg(key);
+    // Foreign type faces must never reach pon hashing raw: read paths
+    // normalize exactly like `dict_set_item_capi` so lookups agree with
+    // normalized inserts.
+    let key = crate::tag::untag_arg(normalize_object_arg(key));
     if unsafe { type_::is_class_dict_view(dict) } {
         unsafe { type_::class_dict_view_get_item(dict, key) }
     } else {
@@ -763,7 +776,7 @@ fn dict_entries_snapshot_capi(dict: *mut PyObject) -> Result<Vec<DictEntry>, Str
 unsafe extern "C" fn capi_dict_del_item(dict: *mut PyObject, key: *mut PyObject) -> c_int {
     catch_status(|| {
         let dict = crate::tag::untag_arg(dict);
-        let key = crate::tag::untag_arg(key);
+        let key = crate::tag::untag_arg(normalize_object_arg(key));
         match dict_remove_capi(dict, key) {
             Ok(true) => 0,
             Ok(false) => {
@@ -778,7 +791,7 @@ unsafe extern "C" fn capi_dict_del_item(dict: *mut PyObject, key: *mut PyObject)
 unsafe extern "C" fn capi_dict_contains(dict: *mut PyObject, key: *mut PyObject) -> c_int {
     catch_status(|| {
         let dict = crate::tag::untag_arg(dict);
-        let key = crate::tag::untag_arg(key);
+        let key = crate::tag::untag_arg(normalize_object_arg(key));
         match dict_contains_capi(dict, key) {
             Ok(true) => 1,
             Ok(false) => 0,
@@ -1033,7 +1046,7 @@ unsafe extern "C" fn capi_dict_set_default_ref(
             Ok(Some(value)) => {
                 if !result.is_null() {
                     super::pin_object(value);
-                    unsafe { *result = value };
+                    unsafe { *result = super::foreignize_type_result(value) };
                 }
                 1
             }
@@ -1049,7 +1062,7 @@ unsafe extern "C" fn capi_dict_set_default_ref(
                 }
                 if !result.is_null() {
                     super::pin_object(default_value);
-                    unsafe { *result = default_value };
+                    unsafe { *result = super::foreignize_type_result(default_value) };
                 }
                 0
             }

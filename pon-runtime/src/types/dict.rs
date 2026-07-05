@@ -1004,6 +1004,7 @@ fn hash_object_non_numeric(object: *mut PyObject) -> Result<isize, String> {
                     }
                 }
             }
+            eprintln!("[pon-diag] backtrace:\n{}", std::backtrace::Backtrace::force_capture());
             return Err("object has null type".to_owned());
         }
     };
