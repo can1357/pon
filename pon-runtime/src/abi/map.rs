@@ -829,7 +829,7 @@ pub unsafe fn pon_dict_bound_method(map: *mut PyObject, name: &str) -> *mut PyOb
         "copy" => alloc_bound_native_method(map, name, dict_copy_method_trampoline),
         "popitem" => alloc_bound_native_method(map, name, dict_popitem_method_trampoline),
         "clear" => alloc_bound_native_method(map, name, dict_clear_method_trampoline),
-        _ => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
+        _ => crate::descr::native_instance_surface_attr(map, name),
     }
 }
 
@@ -1430,7 +1430,7 @@ unsafe extern "C" fn dict_view_isdisjoint_method_trampoline(argv: *mut *mut PyOb
 pub unsafe fn pon_dict_view_bound_method(view: *mut PyObject, name: &str) -> *mut PyObject {
     match name {
         "isdisjoint" => alloc_bound_native_method(view, name, dict_view_isdisjoint_method_trampoline),
-        _ => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
+        _ => crate::descr::native_instance_surface_attr(view, name),
     }
 }
 
@@ -1915,24 +1915,27 @@ unsafe extern "C" fn set_discard_method_trampoline(argv: *mut *mut PyObject, arg
     unsafe { pon_set_discard(args[0], args[1]) }
 }
 
-fn set_method_binary_result(receiver: *mut PyObject, other: *mut PyObject, op: DictViewSetOp) -> *mut PyObject {
-    let left_values = match unsafe { set_::entries_snapshot(receiver) } {
-        Ok(entries) => entries,
-        Err(message) => return null_error(message),
-    };
-    let right_values = match set_argument_entries(other) {
-        Ok(entries) => entries,
-        Err(message) => return null_error(message),
-    };
-    let left_entries = match unsafe { frozenset::unique_entries(&left_values) } {
-        Ok(entries) => entries,
-        Err(message) => return null_error(message),
-    };
-    let right_entries = match unsafe { frozenset::unique_entries(&right_values) } {
-        Ok(entries) => entries,
-        Err(message) => return null_error(message),
-    };
-    let entries = match set_op_entries(&left_entries, &right_entries, op) {
+/// Folds one set operation over every `others` operand, starting from the
+/// receiver's elements (CPython's variadic `union(*others)` family).
+fn fold_set_op_entries(
+    receiver: *mut PyObject,
+    others: &[*mut PyObject],
+    op: DictViewSetOp,
+) -> Result<Vec<*mut PyObject>, String> {
+    let left_values = unsafe { set_::entries_snapshot(receiver) }?;
+    let mut entries = unsafe { frozenset::unique_entries(&left_values) }?;
+    for other in others {
+        let right_values = set_argument_entries(*other)?;
+        let right_entries = unsafe { frozenset::unique_entries(&right_values) }?;
+        entries = set_op_entries(&entries, &right_entries, op)?;
+    }
+    Ok(entries)
+}
+
+/// A new set holding the fold of `op` over the receiver and every operand;
+/// zero operands yield a shallow copy (CPython `s.union()`).
+fn set_method_folded_result(receiver: *mut PyObject, others: &[*mut PyObject], op: DictViewSetOp) -> *mut PyObject {
+    let entries = match fold_set_op_entries(receiver, others, op) {
         Ok(entries) => entries,
         Err(message) => return null_error(message),
     };
@@ -1947,10 +1950,10 @@ unsafe extern "C" fn set_union_method_trampoline(argv: *mut *mut PyObject, argc:
         Ok(args) => args,
         Err(message) => return null_error(message),
     };
-    if args.len() != 2 {
-        return raise_map_type_error(format!("set.union() expected 1 argument, got {}", args.len().saturating_sub(1)));
+    if args.is_empty() {
+        return raise_map_type_error("set.union() expected a set receiver".to_owned());
     }
-    set_method_binary_result(args[0], args[1], DictViewSetOp::Union)
+    set_method_folded_result(args[0], &args[1..], DictViewSetOp::Union)
 }
 
 unsafe extern "C" fn set_intersection_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -1958,10 +1961,10 @@ unsafe extern "C" fn set_intersection_method_trampoline(argv: *mut *mut PyObject
         Ok(args) => args,
         Err(message) => return null_error(message),
     };
-    if args.len() != 2 {
-        return raise_map_type_error(format!("set.intersection() expected 1 argument, got {}", args.len().saturating_sub(1)));
+    if args.is_empty() {
+        return raise_map_type_error("set.intersection() expected a set receiver".to_owned());
     }
-    set_method_binary_result(args[0], args[1], DictViewSetOp::Intersection)
+    set_method_folded_result(args[0], &args[1..], DictViewSetOp::Intersection)
 }
 
 unsafe extern "C" fn set_difference_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -1969,10 +1972,33 @@ unsafe extern "C" fn set_difference_method_trampoline(argv: *mut *mut PyObject, 
         Ok(args) => args,
         Err(message) => return null_error(message),
     };
-    if args.len() != 2 {
-        return raise_map_type_error(format!("set.difference() expected 1 argument, got {}", args.len().saturating_sub(1)));
+    if args.is_empty() {
+        return raise_map_type_error("set.difference() expected a set receiver".to_owned());
     }
-    set_method_binary_result(args[0], args[1], DictViewSetOp::Difference)
+    set_method_folded_result(args[0], &args[1..], DictViewSetOp::Difference)
+}
+
+/// `set.intersection_update(*others)`: in-place variadic intersection.
+unsafe extern "C" fn set_intersection_update_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = match map_method_args(argv, argc, "set.intersection_update") {
+        Ok(args) => args,
+        Err(message) => return null_error(message),
+    };
+    if args.is_empty() {
+        return raise_map_type_error("set.intersection_update() expected a set receiver".to_owned());
+    }
+    let entries = match fold_set_op_entries(args[0], &args[1..], DictViewSetOp::Intersection) {
+        Ok(entries) => entries,
+        Err(message) => return null_error(message),
+    };
+    let _guard = crate::sync::begin_critical_section(args[0]);
+    let set = match unsafe { set_::set_mut(args[0]) } {
+        Ok(set) => set,
+        Err(message) => return null_error(message),
+    };
+    set.entries = entries;
+    set.buckets.clear();
+    map_none()
 }
 
 unsafe extern "C" fn set_difference_update_method_trampoline(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -2218,6 +2244,7 @@ pub unsafe fn pon_set_bound_method(set: *mut PyObject, name: &str) -> *mut PyObj
         "discard" => alloc_bound_native_method(set, name, set_discard_method_trampoline),
         "union" => alloc_bound_native_method(set, name, set_union_method_trampoline),
         "intersection" => alloc_bound_native_method(set, name, set_intersection_method_trampoline),
+        "intersection_update" => alloc_bound_native_method(set, name, set_intersection_update_method_trampoline),
         "difference" => alloc_bound_native_method(set, name, set_difference_method_trampoline),
         "difference_update" => alloc_bound_native_method(set, name, set_difference_update_method_trampoline),
         "symmetric_difference" => alloc_bound_native_method(set, name, set_symmetric_difference_method_trampoline),
@@ -2233,7 +2260,7 @@ pub unsafe fn pon_set_bound_method(set: *mut PyObject, name: &str) -> *mut PyObj
         "remove" => alloc_bound_native_method(set, name, set_remove_method_trampoline),
         "clear" => alloc_bound_native_method(set, name, set_clear_method_trampoline),
         "pop" => alloc_bound_native_method(set, name, set_pop_method_trampoline),
-        _ => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
+        _ => crate::descr::native_instance_surface_attr(set, name),
     }
 }
 

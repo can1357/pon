@@ -1154,7 +1154,7 @@ pub unsafe extern "C" fn builtin_iter(argv: *mut *mut PyObject, argc: usize) -> 
     match args.len() {
         1 => unsafe { pon_get_iter(args[0], ptr::null_mut()) },
         2 => {
-            if !unsafe { is_callable_object(args[0]) } {
+            if !crate::abi::call::is_callable_object(args[0]) {
                 return fail("iter(v, w): v must be callable");
             }
             alloc_callable_sentinel_iter(args[0], args[1])
@@ -2029,7 +2029,7 @@ pub unsafe extern "C" fn builtin_callable(argv: *mut *mut PyObject, argc: usize)
     let Some(args) = (unsafe { exact_args(argv, argc, 1, "callable") }) else {
         return ptr::null_mut();
     };
-    let result = unsafe { is_callable_object(args[0]) };
+    let result = crate::abi::call::is_callable_object(args[0]);
     unsafe { abi::number::pon_const_bool(i32::from(result)) }
 }
 
@@ -2185,6 +2185,49 @@ fn dispatch_text_slot(
     Some(Ok(text))
 }
 
+thread_local! {
+    /// Containers whose repr is in progress on this thread (CPython's
+    /// `Py_ReprEnter` registry).
+    static REPR_IN_PROGRESS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// CPython `Py_ReprEnter`/`Py_ReprLeave`: marks a container's repr as in
+/// progress so a self-referential structure — or a cycle through user
+/// `__repr__`s, e.g. numpy's meson FeatureObject implication graph — prints
+/// the placeholder (`[...]`, `{...}`, `set(...)`) on revisit instead of
+/// recursing to a host stack overflow.
+pub(crate) struct ReprGuard {
+    object: usize,
+}
+
+impl ReprGuard {
+    /// `None` when `object`'s repr is already in progress on this thread:
+    /// the caller prints its type's placeholder.
+    pub(crate) fn enter(object: *mut PyObject) -> Option<Self> {
+        let key = object as usize;
+        REPR_IN_PROGRESS.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if stack.contains(&key) {
+                None
+            } else {
+                stack.push(key);
+                Some(Self { object: key })
+            }
+        })
+    }
+}
+
+impl Drop for ReprGuard {
+    fn drop(&mut self) {
+        REPR_IN_PROGRESS.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if let Some(position) = stack.iter().rposition(|entry| *entry == self.object) {
+                stack.remove(position);
+            }
+        });
+    }
+}
+
 /// Native repr whitelist (no Python-level dispatch).  `Err(())` propagates a
 /// pending exception raised by a container element's `__repr__`.
 pub(crate) fn repr_text_no_dispatch(object: *mut PyObject) -> Result<String, ()> {
@@ -2294,6 +2337,9 @@ pub(crate) fn repr_text_no_dispatch(object: *mut PyObject) -> Result<String, ()>
                 }
             }
             if name == "tuple" {
+                let Some(_guard) = ReprGuard::enter(object) else {
+                    return Ok("(...)".to_owned());
+                };
                 let tuple = &*object.cast::<crate::types::tuple::PyTuple>();
                 return format_sequence(SequenceKind::Tuple, tuple.as_slice());
             }
@@ -2314,20 +2360,24 @@ pub(crate) fn repr_text_no_dispatch(object: *mut PyObject) -> Result<String, ()>
             }
             if name == "set" {
                 if let Ok(entries) = crate::types::set_::entries_snapshot(object) {
-                    return if entries.is_empty() {
-                        Ok("set()".to_owned())
-                    } else {
-                        Ok(format!("{{{}}}", join_repr(&entries)?))
+                    if entries.is_empty() {
+                        return Ok("set()".to_owned());
+                    }
+                    let Some(_guard) = ReprGuard::enter(object) else {
+                        return Ok("set(...)".to_owned());
                     };
+                    return Ok(format!("{{{}}}", join_repr(&entries)?));
                 }
             }
             if name == "frozenset" {
                 if let Ok(entries) = crate::types::frozenset::entries_snapshot(object) {
-                    return if entries.is_empty() {
-                        Ok("frozenset()".to_owned())
-                    } else {
-                        Ok(format!("frozenset({{{}}})", join_repr(&entries)?))
+                    if entries.is_empty() {
+                        return Ok("frozenset()".to_owned());
+                    }
+                    let Some(_guard) = ReprGuard::enter(object) else {
+                        return Ok("frozenset(...)".to_owned());
                     };
+                    return Ok(format!("frozenset({{{}}})", join_repr(&entries)?));
                 }
             }
             return Ok(format!("<{name} object>"));
@@ -2358,6 +2408,9 @@ fn join_repr(items: &[*mut PyObject]) -> Result<String, ()> {
 }
 
 fn dict_repr(object: *mut PyObject) -> Result<String, ()> {
+    let Some(_guard) = ReprGuard::enter(object) else {
+        return Ok("{...}".to_owned());
+    };
     let entries = match unsafe { crate::types::dict::dict_entries_snapshot(object) } {
         Ok(entries) => entries,
         Err(message) => {
@@ -2610,38 +2663,12 @@ unsafe fn type_object(object: *mut PyObject) -> Option<*mut PyType> {
         None
     }
 }
-unsafe fn is_callable_object(object: *mut PyObject) -> bool {
-    // CPython `callable(o)` is `type(o)->tp_call != NULL`.  pon's function/
-    // method/type objects dispatch through dedicated `pon_call` fast paths
-    // without tp_call slots, so they are named explicitly; everything else is
-    // callable when its type carries tp_call or its MRO defines `__call__`
-    // (heap instances go through the DunderCall path).
-    // Tagged small ints are ints: never callable, and must not be
-    // dereferenced as heap pointers.
-    if crate::tag::is_small_int(object) {
-        return false;
-    }
-    if unsafe { type_name(object).is_some_and(|name| matches!(name, "function" | "method" | "type")) } {
-        return true;
-    }
-    if object.is_null() {
-        return false;
-    }
-    let ty = unsafe { (*object).ob_type.cast_mut() };
-    if ty.is_null() {
-        return false;
-    }
-    if unsafe { (*ty).tp_call.is_some() } {
-        return true;
-    }
-    !unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern(crate::intern::DUNDER_CALL)) }.is_null()
-}
 
 
 /// The builtin classmethod/staticmethod carrier type objects, from the
 /// runtime global table (NULL entries when the runtime is not initialized
 /// never match).
-fn carrier_types() -> [*mut PyType; 2] {
+pub(crate) fn carrier_types() -> [*mut PyType; 2] {
     let lookup = |name: &str| {
         abi::runtime_global(crate::intern::intern(name))
             .map_or(core::ptr::null_mut(), |object| object.cast::<PyType>())
@@ -2676,6 +2703,33 @@ fn carrier_matches(value: *mut PyObject, carrier_types: &[*mut PyType; 2], funct
     false
 }
 
+/// Follows a decorator's `__wrapped__` chain (`functools.update_wrapper`)
+/// from a class-dict entry down to the executing function, bounded against
+/// cycles.  `functools.lru_cache`-style decorators store the WRAPPER in the
+/// class dict while zero-arg `super()` executes the wrapped user function
+/// (meson's `CLikeCompiler.can_compile`).
+fn wrapped_chain_matches(value: *mut PyObject, carriers: &[*mut PyType; 2], function: *mut PyObject) -> bool {
+    let mut current = value;
+    for _ in 0..8 {
+        if current.is_null() || !crate::tag::is_heap(current) {
+            return false;
+        }
+        // SAFETY: Generic attribute lookup tolerates any live object; a
+        // missing `__wrapped__` leaves a pending AttributeError we clear.
+        let wrapped = unsafe { abi::object::pon_get_attr(current, intern("__wrapped__"), ptr::null_mut()) };
+        if wrapped.is_null() {
+            pon_err_clear();
+            return false;
+        }
+        let wrapped = crate::tag::untag_arg(wrapped);
+        if wrapped == function || carrier_matches(wrapped, carriers, function) {
+            return true;
+        }
+        current = wrapped;
+    }
+    false
+}
+
 fn find_defining_class(function: *mut PyObject, ty: *mut PyType) -> Option<*mut PyType> {
     let carriers = carrier_types();
     let function_name = crate::types::function::function_name(function);
@@ -2689,15 +2743,30 @@ fn find_defining_class(function: *mut PyObject, ty: *mut PyType) -> Option<*mut 
             continue;
         }
         let dict = unsafe { &*dict.cast::<crate::types::type_::PyClassDict>() };
+        let matches = |value: *mut PyObject| {
+            value == function
+                || carrier_matches(value, &carriers, function)
+                || wrapped_chain_matches(value, &carriers, function)
+        };
         if let Some(name_id) = function_name_id {
             if let Some(value) = dict.get(name_id)
-                && (value == function || carrier_matches(value, &carriers, function))
+                && matches(value)
+            {
+                return Some(class);
+            }
+            // A method can be stored under a different name than the
+            // function's own (`other = method` rebinding): fall back to an
+            // identity/carrier scan.  Wrapper-chain probing stays name-keyed
+            // so the fallback never pays attr lookups per dict entry.
+            if dict
+                .iter()
+                .any(|(entry_name, value)| entry_name != name_id && (value == function || carrier_matches(value, &carriers, function)))
             {
                 return Some(class);
             }
             continue;
         }
-        if dict.iter().any(|(_, value)| value == function || carrier_matches(value, &carriers, function)) {
+        if dict.iter().any(|(_, value)| matches(value)) {
             return Some(class);
         }
     }

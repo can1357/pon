@@ -25,6 +25,12 @@ static FLOAT_TYPE: LazyLock<usize> = LazyLock::new(|| {
     Box::into_raw(Box::new(ty)) as usize
 });
 
+/// Returns the process-wide `float` type object (C-API twin registration).
+#[must_use]
+pub fn float_type() -> *mut PyType {
+    *FLOAT_TYPE as *mut PyType
+}
+
 /// Boxes an IEEE-754 double as a Python `float`.
 #[must_use]
 pub fn from_f64(value: f64) -> *mut PyObject {

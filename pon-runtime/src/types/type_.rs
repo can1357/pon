@@ -12,7 +12,7 @@ use crate::abi;
 use crate::descr;
 use crate::intern;
 use crate::mro;
-use crate::object::{PyObject, PyObjectHeader, PyType, PyUnicode, as_object_ptr, update_slot_from_dunder};
+use crate::object::{NewFunc, PyObject, PyObjectHeader, PyType, PyUnicode, as_object_ptr, update_slot_from_dunder};
 use crate::types::{dict, function, list::PyList, tuple::PyTuple};
 use crate::thread_state::pon_err_set;
 
@@ -1351,6 +1351,51 @@ unsafe fn wrap_class_getitem_as_classmethod(namespace: *mut PyClassDict) {
     }
 }
 
+/// CPython compile-time `__qualname__` approximation: every class-body
+/// callable — plain functions plus the payloads of
+/// classmethod/staticmethod/property carriers — gets `ClassName.attr`
+/// stamped unless a qualname was already assigned.  pickle's `save_global`
+/// resolves staticmethods through exactly this dotted path (meson pickles
+/// `EnvironmentVariables._set`).
+unsafe fn stamp_member_qualnames(class_name: &str, namespace: *mut PyClassDict) {
+    // Pre-runtime class construction (native-module seeds) must not allocate
+    // attr dicts; the stamp is for user classes built after init.
+    if abi::runtime_type_type().is_null() {
+        return;
+    }
+    let ns = unsafe { &*namespace };
+    for (name_id, value) in ns.iter() {
+        let Some(attr_name) = intern::resolve(name_id) else {
+            continue;
+        };
+        if value.is_null() || !crate::tag::is_heap(value) {
+            continue;
+        }
+        let qualname = format!("{class_name}.{attr_name}");
+        crate::types::function::stamp_function_qualname(value, &qualname);
+        if value.is_null() || !crate::tag::is_heap(value) {
+            continue;
+        }
+        // EXACT builtin carrier types only (pointer identity, never type
+        // NAME): enum defines a Python class literally named `property`,
+        // whose instances are heap instances, not `PyProperty` boxes.
+        // SAFETY: Heap pointer with a live header per the guard above.
+        let value_type = unsafe { (*value).ob_type.cast_mut() };
+        if crate::native::builtins_mod::carrier_types().contains(&value_type) {
+            // SAFETY: Carrier identity proved; PyClassMethod and
+            // PyStaticMethod share the wrapped-callable offset.
+            let callable = unsafe { (*value.cast::<crate::types::classmethod::PyClassMethod>()).callable };
+            crate::types::function::stamp_function_qualname(callable, &qualname);
+        } else if value_type == crate::native::builtins_mod::property_type() {
+            // SAFETY: Exact-type identity proved the PyProperty layout.
+            let property = unsafe { &*value.cast::<crate::types::property::PyProperty>() };
+            for target in [property.fget, property.fset, property.fdel] {
+                crate::types::function::stamp_function_qualname(target, &qualname);
+            }
+        }
+    }
+}
+
 /// `type.__new__` core: allocate and publish the heap type object.
 #[must_use]
 unsafe fn construct_class(
@@ -1367,6 +1412,7 @@ unsafe fn construct_class(
     unsafe { wrap_init_subclass_as_classmethod(namespace) };
     unsafe { wrap_class_getitem_as_classmethod(namespace) };
     unsafe { stamp_unhashable_for_eq_without_hash(namespace) };
+    unsafe { stamp_member_qualnames(name, namespace) };
     // CPython: `class C:` means `class C(object):` — the implicit terminus
     // applies to the CONSTRUCTED type (tp_base, MRO, registries) while the
     // Python-visible `bases` tuple handed to metaclasses stays as written.
@@ -1512,6 +1558,83 @@ unsafe fn construct_class(
     }
     if unsafe { !call_init_subclass(ty, base_types, keywords) } {
         return ptr::null_mut();
+    }
+    ty.cast::<PyObject>()
+}
+
+/// C-API `PyType_Ready` core: publishes a native type for a C-defined layout
+/// WITHOUT the heap-class layout decision tree (`construct_class` bakes
+/// `PyHeapInstance`-family sizes, dict offsets, and gc markers up front;
+/// C-extension instances have their own `tp_basicsize` layout and no
+/// instance dict).
+///
+/// The type gets the plain `type` metaclass; callers must reject foreign
+/// statics carrying a custom metatype BEFORE calling this. Slot bridging
+/// (`tp_new`/`tp_init`/`tp_repr`/...) is the caller's follow-up; entries
+/// already in `namespace` participate in attribute lookup immediately.
+///
+/// `PyType_Ready` parity: `__set_name__`/`__init_subclass__` do NOT run for
+/// C-defined types.
+///
+/// # Safety
+///
+/// `base_types` entries must be live type objects and `namespace` a live
+/// class dict; the runtime must be initialized.
+pub(crate) unsafe fn construct_capi_class(
+    name: &str,
+    base_types: &[*mut PyType],
+    namespace: *mut PyClassDict,
+    basicsize: usize,
+    itemsize: isize,
+    gc_type_id: usize,
+) -> *mut PyObject {
+    if namespace.is_null() {
+        return raise_object("class namespace is NULL");
+    }
+    // Builtin ancestors' native method surfaces must exist before MRO
+    // lookups on the new class resolve through them.
+    for &base in base_types {
+        for entry in unsafe { crate::mro::mro_entries(base) } {
+            if !entry.is_null() && unsafe { (*entry).gc_type_id != TYPE_ID_HEAP_INSTANCE.0 as usize } {
+                unsafe { crate::descr::ensure_builtin_type_surface(entry) };
+            }
+        }
+    }
+    let static_name = leak_type_name(name);
+    let mut ty = PyType::new(abi::runtime_type_type(), static_name, basicsize);
+    ty.tp_base = base_types.first().copied().unwrap_or(ptr::null_mut());
+    ty.tp_dict = namespace.cast::<PyObject>();
+    ty.tp_dictoffset = 0;
+    ty.tp_itemsize = itemsize;
+    ty.tp_getattro = Some(descr::generic_get_attr);
+    ty.tp_setattro = Some(descr::generic_set_attr);
+    ty.gc_type_id = gc_type_id;
+
+    let ty = Box::into_raw(Box::new(ty));
+    unsafe { mro::set_declared_bases(ty, base_types) };
+    if unsafe { mro::set_c3_mro(ty, base_types) } < 0 {
+        // Nothing was published yet; reclaim the box so a failed
+        // `PyType_Ready` leaves no stale roots behind.
+        // SAFETY: `ty` came from `Box::into_raw` above and never escaped.
+        drop(unsafe { Box::from_raw(ty) });
+        return ptr::null_mut();
+    }
+    // Publication only after every fallible step succeeded.
+    // GC visibility: the type box is malloc'd, so the collector can only keep
+    // the namespace's GC values alive through the namespaced-type root set.
+    crate::sync::register_namespaced_type(ty);
+    for ancestor in unsafe { mro::mro_entries(ty) } {
+        if !ancestor.is_null() && ancestor != ty {
+            crate::sync::register_subclass(ancestor, ty);
+        }
+    }
+    for base in base_types.iter().copied() {
+        if !base.is_null() && base != ty {
+            crate::sync::register_direct_subclass(base, ty);
+        }
+    }
+    for (name, value) in unsafe { (&*namespace).iter().collect::<Vec<_>>() } {
+        let _ = update_slot_from_dunder(ty, name, value);
     }
     ty.cast::<PyObject>()
 }
@@ -2056,6 +2179,48 @@ pub unsafe extern "C" fn type_init(_self: *mut PyObject, _args: *mut PyObject, _
     0
 }
 
+/// True when construction proceeds to `__init__`/`tp_init` after `new`
+/// produced `instance`. Shared by both constructor paths (`type_call` and
+/// `abi::call_type_from_argv`) so their semantics cannot drift.
+///
+/// Builtin native constructors (`tp_new != type_new`) perform COMPLETE
+/// construction: the returned object is fully initialized from the call
+/// arguments, and a class-dict `__init__` resolving through the builtin's
+/// MRO must not run a second construction pass — `list(map(...))` would
+/// re-consume the exhausted iterator. C-extension classes are the
+/// exception: their `tp_new` bridge only allocates (CPython `type_call`
+/// semantics), so initialization still runs — but only when `tp_new`
+/// produced an instance of `cls`, matching CPython's guard.
+pub(crate) unsafe fn construction_runs_init(cls: *mut PyType, new: NewFunc, instance: *mut PyObject) -> bool {
+    if new as *const () as usize == type_new as *const () as usize {
+        return true;
+    }
+    if unsafe { !crate::capi::is_capi_class(cls) } || !crate::tag::is_heap(instance) {
+        return false;
+    }
+    // SAFETY: heap-tagged instances carry a readable header.
+    let instance_type = unsafe { (*instance).ob_type.cast_mut() };
+    !instance_type.is_null() && unsafe { crate::mro::is_subtype(instance_type, cls) }
+}
+
+/// `__init__` resolution for the constructor paths: plain MRO lookup, except
+/// that object's permissive default carrier must not shadow a C-extension
+/// class's bridged `tp_init` — CPython's `PyType_Ready` installs a slot
+/// wrapper in the class's own dict, which is more derived than
+/// `object.__init__`. Any real `__init__` (own dict or a base class's)
+/// still wins.
+pub(crate) unsafe fn construction_init_override(cls: *mut PyType) -> *mut PyObject {
+    let init = unsafe { descr::lookup_in_type(cls, intern::intern("__init__")) };
+    if !init.is_null()
+        && init == abi::object_dunder_init_carrier()
+        && unsafe { crate::capi::is_capi_class(cls) }
+        && unsafe { (*cls).tp_init }.is_some()
+    {
+        return ptr::null_mut();
+    }
+    init
+}
+
 /// `type.__call__`: allocate via `__new__`, then invoke `__init__` when present.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn type_call(cls_obj: *mut PyObject, args: *mut PyObject, kwargs: *mut PyObject) -> *mut PyObject {
@@ -2076,20 +2241,11 @@ pub unsafe extern "C" fn type_call(cls_obj: *mut PyObject, args: *mut PyObject, 
         return ptr::null_mut();
     }
 
-    // Builtin native constructors (tp_new != type_new) perform COMPLETE
-    // construction: the returned object is fully initialized from `args`.
-    // The class-dict `__init__` installed for heap subclasses resolving
-    // through the builtin's MRO (dict/list surfaces) must not run a second
-    // construction pass here — `list(map(...))` would re-consume the
-    // exhausted iterator and replace the contents with the empty tail.
-    // Constructed heap classes always carry `tp_new == type_new`, so their
-    // Python-level `__init__` chains still dispatch below.
-    if new as *const () as usize != type_new as *const () as usize {
+    if !unsafe { construction_runs_init(cls, new, instance) } {
         return instance;
     }
 
-    let init_name = intern::intern("__init__");
-    let init = unsafe { descr::lookup_in_type(cls, init_name) };
+    let init = unsafe { construction_init_override(cls) };
     if !init.is_null() {
         let bound = unsafe { descr::descriptor_get(init, instance, cls) };
         if bound.is_null() {
@@ -2107,7 +2263,17 @@ pub unsafe extern "C" fn type_call(cls_obj: *mut PyObject, args: *mut PyObject, 
             return ptr::null_mut();
         }
     } else if let Some(init_slot) = unsafe { (*cls).tp_init } {
-        if unsafe { init_slot(instance, args, kwargs) } < 0 {
+        // A C-extension class's bridged `tp_init` follows the CPython
+        // contract: a real (possibly empty) tuple, never NULL.
+        let args_object = if args.is_null() && unsafe { crate::capi::is_capi_class(cls) } {
+            match abi::empty_args_tuple() {
+                Ok(tuple) => tuple,
+                Err(message) => return raise_object(message),
+            }
+        } else {
+            args
+        };
+        if unsafe { init_slot(instance, args_object, kwargs) } < 0 {
             return ptr::null_mut();
         }
     }

@@ -827,24 +827,7 @@ unsafe extern "C" fn defaultdict_init_method(argv: *mut *mut PyObject, argc: usi
         None => none(),
         Some(value) if value == none() => none(),
         Some(value) => {
-            // Mirror `callable()`: functions/methods/types are callable via
-            // dedicated fast paths even without `tp_call`, and other objects
-            // are callable when their type exposes `tp_call` or `__call__`.
-            let callable = if crate::tag::is_small_int(value) || value.is_null() {
-                false
-            } else if matches!(
-                unsafe { crate::types::dict::type_name(value) },
-                Some("function" | "method" | "type")
-            ) {
-                true
-            } else {
-                let ty = unsafe { (*value).ob_type.cast_mut() };
-                !ty.is_null()
-                    && (unsafe { (*ty).tp_call.is_some() }
-                        || !unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern(crate::intern::DUNDER_CALL)) }
-                            .is_null())
-            };
-            if !callable {
+            if !crate::abi::call::is_callable_object(value) {
                 return raise_type_error("first argument must be callable or None");
             }
             value

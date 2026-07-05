@@ -31,6 +31,12 @@ static COMPLEX_TYPE: LazyLock<usize> = LazyLock::new(|| {
     Box::into_raw(Box::new(ty)) as usize
 });
 
+/// Returns the process-wide `complex` type object (C-API twin registration).
+#[must_use]
+pub fn complex_type() -> *mut PyType {
+    *COMPLEX_TYPE as *mut PyType
+}
+
 /// Boxes a pair of IEEE-754 doubles as a Python `complex`.
 #[must_use]
 pub fn from_f64s(real: f64, imag: f64) -> *mut PyObject {

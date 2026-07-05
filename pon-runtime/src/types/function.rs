@@ -1015,6 +1015,36 @@ pub unsafe extern "C" fn function_setattro(function: *mut PyObject, name: *mut P
     }
 }
 
+/// Stamps `__qualname__` into `function`'s attr dict unless one is already
+/// stored.  Class construction gives class-body callables their CPython
+/// dotted qualname (`EnvironmentVariables._set`); pickle's `save_global`
+/// resolves staticmethods through exactly that dotted path.
+pub(crate) fn stamp_function_qualname(function: *mut PyObject, qualname: &str) {
+    if function.is_null() || !crate::tag::is_heap(function) || !is_function_object(function) {
+        return;
+    }
+    let dict = unsafe { ensure_function_attr_dict(function) };
+    if dict.is_null() {
+        crate::thread_state::pon_err_clear();
+        return;
+    }
+    let key = const_str("__qualname__");
+    if key.is_null() {
+        crate::thread_state::pon_err_clear();
+        return;
+    }
+    // A compile-time or user-assigned qualname wins.
+    if matches!(unsafe { dict::dict_get(dict, key) }, Ok(Some(_))) {
+        return;
+    }
+    let value = const_str(qualname);
+    if value.is_null() {
+        crate::thread_state::pon_err_clear();
+        return;
+    }
+    let _ = unsafe { dict::dict_insert(dict, key, value) };
+}
+
 pub unsafe fn set_function_annotations(
     function: *mut PyObject,
     names: &[u32],
@@ -1758,6 +1788,9 @@ pub unsafe fn call_bound_function(
     if code.is_null() {
         return Err("function code pointer is null".to_owned());
     }
+    if let Some(raised) = crate::abi::guard_recursion_limit() {
+        return Ok(raised);
+    }
     let _guard = crate::abi::push_current_call(function.cast::<PyFunction>(), argv.as_mut_ptr(), argv.len());
     let _handled_guard = crate::abi::HandledExcGuard::enter_clearing_pending();
     // SAFETY: Function entrypoints are emitted with the compiled-code ABI.
@@ -1828,7 +1861,9 @@ fn bind_native_keywords(
         return Err(format!("cannot bind keyword arguments for '{type_name}' object: expected a function"));
     }
     let Some(name) = function_name(function) else {
-        return Err("keyword arguments require Phase-B function metadata".to_owned());
+        return Err(raise_boxed_type_error(
+            "keyword arguments require Phase-B function metadata".to_owned(),
+        ));
     };
     // Same-named natives differ by DEFINING MODULE (`zlib.compress(level=)`
     // vs bz2's `compresslevel=` vs the zstd method shape): qualify first,
@@ -1862,8 +1897,70 @@ fn bind_module_qualified_keywords(
         ("bz2" | "_bz2", "compress") => {
             Some(bind_optional_named_keywords(positional, keywords, "compress", &["data", "compresslevel"], 1))
         }
+        // `os.posix_spawn(path, argv, env, /, *, file_actions=(),
+        // setpgroup=None, resetids=False, setsid=False, setsigmask=(),
+        // setsigdef=(), scheduler=None)` and the `posix_spawnp` twin:
+        // subprocess's `_posix_spawn` fast path passes `file_actions=` and
+        // `setsigdef=`.  Absent optionals arrive as None and the native
+        // entry applies the CPython defaults.
+        ("os" | "posix", "posix_spawn" | "posix_spawnp") => {
+            Some(bind_posix_spawn_keywords(positional, keywords, name))
+        }
+        // `os.utime(path, times=None, *, ns=(), dir_fd=None,
+        // follow_symlinks=True)`: `shutil.copystat` (meson's `--internal
+        // copy`) passes `ns=` and `follow_symlinks=`.  Absent optionals
+        // arrive as None.
+        ("os" | "posix", "utime") => Some(bind_optional_named_keywords(
+            positional,
+            keywords,
+            "utime",
+            &["path", "times", "ns", "dir_fd", "follow_symlinks"],
+            2,
+        )),
         _ => None,
     }
+}
+
+/// `os.posix_spawn`/`posix_spawnp`: `path`, `argv`, `env` are
+/// positional-only, the seven spawn options keyword-only; keywords flatten
+/// into slots 3..10 with None filling absent optionals.
+fn bind_posix_spawn_keywords(
+    positional: &[*mut PyObject],
+    keywords: KeywordArgs<'_>,
+    function_name: &str,
+) -> Result<Vec<*mut PyObject>, String> {
+    for name in keywords.names.iter().copied() {
+        let actual = keyword_name(name);
+        if matches!(actual.as_str(), "path" | "argv" | "env") {
+            return Err(raise_boxed_type_error(format!(
+                "{function_name}() got some positional-only arguments passed as keyword arguments: '{actual}'"
+            )));
+        }
+    }
+    if positional.len() != 3 {
+        return Err(raise_boxed_type_error(format!(
+            "{function_name}() takes exactly 3 positional arguments ({} given)",
+            positional.len()
+        )));
+    }
+    bind_optional_named_keywords(
+        positional,
+        keywords,
+        function_name,
+        &[
+            "path",
+            "argv",
+            "env",
+            "file_actions",
+            "setpgroup",
+            "resetids",
+            "setsid",
+            "setsigmask",
+            "setsigdef",
+            "scheduler",
+        ],
+        3,
+    )
 }
 
 pub(crate) fn bind_native_keywords_for_name(
@@ -1887,6 +1984,17 @@ pub(crate) fn bind_native_keywords_for_name(
         // required positional; `keepends` may arrive positionally or by
         // keyword (Cython's Code.py passes `keepends=True`).
         "splitlines" => bind_single_keyword(positional, keywords, "splitlines", "keepends", 1, 2),
+        // `str.encode(encoding='utf-8', errors='strict')` and
+        // `bytes.decode(encoding='utf-8', errors='strict')`: the bound
+        // receiver occupies the first slot and absent optionals arrive as
+        // None, which the native entries read as the defaults (numpy's
+        // meson.build encodes compiler probes with `encoding=`).
+        "encode" => {
+            bind_optional_named_keywords(positional, keywords, "encode", &["self", "encoding", "errors"], 3)
+        }
+        "decode" => {
+            bind_optional_named_keywords(positional, keywords, "decode", &["self", "encoding", "errors"], 3)
+        }
         // `dict(*args, **kwargs)`: arbitrary keyword names become entries;
         // the raw pairs ride a trailing marker that `builtin_dict` merges
         // after the positional mapping/iterable (argparse's
@@ -1967,6 +2075,13 @@ pub(crate) fn bind_native_keywords_for_name(
         "zip_longest" => bind_trailing_marker_keywords(positional, keywords, "zip_longest", &["fillvalue"]),
         "product" => bind_trailing_marker_keywords(positional, keywords, "product", &["repeat"]),
         "complex" => bind_named_positional_keywords(positional, keywords, "complex", &["real", "imag"], 0, 2),
+        // Builtin data constructors reached as TYPE callees through
+        // `call_builtin_type_with_keywords` (numpy's meson features module
+        // hashes with `bytes(str(a), encoding='utf-8')`).
+        "str" => bind_str_constructor_keywords(positional, keywords),
+        "bytes" => bind_bytes_constructor_keywords(positional, keywords, "bytes"),
+        "bytearray" => bind_bytes_constructor_keywords(positional, keywords, "bytearray"),
+        "int" => bind_int_constructor_keywords(positional, keywords),
         // Native `_struct.unpack_from(format, buffer, offset=0)`; the bound
         // `Struct.unpack_from(buffer, offset=0)` shape fits because the
         // receiver occupies the first slot. Absent optionals arrive as None.
@@ -2216,7 +2331,12 @@ pub(crate) fn bind_native_keywords_for_name(
             ],
             9,
         ),
-        _ => Err(format!("keyword arguments require Phase-B function metadata ('{name}')")),
+        // Boxed: the message must surface as a real, catchable TypeError
+        // (CPython's kind for keyword-binding failures), not a bare
+        // thread-state string that later poisons `raise`/`except` matching.
+        _ => Err(raise_boxed_type_error(format!(
+            "keyword arguments require Phase-B function metadata ('{name}')"
+        ))),
     }
 }
 
@@ -2269,6 +2389,121 @@ fn bind_optional_named_keywords(
         if slot.is_null() {
             *slot = none;
         }
+    }
+    Ok(argv)
+}
+
+/// Slot-binding core for the builtin data constructors: keywords land in
+/// their named slot (`""` marks positional-only slots that never match a
+/// keyword), unknown/duplicate names raise boxed TypeErrors, trailing absent
+/// slots are truncated so complete prefixes flatten to the exact positional
+/// layout, and interior absent slots stay NULL for the constructor-specific
+/// arm to resolve.  Explicit `None` values pass through untouched and fail
+/// in the native entry exactly like a positional call.
+fn bind_constructor_slots(
+    positional: &[*mut PyObject],
+    keywords: KeywordArgs<'_>,
+    function_name: &str,
+    names: &[&str],
+) -> Result<Vec<*mut PyObject>, String> {
+    if positional.len() > names.len() {
+        return Err(raise_boxed_type_error(format!(
+            "{function_name}() expected at most {} arguments, got {}",
+            names.len(),
+            positional.len()
+        )));
+    }
+    let mut argv = positional.to_vec();
+    argv.resize(names.len(), ptr::null_mut());
+    for (name, value) in keywords.names.iter().copied().zip(keywords.values.iter().copied()) {
+        if value.is_null() {
+            return Err(format!("keyword argument {} is NULL", keyword_name(name)));
+        }
+        let actual = keyword_name(name);
+        let Some(index) = names.iter().position(|expected| !expected.is_empty() && *expected == actual) else {
+            return Err(raise_boxed_type_error(format!(
+                "{function_name}() got an unexpected keyword argument '{actual}'"
+            )));
+        };
+        if index < positional.len() || !argv[index].is_null() {
+            return Err(raise_boxed_type_error(format!(
+                "{function_name}() got multiple values for argument '{actual}'"
+            )));
+        }
+        argv[index] = value;
+    }
+    while argv.last().is_some_and(|slot| slot.is_null()) {
+        argv.pop();
+    }
+    Ok(argv)
+}
+
+/// `str(object='', encoding=..., errors=...)`: an absent `object` is the
+/// empty string (CPython returns `''` whatever else was passed by keyword),
+/// and an absent `encoding` before a present `errors` defaults to UTF-8
+/// (`str(b, errors='strict')` decodes).
+fn bind_str_constructor_keywords(
+    positional: &[*mut PyObject],
+    keywords: KeywordArgs<'_>,
+) -> Result<Vec<*mut PyObject>, String> {
+    let mut argv = bind_constructor_slots(positional, keywords, "str", &["object", "encoding", "errors"])?;
+    if argv.first().copied().is_some_and(|slot| slot.is_null()) {
+        return Ok(Vec::new());
+    }
+    if let Some(slot) = argv.get_mut(1) {
+        if slot.is_null() {
+            let utf8 = "utf-8";
+            let utf8 = unsafe { crate::abi::pon_const_str(utf8.as_ptr(), utf8.len()) };
+            if utf8.is_null() {
+                return Err("failed to allocate the default str() encoding".to_owned());
+            }
+            *slot = utf8;
+        }
+    }
+    Ok(argv)
+}
+
+/// `bytes(source=b'', encoding=..., errors=...)` and the `bytearray` twin:
+/// keyword holes reproduce CPython's exact TypeErrors — `encoding without a
+/// string argument`, `errors without a string argument`, and `string
+/// argument without an encoding`.
+fn bind_bytes_constructor_keywords(
+    positional: &[*mut PyObject],
+    keywords: KeywordArgs<'_>,
+    function_name: &str,
+) -> Result<Vec<*mut PyObject>, String> {
+    let argv = bind_constructor_slots(positional, keywords, function_name, &["source", "encoding", "errors"])?;
+    if argv.first().copied().is_some_and(|slot| slot.is_null()) {
+        let message = if argv.get(1).copied().is_some_and(|slot| !slot.is_null()) {
+            "encoding without a string argument"
+        } else {
+            "errors without a string argument"
+        };
+        return Err(raise_boxed_type_error(message.to_owned()));
+    }
+    if argv.len() == 3 && argv[1].is_null() {
+        let source = crate::tag::untag_arg(argv[0]);
+        let source_is_str =
+            !source.is_null() && unsafe { crate::types::dict::type_name(source) } == Some("str");
+        let message = if source_is_str {
+            "string argument without an encoding"
+        } else {
+            "errors without a string argument"
+        };
+        return Err(raise_boxed_type_error(message.to_owned()));
+    }
+    Ok(argv)
+}
+
+/// `int(x, /, base=10)`: `x` is positional-only, and a base-only keyword
+/// call raises CPython's `int() missing string argument`.
+fn bind_int_constructor_keywords(
+    positional: &[*mut PyObject],
+    keywords: KeywordArgs<'_>,
+) -> Result<Vec<*mut PyObject>, String> {
+    let argv = bind_constructor_slots(positional, keywords, "int", &["", "base"])?;
+    if argv.first().copied().is_some_and(|slot| slot.is_null()) {
+        return Err(raise_boxed_type_error("int() missing string argument".to_owned()));
     }
     Ok(argv)
 }

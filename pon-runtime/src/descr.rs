@@ -274,6 +274,8 @@ pub(crate) unsafe fn ensure_builtin_type_surface(ty: *mut PyType) {
         dict::ensure_dict_subclass_methods_installed();
     } else if type_name == "list" {
         crate::abi::seq::ensure_list_type_methods_installed(ty);
+    } else if type_name == "tuple" {
+        crate::abi::seq::ensure_tuple_type_methods_installed(ty);
     } else if type_name == "str" {
         crate::abi::str_::ensure_str_type_methods_installed(ty);
     } else if type_name == "bytes" {
@@ -290,6 +292,28 @@ pub(crate) unsafe fn ensure_builtin_type_surface(ty: *mut PyType) {
         // CPython's `bool.bit_length is int.bit_length` identity.
         crate::types::int::ensure_int_surface_on_global();
     }
+}
+
+/// Fallback for a native container `tp_getattro` whose fast-path name table
+/// missed: resolve through the canonical type's materialized tp_dict surface
+/// with descriptor binding (`some_list.__iter__` — configparser's
+/// `SectionProxy.__iter__` calls it explicitly), raising CPython's
+/// AttributeError when the MRO misses too.
+pub(crate) fn native_instance_surface_attr(object: *mut PyObject, name: &str) -> *mut PyObject {
+    let raw = crate::tag::untag_arg(object);
+    if !raw.is_null() && crate::tag::is_heap(raw) {
+        // SAFETY: Heap pointer with a live header after the tag checks.
+        let ty = unsafe { (*raw).ob_type.cast_mut() };
+        let canonical = unsafe { crate::types::type_::canonical_type_object(ty) };
+        let lookup_ty = if canonical.is_null() { ty } else { canonical };
+        unsafe { ensure_builtin_type_surface(lookup_ty) };
+        let descriptor = unsafe { lookup_in_type(lookup_ty, intern::intern(name)) };
+        if !descriptor.is_null() {
+            return unsafe { descriptor_get(descriptor, raw, lookup_ty) };
+        }
+    }
+    // SAFETY: Typed raise helper tolerates any live (or tagged) object.
+    unsafe { abi::exc::pon_raise_attribute_error(object, intern::intern(name)) }
 }
 
 unsafe fn synthetic_type_attr(ty: *mut PyType, name_id: u32) -> *mut PyObject {
@@ -312,10 +336,12 @@ unsafe fn synthetic_type_attr(ty: *mut PyType, name_id: u32) -> *mut PyObject {
 }
 
 unsafe fn set_instance_dict(object: *mut PyObject, value: *mut PyObject) -> c_int {
-    let instance = object.cast::<PyHeapInstance>();
-    if unsafe { (*instance).dict.is_null() } {
+    // Layout gate: dict-less instances (see `instance_dict`) reject
+    // `__dict__` assignment outright.
+    if unsafe { instance_dict(object) }.is_null() {
         return raise_missing_attr_status(object, intern::intern("__dict__"));
     }
+    let instance = object.cast::<PyHeapInstance>();
     let replacement = type_::new_namespace();
     if !value.is_null() {
         if unsafe { !dict::is_dict(value) } {
@@ -486,6 +512,12 @@ unsafe fn is_type_object(object: *mut PyObject) -> bool {
     unsafe { (*meta).name() == "type" || mro::mro_entries(meta).iter().any(|ty| !ty.is_null() && (**ty).name() == "type") }
 }
 
+/// Layout-gated instance dict: `tp_dictoffset == 0` marks layouts whose
+/// instances carry NO `PyHeapInstance` dict slot (slot-only classes,
+/// C-extension instances); reading through the cast would misread their
+/// payload. This is the single place that decides "does this instance have
+/// a dict?" — every dict probe (slow path, IC replay, setattr) goes
+/// through it.
 unsafe fn instance_dict(object: *mut PyObject) -> *mut PyClassDict {
     if object.is_null() {
         return ptr::null_mut();
@@ -493,6 +525,11 @@ unsafe fn instance_dict(object: *mut PyObject) -> *mut PyClassDict {
     if unsafe { is_type_object(object) } {
         let ty = object.cast::<PyType>();
         return unsafe { (*ty).tp_dict.cast::<PyClassDict>() };
+    }
+    // SAFETY: non-type heap objects carry a readable header.
+    let ty = unsafe { (*object).ob_type };
+    if ty.is_null() || unsafe { (*ty).tp_dictoffset } == 0 {
+        return ptr::null_mut();
     }
     let instance = object.cast::<PyHeapInstance>();
     unsafe { (*instance).dict }
@@ -543,7 +580,7 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
                 AttrCacheKind::DictOffset => {
                     // The record proved the name resolves from the instance
                     // dict (no shadowing data descriptor at this version).
-                    let dict = unsafe { (*object.cast::<PyHeapInstance>()).dict };
+                    let dict = unsafe { instance_dict(object) };
                     if !dict.is_null() {
                         if let Some(value) = unsafe { (&*dict).get(name_id) } {
                             return value;
@@ -555,7 +592,7 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
                 }
                 AttrCacheKind::Descriptor => {
                     if ic.offset == ATTR_DESCR_PROBE_DICT {
-                        let dict = unsafe { (*object.cast::<PyHeapInstance>()).dict };
+                        let dict = unsafe { instance_dict(object) };
                         if !dict.is_null() {
                             if let Some(value) = unsafe { (&*dict).get(name_id) } {
                                 return value;

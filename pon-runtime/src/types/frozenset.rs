@@ -240,7 +240,7 @@ unsafe extern "C" fn frozenset_getattro_slot(object: *mut PyObject, name: *mut P
             crate::abi::map::pon_set_bound_method(object, name)
         },
         "__doc__" => unsafe { crate::abi::pon_none() },
-        _ => crate::abi::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
+        _ => crate::descr::native_instance_surface_attr(object, name),
     }
 }
 

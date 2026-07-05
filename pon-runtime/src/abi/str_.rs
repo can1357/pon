@@ -2815,6 +2815,19 @@ fn expect_translate_table(value: *mut PyObject) -> Result<Cow<'static, str_type:
     if unsafe { (*value).ob_type } == str_translate_table_type().cast_const() {
         return Ok(Cow::Borrowed(unsafe { &(*value.cast::<PyStrTranslateTable>()).table }));
     }
+    // A bytes-like table indexes by ordinal (`bytes.maketrans` products;
+    // numpy's generate_umath uppercases through one).  Ordinals past the
+    // table's length raise LookupError in CPython, which translate treats
+    // as "leave the character unchanged" — omitting them matches.
+    if let Ok(bytes) = expect_bytes_like(value) {
+        let mut table = str_type::TranslationTable::new();
+        for (index, byte) in bytes.iter().enumerate() {
+            let Some(source) = char::from_u32(index as u32) else { continue };
+            let Some(replacement) = char::from_u32(u32::from(*byte)) else { continue };
+            table.insert(source, Some(replacement.to_string()));
+        }
+        return Ok(Cow::Owned(table));
+    }
     translate_table_from_dict(value).map(Cow::Owned)
 }
 

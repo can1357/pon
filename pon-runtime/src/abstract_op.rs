@@ -624,11 +624,22 @@ pub unsafe fn get_attr(object: *mut PyObject, name: u32) -> *mut PyObject {
         if name == crate::intern::intern("__doc__") {
             return unsafe { crate::abi::pon_none() };
         }
-        let attr = crate::intern::resolve(name).unwrap_or_else(|| format!("<interned:{name}>"));
-        return raise_type_error(&format!(
-            "'{}' object does not support attribute lookup (attribute '{attr}')",
-            unsafe { (*ty).name() },
-        ));
+        // Slotless builtin receivers (str/bytes/list/...): materialize the
+        // native tp_dict surface on demand — the same install type-level
+        // access performs lazily — and resolve through the MRO with
+        // descriptor binding, so a cold `sys.path[0].endswith(...)` load
+        // works without a prior warming call.  Helper-family shadow types
+        // canonicalize first so every shadow shares the canonical dict.
+        let canonical = unsafe { crate::types::type_::canonical_type_object(ty) };
+        let lookup_ty = if canonical.is_null() { ty } else { canonical };
+        unsafe { crate::descr::ensure_builtin_type_surface(lookup_ty) };
+        let descriptor = unsafe { crate::descr::lookup_in_type(lookup_ty, name) };
+        if !descriptor.is_null() {
+            return unsafe { crate::descr::descriptor_get(descriptor, object, lookup_ty) };
+        }
+        // CPython raises AttributeError for a missing attribute on builtin
+        // receivers; `hasattr`/three-arg `getattr` depend on the kind.
+        return unsafe { abi::exc::pon_raise_attribute_error(object, name) };
     };
     let Some(name_object) = interned_name_object(name) else {
         return raise_type_error("attribute name is not interned");

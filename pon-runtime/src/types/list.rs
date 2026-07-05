@@ -62,6 +62,9 @@ pub unsafe fn list_repr(object: *mut PyObject) -> Result<String, String> {
     if object.is_null() {
         return Err("list repr received NULL".to_owned());
     }
+    let Some(_guard) = crate::native::builtins_mod::ReprGuard::enter(object) else {
+        return Ok("[...]".to_owned());
+    };
     let list = unsafe { &*object.cast::<PyList>() };
     let items = unsafe { list.as_slice() };
     let mut out = String::from("[");

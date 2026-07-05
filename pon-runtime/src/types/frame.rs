@@ -198,7 +198,9 @@ pub struct PyFrameLocalsProxy {
 }
 
 /// Returns the process-lifetime `FrameLocalsProxy` type object, creating it if
-/// needed.
+/// needed.  The type carries a small mapping-method surface in its tp_dict
+/// (`get`/`keys`/`values`/`items`/`__contains__`/`__len__`): PEP 667 proxies
+/// are full mappings, and Cython's compiler probes `f_locals.get(...)`.
 pub fn ensure_frame_locals_proxy_type(type_type: *mut PyType) -> *mut PyType {
     let mut slot = FRAME_LOCALS_PROXY_TYPE.lock().unwrap_or_else(|poison| poison.into_inner());
     if let Some(ptr) = *slot {
@@ -208,7 +210,35 @@ pub fn ensure_frame_locals_proxy_type(type_type: *mut PyType) -> *mut PyType {
     let mut ty = PyType::new(type_type.cast_const(), "FrameLocalsProxy", mem::size_of::<PyFrameLocalsProxy>());
     ty.gc_type_id = TYPE_ID_FRAME_LOCALS_PROXY.0 as usize;
     ty.tp_as_mapping = *FRAME_LOCALS_PROXY_MAPPING_METHODS as *mut PyMappingMethods;
+    let namespace = crate::types::type_::new_namespace();
+    if !namespace.is_null() {
+        type Entry = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
+        let methods: [(&str, Entry); 6] = [
+            ("get", frame_locals_proxy_get_method),
+            ("keys", frame_locals_proxy_keys_method),
+            ("values", frame_locals_proxy_values_method),
+            ("items", frame_locals_proxy_items_method),
+            ("__contains__", frame_locals_proxy_contains_method),
+            ("__len__", frame_locals_proxy_len_method),
+        ];
+        for (name, entry) in methods {
+            let name_id = crate::intern::intern(name);
+            // SAFETY: Live builtin entry point with the runtime calling convention.
+            let function = unsafe {
+                crate::abi::pon_make_function(entry as *const u8, crate::builtins::variadic_arity(), name_id)
+            };
+            if function.is_null() {
+                continue;
+            }
+            crate::types::function::mark_native_function(function);
+            crate::types::function::mark_native_method_descriptor(function);
+            // SAFETY: Freshly allocated namespace dict.
+            unsafe { (&mut *namespace).set(name_id, function) };
+        }
+        ty.tp_dict = namespace.cast::<PyObject>();
+    }
     let ptr = Box::into_raw(Box::new(ty));
+    crate::sync::register_namespaced_type(ptr);
     *slot = Some(ptr as usize);
     ptr
 }
@@ -225,6 +255,137 @@ unsafe extern "C" fn frame_locals_proxy_subscript(object: *mut PyObject, key: *m
             ptr::null_mut()
         }
     }
+}
+
+/// Bound-method receiver plus argument window for the proxy method entries.
+unsafe fn proxy_method_args<'a>(argv: *mut *mut PyObject, argc: usize) -> &'a [*mut PyObject] {
+    if argv.is_null() || argc == 0 {
+        &[]
+    } else {
+        // SAFETY: The caller passed `argc` live argument slots.
+        unsafe { std::slice::from_raw_parts(argv, argc) }
+    }
+}
+
+fn proxy_mapping(receiver: *mut PyObject) -> Option<*mut PyObject> {
+    let raw = crate::tag::untag_arg(receiver);
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: Method dispatch binds only PyFrameLocalsProxy receivers.
+    Some(unsafe { (*raw.cast::<PyFrameLocalsProxy>()).mapping })
+}
+
+/// `proxy.get(key, default=None)`.
+unsafe extern "C" fn frame_locals_proxy_get_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { proxy_method_args(argv, argc) };
+    if !(2..=3).contains(&args.len()) {
+        pon_err_set(format!("get expected 1 or 2 arguments, got {}", args.len().saturating_sub(1)));
+        return ptr::null_mut();
+    }
+    let Some(mapping) = proxy_mapping(args[0]) else {
+        pon_err_set("FrameLocalsProxy receiver is NULL");
+        return ptr::null_mut();
+    };
+    match unsafe { crate::types::dict::dict_get(mapping, args[1]) } {
+        Ok(Some(value)) => value,
+        Ok(None) => args.get(2).copied().unwrap_or_else(|| unsafe { crate::abi::pon_none() }),
+        Err(message) => {
+            pon_err_set(message);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `key in proxy`.
+unsafe extern "C" fn frame_locals_proxy_contains_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { proxy_method_args(argv, argc) };
+    if args.len() != 2 {
+        pon_err_set(format!("__contains__ expected 1 argument, got {}", args.len().saturating_sub(1)));
+        return ptr::null_mut();
+    }
+    let Some(mapping) = proxy_mapping(args[0]) else {
+        pon_err_set("FrameLocalsProxy receiver is NULL");
+        return ptr::null_mut();
+    };
+    match unsafe { crate::types::dict::dict_get(mapping, args[1]) } {
+        Ok(found) => unsafe { crate::abi::number::pon_const_bool(i32::from(found.is_some())) },
+        Err(message) => {
+            pon_err_set(message);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `len(proxy)`.
+unsafe extern "C" fn frame_locals_proxy_len_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let args = unsafe { proxy_method_args(argv, argc) };
+    let Some(mapping) = args.first().copied().and_then(proxy_mapping) else {
+        pon_err_set("FrameLocalsProxy receiver is NULL");
+        return ptr::null_mut();
+    };
+    match unsafe { crate::types::dict::dict_entries_snapshot(mapping) } {
+        Ok(entries) => unsafe { crate::abi::pon_const_int(entries.len() as i64) },
+        Err(message) => {
+            pon_err_set(message);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Shared list-building core for `keys`/`values`/`items`.
+unsafe fn proxy_snapshot_list(
+    argv: *mut *mut PyObject,
+    argc: usize,
+    which: u8,
+) -> *mut PyObject {
+    let args = unsafe { proxy_method_args(argv, argc) };
+    let Some(mapping) = args.first().copied().and_then(proxy_mapping) else {
+        pon_err_set("FrameLocalsProxy receiver is NULL");
+        return ptr::null_mut();
+    };
+    let entries = match unsafe { crate::types::dict::dict_entries_snapshot(mapping) } {
+        Ok(entries) => entries,
+        Err(message) => {
+            pon_err_set(message);
+            return ptr::null_mut();
+        }
+    };
+    let mut items = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let item = match which {
+            0 => entry.key,
+            1 => entry.value,
+            _ => {
+                let mut pair = [entry.key, entry.value];
+                // SAFETY: Two live slots for the tuple builder.
+                let tuple = unsafe { crate::abi::seq::pon_build_tuple(pair.as_mut_ptr(), pair.len()) };
+                if tuple.is_null() {
+                    return ptr::null_mut();
+                }
+                tuple
+            }
+        };
+        items.push(item);
+    }
+    let ptr_slot = if items.is_empty() { ptr::null_mut() } else { items.as_mut_ptr() };
+    // SAFETY: `items` is live for the duration of the call.
+    unsafe { crate::abi::seq::pon_build_list(ptr_slot, items.len()) }
+}
+
+/// `proxy.keys()` (list snapshot; CPython hands out a view).
+unsafe extern "C" fn frame_locals_proxy_keys_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { proxy_snapshot_list(argv, argc, 0) }
+}
+
+/// `proxy.values()` (list snapshot).
+unsafe extern "C" fn frame_locals_proxy_values_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { proxy_snapshot_list(argv, argc, 1) }
+}
+
+/// `proxy.items()` (list-of-pairs snapshot).
+unsafe extern "C" fn frame_locals_proxy_items_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    unsafe { proxy_snapshot_list(argv, argc, 2) }
 }
 
 /// Traces a `PyFrameLocalsProxy` allocation for the runtime GC.

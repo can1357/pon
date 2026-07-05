@@ -52,6 +52,8 @@ const PON_INCLUDEPY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/include");
 const PON_EXT_SUFFIX: &str = ".pon.so";
 #[cfg(test)]
 const PON_CAPI_BOOTSTRAP: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/capi/pon_capi_bootstrap.c");
+#[cfg(test)]
+const PON_CAPI_ARGS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/capi/pon_capi_args.c");
 
 /// One `build_time_vars` value.  CPython's generated dict holds strings and
 /// ints: flag vars parse as ints, while `sysconfig._ALWAYS_STR` names
@@ -74,8 +76,9 @@ fn build_time_vars() -> Vec<(&'static str, VarValue)> {
         // mirrors `sys.abiflags` ('').
         ("ABIFLAGS", Str("")),
         // Distutils-style build backends use this to link extension modules.
-        // The bootstrap source is linked into each extension so the loader can
-        // inject Pon's C-API table without relying on executable symbol export.
+        // The bootstrap and argument-parser sources are linked into each
+        // extension so the loader can inject Pon's C-API table without relying
+        // on executable symbol export.
         (
             "BLDSHARED",
             Str(if macos {
@@ -84,7 +87,9 @@ fn build_time_vars() -> Vec<(&'static str, VarValue)> {
                     env!("CARGO_MANIFEST_DIR"),
                     "/include ",
                     env!("CARGO_MANIFEST_DIR"),
-                    "/capi/pon_capi_bootstrap.c"
+                    "/capi/pon_capi_bootstrap.c ",
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/capi/pon_capi_args.c"
                 )
             } else {
                 concat!(
@@ -92,7 +97,9 @@ fn build_time_vars() -> Vec<(&'static str, VarValue)> {
                     env!("CARGO_MANIFEST_DIR"),
                     "/include ",
                     env!("CARGO_MANIFEST_DIR"),
-                    "/capi/pon_capi_bootstrap.c"
+                    "/capi/pon_capi_bootstrap.c ",
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/capi/pon_capi_args.c"
                 )
             }),
         ),
@@ -121,7 +128,9 @@ fn build_time_vars() -> Vec<(&'static str, VarValue)> {
                     env!("CARGO_MANIFEST_DIR"),
                     "/include ",
                     env!("CARGO_MANIFEST_DIR"),
-                    "/capi/pon_capi_bootstrap.c"
+                    "/capi/pon_capi_bootstrap.c ",
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/capi/pon_capi_args.c"
                 )
             } else {
                 concat!(
@@ -129,10 +138,19 @@ fn build_time_vars() -> Vec<(&'static str, VarValue)> {
                     env!("CARGO_MANIFEST_DIR"),
                     "/include ",
                     env!("CARGO_MANIFEST_DIR"),
-                    "/capi/pon_capi_bootstrap.c"
+                    "/capi/pon_capi_bootstrap.c ",
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/capi/pon_capi_args.c"
                 )
             }),
         ),
+        // Extensions never link against a libpython: pon resolves the C-API
+        // at load time (`-undefined dynamic_lookup` on macOS).  Meson's
+        // python_info.py treats an ABSENT key as "yes"
+        // (`variables.get('LIBPYTHON', 'yes')`), which would send its python
+        // dependency hunting for a libpython3.14 that does not exist;
+        // CPython's own macOS sysconfigdata pins the same empty string.
+        ("LIBPYTHON", Str("")),
     ];
     if macos {
         // `_osx_support.get_platform_osx` (via `sysconfig.get_platform`):
@@ -248,7 +266,7 @@ fn str_object(text: &str) -> Result<*mut PyObject, String> {
 mod tests {
     use std::ptr;
 
-    use super::{MODULE_NAME, PON_CAPI_BOOTSTRAP, PON_EXT_SUFFIX, PON_INCLUDEPY, VarValue, build_time_vars};
+    use super::{MODULE_NAME, PON_CAPI_ARGS, PON_CAPI_BOOTSTRAP, PON_EXT_SUFFIX, PON_INCLUDEPY, VarValue, build_time_vars};
     use crate::abi::map::pon_dict_get_item;
     use crate::abi::{format_object_for_print, pon_const_str, pon_runtime_init};
     use crate::import::{pon_import_from, pon_import_name, reset_import_state_for_tests};
@@ -292,6 +310,7 @@ mod tests {
             "EXT_SUFFIX",
             "INCLUDEPY",
             "LDSHARED",
+            "LIBPYTHON",
             "Py_GIL_DISABLED",
             "SHLIB_SUFFIX",
             "SOABI",
@@ -307,6 +326,7 @@ mod tests {
         assert!(matches!(entry("CONFINCLUDEPY"), Some(VarValue::Str(value)) if *value == PON_INCLUDEPY));
         assert!(matches!(entry("EXT_SUFFIX"), Some(VarValue::Str(value)) if *value == PON_EXT_SUFFIX));
         assert!(matches!(entry("INCLUDEPY"), Some(VarValue::Str(value)) if *value == PON_INCLUDEPY));
+        assert!(matches!(entry("LIBPYTHON"), Some(VarValue::Str(""))));
         assert!(matches!(entry("SHLIB_SUFFIX"), Some(VarValue::Str(".so"))));
         assert!(matches!(entry("SOABI"), Some(VarValue::Str("pon-314"))));
         assert!(matches!(entry("prefix"), Some(VarValue::Str(""))));
@@ -352,6 +372,7 @@ mod tests {
         assert!(!build_shared.is_null(), "BLDSHARED missing from build_time_vars");
         let build_shared = format_object_for_print(build_shared).expect("BLDSHARED text");
         assert!(build_shared.contains(PON_CAPI_BOOTSTRAP), "BLDSHARED missing bootstrap source: {build_shared}");
+        assert!(build_shared.contains(PON_CAPI_ARGS), "BLDSHARED missing args parser source: {build_shared}");
         let expected_builder = if cfg!(target_os = "macos") { "clang -bundle" } else { "cc -shared" };
         assert!(build_shared.contains(expected_builder), "BLDSHARED missing expected linker form: {build_shared}");
         assert!(build_shared.contains(PON_INCLUDEPY), "BLDSHARED missing Pon include path: {build_shared}");

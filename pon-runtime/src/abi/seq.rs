@@ -50,7 +50,7 @@ static RANGE_TYPE: OnceLock<usize> = OnceLock::new();
 static SLICE_TYPE: OnceLock<usize> = OnceLock::new();
 static SEQ_ITER_TYPE: OnceLock<usize> = OnceLock::new();
 
-fn list_type() -> *mut PyType {
+pub(crate) fn list_type() -> *mut PyType {
     LIST_TYPE.get_or_init(|| {
         let sequence = Box::leak(Box::new(PySequenceMethods {
             sq_length: Some(list_len_slot),
@@ -80,7 +80,7 @@ fn list_type() -> *mut PyType {
     (*LIST_TYPE.get().expect("list type initialized")) as *mut PyType
 }
 
-fn tuple_type() -> *mut PyType {
+pub(crate) fn tuple_type() -> *mut PyType {
     TUPLE_TYPE.get_or_init(|| {
         let sequence = Box::leak(Box::new(PySequenceMethods {
             sq_length: Some(tuple_len_slot),
@@ -151,7 +151,7 @@ fn range_type() -> *mut PyType {
     (*RANGE_TYPE.get().expect("range type initialized")) as *mut PyType
 }
 
-fn slice_type() -> *mut PyType {
+pub(crate) fn slice_type() -> *mut PyType {
     SLICE_TYPE.get_or_init(|| {
         let mut ty = PyType::new(ptr::null(), "slice", mem::size_of::<PySlice>());
         slice_::install_slice_slots(&mut ty);
@@ -1917,7 +1917,7 @@ unsafe extern "C" fn list_getattro_slot(object: *mut PyObject, name: *mut PyObje
         "count" => bound_seq_method(object, &name, list_count_method),
         "insert" => bound_seq_method(object, &name, list_insert_method),
         "remove" => bound_seq_method(object, &name, list_remove_method),
-        _ => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
+        _ => crate::descr::native_instance_surface_attr(object, &name),
     }
 }
 
@@ -2726,7 +2726,7 @@ unsafe extern "C" fn tuple_getattro_slot(object: *mut PyObject, name: *mut PyObj
     match name.as_str() {
         "count" => bound_seq_method(object, &name, tuple_count_method),
         "index" => bound_seq_method(object, &name, tuple_index_method),
-        _ => super::exc::raise_attribute_error_text(&format!("attribute '{name}' was not found")),
+        _ => crate::descr::native_instance_surface_attr(object, &name),
     }
 }
 

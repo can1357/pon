@@ -3171,8 +3171,11 @@ fn bytes_to_python(file: &PyNativeFile, bytes: Vec<u8>) -> *mut PyObject {
 fn write_object(file: &mut PyNativeFile, object: *mut PyObject) -> Result<i64, FileOpError> {
     ensure_writable(file)?;
     if file.binary {
-        let bytes = object_bytes(object)
-            .ok_or_else(|| FileOpError::Type("a bytes-like object is required, not 'str'".to_owned()))?;
+        let bytes = bytes_like_bytes(object).map_err(|error| match error {
+            BioError::Type(message) => FileOpError::Type(message),
+            BioError::Value(message) => FileOpError::Value(message),
+            BioError::Buffer => FileOpError::Value("buffer export pins the source".to_owned()),
+        })?;
         let handle = file.file.as_mut().ok_or_else(closed_error)?;
         handle.write_all(&bytes).map_err(io_op_error)?;
         Ok(bytes.len() as i64)
@@ -3236,21 +3239,6 @@ fn ensure_writable(file: &PyNativeFile) -> Result<(), FileOpError> {
     }
 }
 
-fn object_bytes(object: *mut PyObject) -> Option<Vec<u8>> {
-    if object.is_null() {
-        return None;
-    }
-    let ty = unsafe { (*object).ob_type };
-    if bytes_::is_bytes_type(ty) {
-        let bytes = unsafe { &*object.cast::<bytes_::PyBytes>() };
-        Some(unsafe { bytes.as_slice() }.to_vec())
-    } else if bytearray_::is_bytearray_type(ty) {
-        let bytes = unsafe { &*object.cast::<bytearray_::PyByteArray>() };
-        Some(bytes.as_slice().to_vec())
-    } else {
-        None
-    }
-}
 
 fn update_newlines(file: &mut PyNativeFile, bytes: &[u8]) {
     if file.newline.detects_universal() {

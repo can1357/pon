@@ -37,6 +37,12 @@ pub fn from_bool(value: bool) -> *mut PyObject {
     }
 }
 
+/// Returns the process-wide `bool` type object (C-API twin registration).
+#[must_use]
+pub fn bool_type() -> *mut PyType {
+    *BOOL_TYPE as *mut PyType
+}
+
 /// Returns true for exact `bool` objects.
 #[must_use]
 pub unsafe fn is_exact_bool(object: *mut PyObject) -> bool {

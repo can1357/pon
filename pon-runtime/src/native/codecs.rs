@@ -1087,7 +1087,9 @@ fn collapse_normalize(encoding: &str) -> String {
 /// `Lib/encodings/aliases.py`).
 fn builtin_codec(collapsed: &str) -> Option<BuiltinCodec> {
     match collapsed {
-        "utf_8" | "u8" | "utf" | "utf8" | "utf8_ucs2" | "utf8_ucs4" | "cp65001" => Some(BuiltinCodec::Utf8),
+        // "locale" (PEP 597): the current locale encoding — UTF-8 on every
+        // host pon supports (`locale.getencoding()` on macOS/Linux).
+        "utf_8" | "u8" | "utf" | "utf8" | "utf8_ucs2" | "utf8_ucs4" | "cp65001" | "locale" => Some(BuiltinCodec::Utf8),
         "ascii" | "646" | "ansi_x3_4_1968" | "ansi_x3_4_1986" | "cp367" | "csascii" | "ibm367" | "iso646_us"
         | "iso_646_irv_1991" | "iso_ir_6" | "us" | "us_ascii" => Some(BuiltinCodec::Ascii),
         "latin_1" | "8859" | "cp819" | "csisolatin1" | "ibm819" | "iso8859" | "iso8859_1" | "iso_8859_1"
