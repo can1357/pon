@@ -114,11 +114,11 @@ pub(super) fn build_attrs(module: &'static str) -> Result<Vec<(u32, *mut PyObjec
         return Err(format!("failed to allocate {module}.scandir defaults"));
     }
     attrs.push(phase_b_function_attr("scandir", os_scandir, &["path"], &mut scandir_defaults)?);
-    let mut chmod_defaults = unsafe { [crate::abi::pon_const_bool(1)] };
+    let mut chmod_defaults = unsafe { [crate::abi::pon_none(), crate::abi::pon_const_bool(1)] };
     if chmod_defaults.iter().any(|value| value.is_null()) {
         return Err(format!("failed to allocate {module}.chmod defaults"));
     }
-    attrs.push(phase_b_function_attr("chmod", os_chmod, &["path", "mode", "follow_symlinks"], &mut chmod_defaults)?);
+    attrs.push(phase_b_function_attr("chmod", os_chmod, &["path", "mode", "dir_fd", "follow_symlinks"], &mut chmod_defaults)?);
     // POSIX fd/path syscall surface shared with `posix` (CPython's `os.py`
     // re-exports these names from the C `posix` module wholesale).
     for &(name, entry, arity) in SYSCALL_FUNCTIONS {
@@ -903,7 +903,7 @@ unsafe extern "C" fn os_fstat(argv: *mut *mut PyObject, argc: usize) -> *mut PyO
 unsafe extern "C" fn os_chmod(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     // SAFETY: Live argument slots per the runtime calling convention.
     let args = unsafe { call_args(argv, argc) };
-    if !(2..=3).contains(&args.len()) {
+    if !(2..=4).contains(&args.len()) {
         return crate::abi::return_null_with_error("os.chmod expected two arguments (path, mode)");
     }
     let path = match path_arg(args[0], "chmod") {
@@ -914,7 +914,16 @@ unsafe extern "C" fn os_chmod(argv: *mut *mut PyObject, argc: usize) -> *mut PyO
         Ok(mode) => mode,
         Err(error) => return error,
     };
-    if let Some(follow_arg) = optional_arg(args, 2) {
+    // CPython: `chmod(path, mode, *, dir_fd=None, follow_symlinks=True)` —
+    // a real dir_fd routes through fchmodat(2).
+    let mut dir_fd: Option<i64> = None;
+    if let Some(dir_fd_arg) = optional_arg(args, 2) {
+        dir_fd = match int_arg(dir_fd_arg, "chmod dir_fd") {
+            Ok(value) => Some(value),
+            Err(error) => return error,
+        };
+    }
+    if let Some(follow_arg) = optional_arg(args, 3) {
         let follow = match truth_arg(follow_arg) {
             Ok(value) => value,
             Err(error) => return error,
@@ -925,6 +934,18 @@ unsafe extern "C" fn os_chmod(argv: *mut *mut PyObject, argc: usize) -> *mut PyO
                 "chmod: follow_symlinks unavailable on this platform",
             );
         }
+    }
+    if let Some(fd) = dir_fd {
+        let c_path = match c_path(&path) {
+            Ok(c_path) => c_path,
+            Err(error) => return error,
+        };
+        // SAFETY: `c_path` is NUL-terminated; fd validity is the caller's contract.
+        if unsafe { libc::fchmodat(fd as libc::c_int, c_path.as_ptr(), mode as libc::mode_t, 0) } < 0 {
+            return raise_errno(last_errno(), Some(&path));
+        }
+        // SAFETY: Singleton accessor.
+        return unsafe { crate::abi::pon_none() };
     }
     let c_path = match c_path(&path) {
         Ok(c_path) => c_path,
