@@ -502,16 +502,26 @@ static STR_MAPPING_METHODS: LazyLock<usize> = LazyLock::new(|| {
     Box::into_raw(Box::new(methods)) as usize
 });
 
+/// Installs the str protocol/getattr slot tables onto this runtime's
+/// unicode type (the same object `install_builtin_type` publishes as the
+/// global `str`). Idempotent. Called EAGERLY at runtime init — constructor
+/// paths reaching `alloc_unicode` through `pon_const_str` bypass the lazy
+/// installer, and dispatch must still find `sq_repeat` — and lazily from
+/// the allocation helpers.
+pub(super) unsafe fn install_str_slot_tables(runtime: &super::Runtime) {
+    unsafe {
+        (*runtime.unicode_type).tp_getattro = Some(str_getattro);
+        (*runtime.unicode_type).tp_as_sequence = *STR_SEQUENCE_METHODS as *mut PySequenceMethods;
+        (*runtime.unicode_type).tp_as_mapping = *STR_MAPPING_METHODS as *mut PyMappingMethods;
+    }
+}
+
 fn install_str_slots() -> Result<(), String> {
     if let Err(message) = super::ensure_runtime_initialized() {
         return Err(message);
     }
-    super::with_runtime(|runtime| unsafe {
-        (*runtime.unicode_type).tp_getattro = Some(str_getattro);
-        (*runtime.unicode_type).tp_as_sequence = *STR_SEQUENCE_METHODS as *mut PySequenceMethods;
-        (*runtime.unicode_type).tp_as_mapping = *STR_MAPPING_METHODS as *mut PyMappingMethods;
-    })
-    .ok_or_else(|| "runtime is not initialized".to_owned())
+    super::with_runtime(|runtime| unsafe { install_str_slot_tables(runtime) })
+        .ok_or_else(|| "runtime is not initialized".to_owned())
 }
 
 static BYTES_SEQUENCE_METHODS: LazyLock<usize> = LazyLock::new(|| {

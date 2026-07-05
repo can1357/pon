@@ -1215,7 +1215,23 @@ unsafe fn unicode_bytes(value: &PyUnicode) -> &[u8] {
 }
 
 unsafe fn try_sequence_repeat(ty: *mut PyType, sequence: *mut PyObject, count: *mut PyObject) -> SlotOutcome {
-    let slot = unsafe { (*ty).tp_as_sequence.as_ref().and_then(|methods| methods.sq_repeat) };
+    // Probe the object's own type face first (seq-family builtins carry
+    // their tables there), then the canonical installed face: shadow types
+    // stamped by some constructor paths (`str(x)`) have no tables of their
+    // own while the installed global does.
+    let slot = unsafe { (*ty).tp_as_sequence.as_ref().and_then(|methods| methods.sq_repeat) }.or_else(|| {
+        // Only helper-family shadows (missing metatype) canonicalize; real
+        // types without sq_repeat must not reroute to same-named globals.
+        if unsafe { !(*ty).ob_base.ob_type.is_null() } {
+            return None;
+        }
+        let canonical = unsafe { crate::types::type_::canonical_type_object(ty) };
+        if canonical == ty {
+            None
+        } else {
+            unsafe { (*canonical).tp_as_sequence.as_ref().and_then(|methods| methods.sq_repeat) }
+        }
+    });
     unsafe { call_binary_slot(slot, sequence, count) }
 }
 
