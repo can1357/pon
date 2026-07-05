@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::ops::Deref;
+use std::sync::Arc;
 
 pub const MAGIC: u32 = 20_230_612;
 pub const CODESIZE: usize = 4;
@@ -154,6 +156,11 @@ pub struct Match {
 
 #[derive(Clone, Debug)]
 struct SubjectData {
+    shared: Arc<SubjectBacking>,
+}
+
+#[derive(Debug)]
+struct SubjectBacking {
     kind: SubjectKind,
     text: String,
     bytes: Vec<u8>,
@@ -287,67 +294,67 @@ impl Pattern {
     }
 
     pub fn match_str(&self, subject: &str) -> Result<Option<Match>, Error> {
-        self.match_data(SubjectData::from_str(subject), 0, None)
+        self.match_data(&SubjectData::from_str(subject), 0, None)
     }
 
     pub fn match_bytes(&self, subject: &[u8]) -> Result<Option<Match>, Error> {
-        self.match_data(SubjectData::from_bytes(subject), 0, None)
+        self.match_data(&SubjectData::from_bytes(subject), 0, None)
     }
 
     pub fn fullmatch_str(&self, subject: &str) -> Result<Option<Match>, Error> {
         let data = SubjectData::from_str(subject);
         let end = data.len();
-        self.match_data(data, 0, Some(end))
+        self.match_data(&data, 0, Some(end))
     }
 
     pub fn fullmatch_bytes(&self, subject: &[u8]) -> Result<Option<Match>, Error> {
         let data = SubjectData::from_bytes(subject);
         let end = data.len();
-        self.match_data(data, 0, Some(end))
+        self.match_data(&data, 0, Some(end))
     }
 
     pub fn search_str(&self, subject: &str) -> Result<Option<Match>, Error> {
-        self.search_data(SubjectData::from_str(subject))
+        self.search_data(&SubjectData::from_str(subject))
     }
 
     pub fn search_bytes(&self, subject: &[u8]) -> Result<Option<Match>, Error> {
-        self.search_data(SubjectData::from_bytes(subject))
+        self.search_data(&SubjectData::from_bytes(subject))
     }
 
     pub fn finditer_str(&self, subject: &str) -> Result<Vec<Match>, Error> {
-        self.finditer_data(SubjectData::from_str(subject))
+        self.finditer_data(&SubjectData::from_str(subject))
     }
 
     pub fn finditer_bytes(&self, subject: &[u8]) -> Result<Vec<Match>, Error> {
-        self.finditer_data(SubjectData::from_bytes(subject))
+        self.finditer_data(&SubjectData::from_bytes(subject))
     }
 
     pub fn match_str_at(&self, subject: &str, pos: usize) -> Result<Option<Match>, Error> {
-        self.match_data(SubjectData::from_str(subject), pos, None)
+        self.match_data(&SubjectData::from_str(subject), pos, None)
     }
 
     pub fn match_bytes_at(&self, subject: &[u8], pos: usize) -> Result<Option<Match>, Error> {
-        self.match_data(SubjectData::from_bytes(subject), pos, None)
+        self.match_data(&SubjectData::from_bytes(subject), pos, None)
     }
 
     pub fn fullmatch_str_at(&self, subject: &str, pos: usize) -> Result<Option<Match>, Error> {
         let data = SubjectData::from_str(subject);
         let end = data.len();
-        self.match_data(data, pos, Some(end))
+        self.match_data(&data, pos, Some(end))
     }
 
     pub fn fullmatch_bytes_at(&self, subject: &[u8], pos: usize) -> Result<Option<Match>, Error> {
         let data = SubjectData::from_bytes(subject);
         let end = data.len();
-        self.match_data(data, pos, Some(end))
+        self.match_data(&data, pos, Some(end))
     }
 
     pub fn search_str_at(&self, subject: &str, pos: usize) -> Result<Option<Match>, Error> {
-        self.search_data_from(SubjectData::from_str(subject), pos)
+        self.search_data_from(&SubjectData::from_str(subject), pos)
     }
 
     pub fn search_bytes_at(&self, subject: &[u8], pos: usize) -> Result<Option<Match>, Error> {
-        self.search_data_from(SubjectData::from_bytes(subject), pos)
+        self.search_data_from(&SubjectData::from_bytes(subject), pos)
     }
 
     pub fn findall_str(&self, subject: &str) -> Result<Vec<Vec<Option<MatchedValue>>>, Error> {
@@ -359,15 +366,15 @@ impl Pattern {
     }
 
     pub fn split_str(&self, subject: &str) -> Result<Vec<MatchedValue>, Error> {
-        self.split_data(SubjectData::from_str(subject))
+        self.split_data(&SubjectData::from_str(subject))
     }
 
     pub fn split_bytes(&self, subject: &[u8]) -> Result<Vec<MatchedValue>, Error> {
-        self.split_data(SubjectData::from_bytes(subject))
+        self.split_data(&SubjectData::from_bytes(subject))
     }
 
     pub fn sub_str(&self, repl: &str, subject: &str) -> Result<String, Error> {
-        let value = self.sub_data(MatchedValue::Str(repl.to_owned()), SubjectData::from_str(subject))?;
+        let value = self.sub_data(MatchedValue::Str(repl.to_owned()), &SubjectData::from_str(subject))?;
         match value {
             MatchedValue::Str(text) => Ok(text),
             MatchedValue::Bytes(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
@@ -375,22 +382,22 @@ impl Pattern {
     }
 
     pub fn sub_bytes(&self, repl: &[u8], subject: &[u8]) -> Result<Vec<u8>, Error> {
-        let value = self.sub_data(MatchedValue::Bytes(repl.to_vec()), SubjectData::from_bytes(subject))?;
+        let value = self.sub_data(MatchedValue::Bytes(repl.to_vec()), &SubjectData::from_bytes(subject))?;
         match value {
             MatchedValue::Str(text) => Ok(text.into_bytes()),
             MatchedValue::Bytes(bytes) => Ok(bytes),
         }
     }
 
-    fn search_data(&self, data: SubjectData) -> Result<Option<Match>, Error> {
+    fn search_data(&self, data: &SubjectData) -> Result<Option<Match>, Error> {
         self.search_data_from(data, 0)
     }
 
     /// Search for the leftmost match at or after `start` (CPython
     /// `Pattern.search`'s `pos`), scanning successive start offsets.
-    fn search_data_from(&self, data: SubjectData, start: usize) -> Result<Option<Match>, Error> {
+    fn search_data_from(&self, data: &SubjectData, start: usize) -> Result<Option<Match>, Error> {
         for pos in start..=data.len() {
-            if let Some(matched) = self.match_data(data.clone(), pos, None)? {
+            if let Some(matched) = self.match_data(data, pos, None)? {
                 return Ok(Some(matched));
             }
         }
@@ -399,7 +406,7 @@ impl Pattern {
 
     fn match_data(
         &self,
-        data: SubjectData,
+        data: &SubjectData,
         start: usize,
         require_end: Option<usize>,
     ) -> Result<Option<Match>, Error> {
@@ -408,31 +415,31 @@ impl Pattern {
 
     fn match_data_filtered(
         &self,
-        data: SubjectData,
+        data: &SubjectData,
         start: usize,
         require_end: Option<usize>,
         skip_empty_at_start: bool,
     ) -> Result<Option<Match>, Error> {
         let start_state = MatchState { pos: start, marks: vec![None; self.groups * 2], lastindex: None };
-        let states = execute(&self.nodes, &data, start_state, require_end.is_some() || skip_empty_at_start)?;
+        let states = execute(&self.nodes, data, start_state, require_end.is_some() || skip_empty_at_start)?;
         for state in states {
             if skip_empty_at_start && state.pos == start {
                 continue;
             }
             if require_end.is_none_or(|end| state.pos == end) {
-                return Ok(Some(self.build_match(data, start, state)));
+                return Ok(Some(self.build_match(SubjectData::clone(data), start, state)));
             }
         }
         Ok(None)
     }
 
-    fn finditer_data(&self, data: SubjectData) -> Result<Vec<Match>, Error> {
+    fn finditer_data(&self, data: &SubjectData) -> Result<Vec<Match>, Error> {
         let mut out = Vec::new();
         let mut start = 0;
         let mut skip_empty_at = None;
         while start <= data.len() {
             let skip_empty = skip_empty_at == Some(start);
-            let Some(matched) = self.match_data_filtered(data.clone(), start, None, skip_empty)? else {
+            let Some(matched) = self.match_data_filtered(data, start, None, skip_empty)? else {
                 skip_empty_at = None;
                 start += 1;
                 continue;
@@ -455,10 +462,10 @@ impl Pattern {
         Ok(out)
     }
 
-    fn split_data(&self, data: SubjectData) -> Result<Vec<MatchedValue>, Error> {
+    fn split_data(&self, data: &SubjectData) -> Result<Vec<MatchedValue>, Error> {
         let mut out = Vec::new();
         let mut last = 0;
-        for matched in self.finditer_data(data.clone())? {
+        for matched in self.finditer_data(data)? {
             let (start, end) = matched.span(0).flatten().unwrap_or((last, last));
             out.push(data.slice_value(last, start));
             for group in 1..=self.groups {
@@ -472,7 +479,7 @@ impl Pattern {
         Ok(out)
     }
 
-    fn sub_data(&self, repl: MatchedValue, data: SubjectData) -> Result<MatchedValue, Error> {
+    fn sub_data(&self, repl: MatchedValue, data: &SubjectData) -> Result<MatchedValue, Error> {
         match data.kind {
             SubjectKind::Str => {
                 let mut out = String::new();
@@ -481,7 +488,7 @@ impl Pattern {
                     MatchedValue::Bytes(bytes) => String::from_utf8_lossy(bytes).into_owned(),
                 };
                 let mut last = 0;
-                for matched in self.finditer_data(data.clone())? {
+                for matched in self.finditer_data(data)? {
                     let (start, end) = matched.span(0).flatten().unwrap_or((last, last));
                     if let MatchedValue::Str(prefix) = data.slice_value(last, start) {
                         out.push_str(&prefix);
@@ -501,7 +508,7 @@ impl Pattern {
                     MatchedValue::Bytes(bytes) => bytes.clone(),
                 };
                 let mut last = 0;
-                for matched in self.finditer_data(data.clone())? {
+                for matched in self.finditer_data(data)? {
                     let (start, end) = matched.span(0).flatten().unwrap_or((last, last));
                     if let MatchedValue::Bytes(prefix) = data.slice_value(last, start) {
                         out.extend(prefix);
@@ -600,6 +607,14 @@ impl Match {
     }
 }
 
+impl Deref for SubjectData {
+    type Target = SubjectBacking;
+
+    fn deref(&self) -> &Self::Target {
+        self.shared.as_ref()
+    }
+}
+
 impl SubjectData {
     fn from_str(subject: &str) -> Self {
         let mut units = Vec::new();
@@ -609,13 +624,29 @@ impl SubjectData {
             units.push(ch as u32);
         }
         offsets.push(subject.len());
-        Self { kind: SubjectKind::Str, text: subject.to_owned(), bytes: Vec::new(), units, offsets }
+        Self {
+            shared: Arc::new(SubjectBacking {
+                kind: SubjectKind::Str,
+                text: subject.to_owned(),
+                bytes: Vec::new(),
+                units,
+                offsets,
+            }),
+        }
     }
 
     fn from_bytes(subject: &[u8]) -> Self {
         let units = subject.iter().map(|byte| u32::from(*byte)).collect::<Vec<_>>();
         let offsets = (0..=subject.len()).collect::<Vec<_>>();
-        Self { kind: SubjectKind::Bytes, text: String::new(), bytes: subject.to_vec(), units, offsets }
+        Self {
+            shared: Arc::new(SubjectBacking {
+                kind: SubjectKind::Bytes,
+                text: String::new(),
+                bytes: subject.to_vec(),
+                units,
+                offsets,
+            }),
+        }
     }
 
     fn len(&self) -> usize {
