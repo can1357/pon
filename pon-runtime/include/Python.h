@@ -1096,10 +1096,10 @@ static inline PyObject *Py_GenericAlias(PyObject *origin, PyObject *args) {
 
 
 /* ---- Object/container protocol completion compile surface (NumPy 2.5) ----
- * The descriptor/C-function object structs below exist so CPython-source casts
- * compile; their type sentinels are deliberately unregistered compile-only
- * statics so code must not reinterpret Pon's native descriptor carriers as
- * these CPython layouts at runtime.
+ * PyCFunctionObject deliberately matches the prefix of Pon's native C-function
+ * carrier: NumPy and CPython macros cast PyCFunction_Type instances and read
+ * m_ml/m_self directly. Descriptor structs below remain compile-surface-only
+ * mirrors for CPython source compatibility.
  */
 
 typedef struct {
