@@ -4272,14 +4272,7 @@ unsafe fn call_method_from_argv(callee: *mut PyObject, argv: *mut *mut PyObject,
     let mut positional = Vec::with_capacity(argc.saturating_add(1));
     positional.push(receiver);
     positional.extend_from_slice(args);
-    let keywords = function::KeywordArgs {
-        names: &[],
-        values: &[],
-    };
-    match unsafe { function::call_bound_function(function, &positional, keywords, None, None) } {
-        Ok(result) => result,
-        Err(message) => return_null_with_error(message),
-    }
+    unsafe { pon_call(function, positional.as_mut_ptr(), positional.len()) }
 }
 
 unsafe fn call_slot_from_argv(
