@@ -873,6 +873,7 @@ unsafe extern "C" fn native_next_slot(object: *mut PyObject) -> *mut PyObject {
         }
         NativePayload::Zip { iters } => {
             let mut items = Vec::with_capacity(iters.len());
+            let guard = abi::scoped_roots(&items as *const _);
             for iter in iters.iter().copied() {
                 let value = unsafe { pon_iter_next(iter, ptr::null_mut()) };
                 if value.is_null() {
@@ -880,10 +881,12 @@ unsafe extern "C" fn native_next_slot(object: *mut PyObject) -> *mut PyObject {
                 }
                 items.push(value);
             }
+            drop(guard);
             alloc_sequence(SequenceKind::Tuple, items)
         }
         NativePayload::Map { function, iters } => {
             let mut items = Vec::with_capacity(iters.len());
+            let guard = abi::scoped_roots(&items as *const _);
             for iter in iters.iter().copied() {
                 let value = unsafe { pon_iter_next(iter, ptr::null_mut()) };
                 if value.is_null() {
@@ -891,7 +894,9 @@ unsafe extern "C" fn native_next_slot(object: *mut PyObject) -> *mut PyObject {
                 }
                 items.push(value);
             }
-            unsafe { call_function(*function, &mut items) }
+            let result = unsafe { call_function(*function, &mut items) };
+            drop(guard);
+            result
         }
         NativePayload::Filter { function, iter } => loop {
             let value = unsafe { pon_iter_next(*iter, ptr::null_mut()) };
@@ -1409,20 +1414,27 @@ pub unsafe extern "C" fn builtin_sorted(argv: *mut *mut PyObject, argc: usize) -
     if !(1..=3).contains(&args.len()) {
         return fail(format!("sorted() expected 1 to 3 positional arguments, got {}", args.len()));
     }
+    let key_func = args
+        .get(1)
+        .copied()
+        .filter(|key| !is_none(*key))
+        .unwrap_or(ptr::null_mut());
+    let reverse = if let Some(reverse) = args.get(2).copied() {
+        match unsafe { truth(reverse) } {
+            Ok(value) => value,
+            Err(message) => return fail_preserving(message),
+        }
+    } else {
+        false
+    };
     let mut items = match collect_iterable(args[0]) {
         Ok(items) => items,
         Err(message) => return fail(message),
     };
-    let key_func = args.get(1).copied().filter(|key| !is_none(*key));
-    items.sort_by(|a, b| compare_for_sort(*a, *b, key_func));
-    if let Some(reverse) = args.get(2).copied() {
-        match unsafe { truth(reverse) } {
-            Ok(true) => items.reverse(),
-            Ok(false) => {}
-            Err(message) => return fail_preserving(message),
-        }
+    match super::builtins_batch::stable_sort(&mut items, key_func, reverse) {
+        Ok(()) => alloc_sequence(SequenceKind::List, items),
+        Err(()) => ptr::null_mut(),
     }
-    alloc_sequence(SequenceKind::List, items)
 }
 
 pub unsafe extern "C" fn builtin_enumerate(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -1452,6 +1464,7 @@ pub unsafe extern "C" fn builtin_zip(argv: *mut *mut PyObject, argc: usize) -> *
         return fail("zip() received a null argv pointer");
     };
     let mut iters = Vec::with_capacity(args.len());
+    let guard = abi::scoped_roots(&iters as *const _);
     for arg in args.iter().copied() {
         let iter = unsafe { pon_get_iter(arg, ptr::null_mut()) };
         if iter.is_null() {
@@ -1459,6 +1472,7 @@ pub unsafe extern "C" fn builtin_zip(argv: *mut *mut PyObject, argc: usize) -> *
         }
         iters.push(iter);
     }
+    drop(guard);
     alloc_native(NativePayload::Zip { iters }, zip_type())
 }
 
@@ -1470,6 +1484,7 @@ pub unsafe extern "C" fn builtin_map(argv: *mut *mut PyObject, argc: usize) -> *
         return fail(format!("map() expected at least 2 arguments, got {}", args.len()));
     }
     let mut iters = Vec::with_capacity(args.len() - 1);
+    let guard = abi::scoped_roots(&iters as *const _);
     for arg in args[1..].iter().copied() {
         let iter = unsafe { pon_get_iter(arg, ptr::null_mut()) };
         if iter.is_null() {
@@ -1477,6 +1492,7 @@ pub unsafe extern "C" fn builtin_map(argv: *mut *mut PyObject, argc: usize) -> *
         }
         iters.push(iter);
     }
+    drop(guard);
     alloc_native(NativePayload::Map { function: args[0], iters }, map_type())
 }
 
@@ -1764,6 +1780,7 @@ pub unsafe extern "C" fn builtin_dict(argv: *mut *mut PyObject, argc: usize) -> 
 /// an iterable of length-2 iterables. On failure the CPython-shaped
 /// TypeError/ValueError is already raised and `Err(())` is returned.
 pub(crate) unsafe fn collect_dict_update_pairs(source: *mut PyObject, pairs: &mut Vec<*mut PyObject>) -> Result<(), ()> {
+    let _pairs_guard = abi::scoped_roots(pairs as *const Vec<*mut PyObject>);
     if unsafe { collect_mapping_pairs(source, pairs) }? {
         return Ok(());
     }
@@ -1773,8 +1790,9 @@ pub(crate) unsafe fn collect_dict_update_pairs(source: *mut PyObject, pairs: &mu
         let _ = unsafe { crate::abi::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
         return Err(());
     };
+    let elements_guard = abi::scoped_roots(&elements as *const _);
     pairs.reserve(elements.len() * 2);
-    for (index, element) in elements.into_iter().enumerate() {
+    for (index, element) in elements.iter().copied().enumerate() {
         let Ok(pair) = collect_iterable(element) else {
             // CPython 3.14 surfaces the bare iteration failure here (no
             // element index): `dict([42])` -> TypeError: object is not iterable
@@ -1792,6 +1810,7 @@ pub(crate) unsafe fn collect_dict_update_pairs(source: *mut PyObject, pairs: &mu
         }
         pairs.extend(pair);
     }
+    drop(elements_guard);
     Ok(())
 }
 
@@ -1803,6 +1822,7 @@ pub(crate) unsafe fn collect_dict_update_pairs(source: *mut PyObject, pairs: &mu
 /// pairs-iterable leg, `f(**x)` raises CPython's "argument after ** must be
 /// a mapping").  `Err(())` propagates with the error already raised.
 pub(crate) unsafe fn collect_mapping_pairs(source: *mut PyObject, pairs: &mut Vec<*mut PyObject>) -> Result<bool, ()> {
+    let _pairs_guard = abi::scoped_roots(pairs as *const Vec<*mut PyObject>);
     // Dict-layout sources (exact dicts AND dict-subclass instances) copy
     // concrete storage in insertion order, mirroring CPython's
     // `PyDict_Merge` which reads `ma_keys` directly for dict subclasses.
@@ -1835,8 +1855,9 @@ pub(crate) unsafe fn collect_mapping_pairs(source: *mut PyObject, pairs: &mut Ve
                     return Err(());
                 }
             };
+            let keys_guard = abi::scoped_roots(&keys as *const _);
             pairs.reserve(keys.len() * 2);
-            for key in keys {
+            for key in keys.iter().copied() {
                 // SAFETY: Subscript dispatch follows the NULL-sentinel error contract.
                 let value = unsafe { crate::abstract_op::subscript_get(source, key) };
                 if value.is_null() {
@@ -1845,6 +1866,7 @@ pub(crate) unsafe fn collect_mapping_pairs(source: *mut PyObject, pairs: &mut Ve
                 pairs.push(key);
                 pairs.push(value);
             }
+            drop(keys_guard);
             Ok(true)
         }
         Ok(None) => Ok(false),
@@ -2909,6 +2931,7 @@ fn collect_iterable(object: *mut PyObject) -> Result<Vec<*mut PyObject>, String>
         return Err("object is not iterable".to_owned());
     }
     let mut items = Vec::new();
+    let guard = abi::scoped_roots(&items as *const _);
     loop {
         let value = unsafe { pon_iter_next(iter, ptr::null_mut()) };
         if value.is_null() {
@@ -2926,6 +2949,7 @@ fn collect_iterable(object: *mut PyObject) -> Result<Vec<*mut PyObject>, String>
         }
         items.push(value);
     }
+    drop(guard);
     Ok(items)
 }
 
@@ -3246,6 +3270,20 @@ mod tests {
         unsafe { (*object.cast::<PyLong>()).value }
     }
 
+    unsafe extern "C" fn constant_zero_key(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+        CALL_COUNTER.fetch_add(1, Ordering::SeqCst);
+        unsafe { abi::pon_const_int(0) }
+    }
+
+    fn int_list(values: &[i64]) -> *mut PyObject {
+        let mut items = values.iter().map(|value| unsafe { abi::pon_const_int(*value) }).collect::<Vec<_>>();
+        unsafe { abi::seq::pon_build_list(items.as_mut_ptr(), items.len()) }
+    }
+
+    fn collect_ints(object: *mut PyObject) -> Vec<i64> {
+        collect_iterable(object).expect("list result should be iterable").into_iter().map(int_value).collect()
+    }
+
     #[test]
     fn next_default_returns_default_after_stop_iteration() {
         let _guard = test_state_lock();
@@ -3286,6 +3324,24 @@ mod tests {
         let stopped = unsafe { builtin_next(default_args.as_mut_ptr(), default_args.len()) };
         assert_eq!(stopped, default);
         assert!(!crate::thread_state::pon_err_occurred());
+    }
+
+    #[test]
+    fn sorted_reverse_equal_keys_preserves_order_and_calls_key_once() {
+        let _guard = test_state_lock();
+        init_runtime();
+        CALL_COUNTER.store(0, Ordering::SeqCst);
+        let input = int_list(&[3, 1, 2]);
+        let key = unsafe { abi::pon_make_function(constant_zero_key as *const u8, 1, intern("constant_zero_key")) };
+        assert!(!key.is_null());
+        let reverse = crate::types::bool_::from_bool(true);
+        let mut args = [input, key, reverse];
+
+        let sorted = unsafe { builtin_sorted(args.as_mut_ptr(), args.len()) };
+
+        assert!(!sorted.is_null());
+        assert_eq!(collect_ints(sorted), vec![3, 1, 2]);
+        assert_eq!(CALL_COUNTER.load(Ordering::SeqCst), 3);
     }
 
     #[test]

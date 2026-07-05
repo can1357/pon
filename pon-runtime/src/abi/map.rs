@@ -1485,11 +1485,13 @@ pub unsafe extern "C" fn pon_set_update(set: *mut PyObject, iterable: *mut PyObj
             Ok(values) => values,
             Err(message) => return null_error(message),
         };
-        for item in values {
+        let guard = super::scoped_roots(&values as *const _);
+        for item in values.iter().copied() {
             if unsafe { pon_set_add(set, item) }.is_null() {
                 return ptr::null_mut();
             }
         }
+        drop(guard);
         return set;
     }
     loop {
@@ -1806,10 +1808,9 @@ fn set_iterable_type_error(object: *mut PyObject) -> String {
 /// directly, any other iterable advances like `pon_set_update` (CPython
 /// `issubset`/`issuperset` coerce arbitrary iterables, `str` included).
 ///
-/// GC note: the accumulated `Vec` is a Rust-heap buffer invisible to the
-/// stack scan (watch-only residual family with `collect_iterable` and
-/// sorted(key=)/min/max) — a collect inside an adversarial `__next__` can
-/// sweep earlier entries until the systemic rooting fix lands.
+/// GC note: the accumulated `Vec` is registered while arbitrary iterator
+/// `next` calls can re-enter pon, so entries already drained from an
+/// adversarial iterable remain roots.
 fn set_argument_entries(object: *mut PyObject) -> Result<Vec<*mut PyObject>, String> {
     if let Ok(entries) = unsafe { set_::entries_snapshot(object) } {
         return Ok(entries);
@@ -1832,6 +1833,7 @@ fn set_argument_entries(object: *mut PyObject) -> Result<Vec<*mut PyObject>, Str
         });
     }
     let mut entries = Vec::new();
+    let guard = super::scoped_roots(&entries as *const _);
     loop {
         let item = unsafe { super::iter::pon_iter_next(iter, ptr::null_mut()) };
         if item.is_null() {
@@ -1839,6 +1841,7 @@ fn set_argument_entries(object: *mut PyObject) -> Result<Vec<*mut PyObject>, Str
             if crate::thread_state::pon_err_occurred() {
                 crate::thread_state::pon_err_clear();
             }
+            drop(guard);
             return Ok(entries);
         }
         entries.push(item);

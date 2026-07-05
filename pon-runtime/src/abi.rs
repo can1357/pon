@@ -3864,6 +3864,16 @@ impl ScopedRootSource for Vec<(*mut PyObject, *mut PyObject)> {
     }
 }
 
+impl ScopedRootSource for Vec<(usize, *mut PyObject)> {
+    fn push_roots(&self, push: &mut dyn FnMut(*mut PyObject)) {
+        for &(_, value) in self {
+            if !value.is_null() && crate::tag::is_heap(value) {
+                push(value);
+            }
+        }
+    }
+}
+
 /// Type-erased [`ScopedRootSource::push_roots`] entry (thin `(addr, thunk)`
 /// pairs, the `gcroot::RootRegistry` pattern): callers register a RAW
 /// pointer and never hold a shared borrow of a buffer they keep mutating.

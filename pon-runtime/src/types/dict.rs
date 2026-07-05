@@ -1061,7 +1061,8 @@ unsafe fn find_entry_index(dict: *mut PyObject, key: *mut PyObject, hash: isize)
             }
         }
         // Deferred pass: Python-level `__eq__` runs with the borrow released.
-        for (index, entry_key) in deferred {
+        let _deferred_guard = crate::abi::scoped_roots(&deferred as *const _);
+        for &(index, entry_key) in deferred.iter() {
             let equal = unsafe { dispatch_user_eq(entry_key, key)? };
             let storage = unsafe { dict_ref(dict)? };
             if equal {

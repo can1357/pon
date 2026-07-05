@@ -469,6 +469,7 @@ pub unsafe extern "C" fn builtin_map(argv: *mut *mut PyObject, argc: usize) -> *
         return raise_type_error(&format!("map() must have at least two arguments, got {}", args.len()));
     }
     let mut iters = Vec::with_capacity(args.len() - 1);
+    let guard = abi::scoped_roots(&iters as *const _);
     for arg in &args[1..] {
         let iter = unsafe { abi::pon_get_iter(*arg, ptr::null_mut()) };
         if iter.is_null() {
@@ -476,6 +477,7 @@ pub unsafe extern "C" fn builtin_map(argv: *mut *mut PyObject, argc: usize) -> *
         }
         iters.push(iter);
     }
+    drop(guard);
     lazy_iter::new_map(args[0], iters)
 }
 
@@ -503,6 +505,7 @@ pub unsafe extern "C" fn builtin_zip(argv: *mut *mut PyObject, argc: usize) -> *
         }
     }
     let mut iters = Vec::with_capacity(positional.len());
+    let guard = abi::scoped_roots(&iters as *const _);
     for arg in positional.iter().copied() {
         let iter = unsafe { abi::pon_get_iter(arg, ptr::null_mut()) };
         if iter.is_null() {
@@ -510,6 +513,7 @@ pub unsafe extern "C" fn builtin_zip(argv: *mut *mut PyObject, argc: usize) -> *
         }
         iters.push(iter);
     }
+    drop(guard);
     lazy_iter::new_zip(iters, strict)
 }
 
@@ -562,49 +566,111 @@ unsafe fn min_max(argv: *mut *mut PyObject, argc: usize, max_mode: bool) -> *mut
 }
 
 fn select_min_max(items: Vec<*mut PyObject>, key: *mut PyObject, max_mode: bool) -> Result<*mut PyObject, ()> {
-    let mut iter = items.into_iter();
+    let items_guard = abi::scoped_roots(&items as *const _);
+    let mut iter = items.iter().copied();
     let mut best = iter.next().expect("non-empty min/max items");
-    let mut best_key = key_value(best, key)?;
+    let best_key = key_value(best, key)?;
+    let mut key_slots = vec![best_key, ptr::null_mut()];
+    let key_slots_guard = abi::scoped_roots(&key_slots as *const _);
     for item in iter {
         let item_key = key_value(item, key)?;
+        key_slots[1] = item_key;
         let better = if max_mode {
-            rich_bool(abstract_op::RICH_GT, item_key, best_key)?
+            rich_bool(abstract_op::RICH_GT, key_slots[1], key_slots[0])?
         } else {
-            rich_bool(abstract_op::RICH_LT, item_key, best_key)?
+            rich_bool(abstract_op::RICH_LT, key_slots[1], key_slots[0])?
         };
         if better {
             best = item;
-            best_key = item_key;
+            key_slots[0] = key_slots[1];
         }
+        key_slots[1] = ptr::null_mut();
     }
+    drop(key_slots_guard);
+    drop(items_guard);
     Ok(best)
 }
 
-/// Insertion-based stable sort shared by `sorted()` and `list.sort()`:
+/// Stable index sort shared by `sorted()` and `list.sort()`:
 /// key-mapped once, then rich-compare ordered (`reverse` flips to GT).
 pub(crate) fn stable_sort(items: &mut Vec<*mut PyObject>, key: *mut PyObject, reverse: bool) -> Result<(), ()> {
+    let items_guard = abi::scoped_roots(items as *const Vec<*mut PyObject>);
     let mut keyed = Vec::with_capacity(items.len());
+    let keyed_guard = abi::scoped_roots(&keyed as *const _);
     for item in items.iter().copied() {
         keyed.push((item, key_value(item, key)?));
     }
-    for index in 1..keyed.len() {
-        let current = keyed[index];
-        let mut pos = index;
-        while pos > 0 {
-            let should_shift = if reverse {
-                rich_bool(abstract_op::RICH_GT, current.1, keyed[pos - 1].1)?
-            } else {
-                rich_bool(abstract_op::RICH_LT, current.1, keyed[pos - 1].1)?
-            };
-            if !should_shift {
-                break;
-            }
-            keyed[pos] = keyed[pos - 1];
-            pos -= 1;
-        }
-        keyed[pos] = current;
+
+    let mut indices: Vec<usize> = (0..keyed.len()).collect();
+    let mut scratch = vec![0; indices.len()];
+    stable_merge_sort_indices(&mut indices, &mut scratch, &mut |left, right| {
+        let ordered = if reverse {
+            rich_bool(abstract_op::RICH_GT, keyed[left].1, keyed[right].1)?
+        } else {
+            rich_bool(abstract_op::RICH_LT, keyed[left].1, keyed[right].1)?
+        };
+        Ok(if ordered { Ordering::Less } else { Ordering::Equal })
+    })?;
+
+    for (slot, &index) in items.iter_mut().zip(indices.iter()) {
+        *slot = keyed[index].0;
     }
-    *items = keyed.into_iter().map(|(item, _)| item).collect();
+    drop(keyed_guard);
+    drop(items_guard);
+    Ok(())
+}
+
+fn stable_merge_sort_indices<F>(
+    indices: &mut [usize],
+    scratch: &mut [usize],
+    compare: &mut F,
+) -> Result<(), ()>
+where
+    F: FnMut(usize, usize) -> Result<Ordering, ()>,
+{
+    let len = indices.len();
+    stable_merge_sort_range(indices, scratch, 0, len, compare)
+}
+
+fn stable_merge_sort_range<F>(
+    indices: &mut [usize],
+    scratch: &mut [usize],
+    start: usize,
+    end: usize,
+    compare: &mut F,
+) -> Result<(), ()>
+where
+    F: FnMut(usize, usize) -> Result<Ordering, ()>,
+{
+    if end - start <= 1 {
+        return Ok(());
+    }
+
+    let mid = start + (end - start) / 2;
+    stable_merge_sort_range(indices, scratch, start, mid, compare)?;
+    stable_merge_sort_range(indices, scratch, mid, end, compare)?;
+
+    let mut left = start;
+    let mut right = mid;
+    let mut out = start;
+    while left < mid && right < end {
+        if compare(indices[right], indices[left])?.is_lt() {
+            scratch[out] = indices[right];
+            right += 1;
+        } else {
+            scratch[out] = indices[left];
+            left += 1;
+        }
+        out += 1;
+    }
+    if left < mid {
+        scratch[out..out + (mid - left)].copy_from_slice(&indices[left..mid]);
+        out += mid - left;
+    }
+    if right < end {
+        scratch[out..out + (end - right)].copy_from_slice(&indices[right..end]);
+    }
+    indices[start..end].copy_from_slice(&scratch[start..end]);
     Ok(())
 }
 
@@ -860,6 +926,7 @@ pub(super) fn collect_iterable(object: *mut PyObject) -> Result<Vec<*mut PyObjec
         return Err(format!("'{}' object is not iterable", type_name(object)));
     }
     let mut items = Vec::new();
+    let guard = abi::scoped_roots(&items as *const _);
     loop {
         let value = unsafe { abi::pon_iter_next(iter, ptr::null_mut()) };
         if value.is_null() {
@@ -871,6 +938,7 @@ pub(super) fn collect_iterable(object: *mut PyObject) -> Result<Vec<*mut PyObjec
         }
         items.push(value);
     }
+    drop(guard);
     Ok(items)
 }
 
@@ -1086,4 +1154,53 @@ pub(super) unsafe fn type_dunder(object: *mut PyObject, name: &str) -> Option<*m
         }
     }
     None
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::PyLong;
+    use crate::thread_state::test_state_lock;
+
+    unsafe extern "C" fn negating_key(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+        if argc != 1 || argv.is_null() {
+            return raise_type_error("negating_key expected 1 argument");
+        }
+        let item = unsafe { *argv };
+        let value = unsafe { (*item.cast::<PyLong>()).value };
+        unsafe { abi::pon_const_int(-value) }
+    }
+
+    fn int_list(values: &[i64]) -> *mut PyObject {
+        let mut items = values.iter().map(|value| unsafe { abi::pon_const_int(*value) }).collect::<Vec<_>>();
+        unsafe { abi::seq::pon_build_list(items.as_mut_ptr(), items.len()) }
+    }
+
+    fn int_value(object: *mut PyObject) -> i64 {
+        assert!(!object.is_null());
+        unsafe { (*object.cast::<PyLong>()).value }
+    }
+
+    #[test]
+    fn min_max_key_path_selects_by_key() {
+        let _guard = test_state_lock();
+        assert_eq!(unsafe { abi::pon_runtime_init() }, 0);
+        pon_err_clear();
+        let key = unsafe { abi::pon_make_function(negating_key as *const u8, 1, intern("negating_key")) };
+        assert!(!key.is_null());
+        let options = lazy_iter::new_minmax_options(key, DEFAULT_SENTINEL, false);
+        let values = int_list(&[7, -2, 3]);
+
+        let mut min_args = [values, options];
+        let min = unsafe { builtin_min(min_args.as_mut_ptr(), min_args.len()) };
+        assert_eq!(int_value(min), 7);
+
+        let options = lazy_iter::new_minmax_options(key, DEFAULT_SENTINEL, false);
+        let values = int_list(&[7, -2, 3]);
+        let mut max_args = [values, options];
+        let max = unsafe { builtin_max(max_args.as_mut_ptr(), max_args.len()) };
+        assert_eq!(int_value(max), -2);
+        assert!(!pon_err_occurred());
+    }
 }

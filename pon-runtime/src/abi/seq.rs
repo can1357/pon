@@ -910,6 +910,7 @@ pub(crate) fn sequence_to_vec(object: *mut PyObject) -> Result<Vec<*mut PyObject
     let iter = unsafe { super::iter::pon_get_iter(object, ptr::null_mut()) };
     if !iter.is_null() {
         let mut out = Vec::new();
+        let guard = super::scoped_roots(&out as *const _);
         loop {
             let value = unsafe { super::iter::pon_iter_next(iter, ptr::null_mut()) };
             if value.is_null() {
@@ -927,6 +928,7 @@ pub(crate) fn sequence_to_vec(object: *mut PyObject) -> Result<Vec<*mut PyObject
             }
             out.push(value);
         }
+        drop(guard);
         return Ok(out);
     }
     if pon_err_occurred() {
@@ -937,9 +939,11 @@ pub(crate) fn sequence_to_vec(object: *mut PyObject) -> Result<Vec<*mut PyObject
     let mut out = Vec::new();
     out.try_reserve_exact(len)
         .map_err(|_| "sequence unpack allocation failed".to_owned())?;
+    let guard = super::scoped_roots(&out as *const _);
     for index in 0..len {
         out.push(sequence_item_raw(object, index as isize)?);
     }
+    drop(guard);
     Ok(out)
 }
 
@@ -1018,11 +1022,13 @@ fn sliced_values(object: *mut PyObject, indices: SliceIndices) -> Result<Vec<*mu
     values
         .try_reserve_exact(indices.len)
         .map_err(|_| "slice result allocation failed".to_owned())?;
+    let guard = super::scoped_roots(&values as *const _);
     let mut index = indices.start;
     for _ in 0..indices.len {
         values.push(sequence_item_raw(object, index)?);
         index = index.saturating_add(indices.step);
     }
+    drop(guard);
     Ok(values)
 }
 
@@ -1155,7 +1161,9 @@ fn list_assign_slice_raw(list_object: *mut PyObject, key: *mut PyObject, value: 
         return replace_list_contents(list, &current);
     }
 
+    let current_guard = super::scoped_roots(&current as *const _);
     let replacement = sequence_to_vec(value)?;
+    drop(current_guard);
     if indices.step == 1 {
         let start = indices.start as usize;
         let stop = indices.stop as usize;
@@ -1426,9 +1434,11 @@ unsafe fn list_sort_with_options(list: *mut PyObject, key: *mut PyObject, revers
         // SAFETY: `has_list_storage` proved a resolvable cell block.
         unsafe { (&*list_cells_ptr(list).expect("storage checked above")).as_slice() }.to_vec()
     };
+    let guard = crate::abi::scoped_roots(&items as *const _);
     if crate::native::builtins_batch::stable_sort(&mut items, key, reverse).is_err() {
         return ptr::null_mut();
     }
+    drop(guard);
     let _guard = crate::sync::begin_critical_section(list);
     // SAFETY: As above; the critical section serializes the write-back.
     let values = unsafe { (&mut *list_cells_ptr(list).expect("storage checked above")).as_mut_slice() };
