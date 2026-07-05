@@ -111,6 +111,10 @@ static inline PyObject *PyList_GET_ITEM(PyObject *list, Py_ssize_t index) {
     return PyList_GetItem(list, index);
 }
 
+static inline PyObject *PyList_GetItemRef(PyObject *list, Py_ssize_t index) {
+    return PyPon_Capi()->containers->list_get_item_ref(list, index);
+}
+
 static inline int PyList_SetItem(PyObject *list, Py_ssize_t index, PyObject *item) {
     return PyPon_Capi()->containers->list_set_item(list, index, item);
 }
@@ -131,6 +135,10 @@ static inline PyObject *PyList_AsTuple(PyObject *list) {
 
 static inline int PyList_Sort(PyObject *list) {
     return PyPon_Capi()->containers->list_sort(list);
+}
+
+static inline int PyList_SetSlice(PyObject *list, Py_ssize_t low, Py_ssize_t high, PyObject *items) {
+    return PyPon_Capi()->containers->list_set_slice(list, low, high, items);
 }
 
 static inline PyObject *PyDict_New(void) {
@@ -189,6 +197,10 @@ static inline Py_ssize_t PyDict_Size(PyObject *dict) {
 
 static inline int PyDict_SetDefaultRef(PyObject *dict, PyObject *key, PyObject *default_value, PyObject **result) {
     return PyPon_Capi()->containers->dict_set_default_ref(dict, key, default_value, result);
+}
+
+static inline PyObject *PyDict_SetDefault(PyObject *dict, PyObject *key, PyObject *default_value) {
+    return PyPon_Capi()->containers->dict_set_default(dict, key, default_value);
 }
 
 static inline PyObject *PyDict_Keys(PyObject *dict) {

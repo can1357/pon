@@ -22,6 +22,10 @@ static inline Py_ssize_t _PyPon_FormatUnicodeInto(char *out, Py_ssize_t capacity
 #define PyExc_UnicodeEncodeError (PyPon_Capi()->err->exc_unicode_encode_error)
 #define PyExc_UnicodeDecodeError (PyPon_Capi()->err->exc_unicode_decode_error)
 #define PyExc_RecursionError (PyPon_Capi()->err->exc_recursion_error)
+#define PyExc_GeneratorExit (PyPon_Capi()->err->exc_generator_exit)
+#define PyExc_StopAsyncIteration (PyPon_Capi()->err->exc_stop_async_iteration)
+#define PyExc_UnboundLocalError (PyPon_Capi()->err->exc_unbound_local_error)
+
 
 #define PyErr_NewException(name, base, dict) \
     (PyPon_Capi()->err->new_exception((name), (base), (dict)))
@@ -76,6 +80,9 @@ static inline int PyErr_WarnFormat(PyObject *category, Py_ssize_t stack_level, c
 
 #define PyErr_SetFromErrno(exception) \
     (PyPon_Capi()->err->set_from_errno((exception)))
+
+#define PyErr_SetRaisedException(exception) \
+    (PyPon_Capi()->err->set_raised_exception((exception)))
 
 #define PyException_SetCause(exception, cause) \
     (PyPon_Capi()->err->exception_set_cause((exception), (cause)))

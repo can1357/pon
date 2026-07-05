@@ -2,6 +2,7 @@
 
 use core::ffi::{c_char, c_double, c_int, c_long, c_longlong, c_ulong, c_ulonglong, c_void};
 use core::ptr;
+use std::ffi::CStr;
 
 use num_bigint::{BigInt, Sign};
 use num_traits::{One, ToPrimitive, Zero};
@@ -11,6 +12,13 @@ use crate::object::{PyObject, PyType};
 use crate::types::exc::ExceptionKind;
 
 use super::twin::{self, ForeignTypeObject};
+
+const PY_ASNATIVEBYTES_DEFAULTS: c_int = -1;
+const PY_ASNATIVEBYTES_LITTLE_ENDIAN: c_int = 1;
+const PY_ASNATIVEBYTES_NATIVE_ENDIAN: c_int = 3;
+const PY_ASNATIVEBYTES_UNSIGNED_BUFFER: c_int = 4;
+const PY_ASNATIVEBYTES_REJECT_NEGATIVE: c_int = 8;
+const PY_ASNATIVEBYTES_ALLOW_INDEX: c_int = 16;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -92,6 +100,10 @@ pub(crate) struct PyPonCapiNumbers {
     number_inplace_matrix_multiply: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
     number_check: unsafe extern "C" fn(*mut PyObject) -> c_int,
     hash_double: unsafe extern "C" fn(*mut PyObject, c_double) -> isize,
+    long_as_native_bytes: unsafe extern "C" fn(*mut PyObject, *mut c_void, isize, c_int) -> isize,
+    long_from_native_bytes: unsafe extern "C" fn(*const c_void, usize, c_int) -> *mut PyObject,
+    long_from_unsigned_native_bytes: unsafe extern "C" fn(*const c_void, usize, c_int) -> *mut PyObject,
+    long_from_string: unsafe extern "C" fn(*const c_char, *mut *mut c_char, c_int) -> *mut PyObject,
 }
 
 unsafe impl Send for PyPonCapiNumbers {}
@@ -169,6 +181,10 @@ pub(crate) fn build() -> PyPonCapiNumbers {
         number_inplace_matrix_multiply: capi_number_inplace_matrix_multiply,
         number_check: capi_number_check,
         hash_double: capi_hash_double,
+        long_as_native_bytes: capi_long_as_native_bytes,
+        long_from_native_bytes: capi_long_from_native_bytes,
+        long_from_unsigned_native_bytes: capi_long_from_unsigned_native_bytes,
+        long_from_string: capi_long_from_string,
     }
 }
 
@@ -275,6 +291,102 @@ unsafe extern "C" fn capi_long_from_double(value: c_double) -> *mut PyObject {
         Some(value) => new_reference(crate::types::int::from_bigint(value)),
         None => {
             raise_overflow("cannot convert float infinity to integer");
+            ptr::null_mut()
+        }
+    }
+}
+
+unsafe extern "C" fn capi_long_as_native_bytes(
+    object: *mut PyObject,
+    buffer: *mut c_void,
+    n_bytes: isize,
+    flags: c_int,
+) -> isize {
+    if object.is_null() || n_bytes < 0 || (buffer.is_null() && n_bytes > 0) {
+        raise_system("bad argument to internal function");
+        return -1;
+    }
+
+    let value = match unsafe { native_bytes_integer_arg(object, flags) } {
+        Ok(value) => value,
+        Err(()) => return -1,
+    };
+    if flags != PY_ASNATIVEBYTES_DEFAULTS
+        && (flags & PY_ASNATIVEBYTES_REJECT_NEGATIVE) != 0
+        && value.sign() == Sign::Minus
+    {
+        raise_value("Cannot convert negative int");
+        return -1;
+    }
+
+    let n = n_bytes as usize;
+    let little_endian = native_bytes_little_endian(flags);
+    if n != 0 {
+        let bytes = bigint_to_native_bytes(&value, n, little_endian);
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), n);
+        }
+    }
+
+    native_bytes_len_to_ssize(native_bytes_required_len(
+        &value,
+        native_bytes_unsigned_buffer(flags),
+        n,
+    ))
+}
+
+unsafe extern "C" fn capi_long_from_native_bytes(
+    buffer: *const c_void,
+    n_bytes: usize,
+    flags: c_int,
+) -> *mut PyObject {
+    if buffer.is_null() {
+        raise_system("bad argument to internal function");
+        return ptr::null_mut();
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), n_bytes) };
+    let value = bigint_from_native_bytes(
+        bytes,
+        native_bytes_little_endian(flags),
+        flags == PY_ASNATIVEBYTES_DEFAULTS || (flags & PY_ASNATIVEBYTES_UNSIGNED_BUFFER) == 0,
+    );
+    new_reference(crate::types::int::from_bigint(value))
+}
+
+unsafe extern "C" fn capi_long_from_unsigned_native_bytes(
+    buffer: *const c_void,
+    n_bytes: usize,
+    flags: c_int,
+) -> *mut PyObject {
+    if buffer.is_null() {
+        raise_system("bad argument to internal function");
+        return ptr::null_mut();
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(buffer.cast::<u8>(), n_bytes) };
+    let value = bigint_from_native_bytes(bytes, native_bytes_little_endian(flags), false);
+    new_reference(crate::types::int::from_bigint(value))
+}
+
+unsafe extern "C" fn capi_long_from_string(
+    text: *const c_char,
+    pend: *mut *mut c_char,
+    base: c_int,
+) -> *mut PyObject {
+    if text.is_null() {
+        set_parse_end(pend, text, 0);
+        raise_system("bad argument to internal function");
+        return ptr::null_mut();
+    }
+
+    let bytes = unsafe { CStr::from_ptr(text).to_bytes() };
+    match parse_c_long_bytes(bytes, base) {
+        Ok((value, end)) => {
+            set_parse_end(pend, text, end);
+            new_reference(crate::types::int::from_bigint(value))
+        }
+        Err((message, end)) => {
+            set_parse_end(pend, text, end);
+            raise_value(&message);
             ptr::null_mut()
         }
     }
@@ -941,6 +1053,217 @@ fn bigint_to_c_ulonglong_mask(value: &BigInt) -> c_ulonglong {
     masked.to_u64().unwrap_or(0) as c_ulonglong
 }
 
+unsafe fn native_bytes_integer_arg(object: *mut PyObject, flags: c_int) -> Result<BigInt, ()> {
+    if flags != PY_ASNATIVEBYTES_DEFAULTS && (flags & PY_ASNATIVEBYTES_ALLOW_INDEX) != 0 {
+        return unsafe { coerce_index_bigint(object) };
+    }
+    let Some(object) = normalize_arg(object) else {
+        raise_type("expect int, got object");
+        return Err(());
+    };
+    match unsafe { crate::types::int::to_bigint_including_bool(object) } {
+        Some(value) => Ok(value),
+        None => {
+            raise_type(&format!("expect int, got {}", type_name(object)));
+            Err(())
+        }
+    }
+}
+
+fn native_bytes_little_endian(flags: c_int) -> bool {
+    if flags == PY_ASNATIVEBYTES_DEFAULTS || (flags & (PY_ASNATIVEBYTES_NATIVE_ENDIAN - PY_ASNATIVEBYTES_LITTLE_ENDIAN)) != 0 {
+        cfg!(target_endian = "little")
+    } else {
+        (flags & PY_ASNATIVEBYTES_LITTLE_ENDIAN) != 0
+    }
+}
+
+fn native_bytes_unsigned_buffer(flags: c_int) -> bool {
+    flags == PY_ASNATIVEBYTES_DEFAULTS || (flags & PY_ASNATIVEBYTES_UNSIGNED_BUFFER) != 0
+}
+
+fn native_bytes_required_len(value: &BigInt, unsigned_buffer: bool, n_bytes: usize) -> usize {
+    let required = match value.sign() {
+        Sign::NoSign => 1,
+        Sign::Minus => value.to_signed_bytes_le().len().max(1),
+        Sign::Plus if unsigned_buffer => value.to_bytes_le().1.len().max(1),
+        Sign::Plus => value.to_signed_bytes_le().len().max(1),
+    };
+    if n_bytes != 0 && required <= n_bytes {
+        n_bytes
+    } else {
+        required
+    }
+}
+
+fn native_bytes_len_to_ssize(len: usize) -> isize {
+    match isize::try_from(len) {
+        Ok(len) => len,
+        Err(_) => {
+            raise_overflow("int has too many bits to express in a platform Py_ssize_t");
+            -1
+        }
+    }
+}
+
+fn bigint_to_native_bytes(value: &BigInt, n_bytes: usize, little_endian: bool) -> Vec<u8> {
+    let mut bytes = if value.sign() == Sign::Minus {
+        value.to_signed_bytes_le()
+    } else {
+        let (_, bytes) = value.to_bytes_le();
+        if bytes.is_empty() {
+            vec![0]
+        } else {
+            bytes
+        }
+    };
+    let fill = if value.sign() == Sign::Minus { 0xff } else { 0x00 };
+    bytes.resize(n_bytes, fill);
+    if !little_endian {
+        bytes.reverse();
+    }
+    bytes
+}
+
+fn bigint_from_native_bytes(bytes: &[u8], little_endian: bool, signed: bool) -> BigInt {
+    match (little_endian, signed) {
+        (true, true) => BigInt::from_signed_bytes_le(bytes),
+        (false, true) => BigInt::from_signed_bytes_be(bytes),
+        (true, false) => BigInt::from_bytes_le(Sign::Plus, bytes),
+        (false, false) => BigInt::from_bytes_be(Sign::Plus, bytes),
+    }
+}
+
+fn set_parse_end(pend: *mut *mut c_char, text: *const c_char, offset: usize) {
+    if !pend.is_null() {
+        unsafe {
+            *pend = text.wrapping_add(offset).cast_mut();
+        }
+    }
+}
+
+fn parse_c_long_bytes(bytes: &[u8], requested_base: c_int) -> Result<(BigInt, usize), (String, usize)> {
+    if requested_base != 0 && !(2..=36).contains(&requested_base) {
+        return Err(("int() base must be >= 2 and <= 36, or 0".to_owned(), 0));
+    }
+
+    let invalid = |offset| (invalid_c_int_literal(bytes, requested_base), offset);
+    let mut index = 0usize;
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+
+    let mut negative = false;
+    if index < bytes.len() {
+        if bytes[index] == b'+' {
+            index += 1;
+        } else if bytes[index] == b'-' {
+            negative = true;
+            index += 1;
+        }
+    }
+
+    let mut base = if requested_base == 0 { 10 } else { requested_base as u32 };
+    let mut prefixed = false;
+    if index + 1 < bytes.len() && bytes[index] == b'0' {
+        let prefix_base = match bytes[index + 1].to_ascii_lowercase() {
+            b'b' => Some(2),
+            b'o' => Some(8),
+            b'x' => Some(16),
+            _ => None,
+        };
+        if let Some(detected) = prefix_base {
+            if requested_base == 0 || requested_base as u32 == detected {
+                base = detected;
+                prefixed = true;
+                index += 2;
+            }
+        }
+    }
+
+    let mut value = BigInt::zero();
+    let mut saw_digit = false;
+    let mut previous_digit = false;
+    let mut after_prefix = prefixed;
+    let mut first_digit = None;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'_' {
+            if !previous_digit && !after_prefix {
+                return Err(invalid(index));
+            }
+            previous_digit = false;
+            after_prefix = false;
+            index += 1;
+            continue;
+        }
+        let Some(digit) = native_digit_value(byte) else {
+            break;
+        };
+        if digit >= base {
+            break;
+        }
+        if first_digit.is_none() {
+            first_digit = Some(digit);
+        }
+        value = value * base + digit;
+        saw_digit = true;
+        previous_digit = true;
+        after_prefix = false;
+        index += 1;
+    }
+
+    if !saw_digit {
+        return Err(invalid(index));
+    }
+    if !previous_digit {
+        return Err(invalid(index.saturating_sub(1)));
+    }
+    if requested_base == 0 && !prefixed && first_digit == Some(0) && !value.is_zero() {
+        return Err(invalid(index));
+    }
+
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    if index != bytes.len() {
+        return Err(invalid(index));
+    }
+
+    Ok((if negative { -value } else { value }, index))
+}
+
+fn native_digit_value(byte: u8) -> Option<u32> {
+    match byte {
+        b'0'..=b'9' => Some(u32::from(byte - b'0')),
+        b'a'..=b'z' => Some(u32::from(byte - b'a') + 10),
+        b'A'..=b'Z' => Some(u32::from(byte - b'A') + 10),
+        _ => None,
+    }
+}
+
+fn invalid_c_int_literal(bytes: &[u8], base: c_int) -> String {
+    format!("invalid literal for int() with base {base}: {}", c_bytes_repr(bytes))
+}
+
+fn c_bytes_repr(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() + 2);
+    out.push('\'');
+    for &byte in bytes {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            b'\'' => out.push_str("\\'"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7e => out.push(byte as char),
+            _ => out.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    out.push('\'');
+    out
+}
+
 fn c_float_error_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).replace('\\', "\\\\").replace('\'', "\\'")
 }
@@ -1067,6 +1390,10 @@ fn raise_value(message: &str) {
 
 fn raise_overflow(message: &str) {
     let _ = abi::exc::raise_kind_error_text(ExceptionKind::OverflowError, message);
+}
+
+fn raise_system(message: &str) {
+    let _ = abi::exc::raise_kind_error_text(ExceptionKind::SystemError, message);
 }
 
 unsafe fn raise_foreign_exception(exception: *mut PyObject, message: &str) {

@@ -63,6 +63,22 @@ static inline PyObject *PyLong_FromDouble(double value) {
     return PyPon_Capi()->numbers->long_from_double(value);
 }
 
+static inline PyObject *PyLong_FromString(const char *str, char **pend, int base) {
+    return PyPon_Capi()->numbers->long_from_string(str, pend, base);
+}
+
+static inline Py_ssize_t PyLong_AsNativeBytes(PyObject *object, void *buffer, Py_ssize_t n_bytes, int flags) {
+    return PyPon_Capi()->numbers->long_as_native_bytes(object, buffer, n_bytes, flags);
+}
+
+static inline PyObject *PyLong_FromNativeBytes(const void *buffer, size_t n_bytes, int flags) {
+    return PyPon_Capi()->numbers->long_from_native_bytes(buffer, n_bytes, flags);
+}
+
+static inline PyObject *PyLong_FromUnsignedNativeBytes(const void *buffer, size_t n_bytes, int flags) {
+    return PyPon_Capi()->numbers->long_from_unsigned_native_bytes(buffer, n_bytes, flags);
+}
+
 static inline long PyLong_AsLong(PyObject *object) {
     return PyPon_Capi()->numbers->long_as_long(object);
 }

@@ -85,6 +85,9 @@ pub(crate) struct PyPonCapiContainers {
     sequence_repeat: unsafe extern "C" fn(*mut PyObject, isize) -> *mut PyObject,
     sequence_inplace_repeat: unsafe extern "C" fn(*mut PyObject, isize) -> *mut PyObject,
     sequence_inplace_concat: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+    list_get_item_ref: unsafe extern "C" fn(*mut PyObject, isize) -> *mut PyObject,
+    list_set_slice: unsafe extern "C" fn(*mut PyObject, isize, isize, *mut PyObject) -> c_int,
+    dict_set_default: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject,
 }
 
 unsafe impl Send for PyPonCapiContainers {}
@@ -154,6 +157,9 @@ pub(crate) fn build() -> PyPonCapiContainers {
         sequence_repeat: capi_sequence_repeat,
         sequence_inplace_repeat: capi_sequence_inplace_repeat,
         sequence_inplace_concat: capi_sequence_inplace_concat,
+        list_get_item_ref: capi_list_get_item_ref,
+        list_set_slice: capi_list_set_slice,
+        dict_set_default: capi_dict_set_default,
     }
 }
 
@@ -488,6 +494,20 @@ unsafe extern "C" fn capi_list_get_item(list: *mut PyObject, index: isize) -> *m
         unsafe { *storage.items.add(index) }
     })
 }
+
+unsafe extern "C" fn capi_list_get_item_ref(list: *mut PyObject, index: isize) -> *mut PyObject {
+    catch_object(|| {
+        let list = crate::tag::untag_arg(list);
+        let Some(storage) = list_storage(list) else {
+            return type_error("expected list object");
+        };
+        let index = match checked_index(index, storage.len, "list") {
+            Ok(index) => index,
+            Err(error) => return error,
+        };
+        unsafe { *storage.items.add(index) }
+    })
+}
 unsafe extern "C" fn capi_list_set_item(list: *mut PyObject, index: isize, item: *mut PyObject) -> c_int {
     catch_status(|| {
         let list = crate::tag::untag_arg(list);
@@ -557,6 +577,33 @@ unsafe extern "C" fn capi_list_insert(list: *mut PyObject, index: isize, item: *
         }
         storage.len += 1;
         0
+    })
+}
+
+unsafe extern "C" fn capi_list_set_slice(list: *mut PyObject, low: isize, high: isize, items: *mut PyObject) -> c_int {
+    catch_status(|| {
+        let list = crate::tag::untag_arg(list);
+        if list_storage(list).is_none() {
+            return status_type_error("expected list object");
+        }
+        let start = unsafe { abi::pon_const_int(low as i64) };
+        if start.is_null() {
+            return -1;
+        }
+        let stop = unsafe { abi::pon_const_int(high as i64) };
+        if stop.is_null() {
+            return -1;
+        }
+        let slice = unsafe { abi::seq::pon_build_slice(start, stop, abi::pon_none()) };
+        if slice.is_null() {
+            return -1;
+        }
+        let items = if items.is_null() {
+            ptr::null_mut()
+        } else {
+            crate::tag::untag_arg(normalize_object_arg(items))
+        };
+        unsafe { abi::seq::pon_seq_set_item(list, slice, items) }
     })
 }
 
@@ -1007,6 +1054,35 @@ unsafe extern "C" fn capi_dict_set_default_ref(
                 0
             }
             Err(message) => status_error(message),
+        }
+    })
+}
+
+unsafe extern "C" fn capi_dict_set_default(
+    dict: *mut PyObject,
+    key: *mut PyObject,
+    default_value: *mut PyObject,
+) -> *mut PyObject {
+    catch_borrowed_object(|| {
+        if default_value.is_null() {
+            return type_error("PyDict_SetDefault default value must not be NULL");
+        }
+        let key = crate::tag::untag_arg(normalize_object_arg(key));
+        match dict_get_result(dict, key) {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                if pon_err_occurred() {
+                    pon_err_clear();
+                }
+                let dict = crate::tag::untag_arg(dict);
+                let default_value = crate::tag::untag_arg(normalize_object_arg(default_value));
+                let status = dict_set_item_capi(dict, key, default_value);
+                if status < 0 {
+                    return ptr::null_mut();
+                }
+                default_value
+            }
+            Err(message) => abi::return_null_with_error(message),
         }
     })
 }

@@ -72,6 +72,10 @@ pub(crate) struct PyPonCapiErr {
     exc_recursion_error: *mut PyObject,
     new_exception: unsafe extern "C" fn(*const c_char, *mut PyObject, *mut PyObject) -> *mut PyObject,
     check_signals: unsafe extern "C" fn() -> c_int,
+    set_raised_exception: unsafe extern "C" fn(*mut PyObject),
+    exc_generator_exit: *mut PyObject,
+    exc_stop_async_iteration: *mut PyObject,
+    exc_unbound_local_error: *mut PyObject,
 }
 
 unsafe impl Send for PyPonCapiErr {}
@@ -137,6 +141,10 @@ pub(crate) fn build() -> PyPonCapiErr {
         exc_recursion_error: singleton(ExceptionKind::RecursionError),
         new_exception: capi_err_new_exception,
         check_signals: capi_err_check_signals,
+        set_raised_exception: capi_err_set_raised_exception,
+        exc_generator_exit: singleton(ExceptionKind::GeneratorExit),
+        exc_stop_async_iteration: singleton(ExceptionKind::StopAsyncIteration),
+        exc_unbound_local_error: singleton(ExceptionKind::UnboundLocalError),
     }
 }
 
@@ -219,6 +227,15 @@ unsafe extern "C" fn capi_err_set_none(exception: *mut PyObject) {
         let _ = abi::exc::raise_kind_error_text(ExceptionKind::RuntimeError, "C extension error");
         return;
     };
+    if class.cast::<PyType>() == abi::exception_type_object(ExceptionKind::StopIteration) {
+        let none = unsafe { abi::pon_none() };
+        if none.is_null() {
+            return;
+        }
+        let mut argv = [none];
+        unsafe { raise_call(class, &mut argv) };
+        return;
+    }
     unsafe { raise_call(class, &mut []) };
 }
 
@@ -345,6 +362,25 @@ unsafe extern "C" fn capi_err_restore(exception: *mut PyObject, value: *mut PyOb
     }
 
     let _ = abi::exc::raise_kind_error_text(ExceptionKind::SystemError, "PyErr_Restore called without an exception type");
+}
+
+unsafe extern "C" fn capi_err_set_raised_exception(exception: *mut PyObject) {
+    if exception.is_null() {
+        pon_err_clear();
+        return;
+    }
+    let normalized = crate::tag::untag_arg(exception);
+    let base_exception = abi::exception_type_object(ExceptionKind::BaseException);
+    if normalized.is_null()
+        || !crate::tag::is_heap(normalized)
+        || unsafe { !crate::types::exc::is_exception_instance(normalized, base_exception.cast_const()) }
+    {
+        let _ = abi::exc::raise_kind_error_text(ExceptionKind::TypeError, "PyErr_SetRaisedException expected a BaseException instance");
+        super::unpin_object(exception);
+        return;
+    }
+    let _ = unsafe { abi::exc::pon_raise(normalized, ptr::null_mut()) };
+    super::unpin_object(exception);
 }
 
 unsafe fn warning_category_type(category: *mut PyObject) -> Option<*mut PyType> {
