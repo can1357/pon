@@ -2284,17 +2284,27 @@ fn alloc_file(file: File, name: String, mode: OpenMode, encoding: Option<String>
 }
 
 /// Process-level std stream (`sys.stdin`/`sys.stdout`/`sys.stderr`) as a
-/// text-mode native file over the raw fd.  The object lives in the `sys`
-/// module for the process lifetime, so the `File` never drops (the fd is
-/// never closed underneath libc); an explicit Python-level `close()` closes
-/// the real stream, exactly like CPython.  `readable` selects the fd-0
-/// shape (mode `"r"`, read side only); writers pass `false` and keep the
-/// write-only stdout/stderr contract.
+/// text-mode native file over a `dup` of the raw fd.
+///
+/// Ownership must be real: stream objects can die (import-state resets,
+/// interpreter teardown) and `finalize_file` closes the owned fd. Owning a
+/// dup means a finalized stream never tears down the process's stdio, and
+/// two stream objects for the same std fd can never double-close one fd
+/// (the historical failure: EBADF abort inside the collector). An explicit
+/// Python-level `close()` closes the object's dup and flips the object to
+/// the closed state; the process-level fd stays open (divergence from
+/// CPython, where closing `sys.stdout` closes fd 1 itself).
+///
+/// `readable` selects the fd-0 shape (mode `"r"`, read side only); writers
+/// pass `false` and keep the write-only stdout/stderr contract.
 pub(super) fn std_stream_object(fd: i32, name: &str, readable: bool) -> *mut PyObject {
     use std::os::fd::FromRawFd;
-    // SAFETY: fds 0/1/2 are open for the process lifetime; ownership is
-    // parked in a static module attribute, never dropped.
-    let file = unsafe { File::from_raw_fd(fd) };
+    let duped = unsafe { libc::dup(fd) };
+    if duped < 0 {
+        return abi::return_null_with_error(format!("dup({fd}) failed while creating {name}"));
+    }
+    // SAFETY: `dup` returned a fresh fd owned solely by this File.
+    let file = unsafe { File::from_raw_fd(duped) };
     alloc_native_file(PyNativeFile {
         ob_base: PyObjectHeader::new(text_file_type()),
         file: Some(file),

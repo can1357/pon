@@ -257,6 +257,14 @@ fn alloc_contextvar(name: String, name_obj: *mut PyObject, default: *mut PyObjec
     )
 }
 
+pub(crate) fn capi_contextvar_new(name: &str, default: *mut PyObject) -> *mut PyObject {
+    let name_obj = alloc_str_object(name);
+    if name_obj.is_null() {
+        return ptr::null_mut();
+    }
+    alloc_contextvar(name.to_owned(), name_obj, default)
+}
+
 fn alloc_token(var: *mut PyObject, old_value: *mut PyObject) -> *mut PyObject {
     register(
         Box::into_raw(Box::new(PyToken {
@@ -308,6 +316,52 @@ unsafe fn as_context<'a>(object: *mut PyObject) -> Option<&'a mut PyContext> {
     // SAFETY: NULL was rejected above; the type check gates the downcast.
     (unsafe { (*object).ob_type } == context_type().cast_const())
         .then(|| unsafe { &mut *object.cast::<PyContext>() })
+}
+
+pub(crate) unsafe fn capi_contextvar_get(
+    var: *mut PyObject,
+    default: *mut PyObject,
+    value: *mut *mut PyObject,
+) -> c_int {
+    if value.is_null() {
+        pon_err_set("PyContextVar_Get received a NULL value pointer".to_owned());
+        return -1;
+    }
+    unsafe {
+        *value = ptr::null_mut();
+    }
+
+    let constructor_default = match unsafe { as_contextvar(var) } {
+        Some(var) => var.default,
+        None => {
+            let _ = raise_type_error("PyContextVar_Get expected a ContextVar");
+            return -1;
+        }
+    };
+    let var = untag(var);
+    let current = CURRENT.with(Cell::get);
+    if !current.is_null() {
+        let Some(context) = (unsafe { as_context(current) }) else {
+            pon_err_set("current context is invalid".to_owned());
+            return -1;
+        };
+        for &(entry_var, entry_value) in &context.entries {
+            if entry_var == var {
+                unsafe {
+                    *value = entry_value;
+                }
+                return 0;
+            }
+        }
+    }
+
+    let fallback = if !default.is_null() { default } else { constructor_default };
+    if !fallback.is_null() {
+        unsafe {
+            *value = fallback;
+        }
+    }
+    0
 }
 
 /// The thread's current context object, materializing an empty one on first
