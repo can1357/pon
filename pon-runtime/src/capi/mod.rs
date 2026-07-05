@@ -143,11 +143,23 @@ unsafe impl Send for PyPonCapiCore {}
 #[repr(C)]
 struct PyCFunctionObject {
     ob_base: PyObjectHeader,
-    method: PyCFunction,
-    flags: c_int,
-    self_object: *mut PyObject,
+    m_ml: *mut PyMethodDef,
+    m_self: *mut PyObject,
+    m_module: *mut PyObject,
+    m_weakreflist: *mut PyObject,
+    vectorcall: *mut c_void,
     name: u32,
 }
+
+const CAPI_CFUNCTION_WORD: usize = mem::size_of::<*mut c_void>();
+const _: () = assert!(mem::size_of::<PyObjectHeader>() == 2 * CAPI_CFUNCTION_WORD);
+const _: () = assert!(mem::offset_of!(PyCFunctionObject, ob_base) == 0);
+const _: () = assert!(mem::offset_of!(PyCFunctionObject, m_ml) == 2 * CAPI_CFUNCTION_WORD);
+const _: () = assert!(mem::offset_of!(PyCFunctionObject, m_self) == 3 * CAPI_CFUNCTION_WORD);
+const _: () = assert!(mem::offset_of!(PyCFunctionObject, m_module) == 4 * CAPI_CFUNCTION_WORD);
+const _: () = assert!(mem::offset_of!(PyCFunctionObject, m_weakreflist) == 5 * CAPI_CFUNCTION_WORD);
+const _: () = assert!(mem::offset_of!(PyCFunctionObject, vectorcall) == 6 * CAPI_CFUNCTION_WORD);
+const _: () = assert!(mem::offset_of!(PyCFunctionObject, name) == 7 * CAPI_CFUNCTION_WORD);
 
 /// GC type id for C-function carriers (registry: pon-gc ids live in
 /// `abi::register_gc_types` and per-module constants; 141 is next to the
@@ -164,9 +176,92 @@ unsafe extern "C" fn trace_cfunction(object: *mut u8, visitor: &mut dyn FnMut(*m
         return;
     }
     // SAFETY: caller contract — live carrier allocation.
-    let receiver = unsafe { (*object.cast::<PyCFunctionObject>()).self_object };
-    if !receiver.is_null() && crate::tag::is_heap(receiver.cast()) {
-        visitor(receiver.cast());
+    let function = unsafe { &*object.cast::<PyCFunctionObject>() };
+    for field in [function.m_self, function.m_module, function.m_weakreflist] {
+        if !field.is_null() && crate::tag::is_heap(field.cast()) {
+            visitor(field.cast());
+        }
+    }
+}
+
+/// Carrier attribute assignment. CPython's `PyCFunctionObject` accepts
+/// `__doc__` (numpy's `add_docstring` writes `m_ml->ml_doc`; we mirror with
+/// a leaked utf-8 copy) and `__module__` (a writable member backed by
+/// `m_module` — numpy's `multiarray.py` re-homes ~30 C functions).
+/// Every other attribute keeps rejecting assignment like CPython.
+unsafe extern "C" fn cfunction_setattro(object: *mut PyObject, name: *mut PyObject, value: *mut PyObject) -> c_int {
+    let attr = unsafe { crate::types::type_::unicode_text(name) };
+    // SAFETY: carrier layout per C_FUNCTION_TYPE; m_ml is process-lifetime.
+    let function = unsafe { &mut *object.cast::<PyCFunctionObject>() };
+    match attr {
+        Some("__doc__") if !value.is_null() => {
+            let Some(text) = (unsafe { crate::types::type_::unicode_text(value) }) else {
+                let _ = abi::return_null_with_type_error("__doc__ must be a str");
+                return -1;
+            };
+            let Ok(c_text) = CString::new(text) else {
+                let _ = abi::return_null_with_type_error("__doc__ contains NUL");
+                return -1;
+            };
+            if let Some(method_def) = unsafe { function.m_ml.as_mut() } {
+                method_def.ml_doc = c_text.into_raw();
+            }
+            0
+        }
+        Some("__module__") if !value.is_null() => {
+            // Traced via `trace_cfunction` so the stored module name stays live.
+            function.m_module = value;
+            0
+        }
+        _ => {
+            let _ = abi::return_null_with_type_error("object does not support attribute assignment");
+            -1
+        }
+    }
+}
+
+/// Carrier attribute reads: CPython's `builtin_function_or_method` exposes
+/// `__name__`/`__qualname__` (ml_name), `__doc__` (ml_doc or None),
+/// `__module__` (m_module or None) and `__self__` (m_self or None); numpy's
+/// `_ArrayFunctionDispatcher` C init reads them unguarded. Everything else
+/// delegates to the generic attribute machinery.
+unsafe extern "C" fn cfunction_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let attr = unsafe { crate::types::type_::unicode_text(name) };
+    // SAFETY: dispatch reaches here only for live carrier instances.
+    let function = unsafe { &*object.cast::<PyCFunctionObject>() };
+    let method_def = unsafe { function.m_ml.as_ref() };
+    match attr {
+        Some("__name__") | Some("__qualname__") => {
+            let raw = method_def.map_or(ptr::null(), |def| def.ml_name);
+            if raw.is_null() {
+                return unsafe { abi::pon_const_str("<builtin>".as_ptr(), "<builtin>".len()) };
+            }
+            let text = unsafe { CStr::from_ptr(raw) }.to_string_lossy();
+            unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }
+        }
+        Some("__doc__") => {
+            let raw = method_def.map_or(ptr::null(), |def| def.ml_doc);
+            if raw.is_null() {
+                return unsafe { abi::pon_none() };
+            }
+            let text = unsafe { CStr::from_ptr(raw) }.to_string_lossy();
+            unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }
+        }
+        Some("__module__") => {
+            if function.m_module.is_null() {
+                unsafe { abi::pon_none() }
+            } else {
+                function.m_module
+            }
+        }
+        Some("__self__") => {
+            if function.m_self.is_null() {
+                unsafe { abi::pon_none() }
+            } else {
+                function.m_self
+            }
+        }
+        _ => unsafe { crate::descr::generic_get_attr(object, name) },
     }
 }
 
@@ -177,6 +272,8 @@ static C_FUNCTION_TYPE: LazyLock<usize> = LazyLock::new(|| {
     // through the descriptor protocol (METH_CLASS binds the type,
     // METH_STATIC stays unbound).
     ty.tp_descr_get = Some(cfunction_descr_get);
+    ty.tp_setattro = Some(cfunction_setattro);
+    ty.tp_getattro = Some(cfunction_getattro);
     Box::into_raw(Box::new(ty)) as usize
 });
 
@@ -309,7 +406,7 @@ pub(crate) fn load_extension_module(name: &str, path: &Path) -> Result<*mut PyOb
     }
 
     let module = if let Some(def) = registered_module_def(init_result) {
-        match unsafe { load_multi_phase_extension_module(def) } {
+        match unsafe { load_multi_phase_extension_module(def, name) } {
             Ok(module) => module,
             Err(message) => {
                 unsafe { libc::dlclose(handle) };
@@ -371,7 +468,7 @@ fn registered_module_def(object: *mut PyObject) -> Option<*mut PyModuleDef> {
         .then_some(object.cast::<PyModuleDef>())
 }
 
-unsafe fn load_multi_phase_extension_module(def: *mut PyModuleDef) -> Result<*mut PyObject, String> {
+unsafe fn load_multi_phase_extension_module(def: *mut PyModuleDef, import_name: &str) -> Result<*mut PyObject, String> {
     let def_ref = unsafe { &*def };
     let Some(name) = c_string(def_ref.m_name) else {
         let message = "module definition has no name".to_owned();
@@ -388,7 +485,27 @@ unsafe fn load_multi_phase_extension_module(def: *mut PyModuleDef) -> Result<*mu
         pon_err_set(message.clone());
         return Err(message);
     }
-    if let Err(message) = unsafe { run_module_slots(module, def_ref, &name) } {
+    // CPython installs the module in `sys.modules` BEFORE exec so exec-time
+    // self re-imports adopt it (numpy hard-errors on double exec).
+    if let Err(message) = crate::import::register_extension_module_for_exec(import_name, module) {
+        runtime_::unregister_module_state(module);
+        pon_err_set(message.clone());
+        return Err(message);
+    }
+    // Slots run with the module ACTIVE so C writes through the module dict
+    // (PyModule_GetDict + PyDict_SetItemString — numpy installs every ufunc
+    // this way) mirror into the module's attr registry, which star-import
+    // and pon-side getattr iterate.
+    if let Err(message) = crate::import::begin_module_execution(&name) {
+        crate::import::unregister_extension_module_after_failed_exec(import_name, module);
+        runtime_::unregister_module_state(module);
+        pon_err_set(message.clone());
+        return Err(message);
+    }
+    let slots_result = unsafe { run_module_slots(module, def_ref, &name) };
+    crate::import::end_module_execution(&name);
+    if let Err(message) = slots_result {
+        crate::import::unregister_extension_module_after_failed_exec(import_name, module);
         runtime_::unregister_module_state(module);
         return Err(message);
     }
@@ -428,10 +545,10 @@ unsafe fn create_module_from_def(def_ref: &PyModuleDef, reject_slots: bool) -> *
             let Some(method_name) = c_string(method.ml_name) else {
                 return abi::return_null_with_error("method definition has invalid name");
             };
-            let Some(function) = method.ml_meth else {
+            if method.ml_meth.is_none() {
                 return abi::return_null_with_error(format!("method '{method_name}' has no function"));
-            };
-            let object = alloc_cfunction(function, method.ml_flags, ptr::null_mut(), &method_name);
+            }
+            let object = alloc_cfunction_from_method_def(cursor.cast_mut(), ptr::null_mut(), &method_name);
             attrs.push((intern(&method_name), object));
             cursor = unsafe { cursor.add(1) };
         }
@@ -549,9 +666,25 @@ pub(super) fn pin_object(object: *mut PyObject) {
     *pins.entry(object as usize).or_insert(0) += 1;
 }
 
+/// Twin contract, reverse leg: native type objects never cross into C raw —
+/// a registered native type returned by any table function is translated to
+/// its foreign face (address-keyed registry probe; no deref for non-types).
+pub(super) fn foreignize_type_result(object: *mut PyObject) -> *mut PyObject {
+    if object.is_null() || !crate::tag::is_heap(object) {
+        return object;
+    }
+    match twin::registered_foreign_of_native(object.cast::<PyType>()) {
+        Some(foreign) => foreign.cast::<PyObject>(),
+        None => object,
+    }
+}
+
 pub(super) fn pin_new_reference(object: *mut PyObject) -> *mut PyObject {
+    // Pin the NATIVE object (faces are C statics `pin_object` ignores), then
+    // hand C the face. The pin/unpin asymmetry is harmless: only registered
+    // TYPE objects translate, and those are process-lifetime.
     pin_object(object);
-    object
+    foreignize_type_result(object)
 }
 
 pub(super) fn unpin_object(object: *mut PyObject) {
@@ -610,65 +743,84 @@ unsafe extern "C" fn cfunction_call(callee: *mut PyObject, args: *mut PyObject, 
         return abi::return_null_with_error("NULL C function object");
     }
     let function = unsafe { &*callee.cast::<PyCFunctionObject>() };
-    let positional = match unsafe { tuple_args(args) } {
-        Ok(values) => values,
+    let Some(method_def) = (unsafe { function.m_ml.as_ref() }) else {
+        return abi::return_null_with_error("C function object has no method definition");
+    };
+    let Some(method) = method_def.ml_meth else {
+        return abi::return_null_with_error("C function object has no function pointer");
+    };
+    let flags = method_def.ml_flags;
+    // Twin contract, inbound-to-C leg: registered native TYPE objects never
+    // cross into C raw — C code casts arguments to CPython struct layouts
+    // (numpy's add_docstring reads `((PyTypeObject *)obj)->tp_doc`).
+    let self_object = foreignize_type_result(function.m_self);
+    let positional: Vec<*mut PyObject> = match unsafe { tuple_args(args) } {
+        Ok(values) => values.iter().map(|&value| foreignize_type_result(value)).collect(),
         Err(message) => return abi::return_null_with_error(message),
     };
-    if function.flags & METH_KEYWORDS != 0 && function.flags & METH_FASTCALL == 0 {
+    // C sees a fresh tuple of translated operands for the tuple conventions;
+    // pinned across the call (only C references it while it runs).
+    let build_call_tuple = |values: &[*mut PyObject]| -> *mut PyObject {
+        let mut values = values.to_vec();
+        let tuple = unsafe { abi::seq::pon_build_tuple(values.as_mut_ptr(), values.len()) };
+        pin_object(tuple);
+        tuple
+    };
+    if flags & METH_KEYWORDS != 0 && flags & METH_FASTCALL == 0 {
         // METH_VARARGS|METH_KEYWORDS: (self, args_tuple, kwargs_dict_or_NULL).
         let with_keywords: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject =
             // SAFETY: the METH_KEYWORDS flag certifies the C entry was
             // declared with the PyCFunctionWithKeywords signature.
-            unsafe { mem::transmute(function.method) };
-        let tuple = if args.is_null() {
-            unsafe { abi::seq::pon_build_tuple(ptr::null_mut(), 0) }
-        } else {
-            args
-        };
-        let result = unsafe { with_keywords(function.self_object, tuple, _kwargs) };
+            unsafe { mem::transmute(method) };
+        let tuple = build_call_tuple(&positional);
+        if tuple.is_null() {
+            return ptr::null_mut();
+        }
+        let result = unsafe { with_keywords(self_object, tuple, _kwargs) };
+        unpin_object(tuple);
         unpin_object(result);
         return result;
     }
-    if function.flags & METH_FASTCALL != 0 {
-        if function.flags & METH_KEYWORDS != 0 {
+    if flags & METH_FASTCALL != 0 {
+        if flags & METH_KEYWORDS != 0 {
             let fastcall_kw: unsafe extern "C" fn(*mut PyObject, *const *mut PyObject, isize, *mut PyObject) -> *mut PyObject =
                 // SAFETY: METH_FASTCALL|METH_KEYWORDS certifies the
                 // _PyCFunctionFastWithKeywords signature.
-                unsafe { mem::transmute(function.method) };
-            let result = unsafe { fastcall_kw(function.self_object, positional.as_ptr(), positional.len() as isize, ptr::null_mut()) };
+                unsafe { mem::transmute(method) };
+            let result = unsafe { fastcall_kw(self_object, positional.as_ptr(), positional.len() as isize, ptr::null_mut()) };
             unpin_object(result);
             return result;
         }
         let fastcall: unsafe extern "C" fn(*mut PyObject, *const *mut PyObject, isize) -> *mut PyObject =
             // SAFETY: METH_FASTCALL certifies the _PyCFunctionFast signature.
-            unsafe { mem::transmute(function.method) };
-        let result = unsafe { fastcall(function.self_object, positional.as_ptr(), positional.len() as isize) };
+            unsafe { mem::transmute(method) };
+        let result = unsafe { fastcall(self_object, positional.as_ptr(), positional.len() as isize) };
         unpin_object(result);
         return result;
     }
-    if function.flags & METH_NOARGS != 0 {
+    if flags & METH_NOARGS != 0 {
         if !positional.is_empty() {
             return abi::return_null_with_error(format!("{}() takes no arguments", crate::intern::resolve(function.name).unwrap_or_default()));
         }
-        let result = unsafe { (function.method)(function.self_object, ptr::null_mut()) };
+        let result = unsafe { method(self_object, ptr::null_mut()) };
         unpin_object(result);
         return result;
     }
-    if function.flags & METH_O != 0 {
+    if flags & METH_O != 0 {
         if positional.len() != 1 {
             return abi::return_null_with_error(format!("{}() takes exactly one argument", crate::intern::resolve(function.name).unwrap_or_default()));
         }
-        let result = unsafe { (function.method)(function.self_object, positional[0]) };
+        let result = unsafe { method(self_object, positional[0]) };
         unpin_object(result);
         return result;
     }
-    if function.flags & METH_VARARGS != 0 {
-        let tuple = if args.is_null() {
-            unsafe { abi::seq::pon_build_tuple(ptr::null_mut(), 0) }
-        } else {
-            args
-        };
-        let result = unsafe { (function.method)(function.self_object, tuple) };
+    if flags & METH_VARARGS != 0 {
+        let tuple = build_call_tuple(&positional);
+        if tuple.is_null() {
+            return ptr::null_mut();
+        }
+        let result = unsafe { method(self_object, tuple) };
+        unpin_object(tuple);
         unpin_object(result);
         return result;
     }
@@ -683,7 +835,7 @@ unsafe fn tuple_args<'a>(args: *mut PyObject) -> Result<&'a [*mut PyObject], Str
 }
 
 /// Binds a C method carrier to its receiver: instance access clones the
-/// carrier with `self_object` filled; class access and METH_STATIC return the
+/// carrier with `m_self` filled; class access and METH_STATIC return the
 /// carrier unbound; METH_CLASS binds the owning type.
 unsafe extern "C" fn cfunction_descr_get(descriptor: *mut PyObject, instance: *mut PyObject, owner: *mut PyObject) -> *mut PyObject {
     if descriptor.is_null() {
@@ -692,24 +844,43 @@ unsafe extern "C" fn cfunction_descr_get(descriptor: *mut PyObject, instance: *m
     // SAFETY: the descriptor protocol dispatches here only for live
     // PyCFunctionObject values (C_FUNCTION_TYPE's tp_descr_get).
     let function = unsafe { &*descriptor.cast::<PyCFunctionObject>() };
-    if function.flags & METH_STATIC != 0 {
+    let Some(method_def) = (unsafe { function.m_ml.as_ref() }) else {
+        return abi::return_null_with_error("C function descriptor has no method definition");
+    };
+    let flags = method_def.ml_flags;
+    if flags & METH_STATIC != 0 {
         return descriptor;
     }
-    if function.flags & METH_CLASS != 0 {
+    if flags & METH_CLASS != 0 {
         let receiver = if owner.is_null() { instance } else { owner };
-        return alloc_cfunction_named(function.method, function.flags, receiver, function.name);
+        return alloc_cfunction_from_method_def_named(function.m_ml, receiver, function.name);
     }
     if instance.is_null() {
         return descriptor;
     }
-    alloc_cfunction_named(function.method, function.flags, instance, function.name)
+    alloc_cfunction_from_method_def_named(function.m_ml, instance, function.name)
 }
 
+#[allow(dead_code)]
 pub(super) fn alloc_cfunction(function: PyCFunction, flags: c_int, self_object: *mut PyObject, name: &str) -> *mut PyObject {
-    alloc_cfunction_named(function, flags, self_object, intern(name))
+    let method_def = match synthesize_cfunction_method_def(function, flags, name) {
+        Ok(method_def) => method_def,
+        Err(message) => return abi::return_null_with_error(message),
+    };
+    alloc_cfunction_from_method_def_named(method_def, self_object, intern(name))
 }
 
-fn alloc_cfunction_named(function: PyCFunction, flags: c_int, self_object: *mut PyObject, name: u32) -> *mut PyObject {
+pub(super) fn alloc_cfunction_from_method_def(method_def: *mut PyMethodDef, self_object: *mut PyObject, name: &str) -> *mut PyObject {
+    alloc_cfunction_from_method_def_named(method_def, self_object, intern(name))
+}
+
+fn alloc_cfunction_from_method_def_named(method_def: *mut PyMethodDef, self_object: *mut PyObject, name: u32) -> *mut PyObject {
+    let Some(method_def_ref) = (unsafe { method_def.as_ref() }) else {
+        return abi::return_null_with_error("C function method definition is NULL");
+    };
+    if method_def_ref.ml_meth.is_none() {
+        return abi::return_null_with_error("C function method definition has no function pointer");
+    }
     let info = pon_gc::GcTypeInfo {
         size: mem::size_of::<PyCFunctionObject>(),
         trace: trace_cfunction,
@@ -723,13 +894,31 @@ fn alloc_cfunction_named(function: PyCFunction, flags: c_int, self_object: *mut 
     unsafe {
         object.write(PyCFunctionObject {
             ob_base: PyObjectHeader::new(*C_FUNCTION_TYPE as *const PyType),
-            method: function,
-            flags,
-            self_object,
+            m_ml: method_def,
+            m_self: self_object,
+            m_module: ptr::null_mut(),
+            m_weakreflist: ptr::null_mut(),
+            vectorcall: ptr::null_mut(),
             name,
         });
     }
     as_object_ptr(object)
+}
+
+/// Builds a process-lifetime method definition for Pon-created C-function
+/// carriers that do not originate from an extension-owned `PyMethodDef`.
+/// CPython-source extensions read `PyCFunctionObject.m_ml` directly, so the
+/// leaked CString and `PyMethodDef` are intentional C-face ABI storage.
+#[allow(dead_code)]
+fn synthesize_cfunction_method_def(function: PyCFunction, flags: c_int, name: &str) -> Result<*mut PyMethodDef, String> {
+    let c_name = CString::new(name).map_err(|_| "C function name contains an interior NUL".to_owned())?;
+    let ml_name = c_name.into_raw();
+    Ok(Box::into_raw(Box::new(PyMethodDef {
+        ml_name,
+        ml_meth: Some(function),
+        ml_flags: flags,
+        ml_doc: ptr::null(),
+    })))
 }
 
 pub(super) fn c_string(ptr: *const c_char) -> Option<String> {

@@ -501,6 +501,25 @@ fn mirror_module_registration(name: &str, module: *mut PyObject) -> Result<(), S
     unsafe { crate::types::dict::dict_insert(dict, key, module) }
 }
 
+/// Registers an extension module under its full import name BEFORE its
+/// `Py_mod_exec` slots run (CPython installs into `sys.modules` pre-exec so
+/// the module's own exec-time re-imports adopt it instead of re-loading —
+/// numpy's `_multiarray_umath` guards double-exec with a hard error).
+pub(crate) fn register_extension_module_for_exec(name: &str, module: *mut PyObject) -> Result<(), String> {
+    let name_id = intern(name);
+    let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    state.modules.insert(name_id, module);
+    drop(state);
+    mirror_module_registration(name, module)?;
+    crate::abi::bump_namespace_version();
+    Ok(())
+}
+
+/// Rolls back [`register_extension_module_for_exec`] after a failed exec.
+pub(crate) fn unregister_extension_module_after_failed_exec(name: &str, module: *mut PyObject) {
+    evict_failed_module(name, module);
+}
+
 /// Reads the `sys.modules` binding for `name`, when the dict already exists.
 fn sys_modules_entry(name: &str) -> Result<Option<*mut PyObject>, String> {
     let dict = {
@@ -790,6 +809,13 @@ fn resolve_module_by_name(name: &str) -> Result<*mut PyObject, String> {
 
     if let Some(path) = find_extension_module(name) {
         let module = crate::capi::load_extension_module(name, &path)?;
+        // Cache like the native branch: extension exec slots are strictly
+        // once-per-process (numpy guards this loudly), so re-imports must
+        // adopt the registered module instead of re-running dlopen/init.
+        let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        state.modules.insert(name_id, module);
+        drop(state);
+        mirror_module_registration(name, module)?;
         bind_child_to_parent(name, module);
         return Ok(module);
     }
