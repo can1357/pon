@@ -49,6 +49,8 @@ typedef struct PyPonCapiRuntime {
     PyCodeObject *(*frame_get_code)(PyFrameObject *);
     PyObject *(*contextvar_new)(const char *, PyObject *);
     int (*contextvar_get)(PyObject *, PyObject *, PyObject **);
+    void *(*datetime_capi_import)(void);
+    int (*datetime_get_attr_int)(PyObject *, const char *);
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiRuntime;
 

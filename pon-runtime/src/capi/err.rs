@@ -60,6 +60,18 @@ pub(crate) struct PyPonCapiErr {
     exception_set_cause: unsafe extern "C" fn(*mut PyObject, *mut PyObject),
     exception_set_context: unsafe extern "C" fn(*mut PyObject, *mut PyObject),
     exception_set_traceback: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> c_int,
+    exc_warning: *mut PyObject,
+    exc_future_warning: *mut PyObject,
+    exc_import_warning: *mut PyObject,
+    exc_module_not_found_error: *mut PyObject,
+    exc_assertion_error: *mut PyObject,
+    exc_name_error: *mut PyObject,
+    exc_unicode_error: *mut PyObject,
+    exc_unicode_encode_error: *mut PyObject,
+    exc_unicode_decode_error: *mut PyObject,
+    exc_recursion_error: *mut PyObject,
+    new_exception: unsafe extern "C" fn(*const c_char, *mut PyObject, *mut PyObject) -> *mut PyObject,
+    check_signals: unsafe extern "C" fn() -> c_int,
 }
 
 unsafe impl Send for PyPonCapiErr {}
@@ -113,6 +125,18 @@ pub(crate) fn build() -> PyPonCapiErr {
         exception_set_cause: capi_exception_set_cause,
         exception_set_context: capi_exception_set_context,
         exception_set_traceback: capi_exception_set_traceback,
+        exc_warning: singleton(ExceptionKind::Warning),
+        exc_future_warning: singleton(ExceptionKind::FutureWarning),
+        exc_import_warning: singleton(ExceptionKind::ImportWarning),
+        exc_module_not_found_error: singleton(ExceptionKind::ModuleNotFoundError),
+        exc_assertion_error: singleton(ExceptionKind::AssertionError),
+        exc_name_error: singleton(ExceptionKind::NameError),
+        exc_unicode_error: singleton(ExceptionKind::UnicodeError),
+        exc_unicode_encode_error: singleton(ExceptionKind::UnicodeEncodeError),
+        exc_unicode_decode_error: singleton(ExceptionKind::UnicodeDecodeError),
+        exc_recursion_error: singleton(ExceptionKind::RecursionError),
+        new_exception: capi_err_new_exception,
+        check_signals: capi_err_check_signals,
     }
 }
 
@@ -541,6 +565,129 @@ unsafe extern "C" fn capi_exception_set_traceback(exception: *mut PyObject, trac
     0
 }
 
+unsafe fn exception_base_from_arg(base: *mut PyObject) -> Option<*mut PyObject> {
+    let native = if base.is_null() {
+        abi::exception_type_object(ExceptionKind::Exception)
+    } else {
+        let Some(native) = (unsafe { native_class_type(base) }) else {
+            let _ = abi::exc::raise_kind_error_text(ExceptionKind::TypeError, "PyErr_NewException base must be an exception class");
+            return None;
+        };
+        native
+    };
+    if !abi::exc::type_derives_base_exception(native.cast_const()) {
+        let _ = abi::exc::raise_kind_error_text(ExceptionKind::TypeError, "PyErr_NewException base must derive from BaseException");
+        return None;
+    }
+    Some(native.cast::<PyObject>())
+}
+
+unsafe fn exception_bases_from_arg(base: *mut PyObject) -> Option<Vec<*mut PyObject>> {
+    if base.is_null() {
+        return unsafe { exception_base_from_arg(base) }.map(|single| vec![single]);
+    }
+    if let Some(native) = unsafe { native_class_type(base) } {
+        if !abi::exc::type_derives_base_exception(native.cast_const()) {
+            let _ = abi::exc::raise_kind_error_text(ExceptionKind::TypeError, "PyErr_NewException base must derive from BaseException");
+            return None;
+        }
+        return Some(vec![native.cast::<PyObject>()]);
+    }
+    let raw_bases = match unsafe { crate::types::type_::positional_args_from_object(base) } {
+        Ok(raw_bases) => raw_bases,
+        Err(_) => {
+            let _ = abi::exc::raise_kind_error_text(ExceptionKind::TypeError, "PyErr_NewException base must be an exception class or tuple");
+            return None;
+        }
+    };
+    if raw_bases.is_empty() {
+        let _ = abi::exc::raise_kind_error_text(ExceptionKind::TypeError, "PyErr_NewException base tuple must not be empty");
+        return None;
+    }
+    let mut bases = Vec::with_capacity(raw_bases.len());
+    for raw in raw_bases {
+        bases.push(unsafe { exception_base_from_arg(raw) }?);
+    }
+    Some(bases)
+}
+
+unsafe fn set_namespace_str(namespace: *mut crate::types::type_::PyClassDict, name: &str, value: &str) -> bool {
+    let object = unsafe { abi::pon_const_str(value.as_ptr(), value.len()) };
+    if object.is_null() {
+        return false;
+    }
+    unsafe { (&mut *namespace).set(intern(name), object) };
+    true
+}
+
+unsafe fn copy_exception_namespace_entries(dict: *mut PyObject, namespace: *mut crate::types::type_::PyClassDict) -> bool {
+    if dict.is_null() {
+        return true;
+    }
+    let entries = if unsafe { crate::types::type_::is_class_dict_view(dict) } {
+        match unsafe { crate::types::type_::class_dict_view_entries_snapshot(dict) } {
+            Ok(entries) => entries,
+            Err(message) => {
+                let _ = abi::exc::raise_kind_error_text(ExceptionKind::TypeError, &format!("PyErr_NewException dict copy failed: {message}"));
+                return false;
+            }
+        }
+    } else {
+        match unsafe { crate::types::dict::dict_entries_snapshot(dict) } {
+            Ok(entries) => entries,
+            Err(_) => {
+                let _ = abi::exc::raise_kind_error_text(ExceptionKind::TypeError, "PyErr_NewException dict must be a dict");
+                return false;
+            }
+        }
+    };
+    for entry in entries {
+        let Some(key) = (unsafe { crate::types::type_::unicode_text(entry.key) }) else {
+            let _ = abi::exc::raise_kind_error_text(ExceptionKind::TypeError, "PyErr_NewException dict keys must be str");
+            return false;
+        };
+        unsafe { (&mut *namespace).set(intern(key), entry.value) };
+    }
+    true
+}
+
+unsafe extern "C" fn capi_err_new_exception(name: *const c_char, base: *mut PyObject, dict: *mut PyObject) -> *mut PyObject {
+    let Some(full_name) = c_string(name) else {
+        let _ = abi::exc::raise_kind_error_text(ExceptionKind::SystemError, "PyErr_NewException name must not be NULL");
+        return ptr::null_mut();
+    };
+    let Some(dot) = full_name.rfind('.') else {
+        let _ = abi::exc::raise_kind_error_text(ExceptionKind::SystemError, "PyErr_NewException name must be module-qualified");
+        return ptr::null_mut();
+    };
+    if dot == 0 || dot + 1 == full_name.len() {
+        let _ = abi::exc::raise_kind_error_text(ExceptionKind::SystemError, "PyErr_NewException received an invalid qualified name");
+        return ptr::null_mut();
+    }
+    let module_name = &full_name[..dot];
+    let class_name = &full_name[dot + 1..];
+    let Some(bases) = (unsafe { exception_bases_from_arg(base) }) else {
+        return ptr::null_mut();
+    };
+    let namespace = crate::types::type_::new_namespace();
+    if !unsafe { copy_exception_namespace_entries(dict, namespace) } {
+        unsafe { drop(Box::from_raw(namespace)) };
+        return ptr::null_mut();
+    }
+    if !unsafe { set_namespace_str(namespace, "__module__", module_name) } {
+        unsafe { drop(Box::from_raw(namespace)) };
+        return ptr::null_mut();
+    }
+    unsafe { crate::types::type_::build_class_from_namespace(class_name, &bases, namespace, &[]) }
+}
+
+unsafe extern "C" fn capi_err_check_signals() -> c_int {
+    // Pon's native `_signal` module stores handler registrations but installs no
+    // asynchronous OS-signal trampoline; there is therefore no pending signal
+    // state for this single-threaded C-API surface to drain.
+    0
+}
+
 fn import_module_text(name: &str) -> *mut PyObject {
     let name_id = intern(name);
     let fromlist = [intern("*")];
@@ -577,7 +724,7 @@ mod tests {
         assert!(!result.is_null(), "drive() returned NULL: {:?}", pon_err_message());
         assert_eq!(
             format_object_for_print(result).as_deref(),
-            Ok("8191"),
+            Ok("131071"),
             "err C-API bitmask mismatch"
         );
     }
@@ -586,6 +733,25 @@ mod tests {
 #include <Python.h>
 #include <errno.h>
 #include <string.h>
+
+static int check_pending_chain(PyObject *exc, PyObject *base1, PyObject *base2, PyObject *base3) {
+    if (exc == NULL) {
+        return 0;
+    }
+    PyErr_SetString(exc, "chain probe");
+    int matches = PyErr_ExceptionMatches(exc);
+    if (base1 != NULL) {
+        matches = matches && PyErr_ExceptionMatches(base1);
+    }
+    if (base2 != NULL) {
+        matches = matches && PyErr_ExceptionMatches(base2);
+    }
+    if (base3 != NULL) {
+        matches = matches && PyErr_ExceptionMatches(base3);
+    }
+    PyErr_Clear();
+    return matches;
+}
 
 static PyObject *drive(PyObject *self, PyObject *args) {
     (void)self;
@@ -696,6 +862,72 @@ static PyObject *drive(PyObject *self, PyObject *args) {
         PyErr_Clear();
     }
 
+
+    /* CPython 3.14 oracle checked for these direct chains:
+     * ModuleNotFoundError->ImportError, RecursionError->RuntimeError,
+     * UnicodeEncodeError/UnicodeDecodeError->UnicodeError->ValueError,
+     * FutureWarning/ImportWarning->Warning, NameError/AssertionError->Exception.
+     */
+    if (check_pending_chain(PyExc_Warning, PyExc_Exception, NULL, NULL) &&
+            check_pending_chain(PyExc_FutureWarning, PyExc_Warning, PyExc_Exception, NULL) &&
+            check_pending_chain(PyExc_ImportWarning, PyExc_Warning, PyExc_Exception, NULL) &&
+            check_pending_chain(PyExc_ModuleNotFoundError, PyExc_ImportError, PyExc_Exception, NULL) &&
+            check_pending_chain(PyExc_AssertionError, PyExc_Exception, NULL, NULL) &&
+            check_pending_chain(PyExc_NameError, PyExc_Exception, NULL, NULL) &&
+            check_pending_chain(PyExc_UnicodeError, PyExc_ValueError, PyExc_Exception, NULL) &&
+            check_pending_chain(PyExc_UnicodeEncodeError, PyExc_UnicodeError, PyExc_ValueError, PyExc_Exception) &&
+            check_pending_chain(PyExc_UnicodeDecodeError, PyExc_UnicodeError, PyExc_ValueError, PyExc_Exception) &&
+            check_pending_chain(PyExc_RecursionError, PyExc_RuntimeError, PyExc_Exception, NULL)) {
+        ok |= 1L << 13;
+    }
+
+    PyObject *warnings = PyImport_ImportModule("warnings");
+    PyObject *filter_result = warnings == NULL ? NULL : PyObject_CallMethod(warnings, "simplefilter", "sO", "error", PyExc_UserWarning);
+    if (filter_result != NULL) {
+        int warn_status = PyErr_WarnFormat(PyExc_UserWarning, 1, "warn %s %zd", "count", (Py_ssize_t)42);
+        if (warn_status == -1 && PyErr_ExceptionMatches(PyExc_UserWarning)) {
+            PyObject *warn_type = NULL;
+            PyObject *warn_value = NULL;
+            PyObject *warn_tb = NULL;
+            PyErr_Fetch(&warn_type, &warn_value, &warn_tb);
+            PyErr_NormalizeException(&warn_type, &warn_value, &warn_tb);
+            if (warn_value != NULL) {
+                PyBaseExceptionObject *warn_base = (PyBaseExceptionObject *)warn_value;
+                const char *warn_text = warn_base->message == NULL ? NULL : PyUnicode_AsUTF8(warn_base->message);
+                if (warn_text != NULL && strcmp(warn_text, "warn count 42") == 0) {
+                    ok |= 1L << 14;
+                }
+            }
+        }
+    }
+    if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+
+    PyObject *custom_dict = PyDict_New();
+    PyObject *marker = PyUnicode_FromString("copied");
+    if (custom_dict != NULL && marker != NULL && PyDict_SetItemString(custom_dict, "marker", marker) == 0) {
+        PyObject *custom = PyErr_NewException("capi_err_ext.CustomError", PyExc_ValueError, custom_dict);
+        PyObject *marker_attr = custom == NULL ? NULL : PyObject_GetAttrString(custom, "marker");
+        PyObject *module_attr = custom == NULL ? NULL : PyObject_GetAttrString(custom, "__module__");
+        const char *marker_text = marker_attr == NULL ? NULL : PyUnicode_AsUTF8(marker_attr);
+        const char *module_text = module_attr == NULL ? NULL : PyUnicode_AsUTF8(module_attr);
+        PyErr_SetString(custom, "custom boom");
+        if (marker_text != NULL && strcmp(marker_text, "copied") == 0 &&
+                module_text != NULL && strcmp(module_text, "capi_err_ext") == 0 &&
+                PyErr_ExceptionMatches(custom) && PyErr_ExceptionMatches(PyExc_ValueError)) {
+            ok |= 1L << 15;
+        }
+    }
+    if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+
+    if (PyErr_CheckSignals() == 0 && PyErr_Occurred() == NULL) {
+        ok |= 1L << 16;
+    } else if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
     return PyLong_FromLong(ok);
 }
 

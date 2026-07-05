@@ -7,12 +7,15 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::sync::{LazyLock, Mutex};
 
+use num_traits::ToPrimitive;
+
 use crate::abi;
 use crate::intern::{intern, resolve};
 use crate::object::{PyObject, PyObjectHeader, PyType};
-use crate::thread_state::pon_err_clear;
+use crate::thread_state::{pon_err_clear, pon_err_message, pon_err_occurred};
 use crate::types::exc::ExceptionKind;
 
+use super::twin::{self, ForeignTypeObject};
 use super::{PyModuleDef, c_string};
 
 pub(crate) type PyCapsuleDestructor = Option<unsafe extern "C" fn(*mut PyObject)>;
@@ -43,6 +46,8 @@ pub(crate) struct PyPonCapiRuntime {
     frame_get_code: unsafe extern "C" fn(*mut c_void) -> *mut c_void,
     contextvar_new: unsafe extern "C" fn(*const c_char, *mut PyObject) -> *mut PyObject,
     contextvar_get: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut *mut PyObject) -> c_int,
+    datetime_capi_import: unsafe extern "C" fn() -> *mut c_void,
+    datetime_get_attr_int: unsafe extern "C" fn(*mut PyObject, *const c_char) -> c_int,
 }
 
 unsafe impl Send for PyPonCapiRuntime {}
@@ -76,6 +81,52 @@ struct PyThreadState {
 unsafe impl Send for PyThreadState {}
 unsafe impl Sync for PyThreadState {}
 
+#[repr(C)]
+struct PyDateTimeCapi {
+    date_type: *mut ForeignTypeObject,
+    datetime_type: *mut ForeignTypeObject,
+    time_type: *mut ForeignTypeObject,
+    delta_type: *mut ForeignTypeObject,
+    tzinfo_type: *mut ForeignTypeObject,
+    timezone_utc: *mut PyObject,
+    date_from_date: unsafe extern "C" fn(c_int, c_int, c_int, *mut ForeignTypeObject) -> *mut PyObject,
+    datetime_from_date_and_time: unsafe extern "C" fn(
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        *mut PyObject,
+        *mut ForeignTypeObject,
+    ) -> *mut PyObject,
+    time_from_time: unsafe extern "C" fn(c_int, c_int, c_int, c_int, *mut PyObject, *mut ForeignTypeObject) -> *mut PyObject,
+    delta_from_delta: unsafe extern "C" fn(c_int, c_int, c_int, c_int, *mut ForeignTypeObject) -> *mut PyObject,
+    timezone_from_timezone: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+    datetime_from_timestamp: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject,
+    date_from_timestamp: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+    datetime_from_date_and_time_and_fold: unsafe extern "C" fn(
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        *mut PyObject,
+        c_int,
+        *mut ForeignTypeObject,
+    ) -> *mut PyObject,
+    time_from_time_and_fold: unsafe extern "C" fn(c_int, c_int, c_int, c_int, *mut PyObject, c_int, *mut ForeignTypeObject) -> *mut PyObject,
+}
+
+unsafe impl Send for PyDateTimeCapi {}
+unsafe impl Sync for PyDateTimeCapi {}
+
+static DATETIME_CAPI: LazyLock<Mutex<Option<usize>>> = LazyLock::new(|| Mutex::new(None));
+const DATETIME_CAPSULE_NAME: &str = "datetime.datetime_CAPI";
+
 static MAIN_INTERPRETER_STATE: LazyLock<PyInterpreterState> = LazyLock::new(|| PyInterpreterState { _private: 0 });
 static MAIN_THREAD_STATE: LazyLock<PyThreadState> = LazyLock::new(|| PyThreadState {
     interp: interpreter_state_main(),
@@ -108,6 +159,8 @@ pub(crate) fn build() -> PyPonCapiRuntime {
         frame_get_code: capi_frame_get_code,
         contextvar_new: capi_contextvar_new,
         contextvar_get: capi_contextvar_get,
+        datetime_capi_import: capi_datetime_capi_import,
+        datetime_get_attr_int: capi_datetime_get_attr_int,
     }
 }
 
@@ -206,6 +259,796 @@ unsafe extern "C" fn capi_contextvar_get(
     unsafe { crate::native::contextvars::capi_contextvar_get(var, default, value) }
 }
 
+unsafe extern "C" fn capi_datetime_capi_import() -> *mut c_void {
+    match datetime_capi_ptr() {
+        Ok(capi) => capi.cast::<c_void>(),
+        Err(message) => raise_import_error_void(&message),
+    }
+}
+
+unsafe extern "C" fn capi_datetime_get_attr_int(object: *mut PyObject, name: *const c_char) -> c_int {
+    let Some(name) = c_string(name) else {
+        raise_system_error("PyDateTime attribute accessor called with invalid attribute name");
+        return -1;
+    };
+    match unsafe { datetime_int_attr_raw(object, &name) } {
+        Ok(value) => value,
+        Err(message) => {
+            if !pon_err_occurred() {
+                raise_type_error(&message);
+            }
+            -1
+        }
+    }
+}
+
+fn datetime_capi_ptr() -> Result<*mut PyDateTimeCapi, String> {
+    let mut cached = DATETIME_CAPI.lock().unwrap_or_else(|poison| poison.into_inner());
+    if let Some(ptr) = *cached {
+        return Ok(ptr as *mut PyDateTimeCapi);
+    }
+
+    let capi = build_datetime_capi()?;
+    let ptr = Box::into_raw(Box::new(capi)) as usize;
+    *cached = Some(ptr);
+    Ok(ptr as *mut PyDateTimeCapi)
+}
+
+#[repr(C)]
+struct PonDateObject {
+    ob_base: PyObjectHeader,
+    year: c_int,
+    month: c_int,
+    day: c_int,
+}
+
+#[repr(C)]
+struct PonDateTimeObject {
+    ob_base: PyObjectHeader,
+    year: c_int,
+    month: c_int,
+    day: c_int,
+    hour: c_int,
+    minute: c_int,
+    second: c_int,
+    microsecond: c_int,
+    fold: c_int,
+    tzinfo: *mut PyObject,
+}
+
+#[repr(C)]
+struct PonTimeObject {
+    ob_base: PyObjectHeader,
+    hour: c_int,
+    minute: c_int,
+    second: c_int,
+    microsecond: c_int,
+    fold: c_int,
+    tzinfo: *mut PyObject,
+}
+
+#[repr(C)]
+struct PonDeltaObject {
+    ob_base: PyObjectHeader,
+    days: c_int,
+    seconds: c_int,
+    microseconds: c_int,
+}
+
+#[repr(C)]
+struct PonTimezoneObject {
+    ob_base: PyObjectHeader,
+}
+
+unsafe impl Send for PonDateObject {}
+unsafe impl Sync for PonDateObject {}
+unsafe impl Send for PonDateTimeObject {}
+unsafe impl Sync for PonDateTimeObject {}
+unsafe impl Send for PonTimeObject {}
+unsafe impl Sync for PonTimeObject {}
+unsafe impl Send for PonDeltaObject {}
+unsafe impl Sync for PonDeltaObject {}
+unsafe impl Send for PonTimezoneObject {}
+unsafe impl Sync for PonTimezoneObject {}
+
+fn build_datetime_capi() -> Result<PyDateTimeCapi, String> {
+    let capi = PyDateTimeCapi {
+        date_type: twin::foreign_of_native(datetime_date_type()),
+        datetime_type: twin::foreign_of_native(datetime_datetime_type()),
+        time_type: twin::foreign_of_native(datetime_time_type()),
+        delta_type: twin::foreign_of_native(datetime_delta_type()),
+        tzinfo_type: twin::foreign_of_native(datetime_tzinfo_type()),
+        timezone_utc: datetime_utc(),
+        date_from_date: capi_datetime_date_from_date,
+        datetime_from_date_and_time: capi_datetime_datetime_from_date_and_time,
+        time_from_time: capi_datetime_time_from_time,
+        delta_from_delta: capi_datetime_delta_from_delta,
+        timezone_from_timezone: capi_datetime_unsupported_timezone_from_timezone,
+        datetime_from_timestamp: capi_datetime_unsupported_datetime_from_timestamp,
+        date_from_timestamp: capi_datetime_unsupported_date_from_timestamp,
+        datetime_from_date_and_time_and_fold: capi_datetime_datetime_from_date_and_time_and_fold,
+        time_from_time_and_fold: capi_datetime_time_from_time_and_fold,
+    };
+
+    verify_datetime_capi(&capi)?;
+    Ok(capi)
+}
+
+fn runtime_object_type() -> *mut PyType {
+    abi::runtime_global(intern("object")).map_or(ptr::null_mut(), |object| object.cast::<PyType>())
+}
+
+fn datetime_date_type() -> *mut PyType {
+    static TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut ty = PyType::new(abi::runtime_type_type().cast_const(), "date", mem::size_of::<PonDateObject>());
+        ty.tp_base = runtime_object_type();
+        ty.tp_new = Some(pon_datetime_date_new);
+        ty.tp_getattro = Some(pon_datetime_date_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *TYPE as *mut PyType
+}
+
+fn datetime_datetime_type() -> *mut PyType {
+    static TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut ty = PyType::new(abi::runtime_type_type().cast_const(), "datetime", mem::size_of::<PonDateTimeObject>());
+        ty.tp_base = datetime_date_type();
+        ty.tp_new = Some(pon_datetime_datetime_new);
+        ty.tp_getattro = Some(pon_datetime_datetime_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *TYPE as *mut PyType
+}
+
+fn datetime_time_type() -> *mut PyType {
+    static TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut ty = PyType::new(abi::runtime_type_type().cast_const(), "time", mem::size_of::<PonTimeObject>());
+        ty.tp_base = runtime_object_type();
+        ty.tp_new = Some(pon_datetime_time_new);
+        ty.tp_getattro = Some(pon_datetime_time_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *TYPE as *mut PyType
+}
+
+fn datetime_delta_type() -> *mut PyType {
+    static TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut ty = PyType::new(abi::runtime_type_type().cast_const(), "timedelta", mem::size_of::<PonDeltaObject>());
+        ty.tp_base = runtime_object_type();
+        ty.tp_new = Some(pon_datetime_delta_new);
+        ty.tp_getattro = Some(pon_datetime_delta_getattro);
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *TYPE as *mut PyType
+}
+
+fn datetime_tzinfo_type() -> *mut PyType {
+    static TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut ty = PyType::new(abi::runtime_type_type().cast_const(), "tzinfo", mem::size_of::<PyObjectHeader>());
+        ty.tp_base = runtime_object_type();
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *TYPE as *mut PyType
+}
+
+fn datetime_timezone_type() -> *mut PyType {
+    static TYPE: LazyLock<usize> = LazyLock::new(|| {
+        let mut ty = PyType::new(abi::runtime_type_type().cast_const(), "timezone", mem::size_of::<PonTimezoneObject>());
+        ty.tp_base = datetime_tzinfo_type();
+        Box::into_raw(Box::new(ty)) as usize
+    });
+    *TYPE as *mut PyType
+}
+
+fn datetime_utc() -> *mut PyObject {
+    static UTC: LazyLock<usize> = LazyLock::new(|| {
+        Box::into_raw(Box::new(PonTimezoneObject {
+            ob_base: PyObjectHeader::new(datetime_timezone_type().cast_const()),
+        })) as usize
+    });
+    *UTC as *mut PyObject
+}
+
+unsafe extern "C" fn pon_datetime_date_new(cls: *mut PyType, args: *mut PyObject, _kwargs: *mut PyObject) -> *mut PyObject {
+    let Ok(positional) = (unsafe { datetime_positional_args(args, 3, "date") }) else {
+        return ptr::null_mut();
+    };
+    let Some(year) = (unsafe { datetime_c_int(positional[0], "year") }) else {
+        return ptr::null_mut();
+    };
+    let Some(month) = (unsafe { datetime_c_int(positional[1], "month") }) else {
+        return ptr::null_mut();
+    };
+    let Some(day) = (unsafe { datetime_c_int(positional[2], "day") }) else {
+        return ptr::null_mut();
+    };
+    alloc_datetime_date(cls, year, month, day)
+}
+
+unsafe extern "C" fn pon_datetime_datetime_new(cls: *mut PyType, args: *mut PyObject, _kwargs: *mut PyObject) -> *mut PyObject {
+    let Ok(positional) = (unsafe { datetime_positional_args(args, 8, "datetime") }) else {
+        return ptr::null_mut();
+    };
+    let Some(year) = (unsafe { datetime_c_int(positional[0], "year") }) else {
+        return ptr::null_mut();
+    };
+    let Some(month) = (unsafe { datetime_c_int(positional[1], "month") }) else {
+        return ptr::null_mut();
+    };
+    let Some(day) = (unsafe { datetime_c_int(positional[2], "day") }) else {
+        return ptr::null_mut();
+    };
+    let Some(hour) = (unsafe { datetime_c_int(positional[3], "hour") }) else {
+        return ptr::null_mut();
+    };
+    let Some(minute) = (unsafe { datetime_c_int(positional[4], "minute") }) else {
+        return ptr::null_mut();
+    };
+    let Some(second) = (unsafe { datetime_c_int(positional[5], "second") }) else {
+        return ptr::null_mut();
+    };
+    let Some(microsecond) = (unsafe { datetime_c_int(positional[6], "microsecond") }) else {
+        return ptr::null_mut();
+    };
+    alloc_datetime_datetime(cls, year, month, day, hour, minute, second, microsecond, 0, positional[7])
+}
+
+unsafe extern "C" fn pon_datetime_time_new(cls: *mut PyType, args: *mut PyObject, _kwargs: *mut PyObject) -> *mut PyObject {
+    let Ok(positional) = (unsafe { datetime_positional_args(args, 5, "time") }) else {
+        return ptr::null_mut();
+    };
+    let Some(hour) = (unsafe { datetime_c_int(positional[0], "hour") }) else {
+        return ptr::null_mut();
+    };
+    let Some(minute) = (unsafe { datetime_c_int(positional[1], "minute") }) else {
+        return ptr::null_mut();
+    };
+    let Some(second) = (unsafe { datetime_c_int(positional[2], "second") }) else {
+        return ptr::null_mut();
+    };
+    let Some(microsecond) = (unsafe { datetime_c_int(positional[3], "microsecond") }) else {
+        return ptr::null_mut();
+    };
+    alloc_datetime_time(cls, hour, minute, second, microsecond, 0, positional[4])
+}
+
+unsafe extern "C" fn pon_datetime_delta_new(cls: *mut PyType, args: *mut PyObject, _kwargs: *mut PyObject) -> *mut PyObject {
+    let Ok(positional) = (unsafe { datetime_positional_args(args, 3, "timedelta") }) else {
+        return ptr::null_mut();
+    };
+    let Some(days) = (unsafe { datetime_c_int(positional[0], "days") }) else {
+        return ptr::null_mut();
+    };
+    let Some(seconds) = (unsafe { datetime_c_int(positional[1], "seconds") }) else {
+        return ptr::null_mut();
+    };
+    let Some(microseconds) = (unsafe { datetime_c_int(positional[2], "microseconds") }) else {
+        return ptr::null_mut();
+    };
+    alloc_datetime_delta(cls, days, seconds, microseconds)
+}
+
+fn alloc_datetime_date(cls: *mut PyType, year: c_int, month: c_int, day: c_int) -> *mut PyObject {
+    let ty = if cls.is_null() { datetime_date_type() } else { cls };
+    Box::into_raw(Box::new(PonDateObject {
+        ob_base: PyObjectHeader::new(ty.cast_const()),
+        year,
+        month,
+        day,
+    }))
+    .cast::<PyObject>()
+}
+
+fn alloc_datetime_datetime(
+    cls: *mut PyType,
+    year: c_int,
+    month: c_int,
+    day: c_int,
+    hour: c_int,
+    minute: c_int,
+    second: c_int,
+    microsecond: c_int,
+    fold: c_int,
+    tzinfo: *mut PyObject,
+) -> *mut PyObject {
+    let ty = if cls.is_null() { datetime_datetime_type() } else { cls };
+    let tzinfo = if tzinfo.is_null() { unsafe { abi::pon_none() } } else { tzinfo };
+    if tzinfo.is_null() {
+        return ptr::null_mut();
+    }
+    Box::into_raw(Box::new(PonDateTimeObject {
+        ob_base: PyObjectHeader::new(ty.cast_const()),
+        year,
+        month,
+        day,
+        hour,
+        minute,
+        second,
+        microsecond,
+        fold,
+        tzinfo,
+    }))
+    .cast::<PyObject>()
+}
+
+fn alloc_datetime_time(
+    cls: *mut PyType,
+    hour: c_int,
+    minute: c_int,
+    second: c_int,
+    microsecond: c_int,
+    fold: c_int,
+    tzinfo: *mut PyObject,
+) -> *mut PyObject {
+    let ty = if cls.is_null() { datetime_time_type() } else { cls };
+    let tzinfo = if tzinfo.is_null() { unsafe { abi::pon_none() } } else { tzinfo };
+    if tzinfo.is_null() {
+        return ptr::null_mut();
+    }
+    Box::into_raw(Box::new(PonTimeObject {
+        ob_base: PyObjectHeader::new(ty.cast_const()),
+        hour,
+        minute,
+        second,
+        microsecond,
+        fold,
+        tzinfo,
+    }))
+    .cast::<PyObject>()
+}
+
+fn alloc_datetime_delta(cls: *mut PyType, days: c_int, seconds: c_int, microseconds: c_int) -> *mut PyObject {
+    let ty = if cls.is_null() { datetime_delta_type() } else { cls };
+    Box::into_raw(Box::new(PonDeltaObject {
+        ob_base: PyObjectHeader::new(ty.cast_const()),
+        days,
+        seconds,
+        microseconds,
+    }))
+    .cast::<PyObject>()
+}
+
+unsafe fn datetime_positional_args(args: *mut PyObject, expected: usize, symbol: &str) -> Result<Vec<*mut PyObject>, ()> {
+    match unsafe { crate::types::type_::positional_args_from_object(args) } {
+        Ok(positional) if positional.len() == expected => Ok(positional),
+        Ok(positional) => {
+            raise_type_error(&format!("{symbol} expected {expected} positional arguments, got {}", positional.len()));
+            Err(())
+        }
+        Err(message) => {
+            raise_type_error(&message);
+            Err(())
+        }
+    }
+}
+
+unsafe fn datetime_c_int(object: *mut PyObject, label: &str) -> Option<c_int> {
+    let object = crate::tag::untag_arg(object);
+    let Some(integer) = (unsafe { crate::types::int::to_bigint_including_bool(object) }) else {
+        raise_type_error(&format!("{label} must be an integer"));
+        return None;
+    };
+    let Some(value) = integer.to_i32() else {
+        raise_type_error(&format!("{label} is outside the C int range"));
+        return None;
+    };
+    Some(value)
+}
+
+unsafe fn datetime_attr_name<'a>(name: *mut PyObject) -> Option<&'a str> {
+    let name = crate::tag::untag_arg(name);
+    let Some(text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+        raise_type_error("datetime attribute name must be str");
+        return None;
+    };
+    Some(text)
+}
+
+unsafe extern "C" fn pon_datetime_date_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name) = (unsafe { datetime_attr_name(name) }) else {
+        return ptr::null_mut();
+    };
+    let date = unsafe { &*object.cast::<PonDateObject>() };
+    match name {
+        "year" => unsafe { abi::pon_const_int(i64::from(date.year)) },
+        "month" => unsafe { abi::pon_const_int(i64::from(date.month)) },
+        "day" => unsafe { abi::pon_const_int(i64::from(date.day)) },
+        _ => datetime_attribute_error(name),
+    }
+}
+
+unsafe extern "C" fn pon_datetime_datetime_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name) = (unsafe { datetime_attr_name(name) }) else {
+        return ptr::null_mut();
+    };
+    let datetime = unsafe { &*object.cast::<PonDateTimeObject>() };
+    match name {
+        "year" => unsafe { abi::pon_const_int(i64::from(datetime.year)) },
+        "month" => unsafe { abi::pon_const_int(i64::from(datetime.month)) },
+        "day" => unsafe { abi::pon_const_int(i64::from(datetime.day)) },
+        "hour" => unsafe { abi::pon_const_int(i64::from(datetime.hour)) },
+        "minute" => unsafe { abi::pon_const_int(i64::from(datetime.minute)) },
+        "second" => unsafe { abi::pon_const_int(i64::from(datetime.second)) },
+        "microsecond" => unsafe { abi::pon_const_int(i64::from(datetime.microsecond)) },
+        "fold" => unsafe { abi::pon_const_int(i64::from(datetime.fold)) },
+        "tzinfo" => datetime.tzinfo,
+        _ => datetime_attribute_error(name),
+    }
+}
+
+unsafe extern "C" fn pon_datetime_time_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name) = (unsafe { datetime_attr_name(name) }) else {
+        return ptr::null_mut();
+    };
+    let time = unsafe { &*object.cast::<PonTimeObject>() };
+    match name {
+        "hour" => unsafe { abi::pon_const_int(i64::from(time.hour)) },
+        "minute" => unsafe { abi::pon_const_int(i64::from(time.minute)) },
+        "second" => unsafe { abi::pon_const_int(i64::from(time.second)) },
+        "microsecond" => unsafe { abi::pon_const_int(i64::from(time.microsecond)) },
+        "fold" => unsafe { abi::pon_const_int(i64::from(time.fold)) },
+        "tzinfo" => time.tzinfo,
+        _ => datetime_attribute_error(name),
+    }
+}
+
+unsafe extern "C" fn pon_datetime_delta_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+    let Some(name) = (unsafe { datetime_attr_name(name) }) else {
+        return ptr::null_mut();
+    };
+    let delta = unsafe { &*object.cast::<PonDeltaObject>() };
+    match name {
+        "days" => unsafe { abi::pon_const_int(i64::from(delta.days)) },
+        "seconds" => unsafe { abi::pon_const_int(i64::from(delta.seconds)) },
+        "microseconds" => unsafe { abi::pon_const_int(i64::from(delta.microseconds)) },
+        _ => datetime_attribute_error(name),
+    }
+}
+
+fn datetime_attribute_error(name: &str) -> *mut PyObject {
+    let _ = abi::exc::raise_kind_error_text(ExceptionKind::AttributeError, &format!("datetime object has no attribute {name}"));
+    ptr::null_mut()
+}
+
+fn verify_datetime_capi(capi: &PyDateTimeCapi) -> Result<(), String> {
+    let date = unsafe { capi_datetime_date_from_date(2020, 1, 2, capi.date_type) };
+    if date.is_null() {
+        let detail = pending_error_detail();
+        pon_err_clear();
+        return Err(format!("PyDateTime_IMPORT datetime.date(2020, 1, 2) failed: {detail}"));
+    }
+    verify_datetime_attr(date, "year", 2020, "datetime.date.year")?;
+    verify_datetime_attr(date, "month", 1, "datetime.date.month")?;
+    verify_datetime_attr(date, "day", 2, "datetime.date.day")?;
+
+    let none = unsafe { abi::pon_none() };
+    let datetime = unsafe { capi_datetime_datetime_from_date_and_time(2020, 1, 2, 3, 4, 5, 6, none, capi.datetime_type) };
+    if datetime.is_null() {
+        let detail = pending_error_detail();
+        pon_err_clear();
+        return Err(format!("PyDateTime_IMPORT datetime.datetime(...) failed: {detail}"));
+    }
+    for (attr, expected) in [
+        ("year", 2020),
+        ("month", 1),
+        ("day", 2),
+        ("hour", 3),
+        ("minute", 4),
+        ("second", 5),
+        ("microsecond", 6),
+    ] {
+        verify_datetime_attr(datetime, attr, expected, &format!("datetime.datetime.{attr}"))?;
+    }
+
+    let delta = unsafe { capi_datetime_delta_from_delta(1, 2, 3, 1, capi.delta_type) };
+    if delta.is_null() {
+        let detail = pending_error_detail();
+        pon_err_clear();
+        return Err(format!("PyDateTime_IMPORT datetime.timedelta(1, 2, 3) failed: {detail}"));
+    }
+    verify_datetime_attr(delta, "days", 1, "datetime.timedelta.days")?;
+    verify_datetime_attr(delta, "seconds", 2, "datetime.timedelta.seconds")?;
+    verify_datetime_attr(delta, "microseconds", 3, "datetime.timedelta.microseconds")?;
+
+    if capi.timezone_utc.is_null() {
+        return Err("PyDateTime_IMPORT datetime.UTC is NULL".to_owned());
+    }
+    Ok(())
+}
+
+fn verify_datetime_attr(object: *mut PyObject, attr: &str, expected: c_int, label: &str) -> Result<(), String> {
+    match unsafe { datetime_int_attr_raw(object, attr) } {
+        Ok(actual) if actual == expected => Ok(()),
+        Ok(actual) => Err(format!("PyDateTime_IMPORT {label} returned {actual}, expected {expected}")),
+        Err(message) => {
+            pon_err_clear();
+            Err(format!("PyDateTime_IMPORT could not read {label}: {message}"))
+        }
+    }
+}
+
+unsafe fn datetime_int_attr_raw(object: *mut PyObject, attr: &str) -> Result<c_int, String> {
+    if object.is_null() {
+        return Err(format!("datetime attribute {attr} read received NULL object"));
+    }
+    let value = unsafe { abi::pon_get_attr(object, intern(attr), ptr::null_mut()) };
+    if value.is_null() {
+        return Err(pending_error_detail());
+    }
+    let value = crate::tag::untag_arg(value);
+    let Some(integer) = (unsafe { crate::types::int::to_bigint_including_bool(value) }) else {
+        return Err(format!("datetime attribute {attr} is not an integer"));
+    };
+    integer
+        .to_i32()
+        .ok_or_else(|| format!("datetime attribute {attr} is outside the C int range"))
+}
+
+unsafe extern "C" fn capi_datetime_date_from_date(
+    year: c_int,
+    month: c_int,
+    day: c_int,
+    type_: *mut ForeignTypeObject,
+) -> *mut PyObject {
+    let Some(callee) = (unsafe { datetime_constructor_type(type_, "PyDateTimeAPI->Date_FromDate") }) else {
+        return ptr::null_mut();
+    };
+    let Some(mut args) = (unsafe { datetime_int_args3(year, month, day) }) else {
+        return ptr::null_mut();
+    };
+    unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) }
+}
+
+unsafe extern "C" fn capi_datetime_datetime_from_date_and_time(
+    year: c_int,
+    month: c_int,
+    day: c_int,
+    hour: c_int,
+    minute: c_int,
+    second: c_int,
+    usecond: c_int,
+    tzinfo: *mut PyObject,
+    type_: *mut ForeignTypeObject,
+) -> *mut PyObject {
+    unsafe { call_datetime_datetime_constructor(year, month, day, hour, minute, second, usecond, tzinfo, None, type_) }
+}
+
+unsafe extern "C" fn capi_datetime_datetime_from_date_and_time_and_fold(
+    year: c_int,
+    month: c_int,
+    day: c_int,
+    hour: c_int,
+    minute: c_int,
+    second: c_int,
+    usecond: c_int,
+    tzinfo: *mut PyObject,
+    fold: c_int,
+    type_: *mut ForeignTypeObject,
+) -> *mut PyObject {
+    unsafe { call_datetime_datetime_constructor(year, month, day, hour, minute, second, usecond, tzinfo, Some(fold), type_) }
+}
+
+unsafe fn call_datetime_datetime_constructor(
+    year: c_int,
+    month: c_int,
+    day: c_int,
+    hour: c_int,
+    minute: c_int,
+    second: c_int,
+    usecond: c_int,
+    tzinfo: *mut PyObject,
+    fold: Option<c_int>,
+    type_: *mut ForeignTypeObject,
+) -> *mut PyObject {
+    let Some(callee) = (unsafe { datetime_constructor_type(type_, "PyDateTimeAPI->DateTime_FromDateAndTime") }) else {
+        return ptr::null_mut();
+    };
+    let Some(tzinfo) = (unsafe { datetime_tzinfo_arg(tzinfo) }) else {
+        return ptr::null_mut();
+    };
+    let Some(mut args) = (unsafe { datetime_int_args7_with_object(year, month, day, hour, minute, second, usecond, tzinfo) }) else {
+        return ptr::null_mut();
+    };
+    if let Some(fold) = fold {
+        let Some(mut fold_values) = (unsafe { datetime_int_args1(fold) }) else {
+            return ptr::null_mut();
+        };
+        let fold_name = [intern("fold")];
+        return unsafe {
+            abi::call::pon_call_ex(
+                callee,
+                args.as_mut_ptr(),
+                args.len(),
+                ptr::null_mut(),
+                fold_name.as_ptr(),
+                fold_values.as_mut_ptr(),
+                fold_values.len(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+    }
+    unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) }
+}
+
+unsafe extern "C" fn capi_datetime_time_from_time(
+    hour: c_int,
+    minute: c_int,
+    second: c_int,
+    usecond: c_int,
+    tzinfo: *mut PyObject,
+    type_: *mut ForeignTypeObject,
+) -> *mut PyObject {
+    unsafe { call_datetime_time_constructor(hour, minute, second, usecond, tzinfo, None, type_) }
+}
+
+unsafe extern "C" fn capi_datetime_time_from_time_and_fold(
+    hour: c_int,
+    minute: c_int,
+    second: c_int,
+    usecond: c_int,
+    tzinfo: *mut PyObject,
+    fold: c_int,
+    type_: *mut ForeignTypeObject,
+) -> *mut PyObject {
+    unsafe { call_datetime_time_constructor(hour, minute, second, usecond, tzinfo, Some(fold), type_) }
+}
+
+unsafe fn call_datetime_time_constructor(
+    hour: c_int,
+    minute: c_int,
+    second: c_int,
+    usecond: c_int,
+    tzinfo: *mut PyObject,
+    fold: Option<c_int>,
+    type_: *mut ForeignTypeObject,
+) -> *mut PyObject {
+    let Some(callee) = (unsafe { datetime_constructor_type(type_, "PyDateTimeAPI->Time_FromTime") }) else {
+        return ptr::null_mut();
+    };
+    let Some(tzinfo) = (unsafe { datetime_tzinfo_arg(tzinfo) }) else {
+        return ptr::null_mut();
+    };
+    let Some(mut args) = (unsafe { datetime_int_args4_with_object(hour, minute, second, usecond, tzinfo) }) else {
+        return ptr::null_mut();
+    };
+    if let Some(fold) = fold {
+        let Some(mut fold_values) = (unsafe { datetime_int_args1(fold) }) else {
+            return ptr::null_mut();
+        };
+        let fold_name = [intern("fold")];
+        return unsafe {
+            abi::call::pon_call_ex(
+                callee,
+                args.as_mut_ptr(),
+                args.len(),
+                ptr::null_mut(),
+                fold_name.as_ptr(),
+                fold_values.as_mut_ptr(),
+                fold_values.len(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+    }
+    unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) }
+}
+
+unsafe extern "C" fn capi_datetime_delta_from_delta(
+    days: c_int,
+    seconds: c_int,
+    useconds: c_int,
+    normalize: c_int,
+    type_: *mut ForeignTypeObject,
+) -> *mut PyObject {
+    if normalize != 1 {
+        raise_not_implemented("PyDateTimeAPI->Delta_FromDelta with normalize=0 is not implemented by Pon's Python-backed datetime shim");
+        return ptr::null_mut();
+    }
+    let Some(callee) = (unsafe { datetime_constructor_type(type_, "PyDateTimeAPI->Delta_FromDelta") }) else {
+        return ptr::null_mut();
+    };
+    let Some(mut args) = (unsafe { datetime_int_args3(days, seconds, useconds) }) else {
+        return ptr::null_mut();
+    };
+    unsafe { abi::pon_call(callee, args.as_mut_ptr(), args.len()) }
+}
+
+unsafe fn datetime_constructor_type(type_: *mut ForeignTypeObject, symbol: &str) -> Option<*mut PyObject> {
+    if type_.is_null() {
+        raise_type_error(&format!("{symbol} received NULL type"));
+        return None;
+    }
+    let Some(native) = twin::native_of_foreign(type_) else {
+        raise_type_error(&format!("{symbol} received a type object that is not registered with Pon"));
+        return None;
+    };
+    Some(native.cast::<PyObject>())
+}
+
+unsafe fn datetime_tzinfo_arg(tzinfo: *mut PyObject) -> Option<*mut PyObject> {
+    if tzinfo.is_null() {
+        let none = unsafe { abi::pon_none() };
+        return (!none.is_null()).then_some(none);
+    }
+    Some(crate::tag::untag_arg(tzinfo))
+}
+
+unsafe fn datetime_int_arg(value: c_int) -> Option<*mut PyObject> {
+    let object = unsafe { abi::pon_const_int(i64::from(value)) };
+    (!object.is_null()).then_some(object)
+}
+
+unsafe fn datetime_int_args1(a: c_int) -> Option<[*mut PyObject; 1]> {
+    Some([unsafe { datetime_int_arg(a) }?])
+}
+
+unsafe fn datetime_int_args3(a: c_int, b: c_int, c: c_int) -> Option<[*mut PyObject; 3]> {
+    Some([
+        unsafe { datetime_int_arg(a) }?,
+        unsafe { datetime_int_arg(b) }?,
+        unsafe { datetime_int_arg(c) }?,
+    ])
+}
+
+unsafe fn datetime_int_args7_with_object(
+    a: c_int,
+    b: c_int,
+    c: c_int,
+    d: c_int,
+    e: c_int,
+    f: c_int,
+    g: c_int,
+    object: *mut PyObject,
+) -> Option<[*mut PyObject; 8]> {
+    Some([
+        unsafe { datetime_int_arg(a) }?,
+        unsafe { datetime_int_arg(b) }?,
+        unsafe { datetime_int_arg(c) }?,
+        unsafe { datetime_int_arg(d) }?,
+        unsafe { datetime_int_arg(e) }?,
+        unsafe { datetime_int_arg(f) }?,
+        unsafe { datetime_int_arg(g) }?,
+        object,
+    ])
+}
+
+unsafe fn datetime_int_args4_with_object(
+    a: c_int,
+    b: c_int,
+    c: c_int,
+    d: c_int,
+    object: *mut PyObject,
+) -> Option<[*mut PyObject; 5]> {
+    Some([
+        unsafe { datetime_int_arg(a) }?,
+        unsafe { datetime_int_arg(b) }?,
+        unsafe { datetime_int_arg(c) }?,
+        unsafe { datetime_int_arg(d) }?,
+        object,
+    ])
+}
+
+unsafe extern "C" fn capi_datetime_unsupported_timezone_from_timezone(_offset: *mut PyObject, _name: *mut PyObject) -> *mut PyObject {
+    raise_not_implemented("PyDateTimeAPI->TimeZone_FromTimeZone is not implemented by Pon's numpy datetime C-API surface");
+    ptr::null_mut()
+}
+
+unsafe extern "C" fn capi_datetime_unsupported_datetime_from_timestamp(
+    _cls: *mut PyObject,
+    _args: *mut PyObject,
+    _kwargs: *mut PyObject,
+) -> *mut PyObject {
+    raise_not_implemented("PyDateTimeAPI->DateTime_FromTimestamp is not implemented by Pon's numpy datetime C-API surface");
+    ptr::null_mut()
+}
+
+unsafe extern "C" fn capi_datetime_unsupported_date_from_timestamp(_cls: *mut PyObject, _args: *mut PyObject) -> *mut PyObject {
+    raise_not_implemented("PyDateTimeAPI->Date_FromTimestamp is not implemented by Pon's numpy datetime C-API surface");
+    ptr::null_mut()
+}
+
+
 unsafe extern "C" fn capi_capsule_new(
     pointer: *mut c_void,
     name: *const c_char,
@@ -258,6 +1101,9 @@ unsafe extern "C" fn capi_capsule_import(name: *const c_char, _no_block: c_int) 
     let Some(full_name) = c_string(name) else {
         return raise_value_error_null("PyCapsule_Import called with invalid name");
     };
+    if full_name == DATETIME_CAPSULE_NAME {
+        return unsafe { capi_datetime_capi_import() };
+    }
     let mut parts = full_name.split('.');
     let Some(module_name) = parts.next().filter(|part| !part.is_empty()) else {
         return raise_value_error_null("PyCapsule_Import called with invalid name");
@@ -423,6 +1269,11 @@ fn raise_import_error_null(message: &str) -> *mut PyObject {
     ptr::null_mut()
 }
 
+fn raise_import_error_void(message: &str) -> *mut c_void {
+    let _ = abi::exc::raise_kind_error_text(ExceptionKind::ImportError, message);
+    ptr::null_mut()
+}
+
 fn raise_system_error_null(message: &str) -> *mut PyObject {
     raise_system_error(message);
     ptr::null_mut()
@@ -434,6 +1285,18 @@ fn raise_value_error(message: &str) {
 
 fn raise_system_error(message: &str) {
     let _ = abi::exc::raise_kind_error_text(ExceptionKind::SystemError, message);
+}
+
+fn raise_type_error(message: &str) {
+    let _ = abi::exc::raise_kind_error_text(ExceptionKind::TypeError, message);
+}
+
+fn raise_not_implemented(message: &str) {
+    let _ = abi::exc::raise_kind_error_text(ExceptionKind::NotImplementedError, message);
+}
+
+fn pending_error_detail() -> String {
+    pon_err_message().unwrap_or_else(|| "unknown error".to_owned())
 }
 
 #[cfg(test)]
@@ -769,6 +1632,217 @@ PyMODINIT_FUNC PyInit_capi_runtime_structural_ext(void) {
 
         let module_name = intern("capi_runtime_structural_ext");
         assert_noargs_text(module_name, "runtime_structural_mask", "4095");
+
+        reset_import_state_for_tests();
+    }
+
+    #[test]
+    fn runtime_datetime_c_api_load_test() {
+        let _guard = test_state_lock();
+        let _reset = ResetImportStateOnDrop;
+        unsafe {
+            assert_eq!(pon_runtime_init(), 0);
+        }
+
+        let temp = TempExtensionRoot::new();
+        let module_path = compile_extension(
+            &temp,
+            "capi_runtime_datetime_ext",
+            r#"
+#include <Python.h>
+#include <datetime.h>
+
+enum {
+    IMPORT_OK = 1L << 0,
+    API_TYPES = 1L << 1,
+    DATE_CONSTRUCT = 1L << 2,
+    DATE_YMD = 1L << 3,
+    DATE_CHECKS = 1L << 4,
+    DATE_TWIN_INSTANCE = 1L << 5,
+    DATETIME_CONSTRUCT = 1L << 6,
+    DATETIME_FIELDS = 1L << 7,
+    DATETIME_CHECKS = 1L << 8,
+    DELTA_CONSTRUCT = 1L << 9,
+    DELTA_FIELDS = 1L << 10,
+    DELTA_CHECKS = 1L << 11,
+    TIME_CONSTRUCT = 1L << 12,
+    TIME_FIELDS = 1L << 13,
+    TIME_CHECKS = 1L << 14,
+    UTC_TZINFO = 1L << 15,
+    CAPSULE_DIRECT = 1L << 16,
+    EXACT_CHECKS = 1L << 17
+};
+
+static void clear_unexpected_error(void) {
+    if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+}
+
+static PyObject *datetime_mask(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+
+    long mask = 0;
+    PyDateTime_IMPORT;
+    if (PyDateTimeAPI == NULL) {
+        clear_unexpected_error();
+        return PyLong_FromLong(mask);
+    }
+    mask |= IMPORT_OK;
+
+    if (PyDateTimeAPI->DateType != NULL &&
+            PyDateTimeAPI->DateTimeType != NULL &&
+            PyDateTimeAPI->TimeType != NULL &&
+            PyDateTimeAPI->DeltaType != NULL &&
+            PyDateTimeAPI->TZInfoType != NULL &&
+            PyDateTime_TimeZone_UTC != NULL) {
+        mask |= API_TYPES;
+    }
+
+    void *direct = PyCapsule_Import(PyDateTime_CAPSULE_NAME, 0);
+    if (direct == PyDateTimeAPI) {
+        mask |= CAPSULE_DIRECT;
+    } else {
+        clear_unexpected_error();
+    }
+
+    PyObject *date = PyDate_FromDate(2020, 1, 2);
+    if (date != NULL) {
+        mask |= DATE_CONSTRUCT;
+        if (PyDateTime_GET_YEAR(date) == 2020 &&
+                PyDateTime_GET_MONTH(date) == 1 &&
+                PyDateTime_GET_DAY(date) == 2 &&
+                PyErr_Occurred() == NULL) {
+            mask |= DATE_YMD;
+        } else {
+            clear_unexpected_error();
+        }
+        if (PyDate_Check(date) == 1 && PyDateTime_Check(date) == 0) {
+            mask |= DATE_CHECKS;
+        } else {
+            clear_unexpected_error();
+        }
+        if (PyObject_IsInstance(date, (PyObject *)PyDateTimeAPI->DateType) == 1) {
+            mask |= DATE_TWIN_INSTANCE;
+        } else {
+            clear_unexpected_error();
+        }
+    } else {
+        clear_unexpected_error();
+    }
+
+    PyObject *dt = PyDateTime_FromDateAndTime(2020, 1, 2, 3, 4, 5, 6);
+    if (dt != NULL) {
+        mask |= DATETIME_CONSTRUCT;
+        if (PyDateTime_GET_YEAR(dt) == 2020 &&
+                PyDateTime_GET_MONTH(dt) == 1 &&
+                PyDateTime_GET_DAY(dt) == 2 &&
+                PyDateTime_DATE_GET_HOUR(dt) == 3 &&
+                PyDateTime_DATE_GET_MINUTE(dt) == 4 &&
+                PyDateTime_DATE_GET_SECOND(dt) == 5 &&
+                PyDateTime_DATE_GET_MICROSECOND(dt) == 6 &&
+                PyErr_Occurred() == NULL) {
+            mask |= DATETIME_FIELDS;
+        } else {
+            clear_unexpected_error();
+        }
+        if (PyDateTime_Check(dt) == 1 && PyDate_Check(dt) == 1) {
+            mask |= DATETIME_CHECKS;
+        } else {
+            clear_unexpected_error();
+        }
+    } else {
+        clear_unexpected_error();
+    }
+
+    if (date != NULL && dt != NULL &&
+            PyDate_CheckExact(date) &&
+            !PyDateTime_CheckExact(date) &&
+            PyDateTime_CheckExact(dt) &&
+            !PyDate_CheckExact(dt)) {
+        mask |= EXACT_CHECKS;
+    }
+
+    PyObject *delta = PyDelta_FromDSU(1, 2, 3);
+    if (delta != NULL) {
+        mask |= DELTA_CONSTRUCT;
+        if (PyDateTime_DELTA_GET_DAYS(delta) == 1 &&
+                PyDateTime_DELTA_GET_SECONDS(delta) == 2 &&
+                PyDateTime_DELTA_GET_MICROSECONDS(delta) == 3 &&
+                PyErr_Occurred() == NULL) {
+            mask |= DELTA_FIELDS;
+        } else {
+            clear_unexpected_error();
+        }
+        if (PyDelta_Check(delta) == 1 &&
+                PyDelta_CheckExact(delta) &&
+                PyObject_IsInstance(delta, (PyObject *)PyDateTimeAPI->DeltaType) == 1) {
+            mask |= DELTA_CHECKS;
+        } else {
+            clear_unexpected_error();
+        }
+    } else {
+        clear_unexpected_error();
+    }
+
+    PyObject *time = PyTime_FromTime(4, 5, 6, 7);
+    if (time != NULL) {
+        mask |= TIME_CONSTRUCT;
+        if (PyDateTime_TIME_GET_HOUR(time) == 4 &&
+                PyDateTime_TIME_GET_MINUTE(time) == 5 &&
+                PyDateTime_TIME_GET_SECOND(time) == 6 &&
+                PyDateTime_TIME_GET_MICROSECOND(time) == 7 &&
+                PyErr_Occurred() == NULL) {
+            mask |= TIME_FIELDS;
+        } else {
+            clear_unexpected_error();
+        }
+        if (PyTime_Check(time) == 1 && PyTime_CheckExact(time)) {
+            mask |= TIME_CHECKS;
+        } else {
+            clear_unexpected_error();
+        }
+    } else {
+        clear_unexpected_error();
+    }
+
+    if (PyTZInfo_Check(PyDateTime_TimeZone_UTC) == 1 &&
+            PyObject_IsInstance(PyDateTime_TimeZone_UTC, (PyObject *)PyDateTimeAPI->TZInfoType) == 1) {
+        mask |= UTC_TZINFO;
+    } else {
+        clear_unexpected_error();
+    }
+
+    clear_unexpected_error();
+    return PyLong_FromLong(mask);
+}
+
+static PyMethodDef methods[] = {
+    {"datetime_mask", datetime_mask, METH_NOARGS, "exercise datetime C-API shim"},
+    {NULL, NULL, 0, NULL}
+};
+
+static struct PyModuleDef module = {
+    PyModuleDef_HEAD_INIT,
+    "capi_runtime_datetime_ext",
+    "Pon datetime C-API test extension",
+    -1,
+    methods
+};
+
+PyMODINIT_FUNC PyInit_capi_runtime_datetime_ext(void) {
+    return PyModule_Create(&module);
+}
+"#,
+        );
+
+        let module = load_extension_module("capi_runtime_datetime_ext", &module_path)
+            .unwrap_or_else(|message| panic!("failed to load datetime C extension: {message}"));
+        assert!(!module.is_null(), "extension loader returned NULL module");
+
+        let module_name = intern("capi_runtime_datetime_ext");
+        assert_noargs_text(module_name, "datetime_mask", "262143");
 
         reset_import_state_for_tests();
     }

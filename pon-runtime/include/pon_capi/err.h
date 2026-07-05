@@ -65,6 +65,18 @@ typedef struct PyPonCapiErr {
     void (*exception_set_cause)(PyObject *, PyObject *);
     void (*exception_set_context)(PyObject *, PyObject *);
     int (*exception_set_traceback)(PyObject *, PyObject *);
+    PyObject *exc_warning;
+    PyObject *exc_future_warning;
+    PyObject *exc_import_warning;
+    PyObject *exc_module_not_found_error;
+    PyObject *exc_assertion_error;
+    PyObject *exc_name_error;
+    PyObject *exc_unicode_error;
+    PyObject *exc_unicode_encode_error;
+    PyObject *exc_unicode_decode_error;
+    PyObject *exc_recursion_error;
+    PyObject *(*new_exception)(const char *, PyObject *, PyObject *);
+    int (*check_signals)(void);
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiErr;
 
