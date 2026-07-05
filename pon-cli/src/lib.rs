@@ -53,6 +53,10 @@ pub fn run_from_args(args: impl IntoIterator<Item = String>) -> Result<()> {
         }
         Some("build") => build_from_args(args),
         Some("repl") => bail!("`pon repl` is unsupported in Phase A"),
+        Some("-m") => {
+            let module = args.next().context("missing module name for `pon -m <module>`")?;
+            run_module_as_main(&module, args.collect())
+        }
         Some(command) => {
             // Python-compatible script invocation: `pon <script> [args...]`
             // runs the file directly (like `python script.py args`), so tools
@@ -100,10 +104,79 @@ fn script_module_attrs(path: &Path) -> Result<Vec<(u32, *mut PyObject)>> {
 }
 
 fn run_file_inner(path: &Path, argv: &[String]) -> Result<()> {
+    run_file_inner_with_package(path, argv, None)
+}
+
+/// `pon -m <module>` (CPython `python -m` / runpy): the current directory
+/// leads the import path, a dotted module runs with `__name__ = "__main__"`
+/// and `__package__` set to its parent package so relative imports resolve,
+/// and a package target runs its `__main__` submodule.
+fn run_module_as_main(module: &str, extra_args: Vec<String>) -> Result<()> {
+    let mut overlay = EnvOverlay::new();
+    let cwd = env::current_dir().context("cannot resolve the current directory for `pon -m`")?;
+    let mut roots = vec![cwd.clone().into_os_string()];
+    if let Some(existing) = env::var_os("PONPATH") {
+        roots.extend(env::split_paths(&existing).map(|path| path.into_os_string()));
+    }
+    overlay.set(
+        OsString::from("PONPATH"),
+        env::join_paths(roots).context("failed to build import search path")?,
+    );
+
+    // Resolve against the same roots the runtime consults: PONPATH (now led
+    // by the cwd), PON_IMPORT_PATH, and PYTHONPATH.
+    let mut search_roots = vec![cwd];
+    for var in ["PONPATH", "PON_IMPORT_PATH", "PYTHONPATH"] {
+        if let Some(extra) = env::var_os(var) {
+            search_roots.extend(env::split_paths(&extra));
+        }
+    }
+    let resolve = |name: &str| -> Option<(std::path::PathBuf, bool)> {
+        let mut relative = std::path::PathBuf::new();
+        for part in name.split('.') {
+            relative.push(part);
+        }
+        for root in &search_roots {
+            let package_init = root.join(&relative).join("__init__.py");
+            if package_init.is_file() {
+                return Some((package_init, true));
+            }
+            let mut module_path = root.join(&relative);
+            module_path.set_extension("py");
+            if module_path.is_file() {
+                return Some((module_path, false));
+            }
+        }
+        None
+    };
+    let Some((path, is_package)) = resolve(module) else {
+        bail!("No module named {module}");
+    };
+    let (path, package) = if is_package {
+        // `python -m pkg` runs `pkg.__main__`.
+        let Some((main_path, false)) = resolve(&format!("{module}.__main__")) else {
+            bail!("No module named {module}.__main__; '{module}' is a package and cannot be directly executed");
+        };
+        (main_path, module.to_owned())
+    } else {
+        let package = module.rsplit_once('.').map(|(parent, _)| parent.to_owned()).unwrap_or_default();
+        (path, package)
+    };
+    let mut argv = vec![path.to_string_lossy().into_owned()];
+    argv.extend(extra_args);
+    run_file_inner_with_package(&path, &argv, Some(&package))
+}
+
+fn run_file_inner_with_package(path: &Path, argv: &[String], main_package: Option<&str>) -> Result<()> {
     let source = fs::read_to_string(path)
         .with_context(|| format!("failed to read UTF-8 source `{}`", path.display()))?;
     let mut script_path_guard = EnvOverlay::new();
-    if let Some(script_dir) = path.parent() {
+    // `pon -m` already placed the cwd at the head of the import path; only
+    // direct script runs prepend the script's own directory (CPython
+    // `sys.path[0]` semantics for each invocation form).
+    if main_package.is_none()
+        && let Some(script_dir) = path.parent()
+    {
         let mut roots = vec![script_dir.as_os_str().to_os_string()];
         if let Some(existing) = env::var_os("PONPATH") {
             roots.extend(env::split_paths(&existing).map(|path| path.into_os_string()));
@@ -142,6 +215,15 @@ fn run_file_inner(path: &Path, argv: &[String]) -> Result<()> {
         bail!("runtime initialization failed");
     }
     install_module("__main__", script_module_attrs(path)?).map_err(anyhow::Error::msg)?;
+    if let Some(package) = main_package.filter(|package| !package.is_empty()) {
+        // runpy: `__main__.__package__` names the parent package so the
+        // module's relative imports resolve.
+        let package_object = unsafe { pon_const_str(package.as_ptr(), package.len()) };
+        if package_object.is_null() {
+            bail!("failed to allocate __package__ for `pon -m`");
+        }
+        pon_runtime::import::store_module_attr(intern("__main__"), intern("__package__"), package_object);
+    }
     let mut engine = JitEngine::new();
     begin_module_execution("__main__").map_err(anyhow::Error::msg)?;
     let result = engine.run(&module).context("JIT execution failed");

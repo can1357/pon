@@ -469,6 +469,22 @@ unsafe extern "C" fn os_get_exports_list(argv: *mut *mut PyObject, argc: usize) 
     super::builtins_batch::build_str_list(names)
 }
 
+/// True when `raw` carries a `str` or `bytes` payload, subclass instances
+/// included (CPython `PyUnicode_Check`/`PyBytes_Check`).
+pub(super) fn type_derives_str_or_bytes(raw: *mut PyObject) -> bool {
+    // SAFETY: Callers proved `raw` is a live heap pointer.
+    if unsafe { crate::types::type_::unicode_text(raw) }.is_some() {
+        return true;
+    }
+    if crate::types::bytes_::is_bytes_type(unsafe { (*raw).ob_type }) {
+        return true;
+    }
+    // bytes subclasses wrap their payload in a subclass carrier.
+    unsafe { crate::types::type_::payload_subclass_value(raw) }.is_some_and(|payload| {
+        payload != raw && !payload.is_null() && crate::types::bytes_::is_bytes_type(unsafe { (*payload).ob_type })
+    })
+}
+
 /// `os.fspath(path)`: str/bytes pass through unchanged; other objects defer
 /// to their type's `__fspath__`; everything else raises CPython's TypeError.
 unsafe extern "C" fn os_fspath(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -479,8 +495,10 @@ unsafe extern "C" fn os_fspath(argv: *mut *mut PyObject, argc: usize) -> *mut Py
     let path = unsafe { *argv };
     let raw = crate::tag::untag_arg(path);
     if !raw.is_null() && !crate::tag::is_small_int(raw) {
-        // SAFETY: Heap pointer with a live header after the tag checks.
-        if matches!(unsafe { crate::types::dict::type_name(raw) }, Some("str" | "bytes")) {
+        // str/bytes pass through unchanged, SUBCLASS instances included
+        // (CPython `PyUnicode_Check`; meson's OptionString is a str
+        // subclass fed straight into path joins).
+        if type_derives_str_or_bytes(raw) {
             return path;
         }
         // SAFETY: Live header per the checks above.
@@ -1464,27 +1482,11 @@ fn at_fork_callback_arg(value: *mut PyObject, name: &str) -> Result<Option<*mut 
         return Ok(None);
     }
     let callback = crate::tag::untag_arg(value);
-    if is_callable_object(callback) {
+    if crate::abi::call::is_callable_object(callback) {
         Ok(Some(callback))
     } else {
         Err(raise_type_error(&format!("os.register_at_fork() argument '{name}' must be callable")))
     }
-}
-
-fn is_callable_object(object: *mut PyObject) -> bool {
-    if object.is_null() || crate::tag::is_small_int(object) {
-        return false;
-    }
-    if matches!(
-        unsafe { crate::types::dict::type_name(object) },
-        Some("function" | "method" | "type")
-    ) {
-        return true;
-    }
-    let ty = unsafe { (*object).ob_type.cast_mut() };
-    !ty.is_null()
-        && (unsafe { (*ty).tp_call.is_some() }
-            || !unsafe { crate::descr::lookup_in_type(ty, intern(crate::intern::DUNDER_CALL)) }.is_null())
 }
 
 fn at_fork_snapshot() -> AtForkCallbacks {
@@ -3388,10 +3390,183 @@ unsafe extern "C" fn os_posix_spawnp(argv: *mut *mut PyObject, argc: usize) -> *
     unsafe { posix_spawn_common(argv, argc, true) }
 }
 
+/// Spawn options carried by `os.posix_spawn`'s keyword-only parameters,
+/// decoded from the ten-slot layout the native keyword binder produces.
+struct SpawnOptions {
+    actions: super::posixsubprocess::FileActions,
+    attr: super::posixsubprocess::SpawnAttr,
+}
+
+impl SpawnOptions {
+    /// Decodes slots 3..10 (`file_actions`, `setpgroup`, `resetids`,
+    /// `setsid`, `setsigmask`, `setsigdef`, `scheduler`).  Empty/None slots
+    /// leave the initialized-but-default actions/attr, which `posix_spawn`
+    /// treats exactly like NULL pointers.
+    fn parse(options: &[*mut PyObject]) -> Result<Self, *mut PyObject> {
+        use super::posixsubprocess::{FileActions, SpawnAttr, POSIX_SPAWN_SETSID_FLAG};
+
+        let mut actions = FileActions::new()
+            .map_err(|errno| spawn_setup_error(errno, "posix_spawn_file_actions_init"))?;
+        let mut attr =
+            SpawnAttr::new().map_err(|errno| spawn_setup_error(errno, "posix_spawnattr_init"))?;
+        let mut flags: libc::c_int = 0;
+
+        if !is_none_value(options[0]) {
+            for (index, entry) in spawn_sequence(options[0], "file_actions")?.iter().enumerate() {
+                let fields = spawn_sequence(*entry, "file_actions entry")?;
+                let what = format!("file_actions[{index}]");
+                let tag = match fields.first() {
+                    Some(&tag) => int_arg(tag, &what)?,
+                    None => return Err(raise_type_error(&format!("{what} must not be empty"))),
+                };
+                // Tag values are pon's os.POSIX_SPAWN_* constants (CPython's
+                // enum order: OPEN=0, CLOSE=1, DUP2=2).
+                let rc = match (tag, fields.len()) {
+                    (0, 5) => {
+                        let fd = spawn_fd(fields[1], &what)?;
+                        let open_path = path_arg(fields[2], "posix_spawn")?;
+                        let open_path = c_path(&open_path)?;
+                        let oflags = int_arg(fields[3], &what)? as libc::c_int;
+                        let mode = int_arg(fields[4], &what)? as libc::mode_t;
+                        // SAFETY: `actions` is initialized and `open_path` is
+                        // a live C string; libc validates the descriptor.
+                        unsafe {
+                            libc::posix_spawn_file_actions_addopen(
+                                actions.as_mut_ptr(),
+                                fd,
+                                open_path.as_ptr(),
+                                oflags,
+                                mode,
+                            )
+                        }
+                    }
+                    (1, 2) => {
+                        let fd = spawn_fd(fields[1], &what)?;
+                        // SAFETY: `actions` is initialized; libc validates `fd`.
+                        unsafe { libc::posix_spawn_file_actions_addclose(actions.as_mut_ptr(), fd) }
+                    }
+                    (2, 3) => {
+                        let fd = spawn_fd(fields[1], &what)?;
+                        let new_fd = spawn_fd(fields[2], &what)?;
+                        // SAFETY: `actions` is initialized; libc validates both descriptors.
+                        unsafe { libc::posix_spawn_file_actions_adddup2(actions.as_mut_ptr(), fd, new_fd) }
+                    }
+                    _ => {
+                        return Err(raise_type_error(&format!(
+                            "{what} is not a valid POSIX_SPAWN_OPEN/CLOSE/DUP2 tuple"
+                        )))
+                    }
+                };
+                if rc != 0 {
+                    return Err(spawn_setup_error(rc, "posix_spawn_file_actions"));
+                }
+            }
+        }
+
+        if !is_none_value(options[1]) {
+            let pgroup = int_arg(options[1], "setpgroup")? as libc::pid_t;
+            // SAFETY: `attr` is initialized.
+            let rc = unsafe { libc::posix_spawnattr_setpgroup(attr.as_mut_ptr(), pgroup) };
+            if rc != 0 {
+                return Err(spawn_setup_error(rc, "posix_spawnattr_setpgroup"));
+            }
+            flags |= libc::POSIX_SPAWN_SETPGROUP as libc::c_int;
+        }
+        if !is_none_value(options[2]) && truth_arg(options[2])? {
+            flags |= libc::POSIX_SPAWN_RESETIDS as libc::c_int;
+        }
+        if !is_none_value(options[3]) && truth_arg(options[3])? {
+            flags |= POSIX_SPAWN_SETSID_FLAG;
+        }
+        if let Some(sigset) = spawn_sigset(options[4], "setsigmask")? {
+            // SAFETY: `attr` is initialized and `sigset` is a built signal set.
+            let rc = unsafe { libc::posix_spawnattr_setsigmask(attr.as_mut_ptr(), &sigset) };
+            if rc != 0 {
+                return Err(spawn_setup_error(rc, "posix_spawnattr_setsigmask"));
+            }
+            flags |= libc::POSIX_SPAWN_SETSIGMASK as libc::c_int;
+        }
+        if let Some(sigset) = spawn_sigset(options[5], "setsigdef")? {
+            // SAFETY: `attr` is initialized and `sigset` is a built signal set.
+            let rc = unsafe { libc::posix_spawnattr_setsigdefault(attr.as_mut_ptr(), &sigset) };
+            if rc != 0 {
+                return Err(spawn_setup_error(rc, "posix_spawnattr_setsigdefault"));
+            }
+            flags |= libc::POSIX_SPAWN_SETSIGDEF as libc::c_int;
+        }
+        if !is_none_value(options[6]) {
+            return Err(crate::abi::exc::raise_kind_error_text(
+                ExceptionKind::NotImplementedError,
+                "os.posix_spawn does not implement the scheduler parameter on this platform",
+            ));
+        }
+
+        if flags != 0 {
+            // SAFETY: `attr` is initialized; flags are host spawn constants.
+            let rc = unsafe { libc::posix_spawnattr_setflags(attr.as_mut_ptr(), flags as libc::c_short) };
+            if rc != 0 {
+                return Err(spawn_setup_error(rc, "posix_spawnattr_setflags"));
+            }
+        }
+        Ok(Self { actions, attr })
+    }
+}
+
+fn spawn_setup_error(errno: libc::c_int, context: &str) -> *mut PyObject {
+    crate::abi::exc::raise_kind_error_text(
+        ExceptionKind::OSError,
+        &format!("{context} failed: [Errno {errno}]"),
+    )
+}
+
+/// A `file_actions` entry or container as a slice of items (list or tuple).
+fn spawn_sequence(object: *mut PyObject, what: &str) -> Result<Vec<*mut PyObject>, *mut PyObject> {
+    crate::abi::seq::sequence_to_vec(object)
+        .map_err(|_| raise_type_error(&format!("{what} must be a sequence")))
+}
+
+fn spawn_fd(object: *mut PyObject, what: &str) -> Result<libc::c_int, *mut PyObject> {
+    let value = int_arg(object, what)?;
+    if value < 0 || value > i64::from(libc::c_int::MAX) {
+        return Err(crate::abi::exc::raise_kind_error_text(ExceptionKind::ValueError, &format!("{what}: bad file descriptor")));
+    }
+    Ok(value as libc::c_int)
+}
+
+/// Builds a signal set from a `setsigmask`/`setsigdef` iterable; `None` and
+/// the empty sequence request no attribute (CPython's `()` default).
+fn spawn_sigset(object: *mut PyObject, what: &str) -> Result<Option<libc::sigset_t>, *mut PyObject> {
+    if is_none_value(object) {
+        return Ok(None);
+    }
+    let signals = spawn_sequence(object, what)?;
+    if signals.is_empty() {
+        return Ok(None);
+    }
+    let mut sigset = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+    // SAFETY: `sigset` is an out-slot for the libc initializer.
+    if unsafe { libc::sigemptyset(sigset.as_mut_ptr()) } != 0 {
+        return Err(spawn_setup_error(last_errno(), "sigemptyset"));
+    }
+    // SAFETY: libc reported successful initialization.
+    let mut sigset = unsafe { sigset.assume_init() };
+    for (index, signal) in signals.iter().enumerate() {
+        let signal = int_arg(*signal, &format!("{what}[{index}]"))? as libc::c_int;
+        // SAFETY: `sigset` is initialized; libc validates the signal number.
+        if unsafe { libc::sigaddset(&mut sigset, signal) } != 0 {
+            return Err(crate::abi::exc::raise_kind_error_text(ExceptionKind::ValueError, &format!("{what}: invalid signal number {signal}")));
+        }
+    }
+    Ok(Some(sigset))
+}
+
 unsafe fn posix_spawn_common(argv: *mut *mut PyObject, argc: usize, search_path: bool) -> *mut PyObject {
     let args = unsafe { call_args(argv, argc) };
-    if args.len() != 3 {
-        return crate::abi::return_null_with_error("os.posix_spawn expected path, argv, and env");
+    // Three slots: plain positional call.  Ten: the native keyword binder
+    // flattened `file_actions`/`setpgroup`/`resetids`/`setsid`/`setsigmask`/
+    // `setsigdef`/`scheduler` into their named slots (absent → None).
+    if args.len() != 3 && args.len() != 10 {
+        return raise_type_error("os.posix_spawn expected path, argv, env, and keyword-only spawn options");
     }
     let path = match path_arg(args[0], "posix_spawn") {
         Ok(path) => path,
@@ -3405,21 +3580,42 @@ unsafe fn posix_spawn_common(argv: *mut *mut PyObject, argc: usize, search_path:
         Ok(argv) => argv,
         Err(error) => return error,
     };
-    let (env_store, env_ptrs) = match env_cstrings(args[2]) {
-        Ok(env) => env,
-        Err(error) => return error,
+    // `env=None` inherits the live process environment (CPython 3.13+,
+    // gh-113119); subprocess's `_posix_spawn` fast path passes it through.
+    let env_data = if is_none_value(args[2]) {
+        None
+    } else {
+        match env_cstrings(args[2]) {
+            Ok(env) => Some(env),
+            Err(error) => return error,
+        }
     };
-    let (_argv_keepalive, _env_keepalive) = (argv_store, env_store);
+    let envp = env_data
+        .as_ref()
+        .map_or_else(super::posixsubprocess::inherited_envp, |(_, ptrs)| ptrs.as_ptr());
+    let _argv_keepalive = argv_store;
+    let options = if args.len() == 10 {
+        match SpawnOptions::parse(&args[3..]) {
+            Ok(options) => Some(options),
+            Err(error) => return error,
+        }
+    } else {
+        None
+    };
+    let (actions_ptr, attr_ptr) = options.as_ref().map_or(
+        (std::ptr::null(), std::ptr::null()),
+        |options| (options.actions.as_ptr(), options.attr.as_ptr()),
+    );
     let mut pid: libc::pid_t = 0;
     let result = if search_path {
         unsafe {
             libc::posix_spawnp(
                 &mut pid,
                 c_path.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
+                actions_ptr,
+                attr_ptr,
                 argv_ptrs.as_ptr(),
-                env_ptrs.as_ptr(),
+                envp,
             )
         }
     } else {
@@ -3427,10 +3623,10 @@ unsafe fn posix_spawn_common(argv: *mut *mut PyObject, argc: usize, search_path:
             libc::posix_spawn(
                 &mut pid,
                 c_path.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
+                actions_ptr,
+                attr_ptr,
                 argv_ptrs.as_ptr(),
-                env_ptrs.as_ptr(),
+                envp,
             )
         }
     };
@@ -3511,10 +3707,14 @@ fn env_cstrings(object: *mut PyObject) -> Result<(Vec<std::ffi::CString>, Vec<*m
     Ok((strings, ptrs))
 }
 
+/// `os.utime(path, times=None, *, ns=(), dir_fd=None, follow_symlinks=True)`
+/// over `utimensat(2)`.  The native keyword binder flattens the keyword-only
+/// options into slots 2..5 (absent → None); `shutil.copystat` passes `ns=`
+/// and `follow_symlinks=`.
 unsafe extern "C" fn os_utime(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
     let args = unsafe { call_args(argv, argc) };
-    if !(1..=2).contains(&args.len()) {
-        return crate::abi::return_null_with_error("os.utime expected path and optional times");
+    if !(1..=5).contains(&args.len()) {
+        return crate::abi::return_null_with_error("os.utime expected path and optional times/ns options");
     }
     let path = match path_arg(args[0], "utime") {
         Ok(path) => path,
@@ -3524,11 +3724,51 @@ unsafe extern "C" fn os_utime(argv: *mut *mut PyObject, argc: usize) -> *mut PyO
         Ok(path) => path,
         Err(error) => return error,
     };
+    let times_arg = args.get(1).copied().filter(|value| !is_none_value(*value));
+    let ns_arg = args.get(2).copied().filter(|value| !is_none_value(*value));
+    if times_arg.is_some() && ns_arg.is_some() {
+        return crate::abi::exc::raise_kind_error_text(
+            ExceptionKind::ValueError,
+            "utime: you may specify either 'times' or 'ns' but not both",
+        );
+    }
+    if args.get(3).copied().is_some_and(|value| !is_none_value(value)) {
+        return crate::abi::exc::raise_kind_error_text(
+            ExceptionKind::NotImplementedError,
+            "utime: dir_fd is not supported",
+        );
+    }
+    let follow_symlinks = match args.get(4).copied().filter(|value| !is_none_value(*value)) {
+        Some(value) => match truth_arg(value) {
+            Ok(value) => value,
+            Err(error) => return error,
+        },
+        None => true,
+    };
     let mut times = [libc::timespec { tv_sec: 0, tv_nsec: 0 }; 2];
-    let times_ptr = if args.get(1).copied().is_none_or(is_none_value) {
-        std::ptr::null()
-    } else {
-        let values = match crate::abi::seq::sequence_to_vec(args[1]) {
+    let times_ptr = if let Some(ns_value) = ns_arg {
+        // `ns` carries exact integer nanoseconds.
+        let values = match crate::abi::seq::sequence_to_vec(ns_value) {
+            Ok(values) if values.len() == 2 => values,
+            Ok(_) => {
+                return crate::abi::exc::raise_kind_error_text(
+                    ExceptionKind::TypeError,
+                    "utime: 'ns' must be a tuple of two ints",
+                )
+            }
+            Err(message) => return crate::abi::return_null_with_error(message),
+        };
+        for (slot, value) in times.iter_mut().zip(values) {
+            let nanos = match int_arg(value, "utime") {
+                Ok(nanos) => nanos,
+                Err(error) => return error,
+            };
+            slot.tv_sec = nanos.div_euclid(1_000_000_000) as libc::time_t;
+            slot.tv_nsec = nanos.rem_euclid(1_000_000_000) as libc::c_long;
+        }
+        times.as_ptr()
+    } else if let Some(times_value) = times_arg {
+        let values = match crate::abi::seq::sequence_to_vec(times_value) {
             Ok(values) if values.len() == 2 => values,
             Ok(_) => {
                 return crate::abi::exc::raise_kind_error_text(
@@ -3549,8 +3789,11 @@ unsafe extern "C" fn os_utime(argv: *mut *mut PyObject, argc: usize) -> *mut PyO
             slot.tv_nsec = nanos as libc::c_long;
         }
         times.as_ptr()
+    } else {
+        std::ptr::null()
     };
-    if unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times_ptr, 0) } < 0 {
+    let flags = if follow_symlinks { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+    if unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times_ptr, flags) } < 0 {
         return raise_errno(last_errno(), Some(&path));
     }
     unsafe { crate::abi::pon_none() }

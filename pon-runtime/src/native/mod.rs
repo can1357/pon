@@ -46,6 +46,7 @@ mod math;
 mod multibyte_codecs;
 mod multiprocessing;
 mod opcode_;
+mod operator_;
 mod packaging_compat;
 pub(crate) mod os;
 pub(crate) mod pickle;
@@ -121,6 +122,7 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
     ("_md5", hashes::make_md5_module),
     ("_multiprocessing", multiprocessing::make_module),
     ("_opcode", opcode_::make_module),
+    ("_operator", operator_::make_module),
     ("_pickle", pickle::make_module),
     ("_posixshmem", posixshmem::make_module),
     ("_posixsubprocess", posixsubprocess::make_module),

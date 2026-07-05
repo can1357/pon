@@ -990,7 +990,10 @@ fn search_roots() -> Vec<PathBuf> {
 
 fn default_search_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    for var in ["PONPATH", "PON_IMPORT_PATH"] {
+    // PYTHONPATH last of the env trio: pon-specific variables win, but
+    // build drivers that only know CPython's contract (meson/ninja export
+    // PYTHONPATH for generator scripts) still resolve their packages.
+    for var in ["PONPATH", "PON_IMPORT_PATH", "PYTHONPATH"] {
         if let Ok(extra) = env::var(var) {
             append_unique_roots(&mut roots, env::split_paths(&extra));
         }
@@ -1127,6 +1130,22 @@ pub(crate) fn source_module_search_locations(name: &str) -> Option<Vec<PathBuf>>
     find_source_module(name).and_then(|spec| spec.search_locations)
 }
 
+/// Filesystem source file backing `name` (`__init__.py` for packages):
+/// CPython `SourceFileLoader.path`, consumed by
+/// `_pon_source_importer.get_resource_reader` to root an
+/// `importlib.readers.FileReader`.  `None` when nothing on disk backs the
+/// module (native, extension, embedded AoT, namespace portions).
+pub(crate) fn source_module_file_path(name: &str) -> Option<PathBuf> {
+    if crate::native::is_native_module(name)
+        || find_extension_module(name).is_some()
+        || is_unsupported_c_accelerated(name)
+        || embedded_module(name).is_some()
+    {
+        return None;
+    }
+    find_source_module(name).and_then(|spec| spec.path)
+}
+
 /// Imports `name` and returns exactly that module — never the root-package
 /// remap `pon_import_name` applies for empty fromlists — raising the same
 /// typed import failure on error. Serves loader entry points
@@ -1204,6 +1223,12 @@ fn create_module(
     // is a NameError without it.  Native modules that pass an explicit
     // `__doc__` keep theirs.
     attr_map.entry(intern("__doc__")).or_insert_with(|| unsafe { pon_none() });
+    // CPython modules ALWAYS expose `__loader__`/`__spec__` (None until the
+    // import machinery fills them); the identity backfill upgrades None to a
+    // real ModuleSpec once `importlib._bootstrap` is live.  meson reads
+    // `mesonbuild.__spec__` from its `--internal` script runner.
+    attr_map.entry(intern("__loader__")).or_insert_with(|| unsafe { pon_none() });
+    attr_map.entry(intern("__spec__")).or_insert_with(|| unsafe { pon_none() });
 
     let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
     let object = Box::new(PyModuleObject {
@@ -1387,9 +1412,14 @@ fn finalize_source_module_identity_attrs(
     let Some(module_ptr) = as_module(module) else {
         return Ok(());
     };
-    let existing_loader = unsafe { (&*module_ptr).attrs.get(&intern("__loader__")).copied() };
+    let none = unsafe { pon_none() };
+    let existing_loader =
+        unsafe { (&*module_ptr).attrs.get(&intern("__loader__")).copied() }.filter(|&value| value != none);
     let needs_loader = existing_loader.is_none();
-    let needs_spec = unsafe { !(&*module_ptr).attrs.contains_key(&intern("__spec__")) };
+    // A present-but-None spec still needs the backfill: module creation
+    // seeds None before the bootstrap can build real specs.
+    let needs_spec = unsafe { (&*module_ptr).attrs.get(&intern("__spec__")).copied() }
+        .is_none_or(|value| value == none);
     if !needs_loader && !needs_spec {
         return Ok(());
     }
@@ -1530,13 +1560,27 @@ fn evict_failed_module(name: &str, module: *mut PyObject) {
     crate::abi::bump_namespace_version();
 }
 
+/// Synthetic `types.ModuleType(...)` instance for `name_id` (its unique
+/// registry key), or `None`.  Locked lookup only — the SYNTHETIC_MODULES
+/// mutex must never be taken while `IMPORT_STATE` is held.
+fn synthetic_module_object(name_id: u32) -> Option<*mut PyObject> {
+    let synthetic = SYNTHETIC_MODULES.lock().unwrap_or_else(|poison| poison.into_inner());
+    synthetic.get(&name_id).copied().map(|address| address as *mut PyObject)
+}
+
 pub fn begin_module_execution(name: &str) -> Result<(), String> {
     let name_id = intern(name);
     // Captured before taking the import lock: the depth belongs to the
     // executing thread's compiled-call stack.
     let floor = crate::abi::current_function_stack_depth();
+    // Synthetic modules execute too: `exec(code, mod.__dict__)` on a
+    // `types.ModuleType(...)` instance (importlib.util's
+    // `spec.loader.exec_module`) switches the active-module context to the
+    // synthetic instance so its global stores land on that object.
+    // Resolved BEFORE the import lock per the lock-order contract.
+    let synthetic = synthetic_module_object(name_id);
     let mut state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
-    let Some(&module_object) = state.modules.get(&name_id) else {
+    let Some(module_object) = state.modules.get(&name_id).copied().or(synthetic) else {
         return Err(format!("cannot execute uncached module '{name}'"));
     };
     state.current_modules.push(name_id);
@@ -1697,12 +1741,22 @@ pub fn active_module_attr(name: u32) -> Option<*mut PyObject> {
 }
 
 /// Live attribute binding of one cached module, by interned module name.
+/// Synthetic `types.ModuleType(...)` instances resolve by their unique
+/// registry key (dynexec executes into their namespace dicts).
 pub fn module_attr(module_name: u32, name: u32) -> Option<*mut PyObject> {
-    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
-    let module = state.modules.get(&module_name).copied()?;
-    let module = module_from_object_locked(&state, module)?;
-    // SAFETY: The import state proved the object uses `PyModuleObject` layout.
-    unsafe { (&*module).attrs.get(&name).copied() }
+    {
+        let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(module) = state.modules.get(&module_name).copied() {
+            let module = module_from_object_locked(&state, module)?;
+            // SAFETY: The import state proved the `PyModuleObject` layout.
+            return unsafe { (&*module).attrs.get(&name).copied() };
+        }
+    }
+    let object = synthetic_module_object(module_name)?;
+    // SAFETY: Synthetic-table entries use the `PyModuleObject` layout
+    // (`module_tp_new`); reads happen outside any lock like
+    // `module_attrs_snapshot`.
+    unsafe { (&*object.cast::<PyModuleObject>()).attrs.get(&name).copied() }
 }
 
 /// Registry key backing a module object's live namespace dictionary.
@@ -1741,16 +1795,28 @@ pub fn store_active_module_attr(name: u32, value: *mut PyObject) -> bool {
 
 /// Store one attribute binding into a cached module, by interned module name.
 pub fn store_module_attr(module_name: u32, name: u32, value: *mut PyObject) -> bool {
-    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
-    let Some(module) = state.modules.get(&module_name).copied() else {
+    {
+        let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Some(module) = state.modules.get(&module_name).copied() {
+            let Some(module) = module_from_object_locked(&state, module) else {
+                return false;
+            };
+            // SAFETY: The import state proved the `PyModuleObject` layout.
+            unsafe {
+                (&mut *module).attrs.insert(name, value);
+            }
+            // J0.3 GlobalIC site: module attr overlay insert/replace.
+            crate::abi::bump_namespace_version();
+            return true;
+        }
+    }
+    let Some(object) = synthetic_module_object(module_name) else {
         return false;
     };
-    let Some(module) = module_from_object_locked(&state, module) else {
-        return false;
-    };
-    // SAFETY: The import state proved the object uses `PyModuleObject` layout.
+    // SAFETY: Synthetic-table entries use the `PyModuleObject` layout;
+    // writes happen outside any lock like `module_attrs_snapshot` reads.
     unsafe {
-        (&mut *module).attrs.insert(name, value);
+        (&mut *object.cast::<PyModuleObject>()).attrs.insert(name, value);
     }
     // J0.3 GlobalIC site: module attr overlay insert/replace.
     crate::abi::bump_namespace_version();
@@ -1781,15 +1847,23 @@ pub fn delete_active_module_attr(name: u32) -> bool {
 
 /// Delete one attribute binding from a cached module, by interned module name.
 pub fn delete_module_attr(module_name: u32, name: u32) -> bool {
-    let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
-    let Some(module) = state.modules.get(&module_name).copied() else {
-        return false;
+    let removed = 'removed: {
+        {
+            let state = IMPORT_STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+            if let Some(module) = state.modules.get(&module_name).copied() {
+                let Some(module) = module_from_object_locked(&state, module) else {
+                    return false;
+                };
+                // SAFETY: The import state proved the `PyModuleObject` layout.
+                break 'removed unsafe { (&mut *module).attrs.remove(&name).is_some() };
+            }
+        }
+        let Some(object) = synthetic_module_object(module_name) else {
+            return false;
+        };
+        // SAFETY: Synthetic-table entries use the `PyModuleObject` layout.
+        unsafe { (&mut *object.cast::<PyModuleObject>()).attrs.remove(&name).is_some() }
     };
-    let Some(module) = module_from_object_locked(&state, module) else {
-        return false;
-    };
-    // SAFETY: The import state proved the object uses `PyModuleObject` layout.
-    let removed = unsafe { (&mut *module).attrs.remove(&name).is_some() };
     if removed {
         // J0.3 GlobalIC site: module attr overlay removal.
         crate::abi::bump_namespace_version();

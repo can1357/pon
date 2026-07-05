@@ -120,7 +120,12 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
         // vars (`_CONFIG_VARS['platlibdir'] = sys.platlibdir`).
         string_attr("platlibdir", "lib"),
         int_attr("api_version", 1013),
-        bool_attr("dont_write_bytecode", false),
+        // Pinned TRUE: pon has no marshaled code-object format, so
+        // importlib's bytecode-cache write path (`SourceLoader.get_code` →
+        // `marshal.dumps`) must never run.  The CT driver exports
+        // PYTHONDONTWRITEBYTECODE=1 to both engines, so the oracle agrees
+        // in conformance runs.
+        bool_attr("dont_write_bytecode", true),
         none_attr("pycache_prefix"),
         empty_dict_attr("_xoptions"),
         flags_attr(),
@@ -339,14 +344,10 @@ unsafe extern "C" fn flags_getattro(object: *mut PyObject, name: *mut PyObject) 
         // The int->str conversion guard default, matching the host oracle;
         // pon does not enforce the limit (see the int_info section note).
         "int_max_str_digits" => unsafe { pon_const_int(4300) },
-        // Env-derived flags: the CT driver exports PYTHONDONTWRITEBYTECODE=1
-        // and PYTHONHASHSEED=0 to BOTH engines, so oracle parity requires
-        // reading the live environment rather than pinning either value.
-        "dont_write_bytecode" => {
-            let set = std::env::var("PYTHONDONTWRITEBYTECODE").is_ok_and(|value| !value.is_empty());
-            // SAFETY: Integer boxing helper follows the NULL-sentinel contract.
-            unsafe { pon_const_int(i64::from(set)) }
-        }
+        // Pinned like the module attribute above: pon can never write
+        // bytecode (no marshal format), and the CT driver exports
+        // PYTHONDONTWRITEBYTECODE=1 to both engines for oracle parity.
+        "dont_write_bytecode" => unsafe { pon_const_int(1) },
         // CPython: randomization is OFF exactly when PYTHONHASHSEED names
         // the fixed seed 0 (`use_hash_seed && hash_seed == 0`); any other
         // state — unset, empty, "random", a nonzero seed — reports 1.
@@ -1293,6 +1294,18 @@ fn simple_namespace_type() -> Result<*mut PyType, String> {
     TYPE.clone().map(|object| object as *mut PyType)
 }
 
+/// Allocates a `types.SimpleNamespace` instance carrying `attrs`.  Serves
+/// native callers needing a small attribute bag for stdlib protocols —
+/// `_pon_source_importer.get_resource_reader` builds the stand-in loader
+/// `importlib.readers.FileReader` reads `.path` from.
+pub(crate) fn simple_namespace_with_attrs(attrs: &[(&str, *mut PyObject)]) -> Result<*mut PyObject, String> {
+    let object = empty_simple_namespace_instance(simple_namespace_type()?)?;
+    for (name, value) in attrs {
+        simple_namespace_store_attr(object, name, *value)?;
+    }
+    Ok(object)
+}
+
 fn empty_simple_namespace_instance(ty: *mut PyType) -> Result<*mut PyObject, String> {
     let object = unsafe { crate::types::type_::type_new(ty, std::ptr::null_mut(), std::ptr::null_mut()) };
     if object.is_null() {
@@ -1700,6 +1713,12 @@ const DEFAULT_RECURSION_LIMIT: usize = 1000;
 /// observe a value some `setrecursionlimit` call stored, and the value
 /// carries no happens-before payload.
 static RECURSION_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_RECURSION_LIMIT);
+
+/// The live recursion limit for the compiled-call guard
+/// (`crate::abi::guard_recursion_limit`).
+pub(crate) fn recursion_limit() -> usize {
+    RECURSION_LIMIT.load(Ordering::Relaxed)
+}
 
 /// `sys.getrecursionlimit()`: the stored limit (default 1000).
 unsafe extern "C" fn sys_getrecursionlimit(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {

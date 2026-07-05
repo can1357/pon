@@ -621,6 +621,44 @@ unsafe extern "C" fn source_exec_module_entry(_argv: *mut *mut PyObject, _argc: 
     none()
 }
 
+/// `get_resource_reader(fullname)`: an `importlib.readers.FileReader` rooted
+/// at the module's source file (CPython `FileLoader.get_resource_reader`), so
+/// `importlib.resources.files()` traverses the real package directory.  None
+/// when nothing on disk backs the module (native, extension, embedded AoT,
+/// namespace portions) — `importlib.resources` then falls back to its
+/// compatibility adapter, exactly as for a loader without a reader.
+unsafe extern "C" fn source_get_resource_reader_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+    let name = match unsafe { single_name_argument(argv, argc, "get_resource_reader") } {
+        Ok(name) => name,
+        Err(error) => return error,
+    };
+    let Some(path) = crate::import::source_module_file_path(&name) else {
+        return none();
+    };
+    let path_object = str_object(&path.to_string_lossy());
+    if path_object.is_null() {
+        return ptr::null_mut();
+    }
+    // `FileReader.__init__` reads exactly `loader.path`; a SimpleNamespace
+    // carries it without inventing a per-module loader type.
+    let stand_in = match super::sys::simple_namespace_with_attrs(&[("path", path_object)]) {
+        Ok(object) => object,
+        Err(message) => return crate::abi::return_null_with_error(message),
+    };
+    let readers = crate::import::import_named_module_raw("importlib.readers");
+    if readers.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: Attribute read on a live module; NULL propagates.
+    let file_reader = unsafe { abi::object::pon_get_attr(readers, intern("FileReader"), ptr::null_mut()) };
+    if file_reader.is_null() {
+        return ptr::null_mut();
+    }
+    let mut call_args = [stand_in];
+    // SAFETY: `file_reader` is a live class; argv holds one live slot.
+    untag(unsafe { abi::pon_call(untag(file_reader), call_args.as_mut_ptr(), call_args.len()) })
+}
+
 /// Builds and registers the `_pon_source_importer` module: pon's stand-in for
 /// CPython's `PathFinder` meta-path slot (`crate::import`'s
 /// `seed_meta_path_finders` appends it third).  The module object doubles as
@@ -633,10 +671,11 @@ pub(crate) fn make_source_importer_module() -> Result<*mut PyObject, String> {
         return Ok(existing);
     }
     let mut attrs = Vec::new();
-    let functions: [(&str, BuiltinFn); 4] = [
+    let functions: [(&str, BuiltinFn); 5] = [
         ("create_module", source_create_module_entry),
         ("exec_module", source_exec_module_entry),
         ("find_spec", source_find_spec_entry),
+        ("get_resource_reader", source_get_resource_reader_entry),
         ("is_package", source_is_package_entry),
     ];
     for (function_name, entry) in functions {

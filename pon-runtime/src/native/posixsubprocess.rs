@@ -18,10 +18,12 @@ use crate::types::exc::ExceptionKind;
 
 use super::install_module;
 
+/// Darwin's `POSIX_SPAWN_SETSID` attribute flag (spawn.h); the libc crate
+/// only exports it for non-apple targets.
 #[cfg(target_vendor = "apple")]
-const POSIX_SPAWN_SETSID_FLAG: libc::c_int = 0x0400;
+pub(super) const POSIX_SPAWN_SETSID_FLAG: libc::c_int = 0x0400;
 #[cfg(not(target_vendor = "apple"))]
-const POSIX_SPAWN_SETSID_FLAG: libc::c_int = libc::POSIX_SPAWN_SETSID as libc::c_int;
+pub(super) const POSIX_SPAWN_SETSID_FLAG: libc::c_int = libc::POSIX_SPAWN_SETSID as libc::c_int;
 
 const DUMMY_ERROR_PID: libc::pid_t = i32::MAX as libc::pid_t;
 
@@ -62,12 +64,14 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
     )
 }
 
-struct FileActions {
+/// RAII `posix_spawn_file_actions_t` (init/destroy paired); shared by
+/// `_posixsubprocess.fork_exec` and `os.posix_spawn`.
+pub(super) struct FileActions {
     inner: libc::posix_spawn_file_actions_t,
 }
 
 impl FileActions {
-    fn new() -> Result<Self, libc::c_int> {
+    pub(super) fn new() -> Result<Self, libc::c_int> {
         let mut inner = MaybeUninit::<libc::posix_spawn_file_actions_t>::uninit();
         // SAFETY: `inner` is an out-slot for the libc initializer.
         let rc = unsafe { libc::posix_spawn_file_actions_init(inner.as_mut_ptr()) };
@@ -78,11 +82,11 @@ impl FileActions {
         Ok(Self { inner: unsafe { inner.assume_init() } })
     }
 
-    fn as_ptr(&self) -> *const libc::posix_spawn_file_actions_t {
+    pub(super) fn as_ptr(&self) -> *const libc::posix_spawn_file_actions_t {
         &self.inner
     }
 
-    fn as_mut_ptr(&mut self) -> *mut libc::posix_spawn_file_actions_t {
+    pub(super) fn as_mut_ptr(&mut self) -> *mut libc::posix_spawn_file_actions_t {
         &mut self.inner
     }
 }
@@ -94,12 +98,14 @@ impl Drop for FileActions {
     }
 }
 
-struct SpawnAttr {
+/// RAII `posix_spawnattr_t` (init/destroy paired); shared by
+/// `_posixsubprocess.fork_exec` and `os.posix_spawn`.
+pub(super) struct SpawnAttr {
     inner: libc::posix_spawnattr_t,
 }
 
 impl SpawnAttr {
-    fn new() -> Result<Self, libc::c_int> {
+    pub(super) fn new() -> Result<Self, libc::c_int> {
         let mut inner = MaybeUninit::<libc::posix_spawnattr_t>::uninit();
         // SAFETY: `inner` is an out-slot for the libc initializer.
         let rc = unsafe { libc::posix_spawnattr_init(inner.as_mut_ptr()) };
@@ -110,11 +116,11 @@ impl SpawnAttr {
         Ok(Self { inner: unsafe { inner.assume_init() } })
     }
 
-    fn as_ptr(&self) -> *const libc::posix_spawnattr_t {
+    pub(super) fn as_ptr(&self) -> *const libc::posix_spawnattr_t {
         &self.inner
     }
 
-    fn as_mut_ptr(&mut self) -> *mut libc::posix_spawnattr_t {
+    pub(super) fn as_mut_ptr(&mut self) -> *mut libc::posix_spawnattr_t {
         &mut self.inner
     }
 }
@@ -331,18 +337,27 @@ fn spawn_child(spec: &ForkExecSpec) -> Result<libc::pid_t, SpawnError> {
             context: "posix_spawn_file_actions_addclose",
         })?;
     }
-    for (source, target) in [(spec.p2cread, 0), (spec.c2pwrite, 1), (spec.errwrite, 2)] {
+    let dup_pairs = [(spec.p2cread, 0), (spec.c2pwrite, 1), (spec.errwrite, 2)];
+    for (source, target) in dup_pairs {
         if source != -1 {
             add_dup2(&mut actions, source, target).map_err(|errno| SpawnError::Setup {
                 errno,
                 context: "posix_spawn_file_actions_adddup2",
             })?;
-            if source != target && source > 2 && !spec.fds_to_keep.contains(&source) {
-                add_close(&mut actions, source).map_err(|errno| SpawnError::Setup {
-                    errno,
-                    context: "posix_spawn_file_actions_addclose",
-                })?;
-            }
+        }
+    }
+    // Close each distinct redirected source only after EVERY dup2 consumed
+    // it: `stderr=subprocess.STDOUT` hands the same pipe fd to slots 1 and 2
+    // (meson probes `cc -print-search-dirs` this way), and an interleaved
+    // close would make the second dup2 fail with EBADF.
+    let mut closed_sources: [libc::c_int; 3] = [-1; 3];
+    for (index, (source, target)) in dup_pairs.into_iter().enumerate() {
+        if source != -1 && source != target && source > 2 && !spec.fds_to_keep.contains(&source) && !closed_sources.contains(&source) {
+            add_close(&mut actions, source).map_err(|errno| SpawnError::Setup {
+                errno,
+                context: "posix_spawn_file_actions_addclose",
+            })?;
+            closed_sources[index] = source;
         }
     }
     add_close(&mut actions, spec.errpipe_write).map_err(|errno| SpawnError::Setup {
@@ -578,14 +593,22 @@ fn object_to_bytes(object: *mut PyObject, _what: &str) -> Result<Vec<u8>, *mut P
         // SAFETY: Type check proved the PyBytes layout.
         return Ok(unsafe { (*raw.cast::<crate::types::bytes_::PyBytes>()).as_slice() }.to_vec());
     }
+    // Payload subclasses (str/bytes subclass instances) unwrap to their
+    // builtin payload and re-enter the extraction above.
+    if let Some(payload) = unsafe { crate::types::type_::payload_subclass_value(raw) } {
+        if payload != raw {
+            return object_to_bytes(payload, _what);
+        }
+    }
     Err(path_result_type_error(object, raw))
 }
 
 fn fspath_coerce(object: *mut PyObject) -> Result<*mut PyObject, *mut PyObject> {
     let raw = crate::tag::untag_arg(object);
     if !raw.is_null() && !crate::tag::is_small_int(raw) {
-        // SAFETY: Heap pointer with a live header after the tag checks.
-        if matches!(unsafe { crate::types::dict::type_name(raw) }, Some("str" | "bytes")) {
+        // str/bytes pass through, SUBCLASS instances included (meson feeds
+        // OptionString compiler arguments straight into argv lists).
+        if super::os::type_derives_str_or_bytes(raw) {
             return Ok(object);
         }
         // SAFETY: Heap pointer with a live header after the tag checks.
@@ -759,13 +782,13 @@ fn last_errno() -> libc::c_int {
 }
 
 #[cfg(target_vendor = "apple")]
-fn inherited_envp() -> *const *mut libc::c_char {
+pub(super) fn inherited_envp() -> *const *mut libc::c_char {
     // SAFETY: `_NSGetEnviron` returns the process global `environ` slot.
     unsafe { *libc::_NSGetEnviron() }.cast_const()
 }
 
 #[cfg(not(target_vendor = "apple"))]
-fn inherited_envp() -> *const *mut libc::c_char {
+pub(super) fn inherited_envp() -> *const *mut libc::c_char {
     unsafe extern "C" {
         static mut environ: *mut *mut libc::c_char;
     }
