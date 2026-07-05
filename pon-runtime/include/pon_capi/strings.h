@@ -38,6 +38,11 @@ typedef struct PyPonCapiStrings {
     PyObject *(*unicode_from_utf8)(const char *, Py_ssize_t);
     PyObject *(*object_str)(PyObject *);
     PyObject *(*object_repr)(PyObject *);
+    int (*unicode_kind)(PyObject *);
+    const void *(*unicode_data)(PyObject *);
+    Py_UCS4 (*unicode_read_char)(PyObject *, Py_ssize_t);
+    int (*unicode_is_ascii)(PyObject *);
+    PyObject *(*unicode_as_latin1_string)(PyObject *);
     /* Family expansion point: append fields only; never reorder. */
 } PyPonCapiStrings;
 

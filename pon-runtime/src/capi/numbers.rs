@@ -141,8 +141,9 @@ unsafe extern "C" fn capi_long_from_double(value: c_double) -> *mut PyObject {
 }
 
 unsafe extern "C" fn capi_long_as_long_long(object: *mut PyObject) -> c_longlong {
-    let Some(value) = (unsafe { required_integer(object, "an integer is required") }) else {
-        return -1;
+    let value = match unsafe { coerce_index_bigint(object) } {
+        Ok(value) => value,
+        Err(()) => return -1,
     };
     match bigint_to_c_longlong(&value) {
         Some(value) => value,
@@ -195,8 +196,9 @@ unsafe extern "C" fn capi_long_as_unsigned_long_mask(object: *mut PyObject) -> c
 }
 
 unsafe extern "C" fn capi_long_as_ssize_t(object: *mut PyObject) -> isize {
-    let Some(value) = (unsafe { required_integer(object, "an integer is required") }) else {
-        return -1;
+    let value = match unsafe { coerce_index_bigint(object) } {
+        Ok(value) => value,
+        Err(()) => return -1,
     };
     match value.to_isize() {
         Some(value) => value,
@@ -243,8 +245,9 @@ unsafe extern "C" fn capi_long_as_long_and_overflow(object: *mut PyObject, overf
             *overflow = 0;
         }
     }
-    let Some(value) = (unsafe { required_integer(object, "'object' cannot be interpreted as an integer") }) else {
-        return -1;
+    let value = match unsafe { coerce_index_bigint(object) } {
+        Ok(value) => value,
+        Err(()) => return -1,
     };
     if let Some(value) = bigint_to_c_long(&value) {
         return value;
