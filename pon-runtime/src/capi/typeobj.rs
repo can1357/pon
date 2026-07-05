@@ -1172,6 +1172,13 @@ unsafe extern "C" fn trace_capi_instance(object: *mut u8, visitor: &mut dyn FnMu
             }
         }
     }
+    let dict = crate::descr::registered_capi_instance_dict(object.cast::<PyObject>());
+    if !dict.is_null() {
+        visit_capi_reference(dict, visitor);
+    } else if let Some(dict_slot) = unsafe { capi_instance_dict_slot(object, native) } {
+        let dict = unsafe { dict_slot.read() };
+        visit_capi_reference(dict, visitor);
+    }
 
 
     // SAFETY: `native` is the runtime type object paired with `foreign`.
@@ -1231,6 +1238,7 @@ unsafe extern "C" fn capi_object_free(ptr: *mut c_void) {
     if ptr.is_null() || is_capi_instance(ptr) {
         return;
     }
+    unsafe { crate::descr::forget_capi_instance_dict(ptr.cast::<PyObject>()) };
     // SAFETY: non-instance pointers passed here were PyObject_Malloc'd.
     unsafe { libc::free(ptr) };
 }
