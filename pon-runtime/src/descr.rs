@@ -674,6 +674,14 @@ pub unsafe fn generic_get_attr_cached(object: *mut PyObject, name_id: u32, cell:
     if is_type && name_id == intern::intern("__bases__") {
         return unsafe { type_bases_tuple(object.cast::<PyType>()) };
     }
+    if is_type && name_id == intern::intern("__base__") {
+        // CPython `type.__base__`: the solid base (`tp_base`), None for object.
+        let base = unsafe { (*object.cast::<PyType>()).tp_base };
+        if base.is_null() {
+            return unsafe { abi::pon_none() };
+        }
+        return base.cast::<PyObject>();
+    }
     if is_type && name_id == intern::intern("__subclasses__") {
         return unsafe { type_subclasses_method(object) };
     }

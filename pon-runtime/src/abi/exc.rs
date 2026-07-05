@@ -233,7 +233,23 @@ pub(super) fn alloc_exception_object(
             PyBaseException::new(ty.cast_const(), message, cause, context, ptr::null_mut()),
         );
     }
-    Ok(as_object_ptr(object))
+    let exception = as_object_ptr(object);
+    unsafe {
+        // `runtime` is already borrowed here — `pon_none()` would re-enter
+        // `with_runtime` and deadlock; read the singleton directly.
+        let arg_or_none = if message.is_null() { as_object_ptr(runtime.none) } else { message };
+        // CPython `SystemExit.__init__` mirrors the single argument (or None)
+        // into `.code`; meson/pip-style installers read `e.code`.
+        if is_exception_subclass(ty.cast_const(), runtime.exception_types.get(ExceptionKind::SystemExit).cast_const()) {
+            crate::types::exc::set_exception_instance_attr(exception, intern::intern("code"), arg_or_none);
+        }
+        // CPython `ImportError.__init__` mirrors the message into `.msg`
+        // (numpy's package __init__ reads `exc.msg` in its except handler).
+        if is_exception_subclass(ty.cast_const(), runtime.exception_types.get(ExceptionKind::ImportError).cast_const()) {
+            crate::types::exc::set_exception_instance_attr(exception, intern::intern("msg"), arg_or_none);
+        }
+    }
+    Ok(exception)
 }
 
 fn alloc_exception_group_object(
@@ -407,6 +423,59 @@ fn attach_innermost_traceback(runtime: &Runtime, exception: *mut PyObject) {
         );
     }
     *slot = entry.cast::<PyObject>();
+}
+
+/// Prepends one C-API supplied frame to the currently pending exception.
+///
+/// Cython's `__Pyx_AddTraceback` creates a synthetic `PyFrameObject`, writes
+/// `f_lineno`, then calls `PyTraceBack_Here`.  The frame is the same heap
+/// `PyFrame` object family used by pon's own traceback capture; this helper
+/// only allocates the `PyTraceback` link and stores it on the pending boxed
+/// exception.
+pub(crate) fn prepend_traceback_for_frame(frame: *mut PyFrame) -> Result<(), String> {
+    if frame.is_null() {
+        return Err("PyTraceBack_Here called with NULL frame".to_owned());
+    }
+    let Some(exception) = pending_exception_object() else {
+        return Err("PyTraceBack_Here called with no pending exception".to_owned());
+    };
+    super::with_runtime(|runtime| {
+        runtime.heap.register_type(
+            TYPE_ID_TRACEBACK,
+            GcTypeInfo {
+                size: size_of::<PyTraceback>(),
+                trace: trace_traceback,
+                finalize: None,
+            },
+        );
+        runtime.heap.register_type(
+            TYPE_ID_FRAME,
+            GcTypeInfo {
+                size: size_of::<PyFrame>(),
+                trace: trace_frame,
+                finalize: Some(finalize_frame),
+            },
+        );
+        let traceback_type = ensure_traceback_type(runtime._type_type);
+        // SAFETY: caller passed a non-NULL PyFrame allocated by the frame C-API.
+        let line = unsafe { (*frame).line };
+        // SAFETY: pending_exception_object returned a live boxed exception.
+        let slot = unsafe { &mut (*exception.cast::<PyBaseException>()).traceback };
+        let next = *slot;
+        let entry = runtime
+            .heap
+            .alloc(size_of::<PyTraceback>(), TYPE_ID_TRACEBACK)
+            .cast::<PyTraceback>();
+        // SAFETY: `entry` points to a freshly allocated zeroed block of the right size.
+        unsafe {
+            ptr::write(
+                entry,
+                PyTraceback::new(traceback_type.cast_const(), frame.cast::<PyObject>(), i64::from(line), next),
+            );
+        }
+        *slot = entry.cast::<PyObject>();
+    })
+    .ok_or_else(|| "runtime is not initialized".to_owned())
 }
 
 /// Installs `exception` as pending WITHOUT touching its traceback.
