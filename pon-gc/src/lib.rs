@@ -498,8 +498,7 @@ impl Heap {
 		);
 
 		let allocated_size = size.max(1);
-		let layout = Layout::from_size_align(allocated_size, DEFAULT_HEAP_ALIGNMENT)
-			.unwrap_or_else(|_| std::process::abort());
+		let layout = heap_layout(allocated_size);
 		state
 			.allocations
 			.try_reserve(1)
@@ -517,15 +516,13 @@ impl Heap {
 		let birth_epoch = state.epoch;
 		state.allocations.push(Allocation {
 			start,
-			requested_size: size,
 			allocated_size,
-			layout,
 			type_id,
 			finalized: false,
 			birth_epoch,
 		});
-		let mark_state = state.new_allocation_mark_state();
-		state.mark_states.push(mark_state);
+		let mark_color = state.new_allocation_mark_state();
+		state.mark_states.push(mark_color);
 		state.addr_index_dirty = true;
 		self
 			.bytes_since_collect
@@ -614,7 +611,7 @@ impl Heap {
 			if state
 				.mark_states
 				.get(index)
-				.is_some_and(|mark_state| mark_state.is_reached())
+				.is_some_and(|color| color.is_reached())
 			{
 				continue;
 			}
@@ -724,7 +721,7 @@ impl Drop for Heap {
 			// SAFETY: Every allocation record was created from `alloc_zeroed`
 			// with the same layout and has not yet been deallocated.
 			unsafe {
-				dealloc(allocation.start.as_ptr(), allocation.layout);
+				dealloc(allocation.start.as_ptr(), allocation.layout());
 			}
 		}
 	}
@@ -735,7 +732,7 @@ struct HeapState {
 	/// Dense type registry indexed by `TypeId.0`; see [`Heap::register_type`].
 	types:                   Vec<Option<GcTypeInfo>>,
 	allocations:             Vec<Allocation>,
-	mark_states:             Vec<MarkState>,
+	mark_states:             Vec<MarkColor>,
 	/// Allocation starts whose finalizers are executing in an outer
 	/// `collect` frame with the lock released; rooted by every mark phase.
 	pending_finalizer_roots: Vec<NonNull<u8>>,
@@ -756,13 +753,12 @@ struct HeapState {
 }
 
 impl HeapState {
-
-	fn new_allocation_mark_state(&self) -> MarkState {
+	fn new_allocation_mark_state(&self) -> MarkColor {
 		if write_barrier_state().allocation_black_active() {
-			return MarkState::black();
+			return MarkColor::Black;
 		}
 
-		MarkState::default()
+		MarkColor::White
 	}
 
 	/// Rebuilds the sorted address index after allocations changed.
@@ -815,25 +811,13 @@ impl HeapState {
 		Some(PointerClassification { index, representative: allocation.start.as_ptr() })
 	}
 
-	fn begin_object_scan(&mut self, index: usize) -> bool {
-		let Some(mark_state) = self.mark_states.get_mut(index) else {
-			return false;
-		};
-
-		if mark_state.color != MarkColor::Gray {
-			return false;
-		}
-
-		let _previous_scan = mark_state.last_scan.take();
-		true
+	fn begin_object_scan(&self, index: usize) -> bool {
+		self.mark_states.get(index) == Some(&MarkColor::Gray)
 	}
 
-	fn finish_object_scan(&mut self, index: usize, scan: SingleObjectScan) {
-		debug_assert!(!scan.representative.is_null());
-		let _scan_hit = scan.hit;
-		if let Some(mark_state) = self.mark_states.get_mut(index) {
-			mark_state.color = MarkColor::Black;
-			mark_state.last_scan = Some(scan);
+	fn finish_object_scan(&mut self, index: usize) {
+		if let Some(color) = self.mark_states.get_mut(index) {
+			*color = MarkColor::Black;
 		}
 	}
 
@@ -851,7 +835,7 @@ impl HeapState {
 		for (index, allocation) in old_allocations.into_iter().enumerate() {
 			let reached = old_mark_states
 				.get(index)
-				.is_some_and(|mark_state| mark_state.is_reached());
+				.is_some_and(|color| color.is_reached());
 			// Age gate: unreached blocks born in the CURRENT epoch survive
 			// one cycle — they may still be referenced from Rust helper
 			// buffers the conservative scan cannot see.
@@ -859,12 +843,12 @@ impl HeapState {
 				survivors.push(allocation);
 			} else {
 				unreachable
-					.push(UnreachableAllocation { start: allocation.start, layout: allocation.layout });
+					.push(UnreachableAllocation { start: allocation.start, layout: allocation.layout() });
 			}
 		}
 
 		self.allocations = survivors;
-		self.mark_states = vec![MarkState::default(); self.allocations.len()];
+		self.mark_states = vec![MarkColor::White; self.allocations.len()];
 		self.addr_index_dirty = true;
 		unreachable
 	}
@@ -872,9 +856,10 @@ impl HeapState {
 
 struct Allocation {
 	start:          NonNull<u8>,
-	requested_size: usize,
+	/// Allocated byte size: the requested size clamped to a 1-byte minimum.
+	/// Alignment is always [`DEFAULT_HEAP_ALIGNMENT`]; the deallocation
+	/// layout is reconstructed by [`Allocation::layout`].
 	allocated_size: usize,
-	layout:         Layout,
 	type_id:        TypeId,
 	/// The type's finalizer already ran for this allocation; it is freed
 	/// without a second callback once unreached again.
@@ -894,15 +879,22 @@ struct UnreachableAllocation {
 }
 
 impl Allocation {
-	fn classified_size(&self) -> usize {
-		self.requested_size.max(self.allocated_size)
+	fn layout(&self) -> Layout {
+		heap_layout(self.allocated_size)
 	}
 
 	fn contains_address(&self, address: usize) -> bool {
 		let start = self.start.as_ptr().addr();
-		let end = start.saturating_add(self.classified_size());
+		let end = start.saturating_add(self.allocated_size);
 		(start..end).contains(&address)
 	}
+}
+
+/// The single layout rule for every heap block: `size` bytes (already
+/// clamped to a 1-byte minimum by the caller) at [`DEFAULT_HEAP_ALIGNMENT`].
+/// Allocation and deallocation MUST both go through this helper.
+fn heap_layout(size: usize) -> Layout {
+	Layout::from_size_align(size, DEFAULT_HEAP_ALIGNMENT).unwrap_or_else(|_| std::process::abort())
 }
 
 #[repr(u8)]
@@ -923,6 +915,12 @@ impl MarkColor {
 			value if value == Self::Black as u8 => Self::Black,
 			_ => Self::White,
 		}
+	}
+
+	/// Whether this color counts as reached in the active mark cycle.
+	#[must_use]
+	pub const fn is_reached(self) -> bool {
+		matches!(self, Self::Gray | Self::Black)
 	}
 }
 
@@ -987,44 +985,6 @@ impl AtomicMarkState {
 impl Default for AtomicMarkState {
 	fn default() -> Self {
 		Self::white()
-	}
-}
-
-#[derive(Clone, Copy, Debug)]
-struct MarkState {
-	color:     MarkColor,
-	last_scan: Option<SingleObjectScan>,
-}
-
-impl Default for MarkState {
-	fn default() -> Self {
-		Self { color: MarkColor::White, last_scan: None }
-	}
-}
-
-impl MarkState {
-	fn is_reached(&self) -> bool {
-		matches!(self.color, MarkColor::Gray | MarkColor::Black)
-	}
-
-	fn black() -> Self {
-		Self { color: MarkColor::Black, last_scan: None }
-	}
-}
-
-#[derive(Clone, Copy, Debug)]
-struct SingleObjectScan {
-	representative: *mut u8,
-	hit:            bool,
-}
-
-impl SingleObjectScan {
-	fn new(representative: *mut u8) -> Self {
-		Self { representative, hit: false }
-	}
-
-	fn record_hit(&mut self) {
-		self.hit = true;
 	}
 }
 
@@ -1138,25 +1098,18 @@ fn drain_mark_queue(state: &mut HeapState, mark_queue: &mut MarkQueue) {
 		};
 		let start = allocation.start.as_ptr();
 		let type_id = allocation.type_id;
-		let Some(info) = state.type_info(type_id) else {
-			state.finish_object_scan(index, SingleObjectScan::new(start));
-			continue;
-		};
-
-		let mut scan = SingleObjectScan::new(start);
-		let mut visitor = |child| {
-			if mark_pointer(state, mark_queue, child) {
-				scan.record_hit();
+		if let Some(info) = state.type_info(type_id) {
+			let mut visitor = |child| {
+				mark_pointer(state, mark_queue, child);
+			};
+			// SAFETY: The allocation is owned by this heap and remains live
+			// for the whole mark phase.  The visitor only records additional
+			// candidate pointers in this collector's mark queue.
+			unsafe {
+				(info.trace)(start, &mut visitor);
 			}
-		};
-
-		// SAFETY: The allocation is owned by this heap and remains live for
-		// the whole mark phase.  The visitor only records additional
-		// candidate pointers in this collector's mark queue.
-		unsafe {
-			(info.trace)(start, &mut visitor);
 		}
-		state.finish_object_scan(index, scan);
+		state.finish_object_scan(index);
 	}
 }
 
@@ -1169,12 +1122,12 @@ fn mark_pointer(state: &mut HeapState, mark_queue: &mut MarkQueue, pointer: *mut
 	let PointerClassification { index, representative } = classification;
 	debug_assert!(!representative.is_null());
 
-	let Some(mark_state) = state.mark_states.get_mut(index) else {
+	let Some(color) = state.mark_states.get_mut(index) else {
 		return false;
 	};
 
-	if mark_state.color == MarkColor::White {
-		mark_state.color = MarkColor::Gray;
+	if *color == MarkColor::White {
+		*color = MarkColor::Gray;
 		mark_queue.push(index);
 	}
 
@@ -1292,7 +1245,7 @@ mod tests {
 	}
 
 	#[test]
-	fn single_object_scan_records_representative_and_child_hit() {
+	fn tracing_marks_children_and_blackens_scanned_object() {
 		let heap = Heap::new();
 		heap.register_type(TYPE_ID, GcTypeInfo {
 			size:     std::mem::size_of::<Node>(),
@@ -1317,24 +1270,19 @@ mod tests {
 
 		let start = state.allocations[first_index].start.as_ptr();
 		let info = state.type_info(TYPE_ID).unwrap();
-		let mut scan = SingleObjectScan::new(start);
 		let mut visitor = |child| {
-			if mark_pointer(&mut state, &mut mark_queue, child) {
-				scan.record_hit();
-			}
+			mark_pointer(&mut state, &mut mark_queue, child);
 		};
 
 		// SAFETY: `start` identifies the initialized first `Node` allocation.
 		unsafe {
 			(info.trace)(start, &mut visitor);
 		}
-		state.finish_object_scan(first_index, scan);
+		state.finish_object_scan(first_index);
 
-		let recorded = state.mark_states[first_index].last_scan.unwrap();
-		assert_eq!(recorded.representative, first);
-		assert!(recorded.hit);
-		assert_eq!(state.mark_states[first_index].color, MarkColor::Black);
-		assert_eq!(mark_queue.pop(), Some(1));
+		assert_eq!(state.mark_states[first_index], MarkColor::Black);
+		assert_eq!(mark_queue.pop(), Some(1), "traced child was shaded gray and queued");
+		assert_eq!(state.mark_states[1], MarkColor::Gray);
 	}
 
 	#[test]
@@ -1804,8 +1752,8 @@ mod tests {
 		let mut state = heap.lock_state();
 		state.prepare_address_index();
 		assert_eq!(state.classify_pointer(first).unwrap().index, 0);
-		assert_eq!(state.mark_states[0].color, MarkColor::White);
+		assert_eq!(state.mark_states[0], MarkColor::White);
 		assert_eq!(state.classify_pointer(second).unwrap().index, 1);
-		assert_eq!(state.mark_states[1].color, MarkColor::Black);
+		assert_eq!(state.mark_states[1], MarkColor::Black);
 	}
 }
