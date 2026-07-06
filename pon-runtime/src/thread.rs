@@ -1,12 +1,9 @@
-//! Thread attachment and free-threading registry support.
+//! Thread attachment and no-GIL registry support.
 //!
-//! The default runtime keeps the Phase-A single global thread state.  With the
-//! `free-threading` feature enabled, each attached OS thread receives its own
-//! leaked `PonThreadState` mutex so existing `thread_state_lock()` users keep
-//! the same guard-based API while GC-facing code can enumerate live thread
-//! handles.
+//! Each attached OS thread receives its own leaked `PonThreadState` mutex so
+//! existing `thread_state_lock()` users keep the same guard-based API while
+//! GC-facing code can enumerate live thread handles.
 
-#[cfg(feature = "free-threading")]
 use std::sync::atomic::Ordering;
 use std::{
 	panic::{AssertUnwindSafe, catch_unwind},
@@ -53,7 +50,7 @@ pub struct ThreadHandle {
 	pub in_gc_safe_region: u8,
 }
 
-/// Live-thread registry used by the free-threading runtime and future GC
+/// Live-thread registry used by the no-GIL runtime and future GC
 /// handshakes.
 ///
 /// `attach_current` registers the calling OS thread if it is not already
@@ -61,7 +58,6 @@ pub struct ThreadHandle {
 /// `for_each` locks each live thread state long enough to emit a
 /// [`ThreadHandle`] snapshot with stack-base/top-frame metadata.
 pub struct ThreadRegistry {
-	#[cfg_attr(not(feature = "free-threading"), allow(dead_code))]
 	next_id: AtomicU64,
 	threads: Mutex<Vec<ThreadRecord>>,
 }
@@ -122,17 +118,15 @@ pub fn thread_registry() -> &'static ThreadRegistry {
 	&THREAD_REGISTRY
 }
 
-#[cfg(feature = "free-threading")]
 thread_local! {
 	 static LOCAL_THREAD_STATE: std::cell::Cell<*const Mutex<PonThreadState>> = const { std::cell::Cell::new(ptr::null()) };
 }
 
-#[cfg(feature = "free-threading")]
+/// Returns the current OS thread's runtime state, attaching it lazily.
 pub(crate) fn current_thread_state_mutex() -> &'static Mutex<PonThreadState> {
 	thread_registry().attach_current()
 }
 
-#[cfg(feature = "free-threading")]
 fn attach_current_thread(registry: &'static ThreadRegistry) -> &'static Mutex<PonThreadState> {
 	if let Some(existing) = LOCAL_THREAD_STATE.with(|slot| {
 		let ptr = slot.get();
@@ -153,7 +147,6 @@ fn attach_current_thread(registry: &'static ThreadRegistry) -> &'static Mutex<Po
 	state
 }
 
-#[cfg(feature = "free-threading")]
 fn detach_current_thread(registry: &'static ThreadRegistry) -> Result<(), &'static str> {
 	let state_ptr = LOCAL_THREAD_STATE.with(|slot| {
 		let ptr = slot.get();
@@ -165,6 +158,7 @@ fn detach_current_thread(registry: &'static ThreadRegistry) -> Result<(), &'stat
 	if state_ptr.is_null() {
 		return Err("thread is not attached");
 	}
+	pon_gc::set_external_stack_base(ptr::null_mut());
 	let mut threads = lock_records(&registry.threads);
 	if let Some(index) = threads
 		.iter()
@@ -177,15 +171,6 @@ fn detach_current_thread(registry: &'static ThreadRegistry) -> Result<(), &'stat
 	}
 }
 
-#[cfg(not(feature = "free-threading"))]
-fn attach_current_thread(_registry: &'static ThreadRegistry) -> &'static Mutex<PonThreadState> {
-	crate::thread_state::thread_state()
-}
-
-#[cfg(not(feature = "free-threading"))]
-fn detach_current_thread(_registry: &'static ThreadRegistry) -> Result<(), &'static str> {
-	Ok(())
-}
 
 fn lock_records(records: &Mutex<Vec<ThreadRecord>>) -> MutexGuard<'_, Vec<ThreadRecord>> {
 	records.lock().unwrap_or_else(|poison| poison.into_inner())
@@ -206,6 +191,12 @@ fn os_thread_id_u64(id: os_thread::ThreadId) -> u64 {
 	hasher.finish()
 }
 
+/// Opaque numeric identifier for the current OS thread.
+#[must_use]
+pub fn current_os_thread_id() -> u64 {
+	os_thread_id_u64(os_thread::current().id())
+}
+
 fn thread_state_ptr(state: &'static Mutex<PonThreadState>) -> *mut PonThreadState {
 	let mut guard = lock_state(state);
 	(&mut *guard) as *mut PonThreadState
@@ -214,8 +205,7 @@ fn thread_state_ptr(state: &'static Mutex<PonThreadState>) -> *mut PonThreadStat
 /// Attaches the current OS thread to the runtime.
 ///
 /// Returns NULL and records a diagnostic on panic; otherwise returns a stable
-/// pointer to the thread's state.  In the default non-free-threaded build this
-/// is the process-global state.
+/// pointer to the calling thread's state.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_thread_attach() -> *mut PonThreadState {
 	match catch_unwind(AssertUnwindSafe(|| thread_state_ptr(thread_registry().attach_current()))) {
@@ -256,20 +246,15 @@ pub unsafe extern "C" fn pon_thread_start_new(entry: *const u8, arg: *mut PyObje
 			pon_err_set("thread entry pointer is null");
 			return -1;
 		}
-		#[cfg(not(feature = "free-threading"))]
-		{
-			let _ = arg;
-			pon_err_set("pon_thread_start_new requires free-threading");
-			-1
-		}
-		#[cfg(feature = "free-threading")]
 		{
 			let entry_addr = entry as usize;
 			let arg_addr = arg as usize;
 			match os_thread::Builder::new()
 				.name("pon-runtime".to_string())
 				.spawn(move || {
+					let mut stack_base_marker = 0usize;
 					let _state = thread_registry().attach_current();
+					crate::aot_entry::capture_stack_base(ptr::addr_of_mut!(stack_base_marker).cast::<u8>());
 					let _ = catch_unwind(AssertUnwindSafe(|| {
 						// SAFETY: The ABI caller supplied a function with PonThreadEntry shape.
 						let entry: PonThreadEntry = unsafe { std::mem::transmute(entry_addr) };
@@ -335,7 +320,7 @@ pub unsafe extern "C" fn pon_gc_safe_region_leave() -> i32 {
 	}
 }
 
-#[cfg(all(test, feature = "free-threading"))]
+#[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::thread_state::{pon_err_clear, pon_err_message, test_state_lock, thread_state_lock};

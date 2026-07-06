@@ -540,6 +540,17 @@ fn new_frame_back(frame: *mut PyObject) -> *mut PyObject {
 	}
 }
 
+/// C-API `PyFrame_GetBack`: returns a new synthesized caller frame, or NULL
+/// with no exception when this frame has no recorded caller.
+pub(crate) fn frame_get_back_for_capi(frame: *mut PyObject) -> *mut PyObject {
+	let back: Option<Box<[FrameLink]>> = FRAME_RECORDS.lock().ok().and_then(|table| {
+		table
+			.get(&(frame as usize))
+			.and_then(|chain| (chain.len() > 1).then(|| chain[1..].into()))
+	});
+	back.map_or(ptr::null_mut(), synthesize_frame_object)
+}
+
 /// Serves frame introspection (`f_locals`, `f_globals`, `f_code`, `f_back`,
 /// `f_lineno`) on frame objects (both `PyFrame` and resumable `GenFrame`
 /// allocations share the runtime `frame` type, so this slot must never read
@@ -621,6 +632,13 @@ fn new_code_object(link: Option<FrameLink>) -> *mut PyObject {
 		}))
 		.cast::<PyObject>(),
 	}
+}
+
+/// C-API `PyFrame_GetCode`: returns a new reference-worthy synthetic code
+/// object for the supplied frame.  Frames without a recorded chain still get
+/// the process-shared placeholder code object, matching `frame.f_code`.
+pub(crate) fn frame_get_code_for_capi(frame: *mut PyObject) -> *mut PyObject {
+	new_code_object(frame_link(frame))
 }
 
 unsafe extern "C" fn code_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {

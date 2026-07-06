@@ -1,4 +1,4 @@
-//!Standalone stop-the-world heap for Phase-A runtime objects.
+//! Stop-the-world heap for runtime objects.
 #![allow(improper_ctypes_definitions)]
 
 pub mod handshake;
@@ -15,7 +15,7 @@ use std::{
 
 pub use handshake::{
 	GcHandshake, GcPhase, ack_global_stop, clear_global_stop_request, gc_stop_requested,
-	global_handshake, request_global_stop, resume_global_stop,
+	global_handshake, request_global_stop, resume_global_stop, wait_for_global_resume,
 };
 
 /// Default byte alignment used for every heap allocation.
@@ -45,18 +45,38 @@ enum RootProvenance {
 	StackSlot { slot: usize },
 }
 
-/// Conservative stack boundary plus the thread that captured it.
-///
-/// The boundary is an address inside the capturing thread's native stack, so a
-/// scan range derived from it is only meaningful on that same thread.  Reads
-/// from any other thread see NULL, which disables conservative scanning there.
-struct ExternalStackBase {
-	base:  usize,
-	owner: Option<std::thread::ThreadId>,
+thread_local! {
+	/// Conservative stack boundary captured for this OS thread.
+	static EXTERNAL_STACK_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-static EXTERNAL_STACK_BASE: Mutex<ExternalStackBase> =
-	Mutex::new(ExternalStackBase { base: 0, owner: None });
+thread_local! {
+	/// Non-zero while this thread is running the collector.
+	static COLLECTOR_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Guard marking the current thread as the active collector.
+#[must_use]
+pub struct CollectorThreadGuard;
+
+impl Drop for CollectorThreadGuard {
+	fn drop(&mut self) {
+		COLLECTOR_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+	}
+}
+
+/// Marks this thread as running collection work.
+pub fn enter_collector_thread() -> CollectorThreadGuard {
+	COLLECTOR_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+	CollectorThreadGuard
+}
+
+/// Returns true while this thread is executing collector/finalizer work under a
+/// process-wide stop request.
+#[must_use]
+pub fn current_thread_is_collecting() -> bool {
+	COLLECTOR_DEPTH.with(|depth| depth.get() != 0)
+}
 
 /// Precise stack-root enumerator installed by runtimes with stack maps.
 ///
@@ -74,33 +94,16 @@ static PRECISE_STACK_ROOTS: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
 /// conservative stack scanning, preserving the existing explicit-root-only
 /// path.
 ///
-/// The boundary is owned by the calling thread: only that thread observes it
-/// through [`external_stack_base`], because a range between the current stack
-/// pointer and another thread's stack is not a scannable interval.
+/// The boundary is thread-local: each attached mutator publishes the outer
+/// stack frame that encloses its generated-code execution.
 pub fn set_external_stack_base(base: *mut u8) {
-	let mut slot = EXTERNAL_STACK_BASE
-		.lock()
-		.unwrap_or_else(std::sync::PoisonError::into_inner);
-	slot.base = base as usize;
-	slot.owner = if base.is_null() {
-		None
-	} else {
-		Some(std::thread::current().id())
-	};
+	EXTERNAL_STACK_BASE.with(|slot| slot.set(base as usize));
 }
 
 /// Returns the conservative stack boundary captured by the current thread.
-///
-/// Threads other than the one that supplied the boundary observe NULL.
 #[must_use]
 pub fn external_stack_base() -> *mut u8 {
-	let slot = EXTERNAL_STACK_BASE
-		.lock()
-		.unwrap_or_else(std::sync::PoisonError::into_inner);
-	match slot.owner {
-		Some(owner) if owner == std::thread::current().id() => slot.base as *mut u8,
-		_ => ptr::null_mut(),
-	}
+	EXTERNAL_STACK_BASE.with(|slot| slot.get() as *mut u8)
 }
 
 /// C ABI hook for runtimes that cannot call the Rust wrapper directly.
@@ -233,10 +236,9 @@ pub trait RootSource {
 
 /// Public write-barrier hook used by generated stores into managed objects.
 ///
-/// The barrier is inert for the default stop-the-world collector.  In
-/// free-threaded builds it remains inert until concurrent marking is explicitly
-/// enabled; while enabled it records the changed slot and shades the newly
-/// stored pointer as a candidate for the concurrent marker.
+/// The barrier is inert until concurrent marking is explicitly enabled; while
+/// enabled it records the changed slot and shades the newly stored pointer as a
+/// candidate for the concurrent marker.
 pub struct WriteBarrier;
 
 impl WriteBarrier {
@@ -246,46 +248,33 @@ impl WriteBarrier {
 			return;
 		}
 
-		#[cfg(feature = "free-threading")]
-		{
-			write_barrier_state().record(slot, new);
-		}
-
-		#[cfg(not(feature = "free-threading"))]
-		{
-			let _ = (slot, new);
-		}
+		write_barrier_state().record(slot, new);
 	}
 
 	/// Enables write recording and allocation-black behavior for a concurrent
 	/// mark cycle.
-	#[cfg(feature = "free-threading")]
 	pub fn begin_concurrent_marking() {
 		write_barrier_state().begin_concurrent_marking();
 	}
 
 	/// Disables concurrent write recording.
-	#[cfg(feature = "free-threading")]
 	pub fn end_concurrent_marking() {
 		write_barrier_state().end_concurrent_marking();
 	}
 
 	/// Drains recorded slot updates.
-	#[cfg(feature = "free-threading")]
 	#[must_use]
 	pub fn drain_records() -> Vec<WriteBarrierRecord> {
 		write_barrier_state().drain_records()
 	}
 
 	/// Drains pointers shaded by the barrier.
-	#[cfg(feature = "free-threading")]
 	#[must_use]
 	pub fn drain_shaded() -> Vec<*mut u8> {
 		write_barrier_state().drain_shaded()
 	}
 
 	/// Returns whether allocation-black is currently active.
-	#[cfg(feature = "free-threading")]
 	#[must_use]
 	pub fn allocation_black_active() -> bool {
 		write_barrier_state().allocation_black_active()
@@ -301,7 +290,7 @@ pub extern "C" fn pon_gc_write_barrier(slot: *mut *mut u8, new: *mut u8) {
 	WriteBarrier::record(slot, new);
 }
 
-/// A raw slot update captured by the free-threaded write barrier.
+/// A raw slot update captured by the no-GIL write barrier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WriteBarrierRecord {
 	slot: usize,
@@ -309,7 +298,6 @@ pub struct WriteBarrierRecord {
 }
 
 impl WriteBarrierRecord {
-	#[cfg(feature = "free-threading")]
 	fn new(slot: *mut *mut u8, new: *mut u8) -> Self {
 		Self { slot: slot as usize, new: new.addr() }
 	}
@@ -327,7 +315,6 @@ impl WriteBarrierRecord {
 	}
 }
 
-#[cfg(feature = "free-threading")]
 #[derive(Debug, Default)]
 struct WriteBarrierState {
 	concurrent_marking: AtomicBool,
@@ -335,7 +322,6 @@ struct WriteBarrierState {
 	shaded:             Mutex<Vec<usize>>,
 }
 
-#[cfg(feature = "free-threading")]
 impl WriteBarrierState {
 	fn begin_concurrent_marking(&self) {
 		self.concurrent_marking.store(true, Ordering::Release);
@@ -388,7 +374,6 @@ impl WriteBarrierState {
 	}
 }
 
-#[cfg(feature = "free-threading")]
 fn write_barrier_state() -> &'static WriteBarrierState {
 	static STATE: std::sync::OnceLock<WriteBarrierState> = std::sync::OnceLock::new();
 	STATE.get_or_init(WriteBarrierState::default)
@@ -808,11 +793,8 @@ impl HeapState {
 	}
 
 	fn new_allocation_mark_state(&self) -> MarkState {
-		#[cfg(feature = "free-threading")]
-		{
-			if write_barrier_state().allocation_black_active() {
-				return MarkState::black();
-			}
+		if write_barrier_state().allocation_black_active() {
+			return MarkState::black();
 		}
 
 		MarkState::default()
@@ -1118,7 +1100,6 @@ impl MarkState {
 		matches!(self.color, MarkColor::Gray | MarkColor::Black)
 	}
 
-	#[cfg(feature = "free-threading")]
 	fn black() -> Self {
 		Self { color: MarkColor::Black, last_scan: None }
 	}
@@ -1189,29 +1170,43 @@ fn collect_external_stack_roots(visitor: &mut dyn FnMut(usize, *mut u8)) {
 	}
 
 	let stack_marker = 0usize;
-	let current = ptr::addr_of!(stack_marker).cast::<u8>() as usize;
-	let base = base as usize;
-	if current == base {
+	let current = ptr::addr_of!(stack_marker).cast::<u8>().cast_mut();
+	// SAFETY: `current` and the thread-local external base are both addresses in
+	// this thread's stack.
+	unsafe { collect_stack_range_roots(current, base, conservative_scan_floor(), visitor) };
+}
+
+/// Conservatively scans the pointer-sized words in one stopped thread's stack
+/// interval.
+///
+/// `stack_top` and `stack_base` may be supplied in either order; `floor` raises
+/// the low end of the scan when it lies inside the interval.  Registers are
+/// deliberately not scanned.  A callee-saved register can hold a dead pointer
+/// long after its last semantic use, so generated code mirrors live locals into
+/// stack slots that this scan observes.
+///
+/// # Safety
+///
+/// The caller must guarantee the interval is a readable stack range for the
+/// current thread or for another mutator that has stopped in a published GC-safe
+/// region.
+pub unsafe fn collect_stack_range_roots(
+	stack_top: *mut u8,
+	stack_base: *mut u8,
+	floor: usize,
+	visitor: &mut dyn FnMut(usize, *mut u8),
+) {
+	if stack_top.is_null() || stack_base.is_null() || stack_top == stack_base {
 		return;
 	}
 
-	// Registers are deliberately NOT scanned.  A callee-saved register can
-	// hold a *dead* pointer long after its value's last use (the register
-	// allocator frees the register without clearing it), so treating the
-	// register file as roots retains semantic garbage and breaks CPython
-	// finalization parity (`del x; gc.collect()` never finalizing).  Live
-	// named locals do not need register scanning: tier-0 codegen mirrors
-	// every local store into an explicit frame stack slot (`store_local`'s
-	// shadow slot in pon-codegen), which this stack walk observes.
-
+	let current = stack_top as usize;
+	let base = stack_base as usize;
 	let (mut low, high) = if current < base {
 		(current, base)
 	} else {
 		(base, current)
 	};
-	// The runtime-published floor skips the collect-dispatch frames: their
-	// stack memory holds only ghosts (see `set_conservative_scan_floor`).
-	let floor = conservative_scan_floor();
 	if floor > low && floor < high {
 		low = floor;
 	}
@@ -1310,10 +1305,8 @@ mod tests {
 	static PRECISE_ROOT_A: AtomicUsize = AtomicUsize::new(0);
 	static PRECISE_ROOT_B: AtomicUsize = AtomicUsize::new(0);
 
-	#[cfg(feature = "free-threading")]
 	static BARRIER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-	#[cfg(feature = "free-threading")]
 	fn reset_write_barrier_for_test() -> std::sync::MutexGuard<'static, ()> {
 		let guard = BARRIER_TEST_LOCK
 			.lock()
@@ -1874,7 +1867,6 @@ mod tests {
 
 	#[test]
 	fn write_barrier_record_is_noop_when_inactive() {
-		#[cfg(feature = "free-threading")]
 		let _guard = reset_write_barrier_for_test();
 
 		let mut slot = ptr::null_mut();
@@ -1886,15 +1878,11 @@ mod tests {
 
 		assert!(slot.is_null());
 
-		#[cfg(feature = "free-threading")]
-		{
-			assert!(WriteBarrier::drain_records().is_empty());
-			assert!(WriteBarrier::drain_shaded().is_empty());
-			assert!(!WriteBarrier::allocation_black_active());
-		}
+		assert!(WriteBarrier::drain_records().is_empty());
+		assert!(WriteBarrier::drain_shaded().is_empty());
+		assert!(!WriteBarrier::allocation_black_active());
 	}
 
-	#[cfg(feature = "free-threading")]
 	#[test]
 	fn write_barrier_records_and_shades_during_concurrent_marking() {
 		let _guard = reset_write_barrier_for_test();
@@ -1913,7 +1901,6 @@ mod tests {
 		assert!(WriteBarrier::drain_shaded().is_empty());
 	}
 
-	#[cfg(feature = "free-threading")]
 	#[test]
 	fn write_barrier_skips_tagged_new_values_during_concurrent_marking() {
 		let _guard = reset_write_barrier_for_test();
@@ -1929,7 +1916,6 @@ mod tests {
 		assert!(WriteBarrier::drain_shaded().is_empty());
 	}
 
-	#[cfg(feature = "free-threading")]
 	#[test]
 	fn write_barrier_allocation_black_marks_new_objects_during_concurrent_marking() {
 		let _guard = reset_write_barrier_for_test();

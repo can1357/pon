@@ -284,50 +284,6 @@ pub(super) fn lower_continue_with_targets(
 	scope.set_term(Terminator::Jump(targets.continue_block))
 }
 
-#[allow(dead_code)]
-pub(super) fn lower_for(stmt: &ruff_python_ast::StmtFor) -> Result<(), LowerError> {
-	unsupported_at(
-		if stmt.is_async {
-			"async for statement"
-		} else {
-			"for statement"
-		},
-		span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()),
-	)
-}
-
-#[allow(dead_code)]
-pub(super) fn lower_while(stmt: &ruff_python_ast::StmtWhile) -> Result<(), LowerError> {
-	unsupported_at(
-		"while statement",
-		span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()),
-	)
-}
-
-#[allow(dead_code)]
-pub(super) fn lower_if(stmt: &ruff_python_ast::StmtIf) -> Result<(), LowerError> {
-	unsupported_at(
-		"if statement",
-		span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()),
-	)
-}
-
-#[allow(dead_code)]
-pub(super) fn lower_break(stmt: &ruff_python_ast::StmtBreak) -> Result<(), LowerError> {
-	unsupported_at(
-		"break statement",
-		span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()),
-	)
-}
-
-#[allow(dead_code)]
-pub(super) fn lower_continue(stmt: &ruff_python_ast::StmtContinue) -> Result<(), LowerError> {
-	unsupported_at(
-		"continue statement",
-		span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()),
-	)
-}
-
 pub(super) fn lower_assert(
 	driver: &mut LoweringDriver,
 	scope: &mut BodyScope,

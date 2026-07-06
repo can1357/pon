@@ -9,7 +9,7 @@ use anyhow::{Context, bail};
 use target_lexicon::{BinaryFormat, Triple};
 
 const RUNTIME_ARCHIVE: &str = "libpon_runtime.a";
-
+const DYNAMIC_RUNTIME_ARCHIVE: &str = "libpon_aot_dynamic.a";
 /// Link Cranelift object files with the Pon runtime static archive.
 pub fn link_executable(
 	objects: &[PathBuf],
@@ -56,11 +56,17 @@ pub fn link_executable(
 	Ok(())
 }
 
-/// Locate `libpon_runtime.a` for AoT links.
-pub fn locate_runtime_archive() -> anyhow::Result<PathBuf> {
+/// Locate the static archive used for AoT links.
+///
+/// Plain AoT images link `libpon_runtime.a`. Images that reach permitted
+/// dynamic-code hooks link `libpon_aot_dynamic.a`, which includes the runtime
+/// plus the JIT/parser hook installer.
+pub fn locate_runtime_archive(dynamic: bool) -> anyhow::Result<PathBuf> {
+	let archive = if dynamic { DYNAMIC_RUNTIME_ARCHIVE } else { RUNTIME_ARCHIVE };
+	let env_var = if dynamic { "PON_AOT_DYNAMIC_LIB" } else { "PON_RUNTIME_LIB" };
 	let mut tried = Vec::new();
 
-	if let Some(path) = env_path("PON_RUNTIME_LIB") {
+	if let Some(path) = env_path(env_var) {
 		tried.push(path.clone());
 		if path.is_file() {
 			return Ok(path);
@@ -69,13 +75,13 @@ pub fn locate_runtime_archive() -> anyhow::Result<PathBuf> {
 
 	if let Ok(exe) = std::env::current_exe() {
 		if let Some(exe_dir) = exe.parent() {
-			let installed = exe_dir.join("..").join("lib").join(RUNTIME_ARCHIVE);
+			let installed = exe_dir.join("..").join("lib").join(archive);
 			tried.push(installed.clone());
 			if installed.is_file() {
 				return Ok(installed);
 			}
 
-			let side_by_side = exe_dir.join(RUNTIME_ARCHIVE);
+			let side_by_side = exe_dir.join(archive);
 			tried.push(side_by_side.clone());
 			if side_by_side.is_file() {
 				return Ok(side_by_side);
@@ -86,9 +92,9 @@ pub fn locate_runtime_archive() -> anyhow::Result<PathBuf> {
 	let target_dir = env_path("CARGO_TARGET_DIR").unwrap_or_else(|| PathBuf::from("target"));
 	let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_owned());
 	for candidate in [
-		target_dir.join(&profile).join(RUNTIME_ARCHIVE),
-		target_dir.join("debug").join(RUNTIME_ARCHIVE),
-		target_dir.join("release").join(RUNTIME_ARCHIVE),
+		target_dir.join(&profile).join(archive),
+		target_dir.join("debug").join(archive),
+		target_dir.join("release").join(archive),
 	] {
 		tried.push(candidate.clone());
 		if candidate.is_file() {
@@ -101,7 +107,7 @@ pub fn locate_runtime_archive() -> anyhow::Result<PathBuf> {
 		.map(|path| format!("  - {}", path.display()))
 		.collect::<Vec<_>>()
 		.join("\n");
-	bail!("could not locate {RUNTIME_ARCHIVE}; tried:\n{tried}")
+	bail!("could not locate {archive}; tried:\n{tried}")
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {

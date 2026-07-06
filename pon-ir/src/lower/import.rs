@@ -112,22 +112,9 @@ fn import_binding_name(name: &Identifier, asname: Option<&Identifier>) -> String
 		.to_owned()
 }
 
-#[allow(dead_code)]
-pub(super) fn lower_import(stmt: &ruff_python_ast::StmtImport) -> Result<(), LowerError> {
-	unsupported_at(
-		"import statement",
-		span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()),
-	)
-}
-
-#[allow(dead_code)]
-pub(super) fn lower_import_from(stmt: &ruff_python_ast::StmtImportFrom) -> Result<(), LowerError> {
-	unsupported_at(
-		"import-from statement",
-		span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()),
-	)
-}
-
+// Scope analysis has already validated declaration legality and applied the
+// declarations to name classification. No runtime IR is emitted for either
+// statement.
 pub(super) fn lower_global(_stmt: &ruff_python_ast::StmtGlobal) -> Result<(), LowerError> {
 	Ok(())
 }

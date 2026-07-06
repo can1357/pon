@@ -2199,12 +2199,32 @@ unsafe extern "C" fn member_descriptor_get(
 	if obj.is_null() {
 		return descr;
 	}
-	// Exception-layout receivers carry no slot storage: refuse cleanly
-	// instead of misreading the boxed-exception fields as a PyHeapInstance.
-	if unsafe { instance_uses_exception_layout(obj) } {
-		return raise_object("__slots__ on BaseException subclasses is not supported");
-	}
 	let descr = unsafe { &*descr.cast::<PyMemberDescriptor>() };
+	// Exception-layout receivers carry their own slot vector instead of the
+	// generic PyHeapInstance prefix.
+	if unsafe { instance_uses_exception_layout(obj) } {
+		return match descr.kind {
+			PyMemberKind::Slot => {
+				let exception = unsafe { &*obj.cast::<crate::types::exc::PyBaseException>() };
+				let value = slot_value_get(&exception.slots, descr.name);
+				if value.is_null() {
+					unsafe { crate::abi::exc::pon_raise_attribute_error(obj, descr.name) }
+				} else {
+					value
+				}
+			},
+			PyMemberKind::Dict => {
+				let exception = unsafe { &mut *obj.cast::<crate::types::exc::PyBaseException>() };
+				let dict = if exception.dict.is_null() {
+					exception.dict = new_namespace();
+					exception.dict
+				} else {
+					exception.dict
+				};
+				unsafe { crate::descr::class_dict_to_dict(dict) }
+			},
+		};
+	}
 	let obj_ty = unsafe { object_type(obj) };
 	if obj_ty.is_null() || unsafe { !mro::is_subtype(obj_ty, descr.owner) } {
 		return raise_object("descriptor does not apply to this object");
@@ -2249,8 +2269,21 @@ unsafe extern "C" fn member_descriptor_set(
 		return -1;
 	}
 	if unsafe { instance_uses_exception_layout(obj) } {
-		pon_err_set("__slots__ on BaseException subclasses is not supported");
-		return -1;
+		let exception = unsafe { &mut *obj.cast::<crate::types::exc::PyBaseException>() };
+		return match descr.kind {
+			PyMemberKind::Slot => {
+				if slot_value_set(&mut exception.slots, descr.name, value) {
+					0
+				} else {
+					pon_err_set("slot storage is missing");
+					-1
+				}
+			},
+			PyMemberKind::Dict => {
+				pon_err_set("__dict__ attribute is read-only");
+				-1
+			},
+		};
 	}
 	let instance = obj.cast::<PyHeapInstance>();
 	match descr.kind {
@@ -2377,7 +2410,7 @@ pub unsafe extern "C" fn type_new(
 	}
 }
 
-fn slot_storage(cls: *mut PyType) -> Vec<PySlotValue> {
+pub(crate) fn slot_storage(cls: *mut PyType) -> Vec<PySlotValue> {
 	if cls.is_null() {
 		return Vec::new();
 	}
@@ -2770,14 +2803,34 @@ pub unsafe extern "C" fn type_call(
 	if cls_obj.is_null() {
 		return raise_object("type call receiver is NULL");
 	}
-	if !kwargs.is_null() {
-		return raise_object("type.__call__ keyword carrier is not supported yet");
-	}
 	let cls = cls_obj.cast::<PyType>();
 	let explicit_args = match unsafe { positional_args_from_object(args) } {
 		Ok(args) => args,
 		Err(message) => return raise_object(message),
 	};
+	if !kwargs.is_null() && crate::tag::untag_arg(kwargs) != unsafe { abi::pon_none() } {
+		let entries = match unsafe { dict::dict_entries_snapshot(crate::tag::untag_arg(kwargs)) } {
+			Ok(entries) => entries,
+			Err(message) => return raise_object(message),
+		};
+		let mut names = Vec::with_capacity(entries.len());
+		let mut values = Vec::with_capacity(entries.len());
+		for entry in entries {
+			let key = crate::tag::untag_arg(entry.key);
+			let Some(text) = (unsafe { unicode_text(key) }) else {
+				return raise_object("type.__call__ keyword names must be str");
+			};
+			names.push(intern::intern(text));
+			values.push(entry.value);
+		}
+		return unsafe {
+			abi::call_type_with_keywords(
+				cls_obj,
+				&explicit_args,
+				function::KeywordArgs { names: &names, values: &values },
+			)
+		};
+	}
 	let new = unsafe { (*cls).tp_new.unwrap_or(type_new) };
 	let instance = unsafe { new(cls, args, kwargs) };
 	if instance.is_null() {
@@ -2831,6 +2884,23 @@ pub unsafe extern "C" fn type_call(
 		}
 	}
 	instance
+}
+
+fn slot_value_set(slots: &mut [PySlotValue], name: u32, value: *mut PyObject) -> bool {
+	let Some(slot) = slots.iter_mut().find(|slot| slot.name == name) else {
+		return false;
+	};
+	slot.value = value;
+	true
+}
+
+#[must_use]
+fn slot_value_get(slots: &[PySlotValue], name: u32) -> *mut PyObject {
+	slots
+		.iter()
+		.find(|slot| slot.name == name)
+		.map(|slot| slot.value)
+		.unwrap_or(ptr::null_mut())
 }
 
 /// Store/delete an instance slot.  Returns true when the name was handled.

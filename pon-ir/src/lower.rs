@@ -114,6 +114,12 @@ impl LowerError {
 		Self::Parse(message.into())
 	}
 
+	/// Build a compile-time SyntaxError message from semantic validation.
+	#[must_use]
+	pub fn syntax(message: impl Into<String>) -> Self {
+		Self::Parse(message.into())
+	}
+
 	/// Build an unsupported-construct error without a source span.
 	#[must_use]
 	pub fn unsupported(feature: impl Into<String>) -> Self {
@@ -406,23 +412,6 @@ impl LoweringDriver {
 			.map_err(|_| LowerError::internal("too many functions for u32 ids"))?;
 		self.functions.push(function);
 		Ok(FunctionId(index))
-	}
-
-	#[allow(dead_code)]
-	fn lower_function_def(&mut self, def: &StmtFunctionDef) -> Result<FunctionId, LowerError> {
-		validate_function_header(def)?;
-		let info = scope::analyze_function_def(def)?;
-		if !info.free_vars.is_empty() || !info.cell_vars.is_empty() {
-			return unsupported_at("closure variables", span_function(def));
-		}
-		let mut body = BodyScope::new(&info);
-
-		for stmt in &def.body {
-			self.lower_stmt(&mut body, stmt)?;
-		}
-
-		let function = body.finish()?;
-		self.append_function(function)
 	}
 
 	fn lower_stmt(&mut self, scope: &mut BodyScope, stmt: &Stmt) -> Result<(), LowerError> {
@@ -1565,54 +1554,12 @@ fn param_layout(info: &ScopeInfo) -> ParamLayout {
 	}
 }
 
-fn validate_function_header(def: &StmtFunctionDef) -> Result<(), LowerError> {
-	if !def.decorator_list.is_empty() {
-		return unsupported_at("function decorator", span_function(def));
-	}
-	if def.type_params.is_some() {
-		return unsupported_at("function type parameter", span_function(def));
-	}
-	if def.returns.is_some() {
-		return unsupported_at("function return annotation", span_function(def));
-	}
-	positional_parameters(&def.parameters)?;
-	Ok(())
-}
-
-fn positional_parameters(parameters: &Parameters) -> Result<Vec<String>, LowerError> {
-	if parameters.vararg.is_some() {
-		return Err(LowerError::unsupported("variadic positional parameter"));
-	}
-	if !parameters.kwonlyargs.is_empty() {
-		return Err(LowerError::unsupported("keyword-only parameter"));
-	}
-	if parameters.kwarg.is_some() {
-		return Err(LowerError::unsupported("variadic keyword parameter"));
-	}
-
-	let mut params = Vec::with_capacity(parameters.posonlyargs.len() + parameters.args.len());
-	for parameter in parameters.posonlyargs.iter().chain(&parameters.args) {
-		if parameter.default().is_some() {
-			return Err(LowerError::unsupported("default parameter value"));
-		}
-		if parameter.annotation().is_some() {
-			return Err(LowerError::unsupported("parameter annotation"));
-		}
-		params.push(parameter.name().as_str().to_owned());
-	}
-	Ok(params)
-}
-
 fn unsupported_at<T>(feature: impl Into<String>, span: SourceSpan) -> Result<T, LowerError> {
 	Err(LowerError::unsupported_at(feature, span))
 }
 
 fn unsupported_expr<T>(feature: impl Into<String>, expr: &Expr) -> Result<T, LowerError> {
 	Err(LowerError::unsupported_at(feature, span_expr(expr)))
-}
-
-fn span_function(def: &StmtFunctionDef) -> SourceSpan {
-	span_bounds(def.range.start().to_u32(), def.range.end().to_u32())
 }
 
 fn span_bounds(start: u32, end: u32) -> SourceSpan {

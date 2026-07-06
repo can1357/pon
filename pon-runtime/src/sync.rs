@@ -1,32 +1,29 @@
-//! Synchronization primitives reserved for the free-threaded runtime.
+//! Synchronization primitives for the no-GIL runtime.
 //!
-//! The default runtime is still single-threaded.  The Rust primitives in this
-//! module are available in every build so data structures can be shaped once,
-//! while C ABI critical-section entry points are exported only when the
-//! `free-threading` feature is enabled.
+//! This module owns object/type critical sections, generated-code write-barrier
+//! shims, and the blocking-region/safepoint contract used by the GC handshake.
 
 use core::{
 	ops::{Deref, DerefMut},
 	ptr,
 	sync::atomic::{AtomicUsize, Ordering},
 };
-#[cfg(feature = "free-threading")]
 use std::cell::RefCell;
 use std::{
 	collections::HashMap,
 	sync::{LazyLock, LockResult, Mutex, MutexGuard, TryLockError, TryLockResult},
 };
 
-use crate::object::{PyObject, PyType};
+use crate::{
+	object::{PyObject, PyType},
+	thread_state::thread_state_lock,
+};
 
-/// Runtime mutex used for state that will become shared in free-threaded
-/// builds.
+/// Runtime mutex used for state shared across Python threads.
 ///
-/// `PonMutex` is a thin documented wrapper around [`std::sync::Mutex`].  It is
-/// intentionally present in default builds as well as free-threaded builds so
-/// later waves can add locks without changing public type shapes.  Poisoning is
-/// preserved: callers see the same [`LockResult`] and [`TryLockResult`]
-/// contract as the standard library.
+/// `PonMutex` is a thin documented wrapper around [`std::sync::Mutex`].
+/// Poisoning is preserved: callers see the same [`LockResult`] and
+/// [`TryLockResult`] contract as the standard library.
 #[derive(Debug, Default)]
 pub struct PonMutex<T: ?Sized> {
 	inner: Mutex<T>,
@@ -50,9 +47,6 @@ impl<T> PonMutex<T> {
 impl<T: ?Sized> PonMutex<T> {
 	/// Locks the mutex, blocking the current thread until it can be acquired.
 	///
-	/// In the default runtime this normally has no contention, but it remains a
-	/// real lock so tests and future free-threaded paths exercise the same
-	/// semantics.
 	pub fn lock(&self) -> LockResult<PonMutexGuard<'_, T>> {
 		self
 			.inner
@@ -114,56 +108,55 @@ impl<T: ?Sized> DerefMut for PonMutexGuard<'_, T> {
 	}
 }
 
-/// Side-table entry for free-threaded type coordination.
+/// Side-table entry for no-GIL type coordination.
 ///
 /// This intentionally lives outside [`PyType`] so enabling future type-level
 /// locks or version epochs cannot shift object/type payload offsets.
 #[derive(Debug)]
-struct TypeFreeThreadingMeta {
+struct TypeThreadingMeta {
 	lock:          PonMutex<()>,
 	version_epoch: AtomicUsize,
 }
 
-impl TypeFreeThreadingMeta {
+impl TypeThreadingMeta {
 	fn new() -> Self {
 		Self { lock: PonMutex::new(()), version_epoch: AtomicUsize::new(0) }
 	}
 }
 
-static TYPE_FREE_THREADING_META: LazyLock<Mutex<HashMap<usize, &'static TypeFreeThreadingMeta>>> =
+static TYPE_THREADING_META: LazyLock<Mutex<HashMap<usize, &'static TypeThreadingMeta>>> =
 	LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn type_free_threading_meta(ty: *const PyType) -> &'static TypeFreeThreadingMeta {
+fn type_threading_meta(ty: *const PyType) -> &'static TypeThreadingMeta {
 	let key = ty as usize;
-	let mut table = TYPE_FREE_THREADING_META
+	let mut table = TYPE_THREADING_META
 		.lock()
-		.expect("type free-threading side table should not be poisoned");
+		.expect("type threading side table should not be poisoned");
 
 	*table
 		.entry(key)
-		.or_insert_with(|| Box::leak(Box::new(TypeFreeThreadingMeta::new())))
+		.or_insert_with(|| Box::leak(Box::new(TypeThreadingMeta::new())))
 }
 
 /// Locks side-table metadata for `ty` without adding fields to [`PyType`].
 ///
-/// Default builds may call this too; the metadata is created lazily and remains
-/// off-object, preserving the GIL layout contract while giving Wave-1 a stable
-/// type-level mutex accessor.
+/// The metadata is created lazily and remains off-object, preserving the object
+/// layout while giving mutation paths a stable type-level mutex accessor.
 pub fn lock_type(ty: *const PyType) -> LockResult<PonMutexGuard<'static, ()>> {
-	type_free_threading_meta(ty).lock.lock()
+	type_threading_meta(ty).lock.lock()
 }
 
 /// Returns the side-table type version epoch for `ty`.
 #[must_use]
 pub fn type_version_epoch(ty: *const PyType) -> usize {
-	type_free_threading_meta(ty)
+	type_threading_meta(ty)
 		.version_epoch
 		.load(Ordering::Acquire)
 }
 
 /// Bumps and returns the side-table type version epoch for `ty`.
 pub fn bump_type_version_epoch(ty: *const PyType) -> usize {
-	type_free_threading_meta(ty)
+	type_threading_meta(ty)
 		.version_epoch
 		.fetch_add(1, Ordering::AcqRel)
 		+ 1
@@ -279,7 +272,7 @@ pub fn namespaced_types() -> Vec<*mut PyType> {
 ///
 /// Callers own mutation atomicity: invoke this AFTER the type-dict/slot write,
 /// on the mutating thread (single-threaded today; under the type critical
-/// section in FT builds).
+/// section).
 pub fn type_modified(ty: *const PyType) {
 	if ty.is_null() {
 		return;
@@ -308,17 +301,107 @@ pub fn type_modified(ty: *const PyType) {
 	}
 }
 
-#[cfg(feature = "free-threading")]
+/// Marks the current thread as parked in a GC-safe blocking region.
+///
+/// Call this immediately before a native wait that may block without executing
+/// generated-code safepoints (poll/select, condition-variable waits, sleeps,
+/// joins, blocking syscalls).  The function publishes a stack pointer inside
+/// the caller's frame and increments a nesting counter in the current
+/// `PonThreadState`.  While the counter is non-zero, a collector treats the
+/// thread as stopped and scans the published `[stack_top_fp, stack_base]` span.
+pub fn enter_blocking_region() {
+	let mut marker = 0usize;
+	let mut state = thread_state_lock();
+	state.enter_gc_safe_region((&mut marker as *mut usize).cast::<u8>());
+}
+
+/// Leaves a blocking region previously entered by this thread.
+///
+/// The call is nesting-safe.  If a collector requested a stop while the native
+/// wait was finishing, this function immediately runs the safepoint slow path
+/// before returning to Python execution.
+pub fn leave_blocking_region() -> Result<(), &'static str> {
+	let result = {
+		let mut state = thread_state_lock();
+		state.leave_gc_safe_region()
+	};
+	if result.is_ok() {
+		safepoint_poll();
+	}
+	result
+}
+
+/// RAII helper for native waits with a lexical blocking scope.
+#[must_use]
+pub struct BlockingRegionGuard {
+	active: bool,
+}
+
+impl BlockingRegionGuard {
+	/// Enters a blocking region and returns a guard that leaves on drop.
+	pub fn enter() -> Self {
+		enter_blocking_region();
+		Self { active: true }
+	}
+
+	/// Leaves now and reports unmatched-leave errors to the caller.
+	pub fn leave(&mut self) -> Result<(), &'static str> {
+		if !self.active {
+			return Ok(());
+		}
+		self.active = false;
+		leave_blocking_region()
+	}
+}
+
+impl Drop for BlockingRegionGuard {
+	fn drop(&mut self) {
+		let _ = self.leave();
+	}
+}
+
+/// Generated-code safepoint body shared by JIT and AoT.
+///
+/// Returns `0` when execution may continue and `-1` when a pending Python
+/// signal handler raised an exception.  The GC handshake is still honored before
+/// returning a signal error so collectors are never left waiting on a mutator
+/// that happened to notice a signal first.
+pub fn safepoint_poll() -> i32 {
+	let mut status = 0;
+	if crate::native::signal::has_pending_signals()
+		&& unsafe { crate::native::signal::process_pending_signals() }.is_err()
+	{
+		status = -1;
+	}
+	if pon_gc::gc_stop_requested() && !pon_gc::current_thread_is_collecting() {
+		let mut marker = 0usize;
+		{
+			let mut state = thread_state_lock();
+			state.enter_gc_safe_region((&mut marker as *mut usize).cast::<u8>());
+		}
+		pon_gc::ack_global_stop();
+		pon_gc::wait_for_global_resume();
+		let _ = {
+			let mut state = thread_state_lock();
+			state.leave_gc_safe_region()
+		};
+	}
+	status
+}
+
+/// AoT-visible generated-code safepoint helper.
+#[unsafe(no_mangle)]
+pub extern "C" fn pon_safepoint_poll() -> i32 {
+	safepoint_poll()
+}
+
 const GLOBAL_CRITICAL_SECTION_KEY: usize = 0;
 
-#[cfg(feature = "free-threading")]
 static GLOBAL_CRITICAL_SECTION_LOCK: PonMutex<()> = PonMutex::new(());
 
-#[cfg(feature = "free-threading")]
 static OBJECT_CRITICAL_SECTION_LOCKS: LazyLock<Mutex<HashMap<usize, &'static PonMutex<()>>>> =
 	LazyLock::new(|| Mutex::new(HashMap::new()));
 
-#[cfg(feature = "free-threading")]
 #[derive(Debug)]
 struct HeldCriticalLock {
 	key:   usize,
@@ -326,23 +409,20 @@ struct HeldCriticalLock {
 	guard: Option<PonMutexGuard<'static, ()>>,
 }
 
-#[cfg(feature = "free-threading")]
 #[derive(Debug, Default)]
 struct CriticalSectionFrame {
 	locks:     Vec<HeldCriticalLock>,
 	suspended: Vec<usize>,
 }
 
-#[cfg(feature = "free-threading")]
 thread_local! {
 	 static CRITICAL_SECTION_STACK: RefCell<Vec<CriticalSectionFrame>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Guard for runtime object critical sections.
 ///
-/// Default builds use an inert guard because Python bytecode is not executed
-/// concurrently.  Free-threaded builds lock per-object side-table mutexes keyed
-/// by object address.  Nested sections that would acquire a new mutex suspend
+/// Locks per-object side-table mutexes keyed by object address.  Nested
+/// sections that would acquire a new mutex suspend
 /// the current thread's active critical-section guards, acquire the requested
 /// mutexes in deterministic address order, and restore the suspended guards
 /// when the inner section ends.  This mirrors CPython-style suspend-on-reentry
@@ -354,39 +434,20 @@ pub struct CriticalSectionGuard {
 
 impl CriticalSectionGuard {
 	fn enter(object: *mut PyObject) -> Self {
-		#[cfg(feature = "free-threading")]
-		{
-			push_critical_section(ordered_keys(&[critical_section_key(object)]));
-			Self { active: true }
-		}
-
-		#[cfg(not(feature = "free-threading"))]
-		{
-			let _ = object;
-			Self { active: false }
-		}
+		push_critical_section(ordered_keys(&[critical_section_key(object)]));
+		Self { active: true }
 	}
 
 	fn enter2(left: *mut PyObject, right: *mut PyObject) -> Self {
-		#[cfg(feature = "free-threading")]
-		{
-			push_critical_section(ordered_keys(&[
-				critical_section_key(left),
-				critical_section_key(right),
-			]));
-			Self { active: true }
-		}
-
-		#[cfg(not(feature = "free-threading"))]
-		{
-			let _ = (left, right);
-			Self { active: false }
-		}
+		push_critical_section(ordered_keys(&[
+			critical_section_key(left),
+			critical_section_key(right),
+		]));
+		Self { active: true }
 	}
 
 	fn leave(&mut self) {
 		if self.active {
-			#[cfg(feature = "free-threading")]
 			pop_critical_section();
 			self.active = false;
 		}
@@ -399,12 +460,10 @@ impl Drop for CriticalSectionGuard {
 	}
 }
 
-#[cfg(feature = "free-threading")]
 fn critical_section_key(object: *mut PyObject) -> usize {
 	object as usize
 }
 
-#[cfg(feature = "free-threading")]
 fn ordered_keys(keys: &[usize]) -> Vec<usize> {
 	let mut keys: Vec<usize> = keys.iter().copied().collect();
 	keys.sort_unstable();
@@ -412,7 +471,6 @@ fn ordered_keys(keys: &[usize]) -> Vec<usize> {
 	keys
 }
 
-#[cfg(feature = "free-threading")]
 fn critical_section_lock(key: usize) -> &'static PonMutex<()> {
 	if key == GLOBAL_CRITICAL_SECTION_KEY {
 		return &GLOBAL_CRITICAL_SECTION_LOCK;
@@ -426,7 +484,6 @@ fn critical_section_lock(key: usize) -> &'static PonMutex<()> {
 		.or_insert_with(|| Box::leak(Box::new(PonMutex::new(()))))
 }
 
-#[cfg(feature = "free-threading")]
 fn active_lock_keys(stack: &[CriticalSectionFrame]) -> Vec<usize> {
 	let mut keys = Vec::new();
 	for frame in stack {
@@ -441,7 +498,6 @@ fn active_lock_keys(stack: &[CriticalSectionFrame]) -> Vec<usize> {
 	keys
 }
 
-#[cfg(feature = "free-threading")]
 fn suspend_active_locks(stack: &mut [CriticalSectionFrame]) -> Vec<usize> {
 	let mut keys = Vec::new();
 	for frame in stack {
@@ -457,7 +513,6 @@ fn suspend_active_locks(stack: &mut [CriticalSectionFrame]) -> Vec<usize> {
 	keys
 }
 
-#[cfg(feature = "free-threading")]
 fn restore_suspended_locks(stack: &mut [CriticalSectionFrame], keys: Vec<usize>) {
 	for key in keys {
 		let guard = critical_section_lock(key)
@@ -478,7 +533,6 @@ fn restore_suspended_locks(stack: &mut [CriticalSectionFrame], keys: Vec<usize>)
 	}
 }
 
-#[cfg(feature = "free-threading")]
 fn push_critical_section(keys: Vec<usize>) {
 	CRITICAL_SECTION_STACK.with(|stack| {
 		let mut stack = stack.borrow_mut();
@@ -507,7 +561,6 @@ fn push_critical_section(keys: Vec<usize>) {
 	});
 }
 
-#[cfg(feature = "free-threading")]
 fn pop_critical_section() {
 	CRITICAL_SECTION_STACK.with(|stack| {
 		let mut stack = stack.borrow_mut();
@@ -534,8 +587,7 @@ pub fn begin_critical_section2(left: *mut PyObject, right: *mut PyObject) -> Cri
 
 /// Enters the legacy process-wide runtime critical section and returns a guard.
 ///
-/// This is modeled as the global side-table key in free-threaded builds and as
-/// an inert guard in default builds.
+/// This is modeled as the global side-table key.
 #[must_use]
 pub fn enter_critical_section() -> CriticalSectionGuard {
 	CriticalSectionGuard::enter(ptr::null_mut())
@@ -543,20 +595,9 @@ pub fn enter_critical_section() -> CriticalSectionGuard {
 
 /// Returns whether this thread currently has an active runtime critical
 /// section.
-///
-/// Default builds always return `false` because [`enter_critical_section`] is
-/// intentionally inert without `free-threading`.
 #[must_use]
 pub fn critical_section_is_held() -> bool {
-	#[cfg(feature = "free-threading")]
-	{
-		CRITICAL_SECTION_STACK.with(|stack| !stack.borrow().is_empty())
-	}
-
-	#[cfg(not(feature = "free-threading"))]
-	{
-		false
-	}
+	CRITICAL_SECTION_STACK.with(|stack| !stack.borrow().is_empty())
 }
 
 /// Records a heap pointer write for future incremental collectors.
@@ -578,21 +619,18 @@ pub unsafe fn store_heap_pointer(slot: *mut *mut PyObject, value: *mut PyObject)
 	}
 }
 /// Acquires the legacy global critical section for generated-code callers.
-#[cfg(feature = "free-threading")]
 #[unsafe(no_mangle)]
 pub extern "C" fn pon_runtime_enter_critical_section() {
 	push_critical_section(ordered_keys(&[GLOBAL_CRITICAL_SECTION_KEY]));
 }
 
 /// Releases the legacy global critical section for generated-code callers.
-#[cfg(feature = "free-threading")]
 #[unsafe(no_mangle)]
 pub extern "C" fn pon_runtime_leave_critical_section() {
 	pop_critical_section();
 }
 
 /// Acquires a one-object critical section for generated-code callers.
-#[cfg(feature = "free-threading")]
 #[unsafe(no_mangle)]
 pub extern "C" fn pon_runtime_begin_critical_section(object: *mut PyObject) {
 	push_critical_section(ordered_keys(&[critical_section_key(object)]));
@@ -600,14 +638,12 @@ pub extern "C" fn pon_runtime_begin_critical_section(object: *mut PyObject) {
 
 /// Releases the most recent one-object critical section for generated-code
 /// callers.
-#[cfg(feature = "free-threading")]
 #[unsafe(no_mangle)]
 pub extern "C" fn pon_runtime_end_critical_section() {
 	pop_critical_section();
 }
 
 /// Acquires a two-object critical section for generated-code callers.
-#[cfg(feature = "free-threading")]
 #[unsafe(no_mangle)]
 pub extern "C" fn pon_runtime_begin_critical_section2(left: *mut PyObject, right: *mut PyObject) {
 	push_critical_section(ordered_keys(&[critical_section_key(left), critical_section_key(right)]));
@@ -615,7 +651,6 @@ pub extern "C" fn pon_runtime_begin_critical_section2(left: *mut PyObject, right
 
 /// Releases the most recent two-object critical section for generated-code
 /// callers.
-#[cfg(feature = "free-threading")]
 #[unsafe(no_mangle)]
 pub extern "C" fn pon_runtime_end_critical_section2() {
 	pop_critical_section();
@@ -666,18 +701,12 @@ mod tests {
 
 		{
 			let _guard = enter_critical_section();
-
-			#[cfg(feature = "free-threading")]
 			assert!(critical_section_is_held());
-
-			#[cfg(not(feature = "free-threading"))]
-			assert!(!critical_section_is_held());
 		}
 
 		assert!(!critical_section_is_held());
 	}
 
-	#[cfg(feature = "free-threading")]
 	#[test]
 	fn critical_section_sync_reentry_suspends_without_deadlock() {
 		let first = Box::into_raw(Box::new(1_u8)) as *mut PyObject;
@@ -703,7 +732,6 @@ mod tests {
 		}
 	}
 
-	#[cfg(feature = "free-threading")]
 	#[test]
 	fn critical_section_sync_begin2_orders_addresses_across_threads() {
 		use std::{

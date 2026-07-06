@@ -23,8 +23,11 @@ pub struct EmbeddedModuleSpec {
 }
 
 /// Define `main(argc, argv) -> i32` as a tiny trampoline to runtime
-/// `pon_aot_entry`.
-pub fn define_main_trampoline(module: &mut ObjectModule) -> ModuleResult<FuncId> {
+/// `pon_aot_entry`, optionally installing dynamic-code hooks first.
+pub fn define_main_trampoline(
+	module: &mut ObjectModule,
+	install_dynamic_hooks: bool,
+) -> ModuleResult<FuncId> {
 	let ptr_ty = module.target_config().pointer_type();
 
 	let mut sig = module.make_signature();
@@ -34,10 +37,17 @@ pub fn define_main_trampoline(module: &mut ObjectModule) -> ModuleResult<FuncId>
 
 	let main_id = module.declare_function("main", Linkage::Export, &sig)?;
 	let entry_id = module.declare_function("pon_aot_entry", Linkage::Import, &sig)?;
+	let install_id = if install_dynamic_hooks {
+		let install_sig = module.make_signature();
+		Some(module.declare_function("pon_aot_install_dynamic_hooks", Linkage::Import, &install_sig)?)
+	} else {
+		None
+	};
 
 	let mut ctx = module.make_context();
 	ctx.func.signature = sig;
 	let entry_ref = module.declare_func_in_func(entry_id, &mut ctx.func);
+	let install_ref = install_id.map(|id| module.declare_func_in_func(id, &mut ctx.func));
 
 	let mut fctx = FunctionBuilderContext::new();
 	let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fctx);
@@ -46,6 +56,9 @@ pub fn define_main_trampoline(module: &mut ObjectModule) -> ModuleResult<FuncId>
 	builder.switch_to_block(block);
 	builder.seal_block(block);
 
+	if let Some(install_ref) = install_ref {
+		builder.ins().call(install_ref, &[]);
+	}
 	let argc = builder.func.dfg.block_params(block)[0];
 	let argv = builder.func.dfg.block_params(block)[1];
 	let call = builder.ins().call(entry_ref, &[argc, argv]);

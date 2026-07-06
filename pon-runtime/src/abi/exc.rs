@@ -268,6 +268,7 @@ pub(super) fn alloc_exception_object(
 			object,
 			PyBaseException::new(ty.cast_const(), message, cause, context, ptr::null_mut()),
 		);
+		(*object).slots = crate::types::type_::slot_storage(ty);
 	}
 	let exception = as_object_ptr(object);
 	unsafe {
@@ -336,6 +337,7 @@ fn alloc_exception_group_object(
 			base: PyBaseException::new(ty.cast_const(), message, cause, context, ptr::null_mut()),
 			exceptions,
 		});
+		(*object).base.slots = crate::types::type_::slot_storage(ty);
 	}
 	Ok(as_object_ptr(object))
 }

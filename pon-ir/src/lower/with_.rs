@@ -262,14 +262,3 @@ pub(super) fn lower_with_stmt(
 	Ok(())
 }
 
-#[allow(dead_code)]
-pub(super) fn lower_with(stmt: &ruff_python_ast::StmtWith) -> Result<(), LowerError> {
-	unsupported_at(
-		if stmt.is_async {
-			"async with statement (WS-GEN lowering surface is ready; dispatch seam not wired)"
-		} else {
-			"with statement (WS-GEN lowering surface is ready; dispatch seam not wired)"
-		},
-		span_bounds(stmt.range.start().to_u32(), stmt.range.end().to_u32()),
-	)
-}

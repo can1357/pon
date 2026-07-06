@@ -208,14 +208,14 @@ pub struct ScopeAnalysis {
 pub fn analyze_module(module: &ModModule) -> Result<ScopeAnalysis, LowerError> {
 	let mut builder = ScopeBuilder::new(ScopeKind::Module, "__main__", false);
 	scan_body(&module.body, &mut builder)?;
-	Ok(ScopeAnalysis { root: finalize_scope(builder, &BTreeSet::new()) })
+	Ok(ScopeAnalysis { root: finalize_scope(builder, &BTreeSet::new())? })
 }
 
 /// Analyze a single function definition as an independent lowering unit.
 pub fn analyze_function_def(def: &StmtFunctionDef) -> Result<ScopeInfo, LowerError> {
 	let mut builder = function_builder(def)?;
 	scan_body(&def.body, &mut builder)?;
-	Ok(finalize_scope(builder, &BTreeSet::new()))
+	Ok(finalize_scope(builder, &BTreeSet::new())?)
 }
 
 /// Reserved scope name for synthesized PEP 649 `__annotate__` functions.
@@ -567,11 +567,13 @@ fn scan_stmt(stmt: &Stmt, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
 		},
 		Stmt::Global(global) => {
 			for name in &global.names {
+				validate_global_declaration(scope, name.as_str())?;
 				scope.declare_global(name.as_str());
 			}
 		},
 		Stmt::Nonlocal(nonlocal) => {
 			for name in &nonlocal.names {
+				validate_nonlocal_declaration(scope, name.as_str())?;
 				scope.declare_nonlocal(name.as_str());
 			}
 		},
@@ -579,6 +581,50 @@ fn scan_stmt(stmt: &Stmt, scope: &mut ScopeBuilder) -> Result<(), LowerError> {
 		Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::IpyEscapeCommand(_) => {},
 	}
 	Ok(())
+}
+
+fn validate_global_declaration(scope: &ScopeBuilder, name: &str) -> Result<(), LowerError> {
+	if is_formal_parameter(scope, name) {
+		return Err(LowerError::syntax(format!("name '{name}' is parameter and global")));
+	}
+	if scope.used.contains(name) {
+		return Err(LowerError::syntax(format!(
+			"name '{name}' is used prior to global declaration"
+		)));
+	}
+	if scope.bound.contains(name) {
+		return Err(LowerError::syntax(format!(
+			"name '{name}' is assigned to before global declaration"
+		)));
+	}
+	if scope.nonlocal_decl.contains(name) {
+		return Err(LowerError::syntax(format!("name '{name}' is nonlocal and global")));
+	}
+	Ok(())
+}
+
+fn validate_nonlocal_declaration(scope: &ScopeBuilder, name: &str) -> Result<(), LowerError> {
+	if is_formal_parameter(scope, name) {
+		return Err(LowerError::syntax(format!("name '{name}' is parameter and nonlocal")));
+	}
+	if scope.used.contains(name) {
+		return Err(LowerError::syntax(format!(
+			"name '{name}' is used prior to nonlocal declaration"
+		)));
+	}
+	if scope.bound.contains(name) {
+		return Err(LowerError::syntax(format!(
+			"name '{name}' is assigned to before nonlocal declaration"
+		)));
+	}
+	if scope.global_decl.contains(name) {
+		return Err(LowerError::syntax(format!("name '{name}' is nonlocal and global")));
+	}
+	Ok(())
+}
+
+fn is_formal_parameter(scope: &ScopeBuilder, name: &str) -> bool {
+	scope.formal_params.iter().any(|param| param == name)
 }
 
 fn scan_parameter_defaults(
@@ -968,10 +1014,14 @@ fn import_binding_name(name: &Identifier, asname: Option<&Identifier>) -> String
 		.to_owned()
 }
 
-fn finalize_scope(mut builder: ScopeBuilder, enclosing_locals: &BTreeSet<String>) -> ScopeInfo {
+fn finalize_scope(
+	mut builder: ScopeBuilder,
+	enclosing_locals: &BTreeSet<String>,
+) -> Result<ScopeInfo, LowerError> {
 	if let Some(annotate) = builder.annotate.take() {
 		builder.children.insert(0, *annotate);
 	}
+	validate_nonlocal_bindings(&builder, enclosing_locals)?;
 	let local_names = local_names(&builder);
 	let mut child_enclosing = enclosing_locals.clone();
 	if matches!(builder.kind, ScopeKind::Function | ScopeKind::Comprehension) {
@@ -988,7 +1038,7 @@ fn finalize_scope(mut builder: ScopeBuilder, enclosing_locals: &BTreeSet<String>
 	let mut children = Vec::with_capacity(builder.children.len());
 	let mut names_needed_by_children = BTreeSet::new();
 	for child in builder.children.drain(..) {
-		let child_info = finalize_scope(child, &child_enclosing);
+		let child_info = finalize_scope(child, &child_enclosing)?;
 		for free in &child_info.free_vars {
 			names_needed_by_children.insert(free.clone());
 		}
@@ -1122,7 +1172,7 @@ fn finalize_scope(mut builder: ScopeBuilder, enclosing_locals: &BTreeSet<String>
 
 	let parameters = parameter_summary(&builder, &slot_by_name);
 
-	ScopeInfo {
+	Ok(ScopeInfo {
 		kind: builder.kind,
 		name: builder.name,
 		span: builder.span,
@@ -1136,7 +1186,22 @@ fn finalize_scope(mut builder: ScopeBuilder, enclosing_locals: &BTreeSet<String>
 		is_generator: builder.is_generator,
 		is_async: builder.is_async,
 		type_params: builder.active_type_params,
+	})
+}
+
+fn validate_nonlocal_bindings(
+	builder: &ScopeBuilder,
+	enclosing_locals: &BTreeSet<String>,
+) -> Result<(), LowerError> {
+	for name in &builder.nonlocal_decl {
+		if matches!(builder.kind, ScopeKind::Module) {
+			return Err(LowerError::syntax("nonlocal declaration not allowed at module level"));
+		}
+		if !enclosing_locals.contains(name) {
+			return Err(LowerError::syntax(format!("no binding for nonlocal '{name}' found")));
+		}
 	}
+	Ok(())
 }
 
 fn local_names(builder: &ScopeBuilder) -> BTreeSet<String> {
@@ -1216,6 +1281,15 @@ mod tests {
 	fn analyze(source: &str) -> ScopeAnalysis {
 		let module = parse_module_source(source).expect("fixture should parse");
 		analyze_module(&module).expect("scope analysis should succeed")
+	}
+
+	fn analyze_error_message(source: &str) -> String {
+		let module = parse_module_source(source).expect("fixture should parse");
+		match analyze_module(&module) {
+			Err(LowerError::Parse(message)) => message,
+			Err(other) => panic!("expected SyntaxError-style Parse error, got {other:?}"),
+			Ok(_) => panic!("scope analysis unexpectedly accepted:\n{source}"),
+		}
 	}
 
 	#[test]
@@ -1331,6 +1405,43 @@ def outer():
 			inner.symbol("y").map(|symbol| &symbol.class),
 			Some(NameClass::Free { slot: 0 })
 		));
+	}
+
+	#[test]
+	fn rejects_invalid_global_nonlocal_declarations_with_cpython_messages() {
+		let cases = [
+			("nonlocal x\n", "nonlocal declaration not allowed at module level"),
+			("def f():\n    nonlocal x\n", "no binding for nonlocal 'x' found"),
+			(
+				"def f():\n    global x\n    nonlocal x\n",
+				"name 'x' is nonlocal and global",
+			),
+			(
+				"def f():\n    print(x)\n    global x\n",
+				"name 'x' is used prior to global declaration",
+			),
+			(
+				"def f():\n    x = 1\n    global x\n",
+				"name 'x' is assigned to before global declaration",
+			),
+			(
+				"def outer():\n    x = 1\n    def f():\n        print(x)\n        nonlocal x\n",
+				"name 'x' is used prior to nonlocal declaration",
+			),
+			(
+				"def outer():\n    x = 1\n    def f():\n        x = 2\n        nonlocal x\n",
+				"name 'x' is assigned to before nonlocal declaration",
+			),
+			("def f(x):\n    global x\n", "name 'x' is parameter and global"),
+			(
+				"def outer():\n    x = 1\n    def f(x):\n        nonlocal x\n",
+				"name 'x' is parameter and nonlocal",
+			),
+		];
+
+		for (source, expected) in cases {
+			assert_eq!(analyze_error_message(source), expected, "source:\n{source}");
+		}
 	}
 
 	#[test]

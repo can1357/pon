@@ -993,14 +993,21 @@ fn raise_bytearray_remove_error(message: String) -> *mut PyObject {
 	}
 }
 
+fn is_memoryview_unsupported_format(message: &str) -> bool {
+	message.starts_with("memoryview: format ") && message.ends_with(" not supported")
+}
+
 /// Slice-key failures on str/bytes/bytearray/memoryview subscripts: a zero
-/// step is CPython ValueError, non-int bounds are TypeError; anything else
-/// (receiver invariants, unsupported formats) keeps the bare diagnostic.
+/// step is CPython ValueError, non-int bounds are TypeError; unsupported
+/// memoryview scalar formats are typed NotImplementedError.  Receiver
+/// invariants keep the bare diagnostic.
 fn raise_slice_error(message: String) -> *mut PyObject {
 	if message == "slice step cannot be zero" {
 		raise_value_error(message)
 	} else if message == "expected int object" {
 		raise_type_error(message)
+	} else if is_memoryview_unsupported_format(&message) {
+		raise_typed(ExceptionKind::NotImplementedError, &message)
 	} else {
 		super::return_null_with_error(message)
 	}
@@ -1095,6 +1102,8 @@ fn return_null_with_byte_index_error(message: String) -> *mut PyObject {
 		raise_value_error(message)
 	} else if message == "expected int object" {
 		raise_type_error(message)
+	} else if is_memoryview_unsupported_format(&message) {
+		raise_typed(ExceptionKind::NotImplementedError, &message)
 	} else {
 		super::return_null_with_error(message)
 	}
@@ -2068,11 +2077,14 @@ unsafe extern "C" fn memoryview_tolist_entry(
 	}
 	let values = match unsafe { memoryview_type::tolist(view) } {
 		Ok(values) => values,
+		Err(message) if is_memoryview_unsupported_format(&message) => {
+			return raise_typed(ExceptionKind::NotImplementedError, &message);
+		},
 		Err(message) => return super::return_null_with_error(message),
 	};
 	let mut objects = Vec::with_capacity(values.len());
 	for value in values {
-		objects.push(unsafe { super::pon_const_int(value) });
+		objects.push(memoryview_scalar_object(value));
 	}
 	unsafe { super::seq::pon_build_list(objects.as_mut_ptr(), objects.len()) }
 }
@@ -2115,11 +2127,12 @@ unsafe extern "C" fn memoryview_release_entry(
 	unsafe { super::pon_none() }
 }
 
-/// Marks a view released exactly once, notifying the exporter on the
-/// transition so BytesIO's live-export count (its CPython CHECK_EXPORTS
-/// gate) stays balanced under idempotent `release()`/`__exit__` replays.
+/// Marks a view released exactly once.  BytesIO sees the release transition
+/// for its live-export count, and foreign C exporters see their
+/// `bf_releasebuffer` callback.
 fn release_view_once(view: &mut memoryview_type::PyMemoryView) {
 	if !view.released {
+		unsafe { memoryview_type::release_foreign_export(view) };
 		view.released = true;
 		crate::native::io::bytesio_export_released(view.base);
 	}
@@ -4599,6 +4612,19 @@ fn memoryview_bytes(object: *mut PyObject) -> Result<Vec<u8>, String> {
 	Ok(unsafe { memoryview_type::tobytes(object.cast::<memoryview_type::PyMemoryView>()) })
 }
 
+fn memoryview_scalar_object(value: memoryview_type::MemoryViewListValue) -> *mut PyObject {
+	match value {
+		memoryview_type::MemoryViewListValue::Int(value) => unsafe { super::pon_const_int(value) },
+		memoryview_type::MemoryViewListValue::Unsigned(value) => match i64::try_from(value) {
+			Ok(value) => unsafe { super::pon_const_int(value) },
+			Err(_) => crate::types::int::from_bigint(num_bigint::BigInt::from(value)),
+		},
+		memoryview_type::MemoryViewListValue::Float(value) => unsafe {
+			crate::abi::number::pon_const_float(value)
+		},
+	}
+}
+
 fn memoryview_item_object(object: *mut PyObject, index: isize) -> Result<*mut PyObject, String> {
 	if object.is_null() || !memoryview_type::is_memoryview_type(unsafe { (*object).ob_type }) {
 		return Err("expected memoryview object".to_owned());
@@ -4609,16 +4635,9 @@ fn memoryview_item_object(object: *mut PyObject, index: isize) -> Result<*mut Py
 	}
 	let itemsize = view.itemsize();
 	let index = normalize_byte_index(index, view.len / itemsize)?;
-	let bytes = unsafe { view.as_slice() };
-	let value = match itemsize {
-		1 => i64::from(bytes[index]),
-		4 => {
-			let chunk = &bytes[index * 4..index * 4 + 4];
-			i64::from(u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-		},
-		_ => return Err("memoryview indexing is not supported for this format".to_owned()),
-	};
-	Ok(unsafe { super::pon_const_int(value) })
+	Ok(memoryview_scalar_object(unsafe {
+		memoryview_type::element_value(view, index)?
+	}))
 }
 
 fn memoryview_slice_object(

@@ -34,9 +34,10 @@ use std::{
 	panic::{AssertUnwindSafe, catch_unwind},
 	ptr,
 	sync::{
-		Condvar, LazyLock, Mutex, MutexGuard,
+		Condvar, LazyLock, Mutex, MutexGuard, TryLockError,
 		atomic::{AtomicPtr, AtomicU32, Ordering},
 	},
+	time::{Duration, Instant},
 };
 
 pub use iter::{pon_get_iter, pon_iter_next};
@@ -65,7 +66,8 @@ use crate::{
 		TIER_STATE_TIER1, as_object_ptr, is_exact_type,
 	},
 	thread_state::{
-		pon_err_clear, pon_err_message, pon_err_occurred, pon_err_set, thread_state_lock,
+		GcCallRoots, PonThreadState, ScopedRootSourceEntry, ScopedRootsFn, pon_err_clear,
+		pon_err_message, pon_err_occurred, pon_err_set, thread_state_lock,
 	},
 	types::{
 		bool_, bytearray_, bytes_, classmethod, complex_,
@@ -168,6 +170,322 @@ struct CurrentCall {
 	caller_line: u32,
 }
 
+/// One caller/callee edge returned to `_lsprof.getstats()`.
+#[derive(Clone, Debug)]
+pub(crate) struct LsprofCallSnapshot {
+	/// Callee function object whose `__code__` identifies the pstats row.
+	pub function:      *mut PyObject,
+	/// Calls observed for this caller/callee edge.
+	pub callcount:     u64,
+	/// Recursive calls observed for this caller/callee edge.
+	pub reccallcount:  u64,
+	/// Cumulative seconds spent in the callee for this edge.
+	pub total_seconds: f64,
+	/// Seconds spent in the callee body excluding recorded children.
+	pub inline_seconds: f64,
+}
+
+/// One function row returned to `_lsprof.getstats()`.
+#[derive(Clone, Debug)]
+pub(crate) struct LsprofEntrySnapshot {
+	/// Function object whose `__code__` identifies the pstats row.
+	pub function:      *mut PyObject,
+	/// Total calls observed for this function.
+	pub callcount:     u64,
+	/// Recursive calls observed for this function.
+	pub reccallcount:  u64,
+	/// Cumulative seconds spent in this function.
+	pub total_seconds: f64,
+	/// Seconds spent in this function excluding recorded children.
+	pub inline_seconds: f64,
+	/// Per-callee stats emitted as this entry's `calls` list.
+	pub calls:         Vec<LsprofCallSnapshot>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LsprofFunctionStats {
+	callcount:    u64,
+	reccallcount: u64,
+	total_ns:     u128,
+	inline_ns:    u128,
+	subcalls:     HashMap<usize, LsprofCallStats>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LsprofCallStats {
+	callcount:    u64,
+	reccallcount: u64,
+	total_ns:     u128,
+	inline_ns:    u128,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LsprofActiveFrame {
+	function:  usize,
+	start:     Instant,
+	child_ns:  u128,
+	recursive: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LsprofRuntimeState {
+	enabled: bool,
+	subcalls: bool,
+	builtins: bool,
+	stats:    HashMap<usize, LsprofFunctionStats>,
+	stack:    Vec<LsprofActiveFrame>,
+}
+
+#[derive(Debug, Default)]
+struct LsprofRegistry {
+	profilers: HashMap<usize, LsprofRuntimeState>,
+	active:    Vec<usize>,
+}
+
+static LSPROF_REGISTRY: LazyLock<Mutex<LsprofRegistry>> =
+	LazyLock::new(|| Mutex::new(LsprofRegistry::default()));
+
+/// Register or reset one `_lsprof.Profiler` runtime record.
+pub(crate) fn lsprof_register_profiler(
+	profiler: *mut PyObject,
+	subcalls: bool,
+	builtins: bool,
+) {
+	if profiler.is_null() {
+		return;
+	}
+	let mut registry = LSPROF_REGISTRY
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner());
+	let profiler_key = profiler as usize;
+	registry.active.retain(|&active| active != profiler_key);
+	registry.profilers.insert(profiler_key, LsprofRuntimeState {
+		enabled: false,
+		subcalls,
+		builtins,
+		stats: HashMap::new(),
+		stack: Vec::new(),
+	});
+}
+
+/// Enable one `_lsprof.Profiler`, preserving accumulated stats.
+pub(crate) fn lsprof_enable_profiler(
+	profiler: *mut PyObject,
+	subcalls: bool,
+	builtins: bool,
+) {
+	if profiler.is_null() {
+		return;
+	}
+	let mut registry = LSPROF_REGISTRY
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner());
+	let profiler_key = profiler as usize;
+	let state = registry.profilers.entry(profiler_key).or_default();
+	state.enabled = true;
+	state.subcalls = subcalls;
+	state.builtins = builtins;
+	state.stack.clear();
+	if !registry.active.contains(&profiler_key) {
+		registry.active.push(profiler_key);
+	}
+}
+
+/// Disable one `_lsprof.Profiler`, closing active frames at a monotonic instant.
+pub(crate) fn lsprof_disable_profiler(profiler: *mut PyObject) {
+	if profiler.is_null() {
+		return;
+	}
+	let now = Instant::now();
+	let mut registry = LSPROF_REGISTRY
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner());
+	let profiler_key = profiler as usize;
+	if let Some(state) = registry.profilers.get_mut(&profiler_key) {
+		state.enabled = false;
+		lsprof_discard_control_frame(state);
+		while !state.stack.is_empty() {
+			lsprof_finish_frame(state, now);
+		}
+	}
+	registry.active.retain(|&active| active != profiler_key);
+}
+
+/// Clear accumulated stats and open frames for one `_lsprof.Profiler`.
+pub(crate) fn lsprof_clear_profiler(profiler: *mut PyObject) {
+	if profiler.is_null() {
+		return;
+	}
+	let mut registry = LSPROF_REGISTRY
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner());
+	let state = registry.profilers.entry(profiler as usize).or_default();
+	state.stats.clear();
+	state.stack.clear();
+}
+
+/// Snapshot completed `_lsprof.Profiler` call records in deterministic order.
+#[must_use]
+pub(crate) fn lsprof_stats_snapshot(profiler: *mut PyObject) -> Vec<LsprofEntrySnapshot> {
+	if profiler.is_null() {
+		return Vec::new();
+	}
+	let registry = LSPROF_REGISTRY
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner());
+	let Some(state) = registry.profilers.get(&(profiler as usize)) else {
+		return Vec::new();
+	};
+	let mut entries = state
+		.stats
+		.iter()
+		.map(|(&function, stats)| {
+			let mut calls = stats
+				.subcalls
+				.iter()
+				.map(|(&callee, call)| LsprofCallSnapshot {
+					function:       callee as *mut PyObject,
+					callcount:      call.callcount,
+					reccallcount:   call.reccallcount,
+					total_seconds:  ns_to_seconds(call.total_ns),
+					inline_seconds: ns_to_seconds(call.inline_ns),
+				})
+				.collect::<Vec<_>>();
+			calls.sort_by_key(|call| lsprof_function_sort_key(call.function as usize));
+			LsprofEntrySnapshot {
+				function:       function as *mut PyObject,
+				callcount:      stats.callcount,
+				reccallcount:   stats.reccallcount,
+				total_seconds:  ns_to_seconds(stats.total_ns),
+				inline_seconds: ns_to_seconds(stats.inline_ns),
+				calls,
+			}
+		})
+		.collect::<Vec<_>>();
+	entries.sort_by_key(|entry| lsprof_function_sort_key(entry.function as usize));
+	entries
+}
+
+fn lsprof_call_enter(function: *mut PyFunction) {
+	if function.is_null() {
+		return;
+	}
+	let now = Instant::now();
+	let mut registry = LSPROF_REGISTRY
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner());
+	let active = registry.active.clone();
+	for profiler_key in active {
+		let Some(state) = registry.profilers.get_mut(&profiler_key) else {
+			continue;
+		};
+		if !state.enabled {
+			continue;
+		}
+		if !state.builtins && crate::types::function::is_native_function(function.cast::<PyObject>())
+		{
+			continue;
+		}
+		let function_key = function as usize;
+		let recursive = state.stack.iter().any(|frame| frame.function == function_key);
+		state.stack.push(LsprofActiveFrame {
+			function: function_key,
+			start: now,
+			child_ns: 0,
+			recursive,
+		});
+	}
+}
+
+fn lsprof_call_exit(function: *mut PyFunction) {
+	if function.is_null() {
+		return;
+	}
+	let now = Instant::now();
+	let function_key = function as usize;
+	let mut registry = LSPROF_REGISTRY
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner());
+	let active = registry.active.clone();
+	for profiler_key in active {
+		let Some(state) = registry.profilers.get_mut(&profiler_key) else {
+			continue;
+		};
+		if !state.enabled || state.stack.last().map(|frame| frame.function) != Some(function_key) {
+			continue;
+		}
+		lsprof_finish_frame(state, now);
+	}
+}
+
+fn lsprof_finish_frame(state: &mut LsprofRuntimeState, now: Instant) {
+	let Some(frame) = state.stack.pop() else {
+		return;
+	};
+	let elapsed_ns = now.saturating_duration_since(frame.start).as_nanos();
+	let inline_ns = elapsed_ns.saturating_sub(frame.child_ns);
+	let stats = state.stats.entry(frame.function).or_default();
+	stats.callcount = stats.callcount.saturating_add(1);
+	stats.total_ns = stats.total_ns.saturating_add(elapsed_ns);
+	stats.inline_ns = stats.inline_ns.saturating_add(inline_ns);
+	if frame.recursive {
+		stats.reccallcount = stats.reccallcount.saturating_add(1);
+	}
+	if let Some(parent) = state.stack.last_mut() {
+		parent.child_ns = parent.child_ns.saturating_add(elapsed_ns);
+		if state.subcalls {
+			let parent_stats = state.stats.entry(parent.function).or_default();
+			let call_stats = parent_stats.subcalls.entry(frame.function).or_default();
+			call_stats.callcount = call_stats.callcount.saturating_add(1);
+			call_stats.total_ns = call_stats.total_ns.saturating_add(elapsed_ns);
+			call_stats.inline_ns = call_stats.inline_ns.saturating_add(inline_ns);
+			if frame.recursive {
+				call_stats.reccallcount = call_stats.reccallcount.saturating_add(1);
+			}
+		}
+	}
+}
+
+fn lsprof_discard_control_frame(state: &mut LsprofRuntimeState) {
+	let Some(frame) = state.stack.last() else {
+		return;
+	};
+	if lsprof_is_control_function(frame.function) {
+		state.stack.pop();
+	}
+}
+
+fn lsprof_is_control_function(function: usize) -> bool {
+	if function == 0 {
+		return false;
+	}
+	let name = unsafe { (*((function as *mut PyObject).cast::<PyFunction>())).name_interned };
+	matches!(
+		resolve(name).as_deref(),
+		Some(
+			"__init__"
+				| "__init_subclass__"
+				| "clear"
+				| "create_stats"
+				| "disable"
+				| "enable"
+				| "getstats"
+		)
+	)
+}
+
+fn lsprof_function_sort_key(function: usize) -> (String, usize) {
+	if function == 0 {
+		return (String::new(), 0);
+	}
+	let name = unsafe { (*((function as *mut PyObject).cast::<PyFunction>())).name_interned };
+	(resolve(name).unwrap_or_else(|| format!("<interned:{name}>")), function)
+}
+
+fn ns_to_seconds(ns: u128) -> f64 {
+	ns as f64 / 1_000_000_000.0
+}
+
 thread_local! {
 	 static CURRENT_FUNCTION_STACK: RefCell<Vec<CurrentCall>> = RefCell::new(Vec::new());
 }
@@ -179,11 +497,10 @@ pub const CURRENT_LINE_SYMBOL: &str = "pon_current_line";
 ///
 /// Generated code stores to this cell directly (no helper call) at every
 /// statement-line transition; traceback capture reads it as the raise-site
-/// line.  The cell is process-global like the Phase-A thread state: compiled
-/// Python executes single-threaded today, and [`CurrentFunctionGuard`]
-/// save/restore keeps it frame-accurate across compiled calls.  A
-/// free-threading build needs a per-thread cell (TLS data symbol or a helper
-/// call) before generated code may run on multiple threads.
+/// line.  The cell is process-global for now; [`CurrentFunctionGuard`]
+/// save/restore keeps it frame-accurate across compiled calls.  A future
+/// traceback pass should move this to a per-thread helper before relying on
+/// simultaneous traceback capture from multiple Python threads.
 #[unsafe(export_name = "pon_current_line")]
 static CURRENT_LINE_CELL: AtomicU32 = AtomicU32::new(0);
 
@@ -1925,6 +2242,7 @@ fn perform_runtime_init() -> Result<(), String> {
 	};
 
 	if should_register_native {
+		crate::native::signal::init_main_thread_signal_handlers()?;
 		crate::import::register_native_modules()?;
 		// Eager tuple surface: `collections.namedtuple` captures
 		// `tuple.__new__` at import time (`_tuple_new = tuple.__new__`),
@@ -4353,9 +4671,8 @@ impl ScopedRootSource for Vec<(usize, *mut PyObject)> {
 }
 
 /// Type-erased [`ScopedRootSource::push_roots`] entry (thin `(addr, thunk)`
-/// pairs, the `gcroot::RootRegistry` pattern): callers register a RAW
-/// pointer and never hold a shared borrow of a buffer they keep mutating.
-type ScopedRootsFn = unsafe fn(usize, &mut dyn FnMut(*mut PyObject));
+/// pairs, the `gcroot::RootRegistry` pattern): callers register a raw pointer
+/// and never hold a shared borrow of a buffer they keep mutating.
 
 unsafe fn scoped_roots_thunk<T: ScopedRootSource>(
 	addr: usize,
@@ -4372,7 +4689,11 @@ unsafe fn scoped_roots_thunk<T: ScopedRootSource>(
 /// address for the guard's lifetime (its CONTENTS may change freely).
 pub(crate) fn scoped_roots<T: ScopedRootSource>(source: *const T) -> ScopedRootsGuard {
 	let addr = source as usize;
-	SCOPED_ROOT_SOURCES.with(|cell| cell.borrow_mut().push((addr, scoped_roots_thunk::<T>)));
+	let thunk = scoped_roots_thunk::<T>;
+	SCOPED_ROOT_SOURCES.with(|cell| cell.borrow_mut().push((addr, thunk)));
+	thread_state_lock()
+		.scoped_root_sources
+		.push(ScopedRootSourceEntry { addr, thunk });
 	ScopedRootsGuard { addr }
 }
 
@@ -4388,6 +4709,14 @@ impl Drop for ScopedRootsGuard {
 				sources.remove(position);
 			}
 		});
+		let mut state = thread_state_lock();
+		if let Some(position) = state
+			.scoped_root_sources
+			.iter()
+			.rposition(|entry| entry.addr == self.addr)
+		{
+			state.scoped_root_sources.remove(position);
+		}
 	}
 }
 
@@ -4453,6 +4782,9 @@ struct CallOperandsGuard;
 impl CallOperandsGuard {
 	fn push(callee: *mut PyObject, argv: *mut *mut PyObject, argc: usize, caller_sp: usize) -> Self {
 		ACTIVE_CALL_OPERANDS.with(|cell| cell.borrow_mut().push((callee, argv, argc, caller_sp)));
+		thread_state_lock()
+			.helper_call_roots
+			.push(GcCallRoots { callable: callee, argv, argc });
 		Self
 	}
 }
@@ -4462,6 +4794,7 @@ impl Drop for CallOperandsGuard {
 		ACTIVE_CALL_OPERANDS.with(|cell| {
 			cell.borrow_mut().pop();
 		});
+		let _ = thread_state_lock().helper_call_roots.pop();
 	}
 }
 
@@ -4504,7 +4837,8 @@ fn maybe_auto_collect() {
 /// the dispatch record's scan-floor candidate (see [`dispatch_scan_floor`]),
 /// then tail-jumps into [`pon_call_dispatch`].
 ///
-/// TAG-OK: the naked shim cannot run Rust; `pon_call_dispatch` normalizes `callee`.
+/// TAG-OK: the naked shim cannot run Rust; `pon_call_dispatch` normalizes
+/// `callee`.
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_call(
@@ -4724,9 +5058,9 @@ pub(crate) fn guard_recursion_limit() -> Option<*mut PyObject> {
 		"maximum recursion depth exceeded",
 	))
 }
-
 pub(crate) struct CurrentFunctionGuard {
-	pushed: bool,
+	pushed:   bool,
+	function: *mut PyFunction,
 }
 
 impl CurrentFunctionGuard {
@@ -4738,17 +5072,23 @@ impl CurrentFunctionGuard {
 					.borrow_mut()
 					.push(CurrentCall { function, argv, argc, caller_line })
 			});
-			return Self { pushed: true };
+			thread_state_lock()
+				.current_call_roots
+				.push(GcCallRoots { callable: function.cast::<PyObject>(), argv, argc });
+			lsprof_call_enter(function);
+			return Self { pushed: true, function };
 		}
-		Self { pushed: false }
+		Self { pushed: false, function: ptr::null_mut() }
 	}
 }
 
 impl Drop for CurrentFunctionGuard {
 	fn drop(&mut self) {
 		if self.pushed {
+			lsprof_call_exit(self.function);
 			let caller_line = CURRENT_FUNCTION_STACK
 				.with(|stack| stack.borrow_mut().pop().map(|call| call.caller_line));
+			let _ = thread_state_lock().current_call_roots.pop();
 			if let Some(line) = caller_line {
 				// The callee's stores are stale once it returned: restore the
 				// caller's statement line for post-call raises.
@@ -5159,7 +5499,11 @@ unsafe fn call_type_from_argv(
 		if instance.is_null() {
 			return ptr::null_mut();
 		}
-		// `__init__` only runs when `__new__` produced an instance of `cls`.
+		// `__init__` only runs when `__new__` produced a heap instance of
+		// `cls`; immediate singletons/ints have no object header to inspect.
+		if !crate::tag::is_heap(instance) {
+			return instance;
+		}
 		let instance_type = unsafe { (*instance).ob_type.cast_mut() };
 		if instance_type.is_null() || unsafe { !crate::mro::is_subtype(instance_type, cls) } {
 			return instance;
@@ -6320,6 +6664,132 @@ pub(crate) fn scrub_dead_stack_below() {
 	std::hint::black_box(scrub.as_mut_ptr());
 }
 
+static COLLECT_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn lock_collect_mutex() -> MutexGuard<'static, ()> {
+	match COLLECT_MUTEX.try_lock() {
+		Ok(guard) => guard,
+		Err(TryLockError::Poisoned(poison)) => poison.into_inner(),
+		Err(TryLockError::WouldBlock) => {
+			let mut region = crate::sync::BlockingRegionGuard::enter();
+			let guard = COLLECT_MUTEX.lock().unwrap_or_else(|poison| poison.into_inner());
+			let _ = region.leave();
+			guard
+		},
+	}
+}
+
+struct GcStopGuard;
+
+impl GcStopGuard {
+	fn request() -> Self {
+		let _ = crate::thread::thread_registry().attach_current();
+		pon_gc::request_global_stop();
+		wait_for_registered_threads_to_stop();
+		Self
+	}
+}
+
+impl Drop for GcStopGuard {
+	fn drop(&mut self) {
+		pon_gc::resume_global_stop();
+	}
+}
+
+fn wait_for_registered_threads_to_stop() {
+	let current = crate::thread::current_os_thread_id();
+	loop {
+		let mut all_stopped = true;
+		crate::thread::thread_registry().for_each(|handle| {
+			if handle.os_thread_id != current && handle.in_gc_safe_region == 0 {
+				all_stopped = false;
+			}
+		});
+		if all_stopped {
+			return;
+		}
+		std::thread::sleep(Duration::from_micros(50));
+	}
+}
+
+fn push_thread_state_roots(state: &PonThreadState, roots: &mut Vec<*mut u8>) {
+	if !state.current_exc.is_null() {
+		roots.push(state.current_exc.cast::<u8>());
+	}
+	for value in state.frame_stack.iter().copied() {
+		roots.push(value.cast::<u8>());
+	}
+	for value in state.exception_state_stack.iter().copied() {
+		if !value.is_null() {
+			roots.push(value.cast::<u8>());
+		}
+	}
+	for frame in &state.exc_star_stack {
+		if !frame.original.is_null() {
+			roots.push(frame.original.cast::<u8>());
+		}
+		if !frame.rest.is_null() {
+			roots.push(frame.rest.cast::<u8>());
+		}
+		for raised in frame.raised.iter().copied() {
+			if !raised.is_null() {
+				roots.push(raised.cast::<u8>());
+			}
+		}
+	}
+	if !state.handled_exc.is_null() {
+		roots.push(state.handled_exc.cast::<u8>());
+	}
+	for value in state.handled_exc_saves.iter().copied() {
+		if !value.is_null() {
+			roots.push(value.cast::<u8>());
+		}
+	}
+	for call in state.current_call_roots.iter().chain(state.helper_call_roots.iter()) {
+		if !call.callable.is_null() {
+			roots.push(call.callable.cast::<u8>());
+		}
+		if call.argv.is_null() {
+			continue;
+		}
+		for index in 0..call.argc {
+			let value = unsafe { *call.argv.add(index) };
+			if !value.is_null() {
+				roots.push(value.cast::<u8>());
+			}
+		}
+	}
+	for entry in &state.scoped_root_sources {
+		unsafe { (entry.thunk)(entry.addr, &mut |value| roots.push(value.cast::<u8>())) };
+	}
+}
+
+fn push_registered_thread_roots(roots: &mut Vec<*mut u8>) {
+	let current = crate::thread::current_os_thread_id();
+	crate::thread::thread_registry().for_each(|handle| {
+		// SAFETY: ThreadRegistry::for_each holds the state mutex while invoking
+		// this callback; `handle.state` is valid for this callback only.
+		let state = unsafe { &*handle.state };
+		push_thread_state_roots(state, roots);
+		if handle.os_thread_id != current
+			&& handle.in_gc_safe_region != 0
+			&& !handle.stack_top_fp.is_null()
+			&& !handle.stack_base.is_null()
+		{
+			// SAFETY: non-current threads are scanned only after the stop request
+			// wait observed their GC-safe-region publication.
+			unsafe {
+				pon_gc::collect_stack_range_roots(
+					handle.stack_top_fp,
+					handle.stack_base,
+					0,
+					&mut |_, root| roots.push(root),
+				);
+			}
+		}
+	});
+}
+
 /// Runs a stop-the-world collection using the runtime's current root set.
 pub fn collect() -> Result<(), String> {
 	// Scrub first, then run the whole collection in a fresh callee frame so
@@ -6333,6 +6803,8 @@ pub fn collect() -> Result<(), String> {
 
 #[inline(never)]
 fn collect_impl() -> Result<(), String> {
+	let _collect_lock = lock_collect_mutex();
+	let _stop = GcStopGuard::request();
 	let mut slot = runtime_lock();
 	let Some(runtime) = slot.as_mut() else {
 		return Err("runtime is not initialized".to_owned());
@@ -6389,41 +6861,7 @@ fn collect_impl() -> Result<(), String> {
 		}
 	}
 
-	{
-		let state = thread_state_lock();
-		if !state.current_exc.is_null() {
-			roots.push(state.current_exc.cast::<u8>());
-		}
-		for value in state.frame_stack.iter().copied() {
-			roots.push(value.cast::<u8>());
-		}
-		for value in state.exception_state_stack.iter().copied() {
-			if !value.is_null() {
-				roots.push(value.cast::<u8>());
-			}
-		}
-		for frame in &state.exc_star_stack {
-			if !frame.original.is_null() {
-				roots.push(frame.original.cast::<u8>());
-			}
-			if !frame.rest.is_null() {
-				roots.push(frame.rest.cast::<u8>());
-			}
-			for raised in frame.raised.iter().copied() {
-				if !raised.is_null() {
-					roots.push(raised.cast::<u8>());
-				}
-			}
-		}
-		if !state.handled_exc.is_null() {
-			roots.push(state.handled_exc.cast::<u8>());
-		}
-		for value in state.handled_exc_saves.iter().copied() {
-			if !value.is_null() {
-				roots.push(value.cast::<u8>());
-			}
-		}
-	}
+	push_registered_thread_roots(&mut roots);
 
 	{
 		// Pin J0.1 §6: the thread's stashed delegation finish value must stay
@@ -6575,6 +7013,8 @@ fn collect_impl() -> Result<(), String> {
 		}
 	}
 	let _reset = FloorReset(previous_floor);
+	pon_gc::global_handshake().set_phase(pon_gc::GcPhase::Collecting);
+	let _collector = pon_gc::enter_collector_thread();
 	// SAFETY: `heap` points into the process-lifetime runtime slot.  The slot
 	// is not cleared after initialization; dropping the runtime mutex here lets
 	// object finalizers call back into ABI helpers without deadlocking.

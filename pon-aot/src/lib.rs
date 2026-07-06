@@ -1,11 +1,8 @@
 //!Ahead-of-time object emission and linking for Pon.
 
-use std::{
-	fs,
-	path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use cranelift_frontend::FunctionBuilderContext;
 use cranelift_module::Module as _;
 use target_lexicon::Triple;
@@ -32,47 +29,55 @@ pub struct BuildOptions {
 
 /// Build `entry_path` into a native executable and return the output path.
 ///
-/// The boxed baseline path compiles the whole static module closure: the entry
-/// module exports the zero-argument `pon_module_main` wrapper, and every other
-/// reachability unit becomes its own object file whose body the generated
-/// `pon_aot_init_modules` registrar announces to the runtime import machinery.
-/// The typed `--opt` path still compiles the entry module alone.
+/// Both baseline and `--opt` builds compile the whole static import closure:
+/// the entry module exports the zero-argument `pon_module_main` wrapper, and
+/// every other reachability unit becomes its own object file whose body the
+/// generated `pon_aot_init_modules` registrar announces to the runtime import
+/// machinery. `--opt` seeds type metadata per unit when available, then falls
+/// back to the same boxed baseline lowering for functions the typed path cannot
+/// cover.
 pub fn build(entry_path: &Path, opts: &BuildOptions) -> anyhow::Result<PathBuf> {
-	let (entry_module, embedded_units) = if opts.opt {
-		let module =
-			typed_ir_module(entry_path, opts.allow_dynamic).context("failed to seed typed AoT IR")?;
-		(module, Vec::new())
-	} else {
-		let resolver = reachable::PathImportResolver::with_runtime_import_order(
-			pon_runtime::import::source_search_roots(),
-			pon_runtime::import::import_shadowed_from_source,
-		);
-		let reachability = reachable::module_closure_with_options(
-			entry_path,
-			&resolver,
-			&reachable::ReachabilityOptions {
-				allow_dynamic: opts.allow_dynamic,
-				..Default::default()
-			},
-		)
-		.context("failed to compute AoT reachability")?;
-		if std::env::var_os("PON_AOT_DEBUG_CLOSURE").is_some() {
-			for unit in &reachability.units {
-				eprintln!("unit: {} <- {}", unit.module_name, unit.path.display());
-				for edge in &unit.imports {
-					eprintln!("    import {:?} -> {:?}", edge.import.module, edge.resolution);
-				}
-			}
-			for skip in &reachability.skipped {
-				eprintln!("skip: {} ({})", skip.module_name, skip.reason);
+	let resolver = reachable::PathImportResolver::with_runtime_import_order(
+		pon_runtime::import::source_search_roots(),
+		pon_runtime::import::import_shadowed_from_source,
+	);
+	let mut reachability = reachable::module_closure_with_options(
+		entry_path,
+		&resolver,
+		&reachable::ReachabilityOptions {
+			allow_dynamic: opts.allow_dynamic,
+			..Default::default()
+		},
+	)
+	.context("failed to compute AoT reachability")?;
+	if std::env::var_os("PON_AOT_DEBUG_CLOSURE").is_some() {
+		for unit in &reachability.units {
+			eprintln!("unit: {} <- {}", unit.module_name, unit.path.display());
+			for edge in &unit.imports {
+				eprintln!("    import {:?} -> {:?}", edge.import.module, edge.resolution);
 			}
 		}
-		let mut units = reachability.units.into_iter();
-		let entry_unit = units
-			.next()
-			.context("AoT reachability produced no entry module")?;
-		(entry_unit.module, units.collect())
-	};
+		for skip in &reachability.skipped {
+			eprintln!("skip: {} ({})", skip.module_name, skip.reason);
+		}
+	}
+	for skip in &reachability.skipped {
+		eprintln!(
+			"pon: warning: not embedding runtime-root module `{}` ({}); importing it at runtime \
+			 will fail unless the module is provided by PONPATH",
+			skip.module_name, skip.reason
+		);
+	}
+	if opts.opt {
+		prepare_optimized_modules(&mut reachability.units);
+	}
+	let requires_dynamic_runtime = reachability.requires_dynamic_runtime;
+	let mut units = reachability.units.into_iter();
+	let entry_unit = units
+		.next()
+		.context("AoT reachability produced no entry module")?;
+	let entry_module = entry_unit.module;
+	let embedded_units = units.collect::<Vec<_>>();
 
 	let triple = opts.target.clone().unwrap_or_else(Triple::host);
 	let mut object_paths = vec![object_path_for(&opts.out_path)];
@@ -88,20 +93,34 @@ pub fn build(entry_path: &Path, opts: &BuildOptions) -> anyhow::Result<PathBuf> 
 		let mut unit_object = object_module::new_object_module(isa, &format!("pon_unit_{index}"))?;
 		let mut unit_ctx = unit_object.make_context();
 		let mut unit_fctx = FunctionBuilderContext::new();
-		let compiled = pon_codegen::compile_ir_module(
-			&mut unit_object,
-			&unit.module,
-			pon_codegen::CompileMode::Aot,
-			&mut unit_ctx,
-			&mut unit_fctx,
-		);
+		let compiled = if opts.opt {
+			pon_codegen::compile_optimized_ir_module(
+				&mut unit_object,
+				&unit.module,
+				pon_codegen::CompileMode::Aot,
+				&mut unit_ctx,
+				&mut unit_fctx,
+			)
+		} else {
+			pon_codegen::compile_ir_module(
+				&mut unit_object,
+				&unit.module,
+				pon_codegen::CompileMode::Aot,
+				&mut unit_ctx,
+				&mut unit_fctx,
+			)
+		};
 		let func_ids = match compiled {
 			Ok(func_ids) => func_ids,
 			// Best-effort units (runtime import roots) may outrun codegen
 			// support; dropping one reproduces the no-embedding runtime
 			// behavior for that module instead of failing the whole build.
 			Err(error) if unit.best_effort => {
-				eprintln!("pon: warning: not embedding module `{}`: {error:#}", unit.module_name);
+				eprintln!(
+					"pon: warning: not embedding module `{}`; importing it at runtime will fail \
+					 unless the module is provided by PONPATH: {error:#}",
+					unit.module_name
+				);
 				continue;
 			},
 			Err(error) => {
@@ -170,7 +189,8 @@ pub fn build(entry_path: &Path, opts: &BuildOptions) -> anyhow::Result<PathBuf> 
 		.context("failed to emit AoT module main wrapper")?;
 	entry::define_aot_module_registrar(&mut module, &embedded_specs)
 		.context("failed to emit AoT embedded-module registrar")?;
-	entry::define_main_trampoline(&mut module).context("failed to emit AoT main trampoline")?;
+	entry::define_main_trampoline(&mut module, requires_dynamic_runtime)
+		.context("failed to emit AoT main trampoline")?;
 
 	object_module::finish_to_object_file(module, &triple, &object_paths[0])
 		.with_context(|| format!("failed to emit object file {}", object_paths[0].display()))?;
@@ -180,7 +200,7 @@ pub fn build(entry_path: &Path, opts: &BuildOptions) -> anyhow::Result<PathBuf> 
 		"interner grew after the AoT name snapshot; embedded ids would not replay"
 	);
 
-	let runtime_archive = link::locate_runtime_archive()?;
+	let runtime_archive = link::locate_runtime_archive(requires_dynamic_runtime)?;
 	link::link_executable(&object_paths, &runtime_archive, &opts.out_path, &triple)?;
 
 	Ok(opts.out_path.clone())
@@ -196,32 +216,32 @@ fn aot_runtime_name_snapshot(module_names: &[String]) -> Vec<String> {
 	pon_runtime::intern::snapshot()
 }
 
-fn typed_ir_module(entry_path: &Path, allow_dynamic: bool) -> anyhow::Result<pon_ir::Module> {
-	let source = fs::read_to_string(entry_path)
-		.with_context(|| format!("failed to read `{}` for typed AoT", entry_path.display()))?;
-	let dynamic_sinks = pon_ir::lower::scan_dynamic_sinks_source(&source).with_context(|| {
-		format!("failed to scan `{}` for dynamic-code sinks", entry_path.display())
-	})?;
-	if !allow_dynamic {
-		if let Some(sink) = dynamic_sinks.first() {
-			bail!(
-				"`{}` is unsupported in AoT builds; rebuild with --allow-dynamic to embed \
-				 dynamic-code support",
-				sink.kind.as_str()
-			);
+fn prepare_optimized_modules(units: &mut [reachable::CompileUnit]) {
+	for unit in units {
+		match optimized_ir_module(&unit.path, &unit.source) {
+			Ok(module) => unit.module = module,
+			Err(error) => {
+				eprintln!(
+					"pon: warning: optimized AoT preparation for module `{}` failed; using \
+					 baseline IR for that unit: {error:#}",
+					unit.module_name
+				);
+			},
 		}
 	}
+}
 
-	let parsed = pon_ir::parse_module_source(&source)
-		.with_context(|| format!("failed to parse `{}` for typed AoT", entry_path.display()))?;
+fn optimized_ir_module(path: &Path, source: &str) -> anyhow::Result<pon_ir::Module> {
+	let parsed = pon_ir::parse_module_source(source)
+		.with_context(|| format!("failed to parse `{}` for typed AoT", path.display()))?;
 	let annotations = pon_codegen::read_module_annotations(&parsed).with_context(|| {
-		format!("failed to read type annotations from `{}`", entry_path.display())
+		format!("failed to read type annotations from `{}`", path.display())
 	})?;
 	let mut lowerable = parsed.clone();
 	pon_codegen::strip_annotations_for_lowering(&mut lowerable);
 
-	let mut module = pon_ir::lower_module(&lowerable, Some(&source))
-		.with_context(|| format!("failed to lower `{}` for typed AoT", entry_path.display()))?;
+	let mut module = pon_ir::lower_module(&lowerable, Some(source))
+		.with_context(|| format!("failed to lower `{}` for typed AoT", path.display()))?;
 	pon_codegen::infer_module_types(&mut module, &annotations);
 	Ok(module)
 }

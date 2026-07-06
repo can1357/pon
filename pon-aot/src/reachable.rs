@@ -28,8 +28,9 @@ use pon_ir::{
 /// Options that affect AoT reachability policy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReachabilityOptions {
-	/// Allow statically-reached dynamic code sinks and mark the build as needing
-	/// the optional runtime/JIT dynamic-code path.
+	/// Allow statically-reached entry/source dynamic-code sinks. Best-effort
+	/// runtime-root units may still request the optional runtime/JIT path when
+	/// their stdlib implementation needs `eval`/`exec` internally.
 	pub allow_dynamic:    bool,
 	/// Longest prerequisite import chain followed from the entry module.
 	/// Modules discovered past this depth are skipped (and reported) instead
@@ -301,18 +302,8 @@ pub fn module_closure_with_options(
 			},
 		};
 		if !dynamic_sinks.is_empty() {
-			if options.allow_dynamic {
+			if options.allow_dynamic || pending.best_effort {
 				requires_dynamic_runtime = true;
-			} else if pending.best_effort {
-				skipped.push(SkippedUnit {
-					module_name: pending.name,
-					path,
-					reason: format!(
-						"dynamic-code sink `{}` requires --allow-dynamic",
-						dynamic_sinks[0].kind.as_str()
-					),
-				});
-				continue;
 			} else {
 				return Err(ReachabilityError::DynamicCode {
 					path:     path.clone(),
@@ -379,6 +370,16 @@ pub fn module_closure_with_options(
 					pending.best_effort || resolved_best_effort,
 					pending.depth + 1,
 				);
+			}
+			if matches!(absolute.as_deref(), Some("os" | "os.path")) {
+				enqueue_os_path_prerequisite(
+					&mut worklist,
+					&mut assigned,
+					&path,
+					import_resolver,
+					pending.best_effort,
+					pending.depth + 1,
+				)?;
 			}
 			import_edges.push(ImportEdge { import, resolution });
 		}
@@ -634,6 +635,31 @@ fn static_resolution_target(resolution: &ImportResolution) -> Option<(&Path, boo
 	}
 }
 
+fn enqueue_os_path_prerequisite(
+	worklist: &mut VecDeque<PendingUnit>,
+	assigned: &mut BTreeMap<String, PathBuf>,
+	importing_path: &Path,
+	import_resolver: &dyn StaticImportResolver,
+	best_effort: bool,
+	depth: usize,
+) -> Result<(), ReachabilityError> {
+	let module = if cfg!(windows) { "ntpath" } else { "posixpath" };
+	let import = StaticImport { module: module.to_owned(), level: 0 };
+	let resolution = import_resolver.resolve(importing_path, &import)?;
+	if let Some((path, resolved_best_effort)) = static_resolution_target(&resolution) {
+		let path = canonicalize_existing(path)?;
+		enqueue_with_ancestor_packages(
+			worklist,
+			assigned,
+			module,
+			&path,
+			best_effort || resolved_best_effort,
+			depth,
+		);
+	}
+	Ok(())
+}
+
 fn name_string(module: &Module, name: NameId) -> Option<&str> {
 	module.names.get(name.0 as usize).map(String::as_str)
 }
@@ -867,7 +893,36 @@ mod tests {
 	}
 
 	#[test]
-	fn skips_best_effort_units_that_cannot_join() {
+	fn os_import_queues_posixpath_for_native_os_path_alias() {
+		let root = temp_root("os-path");
+		let stdlib = root.join("lib");
+		fs::create_dir_all(&stdlib).expect("stdlib root should be creatable");
+		let app = root.join("app.py");
+		fs::write(&app, "import os\nprint(os.path)\n").expect("app should be writable");
+		fs::write(stdlib.join("posixpath.py"), "import genericpath\nvalue = 1\n")
+			.expect("posixpath should be writable");
+		fs::write(stdlib.join("genericpath.py"), "value = 2\n")
+			.expect("genericpath should be writable");
+
+		let resolver = PathImportResolver::with_runtime_import_order(vec![stdlib.clone()], |name| {
+			name == "os" || name == "sys"
+		});
+		let report = module_closure_with_options(&app, &resolver, &ReachabilityOptions::default())
+			.expect("native os imports should prefetch the os.path implementation");
+
+		let names: Vec<&str> = report
+			.units
+			.iter()
+			.map(|unit| unit.module_name.as_str())
+			.collect();
+		assert_eq!(names, ["__main__", "posixpath", "genericpath"]);
+		assert!(report.skipped.is_empty());
+
+		let _ = fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn embeds_dynamic_best_effort_units_and_requests_jit_runtime() {
 		let root = temp_root("best-effort-skip");
 		let stdlib = root.join("lib");
 		fs::create_dir_all(&stdlib).expect("stdlib root should be creatable");
@@ -883,21 +938,18 @@ mod tests {
 		let resolver =
 			PathImportResolver::with_runtime_import_order(vec![stdlib.clone()], shadow_nat);
 		let report = module_closure_with_options(&app, &resolver, &ReachabilityOptions::default())
-			.expect("unembeddable best-effort units skip instead of failing");
+			.expect("dynamic best-effort units should embed and request the JIT runtime");
 
 		let names: Vec<&str> = report
 			.units
 			.iter()
 			.map(|unit| unit.module_name.as_str())
 			.collect();
-		assert_eq!(names, ["__main__", "vend"]);
-		assert_eq!(report.skipped.len(), 1);
-		assert_eq!(report.skipped[0].module_name, "sinky");
-		assert!(
-			report.skipped[0].reason.contains("dynamic-code sink"),
-			"reason: {}",
-			report.skipped[0].reason
-		);
+		assert_eq!(names, ["__main__", "vend", "sinky"]);
+		assert!(report.skipped.is_empty());
+		assert!(report.requires_dynamic_runtime);
+		assert_eq!(report.units[2].module_name, "sinky");
+		assert_eq!(report.units[2].dynamic_sinks.len(), 1);
 
 		let _ = fs::remove_dir_all(root);
 	}

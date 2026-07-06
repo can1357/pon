@@ -490,12 +490,15 @@ fn zip_mismatch_message(index: usize, relation: &str) -> String {
 }
 
 unsafe fn is_none(object: *mut PyObject) -> bool {
+	if object.is_null() || !crate::tag::is_heap(object) {
+		return false;
+	}
 	let ty = unsafe { object.as_ref().and_then(|object| object.ob_type.as_ref()) };
 	ty.is_some_and(|ty| ty.name() == "NoneType")
 }
 
 unsafe fn is_exact_type(object: *mut PyObject, ty: *const PyType) -> bool {
-	!object.is_null() && unsafe { (*object).ob_type == ty }
+	!object.is_null() && crate::tag::is_heap(object) && unsafe { (*object).ob_type == ty }
 }
 
 fn raise_stop_iteration() -> *mut PyObject {

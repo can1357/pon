@@ -19,14 +19,14 @@ use crate::{feedback::FeedbackVec, intern};
 /// free-threaded coordination.
 ///
 /// This is not a reference count.  It is deliberately one machine word so the
-/// GIL/default object header remains byte-identical to the pre-Phase-E layout:
-/// `ob_type` followed immediately by this flags word.  Future free-threading
+/// Object headers remain byte-identical to the pre-Phase-E layout:
+/// `ob_type` followed immediately by this flags word.  Future no-GIL
 /// object-state bits must be carved out of `flags` rather than adding fields to
 /// [`PyObjectHeader`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GcMeta {
-	/// Reserved collector/free-threading bits.  Runtime code must not encode
+	/// Reserved collector/no-GIL bits.  Runtime code must not encode
 	/// ownership here.
 	pub flags: usize,
 }

@@ -36,6 +36,10 @@ pub struct PyBaseException {
 	pub args:             *mut PyObject,
 	/// Lazily created per-instance attribute dictionary, or NULL.
 	pub dict:             *mut crate::types::type_::PyClassDict,
+	/// Slot storage for Python-defined `BaseException` subclasses declaring
+	/// `__slots__`. Builtin exception types and unslotted subclasses leave it
+	/// empty.
+	pub slots:            Vec<crate::types::type_::PySlotValue>,
 	/// `__suppress_context__`: set by an explicit `raise ... from ...` (PEP
 	/// 3134).
 	pub suppress_context: bool,
@@ -59,6 +63,7 @@ impl PyBaseException {
 			traceback,
 			args: ptr::null_mut(),
 			dict: ptr::null_mut(),
+			slots: Vec::new(),
 			suppress_context: false,
 		}
 	}
@@ -1109,6 +1114,11 @@ pub unsafe extern "C" fn trace_base_exception(object: *mut u8, visitor: &mut dyn
 			}
 		}
 	}
+	for slot in &exception.slots {
+		if !slot.value.is_null() {
+			visitor(slot.value.cast::<u8>());
+		}
+	}
 }
 
 /// Traces the boxed pointers stored in a `PyExceptionGroup`.
@@ -1143,6 +1153,7 @@ pub unsafe extern "C" fn finalize_base_exception(object: *mut u8) {
 		unsafe { drop(Box::from_raw(exception.dict)) };
 		exception.dict = ptr::null_mut();
 	}
+	unsafe { ptr::drop_in_place(ptr::addr_of_mut!(exception.slots)) };
 }
 
 const _: () = {

@@ -1,13 +1,12 @@
 //! Runtime thread state.
 //!
-//! The default build preserves the Phase-A process-global state.  When the
-//! `free-threading` feature is enabled, `thread_state_lock()` resolves through
-//! the thread registry so existing helper code keeps using the same guard API
-//! against per-thread state.
+//! Each attached OS thread owns one leaked `PonThreadState` mutex registered in
+//! `crate::thread`.  Runtime helpers keep using the same guard API while the GC
+//! can enumerate every live thread's exception, frame, and safe-region metadata.
 
-#[cfg(any(not(feature = "free-threading"), test))]
-use std::sync::{LazyLock, Mutex};
-use std::{ptr, sync::MutexGuard};
+#[cfg(test)]
+use std::sync::LazyLock;
+use std::{ptr, sync::{Mutex, MutexGuard}};
 
 use crate::{
 	abi::{HandlerInfo, PyFrame},
@@ -32,6 +31,27 @@ impl ExcStarFrame {
 		Self { original, rest: original, raised: Vec::new() }
 	}
 }
+
+/// One in-flight call whose callable/argv roots must remain visible to the GC
+/// even when the owning Rust helper frame is suspended or another thread is
+/// being collected.
+#[derive(Clone, Copy, Debug)]
+pub struct GcCallRoots {
+	pub callable: *mut PyObject,
+	pub argv:     *mut *mut PyObject,
+	pub argc:     usize,
+}
+
+/// Type-erased root-source callback stored in [`PonThreadState`].
+pub type ScopedRootsFn = unsafe fn(usize, &mut dyn FnMut(*mut PyObject));
+
+/// One helper-owned root source whose backing storage lives outside the stack.
+#[derive(Clone, Copy, Debug)]
+pub struct ScopedRootSourceEntry {
+	pub addr:  usize,
+	pub thunk: ScopedRootsFn,
+}
+
 #[derive(Clone, Debug)]
 enum DiagnosticMessage {
 	Text(String),
@@ -79,6 +99,12 @@ pub struct PonThreadState {
 	/// Approximate top frame/stack pointer recorded when entering a GC-safe
 	/// region.
 	pub stack_top_fp:          *mut u8,
+	/// In-flight Python call roots mirrored out of TLS for cross-thread GC.
+	pub current_call_roots:    Vec<GcCallRoots>,
+	/// In-flight helper-frame call operands mirrored out of TLS for cross-thread GC.
+	pub helper_call_roots:     Vec<GcCallRoots>,
+	/// Helper-owned heap buffers that must stay rooted across re-entry.
+	pub scoped_root_sources:   Vec<ScopedRootSourceEntry>,
 	/// Nested GC-safe-region depth for the current thread.
 	gc_safe_region_depth:      usize,
 	diagnostic_message:        Option<DiagnosticMessage>,
@@ -98,6 +124,9 @@ impl Default for PonThreadState {
 			handled_exc_saves:     Vec::new(),
 			stack_base:            ptr::null_mut(),
 			stack_top_fp:          ptr::null_mut(),
+			current_call_roots:    Vec::new(),
+			helper_call_roots:     Vec::new(),
+			scoped_root_sources:   Vec::new(),
 			gc_safe_region_depth:  0,
 			diagnostic_message:    None,
 		}
@@ -204,25 +233,17 @@ impl PonThreadState {
 	}
 }
 
-#[cfg(not(feature = "free-threading"))]
-static THREAD_STATE: LazyLock<Mutex<PonThreadState>> =
-	LazyLock::new(|| Mutex::new(PonThreadState::default()));
-
-/// Returns the process-global Phase-A thread state.
-#[cfg(not(feature = "free-threading"))]
+/// Returns the active thread state mutex.
 #[must_use]
 pub fn thread_state() -> &'static Mutex<PonThreadState> {
-	&THREAD_STATE
+	crate::thread::current_thread_state_mutex()
 }
 
 /// Locks the active thread state, recovering poisoned state instead of
 /// unwinding through the C ABI.
 #[must_use]
 pub fn thread_state_lock() -> MutexGuard<'static, PonThreadState> {
-	#[cfg(feature = "free-threading")]
 	let state = crate::thread::current_thread_state_mutex();
-	#[cfg(not(feature = "free-threading"))]
-	let state = &THREAD_STATE;
 
 	match state.lock() {
 		Ok(guard) => guard,

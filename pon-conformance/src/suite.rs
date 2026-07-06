@@ -210,7 +210,7 @@ pub fn run_ft_stress_suite(root: &Path, requested_modules: &[PathBuf]) -> Result
 		ReferenceMode::BuiltInGoldens => println!("reference: built-in FT stress goldens"),
 	}
 
-	let pon_binary = ensure_pon_free_threading(root)?;
+	let pon_binary = ensure_pon(root)?;
 	let mut scoreboard = Scoreboard::new("ft-stress", None);
 
 	for script in scripts {
@@ -336,33 +336,6 @@ pub(crate) fn ensure_pon(root: &Path) -> Result<PathBuf> {
 	Ok(binary)
 }
 
-fn ensure_pon_free_threading(root: &Path) -> Result<PathBuf> {
-	let output = Command::new("cargo")
-		.arg("build")
-		.arg("--quiet")
-		.arg("-p")
-		.arg("pon")
-		.arg("--features")
-		.arg("free-threading")
-		.current_dir(root)
-		.output()
-		.context("failed to spawn cargo build for pon with free-threading")?;
-	if !output.status.success() {
-		bail!(
-			"failed to build pon with free-threading\nstdout={:?}\nstderr={:?}",
-			String::from_utf8_lossy(&output.stdout),
-			String::from_utf8_lossy(&output.stderr),
-		);
-	}
-
-	let binary = target_dir(root)?
-		.join("debug")
-		.join(format!("pon{}", std::env::consts::EXE_SUFFIX));
-	if !binary.is_file() {
-		bail!("cargo build succeeded but `{}` was not created", binary.display());
-	}
-	Ok(binary)
-}
 
 pub(crate) fn target_dir(root: &Path) -> Result<PathBuf> {
 	let output = Command::new("cargo")
