@@ -580,7 +580,12 @@ unsafe fn vectorcall_function_for(callable: *mut PyObject) -> Option<VectorcallF
 		return None;
 	}
 	// SAFETY: heap-tagged objects carry a readable Pon object header.
-	let native_type = unsafe { (*callable).ob_type.cast_mut() };
+	// Instances minted by C may carry a foreign face as their header type;
+	// normalize so the twin registry resolves from either side.
+	let native_type = {
+		let raw = unsafe { (*callable).ob_type.cast_mut() };
+		twin::registered_native_of_foreign(raw.cast()).unwrap_or(raw)
+	};
 	let foreign = twin::registered_foreign_of_native(native_type)?;
 	// SAFETY: registered foreign type objects are process-lifetime statics.
 	let foreign_ref = unsafe { &*foreign };
@@ -643,7 +648,10 @@ unsafe fn vectorcall_fallback_would_recurse(callable: *mut PyObject) -> bool {
 	if callable.is_null() || crate::tag::is_small_int(callable) || !crate::tag::is_heap(callable) {
 		return false;
 	}
-	let ty = unsafe { (*callable).ob_type.cast_mut() };
+	let ty = {
+		let raw = unsafe { (*callable).ob_type.cast_mut() };
+		twin::registered_native_of_foreign(raw.cast()).unwrap_or(raw)
+	};
 	!ty.is_null()
 		&& unsafe {
 			(*ty)
@@ -1032,6 +1040,26 @@ pub(crate) unsafe extern "C" fn capi_vectorcall_call(
 			);
 		}
 		let mut positional = positional;
+		{
+			// TEMP diag
+			static DIAG_COUNT: core::sync::atomic::AtomicUsize =
+				core::sync::atomic::AtomicUsize::new(0);
+			if DIAG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 6 {
+				let raw_ty = unsafe { (*callable).ob_type.cast_mut() };
+				let norm =
+					twin::registered_native_of_foreign(raw_ty.cast()).unwrap_or(raw_ty);
+				eprintln!(
+					"[dbg] vc fallback callable {:p} raw_ty {:p} norm {:p} name {:?} tp_call_is_vc {}",
+					callable,
+					raw_ty,
+					norm,
+					unsafe { crate::types::dict::type_name(callable) },
+					unsafe { (*norm).tp_call }
+						.map(|call| call as *const () == capi_vectorcall_call as *const ())
+						.unwrap_or(false),
+				);
+			}
+		}
 		if kwargs.is_null() {
 			unsafe { call_with_argv(callable, argv_ptr(&mut positional), positional.len()) }
 		} else {
@@ -1857,10 +1885,12 @@ unsafe extern "C" fn capi_generic_get_dict(
 		}
 		// SAFETY: normalized live receiver.
 		let ty = unsafe { (*object).ob_type };
-		if unsafe { crate::capi::is_capi_class(ty) } && unsafe { (*ty).tp_dictoffset } > 0 {
-			// Read the tp_dictoffset slot DIRECTLY: routing through attribute
-			// lookup re-enters the type's own `__dict__` getset (numpy wires
-			// it to this very function) and recurses to a stack overflow.
+		if unsafe { crate::capi::is_capi_class(ty) } {
+			// Resolve the dict storage DIRECTLY (tp_dictoffset slot or the
+			// side table for managed-dict spec types): routing through
+			// attribute lookup re-enters the type's own `__dict__` getset
+			// (numpy and Cython wire it to this very function) and recurses
+			// to a stack overflow.
 			return match unsafe { crate::descr::ensure_capi_instance_dict(object, ty) } {
 				Ok(dict) if !dict.is_null() => dict,
 				Ok(_) => abi::exc::raise_kind_error_text(

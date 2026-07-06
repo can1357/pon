@@ -1065,7 +1065,20 @@ unsafe extern "C" fn capi_type_check(object: *mut PyObject, tid: c_int) -> c_int
 	let Some(ty) = (unsafe { object.as_ref().and_then(|object| object.ob_type.as_ref()) }) else {
 		return 0;
 	};
-	c_int::from(unsafe { crate::mro::is_subtype((ty as *const PyType).cast_mut(), base) })
+	let ty = (ty as *const PyType).cast_mut();
+	// Foreign C headers (extension statics) must not be walked as native
+	// MRO: normalize through the twin registry; an unregistered foreign
+	// type cannot be a builtin subtype.
+	let ty = match twin::registered_native_of_foreign(ty.cast()) {
+		Some(native) => native,
+		None => {
+			if unsafe { crate::types::dict::native_type_name_if_plausible(ty) }.is_none() {
+				return 0;
+			}
+			ty
+		},
+	};
+	c_int::from(unsafe { crate::mro::is_subtype(ty, base) })
 }
 
 unsafe fn required_integer(object: *mut PyObject, type_error: &str) -> Option<BigInt> {
