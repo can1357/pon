@@ -139,6 +139,7 @@ const PY_TP_FREE: c_int = 74;
 const PY_NB_MATRIX_MULTIPLY: c_int = 75;
 const PY_NB_INPLACE_MATRIX_MULTIPLY: c_int = 76;
 const PY_AM_AWAIT: c_int = 77;
+const PY_AM_AITER: c_int = 78;
 const PY_AM_ANEXT: c_int = 79;
 const PY_TP_FINALIZE: c_int = 80;
 const PY_AM_SEND: c_int = 81;
@@ -231,6 +232,14 @@ struct CMappingMethods {
 	mp_subscript:     *mut (),
 	mp_ass_subscript: *mut (),
 }
+/// C-facing `PyAsyncMethods`: exact CPython 3.14 `object.h` field order.
+#[repr(C)]
+struct CAsyncMethods {
+	am_await: *mut (),
+	am_aiter: *mut (),
+	am_anext: *mut (),
+	am_send:  *mut (),
+}
 
 /// Heap protocol tables allocated while materializing `PyType_FromSpec` types.
 /// Static extension tables are not ours, so per-member inheritance only mutates
@@ -240,6 +249,8 @@ static FROMSPEC_NUMBER_TABLES: LazyLock<Mutex<HashSet<usize>>> =
 static FROMSPEC_SEQUENCE_TABLES: LazyLock<Mutex<HashSet<usize>>> =
 	LazyLock::new(|| Mutex::new(HashSet::new()));
 static FROMSPEC_MAPPING_TABLES: LazyLock<Mutex<HashSet<usize>>> =
+	LazyLock::new(|| Mutex::new(HashSet::new()));
+static FROMSPEC_ASYNC_TABLES: LazyLock<Mutex<HashSet<usize>>> =
 	LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Addresses of live C-extension instances allocated on the GC heap.
@@ -927,7 +938,13 @@ unsafe fn apply_type_spec_slots(
 			PY_TP_ITER => foreign.tp_iter = field,
 			PY_TP_ITERNEXT => foreign.tp_iternext = field,
 			PY_TP_METHODS => foreign.tp_methods = field,
-			PY_TP_MEMBERS => foreign.tp_members = field,
+			PY_TP_MEMBERS => {
+				foreign.tp_members = field;
+				// CPython `PyType_FromSpec` maps the special members onto
+				// type fields instead of attribute descriptors (Cython's
+				// cyfunction conveys its vectorcall offset this way).
+				unsafe { apply_special_spec_members(foreign) };
+			},
 			PY_TP_GETSET => foreign.tp_getset = field,
 			PY_TP_NEW => foreign.tp_new = field,
 			PY_TP_REPR => foreign.tp_repr = field,
@@ -937,14 +954,16 @@ unsafe fn apply_type_spec_slots(
 			PY_TP_TRAVERSE => foreign.tp_traverse = field,
 			PY_TP_FREE => foreign.tp_free = field,
 			PY_TP_FINALIZE => foreign.tp_finalize = field,
+			PY_AM_AWAIT => unsafe { ensure_fromspec_async_table(foreign).am_await = field },
+			PY_AM_AITER => unsafe { ensure_fromspec_async_table(foreign).am_aiter = field },
+			PY_AM_ANEXT => unsafe { ensure_fromspec_async_table(foreign).am_anext = field },
+			PY_AM_SEND => unsafe { ensure_fromspec_async_table(foreign).am_send = field },
 			PY_TP_DEL
 			| PY_TP_GETATTR
 			| PY_TP_IS_GC
 			| PY_TP_SETATTR
 			| PY_TP_VECTORCALL
-			| PY_TP_TOKEN
-			| PY_AM_AWAIT..=PY_AM_ANEXT
-			| PY_AM_SEND => {
+			| PY_TP_TOKEN => {
 				raise_type_error(format!(
 					"PyType_FromSpec: slot id {} is not supported yet for {type_name}",
 					slot.slot
@@ -961,6 +980,33 @@ unsafe fn apply_type_spec_slots(
 		}
 		// SAFETY: 0-terminated slot array; cursor is advanced one element.
 		cursor = unsafe { cursor.add(1) };
+	}
+}
+
+/// CPython `PyType_FromSpec` parity: members named `__vectorcalloffset__`,
+/// `__dictoffset__`, or `__weaklistoffset__` set the corresponding type
+/// fields (their `offset` IS the field value) instead of appearing as
+/// instance attribute descriptors.
+unsafe fn apply_special_spec_members(foreign: &mut ForeignTypeObject) {
+	let mut cursor = foreign.tp_members.cast::<CMemberDef>();
+	if cursor.is_null() {
+		return;
+	}
+	// SAFETY: NULL-name terminated array per CPython contract.
+	unsafe {
+		while !(*cursor).name.is_null() {
+			match c_string((*cursor).name).as_deref() {
+				Some("__vectorcalloffset__") => {
+					foreign.tp_vectorcall_offset = (*cursor).offset;
+				},
+				Some("__dictoffset__") => foreign.tp_dictoffset = (*cursor).offset,
+				Some("__weaklistoffset__") => {
+					foreign.tp_weaklistoffset = (*cursor).offset;
+				},
+				_ => {},
+			}
+			cursor = cursor.add(1);
+		}
 	}
 }
 
@@ -990,6 +1036,19 @@ unsafe fn ensure_fromspec_sequence_table(foreign: &mut ForeignTypeObject) -> &mu
 	}
 	// SAFETY: created above or supplied by an earlier Py_sq_* slot in this spec.
 	unsafe { &mut *foreign.tp_as_sequence.cast::<CSequenceMethods>() }
+}
+unsafe fn ensure_fromspec_async_table(foreign: &mut ForeignTypeObject) -> &mut CAsyncMethods {
+	if foreign.tp_as_async.is_null() {
+		// SAFETY: C protocol tables are plain nullable-pointer records.
+		let table = Box::into_raw(Box::new(unsafe { core::mem::zeroed::<CAsyncMethods>() }));
+		FROMSPEC_ASYNC_TABLES
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.insert(table as usize);
+		foreign.tp_as_async = table.cast::<()>();
+	}
+	// SAFETY: created above or supplied by an earlier Py_am_* slot in this spec.
+	unsafe { &mut *foreign.tp_as_async.cast::<CAsyncMethods>() }
 }
 
 unsafe fn ensure_fromspec_mapping_table(foreign: &mut ForeignTypeObject) -> &mut CMappingMethods {
@@ -1182,6 +1241,85 @@ unsafe extern "C" fn capi_generic_new(
 	_kwargs: *mut PyObject,
 ) -> *mut PyObject {
 	unsafe { capi_generic_alloc(foreign, 0) }
+}
+/// `float.__new__` face installed on the canonical float twin (`fill_twin`).
+///
+/// C float subclasses delegate construction here (numpy's
+/// `double_arrtype_new` calls `PyFloat_Type.tp_new(type, args, kwds)`): the
+/// optional positional argument converts like CPython `float.__new__`
+/// (strings parse, everything else through `__float__`), the instance is a
+/// C-layout allocation of the REQUESTED subtype, and the converted value is
+/// written at the CPython `PyFloatObject.ob_fval` offset — header-size
+/// parity keeps that offset identical for the runtime and CPython layouts.
+/// An exact-float receiver returns the runtime float directly.
+pub(crate) unsafe extern "C" fn capi_float_face_new(
+	foreign: *mut ForeignTypeObject,
+	args: *mut PyObject,
+	kwargs: *mut PyObject,
+) -> *mut PyObject {
+	if !kwargs.is_null() {
+		let non_empty = unsafe {
+			crate::types::dict::dict_entries_snapshot(crate::tag::untag_arg(kwargs))
+		}
+		.is_ok_and(|entries| !entries.is_empty());
+		if non_empty {
+			raise_type_error("float() takes no keyword arguments");
+			return ptr::null_mut();
+		}
+	}
+	let values = match unsafe { crate::types::type_::positional_args_from_object(args) } {
+		Ok(values) => values,
+		Err(message) => return abi::return_null_with_error(message),
+	};
+	if values.len() > 1 {
+		raise_type_error(format!(
+			"float expected at most 1 argument, got {}",
+			values.len()
+		));
+		return ptr::null_mut();
+	}
+	let value = match values.first() {
+		None => 0.0,
+		Some(&argument) => {
+			let text = unsafe { crate::types::type_::unicode_text(argument) };
+			match text {
+				Some(text) => match text.trim().parse::<f64>() {
+					Ok(value) => value,
+					Err(_) => {
+						let _ = abi::exc::raise_kind_error_text(
+							ExceptionKind::ValueError,
+							&format!("could not convert string to float: '{text}'"),
+						);
+						return ptr::null_mut();
+					},
+				},
+				None => match unsafe { crate::native::math::coerce_f64(argument) } {
+					Ok(value) => value,
+					Err(_) => return ptr::null_mut(),
+				},
+			}
+		},
+	};
+	let Some(native) = twin::registered_native_of_foreign(foreign) else {
+		return abi::return_null_with_error("float subtype is not PyType_Ready'd");
+	};
+	if native == crate::types::float::float_type() {
+		return super::pin_new_reference(crate::types::float::from_f64(value));
+	}
+	let instance = unsafe { capi_generic_alloc(foreign, 0) };
+	if instance.is_null() {
+		return ptr::null_mut();
+	}
+	// SAFETY: the allocation is at least `tp_basicsize` (a C float subclass
+	// embeds PyFloatObject), and the header is 16 bytes in both layouts.
+	unsafe {
+		instance
+			.cast::<u8>()
+			.add(core::mem::size_of::<crate::object::PyObjectHeader>())
+			.cast::<f64>()
+			.write(value);
+	}
+	instance
 }
 
 /// `PyPonCapiTypeObj.generic_alloc` (`PyType_GenericAlloc`): zeroed C-layout
