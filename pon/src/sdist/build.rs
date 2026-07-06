@@ -47,6 +47,28 @@ static CATALOG_SDIST_INDEX: CatalogIndex = CatalogIndex;
 const DEFAULT_BUILD_BACKEND: &str = "setuptools.build_meta:__legacy__";
 const DEFAULT_BUILD_REQUIRES: &[&str] = &["setuptools>=40.8.0"];
 const GET_REQUIRES_OUTPUT: &str = "__pon_pep517_requires.txt";
+/// PEP 517 contract: build hooks run with the current directory set to the
+/// unpacked source tree (mesonpy resolves `meson.build` from `os.getcwd()`).
+/// Restores the previous directory on drop.
+struct CwdGuard {
+	previous: Option<PathBuf>,
+}
+
+impl CwdGuard {
+	fn enter(dir: &Path) -> Self {
+		let previous = std::env::current_dir().ok();
+		let _ = std::env::set_current_dir(dir);
+		Self { previous }
+	}
+}
+
+impl Drop for CwdGuard {
+	fn drop(&mut self) {
+		if let Some(previous) = self.previous.take() {
+			let _ = std::env::set_current_dir(previous);
+		}
+	}
+}
 
 impl<'a, I: PackageIndex + ?Sized> Pep517Builder<'a, I> {
 	#[must_use]
@@ -383,12 +405,14 @@ fn run_get_requires_for_build_wheel_hook(
 	script.push_str("_pon_file.close()\n");
 	fs::write(&script_path, script)?;
 	let argv = [script_path.display().to_string()];
+	let cwd = CwdGuard::enter(source_root);
 	let result = crate::run::run_file_with_env(
 		&script_path,
 		build_runtime_env(build_env, source_root, backend_path),
 		&argv,
 	)
 	.map_err(|error| classify_hook_error(backend, error));
+	drop(cwd);
 	let _ = fs::remove_file(&script_path);
 	match result {
 		Ok(()) => {
@@ -425,12 +449,14 @@ fn run_build_wheel_hook(
 		));
 	fs::write(&script_path, script)?;
 	let argv = [script_path.display().to_string()];
+	let cwd = CwdGuard::enter(source_root);
 	let result = crate::run::run_file_with_env(
 		&script_path,
 		build_runtime_env(build_env, source_root, backend_path),
 		&argv,
 	)
 	.map_err(|error| classify_hook_error(backend, error));
+	drop(cwd);
 	let _ = fs::remove_file(script_path);
 	result
 }

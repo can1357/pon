@@ -393,12 +393,21 @@ fn write_entry_point_scripts(
 	let launcher_path = env
 		.scripts_dir
 		.join(format!("{}.py", script_name.to_string_lossy()));
-	let script_path_literal = shell_double_quoted(&launcher_path.to_string_lossy());
+	// The shim is executed from arbitrary working directories (meson probes
+	// `cython -V` from its build dir), so the embedded launcher path must be
+	// absolute.
+	let launcher_invocation_path =
+		std::path::absolute(&launcher_path).unwrap_or_else(|_| launcher_path.clone());
+	let script_path_literal = shell_double_quoted(&launcher_invocation_path.to_string_lossy());
 	let script_content = format!(
 		"#!/bin/sh\nexec \"${{PON_SYS_EXECUTABLE:-pon}}\" \"{script_path_literal}\" \"$@\"\n"
 	);
-	let launcher_content =
-		python_launcher_content(entry_point, &env.scripts_dir, &env.site_packages);
+	// Same absoluteness contract for the paths the launcher embeds.
+	let scripts_dir =
+		std::path::absolute(&env.scripts_dir).unwrap_or_else(|_| env.scripts_dir.clone());
+	let site_packages =
+		std::path::absolute(&env.site_packages).unwrap_or_else(|_| env.site_packages.clone());
+	let launcher_content = python_launcher_content(entry_point, &scripts_dir, &site_packages);
 
 	Ok(vec![
 		write_recorded_file(
