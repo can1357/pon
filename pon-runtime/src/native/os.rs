@@ -7772,8 +7772,9 @@ unsafe fn env_bytes_arg(slot: *mut PyObject, what: &str) -> Result<Vec<u8>, *mut
 }
 
 /// `os.putenv(name, value)` / `posix.putenv`: writes through to the real
-/// process environment and keeps cached `os.environ`/`posix.environ`
-/// dict-layout bindings coherent with the new value.
+/// process environment only.  CPython never propagates `putenv` into
+/// `os.environ` (the mapping is a one-way write-through: `__setitem__` calls
+/// putenv, never the reverse); corpus `os_environ.py` pins this.
 unsafe extern "C" fn os_putenv(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 	if argc != 2 || argv.is_null() {
 		return crate::abi::return_null_with_error(format!(
@@ -7793,24 +7794,13 @@ unsafe extern "C" fn os_putenv(argv: *mut *mut PyObject, argc: usize) -> *mut Py
 	if let Err(raised) = env_set_bytes(&name, &value) {
 		return raised;
 	}
-	let key_obj = match env_object_from_bytes(&name, "os.environ key") {
-		Ok(object) => object,
-		Err(raised) => return raised,
-	};
-	let value_obj = match env_object_from_bytes(&value, "os.environ value") {
-		Ok(object) => object,
-		Err(raised) => return raised,
-	};
-	if let Err(raised) = sync_environ_bindings_set(key_obj, value_obj, std::ptr::null_mut()) {
-		return raised;
-	}
 	// SAFETY: Singleton accessor.
 	unsafe { crate::abi::pon_none() }
 }
 
-/// `os.unsetenv(name)` / `posix.unsetenv`: removes `name` from the real process
-/// environment and removes the key from cached `os.environ`/`posix.environ`
-/// dict-layout bindings.
+/// `os.unsetenv(name)` / `posix.unsetenv`: removes `name` from the real
+/// process environment only; cached `os.environ` bindings are untouched,
+/// matching CPython's one-way mapping write-through.
 unsafe extern "C" fn os_unsetenv(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 	if argc != 1 || argv.is_null() {
 		return crate::abi::return_null_with_error(format!(
@@ -7823,13 +7813,6 @@ unsafe extern "C" fn os_unsetenv(argv: *mut *mut PyObject, argc: usize) -> *mut 
 		Err(raised) => return raised,
 	};
 	if let Err(raised) = env_unset_bytes(&name) {
-		return raised;
-	}
-	let key_obj = match env_object_from_bytes(&name, "os.environ key") {
-		Ok(object) => object,
-		Err(raised) => return raised,
-	};
-	if let Err(raised) = sync_environ_bindings_unset(key_obj, std::ptr::null_mut()) {
 		return raised;
 	}
 	// SAFETY: Singleton accessor.
