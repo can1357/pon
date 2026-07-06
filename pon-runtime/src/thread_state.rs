@@ -2,11 +2,15 @@
 //!
 //! Each attached OS thread owns one leaked `PonThreadState` mutex registered in
 //! `crate::thread`.  Runtime helpers keep using the same guard API while the GC
-//! can enumerate every live thread's exception, frame, and safe-region metadata.
+//! can enumerate every live thread's exception, frame, and safe-region
+//! metadata.
 
 #[cfg(test)]
 use std::sync::LazyLock;
-use std::{ptr, sync::{Mutex, MutexGuard}};
+use std::{
+	ptr,
+	sync::{Mutex, MutexGuard},
+};
 
 use crate::{
 	abi::{HandlerInfo, PyFrame},
@@ -101,7 +105,8 @@ pub struct PonThreadState {
 	pub stack_top_fp:          *mut u8,
 	/// In-flight Python call roots mirrored out of TLS for cross-thread GC.
 	pub current_call_roots:    Vec<GcCallRoots>,
-	/// In-flight helper-frame call operands mirrored out of TLS for cross-thread GC.
+	/// In-flight helper-frame call operands mirrored out of TLS for cross-thread
+	/// GC.
 	pub helper_call_roots:     Vec<GcCallRoots>,
 	/// Helper-owned heap buffers that must stay rooted across re-entry.
 	pub scoped_root_sources:   Vec<ScopedRootSourceEntry>,

@@ -1257,6 +1257,21 @@ pub unsafe extern "C" fn pon_raise(exc: *mut PyObject, cause: *mut PyObject) -> 
 			// the original diagnostic instead of morphing it into TypeError.
 			return ptr::null_mut();
 		}
+		if super::with_runtime(|runtime| {
+			// SAFETY: `exc` passed the NULL/sentinel guards above.
+			unsafe { is_exact_type(exc, runtime.none_type.cast_const()) }
+		})
+		.unwrap_or(false)
+		{
+			// `finally` re-raise: `pon_get_current_exc` returns `None` when
+			// no object-safe exception is pending.  Treat `raise None` as a
+			// bare `raise` so a pending diagnostic (e.g. a C extension that
+			// returned NULL) propagates instead of morphing into TypeError.
+			if pon_err_occurred() {
+				return ptr::null_mut();
+			}
+			return raise_type_error_text("no active exception to reraise");
+		}
 		if let Err(message) = ensure_runtime_for_exc() {
 			return super::return_null_with_error(message);
 		}
@@ -2090,16 +2105,33 @@ pub unsafe extern "C" fn pon_exc_star_finish() -> *mut PyObject {
 }
 
 /// Returns the current object-safe exception, or `None` when there is none.
+///
+/// A message-only diagnostic (the dangling sentinel installed by
+/// `pon_err_set`) is materialized into a real `RuntimeError` carrying the
+/// diagnostic text: `finally` lowering saves this helper's result as an SSA
+/// value across the finally body, whose call boundaries clear the pending
+/// slot — an object survives that, a sentinel plus thread-state message does
+/// not.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_get_current_exc() -> *mut PyObject {
 	super::catch_object_helper(|| {
 		let current = thread_state_lock().current_exc;
-		if current.is_null() || is_diagnostic_sentinel(current) {
-			unsafe { super::pon_none() }
-		} else {
-			park_handled_exception(current);
-			current
+		if current.is_null() {
+			return unsafe { super::pon_none() };
 		}
+		if is_diagnostic_sentinel(current) {
+			let message =
+				crate::thread_state::pon_err_message().unwrap_or_else(|| "runtime error".to_owned());
+			let _ = raise_kind_error_text(ExceptionKind::RuntimeError, &message);
+			let materialized = thread_state_lock().current_exc;
+			if materialized.is_null() || is_diagnostic_sentinel(materialized) {
+				return unsafe { super::pon_none() };
+			}
+			park_handled_exception(materialized);
+			return materialized;
+		}
+		park_handled_exception(current);
+		current
 	})
 }
 
