@@ -333,6 +333,13 @@ impl LoweringDriver {
 	}
 
 	fn lower_module(mut self, module: &ModModule) -> Result<Module, LowerError> {
+		// Private name mangling is a source-level rewrite (CPython performs
+		// it in the symtable); running it on a clone up front keeps scope
+		// analysis and lowering in agreement. Identifier rewrites never move
+		// byte ranges, so span-keyed child-scope pairing stays valid.
+		let mut module = module.clone();
+		mangle::mangle_module(&mut module);
+		let module = &module;
 		let analysis = scope::analyze_module(module)?;
 		let main = self.reserve_function("__main__")?;
 		let mut body = BodyScope::new(&analysis.root);
@@ -1678,6 +1685,7 @@ fn span_expr(expr: &Expr) -> SourceSpan {
 
 mod assign;
 mod class;
+mod mangle;
 mod comprehension;
 mod control;
 mod func;

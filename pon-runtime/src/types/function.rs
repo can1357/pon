@@ -2846,6 +2846,15 @@ pub(crate) fn bind_native_keywords_for_name(
 			],
 			9,
 		),
+		// `sys.set_asyncgen_hooks(firstiter=..., finalizer=...)`: asyncio's
+		// event loop installs/restores the hooks by keyword.
+		"set_asyncgen_hooks" => bind_optional_named_keywords(
+			positional,
+			keywords,
+			"set_asyncgen_hooks",
+			&["firstiter", "finalizer"],
+			2,
+		),
 		// Boxed: the message must surface as a real, catchable TypeError
 		// (CPython's kind for keyword-binding failures), not a bare
 		// thread-state string that later poisons `raise`/`except` matching.
