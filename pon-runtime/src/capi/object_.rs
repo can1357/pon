@@ -1217,7 +1217,7 @@ unsafe extern "C" fn capi_del_item(object: *mut PyObject, key: *mut PyObject) ->
 	})
 }
 
-unsafe extern "C" fn capi_get_iter(object: *mut PyObject) -> *mut PyObject {
+pub(crate) unsafe extern "C" fn capi_get_iter(object: *mut PyObject) -> *mut PyObject {
 	catch_object(|| {
 		let object = normalize_object_arg(object);
 		// SAFETY: Iterator dispatch tolerates a NULL feedback cell.
@@ -1225,12 +1225,13 @@ unsafe extern "C" fn capi_get_iter(object: *mut PyObject) -> *mut PyObject {
 	})
 }
 
-unsafe extern "C" fn capi_iter_next(iterator: *mut PyObject) -> *mut PyObject {
+pub(crate) unsafe extern "C" fn capi_iter_next(iterator: *mut PyObject) -> *mut PyObject {
 	catch_object(|| {
 		let iterator = normalize_object_arg(iterator);
 		// SAFETY: Iterator dispatch tolerates a NULL feedback cell.
 		let result = unsafe { abi::pon_iter_next(iterator, ptr::null_mut()) };
 		if result.is_null() && abi::exc::pending_exception_is("StopIteration") {
+			// CPython PyIter_Next: exhaustion is a bare NULL, not StopIteration.
 			pon_err_clear();
 		}
 		result

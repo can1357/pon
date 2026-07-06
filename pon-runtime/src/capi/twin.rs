@@ -456,6 +456,19 @@ fn fill_twin(
 		(*twin).ob_type = resolve_in_batch(meta, batch);
 		let base = (*native).tp_base;
 		(*twin).tp_base = resolve_in_batch(base, batch);
+		// Iterator protocol slots: recompiled extension code (Cython's
+		// `__Pyx_PyObject_GetIterNextFunc`) reads these fields raw off the
+		// face instead of calling `PyIter_Next`, so a zeroed slot makes
+		// every native iterator look like a non-iterator.  Route through
+		// the pinning C-API trampolines so items crossing to C stay
+		// GC-visible; gate on the native slots so `PyIter_Check`-style
+		// probes keep CPython semantics for non-iterators.
+		if (*native).tp_iter.is_some() {
+			(*twin).tp_iter = super::object_::capi_get_iter as *mut ();
+		}
+		if (*native).tp_iternext.is_some() {
+			(*twin).tp_iternext = super::object_::capi_iter_next as *mut ();
+		}
 		if tid == Some(TID_FLOAT) {
 			// C float subclasses (numpy's float64) delegate `__new__` to
 			// `PyFloat_Type.tp_new`; the generic-alloc backfill would drop
