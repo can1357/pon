@@ -116,6 +116,24 @@ impl FunctionRecord {
 			.map(|value| *value as *mut PyObject)
 			.collect()
 	}
+
+	/// Number of positional defaults captured at function creation.
+	#[must_use]
+	pub fn default_count(&self) -> usize {
+		self.defaults.len()
+	}
+
+	/// Number of keyword-only defaults captured at function creation.
+	#[must_use]
+	pub fn kwdefault_count(&self) -> usize {
+		self.kwdefaults.len()
+	}
+
+	/// Number of closure cells captured by this function.
+	#[must_use]
+	pub fn closure_count(&self) -> usize {
+		self.closure.len()
+	}
 }
 
 /// Reports the GC-managed objects held by `function`'s side-table records to a

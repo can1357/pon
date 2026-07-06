@@ -101,6 +101,55 @@ class Accumulator:
         total = value + 1
         return total
 
+def known_tier(value):
+    return (
+        type(value) is str
+        and (
+            value == "tier0"
+            or value == "queued"
+            or value == "tier1"
+            or value == "deferred"
+            or value == "disabled"
+        )
+    )
+
+def non_negative_int(value):
+    return type(value) is int and value >= 0
+
+def optional_non_negative_int(value):
+    return value is None or non_negative_int(value)
+
+def core_state_ok(state, expected_name, expected_positional_arity):
+    return (
+        type(state) is dict
+        and state["name"] == expected_name
+        and state["arity"] == expected_positional_arity
+        and known_tier(state["tier"])
+        and non_negative_int(state["hotness"])
+        and non_negative_int(state["loop_hotness"])
+        and non_negative_int(state["deopt_count"])
+        and non_negative_int(state["tier_epoch"])
+        and type(state["osr_installed"]) is bool
+        and optional_non_negative_int(state["osr_loop_header"])
+        and type(state["has_metadata"]) is bool
+    )
+
+def metadata_ok(state, expected_positional_arity):
+    return (
+        state["has_metadata"] is True
+        and non_negative_int(state["n_locals"])
+        and state["n_locals"] >= expected_positional_arity
+        and non_negative_int(state["flags"])
+        and state["positional_arity"] == expected_positional_arity
+        and state["positional_only"] == 0
+        and state["positional_or_keyword"] == expected_positional_arity
+        and state["keyword_only"] == 0
+        and state["has_varargs"] is False
+        and state["has_varkw"] is False
+        and state["default_count"] == 0
+        and state["closure_count"] == 0
+    )
+
 ir = pon.ir(add)
 clif = pon.clif(add)
 asm = pon.asm(add)
@@ -108,8 +157,18 @@ print("IR_OK", "add(a, b)" in ir and "block0:" in ir and "BinaryOp" in ir and "r
 print("CLIF_OK", "function u0:" in clif)
 print("ASM_OK", len(asm) > 0 and "block0:" in asm)
 
-method_ir = pon.ir(Accumulator().method)
+add_tier = pon.tier(add)
+add_state = pon.state(add)
+print("TIER_OK", known_tier(add_tier) and add_tier == add_state["tier"])
+print("STATE_OK", core_state_ok(add_state, "add", 2) and metadata_ok(add_state, 2))
+
+bound_method = Accumulator().method
+method_ir = pon.ir(bound_method)
 print("METHOD_IR_OK", "method(self, value)" in method_ir and "BinaryOp" in method_ir)
+method_tier = pon.tier(bound_method)
+method_state = pon.state(bound_method)
+print("METHOD_TIER_OK", known_tier(method_tier) and method_tier == method_state["tier"])
+print("METHOD_STATE_OK", core_state_ok(method_state, "method", 2) and metadata_ok(method_state, 2))
 
 try:
     pon.ir(1)
@@ -149,7 +208,11 @@ else:
 			"IR_OK True",
 			"CLIF_OK True",
 			"ASM_OK True",
+			"TIER_OK True",
+			"STATE_OK True",
 			"METHOD_IR_OK True",
+			"METHOD_TIER_OK True",
+			"METHOD_STATE_OK True",
 			"TYPE_ERROR_OK True",
 			"VALUE_ERROR_OK True",
 		],
