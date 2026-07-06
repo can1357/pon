@@ -40,7 +40,7 @@ pub(crate) mod imp;
 pub(crate) mod io;
 pub(crate) mod itertools;
 mod lsprof;
-mod math;
+pub(crate) mod math;
 mod mmap;
 mod multibyte_codecs;
 mod multiprocessing;

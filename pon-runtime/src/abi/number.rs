@@ -207,6 +207,34 @@ pub unsafe extern "C" fn pon_index(object: *mut PyObject) -> *mut PyObject {
 				return int::from_i64(if value { 1 } else { 0 });
 			}
 		}
+		// `__index__` protocol (numpy integer scalars, enum-like wrappers):
+		// dispatch through the type's descriptor, which covers C `nb_index`
+		// slots via their bridged class-dict wrappers.
+		let ty = if object.is_null() || !crate::tag::is_heap(object) {
+			core::ptr::null_mut()
+		} else {
+			let raw = unsafe { (*object).ob_type.cast_mut() };
+			crate::capi::twin::registered_native_of_foreign(raw.cast()).unwrap_or(raw)
+		};
+		if !ty.is_null() {
+			let hook =
+				unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern("__index__")) };
+			if !hook.is_null() {
+				let bound = unsafe { crate::descr::descriptor_get(hook, object, ty) };
+				if bound.is_null() {
+					return core::ptr::null_mut();
+				}
+				let result = unsafe { crate::abi::pon_call(bound, core::ptr::null_mut(), 0) };
+				if result.is_null() {
+					return core::ptr::null_mut();
+				}
+				let result = crate::tag::untag_arg(result);
+				if let Some(value) = unsafe { int::to_bigint(result) } {
+					return int::from_bigint(value);
+				}
+				return raise_type_error("__index__ returned non-int");
+			}
+		}
 		raise_type_error("object cannot be interpreted as an integer")
 	})
 }

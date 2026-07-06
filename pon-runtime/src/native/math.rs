@@ -220,7 +220,7 @@ unsafe fn try_get_attr(object: *mut PyObject, name: &str) -> Option<*mut PyObjec
 /// converted directly; other objects go through their `__float__`; anything
 /// else is the 3.14 `TypeError`. Ints wider than the double range raise
 /// `OverflowError` exactly like `PyLong_AsDouble`.
-unsafe fn coerce_f64(object: *mut PyObject) -> Result<f64, *mut PyObject> {
+pub(crate) unsafe fn coerce_f64(object: *mut PyObject) -> Result<f64, *mut PyObject> {
 	// SAFETY: Type probes tolerate any live object.
 	if let Some(value) = unsafe { to_f64(object) } {
 		return Ok(value);

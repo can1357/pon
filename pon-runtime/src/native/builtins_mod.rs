@@ -328,6 +328,7 @@ fn range_type() -> *mut PyType {
 	// once-init to keep the leaked boxes single-shot.
 	*RANGE_TYPE.get_or_init(|| {
 		let mut ty = Box::new(PyType::new(ptr::null(), "range", std::mem::size_of::<NativeObject>()));
+		ty.tp_new = Some(native_range_new_slot);
 		ty.tp_iter = Some(range_iter_slot);
 		ty.tp_bool = Some(native_bool_slot);
 		ty.tp_hash = Some(native_range_hash_slot);
@@ -353,6 +354,25 @@ fn range_type() -> *mut PyType {
 	}) as *mut PyType
 }
 
+/// `range` construction through the type object (C extensions calling
+/// `(&PyRange_Type)(n)` — Cython lowers `range(n)` this way): `type_call`
+/// dispatches `tp_new`; forward to the builtin constructor.
+unsafe extern "C" fn native_range_new_slot(
+	_cls: *mut PyType,
+	args: *mut PyObject,
+	_kwargs: *mut PyObject,
+) -> *mut PyObject {
+	let mut values = match unsafe { crate::types::type_::positional_args_from_object(args) } {
+		Ok(values) => values,
+		Err(message) => return fail(message),
+	};
+	let argv = if values.is_empty() {
+		ptr::null_mut()
+	} else {
+		values.as_mut_ptr()
+	};
+	unsafe { builtin_range(argv, values.len()) }
+}
 fn range_iter_type() -> *mut PyType {
 	type_from(&RANGE_ITER_TYPE, "range_iterator", Some(identity_iter_slot), Some(native_next_slot))
 }
@@ -3223,12 +3243,16 @@ unsafe fn numeric_constructor(argv: *mut *mut PyObject, argc: usize, name: &str)
 			if let Some(value) = object_to_f64(args[0]) {
 				crate::types::float::from_f64(value)
 			} else if let Some(text) = object_to_string(args[0]) {
-				match text.parse::<f64>() {
+				match text.trim().parse::<f64>() {
 					Ok(value) => crate::types::float::from_f64(value),
 					Err(_) => fail(format!("could not convert string to float: {text}")),
 				}
 			} else {
-				fail("float() expected int, float, or str argument")
+				// Objects exposing `__float__` (numpy scalars, Decimal, ...).
+				match unsafe { crate::native::math::coerce_f64(args[0]) } {
+					Ok(value) => crate::types::float::from_f64(value),
+					Err(_) => ptr::null_mut(),
+				}
 			}
 		},
 		1 => {

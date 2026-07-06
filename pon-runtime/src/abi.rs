@@ -2664,6 +2664,24 @@ unsafe extern "C" fn object_dunder_reduce_ex_native(
 	};
 	unsafe { object_reduce_ex(receiver, *argv.add(1), protocol) }
 }
+/// `object.__reduce__(self)` — CPython's protocol-0 default reduce
+/// (`object.__reduce_ex__(self, 0)`).  Cython's `__Pyx_setup_reduce`
+/// requires the attribute to exist on every extension class
+/// (numpy.random's bit generators probe it at import).
+unsafe extern "C" fn object_dunder_reduce_native(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let receiver = match unsafe { native_receiver_arg(argv, argc, "__reduce__") } {
+		Ok(receiver) => receiver,
+		Err(error) => return error,
+	};
+	let protocol = unsafe { pon_const_int(0) };
+	if protocol.is_null() {
+		return ptr::null_mut();
+	}
+	unsafe { object_reduce_ex(receiver, protocol, 0) }
+}
 
 /// `object.__getstate__(self)` — default instance state for pickle/copy.
 unsafe extern "C" fn object_dunder_getstate_native(
@@ -2990,11 +3008,12 @@ unsafe extern "C" fn object_dunder_delattr_native(
 /// staticmethod-wrapped `__new__` allocator, the MRO terminus class machinery
 /// like enum's `EnumType.__new__`/`_find_new_` identity-compares against.
 fn install_object_dunders(runtime: &mut Runtime, object_type: *mut PyType) {
-	let entries: [(&str, *const u8); 8] = [
+	let entries: [(&str, *const u8); 9] = [
 		("__repr__", object_dunder_repr_native as *const u8),
 		("__str__", object_dunder_str_native as *const u8),
 		("__format__", object_dunder_format_native as *const u8),
 		("__reduce_ex__", object_dunder_reduce_ex_native as *const u8),
+		("__reduce__", object_dunder_reduce_native as *const u8),
 		("__getstate__", object_dunder_getstate_native as *const u8),
 		("__init__", object_dunder_init_native as *const u8),
 		("__setattr__", object_dunder_setattr_native as *const u8),

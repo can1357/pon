@@ -382,13 +382,49 @@ static inline Py_ssize_t _PyPon_FormatUnicodeInto(char *out, Py_ssize_t capacity
             return -1;
         }
 
+        /* CPython accepts flag/width/precision prefixes ("%.200s", "%5d").
+         * Width and flags never change what pon renders (no padding); a
+         * precision truncates %s. */
+        int has_precision = 0;
+        long precision = 0;
+        while (*cursor == '-' || *cursor == '+' || *cursor == ' ' || *cursor == '#' || *cursor == '0') {
+            cursor++;
+        }
+        while (*cursor >= '0' && *cursor <= '9') {
+            cursor++;
+        }
+        if (*cursor == '.') {
+            cursor++;
+            has_precision = 1;
+            while (*cursor >= '0' && *cursor <= '9') {
+                precision = precision * 10 + (*cursor - '0');
+                cursor++;
+            }
+        }
+        if (*cursor == '\0') {
+            PyErr_SetString(PyExc_ValueError, "incomplete PyUnicode_FromFormat format");
+            return -1;
+        }
+
         if (*cursor == '%') {
             if (_PyPon_FormatAppend(out, capacity, &used, "%", 1) < 0) {
                 return -1;
             }
         } else if (*cursor == 's') {
             const char *text = va_arg(vargs, const char *);
-            if (_PyPon_FormatAppend(out, capacity, &used, text, -1) < 0) {
+            if (text == NULL) {
+                text = "(null)";
+            }
+            Py_ssize_t text_len = (Py_ssize_t)strlen(text);
+            if (has_precision && text_len > (Py_ssize_t)precision) {
+                text_len = (Py_ssize_t)precision;
+            }
+            if (_PyPon_FormatAppend(out, capacity, &used, text, text_len) < 0) {
+                return -1;
+            }
+        } else if (*cursor == 'A') {
+            PyObject *object = va_arg(vargs, PyObject *);
+            if (_PyPon_FormatAppendObject(out, capacity, &used, object, 1) < 0) {
                 return -1;
             }
         } else if (*cursor == 'p') {
