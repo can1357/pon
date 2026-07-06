@@ -1231,7 +1231,7 @@ fn address_to_object(address: &HostAddress) -> *mut PyObject {
 	match i32::from(address.storage.ss_family) {
 		libc::AF_INET => {
 			let sin = (&raw const address.storage).cast::<libc::sockaddr_in>();
-			let mut text = [0i8; INET6_ADDRSTRLEN];
+			let mut text = [0 as libc::c_char; INET6_ADDRSTRLEN];
 			// SAFETY: Live sockaddr_in and a correctly sized text buffer.
 			let rendered = unsafe {
 				inet_ntop(
@@ -1259,7 +1259,7 @@ fn address_to_object(address: &HostAddress) -> *mut PyObject {
 		},
 		libc::AF_INET6 => {
 			let sin6 = (&raw const address.storage).cast::<libc::sockaddr_in6>();
-			let mut text = [0i8; INET6_ADDRSTRLEN];
+			let mut text = [0 as libc::c_char; INET6_ADDRSTRLEN];
 			// SAFETY: Live sockaddr_in6 and a correctly sized text buffer.
 			let rendered = unsafe {
 				inet_ntop(
@@ -1692,7 +1692,7 @@ unsafe extern "C" fn socket_gethostname_real(
 	if argc != 0 {
 		return raise_type_error("gethostname() takes no arguments");
 	}
-	let mut buffer = [0i8; 256];
+	let mut buffer = [0 as libc::c_char; 256];
 	// SAFETY: Plain gethostname(3) into a stack buffer.
 	if unsafe { libc::gethostname(buffer.as_mut_ptr(), buffer.len()) } < 0 {
 		return crate::native::os::raise_errno(last_socket_errno(), None);

@@ -1480,7 +1480,10 @@ unsafe extern "C" fn module_tp_new(
 			Err(message) => return return_null_with_error(message),
 		};
 		for entry in entries {
-			let (slot, position) = match unicode_text(crate::tag::untag_arg(entry.key)) {
+			let key = crate::tag::untag_arg(entry.key);
+			// Type-checked read: keyword keys are user-controlled objects, so
+			// the identity-attr fast reader below must not touch them.
+			let (slot, position) = match unsafe { crate::types::type_::unicode_text(key) } {
 				Some("name") => (&mut name_value, 1usize),
 				Some("doc") => (&mut doc_value, 2usize),
 				Some(other) => {
@@ -1504,7 +1507,9 @@ unsafe extern "C" fn module_tp_new(
 		return unsafe { pon_raise_type_error(MESSAGE.as_ptr(), MESSAGE.len()) };
 	}
 	let name_object = crate::tag::untag_arg(name_value);
-	let Some(name_text) = unicode_text(name_object) else {
+	// Type-checked read (the local `unicode_text` trusts module-identity
+	// layout and would misread a non-str user argument).
+	let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name_object) }) else {
 		let kind = unsafe { crate::types::dict::type_name(name_object) }.unwrap_or("object");
 		let message = format!("module() argument 'name' must be str, not {kind}");
 		return unsafe { pon_raise_type_error(message.as_ptr(), message.len()) };
