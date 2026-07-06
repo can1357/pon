@@ -778,8 +778,53 @@ impl HeapState {
 				.enumerate()
 				.map(|(index, allocation)| (allocation.start.as_ptr().addr(), index)),
 		);
-		self.addr_index.sort_unstable();
+		Self::radix_sort_by_address(&mut self.addr_index);
 		self.addr_index_dirty = false;
+	}
+
+	/// Sorts `(address, index)` pairs by address with LSD radix passes.
+	///
+	/// The address index is rebuilt from scratch once per collection; in
+	/// allocation-heavy programs the pair count reaches millions, where the
+	/// comparison sort dominated whole-collection profiles. Each 16-bit digit
+	/// costs O(n), and digits shared by every key (the high address bits in
+	/// practice) are skipped outright.
+	fn radix_sort_by_address(entries: &mut Vec<(usize, usize)>) {
+		const DIGIT_BITS: usize = 16;
+		const BUCKETS: usize = 1 << DIGIT_BITS;
+		if entries.len() <= 64 {
+			entries.sort_unstable();
+			return;
+		}
+		let mut scratch = vec![(0usize, 0usize); entries.len()];
+		let mut counts = vec![0usize; BUCKETS];
+		for shift in (0..usize::BITS as usize).step_by(DIGIT_BITS) {
+			counts.fill(0);
+			let mut all_same = true;
+			let first_digit = (entries[0].0 >> shift) & (BUCKETS - 1);
+			for &(address, _) in entries.iter() {
+				let digit = (address >> shift) & (BUCKETS - 1);
+				counts[digit] += 1;
+				all_same &= digit == first_digit;
+			}
+			// A digit column shared by every key permutes nothing.
+			if all_same {
+				continue;
+			}
+			let mut total = 0usize;
+			for count in &mut counts {
+				let bucket = *count;
+				*count = total;
+				total += bucket;
+			}
+			// Stable scatter (required for LSD correctness across passes).
+			for &entry in entries.iter() {
+				let digit = (entry.0 >> shift) & (BUCKETS - 1);
+				scratch[counts[digit]] = entry;
+				counts[digit] += 1;
+			}
+			std::mem::swap(entries, &mut scratch);
+		}
 	}
 
 	/// Registered layout for `type_id`, if any.
@@ -1194,6 +1239,32 @@ mod tests {
 			visitor(second);
 		}
 		true
+	}
+
+	#[test]
+	fn radix_sort_matches_comparison_sort() {
+		// Deterministic xorshift over full 64-bit range, plus edge patterns
+		// (dense low bits, shared high bits, duplicates of the digit skips).
+		let mut seed = 0x243F_6A88_85A3_08D3_u64;
+		let mut entries: Vec<(usize, usize)> = (0..10_000)
+			.map(|index| {
+				seed ^= seed << 13;
+				seed ^= seed >> 7;
+				seed ^= seed << 17;
+				(seed as usize, index)
+			})
+			.collect();
+		entries.extend((0..500).map(|index| (index * 16, 10_000 + index)));
+		entries.extend((0..500).map(|index| (0x7F00_0000_0000 + index * 32, 10_500 + index)));
+
+		let mut expected = entries.clone();
+		expected.sort_unstable();
+		HeapState::radix_sort_by_address(&mut entries);
+		assert_eq!(entries, expected);
+
+		let mut small = vec![(3usize, 0usize), (1, 1), (2, 2)];
+		HeapState::radix_sort_by_address(&mut small);
+		assert_eq!(small, vec![(1, 1), (2, 2), (3, 0)]);
 	}
 
 	#[test]
