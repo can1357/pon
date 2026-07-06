@@ -214,6 +214,9 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 	for (name, entry) in STUB_CODEC_FNS {
 		module_fn(name, *entry)?;
 	}
+	module_fn("charmap_encode", charmap_encode_entry)?;
+	module_fn("charmap_decode", charmap_decode_entry)?;
+	module_fn("charmap_build", charmap_build_entry)?;
 
 	let mut handlers: Vec<(&str, *mut PyObject)> = Vec::with_capacity(8);
 	for (name, entry) in [
@@ -301,9 +304,6 @@ stub_codec_fns!(
 	("utf_32_le_decode", utf_32_le_decode_entry),
 	("utf_32_be_decode", utf_32_be_decode_entry),
 	("utf_32_ex_decode", utf_32_ex_decode_entry),
-	("charmap_encode", charmap_encode_entry),
-	("charmap_decode", charmap_decode_entry),
-	("charmap_build", charmap_build_entry),
 	("readbuffer_encode", readbuffer_encode_entry),
 );
 
@@ -1754,6 +1754,199 @@ unsafe extern "C" fn raw_unicode_escape_decode_entry(
 		return fail("_codecs.raw_unicode_escape_decode received a NULL argv pointer");
 	};
 	escape_decode_entry_impl(args, "raw_unicode_escape", raw_unicode_escape_decode_core)
+}
+
+// ---------------------------------------------------------------------------
+// Charmap codecs (`encodings/cp*.py` generated modules and zipfile's cp437)
+
+/// Decoded mapping value for one byte: a produced string or "undefined".
+fn charmap_mapped_char(mapping: *mut PyObject, byte: u8) -> Result<Option<String>, ()> {
+	if is_none(mapping) {
+		// CPython: a missing mapping decodes as latin-1.
+		return Ok(Some(char::from(byte).to_string()));
+	}
+	if let Ok(table) = str_arg(mapping, "mapping") {
+		let ch = table.chars().nth(usize::from(byte));
+		return Ok(match ch {
+			None | Some('\u{fffe}') => None,
+			Some(ch) => Some(ch.to_string()),
+		});
+	}
+	// Dict-style mapping: byte -> codepoint int, str, or None.
+	let key = alloc_int_object(i64::from(byte));
+	if key.is_null() {
+		return Err(());
+	}
+	// SAFETY: live mapping and key; NULL result leaves a pending error.
+	let value = unsafe { abi::pon_subscript_get(mapping, key, ptr::null_mut()) };
+	if value.is_null() {
+		crate::thread_state::pon_err_clear();
+		return Ok(None);
+	}
+	if is_none(value) {
+		return Ok(None);
+	}
+	if let Some(code) = object_int_value(value) {
+		if !(0..=0x10_FFFF).contains(&code) {
+			return Ok(None);
+		}
+		return Ok(match char::from_u32(code as u32) {
+			None | Some('\u{fffe}') => None,
+			Some(ch) => Some(ch.to_string()),
+		});
+	}
+	if let Ok(text) = str_arg(value, "mapping value") {
+		if text == "\u{fffe}" {
+			return Ok(None);
+		}
+		return Ok(Some(text.to_owned()));
+	}
+	Ok(None)
+}
+
+fn object_int_value(object: *mut PyObject) -> Option<i64> {
+	// SAFETY: tolerant int readers accept any live (or tagged) object.
+	unsafe { crate::types::int::to_bigint(object) }
+		.and_then(|value| num_traits::ToPrimitive::to_i64(&value))
+}
+
+unsafe extern "C" fn charmap_decode_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return fail("_codecs.charmap_decode received a NULL argv pointer");
+	};
+	if args.is_empty() || args.len() > 3 {
+		return raise_type_error("charmap_decode() takes from 1 to 3 arguments");
+	}
+	let bytes = match bytes_arg(args[0], "argument") {
+		Ok(bytes) => bytes,
+		Err(message) => return raise_type_error(&message),
+	};
+	let errors = match errors_arg(args, 1) {
+		Ok(errors) => errors,
+		Err(message) => return raise_type_error(&message),
+	};
+	let mapping = args.get(2).copied().map_or_else(none, untag);
+	let mut out = String::with_capacity(bytes.len());
+	for (position, &byte) in bytes.iter().enumerate() {
+		match charmap_mapped_char(mapping, byte) {
+			Err(()) => return ptr::null_mut(),
+			Ok(Some(text)) => out.push_str(&text),
+			Ok(None) => match errors {
+				"strict" => {
+					return CoreError::Decode(format!(
+						"'charmap' codec can't decode byte 0x{byte:02x} in position {position}: character maps to <undefined>"
+					))
+					.raise();
+				},
+				"ignore" => {},
+				"replace" => out.push('\u{fffd}'),
+				other => return unknown_handler(other).raise(),
+			},
+		}
+	}
+	codec_result(alloc_str_object(&out), bytes.len())
+}
+
+/// Encoded mapping value for one char: produced bytes or "undefined".
+fn charmap_mapped_bytes(mapping: *mut PyObject, ch: char) -> Result<Option<Vec<u8>>, ()> {
+	let key = alloc_int_object(i64::from(ch as u32));
+	if key.is_null() {
+		return Err(());
+	}
+	// SAFETY: live mapping and key; NULL result leaves a pending error.
+	let value = unsafe { abi::pon_subscript_get(mapping, key, ptr::null_mut()) };
+	if value.is_null() {
+		crate::thread_state::pon_err_clear();
+		return Ok(None);
+	}
+	if is_none(value) {
+		return Ok(None);
+	}
+	if let Some(code) = object_int_value(value) {
+		if !(0..=255).contains(&code) {
+			return Ok(None);
+		}
+		return Ok(Some(vec![code as u8]));
+	}
+	if let Ok(bytes) = bytes_arg(value, "mapping value") {
+		return Ok(Some(bytes.to_vec()));
+	}
+	Ok(None)
+}
+
+unsafe extern "C" fn charmap_encode_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return fail("_codecs.charmap_encode received a NULL argv pointer");
+	};
+	if args.is_empty() || args.len() > 3 {
+		return raise_type_error("charmap_encode() takes from 1 to 3 arguments");
+	}
+	let text = match str_arg(args[0], "argument") {
+		Ok(text) => text,
+		Err(message) => return raise_type_error(&message),
+	};
+	let errors = match errors_arg(args, 1) {
+		Ok(errors) => errors,
+		Err(message) => return raise_type_error(&message),
+	};
+	let mapping = args.get(2).copied().map_or_else(none, untag);
+	if is_none(mapping) {
+		// CPython: a missing mapping encodes as latin-1.
+		return match encode_charrange(BuiltinCodec::Latin1, text, errors, 256) {
+			Ok(bytes) => codec_result(alloc_bytes_object(&bytes), text.chars().count()),
+			Err(error) => error.raise(),
+		};
+	}
+	let mut out = Vec::with_capacity(text.len());
+	for (position, ch) in text.chars().enumerate() {
+		match charmap_mapped_bytes(mapping, ch) {
+			Err(()) => return ptr::null_mut(),
+			Ok(Some(bytes)) => out.extend_from_slice(&bytes),
+			Ok(None) => match errors {
+				"strict" => {
+					return CoreError::Encode(format!(
+						"'charmap' codec can't encode character '{}' in position {position}: character maps to <undefined>",
+						escape_char(ch)
+					))
+					.raise();
+				},
+				"ignore" => {},
+				"replace" => out.push(b'?'),
+				other => return unknown_handler(other).raise(),
+			},
+		}
+	}
+	codec_result(alloc_bytes_object(&out), text.chars().count())
+}
+
+/// CPython returns an opaque `EncodingMap`; pon builds the equivalent plain
+/// dict `{codepoint: byte}` (consumed only by `charmap_encode` above).
+unsafe extern "C" fn charmap_build_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return fail("_codecs.charmap_build received a NULL argv pointer");
+	};
+	if args.len() != 1 {
+		return raise_type_error("charmap_build() takes exactly 1 argument");
+	}
+	let table = match str_arg(args[0], "argument") {
+		Ok(table) => table,
+		Err(message) => return raise_type_error(&message),
+	};
+	let mut items: Vec<*mut PyObject> = Vec::with_capacity(table.chars().count() * 2);
+	for (index, ch) in table.chars().enumerate() {
+		if ch == '\u{fffe}' {
+			continue;
+		}
+		let key = alloc_int_object(i64::from(ch as u32));
+		let value = alloc_int_object(index as i64);
+		if key.is_null() || value.is_null() {
+			return ptr::null_mut();
+		}
+		items.push(key);
+		items.push(value);
+	}
+	// SAFETY: interleaved key/value slots, all live.
+	unsafe { abi::map::pon_build_map(items.as_mut_ptr(), items.len() / 2) }
 }
 
 macro_rules! fixed_codec_entries {

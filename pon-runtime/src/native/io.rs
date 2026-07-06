@@ -1947,8 +1947,6 @@ const STREAM_METHOD_STUBS: &[&str] = &[
 	"seek",
 	"tell",
 	"truncate",
-	"flush",
-	"close",
 	"detach",
 	"fileno",
 	"isatty",
@@ -1958,13 +1956,131 @@ const STREAM_METHOD_STUBS: &[&str] = &[
 	"getvalue",
 ];
 
+/// Reads the CPython-shaped `__IOBase_closed` instance marker; absent means
+/// open (the abstract bases carry no native state).
+unsafe fn io_base_is_closed(receiver: *mut PyObject) -> Result<bool, ()> {
+	let closed = unsafe { crate::abstract_op::get_attr(receiver, intern("__IOBase_closed")) };
+	if closed.is_null() {
+		pon_err_clear();
+		return Ok(false);
+	}
+	match unsafe { crate::abstract_op::is_true(closed) } {
+		1 => Ok(true),
+		-1 => Err(()),
+		_ => Ok(false),
+	}
+}
+
+/// `IOBase.closed` property getter (CPython `iobase_closed_get`).
+unsafe extern "C" fn io_base_closed_getter(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "closed") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	match unsafe { io_base_is_closed(args[0]) } {
+		Ok(closed) => unsafe { abi::number::pon_const_bool(i32::from(closed)) },
+		Err(()) => ptr::null_mut(),
+	}
+}
+
+/// `IOBase.flush()` (CPython `iobase_flush`): no-op on open streams,
+/// `ValueError` once closed.
+unsafe extern "C" fn io_base_flush_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "flush") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	match unsafe { io_base_is_closed(args[0]) } {
+		Ok(true) => raise_value_error("I/O operation on closed file."),
+		Ok(false) => unsafe { abi::pon_none() },
+		Err(()) => ptr::null_mut(),
+	}
+}
+
+/// `IOBase.close()` (CPython `iobase_close`): flush, then mark closed via the
+/// `__IOBase_closed` instance attribute; a flush failure still closes and
+/// propagates.
+unsafe extern "C" fn io_base_close_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "close") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	let receiver = args[0];
+	match unsafe { io_base_is_closed(receiver) } {
+		Ok(true) => return unsafe { abi::pon_none() },
+		Ok(false) => {},
+		Err(()) => return ptr::null_mut(),
+	}
+	let mut flush_failed = false;
+	let flush = unsafe { crate::abstract_op::get_attr(receiver, intern("flush")) };
+	if flush.is_null() {
+		pon_err_clear();
+	} else if unsafe { abi::pon_call(flush, ptr::null_mut(), 0) }.is_null() {
+		flush_failed = true;
+	}
+	let marker = unsafe { abi::number::pon_const_bool(1) };
+	if unsafe { abi::pon_set_attr(receiver, intern("__IOBase_closed"), marker) } < 0 {
+		return ptr::null_mut();
+	}
+	if flush_failed {
+		return ptr::null_mut();
+	}
+	unsafe { abi::pon_none() }
+}
+
+/// `IOBase.__enter__` (CPython `iobase_enter`): polymorphic `self.closed`
+/// check (subclasses override the property), then the receiver itself.
+unsafe extern "C" fn io_base_enter_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "__enter__") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	let receiver = args[0];
+	let closed = unsafe { crate::abstract_op::get_attr(receiver, intern("closed")) };
+	if closed.is_null() {
+		pon_err_clear();
+		return receiver;
+	}
+	match unsafe { crate::abstract_op::is_true(closed) } {
+		1 => raise_value_error("I/O operation on closed file."),
+		-1 => ptr::null_mut(),
+		_ => receiver,
+	}
+}
+
+/// `IOBase.__exit__` (CPython `iobase_exit`): close the stream, swallow
+/// nothing — always returns `None` so exceptions propagate.
+unsafe extern "C" fn io_base_exit_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "__exit__") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	let receiver = args[0];
+	let close = unsafe { crate::abstract_op::get_attr(receiver, intern("close")) };
+	if close.is_null() {
+		return ptr::null_mut();
+	}
+	let result = unsafe { abi::pon_call(close, ptr::null_mut(), 0) };
+	if result.is_null() {
+		return ptr::null_mut();
+	}
+	unsafe { abi::pon_none() }
+}
+
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
 	let unsupported_operation = unsupported_operation_class()?;
-	let io_base = heap_class(
+	let io_base = heap_class_with_methods(
 		"_IOBase",
 		&[],
 		"The abstract base class for all I/O classes.",
 		STREAM_METHOD_STUBS,
+		&[
+			("__enter__", io_base_enter_method as *const u8),
+			("__exit__", io_base_exit_method as *const u8),
+			("close", io_base_close_method as *const u8),
+			("flush", io_base_flush_method as *const u8),
+		],
+		&[("closed", io_base_closed_getter as *const u8)],
 	)?;
 	let raw_io_base = heap_class("_RawIOBase", &[io_base], "Base class for raw binary I/O.", &[])?;
 	let buffered_io_base =
@@ -2111,6 +2227,19 @@ fn heap_class(
 	doc: &str,
 	method_stubs: &[&str],
 ) -> Result<*mut PyObject, String> {
+	heap_class_with_methods(name, bases, doc, method_stubs, &[], &[])
+}
+
+/// `heap_class` plus real native methods and read-only properties (name,
+/// `argv/argc` entry pointer).
+fn heap_class_with_methods(
+	name: &str,
+	bases: &[*mut PyObject],
+	doc: &str,
+	method_stubs: &[&str],
+	native_methods: &[(&str, *const u8)],
+	native_properties: &[(&str, *const u8)],
+) -> Result<*mut PyObject, String> {
 	let namespace = type_::new_namespace();
 	if namespace.is_null() {
 		return Err(format!("failed to allocate _io.{name} namespace"));
@@ -2137,6 +2266,34 @@ fn heap_class(
 		}
 		// SAFETY: Namespace is live; the function object is a valid attr value.
 		unsafe { (*namespace).set(intern(method_name), function) };
+	}
+	for &(method_name, entry) in native_methods {
+		let function = unsafe { abi::pon_make_function(entry, VARIADIC_ARITY, intern(method_name)) };
+		if function.is_null() {
+			return Err(format!("failed to allocate _io.{name}.{method_name}"));
+		}
+		// SAFETY: Namespace is live; the function object is a valid attr value.
+		unsafe { (*namespace).set(intern(method_name), function) };
+	}
+	for &(property_name, entry) in native_properties {
+		let getter = unsafe { abi::pon_make_function(entry, VARIADIC_ARITY, intern(property_name)) };
+		if getter.is_null() {
+			return Err(format!("failed to allocate _io.{name}.{property_name} getter"));
+		}
+		let descriptor = unsafe {
+			crate::types::property::new_property(
+				super::builtins_mod::property_type().cast_const(),
+				getter,
+				ptr::null_mut(),
+				ptr::null_mut(),
+				ptr::null_mut(),
+			)
+		};
+		if descriptor.is_null() {
+			return Err(format!("failed to allocate _io.{name}.{property_name}"));
+		}
+		// SAFETY: Namespace is live; the property descriptor is a valid attr value.
+		unsafe { (*namespace).set(intern(property_name), descriptor) };
 	}
 	// SAFETY: Bases are live class objects owned by the runtime.
 	let class = unsafe { type_::build_class_from_namespace(name, bases, namespace, &[]) };

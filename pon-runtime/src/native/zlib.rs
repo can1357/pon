@@ -306,8 +306,345 @@ unsafe extern "C" fn compress_entry(argv: *mut *mut PyObject, argc: usize) -> *m
     }
 }
 
-unsafe extern "C" fn compressobj_entry(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
-    raise_not_implemented("compressobj")
+/// Window-bits interpretation shared by `compressobj`/`decompressobj`:
+/// negative -> raw deflate, 9..=15 -> zlib wrapper, 25..=31 -> gzip wrapper.
+#[derive(Clone, Copy, PartialEq)]
+enum Window {
+	Raw,
+	Zlib,
+	Gzip,
+}
+
+fn window_from_wbits(wbits: i64) -> Option<Window> {
+	match wbits {
+		-15..=-9 => Some(Window::Raw),
+		9..=15 => Some(Window::Zlib),
+		25..=31 => Some(Window::Gzip),
+		_ => None,
+	}
+}
+
+/// `zlib.compressobj(...)` product: a streaming deflate encoder.
+#[repr(C)]
+struct PyZlibCompressor {
+	ob_base: PyObjectHeader,
+	stream:  std::sync::Mutex<flate2::Compress>,
+}
+
+/// `zlib.decompressobj(...)` product: a streaming inflate decoder with the
+/// CPython-visible `eof`/`unconsumed_tail` state.
+#[repr(C)]
+struct PyZlibDecompressorObj {
+	ob_base: PyObjectHeader,
+	state:   std::sync::Mutex<InflateState>,
+}
+
+struct InflateState {
+	stream:     flate2::Decompress,
+	unconsumed: Vec<u8>,
+	eof:        bool,
+}
+
+fn zlib_compressor_type() -> *mut PyType {
+	static TYPE: LazyLock<usize> = LazyLock::new(|| {
+		let type_type = crate::abi::runtime_type_type();
+		let mut ty = PyType::new(type_type.cast_const(), "zlib.Compress", mem::size_of::<PyZlibCompressor>());
+		ty.tp_getattro = Some(compressor_getattro);
+		Box::into_raw(Box::new(ty)) as usize
+	});
+	*TYPE as *mut PyType
+}
+
+fn zlib_decompressorobj_type() -> *mut PyType {
+	static TYPE: LazyLock<usize> = LazyLock::new(|| {
+		let type_type = crate::abi::runtime_type_type();
+		let mut ty = PyType::new(type_type.cast_const(), "zlib.Decompress", mem::size_of::<PyZlibDecompressorObj>());
+		ty.tp_getattro = Some(decompressor_getattro);
+		Box::into_raw(Box::new(ty)) as usize
+	});
+	*TYPE as *mut PyType
+}
+
+unsafe fn compressor_ref<'a>(object: *mut PyObject) -> Option<&'a PyZlibCompressor> {
+	let object = crate::tag::untag_arg(object);
+	if object.is_null() || !crate::tag::is_heap(object) {
+		return None;
+	}
+	// SAFETY: heap-tagged object with a readable header.
+	if unsafe { (*object).ob_type } != zlib_compressor_type().cast_const() {
+		return None;
+	}
+	Some(unsafe { &*object.cast::<PyZlibCompressor>() })
+}
+
+unsafe fn decompressor_ref<'a>(object: *mut PyObject) -> Option<&'a PyZlibDecompressorObj> {
+	let object = crate::tag::untag_arg(object);
+	if object.is_null() || !crate::tag::is_heap(object) {
+		return None;
+	}
+	// SAFETY: heap-tagged object with a readable header.
+	if unsafe { (*object).ob_type } != zlib_decompressorobj_type().cast_const() {
+		return None;
+	}
+	Some(unsafe { &*object.cast::<PyZlibDecompressorObj>() })
+}
+
+fn bound_zlib_method(
+	receiver: *mut PyObject,
+	name: &str,
+	entry: BuiltinFn,
+) -> *mut PyObject {
+	let function = unsafe { crate::abi::pon_make_function(entry as *const u8, VARIADIC_ARITY, intern(name)) };
+	if function.is_null() {
+		return core::ptr::null_mut();
+	}
+	match crate::types::method::new_bound_method(function, receiver) {
+		Ok(method) => method.cast::<PyObject>(),
+		Err(message) => raise_type_error(&message),
+	}
+}
+
+fn raise_attribute(name: &str) -> *mut PyObject {
+	crate::abi::exc::raise_kind_error_text(ExceptionKind::AttributeError, &format!("no attribute '{name}'"))
+}
+
+unsafe extern "C" fn compressor_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+	let Some(name) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+		return raise_type_error("attribute name must be str");
+	};
+	match name {
+		"compress" => bound_zlib_method(object, name, compressor_compress_entry),
+		"flush" => bound_zlib_method(object, name, compressor_flush_entry),
+		_ => raise_attribute(name),
+	}
+}
+
+unsafe extern "C" fn decompressor_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+	let Some(name) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+		return raise_type_error("attribute name must be str");
+	};
+	let Some(decompressor) = (unsafe { decompressor_ref(object) }) else {
+		return raise_type_error("receiver is not a zlib decompressor");
+	};
+	match name {
+		"decompress" => bound_zlib_method(object, name, decompressor_decompress_entry),
+		"flush" => bound_zlib_method(object, name, decompressor_flush_entry),
+		"eof" => {
+			let state = decompressor.state.lock().unwrap_or_else(|poison| poison.into_inner());
+			// SAFETY: Singleton bool constants.
+			unsafe { crate::abi::pon_const_bool(i32::from(state.eof)) }
+		},
+		"unconsumed_tail" => {
+			let state = decompressor.state.lock().unwrap_or_else(|poison| poison.into_inner());
+			alloc_bytes(&state.unconsumed)
+		},
+		"unused_data" => alloc_bytes(&[]),
+		_ => raise_attribute(name),
+	}
+}
+
+/// Streams `input` through `stream` into a growing buffer. `flush` follows
+/// flate2 semantics (`None` for incremental feed, `Finish` to terminate).
+fn deflate_chunks(
+	stream: &mut flate2::Compress,
+	input: &[u8],
+	flush: flate2::FlushCompress,
+) -> Result<Vec<u8>, String> {
+	let mut out = Vec::new();
+	let mut scratch = vec![0u8; 64 * 1024];
+	let mut consumed = 0usize;
+	loop {
+		let before_in = stream.total_in();
+		let before_out = stream.total_out();
+		let status = stream
+			.compress(&input[consumed..], &mut scratch, flush)
+			.map_err(|error| format!("Error {error} while compressing data"))?;
+		consumed += (stream.total_in() - before_in) as usize;
+		let produced = (stream.total_out() - before_out) as usize;
+		out.extend_from_slice(&scratch[..produced]);
+		match status {
+			flate2::Status::StreamEnd => break,
+			_ if flush == flate2::FlushCompress::None && consumed == input.len() && produced == 0 => break,
+			_ => {},
+		}
+	}
+	Ok(out)
+}
+
+unsafe extern "C" fn compressor_compress_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return raise_type_error("compress received an invalid argument window");
+	};
+	if args.len() != 2 {
+		return raise_type_error("compress() takes exactly one argument");
+	}
+	let Some(compressor) = (unsafe { compressor_ref(args[0]) }) else {
+		return raise_type_error("receiver is not a zlib compressor");
+	};
+	let Some(data) = (unsafe { bytes_arg(args[1]) }) else {
+		let got = unsafe { crate::types::dict::type_name(crate::tag::untag_arg(args[1])) }.unwrap_or("object");
+		return raise_type_error(&format!("a bytes-like object is required, not '{got}'"));
+	};
+	let mut stream = compressor.stream.lock().unwrap_or_else(|poison| poison.into_inner());
+	match deflate_chunks(&mut stream, data, flate2::FlushCompress::None) {
+		Ok(bytes) => alloc_bytes(&bytes),
+		Err(message) => raise_zlib_error(&message),
+	}
+}
+
+unsafe extern "C" fn compressor_flush_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return raise_type_error("flush received an invalid argument window");
+	};
+	if args.is_empty() || args.len() > 2 {
+		return raise_type_error("flush() takes at most one argument");
+	}
+	let Some(compressor) = (unsafe { compressor_ref(args[0]) }) else {
+		return raise_type_error("receiver is not a zlib compressor");
+	};
+	// Mode argument: only Z_FINISH (the default) terminates; other modes are
+	// accepted and treated as a full sync flush of pending output.
+	let mode = match optional_i64(args.get(1).copied(), "mode") {
+		Ok(value) => value.unwrap_or(Z_FINISH),
+		Err(raised) => return raised,
+	};
+	let flush = if mode == Z_FINISH { flate2::FlushCompress::Finish } else { flate2::FlushCompress::Sync };
+	let mut stream = compressor.stream.lock().unwrap_or_else(|poison| poison.into_inner());
+	match deflate_chunks(&mut stream, &[], flush) {
+		Ok(bytes) => alloc_bytes(&bytes),
+		Err(message) => raise_zlib_error(&message),
+	}
+}
+
+unsafe extern "C" fn decompressor_decompress_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return raise_type_error("decompress received an invalid argument window");
+	};
+	if args.len() < 2 || args.len() > 3 {
+		return raise_type_error("decompress() takes 1 or 2 arguments");
+	}
+	let Some(decompressor) = (unsafe { decompressor_ref(args[0]) }) else {
+		return raise_type_error("receiver is not a zlib decompressor");
+	};
+	let Some(data) = (unsafe { bytes_arg(args[1]) }) else {
+		let got = unsafe { crate::types::dict::type_name(crate::tag::untag_arg(args[1])) }.unwrap_or("object");
+		return raise_type_error(&format!("a bytes-like object is required, not '{got}'"));
+	};
+	let max_length = match optional_i64(args.get(2).copied(), "max_length") {
+		Ok(None) => None,
+		Ok(Some(value)) if value < 0 => return raise_value_error_zlib("max_length must be non-negative"),
+		Ok(Some(0)) => None,
+		Ok(Some(value)) => Some(value as usize),
+		Err(raised) => return raised,
+	};
+	let mut state = decompressor.state.lock().unwrap_or_else(|poison| poison.into_inner());
+	let state = &mut *state;
+	let mut out = Vec::new();
+	let mut scratch = vec![0u8; 64 * 1024];
+	let mut consumed = 0usize;
+	loop {
+		let remaining_budget = match max_length {
+			Some(max) => max.saturating_sub(out.len()),
+			None => scratch.len(),
+		};
+		if remaining_budget == 0 {
+			break;
+		}
+		let window = remaining_budget.min(scratch.len());
+		let before_in = state.stream.total_in();
+		let before_out = state.stream.total_out();
+		let status = match state.stream.decompress(
+			&data[consumed..],
+			&mut scratch[..window],
+			flate2::FlushDecompress::None,
+		) {
+			Ok(status) => status,
+			Err(error) => return raise_zlib_error(&format!("Error {error} while decompressing data")),
+		};
+		consumed += (state.stream.total_in() - before_in) as usize;
+		let produced = (state.stream.total_out() - before_out) as usize;
+		out.extend_from_slice(&scratch[..produced]);
+		match status {
+			flate2::Status::StreamEnd => {
+				state.eof = true;
+				break;
+			},
+			_ if consumed == data.len() && produced == 0 => break,
+			_ => {},
+		}
+	}
+	state.unconsumed = if state.eof { Vec::new() } else { data[consumed..].to_vec() };
+	alloc_bytes(&out)
+}
+
+unsafe extern "C" fn decompressor_flush_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return raise_type_error("flush received an invalid argument window");
+	};
+	if args.is_empty() || args.len() > 2 {
+		return raise_type_error("flush() takes at most one argument");
+	}
+	if unsafe { decompressor_ref(args[0]) }.is_none() {
+		return raise_type_error("receiver is not a zlib decompressor");
+	}
+	// Pending output is always drained eagerly by `decompress`; nothing is
+	// buffered stream-side.
+	alloc_bytes(&[])
+}
+
+fn raise_value_error_zlib(message: &str) -> *mut PyObject {
+	crate::abi::exc::raise_kind_error_text(ExceptionKind::ValueError, message)
+}
+
+/// `zlib.compressobj(level=-1, method=DEFLATED, wbits=MAX_WBITS, memLevel=8,
+/// strategy=0, zdict=None)`: memLevel/strategy are validated by range only
+/// (flate2 exposes no knobs for them); zdict is unsupported.
+unsafe extern "C" fn compressobj_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return raise_type_error("compressobj received an invalid argument window");
+	};
+	if args.len() > 6 {
+		return raise_type_error("compressobj() takes at most 6 arguments");
+	}
+	let level = match optional_i64(args.first().copied(), "level") {
+		Ok(value) => value.unwrap_or(Z_DEFAULT_COMPRESSION),
+		Err(raised) => return raised,
+	};
+	if !(level == Z_DEFAULT_COMPRESSION || (0..=9).contains(&level)) {
+		return raise_zlib_error("Bad compression level");
+	}
+	let method = match optional_i64(args.get(1).copied(), "method") {
+		Ok(value) => value.unwrap_or(DEFLATED),
+		Err(raised) => return raised,
+	};
+	if method != DEFLATED {
+		return raise_zlib_error(&format!("Invalid initialization option: method={method}"));
+	}
+	let wbits = match optional_i64(args.get(2).copied(), "wbits") {
+		Ok(value) => value.unwrap_or(MAX_WBITS),
+		Err(raised) => return raised,
+	};
+	let Some(window) = window_from_wbits(wbits) else {
+		return raise_zlib_error(&format!("Invalid initialization option: wbits={wbits}"));
+	};
+	if args.len() > 5 && !args[5].is_null() && args[5] != unsafe { crate::abi::pon_none() } {
+		return raise_not_implemented("compressobj(zdict=...)");
+	}
+	let level = if level == Z_DEFAULT_COMPRESSION {
+		flate2::Compression::default()
+	} else {
+		flate2::Compression::new(level as u32)
+	};
+	let stream = match window {
+		Window::Raw => flate2::Compress::new(level, false),
+		Window::Zlib => flate2::Compress::new(level, true),
+		Window::Gzip => flate2::Compress::new_gzip(level, 15),
+	};
+	Box::into_raw(Box::new(PyZlibCompressor {
+		ob_base: PyObjectHeader::new(zlib_compressor_type().cast_const()),
+		stream:  std::sync::Mutex::new(stream),
+	}))
+	.cast::<PyObject>()
 }
 
 /// `zlib.decompress(data, /, wbits=MAX_WBITS, bufsize=DEF_BUF_SIZE)` — the
@@ -437,6 +774,32 @@ fn raise_type_error(message: &str) -> *mut PyObject {
     crate::abi::exc::raise_kind_error_text(ExceptionKind::TypeError, message)
 }
 
-unsafe extern "C" fn decompressobj_entry(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
-    raise_not_implemented("decompressobj")
+/// `zlib.decompressobj(wbits=MAX_WBITS, zdict=None)`.
+unsafe extern "C" fn decompressobj_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return raise_type_error("decompressobj received an invalid argument window");
+	};
+	if args.len() > 2 {
+		return raise_type_error("decompressobj() takes at most 2 arguments");
+	}
+	let wbits = match optional_i64(args.first().copied(), "wbits") {
+		Ok(value) => value.unwrap_or(MAX_WBITS),
+		Err(raised) => return raised,
+	};
+	let Some(window) = window_from_wbits(wbits) else {
+		return raise_zlib_error(&format!("Invalid initialization option: wbits={wbits}"));
+	};
+	if args.len() > 1 && !args[1].is_null() && args[1] != unsafe { crate::abi::pon_none() } {
+		return raise_not_implemented("decompressobj(zdict=...)");
+	}
+	let stream = match window {
+		Window::Raw => flate2::Decompress::new(false),
+		Window::Zlib => flate2::Decompress::new(true),
+		Window::Gzip => flate2::Decompress::new_gzip(15),
+	};
+	Box::into_raw(Box::new(PyZlibDecompressorObj {
+		ob_base: PyObjectHeader::new(zlib_decompressorobj_type().cast_const()),
+		state:   std::sync::Mutex::new(InflateState { stream, unconsumed: Vec::new(), eof: false }),
+	}))
+	.cast::<PyObject>()
 }
