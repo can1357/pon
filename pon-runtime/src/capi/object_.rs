@@ -471,10 +471,30 @@ unsafe fn vectorcall_through_pon(
 		Ok(names) => names,
 		Err(error) => return error,
 	};
-	let mut positional = match unsafe { normalize_vectorcall_slice(args, 0, nargs) } {
+	let positional = match unsafe { normalize_vectorcall_slice(args, 0, nargs) } {
 		Ok(values) => values,
 		Err(error) => return error,
 	};
+	if let Some(vectorcall) = unsafe { vectorcall_function_for(callable) } {
+		let mut c_args: Vec<*mut PyObject> =
+			positional.into_iter().map(super::foreignize_type_result).collect();
+		if !names.is_empty() {
+			let kw_values = match unsafe { normalize_vectorcall_slice(args, nargs, names.len()) } {
+				Ok(values) => values,
+				Err(error) => return error,
+			};
+			c_args.extend(kw_values.into_iter().map(super::foreignize_type_result));
+		}
+		let argv = if c_args.is_empty() {
+			ptr::null()
+		} else {
+			c_args.as_ptr()
+		};
+		let result = unsafe { vectorcall(callable, argv, nargs, kwnames) };
+		super::unpin_object(result);
+		return normalize_object_arg(result);
+	}
+	let mut positional = positional;
 	if names.is_empty() {
 		// SAFETY: `positional` lives for the duration of the call.
 		return unsafe { abi::pon_call(callable, argv_ptr(&mut positional), positional.len()) };
@@ -511,10 +531,27 @@ unsafe fn vectorcall_through_pon_dict(
 		return abi::return_null_with_error("PyObject_VectorcallDict received NULL callable");
 	}
 	let nargs = vectorcall_nargs(nargsf);
-	let mut positional = match unsafe { normalize_vectorcall_slice(args, 0, nargs) } {
+	let positional = match unsafe { normalize_vectorcall_slice(args, 0, nargs) } {
 		Ok(values) => values,
 		Err(error) => return error,
 	};
+	if let Some(vectorcall) = unsafe { vectorcall_function_for(callable) } {
+		let mut c_args: Vec<*mut PyObject> =
+			positional.into_iter().map(super::foreignize_type_result).collect();
+		let kwnames = match unsafe { dict_keywords_for_vectorcall(kwargs, &mut c_args) } {
+			Ok(kwnames) => kwnames,
+			Err(error) => return error,
+		};
+		let argv = if c_args.is_empty() {
+			ptr::null()
+		} else {
+			c_args.as_ptr()
+		};
+		let result = unsafe { vectorcall(callable, argv, nargs, kwnames) };
+		super::unpin_object(result);
+		return normalize_object_arg(result);
+	}
+	let mut positional = positional;
 	let kwargs = normalize_object_arg(kwargs);
 	if kwargs.is_null() {
 		// SAFETY: `positional` lives for the duration of the call.
@@ -589,7 +626,7 @@ unsafe fn dict_keywords_for_vectorcall(
 			return Err(raise_type_error("vectorcall keyword names must be strings"));
 		}
 		names.push(key);
-		argv.push(normalize_object_arg(entry.value));
+		argv.push(super::foreignize_type_result(entry.value));
 	}
 	// SAFETY: `names` lives through tuple construction; the resulting tuple
 	// owns references in Pon's GC model by reachability for this call.
@@ -967,7 +1004,7 @@ unsafe extern "C" fn capi_vectorcall_dict(
 	catch_object(|| unsafe { vectorcall_through_pon_dict(callable, args, nargsf, kwargs) })
 }
 
-unsafe extern "C" fn capi_vectorcall_call(
+pub(crate) unsafe extern "C" fn capi_vectorcall_call(
 	callable: *mut PyObject,
 	args: *mut PyObject,
 	kwargs: *mut PyObject,
@@ -977,32 +1014,35 @@ unsafe extern "C" fn capi_vectorcall_call(
 		if callable.is_null() {
 			return abi::return_null_with_error("PyVectorcall_Call received NULL callable");
 		}
-		let mut positional = match unsafe { positional_args_from_object(args) } {
+		let positional = match unsafe { positional_args_from_object(args) } {
 			Ok(values) => values,
 			Err(error) => return error,
 		};
 		if let Some(vectorcall) = unsafe { vectorcall_function_for(callable) } {
-			let positional_count = positional.len();
-			let kwnames = match unsafe { dict_keywords_for_vectorcall(kwargs, &mut positional) } {
+			let mut c_args: Vec<*mut PyObject> =
+				positional.into_iter().map(super::foreignize_type_result).collect();
+			let positional_count = c_args.len();
+			let kwnames = match unsafe { dict_keywords_for_vectorcall(kwargs, &mut c_args) } {
 				Ok(kwnames) => kwnames,
 				Err(error) => return error,
 			};
-			let argv = if positional.is_empty() {
+			let argv = if c_args.is_empty() {
 				ptr::null()
 			} else {
-				positional.as_ptr()
+				c_args.as_ptr()
 			};
 			// SAFETY: `argv` and `kwnames` live for the duration of the call;
 			// the function pointer was read from the callable's vectorcall slot.
 			let result = unsafe { vectorcall(callable, argv, positional_count, kwnames) };
 			super::unpin_object(result);
-			return result;
+			return normalize_object_arg(result);
 		}
 		if unsafe { vectorcall_fallback_would_recurse(callable) } {
 			return raise_type_error(
 				"PyVectorcall_Call callable does not provide a vectorcall function",
 			);
 		}
+		let mut positional = positional;
 		if kwargs.is_null() {
 			unsafe { call_with_argv(callable, argv_ptr(&mut positional), positional.len()) }
 		} else {

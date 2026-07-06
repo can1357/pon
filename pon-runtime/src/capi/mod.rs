@@ -393,6 +393,7 @@ pub(crate) fn load_extension_module(name: &str, path: &Path) -> Result<*mut PyOb
 	let path_text = path
 		.to_str()
 		.ok_or_else(|| format!("extension path is not UTF-8: {}", path.display()))?;
+	eprintln!("[pon-diag] load ext {name} {}", path.display());
 	let c_path = CString::new(path_text)
 		.map_err(|_| format!("extension path contains NUL: {}", path.display()))?;
 	let handle = unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
@@ -824,7 +825,8 @@ unsafe extern "C" fn cfunction_call(
 		let result = unsafe { with_keywords(self_object, tuple, _kwargs) };
 		unpin_object(tuple);
 		unpin_object(result);
-		return result;
+		// Faces echoed by C never re-enter pon raw (twin contract).
+		return unsafe { py_normalize_foreign(result) };
 	}
 	if flags & METH_FASTCALL != 0 {
 		if flags & METH_KEYWORDS != 0 {
@@ -841,14 +843,16 @@ unsafe extern "C" fn cfunction_call(
 				)
 			};
 			unpin_object(result);
-			return result;
+			// Faces echoed by C never re-enter pon raw (twin contract).
+			return unsafe { py_normalize_foreign(result) };
 		}
 		let fastcall: unsafe extern "C" fn(*mut PyObject, *const *mut PyObject, isize) -> *mut PyObject =
             // SAFETY: METH_FASTCALL certifies the _PyCFunctionFast signature.
             unsafe { mem::transmute(method) };
 		let result = unsafe { fastcall(self_object, positional.as_ptr(), positional.len() as isize) };
 		unpin_object(result);
-		return result;
+		// Faces echoed by C never re-enter pon raw (twin contract).
+		return unsafe { py_normalize_foreign(result) };
 	}
 	if flags & METH_NOARGS != 0 {
 		if !positional.is_empty() {
@@ -859,7 +863,8 @@ unsafe extern "C" fn cfunction_call(
 		}
 		let result = unsafe { method(self_object, ptr::null_mut()) };
 		unpin_object(result);
-		return result;
+		// Faces echoed by C never re-enter pon raw (twin contract).
+		return unsafe { py_normalize_foreign(result) };
 	}
 	if flags & METH_O != 0 {
 		if positional.len() != 1 {
@@ -870,7 +875,8 @@ unsafe extern "C" fn cfunction_call(
 		}
 		let result = unsafe { method(self_object, positional[0]) };
 		unpin_object(result);
-		return result;
+		// Faces echoed by C never re-enter pon raw (twin contract).
+		return unsafe { py_normalize_foreign(result) };
 	}
 	if flags & METH_VARARGS != 0 {
 		let tuple = build_call_tuple(&positional);
@@ -880,7 +886,8 @@ unsafe extern "C" fn cfunction_call(
 		let result = unsafe { method(self_object, tuple) };
 		unpin_object(tuple);
 		unpin_object(result);
-		return result;
+		// Faces echoed by C never re-enter pon raw (twin contract).
+		return unsafe { py_normalize_foreign(result) };
 	}
 	abi::return_null_with_error("unsupported C function calling convention")
 }

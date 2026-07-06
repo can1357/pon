@@ -598,6 +598,9 @@ fn import_module_by_name(name: &str) -> Result<*mut PyObject, String> {
 	if name == "importlib._bootstrap_external" {
 		ensure_source_importlib_alias("_frozen_importlib_external", module)?;
 	}
+	if let Some(alias) = numpy_core_alias_name(name) {
+		ensure_source_module_alias(alias, module)?;
+	}
 	Ok(module)
 }
 
@@ -618,6 +621,30 @@ fn ensure_source_importlib_alias(alias: &str, module: *mut PyObject) -> Result<(
 	state.modules.insert(alias_id, module);
 	drop(state);
 	mirror_module_registration(alias, module)
+}
+
+fn numpy_core_alias_name(name: &str) -> Option<String> {
+	if name == "numpy._core" {
+		return Some("numpy.core".to_owned());
+	}
+	name
+		.strip_prefix("numpy._core.")
+		.map(|suffix| format!("numpy.core.{suffix}"))
+}
+
+fn ensure_source_module_alias(alias: String, module: *mut PyObject) -> Result<(), String> {
+	if sys_modules_entry(&alias)?.is_some() {
+		return Ok(());
+	}
+	let alias_id = intern(&alias);
+	let mut state = IMPORT_STATE
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner());
+	state.modules.insert(alias_id, module);
+	drop(state);
+	mirror_module_registration(&alias, module)?;
+	bind_child_to_parent(&alias, module);
+	Ok(())
 }
 
 static IMPORTLIB_FROZEN_ALIAS_BOOTSTRAP: AtomicBool = AtomicBool::new(false);
