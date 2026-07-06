@@ -81,8 +81,8 @@ The correctness contract is differential: a corpus module passes only if `pon` p
 
 | Suite | What it measures | Committed floor |
 | --- | --- | --- |
-| `cpython` | corpus modules, JIT, byte-exact vs CPython 3.14 | 112 modules ([`conformance-floor.json`](conformance-floor.json)) |
-| `cpython-aot-subset` | same corpus compiled AoT and executed as native binaries | 108 modules ([`aot-parity-floor.json`](aot-parity-floor.json)) |
+| `cpython` | corpus modules, JIT, byte-exact vs CPython 3.14 | 209 modules ([`conformance-floor.json`](conformance-floor.json)) |
+| `cpython-aot-subset` | same corpus compiled AoT and executed as native binaries | 172 modules ([`aot-parity-floor.json`](aot-parity-floor.json)) |
 | `cpython-full` | CPython's own test suite (`Lib/test`), run under pon | being brought up ([`conformance-full-floor.json`](conformance-full-floor.json)) |
 | `fuzz` | differential fuzzing vs CPython; must stay at zero divergences | — |
 | `ft-stress` | free-threading stress (`--features free-threading`, experimental) | — |
@@ -129,7 +129,7 @@ These pins are settled workspace-wide and enforced by `Cargo.lock` / `rust-toolc
 What is verified today (all behind ratcheted, CI-checked floors):
 
 - `pon run` and `pon build` work end to end; the quickstart above is a smoke-tested example.
-- 112 differential corpus modules byte-identical to CPython 3.14 under the JIT; 108 of them also pass compiled AoT.
+- 209 differential corpus modules byte-identical to CPython 3.14 under the JIT; 172 of them also pass compiled AoT.
 - The perf substrate is in place: background compilation, OSR, inline caches, type feedback.
 
 What is explicitly **not** done yet — this is the active roadmap, in order:

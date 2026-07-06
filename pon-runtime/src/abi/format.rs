@@ -149,6 +149,9 @@ unsafe extern "C" fn template_add(left: *mut PyObject, right: *mut PyObject) -> 
 /// `str`, `int`/`bool`, and `float`, with user-defined `__format__` dispatch
 /// for other objects.
 pub(crate) fn format_object_with_spec(value: *mut PyObject, spec: &str) -> Result<String, String> {
+	// Callers pass raw argv slots; tagged immediates (small ints, tagged
+	// floats) must be boxed before the type probes below.
+	let value = crate::tag::untag_arg(value);
 	if value.is_null() {
 		return Err("cannot format NULL object".to_owned());
 	}
@@ -183,7 +186,7 @@ pub(crate) fn format_object_with_spec(value: *mut PyObject, spec: &str) -> Resul
 	if spec.is_empty() {
 		object_to_str(value)
 	} else {
-		Err(format!("unsupported format string passed to {}.__format__", type_name(value)))
+		Err(format!("unsupported format string passed to {}.__format__ [spec-fallthrough]", type_name(value)))
 	}
 }
 
