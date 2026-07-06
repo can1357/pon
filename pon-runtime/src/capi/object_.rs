@@ -1040,26 +1040,6 @@ pub(crate) unsafe extern "C" fn capi_vectorcall_call(
 			);
 		}
 		let mut positional = positional;
-		{
-			// TEMP diag
-			static DIAG_COUNT: core::sync::atomic::AtomicUsize =
-				core::sync::atomic::AtomicUsize::new(0);
-			if DIAG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 6 {
-				let raw_ty = unsafe { (*callable).ob_type.cast_mut() };
-				let norm =
-					twin::registered_native_of_foreign(raw_ty.cast()).unwrap_or(raw_ty);
-				eprintln!(
-					"[dbg] vc fallback callable {:p} raw_ty {:p} norm {:p} name {:?} tp_call_is_vc {}",
-					callable,
-					raw_ty,
-					norm,
-					unsafe { crate::types::dict::type_name(callable) },
-					unsafe { (*norm).tp_call }
-						.map(|call| call as *const () == capi_vectorcall_call as *const ())
-						.unwrap_or(false),
-				);
-			}
-		}
 		if kwargs.is_null() {
 			unsafe { call_with_argv(callable, argv_ptr(&mut positional), positional.len()) }
 		} else {
