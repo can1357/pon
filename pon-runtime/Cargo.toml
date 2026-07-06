@@ -8,9 +8,6 @@ rust-version.workspace = true
 [lib]
 crate-type = ["rlib", "staticlib"]
 
-[features]
-default = []
-free-threading = ["pon-gc/free-threading"]
 [lints]
 workspace = true
 
@@ -20,6 +17,8 @@ libc.workspace = true
 num-bigint.workspace = true
 num-integer.workspace = true
 num-traits.workspace = true
+ruff_python_ast.workspace = true
+ruff_python_parser.workspace = true
 openssl.workspace = true
 bzip2.workspace = true
 flate2.workspace = true
@@ -32,6 +31,7 @@ scrypt.workspace = true
 rusqlite.workspace = true
 xz2.workspace = true
 zstd.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 loom.workspace = true

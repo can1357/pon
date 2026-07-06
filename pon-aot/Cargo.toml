@@ -4,9 +4,6 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
-[features]
-default = []
-free-threading = ["pon-codegen/free-threading", "pon-runtime/free-threading"]
 
 [lints]
 workspace = true
@@ -15,6 +12,7 @@ workspace = true
 pon-codegen.workspace = true
 pon-runtime.workspace = true
 pon-ir.workspace = true
+pon-aot-dynamic.workspace = true
 anyhow.workspace = true
 target-lexicon.workspace = true
 cranelift-codegen.workspace = true

@@ -1558,10 +1558,23 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "cranelift-object",
+ "pon-aot-dynamic",
  "pon-codegen",
  "pon-ir",
  "pon-runtime",
  "target-lexicon",
+]
+
+[[package]]
+name = "pon-aot-dynamic"
+version = "0.1.0"
+dependencies = [
+ "pon-ir",
+ "pon-jit",
+ "pon-runtime",
+ "ruff_python_ast",
+ "ruff_python_parser",
+ "ruff_text_size",
 ]
 
 [[package]]
@@ -1632,12 +1645,15 @@ dependencies = [
  "num-traits",
  "openssl",
  "pon-gc",
+ "ruff_python_ast",
+ "ruff_python_parser",
  "rusqlite",
  "scrypt",
  "sha1",
  "sha2",
  "sha3",
  "xz2",
+ "zip",
  "zstd",
 ]
 

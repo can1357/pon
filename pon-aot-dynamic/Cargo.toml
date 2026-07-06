@@ -1,15 +1,19 @@
 [package]
-name = "pon-ir"
+name = "pon-aot-dynamic"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 
+[lib]
+crate-type = ["rlib", "staticlib"]
 
 [lints]
 workspace = true
 
 [dependencies]
-cranelift-codegen.workspace = true
-ruff_python_parser.workspace = true
+pon-ir.workspace = true
+pon-jit.workspace = true
+pon-runtime.workspace = true
 ruff_python_ast.workspace = true
+ruff_python_parser.workspace = true
 ruff_text_size.workspace = true

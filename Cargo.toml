@@ -7,6 +7,7 @@ members = [
     "pon-codegen",
     "pon-jit",
     "pon-aot",
+    "pon-aot-dynamic",
     "pon-abi",
     "pon",
     "pon-conformance",
@@ -24,6 +25,7 @@ pon-runtime     = { path = "pon-runtime" }
 pon-codegen     = { path = "pon-codegen" }
 pon-jit         = { path = "pon-jit" }
 pon-aot         = { path = "pon-aot" }
+pon-aot-dynamic = { path = "pon-aot-dynamic" }
 pon-abi         = { path = "pon-abi" }
 pon = { path = "pon" }
 pon-conformance = { path = "pon-conformance" }
