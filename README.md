@@ -81,8 +81,8 @@ The correctness contract is differential: a corpus module passes only if `pon` p
 
 | Suite | What it measures | Committed floor |
 | --- | --- | --- |
-| `cpython` | corpus modules, JIT, byte-exact vs CPython 3.14 | 209 modules ([`conformance-floor.json`](conformance-floor.json)) |
-| `cpython-aot-subset` | same corpus compiled AoT and executed as native binaries | 172 modules ([`aot-parity-floor.json`](aot-parity-floor.json)) |
+| `cpython` | corpus modules, JIT, byte-exact vs CPython 3.14 | 244 modules ([`conformance-floor.json`](conformance-floor.json)) |
+| `cpython-aot-subset` | same corpus compiled AoT and executed as native binaries | 206 modules ([`aot-parity-floor.json`](aot-parity-floor.json)) |
 | `cpython-full` | CPython's own test suite (`Lib/test`), run under pon | being brought up ([`conformance-full-floor.json`](conformance-full-floor.json)) |
 | `fuzz` | differential fuzzing vs CPython; must stay at zero divergences | — |
 | `ft-stress` | free-threading stress (`--features free-threading`, experimental) | — |

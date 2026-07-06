@@ -230,3 +230,20 @@ pon-conformance/corpus/cpython/decimal_reexport.py
 pon-conformance/corpus/cpython/time_asctime_mktime.py
 pon-conformance/corpus/cpython/pyio_open.py
 pon-conformance/corpus/cpython/exceptions_index_messages.py
+# Floor members restored after the corpus reshuffle dropped them from the manifest.
+pon-conformance/corpus/cpython/dict_update_protocol.py
+pon-conformance/corpus/cpython/dict_views_setops.py
+pon-conformance/corpus/cpython/fcntl_flock_basic.py
+pon-conformance/corpus/cpython/future_annotations_pep563.py
+pon-conformance/corpus/cpython/isinstance_object_universal.py
+pon-conformance/corpus/cpython/itertools_tee_lazy.py
+pon-conformance/corpus/cpython/lock_fork_reinit.py
+pon-conformance/corpus/cpython/pep562_module_getattr.py
+pon-conformance/corpus/cpython/re_match_subscript.py
+pon-conformance/corpus/cpython/re_pos_endpos.py
+pon-conformance/corpus/cpython/re_possessive_atomic.py
+pon-conformance/corpus/cpython/relative_import_function_scope.py
+pon-conformance/corpus/cpython/subprocess_input_roundtrip.py
+pon-conformance/corpus/cpython/type_mro_method.py
+pon-conformance/corpus/cpython/typing_namedtuple_construct.py
+pon-conformance/corpus/cpython/varargs_keyword_binding.py
