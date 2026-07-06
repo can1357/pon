@@ -730,11 +730,22 @@ unsafe fn capi_instance_dict_slot(
 	Ok(Some(unsafe { object.cast::<u8>().add(offset).cast::<*mut PyObject>() }))
 }
 
+/// True when a slot-less C type still owns a per-instance dictionary: spec
+/// types built with a managed dict wire a `__dict__` getset (Cython's
+/// cyfunction uses `PyObject_GenericGetDict`) instead of a positive
+/// `tp_dictoffset`.  Their storage lives ONLY in the side table.
+unsafe fn capi_sidetable_dict_eligible(ty: *const PyType) -> bool {
+	!unsafe { lookup_in_type(ty.cast_mut(), intern::intern("__dict__")) }.is_null()
+}
+
 unsafe fn capi_instance_dict_object(
 	object: *mut PyObject,
 	ty: *const PyType,
 ) -> Result<*mut PyObject, String> {
 	let Some(slot) = (unsafe { capi_instance_dict_slot(object, ty) })? else {
+		if unsafe { capi_sidetable_dict_eligible(ty) } {
+			return Ok(registered_capi_instance_dict(object));
+		}
 		return Ok(ptr::null_mut());
 	};
 	let dict = registered_capi_instance_dict(object);
@@ -754,24 +765,31 @@ pub(crate) unsafe fn ensure_capi_instance_dict(
 	object: *mut PyObject,
 	ty: *const PyType,
 ) -> Result<*mut PyObject, String> {
-	let Some(slot) = (unsafe { capi_instance_dict_slot(object, ty) })? else {
+	let slot = unsafe { capi_instance_dict_slot(object, ty) }?;
+	if slot.is_none() && !unsafe { capi_sidetable_dict_eligible(ty) } {
 		return Ok(ptr::null_mut());
-	};
+	}
 	let current = registered_capi_instance_dict(object);
 	if !current.is_null() {
-		unsafe { slot.write(current) };
+		if let Some(slot) = slot {
+			unsafe { slot.write(current) };
+		}
 		return Ok(current);
 	}
-	let current = unsafe { slot.read() };
-	if !current.is_null() {
-		remember_capi_instance_dict(object, current);
-		return Ok(current);
+	if let Some(slot) = slot {
+		let current = unsafe { slot.read() };
+		if !current.is_null() {
+			remember_capi_instance_dict(object, current);
+			return Ok(current);
+		}
 	}
 	let dict = unsafe { abi::map::pon_build_map(ptr::null_mut(), 0) };
 	if dict.is_null() {
 		return Err("failed to allocate C instance dictionary".to_owned());
 	}
-	unsafe { slot.write(dict) };
+	if let Some(slot) = slot {
+		unsafe { slot.write(dict) };
+	}
 	remember_capi_instance_dict(object, dict);
 	Ok(dict)
 }
@@ -837,13 +855,14 @@ unsafe fn capi_dict_del_attr(
 	let _guard = sync::begin_critical_section(dict);
 	unsafe { dict::dict_remove(dict, key).map(|removed| removed.is_some()) }
 }
-
 unsafe fn instance_dict_value(
 	object: *mut PyObject,
 	ty: *mut PyType,
 	name_id: u32,
 ) -> Result<Option<*mut PyObject>, String> {
-	if unsafe { crate::capi::is_capi_class(ty) } && unsafe { (*ty).tp_dictoffset > 0 } {
+	if unsafe { crate::capi::is_capi_class(ty) } {
+		// Covers both `tp_dictoffset` slots and side-table dicts of
+		// managed-dict spec types (Cython cyfunction).
 		return unsafe { capi_dict_get_attr(object, ty, name_id) };
 	}
 	let dict = unsafe { instance_dict(object) };
@@ -1269,7 +1288,8 @@ pub unsafe extern "C" fn generic_set_attr(
 
 	if !is_type
 		&& unsafe { crate::capi::is_capi_class(obj_ty) }
-		&& unsafe { (*obj_ty).tp_dictoffset > 0 }
+		&& (unsafe { (*obj_ty).tp_dictoffset > 0 }
+			|| unsafe { capi_sidetable_dict_eligible(obj_ty) })
 	{
 		if value.is_null() {
 			return match unsafe { capi_dict_del_attr(object, obj_ty, name_id) } {
