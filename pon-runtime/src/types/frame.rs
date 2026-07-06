@@ -56,6 +56,18 @@ fn frame_link(frame: *mut PyObject) -> Option<FrameLink> {
         .ok()
         .and_then(|table| table.get(&(frame as usize)).and_then(|chain| chain.first().copied()))
 }
+/// Attaches a captured call-chain record to an existing frame allocation
+/// (`chain[0]` = the frame itself). Traceback frames use this at raise time
+/// so `f_code.co_name`/`co_filename` resolve to real names; `finalize_frame`
+/// drops the record with the allocation.
+pub(crate) fn record_frame_chain(frame: *mut PyObject, chain: Box<[FrameLink]>) {
+    if frame.is_null() || chain.is_empty() {
+        return;
+    }
+    if let Ok(mut table) = FRAME_RECORDS.lock() {
+        table.insert(frame as usize, chain);
+    }
+}
 
 /// Returns the process-lifetime frame type object, creating it if needed.
 pub fn ensure_frame_type(type_type: *mut PyType) -> *mut PyType {
@@ -497,7 +509,7 @@ unsafe extern "C" fn frame_getattro(object: *mut PyObject, name: *mut PyObject) 
     match name {
         "f_locals" => new_frame_locals_proxy(),
         "f_globals" => new_frame_globals_dict(object),
-        "f_code" => new_code_object(frame_link(object).and_then(|link| link.name)),
+        "f_code" => new_code_object(frame_link(object)),
         "f_back" => new_frame_back(object),
         // `0` for frames without a captured chain (a traceback frame's line
         // lives on the traceback entry itself as `tb_lineno`).
@@ -509,20 +521,22 @@ unsafe extern "C" fn frame_getattro(object: *mut PyObject, name: *mut PyObject) 
 
 /// Synthetic code object served by `frame.f_code`.
 ///
-/// pon frames carry no code metadata beyond the captured function name, so
-/// the payload is one optional interned name: `co_name` resolves it, and a
-/// nameless payload (module toplevel, traceback and generator frames) reads
-/// `"<module>"`.  `co_filename` is the `"<pon>"` pseudo-file (angle brackets
-/// make `linecache` treat it as source-less deterministically).  Together
-/// with `tb_lasti == -1` this is the exact surface `traceback.StackSummary`
-/// and `logging.Logger.findCaller` read; `co_positions()` stays unreached.
-/// Unknown attributes raise `AttributeError` so the next introspection
-/// frontier stays loud.
+/// pon frames carry no code metadata beyond the captured function name and
+/// defining module, so the payload is two optional interned ids: `co_name`
+/// resolves the name (`None` → `"<module>"`), and `co_filename` reads the
+/// `"<pon:module.path>"` pseudo-file (`"<pon>"` without a module; angle
+/// brackets make `linecache` treat it as source-less deterministically).
+/// Together with `tb_lasti == -1` this is the exact surface
+/// `traceback.StackSummary` and `logging.Logger.findCaller` read;
+/// `co_positions()` stays unreached. Unknown attributes raise
+/// `AttributeError` so the next introspection frontier stays loud.
 #[repr(C)]
 struct PyFrameCode {
     header: PyObjectHeader,
     /// Interned function name backing `co_name`; `None` → `"<module>"`.
     name: Option<u32>,
+    /// Interned defining-module name backing `co_filename`; `None` → `"<pon>"`.
+    module: Option<u32>,
 }
 
 fn frame_code_type() -> *mut PyType {
@@ -538,22 +552,24 @@ fn frame_code_type() -> *mut PyType {
     *CODE_TYPE as *mut PyType
 }
 
-/// Code object for one frame: the process-shared nameless instance, or a
-/// fresh boxed instance carrying the frame's function name (leaked exactly
-/// like `types::function::alloc_code_object`'s per-read shells — the payload
-/// is two words and reads are bounded by introspection walks).
-fn new_code_object(name: Option<u32>) -> *mut PyObject {
+/// Code object for one frame: the process-shared bare instance, or a fresh
+/// boxed instance carrying the frame's function name and module (leaked
+/// exactly like `types::function::alloc_code_object`'s per-read shells — the
+/// payload is three words and reads are bounded by introspection walks).
+fn new_code_object(link: Option<FrameLink>) -> *mut PyObject {
     static SHARED: LazyLock<usize> = LazyLock::new(|| {
         Box::into_raw(Box::new(PyFrameCode {
             header: PyObjectHeader::new(frame_code_type()),
             name: None,
+            module: None,
         })) as usize
     });
-    match name {
+    match link {
         None => *SHARED as *mut PyObject,
-        Some(name) => Box::into_raw(Box::new(PyFrameCode {
+        Some(link) => Box::into_raw(Box::new(PyFrameCode {
             header: PyObjectHeader::new(frame_code_type()),
-            name: Some(name),
+            name: link.name,
+            module: link.module,
         }))
         .cast::<PyObject>(),
     }
@@ -566,7 +582,15 @@ unsafe extern "C" fn code_getattro(object: *mut PyObject, name: *mut PyObject) -
     };
     match name {
         // SAFETY: Runtime allocation helper; NULL propagates with the error set.
-        "co_filename" => unsafe { crate::abi::pon_const_str("<pon>".as_ptr(), "<pon>".len()) },
+        "co_filename" => {
+            // SAFETY: Only `frame_code_type` instances carry this getattro
+            // slot, so `object` is a live `PyFrameCode` allocation.
+            let text = unsafe { (*object.cast::<PyFrameCode>()).module }
+                .and_then(crate::intern::resolve)
+                .map_or_else(|| "<pon>".to_owned(), |module| format!("<pon:{module}>"));
+            // SAFETY: Runtime allocation helper; NULL propagates with the error set.
+            unsafe { crate::abi::pon_const_str(text.as_ptr(), text.len()) }
+        },
         "co_name" | "co_qualname" => {
             // SAFETY: Only `frame_code_type` instances carry this getattro
             // slot, so `object` is a live `PyFrameCode` allocation.

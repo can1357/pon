@@ -388,11 +388,24 @@ fn attach_current_traceback(runtime: &Runtime, exception: *mut PyObject) {
 	});
 	let frame_type = ensure_frame_type(runtime._type_type);
 	let traceback_type = ensure_traceback_type(runtime._type_type);
-	let (python_calls, caller_lines) = super::CURRENT_FUNCTION_STACK.with(|stack| {
+	let (python_calls, caller_lines, frame_ids) = super::CURRENT_FUNCTION_STACK.with(|stack| {
 		let stack = stack.borrow();
 		let lines: Vec<u32> = stack.iter().map(|call| call.caller_line).collect();
-		(stack.len(), lines)
+		// Interned (module, name) per call, innermost last — resolved here so
+		// traceback frames can serve real `co_name`/`co_filename` values.
+		let ids: Vec<(Option<u32>, Option<u32>)> = stack
+			.iter()
+			.map(|call| {
+				// SAFETY: Stack entries hold live function objects for the call's duration.
+				let name = unsafe { (*call.function).name_interned };
+				let module =
+					crate::types::function::function_module(call.function.cast::<PyObject>());
+				(module, Some(name))
+			})
+			.collect();
+		(stack.len(), lines, ids)
 	});
+	let toplevel_module = crate::import::active_module_name_id();
 
 	// SAFETY: Raise-path callers pass a live boxed exception instance.
 	let slot = unsafe { &mut (*exception.cast::<PyBaseException>()).traceback };
@@ -408,6 +421,11 @@ fn attach_current_traceback(runtime: &Runtime, exception: *mut PyObject) {
 		} else {
 			caller_lines[python_calls - depth]
 		};
+		let (module, name) = if depth == python_calls {
+			(toplevel_module, None)
+		} else {
+			frame_ids[python_calls - 1 - depth]
+		};
 		let frame = runtime
 			.heap
 			.alloc(size_of::<PyFrame>(), TYPE_ID_FRAME)
@@ -417,6 +435,10 @@ fn attach_current_traceback(runtime: &Runtime, exception: *mut PyObject) {
 			ptr::write(frame, PyFrame::new(frame_type.cast_const(), 0, ptr::null_mut()));
 			(*frame).line = line;
 		}
+		crate::types::frame::record_frame_chain(
+			frame.cast::<PyObject>(),
+			Box::new([crate::types::frame::FrameLink { module, name, line }]),
+		);
 		let entry = runtime
 			.heap
 			.alloc(size_of::<PyTraceback>(), TYPE_ID_TRACEBACK)
