@@ -13,7 +13,7 @@ use num_traits::{One, Signed, ToPrimitive, Zero};
 use crate::{
 	abi, abstract_op,
 	intern::{intern, resolve},
-	object::{PyObject, PyType},
+	object::{PyObject, PyType, is_exact_type},
 	thread_state::{pon_err_clear, pon_err_occurred, thread_state_lock},
 	types::{
 		bool_, dict, float, int, lazy_iter, type_,
@@ -1240,7 +1240,8 @@ unsafe fn exact_args<'a>(
 }
 
 unsafe fn is_none(object: *mut PyObject) -> bool {
-	type_name(object) == "NoneType"
+	let none_type = abi::runtime_none_type();
+	!none_type.is_null() && unsafe { is_exact_type(object, none_type) }
 }
 
 fn raise_type_error(message: &str) -> *mut PyObject {

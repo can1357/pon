@@ -57,8 +57,7 @@ static SYNC_TIERUP: LazyLock<bool> = LazyLock::new(|| match std::env::var_os("PO
 	None => false,
 });
 static DEBUG_TIER: LazyLock<bool> = LazyLock::new(|| {
-	std::env::var("PON_DEBUG")
-		.is_ok_and(|value| value.split(',').any(|flag| flag.trim() == "tier"))
+	std::env::var("PON_DEBUG").is_ok_and(|value| value.split(',').any(|flag| flag.trim() == "tier"))
 });
 static TIER_COMPILE_DISABLE_LOGGED: AtomicBool = AtomicBool::new(false);
 

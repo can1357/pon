@@ -20,7 +20,7 @@ use num_traits::ToPrimitive;
 use crate::{
 	abi::{self, map, pon_const_str, pon_none, return_null_with_error},
 	intern::{intern, resolve},
-	object::{PyObject, PyObjectHeader, PyType, PyUnicode},
+	object::{PyObject, PyObjectHeader, PyType, PyUnicode, is_exact_type},
 	types::{dict, int},
 };
 
@@ -212,7 +212,8 @@ unsafe fn str_text(object: *mut PyObject) -> Option<String> {
 }
 
 unsafe fn is_none(object: *mut PyObject) -> bool {
-	unsafe { int::type_name_is(object, "NoneType") }
+	let none_type = abi::runtime_none_type();
+	!none_type.is_null() && unsafe { is_exact_type(object, none_type) }
 }
 
 fn const_str_object(value: &str) -> Result<*mut PyObject, String> {

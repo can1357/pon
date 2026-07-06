@@ -5,8 +5,9 @@ use core::{mem::offset_of, ptr};
 use num_traits::ToPrimitive;
 
 use crate::{
+	abi,
 	intern::intern,
-	object::{PyObject, PyObjectHeader, PyType},
+	object::{PyObject, PyObjectHeader, PyType, is_exact_type},
 	types::{method, type_},
 };
 
@@ -155,7 +156,8 @@ fn index_error(object: *mut PyObject) -> String {
 }
 
 unsafe fn is_none(object: *mut PyObject) -> bool {
-	type_name(object) == "NoneType"
+	let none_type = abi::runtime_none_type();
+	!none_type.is_null() && unsafe { is_exact_type(object, none_type) }
 }
 
 fn type_name(object: *mut PyObject) -> &'static str {
