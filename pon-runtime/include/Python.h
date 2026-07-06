@@ -522,7 +522,11 @@ static inline PyObject *PyModuleDef_Init(PyModuleDef *def);
 #ifndef PyMODINIT_FUNC
 /* Module init entries must stay dlsym-visible even under
  * -fvisibility=hidden (numpy compiles extensions that way). */
+#ifdef __cplusplus
+#define PyMODINIT_FUNC extern "C" __attribute__((visibility("default"))) PyObject *
+#else
 #define PyMODINIT_FUNC __attribute__((visibility("default"))) PyObject *
+#endif
 #endif
 
 /* ---- structural runtime compatibility (NumPy C-API surface) ----
@@ -1084,14 +1088,11 @@ static inline int Py_IsInitialized(void) {
     return 1;
 }
 
-/* NumPy uses Py_GenericAlias only for __class_getitem__ helpers. Failing loudly
- * is preferable to pretending Pon implements runtime typing aliases.
- */
+/* NumPy uses Py_GenericAlias for C-level __class_getitem__ helpers.
+ * Route it through the injected typeobj family so extensions and the runtime
+ * stay in sync on the alias representation. */
 static inline PyObject *Py_GenericAlias(PyObject *origin, PyObject *args) {
-    (void)origin;
-    (void)args;
-    PyErr_SetString(PyExc_NotImplementedError, "Py_GenericAlias is not implemented by Pon");
-    return NULL;
+    return PyPon_Capi()->typeobj->generic_alias(origin, args);
 }
 
 

@@ -270,6 +270,7 @@ pub(crate) struct PyPonCapiTypeObj {
 		*mut PyTypeSpec,
 		*mut PyObject,
 	) -> *mut PyObject,
+	generic_alias: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
 }
 
 unsafe impl Send for PyPonCapiTypeObj {}
@@ -289,6 +290,7 @@ pub(crate) fn build() -> PyPonCapiTypeObj {
 		type_from_module_and_spec: capi_type_from_module_and_spec,
 		type_modified:             capi_type_modified,
 		type_from_metaclass:       capi_type_from_metaclass,
+		generic_alias:             crate::types::typealias::pon_make_generic_alias,
 	}
 }
 
@@ -590,6 +592,7 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
 		} else {
 			None
 		};
+		ty.tp_flags = foreign_ref.tp_flags as usize;
 		ty.tp_dictoffset = if foreign_ref.tp_dictoffset > 0 {
 			foreign_ref.tp_dictoffset
 		} else {
@@ -605,7 +608,12 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
 			ty.tp_hash = Some(hash);
 		}
 		if let Some(call) = slot(foreign_ref.tp_call) {
-			ty.tp_call = Some(call);
+			ty.tp_call = if foreign_ref.tp_vectorcall_offset > 0
+			{
+				Some(crate::capi::object_::capi_vectorcall_call)
+			} else {
+				Some(call)
+			};
 		}
 		if let Some(richcmp) = slot(foreign_ref.tp_richcompare) {
 			ty.tp_richcmp = Some(richcmp);
@@ -1441,6 +1449,7 @@ enum SlotKind {
 	ReflectedBinary,
 	Ternary,
 	ReflectedTernary,
+	RichCompare,
 	InquiryBool,
 	Len,
 	SSizeItem,
@@ -1459,6 +1468,8 @@ struct PySlotWrapper {
 	self_object: *mut PyObject,
 	name:        u32,
 	kind:        SlotKind,
+	compare_op:  c_int,
+	doc:         *const c_char,
 }
 
 unsafe extern "C" fn trace_slot_wrapper(object: *mut u8, visitor: &mut dyn FnMut(*mut u8)) {
@@ -1480,6 +1491,8 @@ static SLOT_WRAPPER_TYPE: LazyLock<usize> = LazyLock::new(|| {
 	);
 	ty.tp_call = Some(slot_wrapper_call);
 	ty.tp_descr_get = Some(slot_wrapper_descr_get);
+	ty.tp_getattro = Some(slot_wrapper_getattro);
+	ty.tp_setattro = Some(slot_wrapper_setattro);
 	Box::into_raw(Box::new(ty)) as usize
 });
 
@@ -1488,6 +1501,17 @@ fn alloc_slot_wrapper(
 	kind: SlotKind,
 	self_object: *mut PyObject,
 	name: u32,
+) -> *mut PyObject {
+	alloc_slot_wrapper_full(slot_ptr, kind, self_object, name, 0, ptr::null())
+}
+
+fn alloc_slot_wrapper_full(
+	slot_ptr: *mut (),
+	kind: SlotKind,
+	self_object: *mut PyObject,
+	name: u32,
+	compare_op: c_int,
+	doc: *const c_char,
 ) -> *mut PyObject {
 	let info = GcTypeInfo {
 		size:     core::mem::size_of::<PySlotWrapper>(),
@@ -1506,9 +1530,67 @@ fn alloc_slot_wrapper(
 			self_object,
 			name,
 			kind,
+			compare_op,
+			doc,
 		});
 	}
 	as_object_ptr(object)
+}
+
+fn descriptor_name_attr(name: u32) -> *mut PyObject {
+	let text = crate::intern::resolve(name).unwrap_or_else(|| "<descriptor>".to_owned());
+	unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }
+}
+
+fn descriptor_doc_attr(doc: *const c_char) -> *mut PyObject {
+	if doc.is_null() {
+		return unsafe { abi::pon_none() };
+	}
+	let text = unsafe { std::ffi::CStr::from_ptr(doc) }.to_string_lossy();
+	unsafe { abi::pon_const_str(text.as_ptr(), text.len()) }
+}
+
+fn set_descriptor_doc(doc: &mut *const c_char, value: *mut PyObject) -> c_int {
+	if value.is_null() {
+		*doc = ptr::null();
+		return 0;
+	}
+	let Some(text) = (unsafe { crate::types::type_::unicode_text(value) }) else {
+		let _ = abi::return_null_with_type_error("__doc__ must be a str");
+		return -1;
+	};
+	let Ok(c_text) = CString::new(text) else {
+		let _ = abi::return_null_with_type_error("__doc__ contains NUL");
+		return -1;
+	};
+	*doc = c_text.into_raw();
+	0
+}
+
+unsafe extern "C" fn slot_wrapper_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+	let attr = unsafe { crate::types::type_::unicode_text(name) };
+	let wrapper = unsafe { &*object.cast::<PySlotWrapper>() };
+	match attr {
+		Some("__name__") | Some("__qualname__") => descriptor_name_attr(wrapper.name),
+		Some("__doc__") => descriptor_doc_attr(wrapper.doc),
+		_ => unsafe { crate::descr::generic_get_attr(object, name) },
+	}
+}
+
+unsafe extern "C" fn slot_wrapper_setattro(
+	object: *mut PyObject,
+	name: *mut PyObject,
+	value: *mut PyObject,
+) -> c_int {
+	let attr = unsafe { crate::types::type_::unicode_text(name) };
+	let wrapper = unsafe { &mut *object.cast::<PySlotWrapper>() };
+	match attr {
+		Some("__doc__") => set_descriptor_doc(&mut wrapper.doc, value),
+		_ => {
+			let _ = abi::return_null_with_type_error("object does not support attribute assignment");
+			-1
+		},
+	}
 }
 
 unsafe extern "C" fn slot_wrapper_descr_get(
@@ -1524,7 +1606,14 @@ unsafe extern "C" fn slot_wrapper_descr_get(
 	}
 	// SAFETY: descriptor protocol dispatches here only for PySlotWrapper values.
 	let wrapper = unsafe { &*descriptor.cast::<PySlotWrapper>() };
-	alloc_slot_wrapper(wrapper.slot, wrapper.kind, instance, wrapper.name)
+	alloc_slot_wrapper_full(
+		wrapper.slot,
+		wrapper.kind,
+		instance,
+		wrapper.name,
+		wrapper.compare_op,
+		wrapper.doc,
+	)
 }
 
 unsafe extern "C" fn slot_wrapper_call(
@@ -1565,6 +1654,7 @@ unsafe extern "C" fn slot_wrapper_call(
 		SlotKind::ReflectedTernary => unsafe {
 			call_ternary_slot_wrapper(wrapper, receiver, rest, true)
 		},
+		SlotKind::RichCompare => unsafe { call_richcompare_slot_wrapper(wrapper, receiver, rest) },
 		SlotKind::InquiryBool => unsafe { call_inquiry_slot_wrapper(wrapper, receiver, rest) },
 		SlotKind::Len => unsafe { call_len_slot_wrapper(wrapper, receiver, rest) },
 		SlotKind::SSizeItem => unsafe { call_ssizearg_slot_wrapper(wrapper, receiver, rest) },
@@ -1660,6 +1750,23 @@ unsafe fn call_binary_slot_wrapper(
 		unsafe { function(receiver, args[0]) }
 	};
 	normalize_object_slot_result(result, "binary slot returned NULL without setting an exception")
+}
+
+unsafe fn call_richcompare_slot_wrapper(
+	wrapper: &PySlotWrapper,
+	receiver: *mut PyObject,
+	args: &[*mut PyObject],
+) -> *mut PyObject {
+	if !require_slot_arity(wrapper, args, 1) {
+		return ptr::null_mut();
+	}
+	let Some(function) = (unsafe { slot::<crate::object::RichCmpFunc>(wrapper.slot) }) else {
+		return abi::return_null_with_error("slot wrapper has no rich-compare function");
+	};
+	normalize_object_slot_result(
+		unsafe { function(receiver, args[0], wrapper.compare_op) },
+		"rich-compare slot returned NULL without setting an exception",
+	)
 }
 
 unsafe fn call_ternary_slot_wrapper(
@@ -1927,6 +2034,14 @@ unsafe fn install_slot_wrappers(ns: &mut PyClassDict, foreign: &ForeignTypeObjec
 			SlotKind::Binary,
 		)?;
 	}
+	if !foreign.tp_richcompare.is_null() {
+		install_richcompare_slot_wrapper(ns, "__lt__", foreign.tp_richcompare, abi::object::RICH_LT as c_int)?;
+		install_richcompare_slot_wrapper(ns, "__le__", foreign.tp_richcompare, abi::object::RICH_LE as c_int)?;
+		install_richcompare_slot_wrapper(ns, "__eq__", foreign.tp_richcompare, abi::object::RICH_EQ as c_int)?;
+		install_richcompare_slot_wrapper(ns, "__ne__", foreign.tp_richcompare, abi::object::RICH_NE as c_int)?;
+		install_richcompare_slot_wrapper(ns, "__gt__", foreign.tp_richcompare, abi::object::RICH_GT as c_int)?;
+		install_richcompare_slot_wrapper(ns, "__ge__", foreign.tp_richcompare, abi::object::RICH_GE as c_int)?;
+	}
 
 	if !foreign.tp_as_sequence.is_null() {
 		let methods = unsafe { &*foreign.tp_as_sequence.cast::<CSequenceMethods>() };
@@ -1972,6 +2087,34 @@ fn install_slot_wrapper(
 		return Some(());
 	}
 	let descriptor = alloc_slot_wrapper(slot_ptr, kind, ptr::null_mut(), name_id);
+	if descriptor.is_null() {
+		return None;
+	}
+	ns.set(name_id, descriptor);
+	Some(())
+}
+
+fn install_richcompare_slot_wrapper(
+	ns: &mut PyClassDict,
+	name: &str,
+	slot_ptr: *mut (),
+	compare_op: c_int,
+) -> Option<()> {
+	if slot_ptr.is_null() {
+		return Some(());
+	}
+	let name_id = intern(name);
+	if ns.get(name_id).is_some() {
+		return Some(());
+	}
+	let descriptor = alloc_slot_wrapper_full(
+		slot_ptr,
+		SlotKind::RichCompare,
+		ptr::null_mut(),
+		name_id,
+		compare_op,
+		ptr::null(),
+	);
 	if descriptor.is_null() {
 		return None;
 	}
@@ -2418,6 +2561,7 @@ struct PyGetSetDescr {
 	set:     *mut (),
 	closure: *mut c_void,
 	name:    u32,
+	doc:     *const c_char,
 }
 
 static GETSET_DESCR_TYPE: LazyLock<usize> = LazyLock::new(|| {
@@ -2428,6 +2572,8 @@ static GETSET_DESCR_TYPE: LazyLock<usize> = LazyLock::new(|| {
 	);
 	ty.tp_descr_get = Some(getset_descr_get);
 	ty.tp_descr_set = Some(getset_descr_set);
+	ty.tp_getattro = Some(getset_descr_getattro);
+	ty.tp_setattro = Some(getset_descr_setattro);
 	Box::into_raw(Box::new(ty)) as usize
 });
 
@@ -2438,6 +2584,7 @@ fn alloc_getset_descriptor(def: &CGetSetDef, name: &str) -> *mut PyObject {
 		set:     def.set,
 		closure: def.closure,
 		name:    intern(name),
+		doc:     def.doc,
 	});
 	as_object_ptr(Box::into_raw(descriptor))
 }
@@ -2478,6 +2625,32 @@ unsafe extern "C" fn getset_descr_set(
 	unsafe { set(instance, value, descr.closure) }
 }
 
+unsafe extern "C" fn getset_descr_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+	let attr = unsafe { crate::types::type_::unicode_text(name) };
+	let descr = unsafe { &*object.cast::<PyGetSetDescr>() };
+	match attr {
+		Some("__name__") | Some("__qualname__") => descriptor_name_attr(descr.name),
+		Some("__doc__") => descriptor_doc_attr(descr.doc),
+		_ => unsafe { crate::descr::generic_get_attr(object, name) },
+	}
+}
+
+unsafe extern "C" fn getset_descr_setattro(
+	object: *mut PyObject,
+	name: *mut PyObject,
+	value: *mut PyObject,
+) -> c_int {
+	let attr = unsafe { crate::types::type_::unicode_text(name) };
+	let descr = unsafe { &mut *object.cast::<PyGetSetDescr>() };
+	match attr {
+		Some("__doc__") => set_descriptor_doc(&mut descr.doc, value),
+		_ => {
+			let _ = abi::return_null_with_type_error("object does not support attribute assignment");
+			-1
+		},
+	}
+}
+
 /// member descriptor carrier (structmember.h `PyMemberDef`).
 #[repr(C)]
 struct CMemberDef {
@@ -2495,6 +2668,7 @@ struct PyCMemberDescr {
 	flags:   c_int,
 	offset:  isize,
 	name:    u32,
+	doc:     *const c_char,
 }
 
 // structmember.h T_* codes.
@@ -2527,6 +2701,8 @@ static MEMBER_DESCR_TYPE: LazyLock<usize> = LazyLock::new(|| {
 	);
 	ty.tp_descr_get = Some(member_descr_get);
 	ty.tp_descr_set = Some(member_descr_set);
+	ty.tp_getattro = Some(member_descr_getattro);
+	ty.tp_setattro = Some(member_descr_setattro);
 	Box::into_raw(Box::new(ty)) as usize
 });
 
@@ -2537,6 +2713,7 @@ fn alloc_member_descriptor(def: &CMemberDef, name: &str) -> *mut PyObject {
 		flags:   def.flags,
 		offset:  def.offset,
 		name:    intern(name),
+		doc:     def.doc,
 	});
 	as_object_ptr(Box::into_raw(descriptor))
 }
@@ -2555,6 +2732,32 @@ unsafe extern "C" fn member_descr_get(
 	// own instance layout; `instance` is one of its instances.
 	let field = unsafe { instance.cast::<u8>().offset(descr.offset) };
 	unsafe { read_member(field, descr) }
+}
+
+unsafe extern "C" fn member_descr_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+	let attr = unsafe { crate::types::type_::unicode_text(name) };
+	let descr = unsafe { &*object.cast::<PyCMemberDescr>() };
+	match attr {
+		Some("__name__") | Some("__qualname__") => descriptor_name_attr(descr.name),
+		Some("__doc__") => descriptor_doc_attr(descr.doc),
+		_ => unsafe { crate::descr::generic_get_attr(object, name) },
+	}
+}
+
+unsafe extern "C" fn member_descr_setattro(
+	object: *mut PyObject,
+	name: *mut PyObject,
+	value: *mut PyObject,
+) -> c_int {
+	let attr = unsafe { crate::types::type_::unicode_text(name) };
+	let descr = unsafe { &mut *object.cast::<PyCMemberDescr>() };
+	match attr {
+		Some("__doc__") => set_descriptor_doc(&mut descr.doc, value),
+		_ => {
+			let _ = abi::return_null_with_type_error("object does not support attribute assignment");
+			-1
+		},
+	}
 }
 
 unsafe fn read_member(field: *mut u8, descr: &PyCMemberDescr) -> *mut PyObject {
@@ -2597,7 +2800,7 @@ unsafe fn read_member(field: *mut u8, descr: &PyCMemberDescr) -> *mut PyObject {
 			T_OBJECT | T_OBJECT_EX => {
 				let value = field.cast::<*mut PyObject>().read();
 				if !value.is_null() {
-					value
+					super::py_normalize_foreign(value)
 				} else if descr.kind == T_OBJECT {
 					abi::pon_none()
 				} else {

@@ -11,10 +11,10 @@
 use core::ffi::c_int;
 use core::mem::{offset_of, size_of};
 use core::ptr;
-use std::sync::LazyLock;
+use std::{collections::{HashMap, HashSet}, sync::LazyLock};
 
 use crate::intern::resolve;
-use crate::object::{as_object_ptr, PyFunction, PyNumberMethods, PyObject, PyObjectHeader, PyType, PyUnicode};
+use crate::object::{as_object_ptr, PyFunction, PyMappingMethods, PyNumberMethods, PyObject, PyObjectHeader, PyType, PyUnicode};
 use crate::thread_state::pon_err_set;
 
 /// Runtime object for Python 3.12+ `type X = ...` aliases.
@@ -111,6 +111,7 @@ pub fn type_alias_type(type_type: *const PyType) -> *mut PyType {
     static TYPE: LazyLock<usize> = LazyLock::new(|| {
         let mut ty = PyType::new(core::ptr::null(), "typing.TypeAliasType", size_of::<PyTypeAlias>());
         ty.tp_getattro = Some(type_alias_getattro);
+        ty.tp_as_mapping = type_alias_mapping_methods();
         Box::into_raw(Box::new(ty)) as usize
     });
     *TYPE as *mut PyType
@@ -133,6 +134,7 @@ pub fn generic_alias_type() -> *mut PyType {
     static TYPE: LazyLock<usize> = LazyLock::new(|| {
         let mut ty = PyType::new(core::ptr::null(), "types.GenericAlias", size_of::<PyGenericAlias>());
         ty.tp_getattro = Some(generic_alias_getattro);
+        ty.tp_new = Some(generic_alias_new);
         Box::into_raw(Box::new(ty)) as usize
     });
     *TYPE as *mut PyType
@@ -202,6 +204,38 @@ pub fn new_generic_alias(origin: *mut PyObject, args: Vec<*mut PyObject>) -> *mu
     as_object_ptr(Box::into_raw(object))
 }
 
+unsafe extern "C" fn generic_alias_new(
+    _subtype: *mut PyType,
+    args: *mut PyObject,
+    kwargs: *mut PyObject,
+) -> *mut PyObject {
+    if !kwargs.is_null() {
+        return crate::abi::return_null_with_type_error("types.GenericAlias does not accept keyword arguments");
+    }
+    make_generic_alias_from_args(args)
+}
+
+pub unsafe extern "C" fn pon_make_generic_alias(origin: *mut PyObject, args: *mut PyObject) -> *mut PyObject {
+    if origin.is_null() {
+        return crate::abi::return_null_with_type_error("types.GenericAlias origin must not be NULL");
+    }
+    let alias_args = match unsafe { crate::abi::seq::exact_tuple_slice(args) } {
+        Some(entries) => entries.to_vec(),
+        None => vec![args],
+    };
+    new_generic_alias(origin, alias_args)
+}
+
+fn make_generic_alias_from_args(args: *mut PyObject) -> *mut PyObject {
+    let Some(items) = (unsafe { crate::abi::seq::exact_tuple_slice(args) }) else {
+        return crate::abi::return_null_with_type_error("types.GenericAlias args must be a tuple");
+    };
+    if items.len() != 2 {
+        return crate::abi::return_null_with_type_error("types.GenericAlias expects exactly 2 arguments");
+    }
+    unsafe { pon_make_generic_alias(items[0], items[1]) }
+}
+
 /// Allocates a boxed normalized `UnionType` for `left | right`.
 #[must_use]
 pub fn new_union_type(args: Vec<*mut PyObject>) -> *mut PyObject {
@@ -217,6 +251,103 @@ pub unsafe fn install_type_or_slots(ty: *mut PyType) {
     if let Some(ty) = unsafe { ty.as_mut() } {
         install_union_or_slots(ty);
     }
+}
+
+fn type_alias_mapping_methods() -> *mut PyMappingMethods {
+    static METHODS: LazyLock<usize> = LazyLock::new(|| {
+        let mut methods = PyMappingMethods::EMPTY;
+        methods.mp_subscript = Some(type_alias_subscript);
+        Box::into_raw(Box::new(methods)) as usize
+    });
+    *METHODS as *mut PyMappingMethods
+}
+
+unsafe extern "C" fn type_alias_subscript(object: *mut PyObject, key: *mut PyObject) -> *mut PyObject {
+    let value = unsafe { type_alias_value(object) };
+    if value.is_null() {
+        return ptr::null_mut();
+    }
+    let params = collect_type_params(value);
+    if params.is_empty() {
+        return unsafe { crate::abstract_op::subscript_get(value, key) };
+    }
+    let args = match unsafe { crate::abi::seq::exact_tuple_slice(key) } {
+        Some(entries) => entries.to_vec(),
+        None => vec![key],
+    };
+    if args.len() != params.len() {
+        return crate::abi::return_null_with_type_error(format!(
+            "typing.TypeAliasType expected {} type argument(s), got {}",
+            params.len(),
+            args.len()
+        ));
+    }
+    let bindings = params
+        .into_iter()
+        .zip(args)
+        .map(|(param, arg)| (param as usize, arg))
+        .collect::<HashMap<usize, *mut PyObject>>();
+    substitute_type_params(value, &bindings)
+}
+
+fn collect_type_params(value: *mut PyObject) -> Vec<*mut PyObject> {
+    let mut seen = HashSet::new();
+    let mut params = Vec::new();
+    collect_type_params_inner(value, &mut seen, &mut params);
+    params
+}
+
+fn collect_type_params_inner(
+    value: *mut PyObject,
+    seen: &mut HashSet<usize>,
+    out: &mut Vec<*mut PyObject>,
+) {
+    if is_typevar(value) {
+        if seen.insert(value as usize) {
+            out.push(value);
+        }
+        return;
+    }
+    if is_generic_alias(value) {
+        let alias = unsafe { &*value.cast::<PyGenericAlias>() };
+        for &arg in &alias.args {
+            collect_type_params_inner(arg, seen, out);
+        }
+        return;
+    }
+    if is_union_type(value) {
+        for &arg in union_args(value) {
+            collect_type_params_inner(arg, seen, out);
+        }
+    }
+}
+
+fn substitute_type_params(
+    value: *mut PyObject,
+    bindings: &HashMap<usize, *mut PyObject>,
+) -> *mut PyObject {
+    if let Some(bound) = bindings.get(&(value as usize)).copied() {
+        return bound;
+    }
+    if is_generic_alias(value) {
+        let alias = unsafe { &*value.cast::<PyGenericAlias>() };
+        let args = alias
+            .args
+            .iter()
+            .copied()
+            .map(|arg| substitute_type_params(arg, bindings))
+            .collect();
+        return new_generic_alias(alias.origin, args);
+    }
+    if is_union_type(value) {
+        let args = union_args(value)
+            .iter()
+            .copied()
+            .map(|arg| substitute_type_params(arg, bindings))
+            .collect();
+        return new_union_type(args);
+    }
+    value
 }
 
 fn install_union_or_slots(ty: &mut PyType) {
@@ -432,7 +563,22 @@ unsafe extern "C" fn type_alias_getattro(object: *mut PyObject, name: *mut PyObj
             unsafe { crate::abi::pon_const_str(text.as_ptr(), text.len()) }
         }
         "__value__" => unsafe { type_alias_value(object) },
+        "__type_params__" => type_alias_type_params(object),
         _ => raise_attr(format!("'typing.TypeAliasType' object has no attribute '{name_text}'")),
+    }
+}
+
+fn type_alias_type_params(object: *mut PyObject) -> *mut PyObject {
+    let value = unsafe { type_alias_value(object) };
+    if value.is_null() {
+        return ptr::null_mut();
+    }
+    let params = collect_type_params(value);
+    unsafe {
+        crate::abi::seq::pon_build_tuple(
+            if params.is_empty() { ptr::null_mut() } else { params.as_ptr().cast_mut() },
+            params.len(),
+        )
     }
 }
 
