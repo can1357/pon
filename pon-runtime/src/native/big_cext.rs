@@ -35,6 +35,8 @@ use super::{
 	builtins_mod::{VARIADIC_ARITY, alloc_list, alloc_tuple},
 	install_module,
 };
+#[cfg(target_os = "macos")]
+use crate::object::PyMappingMethods;
 use crate::{
 	abi,
 	intern::intern,
@@ -45,8 +47,6 @@ use crate::{
 		memoryview as memoryview_type, type_,
 	},
 };
-#[cfg(target_os = "macos")]
-use crate::object::PyMappingMethods;
 
 type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
 #[cfg(target_os = "macos")]

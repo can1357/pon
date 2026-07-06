@@ -65,7 +65,13 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 		("is_tracked", gc_is_tracked),
 		("is_finalized", gc_is_finalized),
 	] {
-		attrs.push((intern(name), function_attr(name, entry)?));
+		let function = function_attr(name, entry)?;
+		if name == "collect" {
+			// The scan-floor machinery recognizes explicit `gc.collect()`
+			// dispatches by this function object's identity.
+			crate::abi::set_gc_collect_function(function);
+		}
+		attrs.push((intern(name), function));
 	}
 	install_module("gc", attrs)
 }

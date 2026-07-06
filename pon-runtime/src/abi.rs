@@ -4278,11 +4278,12 @@ static AUTO_COLLECT_ACTIVE: std::sync::atomic::AtomicBool =
 const AUTO_COLLECT_MIN_DEBT: usize = 64 << 20;
 
 thread_local! {
-	 /// Every in-flight `pon_call`'s operands (callee, argv, argc), pushed
-	 /// for EVERY call target. Rust-mediated callers keep argv in heap-backed
-	 /// Vecs the conservative stack scan cannot see; the collector roots the
-	 /// callee and every argv element of every level (`collect_impl`).
-	 static ACTIVE_CALL_OPERANDS: std::cell::RefCell<Vec<(*mut PyObject, *mut *mut PyObject, usize)>> =
+	 /// Every in-flight `pon_call`'s operands (callee, argv, argc, caller
+	 /// SP), pushed for EVERY call target. Rust-mediated callers keep argv in
+	 /// heap-backed Vecs the conservative stack scan cannot see; the
+	 /// collector roots the callee and every argv element of every level
+	 /// (`collect_impl`).  The caller SP feeds [`dispatch_scan_floor`].
+	 static ACTIVE_CALL_OPERANDS: std::cell::RefCell<Vec<(*mut PyObject, *mut *mut PyObject, usize, usize)>> =
 		  const { std::cell::RefCell::new(Vec::new()) };
 	 /// Root sources registered by suspended Rust helper frames that hold GC
 	 /// pointers in heap-backed buffers across pon re-entry (`sorted` key
@@ -4371,7 +4372,7 @@ impl Drop for ScopedRootsGuard {
 pub(crate) fn helper_frame_roots() -> Vec<*mut PyObject> {
 	let mut roots = Vec::new();
 	ACTIVE_CALL_OPERANDS.with(|cell| {
-		for &(callee, argv, argc) in cell.borrow().iter() {
+		for &(callee, argv, argc, _caller_sp) in cell.borrow().iter() {
 			roots.push(callee);
 			if argv.is_null() {
 				continue;
@@ -4391,11 +4392,43 @@ pub(crate) fn helper_frame_roots() -> Vec<*mut PyObject> {
 	roots
 }
 
+/// The `gc.collect` native function object, published by the gc module so
+/// [`collect_impl`] can recognize an explicit-collect dispatch record and
+/// raise the conservative scan floor (see [`dispatch_scan_floor`]).
+static GC_COLLECT_FUNCTION: AtomicPtr<PyObject> = AtomicPtr::new(ptr::null_mut());
+
+/// Publishes the `gc.collect` function object for dispatch-floor matching.
+pub(crate) fn set_gc_collect_function(function: *mut PyObject) {
+	GC_COLLECT_FUNCTION.store(function, Ordering::Release);
+}
+
+/// The conservative-scan floor for an in-flight explicit collection: the
+/// generated-code caller SP recorded by the innermost `pon_call` dispatch,
+/// but only when that dispatch is calling `gc.collect` itself.  Frames below
+/// that SP (the dispatch glue and the collector) root their GC references
+/// explicitly (`ACTIVE_CALL_OPERANDS`, `scoped_roots`), while their raw
+/// stack memory holds ghosts — stale callee-saved register spills of dead
+/// generated-code values and residue of earlier dead frames — that would
+/// otherwise be conservatively retained, breaking `del x; gc.collect()`
+/// finalization parity (corpus `weakref_dicts`).  Returns 0 when the
+/// innermost dispatch is not an explicit collect (automatic collections keep
+/// the fully conservative scan).
+fn dispatch_scan_floor() -> usize {
+	let collect_fn = GC_COLLECT_FUNCTION.load(Ordering::Acquire);
+	if collect_fn.is_null() {
+		return 0;
+	}
+	ACTIVE_CALL_OPERANDS.with(|cell| match cell.borrow().last() {
+		Some(&(callee, _, _, caller_sp)) if callee == collect_fn => caller_sp,
+		_ => 0,
+	})
+}
+
 struct CallOperandsGuard;
 
 impl CallOperandsGuard {
-	fn push(callee: *mut PyObject, argv: *mut *mut PyObject, argc: usize) -> Self {
-		ACTIVE_CALL_OPERANDS.with(|cell| cell.borrow_mut().push((callee, argv, argc)));
+	fn push(callee: *mut PyObject, argv: *mut *mut PyObject, argc: usize, caller_sp: usize) -> Self {
+		ACTIVE_CALL_OPERANDS.with(|cell| cell.borrow_mut().push((callee, argv, argc, caller_sp)));
 		Self
 	}
 }
@@ -4441,15 +4474,43 @@ fn maybe_auto_collect() {
 
 /// Calls a boxed callable, including native builtins, heap types, and bound
 /// methods.
+///
+/// A naked shim on the JIT/AoT-facing symbol: it forwards the caller's stack
+/// pointer — captured before this frame saves any callee-saved register — as
+/// the dispatch record's scan-floor candidate (see [`dispatch_scan_floor`]),
+/// then tail-jumps into [`pon_call_dispatch`].
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_call(
 	callee: *mut PyObject,
 	argv: *mut *mut PyObject,
 	argc: usize,
 ) -> *mut PyObject {
+	#[cfg(target_arch = "aarch64")]
+	core::arch::naked_asm!(
+		"mov x3, sp",
+		"b {dispatch}",
+		dispatch = sym pon_call_dispatch,
+	);
+	#[cfg(target_arch = "x86_64")]
+	core::arch::naked_asm!(
+		"lea rcx, [rsp + 8]",
+		"jmp {dispatch}",
+		dispatch = sym pon_call_dispatch,
+	);
+}
+
+/// [`pon_call`]'s body; `caller_sp` is the generated-code caller's stack
+/// pointer at the call instruction (0 disables the scan-floor candidacy).
+unsafe extern "C" fn pon_call_dispatch(
+	callee: *mut PyObject,
+	argv: *mut *mut PyObject,
+	argc: usize,
+	caller_sp: usize,
+) -> *mut PyObject {
 	crate::untag_prelude!(callee);
 	catch_object_helper(|| {
-		let _operands = CallOperandsGuard::push(callee, argv, argc);
+		let _operands = CallOperandsGuard::push(callee, argv, argc, caller_sp);
 		maybe_auto_collect();
 		if let Err(message) = ensure_runtime_initialized() {
 			return return_null_with_error(message);
@@ -6466,6 +6527,22 @@ fn collect_impl() -> Result<(), String> {
 
 	let mut roots = LocalRoots { roots };
 	drop(slot);
+	// Explicit `gc.collect()` dispatches publish the generated-code caller
+	// SP as the conservative-scan floor: everything below it is dispatch
+	// glue and collector frames whose GC references are all in `roots`
+	// already, while their raw stack memory holds dead-value ghosts (see
+	// `dispatch_scan_floor`).  Restored on every exit path: finalizers run
+	// inside `collect` and may re-enter arbitrary user code.
+	let floor = dispatch_scan_floor();
+	let previous_floor = pon_gc::conservative_scan_floor();
+	pon_gc::set_conservative_scan_floor(floor);
+	struct FloorReset(usize);
+	impl Drop for FloorReset {
+		fn drop(&mut self) {
+			pon_gc::set_conservative_scan_floor(self.0);
+		}
+	}
+	let _reset = FloorReset(previous_floor);
 	// SAFETY: `heap` points into the process-lifetime runtime slot.  The slot
 	// is not cleared after initialization; dropping the runtime mutex here lets
 	// object finalizers call back into ABI helpers without deadlocking.
@@ -7126,10 +7203,8 @@ unsafe extern "C" fn data_type_dunder_format_native(
 	argc: usize,
 ) -> *mut PyObject {
 	if argv.is_null() || argc != 2 {
-		let message = format!(
-			"__format__() takes exactly one argument ({} given)",
-			argc.saturating_sub(1)
-		);
+		let message =
+			format!("__format__() takes exactly one argument ({} given)", argc.saturating_sub(1));
 		return unsafe { exc::pon_raise_type_error(message.as_ptr(), message.len()) };
 	}
 	let receiver = unsafe { *argv };

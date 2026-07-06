@@ -877,7 +877,9 @@ mod tests {
 		let driver = TierUpDriver::new();
 		{
 			let mut shared = driver.shared.lock().expect("test tier-up mutex");
-			shared.modules.push(RegisteredModule { ir: Arc::new(ir_module) });
+			shared
+				.modules
+				.push(RegisteredModule { ir: Arc::new(ir_module) });
 			shared.functions.push(RegisteredFunction {
 				tier0_entry,
 				module_index: 0,

@@ -4562,9 +4562,7 @@ unsafe extern "C" fn os_setpriority(argv: *mut *mut PyObject, argc: usize) -> *m
 		Ok(value) => value,
 		Err(error) => return error,
 	};
-	if unsafe { libc::setpriority(which as _, who as libc::id_t, priority as libc::c_int) }
-		< 0
-	{
+	if unsafe { libc::setpriority(which as _, who as libc::id_t, priority as libc::c_int) } < 0 {
 		return raise_errno(last_errno(), None);
 	}
 	unsafe { crate::abi::pon_none() }
@@ -5520,9 +5518,7 @@ unsafe extern "C" fn os_getgrouplist(argv: *mut *mut PyObject, argc: usize) -> *
 		},
 	};
 	let mut ngroups = 0 as libc::c_int;
-	unsafe {
-		libc::getgrouplist(c_user.as_ptr(), gid as _, std::ptr::null_mut(), &mut ngroups)
-	};
+	unsafe { libc::getgrouplist(c_user.as_ptr(), gid as _, std::ptr::null_mut(), &mut ngroups) };
 	if ngroups <= 0 {
 		ngroups = 16;
 	}
@@ -5597,14 +5593,16 @@ fn confname_arg(
 	if !object.is_null() && !crate::tag::is_small_int(object) {
 		// SAFETY: Heap pointer with a live header after the tag check.
 		if let Some(text) = unsafe { crate::types::type_::unicode_text(object) } {
-			return names.iter().find(|(name, _)| *name == text).map(|&(_, value)| value).ok_or_else(
-				|| {
+			return names
+				.iter()
+				.find(|(name, _)| *name == text)
+				.map(|&(_, value)| value)
+				.ok_or_else(|| {
 					crate::abi::exc::raise_kind_error_text(
 						ExceptionKind::ValueError,
 						"unrecognized configuration name",
 					)
-				},
-			);
+				});
 		}
 	}
 	int_arg(object, "confstr").map(|value| value as libc::c_int)
@@ -5693,10 +5691,10 @@ fn sysconf_result(value: libc::c_long) -> *mut PyObject {
 	unsafe { crate::abi::pon_const_int(value as i64) }
 }
 
-#[cfg(target_os = "macos")]
-use libc::__error as errno_location;
 #[cfg(not(target_os = "macos"))]
 use libc::__errno_location as errno_location;
+#[cfg(target_os = "macos")]
+use libc::__error as errno_location;
 
 fn clear_errno() {
 	// SAFETY: `errno_location` returns the calling thread's live errno slot.

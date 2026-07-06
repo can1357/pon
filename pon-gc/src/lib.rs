@@ -109,6 +109,32 @@ pub unsafe extern "C" fn pon_gc_set_external_stack_base(base: *mut u8) {
 	set_external_stack_base(base);
 }
 
+thread_local! {
+	/// Lower bound for this thread's conservative stack scan, set around a
+	/// collection by the runtime (see [`set_conservative_scan_floor`]).
+	static CONSERVATIVE_SCAN_FLOOR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Raises the conservative scan's lower bound for the current thread.
+///
+/// The runtime sets this to the generated-code caller's stack pointer when a
+/// collection is dispatched through its call helper: every frame below it —
+/// the dispatch glue and the collector itself — keeps its GC references alive
+/// through explicit roots, while its raw stack memory holds ghosts (stale
+/// callee-saved register spills, dead prior-frame residue) that would
+/// otherwise be conservatively retained and break `del x; gc.collect()`
+/// finalization parity.  A floor outside the `(scan start, stack base)`
+/// interval is ignored.  Pass 0 to clear.
+pub fn set_conservative_scan_floor(floor: usize) {
+	CONSERVATIVE_SCAN_FLOOR.with(|cell| cell.set(floor));
+}
+
+/// Returns the current thread's conservative scan floor (0 when unset).
+#[must_use]
+pub fn conservative_scan_floor() -> usize {
+	CONSERVATIVE_SCAN_FLOOR.with(std::cell::Cell::get)
+}
+
 /// Installs or clears the precise stack-root hook.
 ///
 /// A hook is optional: with no hook, or when the hook reports an incomplete
@@ -1178,11 +1204,17 @@ fn collect_external_stack_roots(visitor: &mut dyn FnMut(usize, *mut u8)) {
 	// every local store into an explicit frame stack slot (`store_local`'s
 	// shadow slot in pon-codegen), which this stack walk observes.
 
-	let (low, high) = if current < base {
+	let (mut low, high) = if current < base {
 		(current, base)
 	} else {
 		(base, current)
 	};
+	// The runtime-published floor skips the collect-dispatch frames: their
+	// stack memory holds only ghosts (see `set_conservative_scan_floor`).
+	let floor = conservative_scan_floor();
+	if floor > low && floor < high {
+		low = floor;
+	}
 	let word = core::mem::size_of::<usize>();
 	let align_mask = word - 1;
 	let mut slot = (low + align_mask) & !align_mask;
