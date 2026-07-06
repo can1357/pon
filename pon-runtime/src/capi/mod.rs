@@ -595,9 +595,12 @@ unsafe fn run_module_slots(
 		match slot.slot {
 			0 => return Ok(()),
 			PY_MOD_CREATE => {
-				return module_load_error(format!(
-					"module '{module_name}' uses unsupported Py_mod_create slot"
-				));
+				// PEP 489 custom module creation.  The dominant emitter
+				// (Cython's `__pyx_pymod_create`) builds exactly the default
+				// module and copies spec attributes onto it; the runtime
+				// already created that module and owns its registration, so
+				// the hook is skipped rather than called with a synthetic
+				// spec (numpy.random's Cython extensions load this way).
 			},
 			PY_MOD_EXEC => {
 				if slot.value.is_null() {
@@ -1269,7 +1272,7 @@ PyMODINIT_FUNC PyInit_capi_test_ext(void) {
 		assert_eq!(format_object_for_print(echoed).as_deref(), Ok("99"));
 	}
 	#[test]
-	fn capi_multiphase_module_def_init_executes_slots_and_rejects_create() {
+	fn capi_multiphase_module_def_init_executes_slots_and_skips_create() {
 		let _guard = test_state_lock();
 		let _reset = ResetImportStateOnDrop;
 		unsafe {
@@ -1389,11 +1392,9 @@ PyMODINIT_FUNC PyInit_capi_multiphase_create_ext(void) {
 }
 "#,
 		);
-		let error = load_extension_module("capi_multiphase_create_ext", &create_path)
-			.expect_err("Py_mod_create slot should be rejected");
-		assert!(error.contains("capi_multiphase_create_ext"), "error did not name module: {error}");
-		assert!(error.contains("Py_mod_create"), "error did not name slot: {error}");
-		pon_err_clear();
+		let module = load_extension_module("capi_multiphase_create_ext", &create_path)
+			.expect("Py_mod_create modules load with the default-created module");
+		assert!(!module.is_null());
 	}
 
 	#[test]
