@@ -25,11 +25,9 @@ class SimpleQueue:
         if not block:
             if not self._count.acquire(blocking=False):
                 raise Empty
-            return self._queue.popleft()
-        if timeout is None:
+        elif timeout is None:
             self._count.acquire()
-            return self._queue.popleft()
-        if not self._count.acquire(timeout=timeout):
+        elif not self._count.acquire(timeout=timeout):
             raise Empty
         return self._queue.popleft()
 

@@ -1,9 +1,9 @@
 //! GC stop-request handshake primitives for the no-GIL runtime.
 //!
 //! Mutators poll the process-wide stop flag at generated-code safepoints and
-//! around blocking native waits.  A collector requests a stop, waits until every
-//! other registered thread has published a GC-safe stack range, then resumes
-//! them after tracing.
+//! around blocking native waits.  A collector requests a stop, waits until
+//! every other registered thread has published a GC-safe stack range, then
+//! resumes them after tracing.
 
 use std::sync::{
 	Condvar, Mutex,
@@ -43,9 +43,9 @@ impl GcPhase {
 /// Per-process GC handshake state.
 ///
 /// The atomics are the hot path: generated code performs a relaxed-sized query
-/// through [`gc_stop_requested`].  The mutex/condvar pair is cold and exists only
-/// to park mutators that have acknowledged a stop until the collector resumes
-/// them.
+/// through [`gc_stop_requested`].  The mutex/condvar pair is cold and exists
+/// only to park mutators that have acknowledged a stop until the collector
+/// resumes them.
 #[derive(Debug)]
 pub struct GcHandshake {
 	phase:          AtomicU8,
@@ -80,7 +80,10 @@ impl GcHandshake {
 
 	/// Requests that mutators stop at their next safepoint.
 	pub fn request_stop(&self) {
-		let _guard = self.wait_lock.lock().unwrap_or_else(|poison| poison.into_inner());
+		let _guard = self
+			.wait_lock
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
 		self.stop_requested.store(true, Ordering::Release);
 		self
 			.phase
@@ -108,7 +111,10 @@ impl GcHandshake {
 		if !self.stop_requested.load(Ordering::Acquire) {
 			return;
 		}
-		let mut guard = self.wait_lock.lock().unwrap_or_else(|poison| poison.into_inner());
+		let mut guard = self
+			.wait_lock
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
 		while self.stop_requested.load(Ordering::Acquire) {
 			guard = self
 				.resumed
@@ -120,7 +126,10 @@ impl GcHandshake {
 	/// Clears any pending stop request and returns to [`GcPhase::Idle`].
 	pub fn resume(&self) {
 		{
-			let _guard = self.wait_lock.lock().unwrap_or_else(|poison| poison.into_inner());
+			let _guard = self
+				.wait_lock
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner());
 			self.phase.store(GcPhase::Idle as u8, Ordering::Release);
 			self.stop_requested.store(false, Ordering::Release);
 		}

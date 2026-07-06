@@ -1,4 +1,23 @@
 //! Stop-the-world heap for runtime objects.
+//!
+//! # Architecture
+//!
+//! Small objects (at most 1 KiB) live in 64 KiB, 64 KiB-aligned spans
+//! segregated by 16-byte size classes, in the style of Go's page-heap and its
+//! Green Tea collector:
+//!
+//! - **Allocation** is a free-bit scan in the class's open span: no system
+//!   malloc on the hot path, and freed slots are reused after each sweep.
+//! - **Pointer classification** masks an address to its 64 KiB span base and
+//!   binary-searches the small sorted span-base table; slot arithmetic resolves
+//!   interior pointers. No per-object index is ever built.
+//! - **Marking** is span-granular: the work queue holds spans, not objects.
+//!   Each dequeue scans every accumulated seen-but-unscanned object in that
+//!   span in address order (per-span seen/scanned bitmaps), converting random
+//!   pointer chasing into near-linear passes over span memory.
+//!
+//! Objects larger than 1 KiB get individual 16-byte-aligned system
+//! allocations tracked by a lazily sorted address table.
 #![allow(improper_ctypes_definitions)]
 
 pub mod handshake;
@@ -8,7 +27,7 @@ use std::{
 	collections::VecDeque,
 	ptr::{self, NonNull},
 	sync::{
-		Mutex, MutexGuard,
+		LazyLock, Mutex, MutexGuard,
 		atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering},
 	},
 };
@@ -33,6 +52,15 @@ pub const IMMEDIATE_TAG_HEAP: usize = 0b00;
 /// with its provenance: an explicit runtime root, a precise stack-map root, or
 /// the conservative stack slot address that produced it.
 pub const TRACE_ROOTS_ENV: &str = "PON_GC_TRACE_ROOTS";
+
+/// Bytes per small-object span; also the span alignment, so any interior
+/// pointer resolves to its span base with a single mask.
+const SPAN_BYTES: usize = 64 * 1024;
+/// Largest allocation served from spans; bigger blocks are individually
+/// system-allocated.
+const SMALL_OBJECT_MAX: usize = 1024;
+/// Number of 16-byte size classes covering `1..=SMALL_OBJECT_MAX`.
+const NUM_SIZE_CLASSES: usize = SMALL_OBJECT_MAX / DEFAULT_HEAP_ALIGNMENT;
 
 /// Where one collection root came from, for [`TRACE_ROOTS_ENV`] diagnostics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,7 +171,7 @@ pub fn conservative_scan_floor() -> usize {
 /// A hook is optional: with no hook, or when the hook reports an incomplete
 /// precise walk, collection falls back to the conservative external-stack scan.
 pub fn set_precise_stack_roots(hook: Option<PreciseStackRootFn>) {
-	let hook = hook.map_or(ptr::null_mut(), |hook| hook as *const () as *mut ());
+	let hook = hook.map_or(ptr::null_mut(), |hook| (hook as *const ()).cast_mut());
 	PRECISE_STACK_ROOTS.store(hook, Ordering::SeqCst);
 }
 
@@ -181,8 +209,9 @@ pub struct TypeId(
 
 /// Exclusive upper bound for registered [`TypeId`] values.
 ///
-/// Type identifiers index a dense registry table, so they must stay compact;
-/// [`Heap::register_type`] rejects anything at or above this bound.
+/// Type identifiers index a dense registry table and are stored per object
+/// slot as 16-bit values, so they must stay compact; [`Heap::register_type`]
+/// rejects anything at or above this bound.
 pub const MAX_TYPE_ID: u32 = 1 << 16;
 
 /// Type-specific tracing callback for a heap allocation.
@@ -295,13 +324,13 @@ impl WriteBarrierRecord {
 
 	/// Returns the slot whose contents changed.
 	#[must_use]
-	pub fn slot(self) -> *mut *mut u8 {
+	pub const fn slot(self) -> *mut *mut u8 {
 		self.slot as *mut *mut u8
 	}
 
 	/// Returns the pointer written into the slot.
 	#[must_use]
-	pub fn new_value(self) -> *mut u8 {
+	pub const fn new_value(self) -> *mut u8 {
 		self.new as *mut u8
 	}
 }
@@ -365,9 +394,10 @@ impl WriteBarrierState {
 	}
 }
 
+static WRITE_BARRIER_STATE: LazyLock<WriteBarrierState> = LazyLock::new(WriteBarrierState::default);
+
 fn write_barrier_state() -> &'static WriteBarrierState {
-	static STATE: std::sync::OnceLock<WriteBarrierState> = std::sync::OnceLock::new();
-	STATE.get_or_init(WriteBarrierState::default)
+	&WRITE_BARRIER_STATE
 }
 
 /// Non-owning thread-local allocation buffer descriptor for future fast paths.
@@ -398,7 +428,7 @@ impl ThreadLocalAllocationBuffer {
 
 	/// Returns the number of bytes available in this buffer.
 	#[must_use]
-	pub fn remaining_bytes(self) -> usize {
+	pub const fn remaining_bytes(self) -> usize {
 		self.limit.saturating_sub(self.cursor)
 	}
 
@@ -443,9 +473,10 @@ pub struct Heap {
 
 impl Heap {
 	/// Creates an empty heap.
+	#[must_use]
 	pub fn new() -> Self {
 		Self {
-			state:               Mutex::new(HeapState::default()),
+			state:               Mutex::new(HeapState::new()),
 			bytes_since_collect: AtomicUsize::new(0),
 			live_bytes:          AtomicUsize::new(0),
 		}
@@ -454,7 +485,7 @@ impl Heap {
 	/// Registers or replaces layout information for `type_id`.
 	///
 	/// `type_id.0` must be below [`MAX_TYPE_ID`]: identifiers index a dense
-	/// registry table and are compact small integers by ABI contract.
+	/// registry table and are stored per object slot as 16-bit values.
 	pub fn register_type(&self, type_id: TypeId, info: GcTypeInfo) {
 		assert!(
 			type_id.0 < MAX_TYPE_ID,
@@ -487,8 +518,10 @@ impl Heap {
 
 	/// Allocates a zeroed, aligned, non-moving object for `type_id`.
 	///
-	/// The returned pointer is never null.  Out-of-memory and invalid layout
-	/// conditions abort the process rather than returning a sentinel pointer.
+	/// Small requests (at most 1 KiB) are served from size-class span slots;
+	/// larger requests get individual system allocations.  The returned
+	/// pointer is never null.  Out-of-memory and invalid layout conditions
+	/// abort the process rather than returning a sentinel pointer.
 	/// `type_id` must already have been registered with [`Heap::register_type`].
 	pub fn alloc(&self, size: usize, type_id: TypeId) -> *mut u8 {
 		let mut state = self.lock_state();
@@ -497,33 +530,12 @@ impl Heap {
 			"cannot allocate unregistered GC type {type_id:?}",
 		);
 
-		let allocated_size = size.max(1);
-		let layout = heap_layout(allocated_size);
-		state
-			.allocations
-			.try_reserve(1)
-			.unwrap_or_else(|_| std::process::abort());
-
-		// SAFETY: `layout` was constructed above and is non-zero-sized.  A null
-		// result is handled with Rust's standard OOM abort path below.
-		let raw = unsafe { alloc_zeroed(layout) };
-		if raw.is_null() {
-			handle_alloc_error(layout);
-		}
-
-		// SAFETY: `raw` was just checked for null.
-		let start = unsafe { NonNull::new_unchecked(raw) };
-		let birth_epoch = state.epoch;
-		state.allocations.push(Allocation {
-			start,
-			allocated_size,
-			type_id,
-			finalized: false,
-			birth_epoch,
-		});
-		let mark_color = state.new_allocation_mark_state();
-		state.mark_states.push(mark_color);
-		state.addr_index_dirty = true;
+		let allocation_black = write_barrier_state().allocation_black_active();
+		let (raw, allocated_size) = if size <= SMALL_OBJECT_MAX {
+			state.alloc_small(size, type_id, allocation_black)
+		} else {
+			state.alloc_large(size, type_id, allocation_black)
+		};
 		self
 			.bytes_since_collect
 			.fetch_add(allocated_size, Ordering::Relaxed);
@@ -535,8 +547,8 @@ impl Heap {
 	/// Performs a full stop-the-world mark/sweep collection.
 	///
 	/// The collector enumerates roots, resolves root and traced interior
-	/// pointers to allocation starts, traces registered object layouts, and then
-	/// finalizes and frees every unreached allocation.
+	/// pointers to object starts, traces registered object layouts span by
+	/// span, and then finalizes and frees every unreached allocation.
 	pub fn collect(&self, roots: &mut dyn RootSource) {
 		// Snapshot the pre-collect allocation debt: finalizers running later
 		// in this cycle may allocate, and THEIR debt must survive the reset
@@ -574,18 +586,18 @@ impl Heap {
 			);
 		}
 		let mut state = self.lock_state();
-		state.prepare_address_index();
-		let mut mark_queue = MarkQueue::new();
+		state.prepare_large_index();
 
 		for (index, root) in root_values.into_iter().enumerate() {
-			let marked = mark_pointer(&mut state, &mut mark_queue, root);
-			if trace_roots && marked {
-				if let Some(classification) = state.classify_pointer(root) {
-					eprintln!(
-						"[pon-gc] root {root:p} -> alloc {:p} (index {}) via {:?}",
-						classification.representative, classification.index, root_provenance[index],
-					);
-				}
+			let marked = mark_pointer(&mut state, root);
+			if trace_roots
+				&& marked
+				&& let Some(representative) = state.classify_pointer(root)
+			{
+				eprintln!(
+					"[pon-gc] root {root:p} -> alloc {representative:p} via {:?}",
+					root_provenance[index],
+				);
 			}
 		}
 
@@ -594,64 +606,36 @@ impl Heap {
 		// free memory an in-flight finalizer is still touching.
 		let in_flight = state.pending_finalizer_roots.clone();
 		for root in in_flight {
-			mark_pointer(&mut state, &mut mark_queue, root.as_ptr());
+			mark_pointer(&mut state, root.as_ptr());
 		}
 
-		drain_mark_queue(&mut state, &mut mark_queue);
+		drain_marks(&mut state);
 
 		// Finalization-deferred-free: an unreached allocation whose type
 		// carries a not-yet-run finalizer is resurrected for THIS cycle as a
 		// root wave, so everything its finalizer can touch or store —
 		// including the object itself — stays valid while the finalizer runs.
-		// The allocation is reclaimed by a later cycle once `finalized` is
-		// set (finalizers run at most once; a resurrected object that dies
-		// again is freed without a second callback).
-		let mut pending: Vec<(NonNull<u8>, FinalizeFn)> = Vec::new();
-		for index in 0..state.allocations.len() {
-			if state
-				.mark_states
-				.get(index)
-				.is_some_and(|color| color.is_reached())
-			{
-				continue;
-			}
-			let allocation = &state.allocations[index];
-			if allocation.finalized {
-				continue;
-			}
-			// Age gate: unreached blocks born in the CURRENT epoch may still
-			// be referenced by suspended Rust helper frames (heap-backed
-			// buffers the conservative scan cannot see). They are neither
-			// finalized nor swept until at least one full epoch old.
-			if allocation.birth_epoch >= state.epoch {
-				continue;
-			}
-			let Some(finalize) = state
-				.type_info(allocation.type_id)
-				.and_then(|info| info.finalize)
-			else {
-				continue;
-			};
-			pending.push((allocation.start, finalize));
-		}
+		// The allocation is reclaimed by a later cycle once its finalized bit
+		// is set (finalizers run at most once; a resurrected object that dies
+		// again is freed without a second callback).  Blocks born since the
+		// last collection are age-gated: they may still be referenced by
+		// suspended Rust helper frames (heap-backed buffers the conservative
+		// scan cannot see) and are neither finalized nor swept this cycle.
+		let pending = state.collect_pending_finalizers();
 		if !pending.is_empty() {
-			for &(start, _) in &pending {
-				let root = start.as_ptr();
-				mark_pointer(&mut state, &mut mark_queue, root);
+			for entry in &pending {
+				mark_pointer(&mut state, entry.start.as_ptr());
 			}
-			drain_mark_queue(&mut state, &mut mark_queue);
-			for &(start, _) in &pending {
-				if let Some(classification) = state.classify_pointer(start.as_ptr()) {
-					state.allocations[classification.index].finalized = true;
-				}
+			drain_marks(&mut state);
+			for entry in &pending {
+				state.set_finalized(entry.location);
 			}
 			// Root the pending set across the unlocked callback window below.
 			state
 				.pending_finalizer_roots
-				.extend(pending.iter().map(|&(start, _)| start));
+				.extend(pending.iter().map(|entry| entry.start));
 		}
-		let unreachable = state.sweep();
-		state.epoch += 1;
+		let (unreachable, reclaimed) = state.sweep();
 		drop(state);
 		// Finalizers run OUTSIDE the state lock: Python-level hooks
 		// (`__del__`, weakref death callbacks, C `tp_dealloc` bridges)
@@ -660,35 +644,34 @@ impl Heap {
 		// object and its whole subgraph survived the sweep above, and stays
 		// rooted through `pending_finalizer_roots` until every callback
 		// returns, so a nested collection cannot free memory an in-flight
-		// finalizer still touches; `finalized` suppresses a second callback.
-		for &(start, finalize) in &pending {
+		// finalizer still touches; the finalized bit suppresses a second
+		// callback.
+		for entry in &pending {
 			// SAFETY: The object survived this cycle's sweep and remains
-			// allocated; `finalized` was set under the lock so the callback
-			// runs at most once process-wide.
+			// allocated; its finalized bit was set under the lock so the
+			// callback runs at most once process-wide.
 			unsafe {
-				finalize(start.as_ptr());
+				(entry.finalize)(entry.start.as_ptr());
 			}
 		}
 		if !pending.is_empty() {
 			let mut state = self.lock_state();
-			for (start, _) in &pending {
+			for entry in &pending {
 				if let Some(position) = state
 					.pending_finalizer_roots
 					.iter()
-					.position(|root| root == start)
+					.position(|root| *root == entry.start)
 				{
 					state.pending_finalizer_roots.swap_remove(position);
 				}
 			}
 		}
-		let mut reclaimed = 0usize;
-		for allocation in unreachable {
-			reclaimed += allocation.layout.size();
-			// SAFETY: Every allocation record was created from `alloc_zeroed`
+		for (start, layout) in unreachable {
+			// SAFETY: Every detached block was created from `alloc_zeroed`
 			// with the same layout and has not yet been deallocated; detached
 			// records are owned solely by this frame.
 			unsafe {
-				dealloc(allocation.start.as_ptr(), allocation.layout);
+				dealloc(start.as_ptr(), layout);
 			}
 		}
 		self.live_bytes.fetch_sub(reclaimed, Ordering::Relaxed);
@@ -717,113 +700,190 @@ impl Drop for Heap {
 			.state
 			.get_mut()
 			.unwrap_or_else(|poison| poison.into_inner());
-		for allocation in state.allocations.drain(..) {
-			// SAFETY: Every allocation record was created from `alloc_zeroed`
-			// with the same layout and has not yet been deallocated.
+		for span in state.spans.iter().flatten() {
+			// SAFETY: Every span was allocated with `span_layout()` and is
+			// deallocated exactly once (here or in sweep, never both).
 			unsafe {
-				dealloc(allocation.start.as_ptr(), allocation.layout());
+				dealloc(span.base as *mut u8, span_layout());
+			}
+		}
+		for large in &state.large {
+			// SAFETY: Every large block was allocated with
+			// `large_layout(size)` and has not been deallocated.
+			unsafe {
+				dealloc(large.start.as_ptr(), large_layout(large.size));
 			}
 		}
 	}
 }
 
-#[derive(Default)]
+/// One 64 KiB size-class span and its per-slot metadata.
+///
+/// Slot `i` occupies `[base + i * elem_size, base + (i + 1) * elem_size)`.
+/// Bitmaps follow Go's Green Tea design: `mark_bits` records objects SEEN by
+/// the collector, `scan_bits` records objects already SCANNED; their
+/// difference is the span's pending work when it is dequeued.
+struct Span {
+	/// Span start address; `SPAN_BYTES`-aligned.
+	base:             usize,
+	elem_size:        u32,
+	nelems:           u32,
+	class:            u8,
+	/// Span currently sits on the mark work queue.
+	on_queue:         bool,
+	/// Number of allocated slots.
+	live_count:       u32,
+	/// First slot index worth scanning for a free slot (Go `freeindex`).
+	free_hint:        u32,
+	/// Slots at or above this index have never been allocated and still hold
+	/// the span's original zero fill; reused slots below it are re-zeroed at
+	/// allocation time.
+	zeroed_watermark: u32,
+	/// Slot is allocated.
+	alloc_bits:       Box<[u64]>,
+	/// Slot was seen (marked) this cycle.
+	mark_bits:        Box<[u64]>,
+	/// Slot was scanned this cycle.
+	scan_bits:        Box<[u64]>,
+	/// Slot was allocated since the last completed collection (age gate).
+	young_bits:       Box<[u64]>,
+	/// Slot's finalizer already ran; free silently once unreached again.
+	finalized_bits:   Box<[u64]>,
+	/// Per-slot registered type id.
+	type_ids:         Box<[u16]>,
+}
+
+impl Span {
+	fn new(class: usize) -> Self {
+		let elem_size = class_elem_size(class);
+		let nelems = (SPAN_BYTES / elem_size) as u32;
+		let words = (nelems as usize).div_ceil(64);
+		let layout = span_layout();
+		// SAFETY: `layout` is the constant non-zero span layout.
+		let raw = unsafe { alloc_zeroed(layout) };
+		if raw.is_null() {
+			handle_alloc_error(layout);
+		}
+		Self {
+			base: raw.addr(),
+			elem_size: elem_size as u32,
+			nelems,
+			class: class as u8,
+			on_queue: false,
+			live_count: 0,
+			free_hint: 0,
+			zeroed_watermark: 0,
+			alloc_bits: vec![0u64; words].into_boxed_slice(),
+			mark_bits: vec![0u64; words].into_boxed_slice(),
+			scan_bits: vec![0u64; words].into_boxed_slice(),
+			young_bits: vec![0u64; words].into_boxed_slice(),
+			finalized_bits: vec![0u64; words].into_boxed_slice(),
+			type_ids: vec![0u16; nelems as usize].into_boxed_slice(),
+		}
+	}
+
+	/// Finds the lowest free slot at or after `free_hint`, if any.
+	fn find_free_slot(&mut self) -> Option<u32> {
+		let words = self.alloc_bits.len();
+		let mut word_index = (self.free_hint / 64) as usize;
+		while word_index < words {
+			let mut free = !self.alloc_bits[word_index];
+			if word_index == words - 1 {
+				let tail = self.nelems % 64;
+				if tail != 0 {
+					free &= (1u64 << tail) - 1;
+				}
+			}
+			if free != 0 {
+				let slot = (word_index as u32) * 64 + free.trailing_zeros();
+				self.free_hint = slot;
+				return Some(slot);
+			}
+			word_index += 1;
+		}
+		None
+	}
+
+	const fn slot_address(&self, slot: u32) -> usize {
+		self.base + slot as usize * self.elem_size as usize
+	}
+}
+
+/// A block too large for spans, individually system-allocated.
+struct LargeObject {
+	start:     NonNull<u8>,
+	/// Allocated byte size (the requested size, minimum 1).
+	size:      usize,
+	type_id:   u16,
+	color:     MarkColor,
+	/// Allocated since the last completed collection (age gate).
+	young:     bool,
+	/// Finalizer already ran; free silently once unreached again.
+	finalized: bool,
+}
+
+/// Where one live object lives, for the finalization pass.
+#[derive(Clone, Copy)]
+enum ObjectLocation {
+	Span { span: u32, slot: u32 },
+	Large { index: u32 },
+}
+
+/// One unreached object whose finalizer must run this cycle.
+struct PendingFinalizer {
+	start:    NonNull<u8>,
+	finalize: FinalizeFn,
+	location: ObjectLocation,
+}
+
 struct HeapState {
 	/// Dense type registry indexed by `TypeId.0`; see [`Heap::register_type`].
 	types:                   Vec<Option<GcTypeInfo>>,
-	allocations:             Vec<Allocation>,
-	mark_states:             Vec<MarkColor>,
+	/// Slot arena of spans; freed entries become `None` and their indices are
+	/// recycled, so span indices stay stable across sweeps.
+	spans:                   Vec<Option<Span>>,
+	span_slots_free:         Vec<u32>,
+	/// `(span base, spans index)` sorted by base — the whole pointer
+	/// classification index.  Kept sorted incrementally: spans are created
+	/// rarely, so a sorted insert is cheap, and classification is always a
+	/// clean binary search with NO per-collection rebuild.
+	span_base_index:         Vec<(usize, u32)>,
+	/// Current allocation target per size class.
+	open_span:               [Option<u32>; NUM_SIZE_CLASSES],
+	/// Per class: spans with at least one free slot (rebuilt by sweep).
+	partial_spans:           Vec<Vec<u32>>,
+	large:                   Vec<LargeObject>,
+	/// `(start address, large index)` sorted by start; rebuilt lazily —
+	/// allocation only flips the dirty flag.
+	large_index:             Vec<(usize, u32)>,
+	large_index_dirty:       bool,
+	/// Green Tea work queue: SPANS with seen-but-unscanned objects, FIFO so
+	/// marks accumulate per span before it is scanned.
+	span_queue:              VecDeque<u32>,
+	large_queue:             VecDeque<u32>,
+	/// Reusable gather buffer for one span's pending `(object, type)` pairs.
+	scan_buffer:             Vec<(usize, u16)>,
 	/// Allocation starts whose finalizers are executing in an outer
 	/// `collect` frame with the lock released; rooted by every mark phase.
 	pending_finalizer_roots: Vec<NonNull<u8>>,
-	/// Sorted `(start address, allocations index)` pairs backing
-	/// [`HeapState::classify_pointer`]'s binary search.
-	///
-	/// Rebuilt lazily by [`HeapState::prepare_address_index`]: allocation
-	/// only flips `addr_index_dirty`, so the hot alloc path carries no
-	/// per-object index maintenance (this used to be a per-alloc `BTreeMap`
-	/// insert that dominated allocation-heavy workload profiles).
-	addr_index:              Vec<(usize, usize)>,
-	/// Allocations changed since `addr_index` was last rebuilt.
-	addr_index_dirty:        bool,
-	/// Completed-collection counter; allocations record it at birth. The
-	/// sweep only reclaims unreached blocks born BEFORE the current epoch
-	/// (see `Allocation::birth_epoch`).
-	epoch:                   u64,
 }
 
 impl HeapState {
-	fn new_allocation_mark_state(&self) -> MarkColor {
-		if write_barrier_state().allocation_black_active() {
-			return MarkColor::Black;
-		}
-
-		MarkColor::White
-	}
-
-	/// Rebuilds the sorted address index after allocations changed.
-	///
-	/// Classification requires a clean index: [`Heap::collect`] prepares it
-	/// once after taking the state lock, and [`mark_pointer`] re-checks
-	/// defensively (a no-op branch when already clean).
-	fn prepare_address_index(&mut self) {
-		if !self.addr_index_dirty {
-			return;
-		}
-		self.addr_index.clear();
-		self.addr_index.extend(
-			self
-				.allocations
-				.iter()
-				.enumerate()
-				.map(|(index, allocation)| (allocation.start.as_ptr().addr(), index)),
-		);
-		Self::radix_sort_by_address(&mut self.addr_index);
-		self.addr_index_dirty = false;
-	}
-
-	/// Sorts `(address, index)` pairs by address with LSD radix passes.
-	///
-	/// The address index is rebuilt from scratch once per collection; in
-	/// allocation-heavy programs the pair count reaches millions, where the
-	/// comparison sort dominated whole-collection profiles. Each 16-bit digit
-	/// costs O(n), and digits shared by every key (the high address bits in
-	/// practice) are skipped outright.
-	fn radix_sort_by_address(entries: &mut Vec<(usize, usize)>) {
-		const DIGIT_BITS: usize = 16;
-		const BUCKETS: usize = 1 << DIGIT_BITS;
-		if entries.len() <= 64 {
-			entries.sort_unstable();
-			return;
-		}
-		let mut scratch = vec![(0usize, 0usize); entries.len()];
-		let mut counts = vec![0usize; BUCKETS];
-		for shift in (0..usize::BITS as usize).step_by(DIGIT_BITS) {
-			counts.fill(0);
-			let mut all_same = true;
-			let first_digit = (entries[0].0 >> shift) & (BUCKETS - 1);
-			for &(address, _) in entries.iter() {
-				let digit = (address >> shift) & (BUCKETS - 1);
-				counts[digit] += 1;
-				all_same &= digit == first_digit;
-			}
-			// A digit column shared by every key permutes nothing.
-			if all_same {
-				continue;
-			}
-			let mut total = 0usize;
-			for count in &mut counts {
-				let bucket = *count;
-				*count = total;
-				total += bucket;
-			}
-			// Stable scatter (required for LSD correctness across passes).
-			for &entry in entries.iter() {
-				let digit = (entry.0 >> shift) & (BUCKETS - 1);
-				scratch[counts[digit]] = entry;
-				counts[digit] += 1;
-			}
-			std::mem::swap(entries, &mut scratch);
+	fn new() -> Self {
+		Self {
+			types:                   Vec::new(),
+			spans:                   Vec::new(),
+			span_slots_free:         Vec::new(),
+			span_base_index:         Vec::new(),
+			open_span:               [None; NUM_SIZE_CLASSES],
+			partial_spans:           vec![Vec::new(); NUM_SIZE_CLASSES],
+			large:                   Vec::new(),
+			large_index:             Vec::new(),
+			large_index_dirty:       false,
+			span_queue:              VecDeque::new(),
+			large_queue:             VecDeque::new(),
+			scan_buffer:             Vec::new(),
+			pending_finalizer_roots: Vec::new(),
 		}
 	}
 
@@ -832,114 +892,523 @@ impl HeapState {
 		self.types.get(type_id.0 as usize).copied().flatten()
 	}
 
-	fn classify_pointer(&self, pointer: *mut u8) -> Option<PointerClassification> {
-		if pointer.is_null() {
-			return None;
-		}
-		// Hard assert even in release: classifying against a stale index
-		// silently under-marks and frees live objects.
-		assert!(
-			!self.addr_index_dirty,
-			"classify_pointer called with a stale address index",
-		);
-		let address = pointer.addr();
-		// Address-ordered lookup: allocations are disjoint byte ranges, so
-		// the greatest start <= address is the only candidate block. This
-		// MUST stay sublinear — every conservative stack word and traced
-		// edge classifies, so a linear scan turns collection quadratic.
-		let position = self.addr_index.partition_point(|&(start, _)| start <= address);
-		let (_, index) = *self.addr_index[..position].last()?;
-		let allocation = self.allocations.get(index)?;
-		if !allocation.contains_address(address) {
-			return None;
-		}
-		Some(PointerClassification { index, representative: allocation.start.as_ptr() })
-	}
-
-	fn begin_object_scan(&self, index: usize) -> bool {
-		self.mark_states.get(index) == Some(&MarkColor::Gray)
-	}
-
-	fn finish_object_scan(&mut self, index: usize) {
-		if let Some(color) = self.mark_states.get_mut(index) {
-			*color = MarkColor::Black;
-		}
-	}
-
-	/// Detaches every unreached allocation from the heap tables and re-indexes
-	/// the survivors.  Deallocation is the CALLER's job, outside the state
-	/// lock (see [`Heap::collect`]).  Finalizers never run on the detached
-	/// set: an unreached allocation with a pending finalizer was resurrected
-	/// for one cycle by `collect` before this point.
-	fn sweep(&mut self) -> Vec<UnreachableAllocation> {
-		let old_allocations = std::mem::take(&mut self.allocations);
-		let old_mark_states = std::mem::take(&mut self.mark_states);
-		let mut survivors = Vec::with_capacity(old_allocations.len());
-		let mut unreachable = Vec::new();
-
-		for (index, allocation) in old_allocations.into_iter().enumerate() {
-			let reached = old_mark_states
-				.get(index)
-				.is_some_and(|color| color.is_reached());
-			// Age gate: unreached blocks born in the CURRENT epoch survive
-			// one cycle — they may still be referenced from Rust helper
-			// buffers the conservative scan cannot see.
-			if reached || allocation.birth_epoch >= self.epoch {
-				survivors.push(allocation);
+	/// Allocates one slot from the class's spans; the hot allocation path.
+	fn alloc_small(
+		&mut self,
+		size: usize,
+		type_id: TypeId,
+		allocation_black: bool,
+	) -> (*mut u8, usize) {
+		let class = size_class_of(size);
+		loop {
+			let span_index = if let Some(index) = self.open_span[class] {
+				index
 			} else {
-				unreachable
-					.push(UnreachableAllocation { start: allocation.start, layout: allocation.layout() });
+				let index = self.take_allocatable_span(class);
+				self.open_span[class] = Some(index);
+				index
+			};
+			let Some(span) = self.spans[span_index as usize].as_mut() else {
+				self.open_span[class] = None;
+				continue;
+			};
+			let Some(slot) = span.find_free_slot() else {
+				self.open_span[class] = None;
+				continue;
+			};
+
+			bit_set(&mut span.alloc_bits, slot);
+			bit_set(&mut span.young_bits, slot);
+			bit_clear(&mut span.finalized_bits, slot);
+			if allocation_black {
+				// Allocation-black during concurrent marking: born marked
+				// AND scanned so the cycle never frees or rescans it.
+				bit_set(&mut span.mark_bits, slot);
+				bit_set(&mut span.scan_bits, slot);
+			}
+			span.type_ids[slot as usize] = type_id.0 as u16;
+			span.live_count += 1;
+			let elem_size = span.elem_size as usize;
+			let raw = span.slot_address(slot) as *mut u8;
+			if slot < span.zeroed_watermark {
+				// SAFETY: The slot lies fully inside this heap-owned span and
+				// is free: no live object aliases it.
+				unsafe {
+					ptr::write_bytes(raw, 0, elem_size);
+				}
+			} else {
+				span.zeroed_watermark = slot + 1;
+			}
+			return (raw, elem_size);
+		}
+	}
+
+	/// Pops a span with free capacity for `class`, or creates one.
+	fn take_allocatable_span(&mut self, class: usize) -> u32 {
+		while let Some(index) = self.partial_spans[class].pop() {
+			if let Some(span) = self.spans[index as usize].as_ref()
+				&& span.live_count < span.nelems
+			{
+				return index;
+			}
+		}
+		self.new_span(class)
+	}
+
+	fn new_span(&mut self, class: usize) -> u32 {
+		let span = Span::new(class);
+		let base = span.base;
+		let index = if let Some(index) = self.span_slots_free.pop() {
+			self.spans[index as usize] = Some(span);
+			index
+		} else {
+			self.spans.push(Some(span));
+			(self.spans.len() - 1) as u32
+		};
+		let position = self
+			.span_base_index
+			.partition_point(|&(existing, _)| existing < base);
+		self.span_base_index.insert(position, (base, index));
+		index
+	}
+
+	fn alloc_large(
+		&mut self,
+		size: usize,
+		type_id: TypeId,
+		allocation_black: bool,
+	) -> (*mut u8, usize) {
+		let allocated_size = size.max(1);
+		let layout = large_layout(allocated_size);
+		self
+			.large
+			.try_reserve(1)
+			.unwrap_or_else(|_| std::process::abort());
+		// SAFETY: `layout` was constructed above and is non-zero-sized.  A null
+		// result is handled with Rust's standard OOM abort path below.
+		let raw = unsafe { alloc_zeroed(layout) };
+		if raw.is_null() {
+			handle_alloc_error(layout);
+		}
+		// SAFETY: `raw` was just checked for null.
+		let start = unsafe { NonNull::new_unchecked(raw) };
+		self.large.push(LargeObject {
+			start,
+			size: allocated_size,
+			type_id: type_id.0 as u16,
+			color: if allocation_black {
+				MarkColor::Black
+			} else {
+				MarkColor::White
+			},
+			young: true,
+			finalized: false,
+		});
+		self.large_index_dirty = true;
+		(raw, allocated_size)
+	}
+
+	/// Rebuilds the sorted large-object address index if allocations changed.
+	fn prepare_large_index(&mut self) {
+		if !self.large_index_dirty {
+			return;
+		}
+		self.large_index.clear();
+		self.large_index.extend(
+			self
+				.large
+				.iter()
+				.enumerate()
+				.map(|(index, large)| (large.start.as_ptr().addr(), index as u32)),
+		);
+		self.large_index.sort_unstable();
+		self.large_index_dirty = false;
+	}
+
+	/// Resolves a pointer (start or interior) to its object start.
+	///
+	/// Used by [`TRACE_ROOTS_ENV`] diagnostics and tests; the marking path
+	/// inlines the same lookups in [`mark_pointer`].
+	fn classify_pointer(&mut self, pointer: *mut u8) -> Option<*mut u8> {
+		self.prepare_large_index();
+		let address = pointer.addr();
+		if address == 0 {
+			return None;
+		}
+		let base = address & !(SPAN_BYTES - 1);
+		if let Ok(position) = self
+			.span_base_index
+			.binary_search_by_key(&base, |&(existing, _)| existing)
+		{
+			let span_index = self.span_base_index[position].1;
+			let span = self.spans[span_index as usize].as_ref()?;
+			let slot = ((address - base) as u32) / span.elem_size;
+			if slot >= span.nelems || !bit_get(&span.alloc_bits, slot) {
+				return None;
+			}
+			return Some(span.slot_address(slot) as *mut u8);
+		}
+		let position = self
+			.large_index
+			.partition_point(|&(start, _)| start <= address);
+		let &(start, large_index) = self.large_index[..position].last()?;
+		let large = self.large.get(large_index as usize)?;
+		(address - start < large.size).then_some(large.start.as_ptr())
+	}
+
+	/// Gathers every unreached, aged, unfinalized object with a registered
+	/// finalizer.  Runs after the mark phase reached fixpoint.
+	fn collect_pending_finalizers(&self) -> Vec<PendingFinalizer> {
+		let mut pending = Vec::new();
+		for (span_index, span) in self.spans.iter().enumerate() {
+			let Some(span) = span.as_ref() else {
+				continue;
+			};
+			for word_index in 0..span.alloc_bits.len() {
+				let mut dead = span.alloc_bits[word_index]
+					& !span.mark_bits[word_index]
+					& !span.young_bits[word_index]
+					& !span.finalized_bits[word_index];
+				while dead != 0 {
+					let bit = dead.trailing_zeros();
+					dead &= dead - 1;
+					let slot = (word_index as u32) * 64 + bit;
+					let type_id = TypeId(u32::from(span.type_ids[slot as usize]));
+					let Some(finalize) = self.type_info(type_id).and_then(|info| info.finalize) else {
+						continue;
+					};
+					// SAFETY: Slot addresses inside a live span are non-null.
+					let start = unsafe { NonNull::new_unchecked(span.slot_address(slot) as *mut u8) };
+					pending.push(PendingFinalizer {
+						start,
+						finalize,
+						location: ObjectLocation::Span { span: span_index as u32, slot },
+					});
+				}
+			}
+		}
+		for (index, large) in self.large.iter().enumerate() {
+			if large.color.is_reached() || large.young || large.finalized {
+				continue;
+			}
+			let Some(finalize) = self
+				.type_info(TypeId(u32::from(large.type_id)))
+				.and_then(|info| info.finalize)
+			else {
+				continue;
+			};
+			pending.push(PendingFinalizer {
+				start: large.start,
+				finalize,
+				location: ObjectLocation::Large { index: index as u32 },
+			});
+		}
+		pending
+	}
+
+	fn set_finalized(&mut self, location: ObjectLocation) {
+		match location {
+			ObjectLocation::Span { span, slot } => {
+				if let Some(span) = self.spans[span as usize].as_mut() {
+					bit_set(&mut span.finalized_bits, slot);
+				}
+			},
+			ObjectLocation::Large { index } => {
+				if let Some(large) = self.large.get_mut(index as usize) {
+					large.finalized = true;
+				}
+			},
+		}
+	}
+
+	/// Frees every unreached, aged object and resets per-cycle mark state.
+	///
+	/// Returns the detached memory blocks (deallocation is the CALLER's job,
+	/// outside the state lock — see [`Heap::collect`]) and the number of
+	/// reclaimed bytes.  Finalizers never run on the detached set: an
+	/// unreached allocation with a pending finalizer was resurrected for one
+	/// cycle before this point.  Whole spans whose last object died are
+	/// released too, keeping at most one empty span cached per size class.
+	fn sweep(&mut self) -> (Vec<(NonNull<u8>, Layout)>, usize) {
+		debug_assert!(self.span_queue.is_empty() && self.large_queue.is_empty());
+		let mut detached: Vec<(NonNull<u8>, Layout)> = Vec::new();
+		let mut reclaimed = 0usize;
+
+		self.open_span = [None; NUM_SIZE_CLASSES];
+		for list in &mut self.partial_spans {
+			list.clear();
+		}
+		let mut kept_empty = [false; NUM_SIZE_CLASSES];
+
+		for span_index in 0..self.spans.len() {
+			let Some(span) = self.spans[span_index].as_mut() else {
+				continue;
+			};
+			let mut live = 0u32;
+			let mut freed = 0u32;
+			for word_index in 0..span.alloc_bits.len() {
+				// Survivors: marked objects plus the age-gated young ones
+				// (allocated since the last collection; they may still be
+				// referenced from Rust helper buffers the conservative scan
+				// cannot see).  Go's trick applies: the mark bitmap BECOMES
+				// the next cycle's allocation bitmap, so dead slots are
+				// implicitly freed for reuse.
+				let keep = span.mark_bits[word_index]
+					| (span.alloc_bits[word_index] & span.young_bits[word_index]);
+				freed += (span.alloc_bits[word_index] & !keep).count_ones();
+				live += keep.count_ones();
+				span.alloc_bits[word_index] = keep;
+				span.mark_bits[word_index] = 0;
+				span.scan_bits[word_index] = 0;
+				span.young_bits[word_index] = 0;
+			}
+			reclaimed += freed as usize * span.elem_size as usize;
+			span.live_count = live;
+			span.free_hint = 0;
+			span.on_queue = false;
+			let class = span.class as usize;
+			let base = span.base;
+			let nelems = span.nelems;
+
+			if live == 0 {
+				if kept_empty[class] {
+					// SAFETY: A live span's base is non-null.
+					detached.push((unsafe { NonNull::new_unchecked(base as *mut u8) }, span_layout()));
+					if let Ok(position) = self
+						.span_base_index
+						.binary_search_by_key(&base, |&(existing, _)| existing)
+					{
+						self.span_base_index.remove(position);
+					}
+					self.spans[span_index] = None;
+					self.span_slots_free.push(span_index as u32);
+				} else {
+					kept_empty[class] = true;
+					self.partial_spans[class].push(span_index as u32);
+				}
+			} else if live < nelems {
+				self.partial_spans[class].push(span_index as u32);
 			}
 		}
 
-		self.allocations = survivors;
-		self.mark_states = vec![MarkColor::White; self.allocations.len()];
-		self.addr_index_dirty = true;
-		unreachable
+		let old_large = std::mem::take(&mut self.large);
+		let mut survivors = Vec::with_capacity(old_large.len());
+		for mut large in old_large {
+			if large.color.is_reached() || large.young {
+				large.color = MarkColor::White;
+				large.young = false;
+				survivors.push(large);
+			} else {
+				reclaimed += large.size;
+				detached.push((large.start, large_layout(large.size)));
+			}
+		}
+		self.large = survivors;
+		self.large_index_dirty = true;
+
+		(detached, reclaimed)
+	}
+
+	/// Total allocated objects (spans plus large blocks); test observability.
+	#[cfg(test)]
+	fn live_object_count(&self) -> usize {
+		let span_objects: usize = self
+			.spans
+			.iter()
+			.flatten()
+			.map(|span| span.live_count as usize)
+			.sum();
+		span_objects + self.large.len()
+	}
+
+	/// Tri-color state of the object containing `pointer`; test observability.
+	#[cfg(test)]
+	fn color_of(&mut self, pointer: *mut u8) -> Option<MarkColor> {
+		self.prepare_large_index();
+		let address = pointer.addr();
+		let base = address & !(SPAN_BYTES - 1);
+		if let Ok(position) = self
+			.span_base_index
+			.binary_search_by_key(&base, |&(existing, _)| existing)
+		{
+			let span_index = self.span_base_index[position].1;
+			let span = self.spans[span_index as usize].as_ref()?;
+			let slot = ((address - base) as u32) / span.elem_size;
+			if slot >= span.nelems || !bit_get(&span.alloc_bits, slot) {
+				return None;
+			}
+			if !bit_get(&span.mark_bits, slot) {
+				return Some(MarkColor::White);
+			}
+			return Some(if bit_get(&span.scan_bits, slot) {
+				MarkColor::Black
+			} else {
+				MarkColor::Gray
+			});
+		}
+		let position = self
+			.large_index
+			.partition_point(|&(start, _)| start <= address);
+		let &(start, large_index) = self.large_index[..position].last()?;
+		let large = self.large.get(large_index as usize)?;
+		(address - start < large.size).then_some(large.color)
 	}
 }
 
-struct Allocation {
-	start:          NonNull<u8>,
-	/// Allocated byte size: the requested size clamped to a 1-byte minimum.
-	/// Alignment is always [`DEFAULT_HEAP_ALIGNMENT`]; the deallocation
-	/// layout is reconstructed by [`Allocation::layout`].
-	allocated_size: usize,
-	type_id:        TypeId,
-	/// The type's finalizer already ran for this allocation; it is freed
-	/// without a second callback once unreached again.
-	finalized:      bool,
-	/// Collection epoch this block was allocated in. Unreached allocations
-	/// are only RECLAIMED once they are at least one full epoch old:
-	/// in-flight temporaries held solely by Rust helper frames (heap-backed
-	/// Vecs the conservative stack scan cannot see) are young by
-	/// construction and survive the cycle that races them.
-	birth_epoch:    u64,
-}
-/// A detached, unreached allocation awaiting deallocation outside the heap
-/// state lock (produced by [`HeapState::sweep`]).
-struct UnreachableAllocation {
-	start:  NonNull<u8>,
-	layout: Layout,
+/// The size class serving `size` bytes (`size <= SMALL_OBJECT_MAX`).
+fn size_class_of(size: usize) -> usize {
+	(size.max(1) - 1) / DEFAULT_HEAP_ALIGNMENT
 }
 
-impl Allocation {
-	fn layout(&self) -> Layout {
-		heap_layout(self.allocated_size)
+/// Slot size in bytes for a size class.
+const fn class_elem_size(class: usize) -> usize {
+	(class + 1) * DEFAULT_HEAP_ALIGNMENT
+}
+
+/// The single span layout: `SPAN_BYTES` at `SPAN_BYTES` alignment, so span
+/// bases are recoverable from interior pointers by masking.
+fn span_layout() -> Layout {
+	Layout::from_size_align(SPAN_BYTES, SPAN_BYTES).unwrap_or_else(|_| std::process::abort())
+}
+
+/// The single layout rule for large blocks: `size` bytes (minimum 1) at
+/// [`DEFAULT_HEAP_ALIGNMENT`].  Allocation and deallocation MUST both go
+/// through this helper.
+fn large_layout(size: usize) -> Layout {
+	Layout::from_size_align(size.max(1), DEFAULT_HEAP_ALIGNMENT)
+		.unwrap_or_else(|_| std::process::abort())
+}
+
+fn bit_get(bits: &[u64], index: u32) -> bool {
+	bits[(index / 64) as usize] & (1u64 << (index % 64)) != 0
+}
+
+fn bit_set(bits: &mut [u64], index: u32) {
+	bits[(index / 64) as usize] |= 1u64 << (index % 64);
+}
+
+fn bit_clear(bits: &mut [u64], index: u32) {
+	bits[(index / 64) as usize] &= !(1u64 << (index % 64));
+}
+
+/// Resolves `pointer` (start or interior) and marks its object as seen.
+///
+/// Returns whether the pointer resolved to a live heap object.  Span objects
+/// set their per-span seen bit and enqueue the whole span; large objects shade
+/// white-to-gray and enqueue individually.
+fn mark_pointer(state: &mut HeapState, pointer: *mut u8) -> bool {
+	let address = pointer.addr();
+	if address == 0 {
+		return false;
 	}
-
-	fn contains_address(&self, address: usize) -> bool {
-		let start = self.start.as_ptr().addr();
-		let end = start.saturating_add(self.allocated_size);
-		(start..end).contains(&address)
+	let base = address & !(SPAN_BYTES - 1);
+	if let Ok(position) = state
+		.span_base_index
+		.binary_search_by_key(&base, |&(existing, _)| existing)
+	{
+		let span_index = state.span_base_index[position].1;
+		let Some(span) = state.spans[span_index as usize].as_mut() else {
+			return false;
+		};
+		let slot = ((address - base) as u32) / span.elem_size;
+		if slot >= span.nelems || !bit_get(&span.alloc_bits, slot) {
+			return false;
+		}
+		if !bit_get(&span.mark_bits, slot) {
+			bit_set(&mut span.mark_bits, slot);
+			if !span.on_queue {
+				span.on_queue = true;
+				state.span_queue.push_back(span_index);
+			}
+		}
+		return true;
 	}
+	state.prepare_large_index();
+	let position = state
+		.large_index
+		.partition_point(|&(start, _)| start <= address);
+	let Some(&(start, large_index)) = state.large_index[..position].last() else {
+		return false;
+	};
+	let Some(large) = state.large.get_mut(large_index as usize) else {
+		return false;
+	};
+	if address - start >= large.size {
+		return false;
+	}
+	if large.color == MarkColor::White {
+		large.color = MarkColor::Gray;
+		state.large_queue.push_back(large_index);
+	}
+	true
 }
 
-/// The single layout rule for every heap block: `size` bytes (already
-/// clamped to a 1-byte minimum by the caller) at [`DEFAULT_HEAP_ALIGNMENT`].
-/// Allocation and deallocation MUST both go through this helper.
-fn heap_layout(size: usize) -> Layout {
-	Layout::from_size_align(size, DEFAULT_HEAP_ALIGNMENT).unwrap_or_else(|_| std::process::abort())
+/// Scans queued spans and large objects to fixpoint.
+///
+/// Green Tea discipline: spans are FIFO so seen bits accumulate while a span
+/// waits, and each dequeue scans every pending object in the span in address
+/// order.  A span re-enqueues itself when new objects in it are seen after it
+/// left the queue — including during its own scan.
+fn drain_marks(state: &mut HeapState) {
+	let mut scan_buffer = std::mem::take(&mut state.scan_buffer);
+	loop {
+		if let Some(span_index) = state.span_queue.pop_front() {
+			scan_buffer.clear();
+			if let Some(span) = state.spans[span_index as usize].as_mut() {
+				span.on_queue = false;
+				let base = span.base;
+				let elem_size = span.elem_size as usize;
+				for word_index in 0..span.mark_bits.len() {
+					let mut active = span.mark_bits[word_index] & !span.scan_bits[word_index];
+					span.scan_bits[word_index] |= active;
+					while active != 0 {
+						let bit = active.trailing_zeros();
+						active &= active - 1;
+						let slot = word_index * 64 + bit as usize;
+						scan_buffer.push((base + slot * elem_size, span.type_ids[slot]));
+					}
+				}
+			}
+			for &(object, type_id) in &scan_buffer {
+				let Some(info) = state.type_info(TypeId(u32::from(type_id))) else {
+					continue;
+				};
+				let object = object as *mut u8;
+				let mut visitor = |child: *mut u8| {
+					mark_pointer(state, child);
+				};
+				// SAFETY: The object is owned by this heap and remains live
+				// for the whole mark phase.  The visitor only records
+				// additional candidate pointers in this collector's queues.
+				unsafe {
+					(info.trace)(object, &mut visitor);
+				}
+			}
+			continue;
+		}
+		if let Some(large_index) = state.large_queue.pop_front() {
+			let large = &mut state.large[large_index as usize];
+			if large.color != MarkColor::Gray {
+				continue;
+			}
+			large.color = MarkColor::Black;
+			let object = large.start.as_ptr();
+			let type_id = TypeId(u32::from(large.type_id));
+			if let Some(info) = state.type_info(type_id) {
+				let mut visitor = |child: *mut u8| {
+					mark_pointer(state, child);
+				};
+				// SAFETY: As above; the large block stays live for the whole
+				// mark phase.
+				unsafe {
+					(info.trace)(object, &mut visitor);
+				}
+			}
+			continue;
+		}
+		break;
+	}
+	state.scan_buffer = scan_buffer;
 }
 
 #[repr(u8)]
@@ -1033,31 +1502,6 @@ impl Default for AtomicMarkState {
 	}
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PointerClassification {
-	index:          usize,
-	representative: *mut u8,
-}
-
-#[derive(Default)]
-struct MarkQueue {
-	entries: VecDeque<usize>,
-}
-
-impl MarkQueue {
-	fn new() -> Self {
-		Self::default()
-	}
-
-	fn push(&mut self, index: usize) {
-		self.entries.push_back(index);
-	}
-
-	fn pop(&mut self) -> Option<usize> {
-		self.entries.pop_front()
-	}
-}
-
 fn collect_precise_stack_roots(visitor: &mut dyn FnMut(*mut u8)) -> bool {
 	let Some(hook) = precise_stack_roots() else {
 		return false;
@@ -1093,8 +1537,8 @@ fn collect_external_stack_roots(visitor: &mut dyn FnMut(usize, *mut u8)) {
 /// # Safety
 ///
 /// The caller must guarantee the interval is a readable stack range for the
-/// current thread or for another mutator that has stopped in a published GC-safe
-/// region.
+/// current thread or for another mutator that has stopped in a published
+/// GC-safe region.
 pub unsafe fn collect_stack_range_roots(
 	stack_top: *mut u8,
 	stack_base: *mut u8,
@@ -1119,64 +1563,13 @@ pub unsafe fn collect_stack_range_roots(
 	let align_mask = word - 1;
 	let mut slot = (low + align_mask) & !align_mask;
 	while slot + word <= high {
+		// SAFETY: `slot` lies inside the caller-guaranteed readable interval.
 		let candidate = unsafe { ptr::read_unaligned(slot as *const usize) } as *mut u8;
 		if !candidate.is_null() {
 			visitor(slot, candidate);
 		}
 		slot += word;
 	}
-}
-
-fn is_tagged_non_heap_candidate(pointer: *mut u8) -> bool {
-	pointer.addr() & IMMEDIATE_TAG_MASK != IMMEDIATE_TAG_HEAP
-}
-
-/// Scans queued gray objects to fixpoint, shading every traced child.
-fn drain_mark_queue(state: &mut HeapState, mark_queue: &mut MarkQueue) {
-	while let Some(index) = mark_queue.pop() {
-		if !state.begin_object_scan(index) {
-			continue;
-		}
-
-		let Some(allocation) = state.allocations.get(index) else {
-			continue;
-		};
-		let start = allocation.start.as_ptr();
-		let type_id = allocation.type_id;
-		if let Some(info) = state.type_info(type_id) {
-			let mut visitor = |child| {
-				mark_pointer(state, mark_queue, child);
-			};
-			// SAFETY: The allocation is owned by this heap and remains live
-			// for the whole mark phase.  The visitor only records additional
-			// candidate pointers in this collector's mark queue.
-			unsafe {
-				(info.trace)(start, &mut visitor);
-			}
-		}
-		state.finish_object_scan(index);
-	}
-}
-
-fn mark_pointer(state: &mut HeapState, mark_queue: &mut MarkQueue, pointer: *mut u8) -> bool {
-	state.prepare_address_index();
-	let Some(classification) = state.classify_pointer(pointer) else {
-		let _is_immediate = is_tagged_non_heap_candidate(pointer);
-		return false;
-	};
-	let PointerClassification { index, representative } = classification;
-	debug_assert!(!representative.is_null());
-
-	let Some(color) = state.mark_states.get_mut(index) else {
-		return false;
-	};
-
-	if *color == MarkColor::White {
-		*color = MarkColor::Gray;
-		mark_queue.push(index);
-	}
-
-	true
 }
 
 #[cfg(test)]
@@ -1242,46 +1635,6 @@ mod tests {
 	}
 
 	#[test]
-	fn radix_sort_matches_comparison_sort() {
-		// Deterministic xorshift over full 64-bit range, plus edge patterns
-		// (dense low bits, shared high bits, duplicates of the digit skips).
-		let mut seed = 0x243F_6A88_85A3_08D3_u64;
-		let mut entries: Vec<(usize, usize)> = (0..10_000)
-			.map(|index| {
-				seed ^= seed << 13;
-				seed ^= seed >> 7;
-				seed ^= seed << 17;
-				(seed as usize, index)
-			})
-			.collect();
-		entries.extend((0..500).map(|index| (index * 16, 10_000 + index)));
-		entries.extend((0..500).map(|index| (0x7F00_0000_0000 + index * 32, 10_500 + index)));
-
-		let mut expected = entries.clone();
-		expected.sort_unstable();
-		HeapState::radix_sort_by_address(&mut entries);
-		assert_eq!(entries, expected);
-
-		let mut small = vec![(3usize, 0usize), (1, 1), (2, 2)];
-		HeapState::radix_sort_by_address(&mut small);
-		assert_eq!(small, vec![(1, 1), (2, 2), (3, 0)]);
-	}
-
-	#[test]
-	fn mark_queue_pops_fifo() {
-		let mut queue = MarkQueue::new();
-
-		queue.push(7);
-		queue.push(3);
-		queue.push(11);
-
-		assert_eq!(queue.pop(), Some(7));
-		assert_eq!(queue.pop(), Some(3));
-		assert_eq!(queue.pop(), Some(11));
-		assert_eq!(queue.pop(), None);
-	}
-
-	#[test]
 	fn classify_pointer_resolves_small_and_large_allocations() {
 		let heap = Heap::new();
 		heap.register_type(TYPE_ID, type_info(1024, None));
@@ -1290,13 +1643,11 @@ mod tests {
 		let large = heap.alloc(4096, TYPE_ID);
 
 		let mut state = heap.lock_state();
-		state.prepare_address_index();
-		let resolved_small = state.classify_pointer(small).unwrap();
-		let resolved_large = state.classify_pointer(large).unwrap();
-		assert_eq!(resolved_small.index, 0);
-		assert_eq!(resolved_small.representative, small);
-		assert_eq!(resolved_large.index, 1);
-		assert_eq!(resolved_large.representative, large);
+		assert_eq!(state.classify_pointer(small), Some(small));
+		assert_eq!(state.classify_pointer(large), Some(large));
+		// SAFETY: Offset 2049 remains within the 4096-byte allocation.
+		let large_interior = unsafe { large.add(2049) };
+		assert_eq!(state.classify_pointer(large_interior), Some(large));
 	}
 
 	#[test]
@@ -1308,11 +1659,7 @@ mod tests {
 		// SAFETY: Offset 31 remains within the 64-byte allocation.
 		let interior = unsafe { object.add(31) };
 		let mut state = heap.lock_state();
-		state.prepare_address_index();
-		let classification = state.classify_pointer(interior).unwrap();
-
-		assert_eq!(classification.index, 0);
-		assert_eq!(classification.representative, object);
+		assert_eq!(state.classify_pointer(interior), Some(object));
 	}
 
 	#[test]
@@ -1334,26 +1681,15 @@ mod tests {
 		}
 
 		let mut state = heap.lock_state();
-		let mut mark_queue = MarkQueue::new();
-		assert!(mark_pointer(&mut state, &mut mark_queue, first));
-		let first_index = mark_queue.pop().unwrap();
-		assert!(state.begin_object_scan(first_index));
+		assert!(!mark_pointer(&mut state, ptr::null_mut()));
+		assert!(mark_pointer(&mut state, first));
+		assert_eq!(state.color_of(first), Some(MarkColor::Gray), "seen but not yet scanned");
+		assert_eq!(state.color_of(second), Some(MarkColor::White));
 
-		let start = state.allocations[first_index].start.as_ptr();
-		let info = state.type_info(TYPE_ID).unwrap();
-		let mut visitor = |child| {
-			mark_pointer(&mut state, &mut mark_queue, child);
-		};
+		drain_marks(&mut state);
 
-		// SAFETY: `start` identifies the initialized first `Node` allocation.
-		unsafe {
-			(info.trace)(start, &mut visitor);
-		}
-		state.finish_object_scan(first_index);
-
-		assert_eq!(state.mark_states[first_index], MarkColor::Black);
-		assert_eq!(mark_queue.pop(), Some(1), "traced child was shaded gray and queued");
-		assert_eq!(state.mark_states[1], MarkColor::Gray);
+		assert_eq!(state.color_of(first), Some(MarkColor::Black));
+		assert_eq!(state.color_of(second), Some(MarkColor::Black), "traced child was scanned too");
 	}
 
 	#[test]
@@ -1370,6 +1706,29 @@ mod tests {
 		// heap is dropped at the end of the test.
 		let bytes = unsafe { std::slice::from_raw_parts(object, 32) };
 		assert!(bytes.iter().all(|&byte| byte == 0));
+	}
+
+	#[test]
+	fn freed_slot_memory_is_reused_and_zeroed() {
+		let heap = Heap::new();
+		heap.register_type(TYPE_ID, type_info(32, None));
+
+		let first = heap.alloc(32, TYPE_ID);
+		// SAFETY: 32-byte live allocation owned by this heap.
+		unsafe {
+			first.write_bytes(0xab, 32);
+		}
+		let first_address = first.addr();
+
+		heap.collect(&mut Roots(Vec::new()));
+		heap.collect(&mut Roots(Vec::new()));
+		assert_eq!(heap.lock_state().live_object_count(), 0);
+
+		let second = heap.alloc(32, TYPE_ID);
+		assert_eq!(second.addr(), first_address, "freed slot is reused");
+		// SAFETY: Fresh 32-byte allocation.
+		let bytes = unsafe { std::slice::from_raw_parts(second, 32) };
+		assert!(bytes.iter().all(|&byte| byte == 0), "reused slot is zeroed");
 	}
 
 	#[test]
@@ -1452,19 +1811,23 @@ mod tests {
 
 		heap.collect(&mut Roots(Vec::new()));
 		assert_eq!(FINALIZED.load(Ordering::SeqCst), 0, "young garbage is age-gated for one cycle");
-		assert_eq!(heap.lock_state().allocations.len(), 1, "young garbage survives its birth epoch");
+		assert_eq!(
+			heap.lock_state().live_object_count(),
+			1,
+			"young garbage survives its birth epoch"
+		);
 
 		heap.collect(&mut Roots(Vec::new()));
 		assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
 		assert_eq!(
-			heap.lock_state().allocations.len(),
+			heap.lock_state().live_object_count(),
 			1,
 			"finalized object is resurrected for its finalization cycle"
 		);
 
 		heap.collect(&mut Roots(Vec::new()));
 		assert_eq!(FINALIZED.load(Ordering::SeqCst), 1, "finalizer never re-runs");
-		assert!(heap.lock_state().allocations.is_empty(), "freed one cycle later");
+		assert_eq!(heap.lock_state().live_object_count(), 0, "freed one cycle later");
 	}
 
 	#[test]
@@ -1492,7 +1855,7 @@ mod tests {
 			0,
 			"finalizer has not run during the birth epoch"
 		);
-		assert_eq!(heap.lock_state().allocations.len(), 1);
+		assert_eq!(heap.lock_state().live_object_count(), 1);
 
 		heap.collect(&mut Roots(Vec::new()));
 		assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
@@ -1503,12 +1866,12 @@ mod tests {
 		// finalizer must not run again.
 		heap.collect(&mut Roots(vec![resurrected]));
 		assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
-		assert_eq!(heap.lock_state().allocations.len(), 1);
+		assert_eq!(heap.lock_state().live_object_count(), 1);
 
 		// Dropping the last reference frees it silently.
 		heap.collect(&mut Roots(Vec::new()));
 		assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
-		assert!(heap.lock_state().allocations.is_empty());
+		assert_eq!(heap.lock_state().live_object_count(), 0);
 	}
 
 	#[test]
@@ -1616,7 +1979,7 @@ mod tests {
 		heap.collect(&mut Roots(vec![odd_alias, reserved_alias]));
 
 		assert_eq!(FINALIZED.load(Ordering::SeqCst), 0);
-		assert!(!heap.lock_state().allocations.is_empty());
+		assert!(heap.lock_state().live_object_count() > 0);
 	}
 
 	#[repr(C)]
@@ -1668,9 +2031,8 @@ mod tests {
 		heap.collect(&mut Roots(vec![holder]));
 
 		let mut state = heap.lock_state();
-		state.prepare_address_index();
-		assert!(state.classify_pointer(holder).is_some());
-		assert!(state.classify_pointer(sibling).is_some());
+		assert_eq!(state.classify_pointer(holder), Some(holder));
+		assert_eq!(state.classify_pointer(sibling), Some(sibling));
 	}
 
 	#[test]
@@ -1703,6 +2065,7 @@ mod tests {
 		heap.collect(&mut Roots(Vec::new()));
 		assert_eq!(FINALIZED.load(Ordering::SeqCst), 1);
 	}
+
 	#[test]
 	fn traced_cycle_is_preserved_while_rooted_then_reclaimed() {
 		static FINALIZED: AtomicUsize = AtomicUsize::new(0);
@@ -1821,10 +2184,7 @@ mod tests {
 		WriteBarrier::end_concurrent_marking();
 
 		let mut state = heap.lock_state();
-		state.prepare_address_index();
-		assert_eq!(state.classify_pointer(first).unwrap().index, 0);
-		assert_eq!(state.mark_states[0], MarkColor::White);
-		assert_eq!(state.classify_pointer(second).unwrap().index, 1);
-		assert_eq!(state.mark_states[1], MarkColor::Black);
+		assert_eq!(state.color_of(first), Some(MarkColor::White));
+		assert_eq!(state.color_of(second), Some(MarkColor::Black));
 	}
 }

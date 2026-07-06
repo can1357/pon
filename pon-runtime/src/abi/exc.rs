@@ -522,7 +522,11 @@ pub(crate) fn prepend_traceback_for_frame(frame: *mut PyFrame) -> Result<(), Str
 		return Err("PyTraceBack_Here called with NULL frame".to_owned());
 	}
 	let Some(exception) = pending_exception_object() else {
-		return Err("PyTraceBack_Here called with no pending exception".to_owned());
+		// CPython release builds treat a call with no pending exception as a
+		// no-op; Cython extension code (e.g. numpy.random) reaches this path
+		// when an earlier error handler already consumed the exception.  Don't
+		// raise a fresh SystemError that would mask the real failure.
+		return Ok(());
 	};
 	super::with_runtime(|runtime| {
 		runtime.heap.register_type(TYPE_ID_TRACEBACK, GcTypeInfo {
