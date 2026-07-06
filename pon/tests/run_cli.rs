@@ -101,6 +101,9 @@ class Accumulator:
         total = value + 1
         return total
 
+def shaped(a, b=2, *args, c=3, **kw):
+    return a + b + c + len(args) + len(kw)
+
 def known_tier(value):
     return (
         type(value) is str
@@ -119,12 +122,16 @@ def non_negative_int(value):
 def optional_non_negative_int(value):
     return value is None or non_negative_int(value)
 
+def known_tier_state(value):
+    return type(value) is int and 0 <= value <= 4
+
 def core_state_ok(state, expected_name, expected_positional_arity):
     return (
         type(state) is dict
         and state["name"] == expected_name
         and state["arity"] == expected_positional_arity
         and known_tier(state["tier"])
+        and known_tier_state(state["tier_state"])
         and non_negative_int(state["hotness"])
         and non_negative_int(state["loop_hotness"])
         and non_negative_int(state["deopt_count"])
@@ -134,20 +141,30 @@ def core_state_ok(state, expected_name, expected_positional_arity):
         and type(state["has_metadata"]) is bool
     )
 
-def metadata_ok(state, expected_positional_arity):
+def metadata_ok(
+    state,
+    expected_positional_arity,
+    expected_keyword_only,
+    expected_has_varargs,
+    expected_has_varkw,
+    expected_default_count,
+    expected_kwdefault_count,
+    expected_closure_count,
+):
     return (
         state["has_metadata"] is True
         and non_negative_int(state["n_locals"])
-        and state["n_locals"] >= expected_positional_arity
+        and state["n_locals"] >= expected_positional_arity + expected_keyword_only
         and non_negative_int(state["flags"])
         and state["positional_arity"] == expected_positional_arity
         and state["positional_only"] == 0
         and state["positional_or_keyword"] == expected_positional_arity
-        and state["keyword_only"] == 0
-        and state["has_varargs"] is False
-        and state["has_varkw"] is False
-        and state["default_count"] == 0
-        and state["closure_count"] == 0
+        and state["keyword_only"] == expected_keyword_only
+        and state["has_varargs"] is expected_has_varargs
+        and state["has_varkw"] is expected_has_varkw
+        and state["default_count"] == expected_default_count
+        and state["kwdefault_count"] == expected_kwdefault_count
+        and state["closure_count"] == expected_closure_count
     )
 
 ir = pon.ir(add)
@@ -160,7 +177,7 @@ print("ASM_OK", len(asm) > 0 and "block0:" in asm)
 add_tier = pon.tier(add)
 add_state = pon.state(add)
 print("TIER_OK", known_tier(add_tier) and add_tier == add_state["tier"])
-print("STATE_OK", core_state_ok(add_state, "add", 2) and metadata_ok(add_state, 2))
+print("STATE_OK", core_state_ok(add_state, "add", 2) and metadata_ok(add_state, 2, 0, False, False, 0, 0, 0))
 
 bound_method = Accumulator().method
 method_ir = pon.ir(bound_method)
@@ -168,7 +185,12 @@ print("METHOD_IR_OK", "method(self, value)" in method_ir and "BinaryOp" in metho
 method_tier = pon.tier(bound_method)
 method_state = pon.state(bound_method)
 print("METHOD_TIER_OK", known_tier(method_tier) and method_tier == method_state["tier"])
-print("METHOD_STATE_OK", core_state_ok(method_state, "method", 2) and metadata_ok(method_state, 2))
+print("METHOD_STATE_OK", core_state_ok(method_state, "method", 2) and metadata_ok(method_state, 2, 0, False, False, 0, 0, 0))
+
+shaped_tier = pon.tier(shaped)
+shaped_state = pon.state(shaped)
+print("SHAPED_TIER_OK", known_tier(shaped_tier) and shaped_tier == shaped_state["tier"])
+print("SHAPED_STATE_OK", core_state_ok(shaped_state, "shaped", 2) and metadata_ok(shaped_state, 2, 1, True, True, 1, 1, 0))
 
 try:
     pon.ir(1)
@@ -213,6 +235,8 @@ else:
 			"METHOD_IR_OK True",
 			"METHOD_TIER_OK True",
 			"METHOD_STATE_OK True",
+			"SHAPED_TIER_OK True",
+			"SHAPED_STATE_OK True",
 			"TYPE_ERROR_OK True",
 			"VALUE_ERROR_OK True",
 		],

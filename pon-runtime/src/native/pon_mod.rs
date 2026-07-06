@@ -1,4 +1,4 @@
-//! Native `pon` module: compiler views of live Python functions for debugging.
+//! Native `pon` module: compiler views and runtime state for debugging.
 //!
 //! ```python
 //! import pon
@@ -9,8 +9,10 @@
 //! print(pon.state(f))  # runtime counters and function metadata
 //! ```
 //!
-//! Rendering happens in the JIT frontend through the [`crate::inspect`] hook;
-//! embeddings without a JIT (ahead-of-time products) raise `RuntimeError`.
+//! IR/CLIF/ASM rendering happens in the JIT frontend through the
+//! [`crate::inspect`] hook; `tier`/`state` read live runtime fields directly.
+//! Embeddings without a JIT can still report `tier`/`state`, but compiler-view
+//! rendering raises `RuntimeError`.
 
 use std::{ptr, sync::atomic::Ordering};
 
@@ -110,7 +112,8 @@ unsafe fn render(
 	}
 }
 
-/// Validate the shared `pon.*(function)` argument shape and unwrap bound methods.
+/// Validate the shared `pon.*(function)` argument shape and unwrap bound
+/// methods.
 ///
 /// # Safety
 /// `argv` must point to `argc` live argument slots.
@@ -153,7 +156,11 @@ unsafe fn render_tier(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 		Err(raised) => return raised,
 	};
 	// SAFETY: `expect_function_arg` proved `target` is a live `PyFunction`.
-	let state = unsafe { (*target.cast::<PyFunction>()).tier_state.load(Ordering::Acquire) };
+	let state = unsafe {
+		(*target.cast::<PyFunction>())
+			.tier_state
+			.load(Ordering::Acquire)
+	};
 	py_str(tier_state_name(state))
 }
 
@@ -175,59 +182,29 @@ unsafe fn render_state(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 		("tier", py_str(tier_state_name(tier_state))),
 		("tier_state", py_int_u8(tier_state)),
 		("hotness", py_int_u32(function.hotness.load(Ordering::Acquire))),
-		(
-			"loop_hotness",
-			py_int_u32(function.loop_hotness.load(Ordering::Acquire)),
-		),
+		("loop_hotness", py_int_u32(function.loop_hotness.load(Ordering::Acquire))),
 		("deopt_count", py_int_u32(function.deopt_count.load(Ordering::Acquire))),
 		("tier_epoch", py_int_u8(function.tier_epoch.load(Ordering::Acquire))),
 		("osr_installed", py_bool(!osr_entry.is_null())),
-		(
-			"osr_loop_header",
-			py_int_u32(function.osr_loop_header.load(Ordering::Acquire)),
-		),
+		("osr_loop_header", py_int_u32(function.osr_loop_header.load(Ordering::Acquire))),
 		("has_metadata", py_bool(record.is_some())),
-		(
-			"n_locals",
-			py_optional_u32(record.as_ref().map(|record| record.n_locals)),
-		),
+		("n_locals", py_optional_u32(record.as_ref().map(|record| record.n_locals))),
 		("flags", py_optional_u32(record.as_ref().map(|record| record.flags))),
 		(
 			"positional_arity",
 			py_optional_usize(record.as_ref().map(|record| record.positional_arity())),
 		),
-		(
-			"positional_only",
-			py_optional_usize(params.map(|params| params.positional_only_count)),
-		),
-		(
-			"positional_or_keyword",
-			py_optional_usize(params.map(|params| params.positional_count)),
-		),
-		(
-			"keyword_only",
-			py_optional_usize(params.map(|params| params.keyword_only_count)),
-		),
-		(
-			"has_varargs",
-			py_optional_bool(params.map(|params| params.varargs_name.is_some())),
-		),
-		(
-			"has_varkw",
-			py_optional_bool(params.map(|params| params.varkw_name.is_some())),
-		),
-		(
-			"default_count",
-			py_optional_usize(record.as_ref().map(|record| record.default_count())),
-		),
+		("positional_only", py_optional_usize(params.map(|params| params.positional_only_count))),
+		("positional_or_keyword", py_optional_usize(params.map(|params| params.positional_count))),
+		("keyword_only", py_optional_usize(params.map(|params| params.keyword_only_count))),
+		("has_varargs", py_optional_bool(params.map(|params| params.varargs_name.is_some()))),
+		("has_varkw", py_optional_bool(params.map(|params| params.varkw_name.is_some()))),
+		("default_count", py_optional_usize(record.as_ref().map(|record| record.default_count()))),
 		(
 			"kwdefault_count",
 			py_optional_usize(record.as_ref().map(|record| record.kwdefault_count())),
 		),
-		(
-			"closure_count",
-			py_optional_usize(record.as_ref().map(|record| record.closure_count())),
-		),
+		("closure_count", py_optional_usize(record.as_ref().map(|record| record.closure_count()))),
 	];
 	build_dict(&mut fields)
 }

@@ -151,6 +151,42 @@ static STACK_MAP_INDEX: LazyLock<RwLock<StackMapIndex>> =
 	LazyLock::new(|| RwLock::new(StackMapIndex::default()));
 const MAX_FP_CHAIN_FRAMES: usize = 4096;
 
+/// Code ranges of generated functions whose pointer liveness is fully
+/// described by registered safepoint maps.  A return address inside a range
+/// with no exact map entry means "no declared value is live at this call
+/// site" (tier-0 declares every pointer-typed value, and Cranelift emits a
+/// map wherever any declared value is live), so the frame is skipped
+/// entirely instead of falling back to conservative scanning.
+static MAPPED_CODE_RANGES: LazyLock<RwLock<Vec<(usize, usize)>>> =
+	LazyLock::new(|| RwLock::new(Vec::new()));
+
+/// Registers `[start, start + len)` as fully-mapped generated code.
+pub fn register_mapped_code_range(start: *const u8, len: usize) {
+	if start.is_null() || len == 0 {
+		return;
+	}
+	let mut ranges = MAPPED_CODE_RANGES
+		.write()
+		.unwrap_or_else(|poison| poison.into_inner());
+	let entry = (start.addr(), start.addr() + len);
+	match ranges.binary_search(&entry) {
+		Ok(_) => {},
+		Err(index) => ranges.insert(index, entry),
+	}
+}
+
+fn is_mapped_code(address: *const u8) -> bool {
+	let ranges = MAPPED_CODE_RANGES
+		.read()
+		.unwrap_or_else(|poison| poison.into_inner());
+	let address = address.addr();
+	match ranges.binary_search_by(|&(start, _)| start.cmp(&address)) {
+		Ok(_) => true,
+		Err(0) => false,
+		Err(index) => address < ranges[index - 1].1,
+	}
+}
+
 /// Registers an index globally and installs the GC precise-root hook.
 pub fn register_stack_map_index(index: StackMapIndex) {
 	write_index().extend(index);
@@ -263,11 +299,122 @@ pub unsafe fn walk_fp_chain(
 }
 
 unsafe extern "C" fn collect_precise_stack_roots(visitor: &mut dyn FnMut(*mut u8)) -> bool {
-	let mut complete = true;
-	let summary = walk_current_fp_chain(visitor, &mut |_frame| {
-		complete = false;
-	});
-	complete && summary.indexed_frames != 0 && summary.all_frames_indexed()
+	unsafe { scan_stack_mixed(visitor) }
+}
+
+/// Mixed-precision scan of the current thread's stack.
+///
+/// Walks the frame-pointer chain from the collector toward the published
+/// external base, attributing the region above each frame record to the
+/// function its return address points into:
+///
+/// - an exact safepoint map → visit only the mapped slots (`fp + 16 +
+///   sp_offset`, the caller's SP-relative map offsets);
+/// - a mapped code range without an exact map → no declared value is live
+///   at that call site; visit nothing;
+/// - anything else (runtime/Rust frames) → conservative word scan of the
+///   region, honoring the dispatch scan floor.
+///
+/// Skipping mapped generated frames is what removes dead-value ghosts —
+/// regalloc spill slots and callee-saved register saves — that the
+/// conservative scan cannot tell apart from live roots.  Returns `false`
+/// (caller falls back to the fully conservative scan) when there is nothing
+/// registered or the chain cannot be walked from the collector's frame.
+unsafe fn scan_stack_mixed(visitor: &mut dyn FnMut(*mut u8)) -> bool {
+	let word = core::mem::size_of::<usize>();
+	let record_bytes = 2 * word;
+	{
+		let index = read_index();
+		let ranges = MAPPED_CODE_RANGES
+			.read()
+			.unwrap_or_else(|poison| poison.into_inner());
+		if index.is_empty() && ranges.is_empty() {
+			return false;
+		}
+	}
+	let base = pon_gc::external_stack_base();
+	if base.is_null() {
+		return false;
+	}
+	let stack_marker = 0usize;
+	let current = ptr::addr_of!(stack_marker).cast::<u8>();
+	// Only descending stacks reach here (aarch64/x86-64).
+	if current.addr() >= base.addr() {
+		return false;
+	}
+	let mut fp = current_frame_pointer();
+	if fp.is_null() || fp.addr() >= base.addr() {
+		return false;
+	}
+	// `current_frame_pointer` may not be inlined, in which case its frame
+	// record sits below this function's marker; the walkable interval must
+	// still contain it.
+	let low = if fp.addr() < current.addr() {
+		fp.cast::<u8>()
+	} else {
+		current
+	};
+	let bounds = StackBounds::new(low, base);
+	if !bounds.contains(fp.cast::<u8>(), record_bytes) {
+		return false;
+	}
+
+	let floor = pon_gc::conservative_scan_floor();
+	let scan_words = |visitor: &mut dyn FnMut(*mut u8), mut low: usize, high: usize| {
+		if floor > low {
+			low = floor;
+		}
+		let mut slot = (low + word - 1) & !(word - 1);
+		while slot + word <= high {
+			// SAFETY: `[low, high)` lies inside the readable stack interval.
+			let candidate = unsafe { ptr::read_unaligned(slot as *const usize) } as *mut u8;
+			if !candidate.is_null() {
+				visitor(candidate);
+			}
+			slot += word;
+		}
+	};
+
+	// Innermost region: the collector's and this scanner's own frames up to
+	// (and including) the first frame record.
+	scan_words(visitor, current.addr(), fp.addr() + record_bytes);
+
+	let index = read_index();
+	for _ in 0..MAX_FP_CHAIN_FRAMES {
+		// SAFETY: The record was bounds-checked before each iteration.
+		let next_fp = unsafe { ptr::read(fp) } as *const usize;
+		// SAFETY: `fp + 1` stays inside the checked frame record.
+		let return_address = unsafe { ptr::read(fp.add(1)) } as *const u8;
+		// The region above this record is the caller's frame body; the
+		// record's return address identifies the caller's code.
+		let region_low = fp.addr() + record_bytes;
+		let region_high = if next_fp.is_null() || !next_frame_pointer_advances(fp, next_fp, bounds, true)
+		{
+			// Chain end: everything up to the base belongs to entry glue.
+			scan_words(visitor, region_low, base.addr());
+			return true;
+		} else {
+			next_fp.addr()
+		};
+
+		if let Some(map) = index.lookup(return_address) {
+			visit_precise_roots(fp, bounds, map, visitor);
+		} else if !is_mapped_code(return_address) {
+			scan_words(visitor, region_low, region_high);
+		}
+		// Mapped code without an exact map: no declared value is live; the
+		// frame body is skipped entirely.  The record words themselves hold
+		// a saved frame pointer and return address, never GC data.
+
+		fp = next_fp;
+		if !bounds.contains(fp.cast::<u8>(), record_bytes) {
+			// The saved frame pointer left the readable interval without a
+			// clean chain end; scan the remainder conservatively.
+			scan_words(visitor, region_high + record_bytes, base.addr());
+			return true;
+		}
+	}
+	false
 }
 
 unsafe fn walk_fp_chain_in_bounds(

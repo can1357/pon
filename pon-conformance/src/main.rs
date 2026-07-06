@@ -452,9 +452,24 @@ struct BenchMeasurement {
 	best:   Duration,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BenchRunnerProfile {
+	Debug,
+	Release,
+}
+
+impl BenchRunnerProfile {
+	fn target_dir(self) -> &'static str {
+		match self {
+			Self::Debug => "debug",
+			Self::Release => "release",
+		}
+	}
+}
+
 fn run_bench_gate(root: &Path, requested_modules: &[PathBuf]) -> Result<()> {
 	let scripts = bench_scripts(root, requested_modules)?;
-	let runner_binary = ensure_bench_runner(root)?;
+	let runner_binary = ensure_bench_runner(root, BenchRunnerProfile::Debug)?;
 	let mut failures = Vec::new();
 
 	println!(
@@ -505,7 +520,7 @@ fn run_python_bench_gate(root: &Path, requested_modules: &[PathBuf]) -> Result<(
 	if !suite::python314_available() {
 		bail!("python3.14 reference interpreter is not available")
 	}
-	let runner_binary = ensure_bench_runner(root)?;
+	let runner_binary = ensure_bench_runner(root, BenchRunnerProfile::Release)?;
 	let mut failures = Vec::new();
 
 	println!("Python comparison bench: {} kernel(s), pon tier-up vs python3.14", scripts.len());
@@ -593,7 +608,7 @@ fn resolve_bench_path(root: &Path, bench_dir: &Path, module: &Path) -> PathBuf {
 	}
 }
 
-fn ensure_bench_runner(root: &Path) -> Result<PathBuf> {
+fn ensure_bench_runner(root: &Path, profile: BenchRunnerProfile) -> Result<PathBuf> {
 	let runner_dir = suite::target_dir(root)?.join("pon-conformance-bench-runner");
 	let source_dir = runner_dir.join("src");
 	fs::create_dir_all(&source_dir).with_context(|| {
@@ -605,10 +620,12 @@ fn ensure_bench_runner(root: &Path) -> Result<PathBuf> {
 	write_if_changed(&manifest_path, &bench_runner_manifest(root))?;
 	write_if_changed(&source_path, bench_runner_source())?;
 
-	let output = Command::new("cargo")
-		.arg("build")
-		.arg("--quiet")
-		.arg("--release")
+	let mut command = Command::new("cargo");
+	command.arg("build").arg("--quiet");
+	if profile == BenchRunnerProfile::Release {
+		command.arg("--release");
+	}
+	let output = command
 		.arg("--manifest-path")
 		.arg(&manifest_path)
 		.arg("--target-dir")
@@ -626,7 +643,7 @@ fn ensure_bench_runner(root: &Path) -> Result<PathBuf> {
 
 	let binary = runner_dir
 		.join("target")
-		.join("release")
+		.join(profile.target_dir())
 		.join(format!("pon-bench-runner{}", std::env::consts::EXE_SUFFIX));
 	if !binary.is_file() {
 		bail!("benchmark runner build succeeded but `{}` was not created", binary.display());
@@ -654,7 +671,7 @@ edition = "2024"
 anyhow = "1"
 pon-ir = {{ path = "{}" }}
 pon-jit = {{ path = "{}" }}
-pon-runtime = {{ path = "{}", features = ["tagged-ints"] }}
+pon-runtime = {{ path = "{}" }}
 "#,
 		toml_path(&root.join("pon-ir")),
 		toml_path(&root.join("pon-jit")),
