@@ -88,7 +88,7 @@ struct RegisteredFunction {
 unsafe impl Send for RegisteredFunction {}
 
 struct RegisteredModule {
-	ir: IrModule,
+	ir: Arc<IrModule>,
 }
 
 #[allow(
@@ -156,33 +156,40 @@ impl TierUpDriver {
 		Self { shared, pins, compile_tx: Some(tx), compiler: Some(compiler), shutting_down }
 	}
 
-	/// Record finalized tier-0 entrypoints for a just-compiled IR module.
+	/// Record finalized tier-0 entrypoints for a just-compiled IR module, both
+	/// in this driver's registry and in the process-wide inspection registry.
 	pub fn register_module(
 		&mut self,
 		ir_module: &IrModule,
 		func_ids: &[FuncId],
 		module: &JITModule,
 	) {
-		let mut shared = self.shared.lock().expect("tier-up registry mutex poisoned");
-		let module_index = shared.modules.len();
-		shared
-			.modules
-			.push(RegisteredModule { ir: ir_module.clone() });
+		let ir = Arc::new(ir_module.clone());
+		let mut inspect_entries = Vec::new();
+		{
+			let mut shared = self.shared.lock().expect("tier-up registry mutex poisoned");
+			let module_index = shared.modules.len();
+			shared
+				.modules
+				.push(RegisteredModule { ir: Arc::clone(&ir) });
 
-		shared
-			.functions
-			.extend(ir_module.functions.iter().enumerate().filter_map(
-				|(function_index, function)| {
-					let func_id = *func_ids.get(function_index)?;
-					let tier0_entry = module.get_finalized_function(func_id);
-					Some(RegisteredFunction {
-						tier0_entry,
-						module_index,
-						function_index,
-						feedback_len: feedback_len(function),
-					})
-				},
-			));
+			shared
+				.functions
+				.extend(ir_module.functions.iter().enumerate().filter_map(
+					|(function_index, function)| {
+						let func_id = *func_ids.get(function_index)?;
+						let tier0_entry = module.get_finalized_function(func_id);
+						inspect_entries.push((function_index, tier0_entry));
+						Some(RegisteredFunction {
+							tier0_entry,
+							module_index,
+							function_index,
+							feedback_len: feedback_len(function),
+						})
+					},
+				));
+		}
+		crate::inspect::register_functions(&ir, inspect_entries);
 	}
 
 	/// Synchronous compile+install used only by tier-up unit tests; the
@@ -415,7 +422,8 @@ fn clone_registered_ir(
 ) -> Option<(RegisteredFunction, IrModule)> {
 	let shared = shared.lock().expect("tier-up registry mutex poisoned");
 	let record = shared.functions.get(snapshot.0 as usize)?.clone();
-	let module = shared.modules.get(record.module_index)?.ir.clone();
+	// Deep clone: the tier-1 pipeline mutates its module copy (type inference).
+	let module = shared.modules.get(record.module_index)?.ir.as_ref().clone();
 	Some((record, module))
 }
 
@@ -558,7 +566,7 @@ fn make_tier1_module() -> JITModule {
 	JITModule::new(builder)
 }
 
-fn declare_tier1_functions(
+pub(crate) fn declare_tier1_functions(
 	module: &mut JITModule,
 	ir_module: &IrModule,
 ) -> Result<Vec<FuncId>, ModuleError> {
@@ -869,7 +877,7 @@ mod tests {
 		let driver = TierUpDriver::new();
 		{
 			let mut shared = driver.shared.lock().expect("test tier-up mutex");
-			shared.modules.push(RegisteredModule { ir: ir_module });
+			shared.modules.push(RegisteredModule { ir: Arc::new(ir_module) });
 			shared.functions.push(RegisteredFunction {
 				tier0_entry,
 				module_index: 0,
@@ -927,7 +935,7 @@ mod tests {
 			let mut shared = driver.shared.lock().expect("test tier-up mutex");
 			shared
 				.modules
-				.push(RegisteredModule { ir: arithmetic_range_loop_module() });
+				.push(RegisteredModule { ir: Arc::new(arithmetic_range_loop_module()) });
 			shared.functions.push(RegisteredFunction {
 				tier0_entry,
 				module_index: 0,
@@ -967,7 +975,7 @@ mod tests {
 			let mut shared = driver.shared.lock().expect("test tier-up mutex");
 			shared
 				.modules
-				.push(RegisteredModule { ir: arithmetic_range_loop_module() });
+				.push(RegisteredModule { ir: Arc::new(arithmetic_range_loop_module()) });
 			shared.functions.push(RegisteredFunction {
 				tier0_entry,
 				module_index: 0,

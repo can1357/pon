@@ -18,6 +18,7 @@ use pon_runtime::{
 	thread_state::pon_err_message,
 };
 
+mod inspect;
 pub mod tierup;
 
 /// Phase-A compiled Python function ABI.
