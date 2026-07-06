@@ -115,6 +115,28 @@ static inline int PyUnicode_Check(PyObject *object) {
 static inline int PyUnicode_CheckExact(PyObject *object) {
     return PyPon_Capi()->strings->unicode_check_exact(object);
 }
+/* CPython `PyUnicode_FromObject`: exact strings pass through (new reference),
+ * str subclasses copy into an exact str, anything else is a TypeError. */
+static inline PyObject *PyUnicode_FromObject(PyObject *object) {
+    if (object == NULL) {
+        PyErr_SetString(PyExc_TypeError, "PyUnicode_FromObject received NULL");
+        return NULL;
+    }
+    if (PyUnicode_CheckExact(object)) {
+        Py_INCREF(object);
+        return object;
+    }
+    if (PyUnicode_Check(object)) {
+        Py_ssize_t size = 0;
+        const char *text = PyUnicode_AsUTF8AndSize(object, &size);
+        if (text == NULL) {
+            return NULL;
+        }
+        return PyUnicode_FromStringAndSize(text, size);
+    }
+    PyErr_SetString(PyExc_TypeError, "Can't convert object to str implicitly");
+    return NULL;
+}
 
 /* CPython's compact-unicode data macros expose code-unit views. Pon stores
  * strings as UTF-8 internally, so these wrappers return cached UCS1/UCS2/UCS4

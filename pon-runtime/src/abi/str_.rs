@@ -4189,27 +4189,10 @@ pub(crate) fn bytes_payload_from_object(object: *mut PyObject) -> Option<Vec<u8>
 	if let Ok(bytes) = expect_bytes_like(object) {
 		return Some(bytes);
 	}
-	// SAFETY: Generic attribute lookup tolerates any live object.
-	let dunder = unsafe { crate::abstract_op::get_attr(object, crate::intern::intern("__bytes__")) };
-	if !dunder.is_null() {
-		// SAFETY: Bound method invoked with zero arguments.
-		let result = unsafe { super::pon_call(dunder, ptr::null_mut(), 0) };
-		if result.is_null() {
-			return None; // propagate the `__bytes__` exception
-		}
-		let result = crate::tag::untag_arg(result);
-		// SAFETY: A non-NULL call result carries a live header.
-		if bytes_type::is_bytes_type(unsafe { (*result).ob_type }) {
-			let bytes = unsafe { &*result.cast::<bytes_type::PyBytes>() };
-			return Some(unsafe { bytes.as_slice() }.to_vec());
-		}
-		let type_name = unsafe { crate::types::dict::type_name(result) }.unwrap_or("object");
-		let message = format!("__bytes__ returned non-bytes (type {type_name})");
-		unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
-		return None;
-	}
-	if crate::thread_state::pon_err_occurred() {
-		crate::thread_state::pon_err_clear();
+	match dunder_bytes(object) {
+		Err(()) => return None,
+		Ok(Some(bytes)) => return Some(bytes),
+		Ok(None) => {},
 	}
 	if unsafe { crate::types::dict::type_name(object) } == Some("str") {
 		let message = "cannot convert 'str' object to bytes";
@@ -4217,6 +4200,35 @@ pub(crate) fn bytes_payload_from_object(object: *mut PyObject) -> Option<Vec<u8>
 		return None;
 	}
 	bytes_items_from_iterable(object)
+}
+
+/// Invokes `type(object).__bytes__` when present. `Ok(None)` means the dunder
+/// is absent; `Err(())` propagates a pending exception from the lookup, the
+/// call, or a non-bytes return.
+fn dunder_bytes(object: *mut PyObject) -> Result<Option<Vec<u8>>, ()> {
+	// SAFETY: Generic attribute lookup tolerates any live object.
+	let dunder = unsafe { crate::abstract_op::get_attr(object, crate::intern::intern("__bytes__")) };
+	if dunder.is_null() {
+		if crate::thread_state::pon_err_occurred() {
+			crate::thread_state::pon_err_clear();
+		}
+		return Ok(None);
+	}
+	// SAFETY: Bound method invoked with zero arguments.
+	let result = unsafe { super::pon_call(dunder, ptr::null_mut(), 0) };
+	if result.is_null() {
+		return Err(()); // propagate the `__bytes__` exception
+	}
+	let result = crate::tag::untag_arg(result);
+	// SAFETY: A non-NULL call result carries a live header.
+	if bytes_type::is_bytes_type(unsafe { (*result).ob_type }) {
+		let bytes = unsafe { &*result.cast::<bytes_type::PyBytes>() };
+		return Ok(Some(unsafe { bytes.as_slice() }.to_vec()));
+	}
+	let type_name = unsafe { crate::types::dict::type_name(result) }.unwrap_or("object");
+	let message = format!("__bytes__ returned non-bytes (type {type_name})");
+	unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+	Err(())
 }
 
 /// Implements the CPython `bytes()` constructor forms: no args, int count,
@@ -4236,7 +4248,14 @@ pub unsafe extern "C" fn builtin_bytes(argv: *mut *mut PyObject, argc: usize) ->
 					let message = "string argument without an encoding";
 					return unsafe { super::exc::pon_raise_type_error(message.as_ptr(), message.len()) };
 				}
-				if let Some(count) = object_to_i64(args[0]) {
+				// CPython `bytes_new`: `__bytes__` outranks the integer-count form.
+				let dunder = match dunder_bytes(args[0]) {
+					Err(()) => return ptr::null_mut(),
+					Ok(dunder) => dunder,
+				};
+				if let Some(bytes) = dunder {
+					bytes
+				} else if let Some(count) = object_to_i64(args[0]) {
 					if count < 0 {
 						let message = "negative count";
 						return unsafe {
