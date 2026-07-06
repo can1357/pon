@@ -1157,6 +1157,11 @@ pub unsafe fn generic_get_attr_cached(
 		if !native_method.is_null() {
 			return native_method;
 		}
+		// PEP 695 surface: classes without type parameters expose an empty
+		// `__type_params__` tuple (`annotationlib`/`typing` read it bare).
+		if name_id == intern::intern("__type_params__") {
+			return unsafe { abi::seq::pon_build_tuple(ptr::null_mut(), 0) };
+		}
 		return unsafe { abi::pon_raise_attribute_error(object, name_id) };
 	}
 
@@ -1200,6 +1205,15 @@ pub unsafe fn generic_get_attr_cached(
 		}
 		crate::thread_state::pon_err_clear();
 		return unsafe { abi::pon_none() };
+	}
+	// PEP 695 surface: classes and functions without type parameters expose
+	// an empty `__type_params__` tuple (CPython 3.12+; `annotationlib`/
+	// `typing.get_type_hints` read it bare).
+	if name_id == intern::intern("__type_params__")
+		&& (unsafe { is_type_object(object) }
+			|| unsafe { crate::types::dict::type_name(object) } == Some("function"))
+	{
+		return unsafe { abi::seq::pon_build_tuple(ptr::null_mut(), 0) };
 	}
 	unsafe { abi::pon_raise_attribute_error(object, name_id) }
 }

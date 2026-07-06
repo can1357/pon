@@ -16,8 +16,40 @@ fn method_type() -> *mut PyType {
     *METHOD_TYPE.get_or_init(|| {
         let mut ty = Box::new(PyType::new(ptr::null(), "method", mem::size_of::<PyMethod>()));
         ty.tp_getattro = Some(method_getattro);
+        ty.tp_new = Some(method_new);
         Box::into_raw(ty) as usize
     }) as *mut PyType
+}
+
+/// `types.MethodType(function, instance)`: CPython `method_new` — binds an
+/// arbitrary callable to a receiver (contextlib's `ExitStack` builds its
+/// `__exit__` wrappers this way).
+unsafe extern "C" fn method_new(
+    _cls: *mut PyType,
+    args: *mut PyObject,
+    _kwargs: *mut PyObject,
+) -> *mut PyObject {
+    let positional = match unsafe { crate::types::type_::positional_args_from_object(args) } {
+        Ok(args) => args,
+        Err(message) => {
+            crate::thread_state::pon_err_set(message);
+            return ptr::null_mut();
+        },
+    };
+    if positional.len() != 2 {
+        crate::thread_state::pon_err_set(format!(
+            "TypeError: method expected 2 arguments, got {}",
+            positional.len()
+        ));
+        return ptr::null_mut();
+    }
+    match new_bound_method(crate::tag::untag_arg(positional[0]), crate::tag::untag_arg(positional[1])) {
+        Ok(method) => method.cast::<PyObject>(),
+        Err(message) => {
+            crate::thread_state::pon_err_set(message);
+            ptr::null_mut()
+        },
+    }
 }
 
 /// `tp_getattro` for bound methods: `__func__`/`__self__` answer from the

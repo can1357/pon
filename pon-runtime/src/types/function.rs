@@ -721,6 +721,10 @@ fn function_attr_by_id(function: *mut PyObject, name_id: u32) -> Option<*mut PyO
             .unwrap_or_else(|| intern("__main__"));
         return Some(const_name(module));
     }
+    if name_id == intern("__type_params__") {
+        // PEP 695: functions without type parameters expose an empty tuple.
+        return Some(unsafe { crate::abi::seq::pon_build_tuple(ptr::null_mut(), 0) });
+    }
     if name_id == intern("__code__") {
         return Some(alloc_code_object(function));
     }
