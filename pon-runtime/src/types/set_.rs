@@ -46,12 +46,21 @@ pub fn set_type(type_type: *const PyType) -> *mut PyType {
         number.nb_xor = Some(set_symmetric_difference_slot);
         number.nb_subtract = Some(set_difference_slot);
         let mut ty = PyType::new(ptr::null(), "set", size_of::<PySet>());
+        // CPython MRO parity: `set` derives `object`, so instance and class
+        // lookups inherit the object dunder surface (`__reduce_ex__` backs
+        // copy/deepcopy/pickle; `set.__new__` resolves to `object.__new__`).
+        ty.tp_base = crate::native::builtins_mod::builtin_native_type("object")
+            .unwrap_or(ptr::null_mut());
         ty.tp_as_sequence = Box::into_raw(Box::new(sequence));
         ty.tp_as_number = Box::into_raw(Box::new(number));
         ty.tp_iter = Some(set_iter_slot);
         ty.tp_richcmp = Some(set_richcmp_slot);
         ty.tp_getattro = Some(set_getattro_slot);
-        Box::into_raw(Box::new(ty)) as usize
+        let ty = Box::into_raw(Box::new(ty));
+        // MRO lookups gate on the namespaced-type registry; register so
+        // `lookup_in_type(set, ...)` walks to `object`'s dunder surface.
+        crate::sync::register_namespaced_type(ty);
+        ty as usize
     });
     let ty = *TYPE as *mut PyType;
     unsafe { install_type_type(ty, type_type) };
@@ -557,7 +566,8 @@ unsafe extern "C" fn set_getattro_slot(object: *mut PyObject, name: *mut PyObjec
     match name {
         "add" | "discard" | "union" | "intersection" | "intersection_update" | "difference"
         | "difference_update" | "symmetric_difference" | "symmetric_difference_update" | "update" | "issubset"
-        | "issuperset" | "isdisjoint" | "__contains__" | "copy" | "remove" | "clear" | "pop" => unsafe {
+        | "issuperset" | "isdisjoint" | "__contains__" | "copy" | "remove" | "clear" | "pop"
+        | "__reduce__" | "__reduce_ex__" => unsafe {
             crate::abi::map::pon_set_bound_method(object, name)
         },
         "__doc__" => unsafe { crate::abi::pon_none() },

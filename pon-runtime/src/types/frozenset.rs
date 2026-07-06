@@ -38,13 +38,19 @@ pub fn frozenset_type(type_type: *const PyType) -> *mut PyType {
         number.nb_xor = Some(frozenset_symmetric_difference_slot);
         number.nb_subtract = Some(frozenset_difference_slot);
         let mut ty = PyType::new(ptr::null(), "frozenset", size_of::<PyFrozenSet>());
+        // CPython MRO parity: `frozenset` derives `object` (see `set_type`).
+        ty.tp_base = crate::native::builtins_mod::builtin_native_type("object")
+            .unwrap_or(ptr::null_mut());
         ty.tp_hash = Some(frozenset_hash_slot);
         ty.tp_as_sequence = Box::into_raw(Box::new(sequence));
         ty.tp_as_number = Box::into_raw(Box::new(number));
         ty.tp_iter = Some(frozenset_iter_slot);
         ty.tp_richcmp = Some(crate::types::set_::set_richcmp_slot);
         ty.tp_getattro = Some(frozenset_getattro_slot);
-        Box::into_raw(Box::new(ty)) as usize
+        let ty = Box::into_raw(Box::new(ty));
+        // See `set_type`: registration lets MRO lookups reach `object`.
+        crate::sync::register_namespaced_type(ty);
+        ty as usize
     });
     let ty = *TYPE as *mut PyType;
     unsafe { install_type_type(ty, type_type) };
@@ -236,7 +242,7 @@ unsafe extern "C" fn frozenset_getattro_slot(object: *mut PyObject, name: *mut P
     };
     match name {
         "union" | "intersection" | "difference" | "symmetric_difference" | "issubset" | "issuperset"
-        | "isdisjoint" | "__contains__" | "copy" => unsafe {
+        | "isdisjoint" | "__contains__" | "copy" | "__reduce__" | "__reduce_ex__" => unsafe {
             crate::abi::map::pon_set_bound_method(object, name)
         },
         "__doc__" => unsafe { crate::abi::pon_none() },

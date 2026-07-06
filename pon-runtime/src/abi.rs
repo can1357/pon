@@ -121,6 +121,10 @@ static OBJECT_DUNDER_INIT_CARRIER: AtomicPtr<PyObject> = AtomicPtr::new(ptr::nul
 /// native fallback text instead of re-entering the terminus.
 static OBJECT_DUNDER_REPR_CARRIER: AtomicPtr<PyObject> = AtomicPtr::new(ptr::null_mut());
 static OBJECT_DUNDER_STR_CARRIER: AtomicPtr<PyObject> = AtomicPtr::new(ptr::null_mut());
+/// Identity anchor for the default `object.__reduce__` carrier:
+/// `object_reduce_ex`'s override probe treats a hook resolving to it as "no
+/// user override" (calling it would recurse into the protocol-0 default).
+static OBJECT_DUNDER_REDUCE_CARRIER: AtomicPtr<PyObject> = AtomicPtr::new(ptr::null_mut());
 
 pub(crate) fn object_dunder_repr_carrier() -> *mut PyObject {
 	OBJECT_DUNDER_REPR_CARRIER.load(Ordering::Acquire)
@@ -2752,7 +2756,9 @@ unsafe fn call_reduce_override(receiver: *mut PyObject) -> Option<*mut PyObject>
 	let name = crate::intern::intern("__reduce__");
 	let cls = unsafe { (*receiver).ob_type.cast_mut() };
 	let descriptor = unsafe { crate::descr::lookup_in_type(cls, name) };
-	if descriptor.is_null() {
+	if descriptor.is_null()
+		|| descriptor == OBJECT_DUNDER_REDUCE_CARRIER.load(Ordering::Acquire)
+	{
 		return None;
 	}
 	let method = unsafe { pon_get_attr(receiver, name, ptr::null_mut()) };
@@ -3044,6 +3050,9 @@ fn install_object_dunders(runtime: &mut Runtime, object_type: *mut PyType) {
 			},
 			"__str__" => {
 				OBJECT_DUNDER_STR_CARRIER.store(function.cast::<PyObject>(), Ordering::Release)
+			},
+			"__reduce__" => {
+				OBJECT_DUNDER_REDUCE_CARRIER.store(function.cast::<PyObject>(), Ordering::Release)
 			},
 			_ => {},
 		}
@@ -4458,6 +4467,12 @@ pub unsafe extern "C" fn pon_call(
 			} else if !callee.is_null() && !(*callee).ob_type.is_null() {
 				Ok(CallTarget::DunderCall)
 			} else {
+				// TEMP diag
+				eprintln!(
+					"[dbg] not-callable callee {:p} ty {:p}",
+					callee,
+					if callee.is_null() { ptr::null_mut() } else { (*callee).ob_type.cast_mut() },
+				);
 				Err("callee is not callable".to_owned())
 			}
 		}) {
@@ -5054,8 +5069,14 @@ unsafe fn call_type_from_argv(
 		}
 		instance
 	};
+	// CPython `type_call`: `type(x)` with exactly one argument is a pure
+	// type query — the answer never runs `__init__`.
+	if argc == 1 && cls == runtime_type_type() {
+		return instance;
+	}
 
-	let init = unsafe { type_::construction_init_override(cls) };
+	let init_cls = unsafe { type_::construction_init_receiver_type(cls, instance) };
+	let init = unsafe { type_::construction_init_override(init_cls) };
 	if !init.is_null() {
 		let init_is_function =
 			with_runtime(|runtime| unsafe { is_exact_type(init, runtime.function_type) })
@@ -5079,7 +5100,7 @@ unsafe fn call_type_from_argv(
 			// Generic path, identical to `type_call`: bind through the
 			// descriptor protocol and dispatch dynamically (native
 			// descriptors, C-function carriers, wrappers).
-			let bound = unsafe { crate::descr::descriptor_get(init, instance, cls) };
+			let bound = unsafe { crate::descr::descriptor_get(init, instance, init_cls) };
 			if bound.is_null() {
 				return ptr::null_mut();
 			}
@@ -5099,12 +5120,12 @@ unsafe fn call_type_from_argv(
 				return ptr::null_mut();
 			}
 		}
-	} else if let Some(init_slot) = unsafe { (*cls).tp_init } {
+	} else if let Some(init_slot) = unsafe { (*init_cls).tp_init } {
 		// CPython passes the constructor arguments through to `tp_init`;
 		// NULL stands in for the empty tuple (Pon slot convention), except
 		// for C-extension classes whose bridged `tp_init` follows the
 		// CPython contract: a real (possibly empty) tuple, never NULL.
-		let args_object = if args.is_empty() && !unsafe { crate::capi::is_capi_class(cls) } {
+		let args_object = if args.is_empty() && !unsafe { crate::capi::is_capi_class(init_cls) } {
 			ptr::null_mut()
 		} else {
 			match with_runtime(|runtime| seq::alloc_tuple_from_slice(runtime, args)) {

@@ -2475,6 +2475,62 @@ unsafe extern "C" fn set_isdisjoint_method_trampoline(
 	set_is_disjoint(args[0], args[1])
 }
 
+/// `set.__reduce__` / `set.__reduce_ex__(protocol)` — CPython `set_reduce`
+/// shape adapted to pon: `(builtins.set, (list(self),), None)`.  The default
+/// `object.__reduce_ex__` machinery would rebuild through `set.__new__` as a
+/// bare allocation without native set storage (crashes `copy.deepcopy` of
+/// sets, which Cython's compiler relies on); reconstructing through the
+/// builtin constructor round-trips both flavors.
+unsafe extern "C" fn set_reduce_method_trampoline(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let args = match map_method_args(argv, argc, "set.__reduce__") {
+		Ok(args) => args,
+		Err(message) => return null_error(message),
+	};
+	// Zero args for `__reduce__`, one (the protocol) for `__reduce_ex__`.
+	if args.is_empty() || args.len() > 2 {
+		return raise_map_type_error(format!(
+			"set.__reduce__() expected at most 1 argument, got {}",
+			args.len().saturating_sub(1)
+		));
+	}
+	let receiver = args[0];
+	let entries = {
+		let _guard = crate::sync::begin_critical_section(receiver);
+		match unsafe { set_::entries_snapshot(receiver) } {
+			Ok(entries) => entries,
+			Err(message) => return null_error(message),
+		}
+	};
+	let constructor_name = if unsafe { frozenset::is_frozenset(receiver) } {
+		"frozenset"
+	} else {
+		"set"
+	};
+	let Some(constructor) = super::runtime_global(crate::intern::intern(constructor_name)) else {
+		return null_error(format!("builtin {constructor_name} constructor is not installed"));
+	};
+	let mut items = entries;
+	let items_ptr = if items.is_empty() {
+		core::ptr::null_mut()
+	} else {
+		items.as_mut_ptr()
+	};
+	let list = unsafe { crate::abi::seq::pon_build_list(items_ptr, items.len()) };
+	if list.is_null() {
+		return core::ptr::null_mut();
+	}
+	let mut ctor_args = [list];
+	let ctor_tuple = unsafe { crate::abi::seq::pon_build_tuple(ctor_args.as_mut_ptr(), 1) };
+	if ctor_tuple.is_null() {
+		return core::ptr::null_mut();
+	}
+	let none = unsafe { super::pon_none() };
+	let mut reduce_parts = [constructor, ctor_tuple, none];
+	unsafe { crate::abi::seq::pon_build_tuple(reduce_parts.as_mut_ptr(), 3) }
+}
 unsafe extern "C" fn set_copy_method_trampoline(
 	argv: *mut *mut PyObject,
 	argc: usize,
@@ -2916,6 +2972,9 @@ pub unsafe fn pon_set_bound_method(set: *mut PyObject, name: &str) -> *mut PyObj
 		"remove" => alloc_bound_native_method(set, name, set_remove_method_trampoline),
 		"clear" => alloc_bound_native_method(set, name, set_clear_method_trampoline),
 		"pop" => alloc_bound_native_method(set, name, set_pop_method_trampoline),
+		"__reduce__" | "__reduce_ex__" => {
+			alloc_bound_native_method(set, name, set_reduce_method_trampoline)
+		},
 		_ => crate::descr::native_instance_surface_attr(set, name),
 	}
 }
