@@ -39,7 +39,18 @@ pub fn run() -> Result<()> {
 }
 
 fn run_terminal_loop() -> Result<()> {
-	let mut editor = Editor::<ReplHelper, DefaultHistory>::new()?;
+	// `ColorMode::Enabled` defers to rustyline's own terminal sniffing, which
+	// goes dark under PTY harnesses (vhs recordings, expect). Stdout being a
+	// live tty is the signal that matters for escape codes; force colors then
+	// and stay automatic when stdout is redirected.
+	let config = if io::stdout().is_terminal() {
+		rustyline::Config::builder()
+			.color_mode(rustyline::ColorMode::Forced)
+			.build()
+	} else {
+		rustyline::Config::default()
+	};
+	let mut editor = Editor::<ReplHelper, DefaultHistory>::with_config(config)?;
 	editor.set_helper(Some(ReplHelper));
 	let history_path = env::var_os("HOME").map(|home| PathBuf::from(home).join(".pon_history"));
 	if let Some(path) = history_path.as_deref() {
