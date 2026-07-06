@@ -33,6 +33,7 @@ struct Cli {
 	seed:         Option<u64>,
 	count:        Option<usize>,
 	bench:        bool,
+	bench_python: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,18 +106,25 @@ fn run_cli() -> Result<()> {
 	// Path-taking suites convert selectors to workspace/vendored paths verbatim.
 	let module_paths = cli.modules.iter().map(PathBuf::from).collect::<Vec<_>>();
 
-	if cli.bench {
+	if cli.bench && cli.bench_python {
+		bail!("`--bench` and `--bench-python` are mutually exclusive")
+	}
+	if cli.bench || cli.bench_python {
 		if cli.mode != Mode::Jit {
-			bail!("`--bench` uses the JIT tier-up path; omit `--mode` or pass `--mode jit`")
+			bail!("benchmark modes use the JIT tier-up path; omit `--mode` or pass `--mode jit`")
 		}
 		if cli.suite != SuiteName::Slice {
-			bail!("`--bench` is independent of `--suite`; omit `--suite`")
+			bail!("benchmark modes are independent of `--suite`; omit `--suite`")
 		}
 		if cli.check_floor || cli.update_floor {
-			bail!("floor checks are not defined for `--bench`")
+			bail!("floor checks are not defined for benchmark modes")
 		}
 
-		run_bench_gate(&root, &module_paths)?;
+		if cli.bench_python {
+			run_python_bench_gate(&root, &module_paths)?;
+		} else {
+			run_bench_gate(&root, &module_paths)?;
+		}
 		return Ok(());
 	}
 
@@ -296,6 +304,7 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
 	let mut seed = None;
 	let mut count = None;
 	let mut bench = false;
+	let mut bench_python = false;
 	let mut args = args.into_iter().peekable();
 
 	while let Some(arg) = args.next() {
@@ -312,6 +321,7 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
 			"--update-floor" => update_floor = true,
 			"--diff-floor" => diff_floor = true,
 			"--bench" => bench = true,
+			"--bench-python" => bench_python = true,
 			"--timeout" => {
 				let value = args.next().ok_or_else(usage)?;
 				let secs = value
@@ -377,6 +387,7 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
 		update_floor,
 		diff_floor,
 		bench,
+		bench_python,
 		modules,
 		timeout,
 		shard,
@@ -414,7 +425,7 @@ fn default_jobs() -> usize {
 
 fn usage() -> anyhow::Error {
 	anyhow::anyhow!(
-		"usage: pon-conformance [--bench] [--mode jit|aot] [--suite \
+		"usage: pon-conformance [--bench|--bench-python] [--mode jit|aot] [--suite \
 		 slice|cpython|cpython-aot-subset|aot-parity|cpython-full|ft-stress|fuzz] [--check-floor] \
 		 [--update-floor] [--diff-floor] [--modules <selectors...>] [--timeout <secs>] [--shard \
 		 <i>/<N>] [--jobs <J>] [--seed N] [--count K]"
@@ -489,6 +500,47 @@ fn run_bench_gate(root: &Path, requested_modules: &[PathBuf]) -> Result<()> {
 	Ok(())
 }
 
+fn run_python_bench_gate(root: &Path, requested_modules: &[PathBuf]) -> Result<()> {
+	let scripts = bench_scripts(root, requested_modules)?;
+	if !suite::python314_available() {
+		bail!("python3.14 reference interpreter is not available")
+	}
+	let runner_binary = ensure_bench_runner(root)?;
+	let mut failures = Vec::new();
+
+	println!("Python comparison bench: {} kernel(s), pon tier-up vs python3.14", scripts.len());
+
+	for script in scripts {
+		let label = suite::display_path(root, &script);
+		let pon = measure_bench_variant(root, &runner_binary, &script, false)
+			.with_context(|| format!("failed to measure pon benchmark `{label}`"))?;
+		let python = measure_python_bench(root, &script)
+			.with_context(|| format!("failed to measure python3.14 benchmark `{label}`"))?;
+
+		if pon.output != python.output {
+			failures.push(format!(
+				"`{label}` changed observable output between pon and python3.14 execution\n{}",
+				python_bench_mismatch_report(&pon.output, &python.output)
+			));
+			continue;
+		}
+
+		let speedup = speedup(python.best, pon.best);
+		println!(
+			"bench {label}: python3.14={:.6}s pon={:.6}s pon_vs_python={speedup:.2}x",
+			python.best.as_secs_f64(),
+			pon.best.as_secs_f64()
+		);
+	}
+
+	if !failures.is_empty() {
+		bail!("Python comparison bench failed:\n{}", failures.join("\n\n"))
+	}
+
+	println!("Python comparison bench PASS");
+	Ok(())
+}
+
 fn bench_speedup_floor(script: &Path) -> f64 {
 	let Some(file_name) = script.file_name().and_then(|name| name.to_str()) else {
 		return 1.0;
@@ -556,6 +608,7 @@ fn ensure_bench_runner(root: &Path) -> Result<PathBuf> {
 	let output = Command::new("cargo")
 		.arg("build")
 		.arg("--quiet")
+		.arg("--release")
 		.arg("--manifest-path")
 		.arg(&manifest_path)
 		.arg("--target-dir")
@@ -573,7 +626,7 @@ fn ensure_bench_runner(root: &Path) -> Result<PathBuf> {
 
 	let binary = runner_dir
 		.join("target")
-		.join("debug")
+		.join("release")
 		.join(format!("pon-bench-runner{}", std::env::consts::EXE_SUFFIX));
 	if !binary.is_file() {
 		bail!("benchmark runner build succeeded but `{}` was not created", binary.display());
@@ -601,7 +654,7 @@ edition = "2024"
 anyhow = "1"
 pon-ir = {{ path = "{}" }}
 pon-jit = {{ path = "{}" }}
-pon-runtime = {{ path = "{}" }}
+pon-runtime = {{ path = "{}", features = ["tagged-ints"] }}
 "#,
 		toml_path(&root.join("pon-ir")),
 		toml_path(&root.join("pon-jit")),
@@ -666,18 +719,31 @@ fn measure_bench_variant(
 	script: &Path,
 	tier0_only: bool,
 ) -> Result<BenchMeasurement> {
+	let variant = if tier0_only { "tier-0-only" } else { "tier-up" };
+	measure_bench(script, variant, || run_pon_bench(root, runner_binary, script, tier0_only))
+}
+
+fn measure_python_bench(root: &Path, script: &Path) -> Result<BenchMeasurement> {
+	measure_bench(script, "python3.14", || suite::run_python314(root, script))
+}
+
+fn measure_bench(
+	script: &Path,
+	variant: &str,
+	mut run_once: impl FnMut() -> Result<suite::RunResult>,
+) -> Result<BenchMeasurement> {
 	for _ in 0..BENCH_WARMUP_REPS {
-		let output = run_pon_bench(root, runner_binary, script, tier0_only)?;
-		ensure_bench_success(script, tier0_only, &output)?;
+		let output = run_once()?;
+		ensure_bench_success(script, variant, &output)?;
 	}
 
 	let mut best = None;
 	let mut observed = None;
 	for _ in 0..BENCH_TIMED_REPS {
 		let start = Instant::now();
-		let output = run_pon_bench(root, runner_binary, script, tier0_only)?;
+		let output = run_once()?;
 		let elapsed = start.elapsed();
-		ensure_bench_success(script, tier0_only, &output)?;
+		ensure_bench_success(script, variant, &output)?;
 
 		if best.is_none_or(|current| elapsed < current) {
 			best = Some(elapsed);
@@ -707,12 +773,11 @@ fn run_pon_bench(
 	suite::run_command(&mut command)
 }
 
-fn ensure_bench_success(script: &Path, tier0_only: bool, output: &suite::RunResult) -> Result<()> {
+fn ensure_bench_success(script: &Path, variant: &str, output: &suite::RunResult) -> Result<()> {
 	if output.exit == 0 {
 		return Ok(());
 	}
 
-	let variant = if tier0_only { "tier-0-only" } else { "tier-up" };
 	bail!(
 		"{variant} benchmark `{}` exited with {}\nstdout={:?}\nstderr={:?}",
 		suite::normalize_path(script),
@@ -740,5 +805,17 @@ fn bench_mismatch_report(tier0: &suite::RunResult, tier1: &suite::RunResult) -> 
 		tier1.exit,
 		String::from_utf8_lossy(&tier1.stdout),
 		String::from_utf8_lossy(&tier1.stderr)
+	)
+}
+
+fn python_bench_mismatch_report(pon: &suite::RunResult, python: &suite::RunResult) -> String {
+	format!(
+		"pon: exit={} stdout={:?} stderr={:?}\npython3.14: exit={} stdout={:?} stderr={:?}",
+		pon.exit,
+		String::from_utf8_lossy(&pon.stdout),
+		String::from_utf8_lossy(&pon.stderr),
+		python.exit,
+		String::from_utf8_lossy(&python.stdout),
+		String::from_utf8_lossy(&python.stderr)
 	)
 }
