@@ -621,7 +621,7 @@ fn line_coding_cookie(line: &[u8]) -> Option<String> {
 /// lines, defaulting to UTF-8.  `Err` carries CPython's SyntaxError message
 /// shapes (`Non-UTF-8 code starting with ...` for undeclared non-UTF-8
 /// bytes, `unknown encoding: ...` for unsupported cookies).
-pub(crate) fn decode_python_source(bytes: &[u8], filename: &str) -> Result<String, String> {
+pub fn decode_python_source(bytes: &[u8], filename: &str) -> Result<String, String> {
 	let (bytes, bom) = match bytes {
 		[0xef, 0xbb, 0xbf, rest @ ..] => (rest, true),
 		_ => (bytes, false),

@@ -163,6 +163,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 		monitoring_attr(),
 		warnoptions_attr(),
 		meta_path_attr(),
+		path_hooks_attr(),
 		path_importer_cache_attr(),
 		path_attr(),
 		modules_attr(),
@@ -281,26 +282,45 @@ fn warnoptions_attr() -> Result<(u32, *mut PyObject), String> {
 
 /// `sys.meta_path`: the import-protocol finder chain, born empty (CPython's
 /// pre-`_install` state).  pon's native importer resolves `import`
-/// statements itself and never consults this list (documented divergence);
-/// the list serves the vendored `importlib._bootstrap`, whose `_find_spec`
-/// reads it whenever stdlib code routes an import through
-/// `importlib.import_module` (e.g. `sysconfig._get_sysconfigdata`).  CPython
-/// seeds `[BuiltinImporter, FrozenImporter]` via `_bootstrap._install` at
+/// statements through the same path-entry finder machinery exposed below; the
+/// list serves vendored `importlib._bootstrap`, whose `_find_spec` reads it
+/// whenever stdlib code routes an import through `importlib.import_module`
+/// (e.g. `sysconfig._get_sysconfigdata`).  CPython seeds
+/// `[BuiltinImporter, FrozenImporter]` via `_bootstrap._install` at
 /// interpreter init; the vendored `importlib/__init__.py` source-fallback
 /// branch only runs `_setup`, so `crate::import::seed_meta_path_finders`
-/// mirrors the `_install` append right after `importlib._bootstrap` first
-/// loads.  `PathFinder` (CPython's third entry, installed by
-/// `_install_external_importers`) is deliberately absent: it lives in
-/// `_bootstrap_external`, whose file-loading machinery pon does not run.
+/// mirrors the append right after `importlib._bootstrap` first loads and adds
+/// pon's source importer as the PathFinder-equivalent third entry.
 fn meta_path_attr() -> Result<(u32, *mut PyObject), String> {
 	empty_list_attr("meta_path")
 }
 
-/// `sys.path_importer_cache`: the path-entry finder cache `runpy`'s
-/// `_get_code_from_file` machinery reads and writes.  pon's native importer
-/// never consults it (documented divergence, like `meta_path`), so the
-/// honest surface is one identity-stable empty dict that Python code may
-/// populate freely.
+/// `sys.path_hooks`: the path-entry hook list.  The single pon hook returns a
+/// FileFinder-equivalent object for directories and a source-only zip finder
+/// for zip archives (including `archive.zip/pkg` prefixes); `.pyc` members are
+/// intentionally ignored because pon has no marshal/code-object loader.
+fn path_hooks_attr() -> Result<(u32, *mut PyObject), String> {
+	static HOOKS: std::sync::LazyLock<Result<usize, String>> = std::sync::LazyLock::new(|| {
+		crate::native::imp::make_source_importer_module()?;
+		let hook =
+			crate::import::module_attr(intern("_pon_source_importer"), intern("path_hook"))
+				.ok_or_else(|| "failed to load _pon_source_importer.path_hook".to_owned())?;
+		let mut items = [hook];
+		let list = unsafe { crate::abi::seq::pon_build_list(items.as_mut_ptr(), items.len()) };
+		if list.is_null() {
+			return Err("failed to allocate sys.path_hooks".to_owned());
+		}
+		Ok(list as usize)
+	});
+	HOOKS
+		.clone()
+		.map(|object| (intern("path_hooks"), object as *mut PyObject))
+}
+
+/// `sys.path_importer_cache`: the path-entry finder cache used by pon's native
+/// source resolver, `pkgutil`, and vendored importlib helpers.  Keys are path
+/// strings from `sys.path`/package `__path__`; values are pon directory/zip
+/// finder objects or `None` for entries no installed hook claims.
 fn path_importer_cache_attr() -> Result<(u32, *mut PyObject), String> {
 	static CACHE: std::sync::LazyLock<Result<usize, String>> = std::sync::LazyLock::new(|| {
 		// SAFETY: Map builder allocates an empty runtime dict.
@@ -327,7 +347,7 @@ fn empty_list_attr(name: &str) -> Result<(u32, *mut PyObject), String> {
 /// reads at import time.  Only the consumed subset is served — an unknown
 /// attribute raises `AttributeError` so the next frontier is loud, not a
 /// silently wrong default.  `context_aware_warnings` is 0 to match the
-/// reference CPython default (GIL) build `_py_warnings` is compared against.
+/// reference CPython default build `_py_warnings` is compared against.
 fn flags_attr() -> Result<(u32, *mut PyObject), String> {
 	static FLAGS_TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
 		let mut ty = crate::object::PyType::new(
@@ -355,7 +375,7 @@ unsafe extern "C" fn flags_getattro(object: *mut PyObject, name: *mut PyObject) 
 	match name_text {
 		// Plain `python3` invocation values (no -X/-O/-W switches reach
 		// pon).  `thread_inherit_context` is 0 to match the reference
-		// CPython default (GIL) build: threads start with an empty context.
+		// CPython default: threads start with an empty context.
 		"context_aware_warnings"
 		| "debug"
 		| "optimize"
@@ -2339,7 +2359,7 @@ unsafe extern "C" fn sys_is_gil_enabled(_argv: *mut *mut PyObject, argc: usize) 
 	if argc != 0 {
 		return raise_type_error(&format!("_is_gil_enabled() takes no arguments ({argc} given)"));
 	}
-	unsafe { pon_const_bool(1) }
+	unsafe { pon_const_bool(0) }
 }
 
 unsafe extern "C" fn sys_is_interned(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {

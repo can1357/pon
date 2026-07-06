@@ -547,13 +547,13 @@ fn source_importer_module() -> Option<*mut PyObject> {
 	crate::import::cached_module(intern(SOURCE_IMPORTER_NAME))
 }
 
-/// `find_spec(fullname, path=None, target=None)`: claims exactly the names
-/// pon's post-registry machinery (embedded AoT bodies, then source roots)
-/// would serve, building the spec through the vendored
-/// `importlib._bootstrap.spec_from_loader` so `ModuleSpec` semantics
-/// (`is_package` via `loader.is_package`, `parent`, `_initializing`) are the
-/// bootstrap's own.  `path` and `target` are accepted and ignored: pon
-/// resolves by full dotted name, not per-package search locations.
+/// `find_spec(fullname, path=None, target=None)`: pon's PathFinder-equivalent
+/// meta-path entry.  With `path=None` it searches `sys.path`; with a package
+/// `__path__` it searches those path entries via the same finder/cache
+/// machinery exposed through `sys.path_hooks` and `sys.path_importer_cache`.
+/// Specs are built through vendored `importlib._bootstrap.spec_from_loader`
+/// so `ModuleSpec` semantics (`is_package` via `loader.is_package`, `parent`,
+/// `_initializing`) remain the bootstrap's own.
 unsafe extern "C" fn source_find_spec_entry(
 	argv: *mut *mut PyObject,
 	argc: usize,
@@ -566,48 +566,8 @@ unsafe extern "C" fn source_find_spec_entry(
 	let Some(name) = (unsafe { text_argument(name_object) }) else {
 		return raise_type_error("find_spec() argument 'fullname' must be str");
 	};
-	if crate::import::source_module_package_flag(&name).is_none() {
-		return none();
-	}
-	// A missing loader module or bootstrap binding declines the claim rather
-	// than failing the import: the caller then raises its own
-	// ModuleNotFoundError, matching the pre-finder surface.
-	let Some(loader) = source_importer_module() else {
-		return none();
-	};
-	let Some(spec_from_loader) =
-		crate::import::module_attr(intern("importlib._bootstrap"), intern("spec_from_loader"))
-	else {
-		return none();
-	};
-	let mut call_args = [name_object, loader];
-	// SAFETY: `spec_from_loader` is a live callable; argv holds two live slots.
-	let spec =
-		untag(unsafe { abi::pon_call(spec_from_loader, call_args.as_mut_ptr(), call_args.len()) });
-	if spec.is_null() {
-		return ptr::null_mut();
-	}
-	if let Some(search_locations) = crate::import::source_module_search_locations(&name) {
-		// SAFETY: `ModuleSpec.submodule_search_locations` is the list
-		// `spec_from_loader` created for package specs.
-		let locations =
-			unsafe { abi::pon_get_attr(spec, intern("submodule_search_locations"), ptr::null_mut()) };
-		if locations.is_null() {
-			return ptr::null_mut();
-		}
-		let locations = untag(locations);
-		for path in search_locations {
-			let text = path.to_string_lossy();
-			let path_object = str_object(&text);
-			if path_object.is_null() {
-				return ptr::null_mut();
-			}
-			if let Err(message) = crate::abi::seq::list_append_raw(locations, path_object) {
-				return crate::abi::return_null_with_error(message);
-			}
-		}
-	}
-	spec
+	let path = args.get(1).copied();
+	crate::import::source_importer_find_spec(&name, name_object, path)
 }
 
 /// `is_package(fullname)`: consulted by `spec_from_loader` while `find_spec`
@@ -718,12 +678,13 @@ pub(crate) fn make_source_importer_module() -> Result<*mut PyObject, String> {
 		return Ok(existing);
 	}
 	let mut attrs = Vec::new();
-	let functions: [(&str, BuiltinFn); 5] = [
+	let functions: [(&str, BuiltinFn); 6] = [
 		("create_module", source_create_module_entry),
 		("exec_module", source_exec_module_entry),
 		("find_spec", source_find_spec_entry),
 		("get_resource_reader", source_get_resource_reader_entry),
 		("is_package", source_is_package_entry),
+		("path_hook", crate::import::source_path_hook_entry),
 	];
 	for (function_name, entry) in functions {
 		// SAFETY: `entry` is a live builtin entry point.

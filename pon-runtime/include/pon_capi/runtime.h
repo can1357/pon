@@ -7,8 +7,8 @@
  * Pon has no GIL to release. The GIL/thread-state calls therefore expose
  * honest non-NULL tokens and no-op restore/release operations so C extensions
  * can keep their CPython bracketing structure without implying mutual
- * exclusion. PyCapsule destructors are stored for layout compatibility but are
- * not called; capsule objects are process-lifetime in this shim.
+ * exclusion. PyCapsule destructors run when Pon's GC finalizes the capsule
+ * after the last C reference is released.
  */
 
 typedef struct _is PyInterpreterState;

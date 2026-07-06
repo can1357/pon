@@ -2932,6 +2932,9 @@ fn find_defining_class(function: *mut PyObject, ty: *mut PyType) -> Option<*mut 
 	let carriers = carrier_types();
 	let function_name = crate::types::function::function_name(function);
 	let function_name_id = function_name.as_deref().map(intern);
+	let direct_match =
+		|value: *mut PyObject| value == function || carrier_matches(value, &carriers, function);
+	let mut wrapped_candidate = None;
 	for class in unsafe { crate::mro::mro_entries(ty) } {
 		if class.is_null() {
 			continue;
@@ -2941,34 +2944,39 @@ fn find_defining_class(function: *mut PyObject, ty: *mut PyType) -> Option<*mut 
 			continue;
 		}
 		let dict = unsafe { &*dict.cast::<crate::types::type_::PyClassDict>() };
-		let matches = |value: *mut PyObject| {
-			value == function
-				|| carrier_matches(value, &carriers, function)
-				|| wrapped_chain_matches(value, &carriers, function)
-		};
 		if let Some(name_id) = function_name_id {
-			if let Some(value) = dict.get(name_id)
-				&& matches(value)
-			{
-				return Some(class);
+			if let Some(value) = dict.get(name_id) {
+				if direct_match(value) {
+					return Some(class);
+				}
+				if wrapped_candidate.is_none() && wrapped_chain_matches(value, &carriers, function) {
+					wrapped_candidate = Some(class);
+				}
 			}
 			// A method can be stored under a different name than the
 			// function's own (`other = method` rebinding): fall back to an
 			// identity/carrier scan.  Wrapper-chain probing stays name-keyed
 			// so the fallback never pays attr lookups per dict entry.
-			if dict.iter().any(|(entry_name, value)| {
-				entry_name != name_id
-					&& (value == function || carrier_matches(value, &carriers, function))
-			}) {
+			if dict
+				.iter()
+				.any(|(entry_name, value)| entry_name != name_id && direct_match(value))
+			{
 				return Some(class);
 			}
 			continue;
 		}
-		if dict.iter().any(|(_, value)| matches(value)) {
+		if dict.iter().any(|(_, value)| direct_match(value)) {
 			return Some(class);
 		}
+		if wrapped_candidate.is_none()
+			&& dict
+				.iter()
+				.any(|(_, value)| wrapped_chain_matches(value, &carriers, function))
+		{
+			wrapped_candidate = Some(class);
+		}
 	}
-	None
+	wrapped_candidate
 }
 
 fn infer_zero_arg_super() -> Result<(*mut PyType, *mut PyObject), String> {
@@ -3477,7 +3485,7 @@ mod tests {
 	use super::*;
 	use crate::{
 		object::PyLong,
-		thread_state::{pon_err_clear, test_state_lock},
+		thread_state::{pon_err_clear, pon_err_message, test_state_lock},
 	};
 
 	static CALL_COUNTER: AtomicI64 = AtomicI64::new(0);
@@ -3503,6 +3511,16 @@ mod tests {
 	) -> *mut PyObject {
 		CALL_COUNTER.fetch_add(1, Ordering::SeqCst);
 		unsafe { abi::pon_const_int(0) }
+	}
+
+	fn execute_source(source: &str) {
+		let source = unsafe { abi::pon_const_str(source.as_ptr(), source.len()) };
+		assert!(!source.is_null(), "source string allocation failed");
+		let globals = unsafe { abi::map::pon_build_map(ptr::null_mut(), 0) };
+		assert!(!globals.is_null(), "globals dict allocation failed");
+		let mut argv = [source, globals, globals];
+		let result = unsafe { crate::dynexec::builtin_exec(argv.as_mut_ptr(), argv.len()) };
+		assert!(!result.is_null(), "exec failed: {:?}", pon_err_message());
 	}
 
 	fn int_list(values: &[i64]) -> *mut PyObject {
@@ -3664,5 +3682,28 @@ mod tests {
 		let ascii = unsafe { builtin_ascii(args.as_mut_ptr(), args.len()) };
 		assert!(!ascii.is_null());
 		assert_eq!(object_to_string(ascii).as_deref(), Some("'\\xe9\\U0001f600x'"));
+	}
+
+	#[test]
+	fn zero_arg_super_prefers_direct_owner_over_subclass_wrapper() {
+		let _guard = test_state_lock();
+		init_runtime();
+		execute_source(
+			r#"
+from enum import Enum
+from collections import namedtuple
+
+class ASN(namedtuple("ASN", "nid shortname longname oid")):
+    __slots__ = ()
+
+    def __new__(cls, oid):
+        return super().__new__(cls, 1, "short", "long", oid)
+
+class Purpose(ASN, Enum):
+    SERVER_AUTH = "1.2.3"
+
+assert Purpose.SERVER_AUTH.oid == "1.2.3"
+"#,
+		);
 	}
 }

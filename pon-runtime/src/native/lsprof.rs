@@ -1,18 +1,16 @@
 //! Native `_lsprof` compatibility surface.
 //!
-//! Profiling data collection requires frame-tracing hooks Pon does not have.
-//! The `Profiler` type is real and stateful (`enable`, `disable`, and `clear`
-//! update profiler state), but the recorded sample set is intentionally empty:
-//! `getstats()` returns `[]` instead of fabricating call records.
-//! `cProfile.Profile.create_stats()` is adjusted at subclass creation to give
-//! `pstats.Stats` a truthy empty mapping; no call records are synthesized.
+//! Pon records completed `PyFunction` call spans through the compiled-call stack
+//! hooks in `abi::CurrentFunctionGuard`, using monotonic runtime timing.  The
+//! `Profiler` object is stateful (`enable`, `disable`, `clear`) and
+//! `getstats()` returns cProfile-compatible entry objects with `code`, call
+//! counts, timings, and subcall lists.
+//!
+//! Custom timer/timeunit callbacks and low-level C call events are outside the
+//! current product boundary; custom timers raise `NotImplementedError` instead
+//! of being silently ignored.
 
-use core::ffi::c_int;
-use std::{
-	collections::HashMap,
-	ptr,
-	sync::{LazyLock, Mutex},
-};
+use std::{collections::HashMap, ptr, sync::LazyLock};
 
 use super::{builtins_mod::VARIADIC_ARITY, install_module};
 use crate::{
@@ -22,27 +20,17 @@ use crate::{
 	types::exc::ExceptionKind,
 };
 
-#[derive(Clone, Copy, Debug)]
-struct ProfilerState {
-	enabled:     bool,
-	subcalls:    bool,
-	builtins:    bool,
-	clear_count: u64,
-}
-
-impl Default for ProfilerState {
-	fn default() -> Self {
-		Self { enabled: false, subcalls: true, builtins: true, clear_count: 0 }
-	}
-}
-
 #[repr(C)]
-struct PyEmptyStats {
-	ob_base: PyObjectHeader,
+struct PyProfilerEntry {
+	ob_base:        PyObjectHeader,
+	code:           *mut PyObject,
+	callcount:      u64,
+	reccallcount:   u64,
+	total_seconds:  f64,
+	inline_seconds: f64,
+	calls:          *mut PyObject,
 }
 
-static STATES: LazyLock<Mutex<HashMap<usize, ProfilerState>>> =
-	LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
 	let name = "_lsprof";
@@ -178,22 +166,40 @@ unsafe extern "C" fn profiler_init(argv: *mut *mut PyObject, argc: usize) -> *mu
 		);
 	}
 
-	let mut state = ProfilerState::default();
-	if let Some(&subcalls) = args.get(2) {
-		state.subcalls = match bool_arg(subcalls) {
+	if let Some(&timer) = args.first() {
+		if !is_none_object(timer) {
+			return raise(
+				ExceptionKind::NotImplementedError,
+				"_lsprof.Profiler custom timer callbacks are not implemented in pon; the native \
+				 profiler uses monotonic runtime timing",
+			);
+		}
+	}
+	if let Some(&timeunit) = args.get(1) {
+		if !is_none_object(timeunit) {
+			return raise(
+				ExceptionKind::NotImplementedError,
+				"_lsprof.Profiler timeunit is only meaningful with a custom timer, which pon does \
+				 not implement",
+			);
+		}
+	}
+	let mut subcalls = true;
+	let mut builtins = true;
+	if let Some(&value) = args.get(2) {
+		subcalls = match bool_arg(value) {
 			Some(value) => value,
 			None => return ptr::null_mut(),
 		};
 	}
-	if let Some(&builtins) = args.get(3) {
-		state.builtins = match bool_arg(builtins) {
+	if let Some(&value) = args.get(3) {
+		builtins = match bool_arg(value) {
 			Some(value) => value,
 			None => return ptr::null_mut(),
 		};
 	}
 
-	let mut states = STATES.lock().unwrap_or_else(|poison| poison.into_inner());
-	states.insert(receiver as usize, state);
+	abi::lsprof_register_profiler(receiver, subcalls, builtins);
 	none()
 }
 
@@ -237,31 +243,17 @@ unsafe extern "C" fn profiler_create_stats(argv: *mut *mut PyObject, argc: usize
 		);
 	}
 
-	{
-		let mut states = STATES.lock().unwrap_or_else(|poison| poison.into_inner());
-		states.entry(receiver as usize).or_default().enabled = false;
-	}
+	abi::lsprof_disable_profiler(receiver);
 
 	let snapshot = unsafe { abi::pon_get_attr(receiver, intern("snapshot_stats"), ptr::null_mut()) };
 	if snapshot.is_null() {
-		crate::thread_state::pon_err_clear();
-		return set_empty_stats(receiver);
+		return ptr::null_mut();
 	}
 	let result = unsafe { abi::pon_call(snapshot, ptr::null_mut(), 0) };
 	if result.is_null() {
 		return ptr::null_mut();
 	}
-
-	let stats = unsafe { abi::pon_get_attr(receiver, intern("stats"), ptr::null_mut()) };
-	if stats.is_null() {
-		crate::thread_state::pon_err_clear();
-		return set_empty_stats(receiver);
-	}
-	match unsafe { abi::pon_is_true(stats) } {
-		0 => set_empty_stats(receiver),
-		1 => none(),
-		_ => ptr::null_mut(),
-	}
+	none()
 }
 
 unsafe extern "C" fn profiler_enable(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -284,11 +276,7 @@ unsafe extern "C" fn profiler_enable(argv: *mut *mut PyObject, argc: usize) -> *
 		None => return ptr::null_mut(),
 	};
 
-	let mut states = STATES.lock().unwrap_or_else(|poison| poison.into_inner());
-	let state = states.entry(receiver as usize).or_default();
-	state.enabled = true;
-	state.subcalls = subcalls;
-	state.builtins = builtins;
+	abi::lsprof_enable_profiler(receiver, subcalls, builtins);
 	none()
 }
 
@@ -303,8 +291,7 @@ unsafe extern "C" fn profiler_disable(argv: *mut *mut PyObject, argc: usize) -> 
 			&format!("disable expected no arguments, got {}", args.len()),
 		);
 	}
-	let mut states = STATES.lock().unwrap_or_else(|poison| poison.into_inner());
-	states.entry(receiver as usize).or_default().enabled = false;
+	abi::lsprof_disable_profiler(receiver);
 	none()
 }
 
@@ -319,9 +306,7 @@ unsafe extern "C" fn profiler_clear(argv: *mut *mut PyObject, argc: usize) -> *m
 			&format!("clear expected no arguments, got {}", args.len()),
 		);
 	}
-	let mut states = STATES.lock().unwrap_or_else(|poison| poison.into_inner());
-	let state = states.entry(receiver as usize).or_default();
-	state.clear_count = state.clear_count.wrapping_add(1);
+	abi::lsprof_clear_profiler(receiver);
 	none()
 }
 
@@ -336,45 +321,131 @@ unsafe extern "C" fn profiler_getstats(argv: *mut *mut PyObject, argc: usize) ->
 			&format!("getstats expected no arguments, got {}", args.len()),
 		);
 	}
-	let mut states = STATES.lock().unwrap_or_else(|poison| poison.into_inner());
-	let state = states.entry(receiver as usize).or_default();
-	let _observed_state = (state.enabled, state.subcalls, state.builtins, state.clear_count);
-	// SAFETY: Passing a NULL data pointer with length zero builds a real empty
-	// list.
-	unsafe { abi::seq::pon_build_list(ptr::null_mut(), 0) }
+	let snapshots = abi::lsprof_stats_snapshot(receiver);
+	let mut code_cache = HashMap::new();
+	let mut entries = Vec::with_capacity(snapshots.len());
+	for snapshot in snapshots {
+		let entry = profiler_entry_from_snapshot(&snapshot, &mut code_cache);
+		if entry.is_null() {
+			return ptr::null_mut();
+		}
+		entries.push(entry);
+	}
+	build_list(entries)
 }
 
-static EMPTY_STATS_TYPE: LazyLock<usize> = LazyLock::new(|| {
+static PROFILER_ENTRY_TYPE: LazyLock<usize> = LazyLock::new(|| {
 	let mut ty = PyType::new(
 		abi::runtime_type_type().cast_const(),
-		"_lsprof._EmptyStats",
-		core::mem::size_of::<PyEmptyStats>(),
+		"_lsprof.profiler_entry",
+		core::mem::size_of::<PyProfilerEntry>(),
 	);
 	ty.tp_base = abi::runtime_global(intern("object"))
 		.map_or(ptr::null_mut(), |object| object.cast::<PyType>());
-	ty.tp_bool = Some(empty_stats_bool);
-	ty.tp_getattro = Some(empty_stats_getattro);
+	ty.tp_getattro = Some(profiler_entry_getattro);
 	Box::into_raw(Box::new(ty)) as usize
 });
 
-fn empty_stats_type() -> *mut PyType {
-	*EMPTY_STATS_TYPE as *mut PyType
+fn profiler_entry_type() -> *mut PyType {
+	*PROFILER_ENTRY_TYPE as *mut PyType
 }
 
-static EMPTY_STATS_OBJECT: LazyLock<usize> = LazyLock::new(|| {
-	Box::into_raw(Box::new(PyEmptyStats { ob_base: PyObjectHeader::new(empty_stats_type()) }))
-		as usize
-});
-
-fn empty_stats_object() -> *mut PyObject {
-	*EMPTY_STATS_OBJECT as *mut PyObject
+fn profiler_entry_from_snapshot(
+	snapshot: &abi::LsprofEntrySnapshot,
+	code_cache: &mut HashMap<usize, *mut PyObject>,
+) -> *mut PyObject {
+	let mut calls = Vec::with_capacity(snapshot.calls.len());
+	for call in &snapshot.calls {
+		let entry = profiler_entry_from_call(call, code_cache);
+		if entry.is_null() {
+			return ptr::null_mut();
+		}
+		calls.push(entry);
+	}
+	let calls = build_list(calls);
+	if calls.is_null() {
+		return ptr::null_mut();
+	}
+	let code = code_object_for_function(snapshot.function, code_cache);
+	if code.is_null() {
+		return ptr::null_mut();
+	}
+	alloc_profiler_entry(
+		code,
+		snapshot.callcount,
+		snapshot.reccallcount,
+		snapshot.total_seconds,
+		snapshot.inline_seconds,
+		calls,
+	)
 }
 
-unsafe extern "C" fn empty_stats_bool(_object: *mut PyObject) -> c_int {
-	1
+fn profiler_entry_from_call(
+	call: &abi::LsprofCallSnapshot,
+	code_cache: &mut HashMap<usize, *mut PyObject>,
+) -> *mut PyObject {
+	let calls = build_list(Vec::new());
+	if calls.is_null() {
+		return ptr::null_mut();
+	}
+	let code = code_object_for_function(call.function, code_cache);
+	if code.is_null() {
+		return ptr::null_mut();
+	}
+	alloc_profiler_entry(
+		code,
+		call.callcount,
+		call.reccallcount,
+		call.total_seconds,
+		call.inline_seconds,
+		calls,
+	)
 }
 
-unsafe extern "C" fn empty_stats_getattro(
+fn alloc_profiler_entry(
+	code: *mut PyObject,
+	callcount: u64,
+	reccallcount: u64,
+	total_seconds: f64,
+	inline_seconds: f64,
+	calls: *mut PyObject,
+) -> *mut PyObject {
+	Box::into_raw(Box::new(PyProfilerEntry {
+		ob_base: PyObjectHeader::new(profiler_entry_type()),
+		code,
+		callcount,
+		reccallcount,
+		total_seconds,
+		inline_seconds,
+		calls,
+	}))
+	.cast::<PyObject>()
+}
+
+fn code_object_for_function(
+	function: *mut PyObject,
+	code_cache: &mut HashMap<usize, *mut PyObject>,
+) -> *mut PyObject {
+	let key = function as usize;
+	if let Some(&code) = code_cache.get(&key) {
+		return code;
+	}
+	if !function.is_null() {
+		let code = unsafe { abi::pon_get_attr(function, intern("__code__"), ptr::null_mut()) };
+		if !code.is_null() {
+			code_cache.insert(key, code);
+			return code;
+		}
+		crate::thread_state::pon_err_clear();
+	}
+	let code = str_object("<unknown profiled function>").unwrap_or(ptr::null_mut());
+	if !code.is_null() {
+		code_cache.insert(key, code);
+	}
+	code
+}
+
+unsafe extern "C" fn profiler_entry_getattro(
 	object: *mut PyObject,
 	name: *mut PyObject,
 ) -> *mut PyObject {
@@ -383,40 +454,18 @@ unsafe extern "C" fn empty_stats_getattro(
 	else {
 		return raise(ExceptionKind::TypeError, "attribute name must be str");
 	};
+	let entry = unsafe { &*object.cast::<PyProfilerEntry>() };
 	match name_text {
-		"copy" | "items" | "keys" | "values" => {
-			bound_method(object, name_text, empty_stats_empty_list_method)
-		},
+		"code" => entry.code,
+		"callcount" => count_object(entry.callcount),
+		"reccallcount" => count_object(entry.reccallcount),
+		"totaltime" => float_object(entry.total_seconds),
+		"inlinetime" => float_object(entry.inline_seconds),
+		"calls" => entry.calls,
 		_ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
 	}
 }
 
-unsafe extern "C" fn empty_stats_empty_list_method(
-	argv: *mut *mut PyObject,
-	argc: usize,
-) -> *mut PyObject {
-	if argv.is_null() || argc == 0 {
-		return raise(ExceptionKind::TypeError, "empty stats method missing receiver");
-	}
-	if argc != 1 {
-		return raise(
-			ExceptionKind::TypeError,
-			&format!("empty stats method expected no arguments, got {}", argc - 1),
-		);
-	}
-	unsafe { abi::seq::pon_build_list(ptr::null_mut(), 0) }
-}
-
-fn set_empty_stats(receiver: *mut PyObject) -> *mut PyObject {
-	let stats = empty_stats_object();
-	if stats.is_null() {
-		return ptr::null_mut();
-	}
-	if unsafe { abi::pon_set_attr(receiver, intern("stats"), stats) } < 0 {
-		return ptr::null_mut();
-	}
-	none()
-}
 
 unsafe fn method_args<'a>(
 	argv: *mut *mut PyObject,
@@ -464,6 +513,32 @@ fn is_cprofile_profile_class(object: *mut PyObject) -> bool {
 		return false;
 	};
 	unsafe { crate::types::type_::unicode_text(crate::tag::untag_arg(module)) == Some("cProfile") }
+}
+
+fn count_object(value: u64) -> *mut PyObject {
+	let value = value.min(i64::MAX as u64) as i64;
+	unsafe { abi::pon_const_int(value) }
+}
+
+fn float_object(value: f64) -> *mut PyObject {
+	unsafe { abi::number::pon_const_float(value) }
+}
+
+fn build_list(mut items: Vec<*mut PyObject>) -> *mut PyObject {
+	unsafe {
+		abi::seq::pon_build_list(
+			if items.is_empty() {
+				ptr::null_mut()
+			} else {
+				items.as_mut_ptr()
+			},
+			items.len(),
+		)
+	}
+}
+
+fn is_none_object(value: *mut PyObject) -> bool {
+	crate::tag::untag_arg(value) == none()
 }
 
 fn optional_bool(value: Option<*mut PyObject>, default: bool) -> Option<bool> {

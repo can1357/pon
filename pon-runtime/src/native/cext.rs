@@ -2577,7 +2577,7 @@ unsafe extern "C" fn uuid_generate_time_safe(
 	_argc: usize,
 ) -> *mut PyObject {
 	let uuid = uuid_v1_bytes();
-	alloc_tuple(vec![py_bytes(&uuid), none()])
+	alloc_tuple(vec![py_bytes(&uuid), py_int(-1)])
 }
 
 fn fill_random(bytes: &mut [u8]) {

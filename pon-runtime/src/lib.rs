@@ -29,6 +29,10 @@ pub mod types;
 pub use abi::*;
 pub use feedback::*;
 pub use intern::{intern, resolve};
+/// Drains pending OS signals for generated-code poll bodies.
+pub unsafe extern "C" fn pon_signal_check_pending() -> libc::c_int {
+	unsafe { native::signal::pon_signal_check_pending() }
+}
 pub use object::*;
 pub use stackmap::*;
 pub use sync::*;

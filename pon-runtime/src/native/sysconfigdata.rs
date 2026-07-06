@@ -174,8 +174,8 @@ fn build_time_vars() -> Vec<(&'static str, VarValue)> {
 		// `test.support.check_cflags_pgo`.
 		("PY_CFLAGS_NODIST", Str("")),
 		// Module-scope `test.support.Py_GIL_DISABLED` and sysconfig's
-		// `abi_thread` ('' for a GIL build): pon is not free-threaded.
-		("Py_GIL_DISABLED", Int(0)),
+		// `abi_thread`: pon runs without a GIL.
+		("Py_GIL_DISABLED", Int(1)),
 		// Generic shared-library suffix and ABI tag used by sysconfig callers.
 		("SHLIB_SUFFIX", Str(".so")),
 		("SOABI", Str("pon-314")),
@@ -347,7 +347,7 @@ mod tests {
 		assert!(matches!(entry("SOABI"), Some(VarValue::Str("pon-314"))));
 		assert!(matches!(entry("prefix"), Some(VarValue::Str(""))));
 		assert!(matches!(entry("exec_prefix"), Some(VarValue::Str(""))));
-		assert!(matches!(entry("Py_GIL_DISABLED"), Some(VarValue::Int(0))));
+		assert!(matches!(entry("Py_GIL_DISABLED"), Some(VarValue::Int(1))));
 		// The darwin-only deployment target follows the compile target.
 		assert_eq!(entry("MACOSX_DEPLOYMENT_TARGET").is_some(), cfg!(target_os = "macos"));
 	}
@@ -425,6 +425,6 @@ mod tests {
 
 		let gil = lookup("Py_GIL_DISABLED");
 		assert!(!gil.is_null(), "Py_GIL_DISABLED missing from build_time_vars");
-		assert_eq!(format_object_for_print(gil).as_deref(), Ok("0"));
+		assert_eq!(format_object_for_print(gil).as_deref(), Ok("1"));
 	}
 }

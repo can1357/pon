@@ -6,10 +6,12 @@
 //! code.
 
 use std::{
-	collections::HashMap,
+	collections::{HashMap, HashSet},
 	env,
 	ffi::c_int,
-	fs, mem,
+	fs,
+	io::Read,
+	mem,
 	path::{Path, PathBuf},
 	ptr,
 	sync::{
@@ -38,7 +40,8 @@ pub type SourceModuleLoader = for<'a> fn(SourceModuleRequest<'a>) -> Result<*mut
 pub struct SourceModuleRequest<'a> {
 	/// Fully-qualified import name.
 	pub name:       &'a str,
-	/// Resolved UTF-8 source path.
+	/// Resolved source path (filesystem path, or the import-style pseudo-path
+	/// for a source member inside a zip archive).
 	pub path:       &'a Path,
 	/// Source text to compile and execute.
 	pub source:     &'a str,
@@ -941,14 +944,13 @@ fn resolve_module_by_name(name: &str) -> Result<*mut PyObject, String> {
 
 	if let Some(spec) = find_source_module(name) {
 		let module_attrs = source_module_attrs(&spec)?;
-		let Some(source_path) = spec.path.as_ref() else {
+		let Some(source_location) = spec.location.as_ref() else {
 			let module = create_module(name, true, module_attrs)?;
 			bind_child_to_parent(name, module);
 			return Ok(module);
 		};
-		let source = fs::read_to_string(source_path).map_err(|error| {
-			format!("failed to read source module '{}': {error}", source_path.display())
-		})?;
+		let source_path = source_location.display_path();
+		let source = source_location.read_source()?;
 		let loader = {
 			let state = IMPORT_STATE
 				.lock()
@@ -964,7 +966,7 @@ fn resolve_module_by_name(name: &str) -> Result<*mut PyObject, String> {
 			let handled_guard = crate::abi::HandledExcGuard::enter();
 			let loaded = loader(SourceModuleRequest {
 				name,
-				path: source_path,
+				path: &source_path,
 				source: &source,
 				is_package: spec.is_package,
 			});
@@ -1017,59 +1019,764 @@ fn is_unsupported_c_accelerated(name: &str) -> bool {
 	matches!(name, "_json")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SearchMode {
+	FullName,
+	TailOnly,
+}
+
+struct ModuleRelative {
+	path: PathBuf,
+	zip:  String,
+}
+
+fn module_relative(name: &str, mode: SearchMode) -> Option<ModuleRelative> {
+	if name.is_empty() {
+		return None;
+	}
+	let parts = match mode {
+		SearchMode::FullName => name.split('.').collect::<Vec<_>>(),
+		SearchMode::TailOnly => vec![name.rsplit('.').next()?],
+	};
+	if parts.iter().any(|part| part.is_empty()) {
+		return None;
+	}
+	let mut path = PathBuf::new();
+	for part in &parts {
+		path.push(part);
+	}
+	Some(ModuleRelative { path, zip: parts.join("/") })
+}
+
+#[derive(Clone, Debug)]
+enum SourceLocation {
+	File(PathBuf),
+	Zip { archive: PathBuf, member: String },
+}
+
+impl SourceLocation {
+	fn display_path(&self) -> PathBuf {
+		match self {
+			Self::File(path) => path.clone(),
+			Self::Zip { archive, member } => archive.join(member),
+		}
+	}
+
+	fn filesystem_path(&self) -> Option<PathBuf> {
+		match self {
+			Self::File(path) => Some(path.clone()),
+			Self::Zip { .. } => None,
+		}
+	}
+
+	fn package_search_location(&self) -> PathBuf {
+		match self {
+			Self::File(path) => path
+				.parent()
+				.expect("package __init__.py always has a parent directory")
+				.to_path_buf(),
+			Self::Zip { archive, member } => {
+				let parent = Path::new(member)
+					.parent()
+					.filter(|path| !path.as_os_str().is_empty());
+				parent.map_or_else(|| archive.clone(), |path| archive.join(path))
+			},
+		}
+	}
+
+	fn read_source(&self) -> Result<String, String> {
+		let display_path = self.display_path();
+		let filename = display_path.to_string_lossy();
+		let bytes = match self {
+			Self::File(path) => fs::read(path)
+				.map_err(|error| format!("failed to read source module '{}': {error}", path.display()))?,
+			Self::Zip { archive, member } => read_zip_member(archive, member)?,
+		};
+		crate::dynexec::decode_python_source(&bytes, &filename)
+			.map_err(|error| format!("failed to decode source module '{}': {error}", filename))
+	}
+}
+
 struct SourceSpec {
-	path:             Option<PathBuf>,
+	location:         Option<SourceLocation>,
 	is_package:       bool,
 	search_locations: Option<Vec<PathBuf>>,
 }
 
 impl SourceSpec {
-	fn module(path: PathBuf, is_package: bool) -> Self {
-		let search_locations = is_package.then(|| {
-			vec![
-				path
-					.parent()
-					.expect("package __init__.py always has a parent directory")
-					.to_path_buf(),
-			]
-		});
-		Self { path: Some(path), is_package, search_locations }
+	fn module(location: SourceLocation, is_package: bool) -> Self {
+		let search_locations = is_package.then(|| vec![location.package_search_location()]);
+		Self { location: Some(location), is_package, search_locations }
 	}
 
 	fn namespace(search_locations: Vec<PathBuf>) -> Self {
-		Self {
-			path:             None,
-			is_package:       true,
-			search_locations: Some(search_locations),
+		Self { location: None, is_package: true, search_locations: Some(search_locations) }
+	}
+}
+
+#[derive(Clone, Debug)]
+enum PathEntryKind {
+	Directory(PathBuf),
+	Zip { archive: PathBuf, prefix: String },
+}
+
+impl PathEntryKind {
+	fn display_path(&self) -> PathBuf {
+		match self {
+			Self::Directory(path) => path.clone(),
+			Self::Zip { archive, prefix } if prefix.is_empty() => archive.clone(),
+			Self::Zip { archive, prefix } => archive.join(prefix.trim_end_matches('/')),
+		}
+	}
+
+	fn find_source(&self, name: &str, mode: SearchMode) -> Option<SourceSpec> {
+		let relative = module_relative(name, mode)?;
+		match self {
+			Self::Directory(root) => find_directory_source(root, &relative.path),
+			Self::Zip { archive, prefix } => find_zip_source(archive, prefix, &relative.zip),
 		}
 	}
 }
 
+#[repr(C)]
+struct PyPathEntryFinder {
+	ob_base: PyObjectHeader,
+	kind:    PathEntryKind,
+}
+
+static PATH_ENTRY_FINDER_TYPE: LazyLock<usize> = LazyLock::new(|| {
+	let mut ty = PyType::new(
+		crate::abi::runtime_type_type().cast_const(),
+		"_pon_source_importer.PathEntryFinder",
+		mem::size_of::<PyPathEntryFinder>(),
+	);
+	ty.tp_base = crate::abi::runtime_global(intern("object"))
+		.map_or(ptr::null_mut(), |object| object.cast::<PyType>());
+	ty.tp_getattro = Some(path_entry_finder_getattro);
+	ty.tp_repr = Some(path_entry_finder_repr);
+	Box::into_raw(Box::new(ty)) as usize
+});
+
+fn path_entry_finder_type() -> *mut PyType {
+	*PATH_ENTRY_FINDER_TYPE as *mut PyType
+}
+
+fn alloc_path_entry_finder(kind: PathEntryKind) -> *mut PyObject {
+	Box::into_raw(Box::new(PyPathEntryFinder {
+		ob_base: PyObjectHeader::new(path_entry_finder_type()),
+		kind,
+	}))
+	.cast::<PyObject>()
+}
+
+unsafe fn as_path_entry_finder<'a>(object: *mut PyObject) -> Option<&'a PyPathEntryFinder> {
+	let object = crate::tag::untag_arg(object);
+	if object.is_null() || unsafe { (*object).ob_type } != path_entry_finder_type() {
+		return None;
+	}
+	Some(unsafe { &*object.cast::<PyPathEntryFinder>() })
+}
+
+type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
+
+fn bound_method(receiver: *mut PyObject, name: &str, entry: BuiltinFn) -> *mut PyObject {
+	let function = unsafe {
+		crate::abi::pon_make_function(
+			entry as *const u8,
+			crate::native::builtins_mod::VARIADIC_ARITY,
+			intern(name),
+		)
+	};
+	if function.is_null() {
+		return ptr::null_mut();
+	}
+	match crate::types::method::new_bound_method(function, receiver) {
+		Ok(method) => method.cast::<PyObject>(),
+		Err(message) => return_null_with_error(message),
+	}
+}
+
+unsafe extern "C" fn path_entry_finder_getattro(
+	object: *mut PyObject,
+	name: *mut PyObject,
+) -> *mut PyObject {
+	let Some(name_text) = (unsafe { crate::types::type_::unicode_text(crate::tag::untag_arg(name)) })
+	else {
+		return return_null_with_error("attribute name must be str");
+	};
+	let Some(finder) = (unsafe { as_path_entry_finder(object) }) else {
+		return return_null_with_error("path-entry finder receiver is invalid");
+	};
+	match name_text {
+		"path" => match runtime_string(&finder.kind.display_path().to_string_lossy()) {
+			Ok(value) => value,
+			Err(message) => return_null_with_error(message),
+		},
+		"archive" => match &finder.kind {
+			PathEntryKind::Zip { archive, .. } => match runtime_string(&archive.to_string_lossy()) {
+				Ok(value) => value,
+				Err(message) => return_null_with_error(message),
+			},
+			PathEntryKind::Directory(_) => unsafe { pon_none() },
+		},
+		"prefix" => match &finder.kind {
+			PathEntryKind::Zip { prefix, .. } => match runtime_string(prefix) {
+				Ok(value) => value,
+				Err(message) => return_null_with_error(message),
+			},
+			PathEntryKind::Directory(_) => unsafe { pon_none() },
+		},
+		"find_spec" => bound_method(object, name_text, path_entry_finder_find_spec_method),
+		"iter_modules" => bound_method(object, name_text, path_entry_finder_iter_modules_method),
+		"invalidate_caches" => bound_method(object, name_text, path_entry_finder_invalidate_method),
+		_ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
+	}
+}
+
+unsafe extern "C" fn path_entry_finder_repr(object: *mut PyObject) -> *mut PyObject {
+	let Some(finder) = (unsafe { as_path_entry_finder(object) }) else {
+		return return_null_with_error("path-entry finder receiver is invalid");
+	};
+	let text = match &finder.kind {
+		PathEntryKind::Directory(path) => format!("<pon FileFinder path='{}'>", path.display()),
+		PathEntryKind::Zip { archive, prefix } => {
+			if prefix.is_empty() {
+				format!("<pon zipimporter archive='{}'>", archive.display())
+			} else {
+				format!("<pon zipimporter archive='{}' prefix='{}'>", archive.display(), prefix)
+			}
+		},
+	};
+	match runtime_string(&text) {
+		Ok(value) => value,
+		Err(message) => return_null_with_error(message),
+	}
+}
+
+unsafe fn finder_receiver_and_args<'a>(
+	argv: *mut *mut PyObject,
+	argc: usize,
+	method: &str,
+) -> Result<(&'a PyPathEntryFinder, &'a [*mut PyObject]), *mut PyObject> {
+	if argv.is_null() {
+		return Err(return_null_with_error(format!(
+			"PathEntryFinder.{method} received a NULL argv pointer"
+		)));
+	}
+	let args = unsafe { core::slice::from_raw_parts(argv, argc) };
+	let Some((&receiver, rest)) = args.split_first() else {
+		return Err(return_null_with_error(format!(
+			"PathEntryFinder.{method} requires a receiver"
+		)));
+	};
+	let Some(finder) = (unsafe { as_path_entry_finder(receiver) }) else {
+		return Err(return_null_with_error(format!(
+			"PathEntryFinder.{method} receiver is invalid"
+		)));
+	};
+	Ok((finder, rest))
+}
+
+unsafe extern "C" fn path_entry_finder_find_spec_method(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let (finder, args) = match unsafe { finder_receiver_and_args(argv, argc, "find_spec") } {
+		Ok(pair) => pair,
+		Err(raised) => return raised,
+	};
+	if args.is_empty() || args.len() > 2 {
+		return return_null_with_error(format!(
+			"find_spec() takes 1 or 2 arguments ({} given)",
+			args.len()
+		));
+	}
+	let name_object = crate::tag::untag_arg(args[0]);
+	let Some(name) = (unsafe { exact_str_text(name_object) }) else {
+		return return_null_with_error("find_spec() argument 'fullname' must be str");
+	};
+	let Some(spec) = finder.kind.find_source(&name, SearchMode::TailOnly) else {
+		return unsafe { pon_none() };
+	};
+	importlib_spec_from_source_spec(&name, name_object, &spec)
+}
+
+unsafe extern "C" fn path_entry_finder_iter_modules_method(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let (finder, args) = match unsafe { finder_receiver_and_args(argv, argc, "iter_modules") } {
+		Ok(pair) => pair,
+		Err(raised) => return raised,
+	};
+	if args.len() > 1 {
+		return return_null_with_error(format!(
+			"iter_modules() takes at most 1 argument ({} given)",
+			args.len()
+		));
+	}
+	let prefix = if let Some(&prefix) = args.first() {
+		match unsafe { exact_str_text(crate::tag::untag_arg(prefix)) } {
+			Some(text) => text,
+			None => return return_null_with_error("iter_modules() prefix must be str"),
+		}
+	} else {
+		String::new()
+	};
+	let entries = match iter_modules_for_path_entry(&finder.kind, &prefix) {
+		Ok(entries) => entries,
+		Err(message) => return return_null_with_error(message),
+	};
+	list_from_module_iter_entries(&entries)
+}
+
+unsafe extern "C" fn path_entry_finder_invalidate_method(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let (_finder, args) = match unsafe { finder_receiver_and_args(argv, argc, "invalidate_caches") } {
+		Ok(pair) => pair,
+		Err(raised) => return raised,
+	};
+	if !args.is_empty() {
+		return return_null_with_error(format!(
+			"invalidate_caches() takes no arguments ({} given)",
+			args.len()
+		));
+	}
+	unsafe { pon_none() }
+}
+
+pub(crate) unsafe extern "C" fn source_path_hook_entry(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	if argc != 1 || argv.is_null() {
+		return return_null_with_error(format!(
+			"path_hook() takes exactly one argument ({argc} given)"
+		));
+	}
+	let path_object = crate::tag::untag_arg(unsafe { *argv });
+	let Some(path_text) = (unsafe { exact_str_text(path_object) }) else {
+		return raise_import_error_text("path hook argument must be str");
+	};
+	match path_entry_kind_for_path(Path::new(&path_text)) {
+		Some(kind) => alloc_path_entry_finder(kind),
+		None => raise_import_error_text(&format!("no pon path-entry finder for {path_text:?}")),
+	}
+}
+
 fn find_source_module(name: &str) -> Option<SourceSpec> {
+	find_source_module_with_mode(name, SearchMode::FullName)
+}
+
+fn find_source_module_with_mode(name: &str, mode: SearchMode) -> Option<SourceSpec> {
 	if name.is_empty() {
 		return None;
 	}
-	let mut relative = PathBuf::new();
-	for part in name.split('.') {
-		relative.push(part);
-	}
 	let mut namespace_portions = Vec::new();
 	for root in search_roots() {
-		let package_dir = root.join(&relative);
-		let package_init = package_dir.join("__init__.py");
-		if package_init.is_file() {
-			return Some(SourceSpec::module(package_init, true));
+		let Some(kind) = path_entry_kind_cached(&root) else {
+			continue;
+		};
+		let Some(spec) = kind.find_source(name, mode) else {
+			continue;
+		};
+		if spec.location.is_some() {
+			return Some(spec);
 		}
-		let mut module_path = root.join(&relative);
-		module_path.set_extension("py");
-		if module_path.is_file() {
-			return Some(SourceSpec::module(module_path, false));
-		}
-		if package_dir.is_dir() {
-			namespace_portions.push(package_dir);
+		if let Some(locations) = spec.search_locations {
+			append_unique_roots(&mut namespace_portions, locations);
 		}
 	}
 	(!namespace_portions.is_empty()).then(|| SourceSpec::namespace(namespace_portions))
+}
+
+fn find_source_module_on_path(name: &str, path_entries: &[*mut PyObject]) -> Option<SourceSpec> {
+	let mut namespace_portions = Vec::new();
+	for &entry in path_entries {
+		let Some(text) = (unsafe { exact_str_text(crate::tag::untag_arg(entry)) }) else {
+			continue;
+		};
+		let Some(kind) = path_entry_kind_cached(Path::new(&text)) else {
+			continue;
+		};
+		let Some(spec) = kind.find_source(name, SearchMode::TailOnly) else {
+			continue;
+		};
+		if spec.location.is_some() {
+			return Some(spec);
+		}
+		if let Some(locations) = spec.search_locations {
+			append_unique_roots(&mut namespace_portions, locations);
+		}
+	}
+	(!namespace_portions.is_empty()).then(|| SourceSpec::namespace(namespace_portions))
+}
+
+fn find_directory_source(root: &Path, relative: &Path) -> Option<SourceSpec> {
+	let package_dir = root.join(relative);
+	let package_init = package_dir.join("__init__.py");
+	if package_init.is_file() {
+		return Some(SourceSpec::module(SourceLocation::File(package_init), true));
+	}
+	let mut module_path = root.join(relative);
+	module_path.set_extension("py");
+	if module_path.is_file() {
+		return Some(SourceSpec::module(SourceLocation::File(module_path), false));
+	}
+	if package_dir.is_dir() {
+		return Some(SourceSpec::namespace(vec![package_dir]));
+	}
+	None
+}
+
+fn find_zip_source(archive: &Path, prefix: &str, relative: &str) -> Option<SourceSpec> {
+	let base = zip_member_base(prefix, relative);
+	let mut zip = open_zip_archive(archive).ok()?;
+	let package_init = format!("{base}/__init__.py");
+	if zip.by_name(&package_init).is_ok() {
+		return Some(SourceSpec::module(
+			SourceLocation::Zip { archive: archive.to_path_buf(), member: package_init },
+			true,
+		));
+	}
+	let module_member = format!("{base}.py");
+	if zip.by_name(&module_member).is_ok() {
+		return Some(SourceSpec::module(
+			SourceLocation::Zip { archive: archive.to_path_buf(), member: module_member },
+			false,
+		));
+	}
+	let namespace_prefix = format!("{}/", base.trim_end_matches('/'));
+	if zip.file_names().any(|name| name.starts_with(&namespace_prefix)) {
+		return Some(SourceSpec::namespace(vec![archive.join(base)]));
+	}
+	None
+}
+
+fn zip_member_base(prefix: &str, relative: &str) -> String {
+	if prefix.is_empty() {
+		relative.to_owned()
+	} else {
+		format!("{prefix}{relative}")
+	}
+}
+
+fn open_zip_archive(path: &Path) -> Result<zip::ZipArchive<fs::File>, String> {
+	let file = fs::File::open(path)
+		.map_err(|error| format!("failed to open zip archive '{}': {error}", path.display()))?;
+	zip::ZipArchive::new(file)
+		.map_err(|error| format!("failed to read zip archive '{}': {error}", path.display()))
+}
+
+fn read_zip_member(archive: &Path, member: &str) -> Result<Vec<u8>, String> {
+	let mut zip = open_zip_archive(archive)?;
+	let mut file = zip.by_name(member).map_err(|error| {
+		format!(
+			"failed to read zip member '{}:{}': {error}",
+			archive.display(),
+			member
+		)
+	})?;
+	let mut bytes = Vec::with_capacity(file.size().try_into().unwrap_or(0));
+	file.read_to_end(&mut bytes).map_err(|error| {
+		format!(
+			"failed to read zip member '{}:{}': {error}",
+			archive.display(),
+			member
+		)
+	})?;
+	Ok(bytes)
+}
+
+fn path_entry_kind_for_path(path: &Path) -> Option<PathEntryKind> {
+	if path.is_dir() {
+		return Some(PathEntryKind::Directory(path.to_path_buf()));
+	}
+	let (archive, prefix) = split_zip_path(path)?;
+	Some(PathEntryKind::Zip { archive, prefix })
+}
+
+fn split_zip_path(path: &Path) -> Option<(PathBuf, String)> {
+	let mut current = path.to_path_buf();
+	let mut prefix_parts = Vec::new();
+	loop {
+		if current.is_file() && open_zip_archive(&current).is_ok() {
+			prefix_parts.reverse();
+			let mut prefix = prefix_parts.join("/");
+			if !prefix.is_empty() {
+				prefix.push('/');
+			}
+			return Some((current, prefix));
+		}
+		let name = current.file_name()?.to_string_lossy().into_owned();
+		prefix_parts.push(name);
+		let parent = current.parent()?;
+		if parent == current {
+			return None;
+		}
+		current = parent.to_path_buf();
+	}
+}
+
+enum ImporterCacheLookup {
+	Hit(Option<PathEntryKind>),
+	Miss,
+}
+
+fn path_entry_kind_cached(path: &Path) -> Option<PathEntryKind> {
+	let path_text = path.to_string_lossy();
+	match path_importer_cache_lookup(&path_text) {
+		ImporterCacheLookup::Hit(kind) => return kind,
+		ImporterCacheLookup::Miss => {},
+	}
+	let kind = path_entry_kind_for_path(path);
+	let value = kind
+		.clone()
+		.map_or_else(|| unsafe { pon_none() }, alloc_path_entry_finder);
+	path_importer_cache_insert(&path_text, value);
+	kind
+}
+
+fn path_importer_cache_dict() -> Option<*mut PyObject> {
+	module_attr(intern("sys"), intern("path_importer_cache"))
+}
+
+fn path_importer_cache_lookup(path: &str) -> ImporterCacheLookup {
+	let Some(dict) = path_importer_cache_dict() else {
+		return ImporterCacheLookup::Miss;
+	};
+	let Ok(key) = runtime_string(path) else {
+		return ImporterCacheLookup::Miss;
+	};
+	let _guard = crate::sync::begin_critical_section(dict);
+	let value = match unsafe { crate::types::dict::dict_get(dict, key) } {
+		Ok(Some(value)) => value,
+		Ok(None) => return ImporterCacheLookup::Miss,
+		Err(_) => return ImporterCacheLookup::Miss,
+	};
+	if is_none_binding(value) {
+		return ImporterCacheLookup::Hit(None);
+	}
+	if let Some(finder) = unsafe { as_path_entry_finder(value) } {
+		return ImporterCacheLookup::Hit(Some(finder.kind.clone()));
+	}
+	ImporterCacheLookup::Hit(None)
+}
+
+fn path_importer_cache_insert(path: &str, value: *mut PyObject) {
+	let Some(dict) = path_importer_cache_dict() else {
+		return;
+	};
+	let Ok(key) = runtime_string(path) else {
+		return;
+	};
+	let _guard = crate::sync::begin_critical_section(dict);
+	let _ = unsafe { crate::types::dict::dict_insert(dict, key, value) };
+}
+
+fn importlib_spec_from_source_spec(
+	name: &str,
+	name_object: *mut PyObject,
+	spec: &SourceSpec,
+) -> *mut PyObject {
+	let loader = match crate::native::imp::make_source_importer_module() {
+		Ok(loader) => loader,
+		Err(message) => return return_null_with_error(message),
+	};
+	let Some(spec_from_loader) =
+		module_attr(intern("importlib._bootstrap"), intern("spec_from_loader"))
+	else {
+		return unsafe { pon_none() };
+	};
+	let mut call_args = [name_object, loader];
+	let spec_object = crate::tag::untag_arg(unsafe {
+		crate::abi::pon_call(spec_from_loader, call_args.as_mut_ptr(), call_args.len())
+	});
+	if spec_object.is_null() {
+		return ptr::null_mut();
+	}
+	if let Some(search_locations) = spec.search_locations.as_deref() {
+		let locations = unsafe {
+			crate::abi::pon_get_attr(
+				spec_object,
+				intern("submodule_search_locations"),
+				ptr::null_mut(),
+			)
+		};
+		if locations.is_null() {
+			return ptr::null_mut();
+		}
+		let locations = crate::tag::untag_arg(locations);
+		for path in search_locations {
+			let path_object = match runtime_string(&path.to_string_lossy()) {
+				Ok(path_object) => path_object,
+				Err(message) => return return_null_with_error(message),
+			};
+			if let Err(message) = crate::abi::seq::list_append_raw(locations, path_object) {
+				return return_null_with_error(message);
+			}
+		}
+	}
+	let _ = name;
+	spec_object
+}
+
+pub(crate) fn source_importer_find_spec(
+	name: &str,
+	name_object: *mut PyObject,
+	path: Option<*mut PyObject>,
+) -> *mut PyObject {
+	let spec = match path
+		.map(crate::tag::untag_arg)
+		.filter(|&path| !is_none_binding(path))
+		.and_then(sequence_items)
+	{
+		Some(path_entries) => find_source_module_on_path(name, &path_entries),
+		None => find_source_module(name),
+	};
+	match spec {
+		Some(spec) => importlib_spec_from_source_spec(name, name_object, &spec),
+		None => unsafe { pon_none() },
+	}
+}
+
+struct ModuleIterEntry {
+	name:       String,
+	is_package: bool,
+}
+
+fn iter_modules_for_path_entry(
+	kind: &PathEntryKind,
+	prefix: &str,
+) -> Result<Vec<ModuleIterEntry>, String> {
+	match kind {
+		PathEntryKind::Directory(root) => iter_directory_modules(root, prefix),
+		PathEntryKind::Zip { archive, prefix: archive_prefix } => {
+			iter_zip_modules(archive, archive_prefix, prefix)
+		},
+	}
+}
+
+fn iter_directory_modules(root: &Path, prefix: &str) -> Result<Vec<ModuleIterEntry>, String> {
+	let entries = match fs::read_dir(root) {
+		Ok(entries) => entries,
+		Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+		Err(error) => {
+			return Err(format!("failed to list import path '{}': {error}", root.display()));
+		},
+	};
+	let mut names = Vec::new();
+	for entry in entries {
+		let entry = entry.map_err(|error| {
+			format!("failed to list import path '{}': {error}", root.display())
+		})?;
+		names.push(entry.file_name().to_string_lossy().into_owned());
+	}
+	names.sort();
+	let mut yielded = HashSet::new();
+	let mut out = Vec::new();
+	for filename in names {
+		let path = root.join(&filename);
+		if path.is_dir() && !filename.contains('.') && path.join("__init__.py").is_file() {
+			if yielded.insert(filename.clone()) {
+				out.push(ModuleIterEntry {
+					name:       format!("{prefix}{filename}"),
+					is_package: true,
+				});
+			}
+			continue;
+		}
+		let Some(stem) = filename.strip_suffix(".py") else {
+			continue;
+		};
+		if stem == "__init__" || stem.contains('.') {
+			continue;
+		}
+		if yielded.insert(stem.to_owned()) {
+			out.push(ModuleIterEntry {
+				name:       format!("{prefix}{stem}"),
+				is_package: false,
+			});
+		}
+	}
+	Ok(out)
+}
+
+fn iter_zip_modules(
+	archive: &Path,
+	archive_prefix: &str,
+	prefix: &str,
+) -> Result<Vec<ModuleIterEntry>, String> {
+	let zip = open_zip_archive(archive)?;
+	let mut names = zip.file_names().map(str::to_owned).collect::<Vec<_>>();
+	names.sort();
+	let mut yielded = HashSet::new();
+	let mut out = Vec::new();
+	for name in names {
+		let Some(rest) = name.strip_prefix(archive_prefix) else {
+			continue;
+		};
+		if rest.is_empty() {
+			continue;
+		}
+		let parts = rest.split('/').collect::<Vec<_>>();
+		if parts.len() == 2 && parts[1] == "__init__.py" && !parts[0].contains('.') {
+			if yielded.insert(parts[0].to_owned()) {
+				out.push(ModuleIterEntry {
+					name:       format!("{prefix}{}", parts[0]),
+					is_package: true,
+				});
+			}
+			continue;
+		}
+		if parts.len() != 1 {
+			continue;
+		}
+		let Some(stem) = parts[0].strip_suffix(".py") else {
+			continue;
+		};
+		if stem == "__init__" || stem.contains('.') {
+			continue;
+		}
+		if yielded.insert(stem.to_owned()) {
+			out.push(ModuleIterEntry {
+				name:       format!("{prefix}{stem}"),
+				is_package: false,
+			});
+		}
+	}
+	Ok(out)
+}
+
+fn list_from_module_iter_entries(entries: &[ModuleIterEntry]) -> *mut PyObject {
+	let mut objects = Vec::with_capacity(entries.len());
+	for entry in entries {
+		let name = match runtime_string(&entry.name) {
+			Ok(name) => name,
+			Err(message) => return return_null_with_error(message),
+		};
+		let is_package = unsafe { crate::abi::number::pon_const_bool(c_int::from(entry.is_package)) };
+		let mut tuple_items = [name, is_package];
+		let tuple = unsafe {
+			crate::abi::seq::pon_build_tuple(tuple_items.as_mut_ptr(), tuple_items.len())
+		};
+		if tuple.is_null() {
+			return ptr::null_mut();
+		}
+		objects.push(tuple);
+	}
+	unsafe {
+		crate::abi::seq::pon_build_list(
+			if objects.is_empty() {
+				ptr::null_mut()
+			} else {
+				objects.as_mut_ptr()
+			},
+			objects.len(),
+		)
+	}
 }
 
 fn find_extension_module(name: &str) -> Option<PathBuf> {
@@ -1103,6 +1810,15 @@ pub const STDLIB_PATH_ENV_VAR: &str = "PON_STDLIB_PATH";
 const VENDORED_STDLIB_SUFFIX: &str = "pon-conformance/vendor/cpython-3.14/Lib";
 
 fn search_roots() -> Vec<PathBuf> {
+	let roots = compute_search_roots();
+	if ensure_pth_import_lines_processed(&roots) {
+		compute_search_roots()
+	} else {
+		roots
+	}
+}
+
+fn compute_search_roots() -> Vec<PathBuf> {
 	let defaults = default_search_roots();
 	let mut roots = Vec::with_capacity(defaults.len());
 	append_unique_roots(&mut roots, live_sys_path_extra_roots(&defaults));
@@ -1117,16 +1833,18 @@ fn default_search_roots() -> Vec<PathBuf> {
 	// PYTHONPATH for generator scripts) still resolve their packages.
 	for var in ["PONPATH", "PON_IMPORT_PATH", "PYTHONPATH"] {
 		if let Ok(extra) = env::var(var) {
-			append_unique_roots(&mut roots, env::split_paths(&extra));
+			for root in env::split_paths(&extra) {
+				append_import_root(&mut roots, root);
+			}
 		}
 	}
 	if let Ok(cwd) = env::current_dir() {
-		append_unique_root(&mut roots, cwd.clone());
-		append_unique_root(&mut roots, cwd.join(".pon").join("packages").join("site-packages"));
-		append_unique_root(&mut roots, cwd.join("pon-conformance").join("corpus"));
+		append_import_root(&mut roots, cwd.clone());
+		append_import_root(&mut roots, cwd.join(".pon").join("packages").join("site-packages"));
+		append_import_root(&mut roots, cwd.join("pon-conformance").join("corpus"));
 	}
 	if let Some(stdlib) = vendored_stdlib_root() {
-		append_unique_root(&mut roots, stdlib);
+		append_import_root(&mut roots, stdlib);
 	}
 	roots
 }
@@ -1163,7 +1881,7 @@ fn live_sys_path_extra_roots(default_roots: &[PathBuf]) -> Vec<PathBuf> {
 		{
 			continue;
 		}
-		append_unique_root(&mut roots, root);
+		append_import_root(&mut roots, root);
 	}
 	roots
 }
@@ -1178,6 +1896,130 @@ fn append_unique_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
 	if !roots.contains(&root) {
 		roots.push(root);
 	}
+}
+
+fn append_import_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
+	append_unique_root(roots, root.clone());
+	if is_site_packages_root(&root) {
+		append_pth_plain_paths(roots, &root);
+	}
+}
+
+fn is_site_packages_root(path: &Path) -> bool {
+	path.file_name().is_some_and(|name| name == "site-packages")
+}
+
+fn pth_files(site_dir: &Path) -> Vec<PathBuf> {
+	let Ok(entries) = fs::read_dir(site_dir) else {
+		return Vec::new();
+	};
+	let mut files = entries
+		.filter_map(Result::ok)
+		.map(|entry| entry.path())
+		.filter(|path| path.extension().is_some_and(|ext| ext == "pth"))
+		.collect::<Vec<_>>();
+	files.sort();
+	files
+}
+
+fn append_pth_plain_paths(roots: &mut Vec<PathBuf>, site_dir: &Path) {
+	for file in pth_files(site_dir) {
+		let Ok(text) = fs::read_to_string(&file) else {
+			continue;
+		};
+		for raw_line in text.lines() {
+			let line = raw_line.trim_end_matches('\r');
+			if line.is_empty()
+				|| line.starts_with('#')
+				|| line.starts_with("import ")
+				|| line.starts_with("import\t")
+			{
+				continue;
+			}
+			let candidate = site_dir.join(line);
+			if candidate.exists() {
+				append_unique_root(roots, candidate);
+			}
+		}
+	}
+}
+
+static PTH_IMPORT_LINES_DONE: LazyLock<Mutex<HashSet<PathBuf>>> =
+	LazyLock::new(|| Mutex::new(HashSet::new()));
+static PTH_IMPORT_LINES_RUNNING: AtomicBool = AtomicBool::new(false);
+
+fn ensure_pth_import_lines_processed(roots: &[PathBuf]) -> bool {
+	if PTH_IMPORT_LINES_RUNNING.swap(true, Ordering::AcqRel) {
+		return false;
+	}
+	struct RunningGuard;
+	impl Drop for RunningGuard {
+		fn drop(&mut self) {
+			PTH_IMPORT_LINES_RUNNING.store(false, Ordering::Release);
+		}
+	}
+	let _guard = RunningGuard;
+	if module_attr(intern("sys"), intern("path")).is_none() {
+		return false;
+	}
+	let mut executed_any = false;
+	for root in roots {
+		if !is_site_packages_root(root) {
+			continue;
+		}
+		let key = fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+		{
+			let mut done = PTH_IMPORT_LINES_DONE
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner());
+			if !done.insert(key) {
+				continue;
+			}
+		}
+		executed_any |= execute_pth_import_lines(root);
+	}
+	executed_any
+}
+
+fn execute_pth_import_lines(site_dir: &Path) -> bool {
+	let mut executed_any = false;
+	for file in pth_files(site_dir) {
+		let Ok(text) = fs::read_to_string(&file) else {
+			continue;
+		};
+		for raw_line in text.lines() {
+			let line = raw_line.trim_end_matches('\r');
+			if !(line.starts_with("import ") || line.starts_with("import\t")) {
+				continue;
+			}
+			executed_any = true;
+			let source = format!("{line}\n");
+			let source_object = match runtime_string(&source) {
+				Ok(object) => object,
+				Err(_) => continue,
+			};
+			let globals = unsafe { crate::abi::map::pon_build_map(ptr::null_mut(), 0) };
+			if globals.is_null() {
+				continue;
+			}
+			let mut argv = [source_object, globals, globals];
+			let result = unsafe { crate::dynexec::builtin_exec(argv.as_mut_ptr(), argv.len()) };
+			if result.is_null() && pon_err_occurred() {
+				pon_err_clear();
+			}
+		}
+	}
+	executed_any
+}
+
+/// Processes executable `.pth` lines for already-discovered site-packages
+/// roots. The CLI calls this once after runtime init so `import ...` lines have
+/// CPython's startup-time side effects before user code begins; the import
+/// resolver also calls the same guarded path lazily for embeddings that do not
+/// use the CLI boot helper.
+pub fn process_site_pth_files() {
+	let roots = compute_search_roots();
+	let _ = ensure_pth_import_lines_processed(&roots);
 }
 
 /// Resolves the vendored-stdlib root, always LAST in import resolution order
@@ -1273,8 +2115,10 @@ pub(crate) fn source_module_search_locations(name: &str) -> Option<Vec<PathBuf>>
 /// Filesystem source file backing `name` (`__init__.py` for packages):
 /// CPython `SourceFileLoader.path`, consumed by
 /// `_pon_source_importer.get_resource_reader` to root an
-/// `importlib.readers.FileReader`.  `None` when nothing on disk backs the
-/// module (native, extension, embedded AoT, namespace portions).
+/// `importlib.readers.FileReader`.  Zip members are deliberately excluded:
+/// pon's zip importer is source-only and has no filesystem directory to hand
+/// to `FileReader`. `None` also covers native, extension, embedded AoT, and
+/// namespace portions.
 pub(crate) fn source_module_file_path(name: &str) -> Option<PathBuf> {
 	if crate::native::is_native_module(name)
 		|| find_extension_module(name).is_some()
@@ -1283,7 +2127,7 @@ pub(crate) fn source_module_file_path(name: &str) -> Option<PathBuf> {
 	{
 		return None;
 	}
-	find_source_module(name).and_then(|spec| spec.path)
+	find_source_module(name).and_then(|spec| spec.location.and_then(|location| location.filesystem_path()))
 }
 
 /// Imports `name` and returns exactly that module — never the root-package
@@ -1322,7 +2166,7 @@ fn load_curated_assignment_module(
 				"unsupported assignment target '{lhs}' in pure-Python module '{name}'"
 			));
 		}
-		let value = parse_curated_literal(rhs.trim())?;
+		let value = parse_curated_literal(name, is_package, rhs.trim())?;
 		attrs.push((intern(lhs), value));
 	}
 	create_module(name, is_package, attrs)
@@ -1589,8 +2433,9 @@ fn runtime_path_list(paths: &[PathBuf]) -> Result<*mut PyObject, String> {
 
 fn source_module_attrs(spec: &SourceSpec) -> Result<Vec<(u32, *mut PyObject)>, String> {
 	let mut attrs = Vec::with_capacity(2);
-	if let Some(path) = spec.path.as_ref() {
-		let file_path = std::path::absolute(path).unwrap_or_else(|_| path.clone());
+	if let Some(location) = spec.location.as_ref() {
+		let path = location.display_path();
+		let file_path = location.filesystem_path().and_then(|path| std::path::absolute(&path).ok()).unwrap_or(path);
 		attrs.push((intern("__file__"), runtime_string(&file_path.to_string_lossy())?));
 	} else {
 		attrs.push((intern("__file__"), unsafe { pon_none() }));
@@ -1612,7 +2457,7 @@ fn finalize_source_module_identity_attrs(
 	module: *mut PyObject,
 	spec: &SourceSpec,
 ) -> Result<(), String> {
-	if spec.path.is_none() {
+	if spec.location.is_none() {
 		return Ok(());
 	}
 	let Some(module_ptr) = as_module(module) else {
@@ -2838,13 +3683,13 @@ mod tests {
 	}
 }
 
-fn parse_curated_literal(text: &str) -> Result<*mut PyObject, String> {
+fn parse_curated_literal(
+	module_name: &str,
+	is_package: bool,
+	text: &str,
+) -> Result<*mut PyObject, String> {
 	if let Some(value) = parse_quoted_literal(text) {
-		// SAFETY: `pon_const_str` returns NULL with a thread-state error on failure.
-		let object = unsafe { pon_const_str(value.as_ptr(), value.len()) };
-		return (!object.is_null())
-			.then_some(object)
-			.ok_or_else(|| "failed to allocate string literal".to_owned());
+		return runtime_string(value);
 	}
 	if let Ok(value) = text.parse::<i64>() {
 		// SAFETY: `pon_const_int` returns NULL with a thread-state error on failure.
@@ -2859,6 +3704,13 @@ fn parse_curated_literal(text: &str) -> Result<*mut PyObject, String> {
 		return (!object.is_null())
 			.then_some(object)
 			.ok_or_else(|| "failed to load None".to_owned());
+	}
+	if text == "__name__" {
+		return runtime_string(module_name);
+	}
+	if text == "__package__" {
+		let package = module_package_name(module_name, is_package);
+		return runtime_string(&package);
 	}
 	Err(format!("unsupported curated module literal '{text}'"))
 }

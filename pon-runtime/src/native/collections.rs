@@ -62,6 +62,7 @@ struct PyDequeIter {
 
 static DEQUE_SEQUENCE: PySequenceMethods = PySequenceMethods {
 	sq_length: Some(deque_len_slot),
+	sq_item: Some(deque_item_slot),
 	sq_contains: Some(deque_contains_slot),
 	..PySequenceMethods::EMPTY
 };
@@ -392,6 +393,18 @@ unsafe extern "C" fn deque_len_slot(object: *mut PyObject) -> isize {
 	}
 }
 
+unsafe extern "C" fn deque_item_slot(object: *mut PyObject, index: isize) -> *mut PyObject {
+	let Some(deque) = (unsafe { as_deque(object) }) else {
+		return fail("deque receiver is invalid");
+	};
+	let len = deque.entries.len() as isize;
+	let index = if index < 0 { index + len } else { index };
+	if index < 0 || index >= len {
+		return raise_index_error("deque index out of range");
+	}
+	deque.entries[index as usize]
+}
+
 unsafe extern "C" fn deque_iter(object: *mut PyObject) -> *mut PyObject {
 	if unsafe { as_deque(object) }.is_none() {
 		return fail("deque receiver is invalid");
@@ -604,6 +617,7 @@ unsafe extern "C" fn deque_count_method(argv: *mut *mut PyObject, argc: usize) -
 	let &[needle] = args else {
 		return raise_type_error("count() takes exactly one argument");
 	};
+	let needle = untag(needle);
 	let mut count = 0i64;
 	for &entry in &deque.entries {
 		match value_equal(entry, needle) {
@@ -624,6 +638,7 @@ unsafe extern "C" fn deque_remove_method(argv: *mut *mut PyObject, argc: usize) 
 	let &[needle] = args else {
 		return raise_type_error("remove() takes exactly one argument");
 	};
+	let needle = untag(needle);
 	for index in 0..deque.entries.len() {
 		match value_equal(deque.entries[index], needle) {
 			Ok(true) => {
@@ -1007,17 +1022,5 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 			(*DEQUE_REVERSE_ITER_TYPE as *mut PyType).cast::<PyObject>(),
 		),
 	])?;
-	populate_python_collections_exports();
 	Ok(module)
-}
-
-fn populate_python_collections_exports() {
-	let collections_id = intern("collections");
-	if crate::import::module_attrs_snapshot(collections_id).is_some() {
-		return;
-	}
-	let module = unsafe { crate::import::pon_import_name(collections_id, ptr::null(), 0, 0) };
-	if module.is_null() {
-		pon_err_clear();
-	}
 }

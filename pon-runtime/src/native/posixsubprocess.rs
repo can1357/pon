@@ -4,6 +4,10 @@
 //! to one private entry point, `_posixsubprocess.fork_exec`.  Pon serves the
 //! same ABI and uses `posix_spawn` rather than a raw `fork` so the child never
 //! runs Rust or Python code in a forked multi-threaded runtime.
+//! Product boundary: Pon only supports the `posix_spawn`-safe subset.  Options
+//! that require fork-only child mutation (`uid`, `gid`, `extra_groups`,
+//! `umask`) or running Python in the child (`preexec_fn`) raise a typed
+//! `NotImplementedError` before any spawn attempt.
 
 use std::{
 	ffi::{CStr, CString},
@@ -212,24 +216,20 @@ impl ForkExecSpec {
 		}
 		let pgid_to_set = pgid_to_set as libc::pid_t;
 		if !is_none(args[17]) {
-			return Err(unsupported("_posixsubprocess.fork_exec does not implement gid changes"));
+			return Err(product_boundary("gid changes"));
 		}
 		if !is_none(args[18]) {
-			return Err(unsupported(
-				"_posixsubprocess.fork_exec does not implement extra_groups/setgroups",
-			));
+			return Err(product_boundary("extra_groups/setgroups"));
 		}
 		if !is_none(args[19]) {
-			return Err(unsupported("_posixsubprocess.fork_exec does not implement uid changes"));
+			return Err(product_boundary("uid changes"));
 		}
 		let child_umask = int_arg(args[20], "child_umask")?;
 		if child_umask >= 0 {
-			return Err(unsupported(
-				"_posixsubprocess.fork_exec does not implement child umask changes",
-			));
+			return Err(product_boundary("child umask changes"));
 		}
 		if !is_none(args[21]) {
-			return Err(unsupported("_posixsubprocess.fork_exec does not implement preexec_fn"));
+			return Err(product_boundary("preexec_fn"));
 		}
 
 		let process_args = if is_none(args[0]) {
@@ -711,6 +711,12 @@ unsafe fn call_args<'a>(argv: *mut *mut PyObject, argc: usize) -> &'a [*mut PyOb
 		// SAFETY: The caller passed `argc` live argument slots.
 		unsafe { std::slice::from_raw_parts(argv, argc) }
 	}
+}
+
+fn product_boundary(feature: &str) -> *mut PyObject {
+	unsupported(&format!(
+		"_posixsubprocess.fork_exec product boundary: {feature} requires fork-only child-side behavior; pon uses posix_spawn and does not run child mutation code after fork"
+	))
 }
 
 fn unsupported(message: &str) -> *mut PyObject {

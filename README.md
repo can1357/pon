@@ -85,13 +85,13 @@ The correctness contract is differential: a corpus module passes only if `pon` p
 | `cpython-aot-subset` | same corpus compiled AoT and executed as native binaries | 206 modules ([`aot-parity-floor.json`](aot-parity-floor.json)) |
 | `cpython-full` | CPython's own test suite (`Lib/test`), run under pon | being brought up ([`conformance-full-floor.json`](conformance-full-floor.json)) |
 | `fuzz` | differential fuzzing vs CPython; must stay at zero divergences | — |
-| `ft-stress` | free-threading stress (`--features free-threading`, experimental) | — |
+| `ft-stress` | no-GIL/threading stress in the default runtime | — |
 
 The standing gate is `scripts/gate.sh`; only its output counts as a gate claim:
 
 ```sh
-bash scripts/gate.sh fast    # build + workspace tests + conformance floor + AoT floor
-bash scripts/gate.sh full    # + free-threading tests, ft-stress, bench, tier0-only diff, fuzz
+bash scripts/gate.sh fast    # build + workspace tests + conformance floor + AoT floor + ft-stress
+bash scripts/gate.sh full    # + cpython-full, bench, tier0-only diff, fuzz, package-manager E2E
 
 # Individual meters
 cargo run -q -p pon-conformance -- --suite cpython --check-floor
@@ -138,6 +138,6 @@ What is explicitly **not** done yet — this is the active roadmap, in order:
 2. **Stdlib build-out**: `_io`/`os`, `math`/`struct`/`random`, `collections`/`itertools`/`json`, `datetime`, `importlib` parity — each lands as a native module plus a differential corpus module.
 3. **Performance ratchets**: tagged small-int flip, TLAB allocation, dict fast paths, float unboxing, call/attribute specialization, generator tiering — toward the ≥5× CPython geomean target (numerics ≥20×).
 4. **AoT parity growth** toward the full corpus, plus single-binary product polish.
-5. **Free-threading** is feature-gated (`--features free-threading`) and experimental.
+5. **No-GIL/free-threaded runtime hardening**: thread/GC/signal stress is now on the default runtime path, with remaining gaps tracked by the ratcheted suites.
 
 Known gaps at the language level are burned down through the ratcheted floors above — the committed floor files, not this README, are the authoritative compatibility baseline.

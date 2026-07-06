@@ -25,14 +25,14 @@ run build   cargo build --workspace -q
 run test    cargo test --workspace -q
 run floor   cargo run -q -p pon-conformance -- --suite cpython --check-floor
 run aotparity cargo run -q -p pon-conformance -- --mode aot --suite aot-parity --check-floor
+run ftstress cargo run -q -p pon-conformance -- --suite ft-stress
 
 if [ "$MODE" = "full" ]; then
   run fullsuite cargo run -q -p pon-conformance -- --suite cpython-full --check-floor
-  run ft       cargo test --workspace --features free-threading -q
-  run ftstress cargo run -q -p pon-conformance --features free-threading -- --suite ft-stress
   run bench    cargo run -q -p pon-conformance -- --bench
   run tier0diff env PON_TIER0_ONLY=1 cargo run -q -p pon-conformance -- --suite cpython --check-floor
   run fuzz     cargo run -q -p pon-conformance -- --suite fuzz --seed 42 --count 200 --jobs 8
+  run pkge2e   env PON_TEST_ALLOW_CATALOG=1 PON_TEST_ALLOW_FIXTURE_BRIDGE=1 cargo test -q -p pon --test cli_surface package_manager_catalog_e2e -- --exact
 fi
 
 echo "GATE-SUMMARY: $([ $FAIL -eq 0 ] && echo ALL-GREEN || echo RED)"
