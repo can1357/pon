@@ -5104,13 +5104,15 @@ impl Drop for CurrentFunctionGuard {
 	}
 }
 
-/// Save/restore bracket for `PonThreadState::handled_exc` around one
-/// compiled-code call.  The callee inherits the caller's handled exception
-/// (CPython: `sys.exception()` is thread-wide while a handler runs); on
-/// return the caller's view is restored, so a handler parked inside the
-/// callee never leaks into the caller's frame.  The save rides a
-/// thread-state stack (not a guard local) to stay visible to the precise GC
-/// root scan.
+/// Save/restore bracket for `PonThreadState::handled_exc` and
+/// `current_exc` around one compiled-code call.  The callee inherits the
+/// caller's handled exception (CPython: `sys.exception()` is thread-wide
+/// while a handler runs); on return the caller's view is restored, so a
+/// handler parked inside the callee never leaks into the caller's frame.
+/// The pending exception (`current_exc`) is likewise saved and restored so
+/// a `finally` body that calls a function does not lose the diagnostic the
+/// `try` body established.  Saves ride a thread-state stack (not a guard
+/// local) to stay visible to the precise GC root scan.
 pub(crate) struct HandledExcGuard;
 
 impl HandledExcGuard {
@@ -5432,7 +5434,7 @@ unsafe fn call_slot_from_argv(
 	};
 	let result = unsafe { call(callee, args_object, ptr::null_mut()) };
 	if result.is_null() && !pon_err_occurred() {
-		return return_null_with_error("C extension call returned NULL without setting an exception");
+		return return_null_with_error("tp_call slot returned NULL without setting an exception");
 	}
 	result
 }

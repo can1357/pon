@@ -1489,6 +1489,14 @@ unsafe fn coerce_index_bigint(object: *mut PyObject) -> Result<BigInt, ()> {
 	if let Some(slot) = slot {
 		let result = crate::tag::untag_arg(unsafe { slot(object) });
 		if result.is_null() {
+			if !crate::thread_state::pon_err_occurred() {
+				// Slot contract violation (CPython `_Py_CheckSlotResult`):
+				// keep the failure catchable instead of a bare NULL.
+				let _ = crate::abi::exc::raise_kind_error_text(
+					crate::types::exc::ExceptionKind::RuntimeError,
+					"__index__ returned NULL without setting an exception",
+				);
+			}
 			return Err(());
 		}
 		if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(result) } {

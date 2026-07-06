@@ -1045,6 +1045,12 @@ pub(crate) unsafe extern "C" fn capi_vectorcall_call(
 			// the function pointer was read from the callable's vectorcall slot.
 			let result = unsafe { vectorcall(callable, argv, positional_count, kwnames) };
 			super::unpin_object(result);
+			if result.is_null() && !crate::thread_state::pon_err_occurred() {
+				return abi::return_null_with_error(format!(
+					"vectorcall on '{}' returned NULL without setting an exception",
+					unsafe { crate::types::dict::type_name(callable) }.unwrap_or("object")
+				));
+			}
 			return normalize_object_arg(result);
 		}
 		if unsafe { vectorcall_fallback_would_recurse(callable) } {
