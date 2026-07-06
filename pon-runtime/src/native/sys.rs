@@ -1948,7 +1948,9 @@ pub(crate) fn gc_held_roots() -> Vec<*mut PyObject> {
 		.iter()
 		.map(|&address| address as *mut PyObject)
 		.collect();
-	let hooks = *ASYNCGEN_HOOKS.lock().unwrap_or_else(|poison| poison.into_inner());
+	let hooks = *ASYNCGEN_HOOKS
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner());
 	for address in [hooks.0, hooks.1] {
 		if address != 0 {
 			roots.push(address as *mut PyObject);
@@ -1960,17 +1962,30 @@ pub(crate) fn gc_held_roots() -> Vec<*mut PyObject> {
 /// `sys.get_asyncgen_hooks()`: the stored `(firstiter, finalizer)` pair.
 /// CPython returns a named tuple; the consumers (`asyncio`'s save/restore)
 /// only unpack positionally.
-unsafe extern "C" fn sys_get_asyncgen_hooks(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+unsafe extern "C" fn sys_get_asyncgen_hooks(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
 	let _ = argv;
 	if argc != 0 {
 		return raise_type_error(&format!("get_asyncgen_hooks() takes no arguments ({argc} given)"));
 	}
-	let hooks = *ASYNCGEN_HOOKS.lock().unwrap_or_else(|poison| poison.into_inner());
+	let hooks = *ASYNCGEN_HOOKS
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner());
 	// SAFETY: Singleton accessor.
 	let none = unsafe { crate::abi::pon_none() };
 	let mut pair = [
-		if hooks.0 == 0 { none } else { hooks.0 as *mut PyObject },
-		if hooks.1 == 0 { none } else { hooks.1 as *mut PyObject },
+		if hooks.0 == 0 {
+			none
+		} else {
+			hooks.0 as *mut PyObject
+		},
+		if hooks.1 == 0 {
+			none
+		} else {
+			hooks.1 as *mut PyObject
+		},
 	];
 	// SAFETY: Two live slots; the tuple allocator copies them.
 	unsafe { crate::abi::seq::pon_build_tuple(pair.as_mut_ptr(), 2) }
@@ -1978,7 +1993,10 @@ unsafe extern "C" fn sys_get_asyncgen_hooks(argv: *mut *mut PyObject, argc: usiz
 
 /// `sys.set_asyncgen_hooks(firstiter=None, finalizer=None)`: stores the
 /// hooks (the keyword binder delivers the canonical two-slot layout).
-unsafe extern "C" fn sys_set_asyncgen_hooks(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+unsafe extern "C" fn sys_set_asyncgen_hooks(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
 	// SAFETY: Live argument slots per the runtime calling convention.
 	let args = unsafe { call_args(argv, argc) };
 	if args.len() > 2 {
@@ -1989,12 +2007,22 @@ unsafe extern "C" fn sys_set_asyncgen_hooks(argv: *mut *mut PyObject, argc: usiz
 	}
 	// SAFETY: Singleton accessor.
 	let none = unsafe { crate::abi::pon_none() };
-	let mut hooks = ASYNCGEN_HOOKS.lock().unwrap_or_else(|poison| poison.into_inner());
+	let mut hooks = ASYNCGEN_HOOKS
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner());
 	if let Some(&firstiter) = args.first() {
-		hooks.0 = if crate::tag::untag_arg(firstiter) == none { 0 } else { firstiter as usize };
+		hooks.0 = if crate::tag::untag_arg(firstiter) == none {
+			0
+		} else {
+			firstiter as usize
+		};
 	}
 	if let Some(&finalizer) = args.get(1) {
-		hooks.1 = if crate::tag::untag_arg(finalizer) == none { 0 } else { finalizer as usize };
+		hooks.1 = if crate::tag::untag_arg(finalizer) == none {
+			0
+		} else {
+			finalizer as usize
+		};
 	}
 	// SAFETY: Singleton fetch follows the NULL-sentinel contract.
 	unsafe { crate::abi::pon_none() }
