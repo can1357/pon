@@ -1685,12 +1685,12 @@ fn span_expr(expr: &Expr) -> SourceSpan {
 
 mod assign;
 mod class;
-mod mangle;
 mod comprehension;
 mod control;
 mod func;
 mod generator;
 mod import;
+mod mangle;
 mod match_;
 mod strings;
 pub(crate) mod synth;

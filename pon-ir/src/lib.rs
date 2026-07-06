@@ -4,6 +4,7 @@ pub mod desugar;
 pub mod ir;
 pub mod lower;
 pub mod parse;
+pub mod print;
 pub mod types;
 
 pub use desugar::desugar_module;

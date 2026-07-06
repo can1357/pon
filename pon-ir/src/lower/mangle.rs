@@ -171,7 +171,8 @@ mod tests {
 
 	#[test]
 	fn class_body_assignment_and_method_attr_mangle() {
-		let module = mangle_source("class C:\n    __x = 1\n    def get(self):\n        return self.__x\n");
+		let module =
+			mangle_source("class C:\n    __x = 1\n    def get(self):\n        return self.__x\n");
 		let body = class_body(&module);
 		let Stmt::Assign(assign) = &body[0] else {
 			panic!("expected assign");
@@ -231,9 +232,7 @@ mod tests {
 
 	#[test]
 	fn nested_class_context_and_leading_underscore_strip() {
-		let module = mangle_source(
-			"class _Outer:\n    __a = 1\n    class Inner:\n        __b = 2\n",
-		);
+		let module = mangle_source("class _Outer:\n    __a = 1\n    class Inner:\n        __b = 2\n");
 		let outer_body = class_body(&module);
 		let Stmt::Assign(assign) = &outer_body[0] else {
 			panic!("expected assign");
