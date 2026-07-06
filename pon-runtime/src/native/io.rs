@@ -3471,6 +3471,80 @@ fn text_buffer(receiver: *mut PyObject) -> Result<*mut PyObject, *mut PyObject> 
 		Ok(buffer)
 	}
 }
+/// Decoded characters read from the underlying buffer but not yet returned.
+///
+/// `readline` pulls whole `\n`-terminated byte chunks from the binary
+/// buffer, and one chunk may hold several LOGICAL lines once `\r`/`\r\n`
+/// endings are recognized (`b"gamma\rdelta\n"` is two lines).  The unread
+/// tail waits in the `_pon_pending` instance attribute; `seek`/`detach`
+/// discard it.
+fn text_pending_text(receiver: *mut PyObject) -> String {
+	optional_object_attr(receiver, "_pon_pending")
+		.and_then(|object| unsafe { type_::unicode_text(object) }.map(str::to_owned))
+		.unwrap_or_default()
+}
+
+fn set_text_pending(receiver: *mut PyObject, pending: &str) -> Result<(), *mut PyObject> {
+	set_text_attr(receiver, "_pon_pending", pending)
+}
+
+/// Index just past the first complete line terminator of `text` under
+/// `mode`, or None when no complete line is buffered yet.  A trailing `\r`
+/// under `newline=""` is complete only `at_eof` (more input could turn it
+/// into `\r\n`).
+fn logical_line_end(mode: NewlineMode, text: &str, at_eof: bool) -> Option<usize> {
+	let bytes = text.as_bytes();
+	match mode {
+		NewlineMode::UniversalTranslate | NewlineMode::LineFeed => {
+			bytes.iter().position(|&byte| byte == b'\n').map(|i| i + 1)
+		},
+		NewlineMode::CarriageReturn => bytes.iter().position(|&byte| byte == b'\r').map(|i| i + 1),
+		NewlineMode::CarriageReturnLineFeed => {
+			bytes.windows(2).position(|pair| pair == b"\r\n").map(|i| i + 2)
+		},
+		NewlineMode::UniversalPreserve => {
+			for (index, &byte) in bytes.iter().enumerate() {
+				if byte == b'\n' {
+					return Some(index + 1);
+				}
+				if byte == b'\r' {
+					if index + 1 < bytes.len() {
+						return Some(if bytes[index + 1] == b'\n' { index + 2 } else { index + 1 });
+					}
+					return at_eof.then_some(index + 1);
+				}
+			}
+			None
+		},
+	}
+}
+
+/// One raw `\n`-terminated chunk from the binary buffer, translated and
+/// decoded for the text layer; `Ok(None)` is EOF.
+fn text_next_decoded_chunk(
+	receiver: *mut PyObject,
+	buffer: *mut PyObject,
+	mode: NewlineMode,
+) -> Result<Option<String>, *mut PyObject> {
+	let object = call_object_method(buffer, "readline", &mut [])?;
+	let bytes = bytes_like_bytes(object).map_err(raise_bio)?;
+	if bytes.is_empty() {
+		return Ok(None);
+	}
+	set_text_newlines(receiver, &bytes, mode);
+	let translated = if mode.translates_on_read() {
+		translate_universal_newlines(&bytes)
+	} else {
+		bytes
+	};
+	let encoding = text_encoding_attr(receiver);
+	let errors = text_errors_attr(receiver);
+	match super::codecs::decode_bytes_to_string(&translated, &encoding, &errors) {
+		Ok(text) => Ok(Some(text)),
+		Err(()) => Err(ptr::null_mut()),
+	}
+}
+
 
 unsafe extern "C" fn text_wrapper_read_method(
 	argv: *mut *mut PyObject,
@@ -3509,7 +3583,23 @@ unsafe extern "C" fn text_wrapper_read_method(
 		Err(error) => return error,
 	};
 	let mode = text_newline_mode_from_attr(args[0]);
-	text_bytes_to_object(args[0], bytes, mode)
+	// Decoded characters stashed by `readline` come first; they were already
+	// translated, so only the fresh bytes go through the newline pass.
+	let pending = text_pending_text(args[0]);
+	if pending.is_empty() {
+		return text_bytes_to_object(args[0], bytes, mode);
+	}
+	if let Err(error) = set_text_pending(args[0], "") {
+		return error;
+	}
+	let rest = text_bytes_to_object(args[0], bytes, mode);
+	if rest.is_null() {
+		return ptr::null_mut();
+	}
+	let Some(rest) = (unsafe { type_::unicode_text(rest) }) else {
+		return raise_type_error("decoded stream chunk must be str");
+	};
+	alloc_str(&format!("{pending}{rest}"))
 }
 
 unsafe extern "C" fn text_wrapper_readline_method(
@@ -3526,25 +3616,47 @@ unsafe extern "C" fn text_wrapper_readline_method(
 			args.len() - 1
 		));
 	}
-	let buffer = match text_buffer(args[0]) {
+	let size = match optional_size(args.get(1).copied(), "readline") {
+		Ok(size) => size,
+		Err(message) => return raise_type_error(&message),
+	};
+	let receiver = args[0];
+	let buffer = match text_buffer(receiver) {
 		Ok(buffer) => buffer,
 		Err(error) => return error,
 	};
-	let object = if let Some(&size) = args.get(1) {
-		let mut forwarded = [size];
-		call_object_method(buffer, "readline", &mut forwarded)
-	} else {
-		call_object_method(buffer, "readline", &mut [])
+	let mode = text_newline_mode_from_attr(receiver);
+	let mut pending = text_pending_text(receiver);
+	let mut at_eof = false;
+	// Accumulate decoded chunks until a complete logical line (or EOF) is
+	// buffered; `\n`-chunking of the byte layer never aligns with `\r`/`\r\n`
+	// line endings, hence the pending tail.
+	let (mut line, mut rest) = loop {
+		if let Some(end) = logical_line_end(mode, &pending, at_eof) {
+			let rest = pending.split_off(end);
+			break (pending, rest);
+		}
+		if at_eof {
+			break (pending, String::new());
+		}
+		match text_next_decoded_chunk(receiver, buffer, mode) {
+			Ok(Some(chunk)) => pending.push_str(&chunk),
+			Ok(None) => at_eof = true,
+			Err(error) => return error,
+		}
 	};
-	let bytes = match object {
-		Ok(object) => match bytes_like_bytes(object) {
-			Ok(bytes) => bytes,
-			Err(error) => return raise_bio(error),
-		},
-		Err(error) => return error,
-	};
-	let mode = text_newline_mode_from_attr(args[0]);
-	text_bytes_to_object(args[0], bytes, mode)
+	// `readline(size)` caps the CHARACTER count; the overflow rejoins the
+	// pending tail.
+	if let Some(limit) = size {
+		if let Some((cut, _)) = line.char_indices().nth(limit) {
+			rest = format!("{}{rest}", &line[cut..]);
+			line.truncate(cut);
+		}
+	}
+	if let Err(error) = set_text_pending(receiver, &rest) {
+		return error;
+	}
+	alloc_str(&line)
 }
 
 unsafe extern "C" fn text_wrapper_write_method(
@@ -3652,6 +3764,10 @@ unsafe extern "C" fn text_wrapper_detach_method(
 		Ok(buffer) => buffer,
 		Err(error) => return error,
 	};
+	// The pending decoded tail belongs to the buffer being handed back.
+	if let Err(error) = set_text_pending(args[0], "") {
+		return error;
+	}
 	if let Err(error) = set_object_attr(args[0], "_pon_buffer", unsafe { abi::pon_none() }) {
 		return error;
 	}
@@ -3702,6 +3818,10 @@ unsafe extern "C" fn text_wrapper_seek_method(
 		Ok(buffer) => buffer,
 		Err(error) => return error,
 	};
+	// Repositioning invalidates the pending decoded tail.
+	if let Err(error) = set_text_pending(args[0], "") {
+		return error;
+	}
 	let mut forwarded: Vec<*mut PyObject> = args[1..].to_vec();
 	call_object_method(buffer, "seek", &mut forwarded).unwrap_or_else(|error| error)
 }
