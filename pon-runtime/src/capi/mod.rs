@@ -857,9 +857,7 @@ unsafe extern "C" fn cfunction_call(
 		}
 		let result = unsafe { with_keywords(self_object, tuple, _kwargs) };
 		unpin_object(tuple);
-		unpin_object(result);
-		// Faces echoed by C never re-enter pon raw (twin contract).
-		return unsafe { py_normalize_foreign(result) };
+		return unsafe { finish_c_result(result, function.name) };
 	}
 	if flags & METH_FASTCALL != 0 {
 		if flags & METH_KEYWORDS != 0 {
@@ -890,17 +888,13 @@ unsafe extern "C" fn cfunction_call(
 			if !kwnames.is_null() {
 				unpin_object(kwnames);
 			}
-			unpin_object(result);
-			// Faces echoed by C never re-enter pon raw (twin contract).
-			return unsafe { py_normalize_foreign(result) };
+			return unsafe { finish_c_result(result, function.name) };
 		}
 		let fastcall: unsafe extern "C" fn(*mut PyObject, *const *mut PyObject, isize) -> *mut PyObject =
             // SAFETY: METH_FASTCALL certifies the _PyCFunctionFast signature.
             unsafe { mem::transmute(method) };
 		let result = unsafe { fastcall(self_object, positional.as_ptr(), positional.len() as isize) };
-		unpin_object(result);
-		// Faces echoed by C never re-enter pon raw (twin contract).
-		return unsafe { py_normalize_foreign(result) };
+		return unsafe { finish_c_result(result, function.name) };
 	}
 	if flags & METH_NOARGS != 0 {
 		if !positional.is_empty() {
@@ -910,9 +904,7 @@ unsafe extern "C" fn cfunction_call(
 			));
 		}
 		let result = unsafe { method(self_object, ptr::null_mut()) };
-		unpin_object(result);
-		// Faces echoed by C never re-enter pon raw (twin contract).
-		return unsafe { py_normalize_foreign(result) };
+		return unsafe { finish_c_result(result, function.name) };
 	}
 	if flags & METH_O != 0 {
 		if positional.len() != 1 {
@@ -922,9 +914,7 @@ unsafe extern "C" fn cfunction_call(
 			));
 		}
 		let result = unsafe { method(self_object, positional[0]) };
-		unpin_object(result);
-		// Faces echoed by C never re-enter pon raw (twin contract).
-		return unsafe { py_normalize_foreign(result) };
+		return unsafe { finish_c_result(result, function.name) };
 	}
 	if flags & METH_VARARGS != 0 {
 		let tuple = build_call_tuple(&positional);
@@ -933,11 +923,25 @@ unsafe extern "C" fn cfunction_call(
 		}
 		let result = unsafe { method(self_object, tuple) };
 		unpin_object(tuple);
-		unpin_object(result);
-		// Faces echoed by C never re-enter pon raw (twin contract).
-		return unsafe { py_normalize_foreign(result) };
+		return unsafe { finish_c_result(result, function.name) };
 	}
 	abi::return_null_with_error("unsupported C function calling convention")
+}
+
+/// Post-call normalization shared by every `cfunction_call` convention leg:
+/// unpins the result, enforces CPython's `_Py_CheckFunctionResult` contract
+/// (NULL requires a pending exception; a bare NULL becomes a named
+/// diagnostic), and strips foreign twin faces before the value re-enters
+/// pon (twin contract).
+unsafe fn finish_c_result(result: *mut PyObject, name: u32) -> *mut PyObject {
+	unpin_object(result);
+	if result.is_null() && !crate::thread_state::pon_err_occurred() {
+		return abi::return_null_with_error(format!(
+			"{}() returned NULL without setting an exception",
+			crate::intern::resolve(name).unwrap_or_default()
+		));
+	}
+	unsafe { py_normalize_foreign(result) }
 }
 
 unsafe fn tuple_args<'a>(args: *mut PyObject) -> Result<&'a [*mut PyObject], String> {
