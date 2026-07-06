@@ -5,7 +5,7 @@ pub mod handshake;
 
 use std::{
 	alloc::{Layout, alloc_zeroed, dealloc, handle_alloc_error},
-	collections::{HashMap, VecDeque},
+	collections::VecDeque,
 	ptr::{self, NonNull},
 	sync::{
 		Mutex, MutexGuard,
@@ -179,6 +179,12 @@ pub struct TypeId(
 	pub u32,
 );
 
+/// Exclusive upper bound for registered [`TypeId`] values.
+///
+/// Type identifiers index a dense registry table, so they must stay compact;
+/// [`Heap::register_type`] rejects anything at or above this bound.
+pub const MAX_TYPE_ID: u32 = 1 << 16;
+
 /// Type-specific tracing callback for a heap allocation.
 ///
 /// The callback receives the allocation start and a visitor closure.  It must
@@ -209,21 +215,6 @@ pub struct GcTypeInfo {
 
 /// Compatibility name for the Phase-A object layout contract.
 pub type TypeInfo = GcTypeInfo;
-
-/// Configuration for constructing a standalone stop-the-world [`Heap`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct HeapConfig {
-	/// Largest allocation size considered a small object by future span tiers.
-	pub small_obj_max: usize,
-	/// Nominal span size reserved for future segregated allocation tiers.
-	pub span_size:     usize,
-}
-
-impl Default for HeapConfig {
-	fn default() -> Self {
-		Self { small_obj_max: 512, span_size: 8 * 1024 }
-	}
-}
 
 /// Source of raw root pointers for a collection cycle.
 ///
@@ -443,7 +434,6 @@ impl ConcurrentWorkerState {
 /// stay stable until the object is swept or the heap is dropped.
 pub struct Heap {
 	state:               Mutex<HeapState>,
-	_config:             HeapConfig,
 	/// Bytes allocated since the last collection: the allocation-pressure
 	/// "debt" the runtime's automatic-collection trigger reads lock-free.
 	bytes_since_collect: AtomicUsize,
@@ -452,30 +442,31 @@ pub struct Heap {
 }
 
 impl Heap {
-	/// Creates an empty heap with [`HeapConfig::default`].
+	/// Creates an empty heap.
 	pub fn new() -> Self {
-		Self::with_config(HeapConfig::default())
-	}
-
-	/// Creates an empty heap with explicit allocation configuration.
-	pub fn with_config(config: HeapConfig) -> Self {
-		assert!(config.span_size > 0, "heap span size must be non-zero");
-		assert!(
-			config.small_obj_max <= config.span_size,
-			"heap small-object limit must not exceed span size",
-		);
-
 		Self {
-			state:               Mutex::new(HeapState::new(config)),
-			_config:             config,
+			state:               Mutex::new(HeapState::default()),
 			bytes_since_collect: AtomicUsize::new(0),
 			live_bytes:          AtomicUsize::new(0),
 		}
 	}
 
 	/// Registers or replaces layout information for `type_id`.
+	///
+	/// `type_id.0` must be below [`MAX_TYPE_ID`]: identifiers index a dense
+	/// registry table and are compact small integers by ABI contract.
 	pub fn register_type(&self, type_id: TypeId, info: GcTypeInfo) {
-		self.lock_state().types.insert(type_id, info);
+		assert!(
+			type_id.0 < MAX_TYPE_ID,
+			"GC type id {} exceeds dense registry bound {MAX_TYPE_ID}",
+			type_id.0,
+		);
+		let slot = type_id.0 as usize;
+		let mut state = self.lock_state();
+		if state.types.len() <= slot {
+			state.types.resize(slot + 1, None);
+		}
+		state.types[slot] = Some(info);
 	}
 
 	/// Bytes allocated since the last collection (lock-free).
@@ -502,7 +493,7 @@ impl Heap {
 	pub fn alloc(&self, size: usize, type_id: TypeId) -> *mut u8 {
 		let mut state = self.lock_state();
 		assert!(
-			state.types.contains_key(&type_id),
+			state.type_info(type_id).is_some(),
 			"cannot allocate unregistered GC type {type_id:?}",
 		);
 
@@ -523,7 +514,6 @@ impl Heap {
 
 		// SAFETY: `raw` was just checked for null.
 		let start = unsafe { NonNull::new_unchecked(raw) };
-		let allocation_index = state.allocations.len();
 		let birth_epoch = state.epoch;
 		state.allocations.push(Allocation {
 			start,
@@ -531,13 +521,12 @@ impl Heap {
 			allocated_size,
 			layout,
 			type_id,
-			classification: AllocationClass::LargeFallback,
 			finalized: false,
 			birth_epoch,
 		});
 		let mark_state = state.new_allocation_mark_state();
 		state.mark_states.push(mark_state);
-		state.index_allocation(allocation_index);
+		state.addr_index_dirty = true;
 		self
 			.bytes_since_collect
 			.fetch_add(allocated_size, Ordering::Relaxed);
@@ -588,6 +577,7 @@ impl Heap {
 			);
 		}
 		let mut state = self.lock_state();
+		state.prepare_address_index();
 		let mut mark_queue = MarkQueue::new();
 
 		for (index, root) in root_values.into_iter().enumerate() {
@@ -640,8 +630,7 @@ impl Heap {
 				continue;
 			}
 			let Some(finalize) = state
-				.types
-				.get(&allocation.type_id)
+				.type_info(allocation.type_id)
 				.and_then(|info| info.finalize)
 			else {
 				continue;
@@ -741,56 +730,32 @@ impl Drop for Heap {
 	}
 }
 
+#[derive(Default)]
 struct HeapState {
-	config:                  HeapConfig,
-	types:                   HashMap<TypeId, GcTypeInfo>,
+	/// Dense type registry indexed by `TypeId.0`; see [`Heap::register_type`].
+	types:                   Vec<Option<GcTypeInfo>>,
 	allocations:             Vec<Allocation>,
 	mark_states:             Vec<MarkState>,
-	spans:                   Vec<SmallSpan>,
-	/// Index of the newest (only possibly non-full) span per size class.
-	///
-	/// `span_for_size_class` used to scan `spans` linearly on EVERY small
-	/// allocation; spans never regain capacity in place (`used_bytes` only
-	/// grows; sweep clears and rebuilds the whole table), so the first
-	/// accepting span of a class is always its newest one.  Caching that
-	/// index turns allocation from O(spans) — quadratic over a program's
-	/// lifetime, minutes of wall time in allocation-heavy workloads like
-	/// the Cython compiler — into O(1) with identical span assignment.
-	open_spans:              HashMap<usize, usize>,
-	large_fallbacks:         Vec<usize>,
 	/// Allocation starts whose finalizers are executing in an outer
 	/// `collect` frame with the lock released; rooted by every mark phase.
 	pending_finalizer_roots: Vec<NonNull<u8>>,
-	/// Allocation start address -> `allocations` index, kept in address
-	/// order for O(log n) [`HeapState::classify_pointer`] lookups.
-	by_address:              std::collections::BTreeMap<usize, usize>,
+	/// Sorted `(start address, allocations index)` pairs backing
+	/// [`HeapState::classify_pointer`]'s binary search.
+	///
+	/// Rebuilt lazily by [`HeapState::prepare_address_index`]: allocation
+	/// only flips `addr_index_dirty`, so the hot alloc path carries no
+	/// per-object index maintenance (this used to be a per-alloc `BTreeMap`
+	/// insert that dominated allocation-heavy workload profiles).
+	addr_index:              Vec<(usize, usize)>,
+	/// Allocations changed since `addr_index` was last rebuilt.
+	addr_index_dirty:        bool,
 	/// Completed-collection counter; allocations record it at birth. The
 	/// sweep only reclaims unreached blocks born BEFORE the current epoch
 	/// (see `Allocation::birth_epoch`).
 	epoch:                   u64,
 }
 
-impl Default for HeapState {
-	fn default() -> Self {
-		Self::new(HeapConfig::default())
-	}
-}
-
 impl HeapState {
-	fn new(config: HeapConfig) -> Self {
-		Self {
-			config,
-			types: HashMap::new(),
-			allocations: Vec::new(),
-			mark_states: Vec::new(),
-			spans: Vec::new(),
-			open_spans: HashMap::new(),
-			large_fallbacks: Vec::new(),
-			pending_finalizer_roots: Vec::new(),
-			by_address: std::collections::BTreeMap::new(),
-			epoch: 0,
-		}
-	}
 
 	fn new_allocation_mark_state(&self) -> MarkState {
 		if write_barrier_state().allocation_black_active() {
@@ -800,63 +765,54 @@ impl HeapState {
 		MarkState::default()
 	}
 
-	fn index_allocation(&mut self, allocation_index: usize) {
-		let Some(allocation) = self.allocations.get(allocation_index) else {
+	/// Rebuilds the sorted address index after allocations changed.
+	///
+	/// Classification requires a clean index: [`Heap::collect`] prepares it
+	/// once after taking the state lock, and [`mark_pointer`] re-checks
+	/// defensively (a no-op branch when already clean).
+	fn prepare_address_index(&mut self) {
+		if !self.addr_index_dirty {
 			return;
-		};
-		self
-			.by_address
-			.insert(allocation.start.as_ptr().addr(), allocation_index);
-
-		if allocation.allocated_size <= self.config.small_obj_max {
-			let size_class = size_class_for(allocation.allocated_size);
-			let span_index = self.span_for_size_class(size_class);
-			self.spans[span_index].push(allocation_index);
-			self.allocations[allocation_index].classification =
-				AllocationClass::Small { span_index, size_class };
-		} else {
-			self.large_fallbacks.push(allocation_index);
-			self.allocations[allocation_index].classification = AllocationClass::LargeFallback;
 		}
+		self.addr_index.clear();
+		self.addr_index.extend(
+			self
+				.allocations
+				.iter()
+				.enumerate()
+				.map(|(index, allocation)| (allocation.start.as_ptr().addr(), index)),
+		);
+		self.addr_index.sort_unstable();
+		self.addr_index_dirty = false;
 	}
 
-	fn span_for_size_class(&mut self, size_class: usize) -> usize {
-		if let Some(&index) = self.open_spans.get(&size_class) {
-			if self.spans[index].accepts(size_class) {
-				return index;
-			}
-		}
-
-		let span_index = self.spans.len();
-		self
-			.spans
-			.push(SmallSpan::new(self.config.span_size, size_class));
-		self.open_spans.insert(size_class, span_index);
-		span_index
+	/// Registered layout for `type_id`, if any.
+	fn type_info(&self, type_id: TypeId) -> Option<GcTypeInfo> {
+		self.types.get(type_id.0 as usize).copied().flatten()
 	}
 
 	fn classify_pointer(&self, pointer: *mut u8) -> Option<PointerClassification> {
 		if pointer.is_null() {
 			return None;
 		}
+		// Hard assert even in release: classifying against a stale index
+		// silently under-marks and frees live objects.
+		assert!(
+			!self.addr_index_dirty,
+			"classify_pointer called with a stale address index",
+		);
 		let address = pointer.addr();
 		// Address-ordered lookup: allocations are disjoint byte ranges, so
 		// the greatest start <= address is the only candidate block. This
 		// MUST stay sublinear — every conservative stack word and traced
 		// edge classifies, so a linear scan turns collection quadratic.
-		let (_, &index) = self.by_address.range(..=address).next_back()?;
+		let position = self.addr_index.partition_point(|&(start, _)| start <= address);
+		let (_, index) = *self.addr_index[..position].last()?;
 		let allocation = self.allocations.get(index)?;
 		if !allocation.contains_address(address) {
 			return None;
 		}
-		let route = match allocation.classification {
-			AllocationClass::Small { span_index, size_class } => ClassificationRoute::SmallSpan {
-				span_size: self.spans.get(span_index)?.span_size,
-				size_class,
-			},
-			AllocationClass::LargeFallback => ClassificationRoute::LargeFallback,
-		};
-		Some(PointerClassification { index, representative: allocation.start.as_ptr(), route })
+		Some(PointerClassification { index, representative: allocation.start.as_ptr() })
 	}
 
 	fn begin_object_scan(&mut self, index: usize) -> bool {
@@ -892,10 +848,6 @@ impl HeapState {
 		let mut survivors = Vec::with_capacity(old_allocations.len());
 		let mut unreachable = Vec::new();
 
-		self.spans.clear();
-		self.open_spans.clear();
-		self.large_fallbacks.clear();
-
 		for (index, allocation) in old_allocations.into_iter().enumerate() {
 			let reached = old_mark_states
 				.get(index)
@@ -912,31 +864,10 @@ impl HeapState {
 		}
 
 		self.allocations = survivors;
-		self.rebuild_allocation_metadata();
+		self.mark_states = vec![MarkState::default(); self.allocations.len()];
+		self.addr_index_dirty = true;
 		unreachable
 	}
-
-	fn rebuild_allocation_metadata(&mut self) {
-		self.mark_states = vec![MarkState::default(); self.allocations.len()];
-		self.spans.clear();
-		self.open_spans.clear();
-		self.large_fallbacks.clear();
-		self.by_address.clear();
-
-		for allocation in &mut self.allocations {
-			allocation.classification = AllocationClass::LargeFallback;
-		}
-
-		for index in 0..self.allocations.len() {
-			self.index_allocation(index);
-		}
-	}
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AllocationClass {
-	Small { span_index: usize, size_class: usize },
-	LargeFallback,
 }
 
 struct Allocation {
@@ -945,7 +876,6 @@ struct Allocation {
 	allocated_size: usize,
 	layout:         Layout,
 	type_id:        TypeId,
-	classification: AllocationClass,
 	/// The type's finalizer already ran for this allocation; it is freed
 	/// without a second callback once unreached again.
 	finalized:      bool,
@@ -972,29 +902,6 @@ impl Allocation {
 		let start = self.start.as_ptr().addr();
 		let end = start.saturating_add(self.classified_size());
 		(start..end).contains(&address)
-	}
-}
-
-#[derive(Clone, Debug)]
-struct SmallSpan {
-	span_size:          usize,
-	size_class:         usize,
-	used_bytes:         usize,
-	allocation_indices: Vec<usize>,
-}
-
-impl SmallSpan {
-	fn new(span_size: usize, size_class: usize) -> Self {
-		Self { span_size, size_class, used_bytes: 0, allocation_indices: Vec::new() }
-	}
-
-	fn accepts(&self, size_class: usize) -> bool {
-		self.size_class == size_class && self.used_bytes.saturating_add(size_class) <= self.span_size
-	}
-
-	fn push(&mut self, allocation_index: usize) {
-		self.used_bytes += self.size_class;
-		self.allocation_indices.push(allocation_index);
 	}
 }
 
@@ -1125,13 +1032,6 @@ impl SingleObjectScan {
 struct PointerClassification {
 	index:          usize,
 	representative: *mut u8,
-	route:          ClassificationRoute,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ClassificationRoute {
-	SmallSpan { span_size: usize, size_class: usize },
-	LargeFallback,
 }
 
 #[derive(Default)]
@@ -1222,10 +1122,6 @@ pub unsafe fn collect_stack_range_roots(
 	}
 }
 
-fn size_class_for(size: usize) -> usize {
-	size.max(1).next_multiple_of(DEFAULT_HEAP_ALIGNMENT)
-}
-
 fn is_tagged_non_heap_candidate(pointer: *mut u8) -> bool {
 	pointer.addr() & IMMEDIATE_TAG_MASK != IMMEDIATE_TAG_HEAP
 }
@@ -1242,7 +1138,7 @@ fn drain_mark_queue(state: &mut HeapState, mark_queue: &mut MarkQueue) {
 		};
 		let start = allocation.start.as_ptr();
 		let type_id = allocation.type_id;
-		let Some(info) = state.types.get(&type_id).copied() else {
+		let Some(info) = state.type_info(type_id) else {
 			state.finish_object_scan(index, SingleObjectScan::new(start));
 			continue;
 		};
@@ -1265,19 +1161,13 @@ fn drain_mark_queue(state: &mut HeapState, mark_queue: &mut MarkQueue) {
 }
 
 fn mark_pointer(state: &mut HeapState, mark_queue: &mut MarkQueue, pointer: *mut u8) -> bool {
+	state.prepare_address_index();
 	let Some(classification) = state.classify_pointer(pointer) else {
 		let _is_immediate = is_tagged_non_heap_candidate(pointer);
 		return false;
 	};
-	let PointerClassification { index, representative, route } = classification;
+	let PointerClassification { index, representative } = classification;
 	debug_assert!(!representative.is_null());
-	match route {
-		ClassificationRoute::SmallSpan { span_size, size_class } => {
-			debug_assert!(span_size > 0);
-			debug_assert!(size_class <= span_size);
-		},
-		ClassificationRoute::LargeFallback => {},
-	}
 
 	let Some(mark_state) = state.mark_states.get_mut(index) else {
 		return false;
@@ -1354,11 +1244,6 @@ mod tests {
 	}
 
 	#[test]
-	fn default_config_uses_phase_a_green_tea_values() {
-		assert_eq!(HeapConfig::default(), HeapConfig { small_obj_max: 512, span_size: 8 * 1024 },);
-	}
-
-	#[test]
 	fn mark_queue_pops_fifo() {
 		let mut queue = MarkQueue::new();
 
@@ -1373,49 +1258,37 @@ mod tests {
 	}
 
 	#[test]
-	fn allocations_are_classified_as_small_spans_or_large_fallbacks() {
+	fn classify_pointer_resolves_small_and_large_allocations() {
 		let heap = Heap::new();
 		heap.register_type(TYPE_ID, type_info(1024, None));
 
 		let small = heap.alloc(32, TYPE_ID);
-		let large = heap.alloc(HeapConfig::default().small_obj_max + 1, TYPE_ID);
+		let large = heap.alloc(4096, TYPE_ID);
 
-		let state = heap.lock_state();
-		assert!(matches!(state.allocations[0].classification, AllocationClass::Small {
-			span_index: 0,
-			size_class: 32,
-		},));
-		assert_eq!(state.spans.len(), 1);
-		assert_eq!(state.spans[0].span_size, 8 * 1024);
-		assert_eq!(state.spans[0].size_class, 32);
-		assert_eq!(state.spans[0].allocation_indices, vec![0]);
-		assert!(matches!(
-			state.classify_pointer(small).unwrap().route,
-			ClassificationRoute::SmallSpan { span_size: 8192, size_class: 32 },
-		));
-
-		assert_eq!(state.allocations[1].classification, AllocationClass::LargeFallback);
-		assert_eq!(state.large_fallbacks, vec![1]);
-		assert_eq!(state.classify_pointer(large).unwrap().route, ClassificationRoute::LargeFallback,);
+		let mut state = heap.lock_state();
+		state.prepare_address_index();
+		let resolved_small = state.classify_pointer(small).unwrap();
+		let resolved_large = state.classify_pointer(large).unwrap();
+		assert_eq!(resolved_small.index, 0);
+		assert_eq!(resolved_small.representative, small);
+		assert_eq!(resolved_large.index, 1);
+		assert_eq!(resolved_large.representative, large);
 	}
 
 	#[test]
-	fn interior_pointer_resolution_uses_span_metadata_path() {
+	fn interior_pointer_resolves_to_allocation_start() {
 		let heap = Heap::new();
 		heap.register_type(TYPE_ID, type_info(64, None));
 		let object = heap.alloc(64, TYPE_ID);
 
 		// SAFETY: Offset 31 remains within the 64-byte allocation.
 		let interior = unsafe { object.add(31) };
-		let state = heap.lock_state();
+		let mut state = heap.lock_state();
+		state.prepare_address_index();
 		let classification = state.classify_pointer(interior).unwrap();
 
 		assert_eq!(classification.index, 0);
 		assert_eq!(classification.representative, object);
-		assert_eq!(classification.route, ClassificationRoute::SmallSpan {
-			span_size:  8 * 1024,
-			size_class: 64,
-		},);
 	}
 
 	#[test]
@@ -1443,7 +1316,7 @@ mod tests {
 		assert!(state.begin_object_scan(first_index));
 
 		let start = state.allocations[first_index].start.as_ptr();
-		let info = state.types.get(&TYPE_ID).copied().unwrap();
+		let info = state.type_info(TYPE_ID).unwrap();
 		let mut scan = SingleObjectScan::new(start);
 		let mut visitor = |child| {
 			if mark_pointer(&mut state, &mut mark_queue, child) {
@@ -1775,7 +1648,8 @@ mod tests {
 
 		heap.collect(&mut Roots(vec![holder]));
 
-		let state = heap.lock_state();
+		let mut state = heap.lock_state();
+		state.prepare_address_index();
 		assert!(state.classify_pointer(holder).is_some());
 		assert!(state.classify_pointer(sibling).is_some());
 	}
@@ -1927,7 +1801,8 @@ mod tests {
 		let second = heap.alloc(8, TYPE_ID);
 		WriteBarrier::end_concurrent_marking();
 
-		let state = heap.lock_state();
+		let mut state = heap.lock_state();
+		state.prepare_address_index();
 		assert_eq!(state.classify_pointer(first).unwrap().index, 0);
 		assert_eq!(state.mark_states[0].color, MarkColor::White);
 		assert_eq!(state.classify_pointer(second).unwrap().index, 1);
