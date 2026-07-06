@@ -25,7 +25,10 @@ use core::{
 use std::{
 	collections::HashMap,
 	ffi::CString,
-	sync::{LazyLock, Mutex, OnceLock},
+	sync::{
+		LazyLock, Mutex, OnceLock,
+		atomic::{AtomicBool, Ordering},
+	},
 };
 
 use crate::{
@@ -172,6 +175,13 @@ struct TwinRegistry {
 static REGISTRY: LazyLock<Mutex<TwinRegistry>> =
 	LazyLock::new(|| Mutex::new(TwinRegistry::default()));
 
+/// Lock-free "any twin registered" flag, set under the [`REGISTRY`] lock.
+///
+/// `registered_native_of_foreign` sits on per-operation type-normalization
+/// paths; pure-Python workloads never register foreign faces, so the
+/// empty-registry case must not take the registry mutex.
+static REGISTRY_POPULATED: AtomicBool = AtomicBool::new(false);
+
 /// Serializes fabrication batches. Never held while [`REGISTRY`] is locked
 /// EXCEPT for the final publish step; readers that miss in the registry queue
 /// here, re-check, and only then start their own batch.
@@ -247,6 +257,9 @@ fn collect_builtin_keys() -> Vec<BuiltinKey> {
 }
 
 fn lookup_foreign(native: *mut PyType) -> Option<*mut ForeignTypeObject> {
+	if !REGISTRY_POPULATED.load(Ordering::Acquire) {
+		return None;
+	}
 	let registry = REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
 	registry
 		.foreign_by_native
@@ -261,6 +274,7 @@ pub(crate) fn register_foreign_twin(foreign: *mut ForeignTypeObject, native: *mu
 	// key off the same collapsed pointer.
 	let canonical = unsafe { crate::types::type_::canonical_type_object(native) };
 	let mut registry = REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
+	REGISTRY_POPULATED.store(true, Ordering::Release);
 	registry
 		.native_by_foreign
 		.insert(foreign as usize, canonical as usize);
@@ -283,7 +297,7 @@ pub(crate) fn register_foreign_twin(foreign: *mut ForeignTypeObject, native: *mu
 /// struct.  A raw native type is accepted only when the registry already knows
 /// that exact address as a native key.
 pub(crate) fn native_of_foreign(foreign: *mut ForeignTypeObject) -> Option<*mut PyType> {
-	if foreign.is_null() {
+	if foreign.is_null() || !REGISTRY_POPULATED.load(Ordering::Acquire) {
 		return None;
 	}
 	let registry = REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -301,7 +315,7 @@ pub(crate) fn native_of_foreign(foreign: *mut ForeignTypeObject) -> Option<*mut 
 /// candidate as a `ForeignTypeObject`; callers can probe arbitrary object
 /// pointers safely before deciding whether to treat them as runtime objects.
 pub(crate) fn registered_native_of_foreign(foreign: *mut ForeignTypeObject) -> Option<*mut PyType> {
-	if foreign.is_null() {
+	if foreign.is_null() || !REGISTRY_POPULATED.load(Ordering::Acquire) {
 		return None;
 	}
 	let registry = REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -364,6 +378,7 @@ pub(crate) fn foreign_of_native(native: *mut PyType) -> *mut ForeignTypeObject {
 /// the batch twin then only serves reverse translation.
 fn publish_batch(batch: &HashMap<usize, *mut ForeignTypeObject>) {
 	let mut registry = REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
+	REGISTRY_POPULATED.store(true, Ordering::Release);
 	for (&native, &twin) in batch {
 		registry.native_by_foreign.insert(twin as usize, native);
 		if !registry.foreign_by_native.contains_key(&native) {
@@ -528,6 +543,7 @@ pub(crate) unsafe extern "C" fn capi_register_local_twins(
 		fill_twin(twin, native as *mut PyType, tid, &mut batch);
 	}
 	let mut registry = REGISTRY.lock().unwrap_or_else(|poison| poison.into_inner());
+	REGISTRY_POPULATED.store(true, Ordering::Release);
 	for (&native, &twin) in &batch {
 		let twin_key = twin as usize;
 		registry.native_by_foreign.insert(twin_key, native);

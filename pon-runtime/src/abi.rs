@@ -2086,14 +2086,27 @@ enum InitPhase {
 static INIT_PHASE: LazyLock<(Mutex<InitPhase>, Condvar)> =
 	LazyLock::new(|| (Mutex::new(InitPhase::Uninit), Condvar::new()));
 
+/// Lock-free mirror of `InitPhase::Ready`, set under the phase lock.
+///
+/// Every ABI dispatch re-checks initialization (`ensure_runtime_initialized`
+/// runs on each `pon_call`), so the steady state must not touch the phase
+/// mutex. Initialization is monotonic: the phase never leaves `Ready`.
+static RUNTIME_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn init_runtime() -> Result<(), String> {
+	if RUNTIME_READY.load(Ordering::Acquire) {
+		return Ok(());
+	}
 	let (phase_lock, phase_signal) = &*INIT_PHASE;
 	let mut phase = phase_lock
 		.lock()
 		.unwrap_or_else(|poison| poison.into_inner());
 	loop {
 		match &*phase {
-			InitPhase::Ready => return Ok(()),
+			InitPhase::Ready => {
+				RUNTIME_READY.store(true, Ordering::Release);
+				return Ok(());
+			},
 			InitPhase::Failed(message) => return Err(message.clone()),
 			InitPhase::Running(thread) if *thread == std::thread::current().id() => return Ok(()),
 			InitPhase::Running(_) => {
@@ -2130,7 +2143,10 @@ fn init_runtime() -> Result<(), String> {
 		.lock()
 		.unwrap_or_else(|poison| poison.into_inner());
 	*phase = match &result {
-		Ok(()) => InitPhase::Ready,
+		Ok(()) => {
+			RUNTIME_READY.store(true, Ordering::Release);
+			InitPhase::Ready
+		},
 		Err(message) => InitPhase::Failed(message.clone()),
 	};
 	drop(phase);
