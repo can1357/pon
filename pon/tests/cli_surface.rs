@@ -106,6 +106,24 @@ fn inline_code_executes_expression_statement_program() {
 }
 
 #[test]
+fn inline_code_zero_arg_super_tracks_lexical_owner() {
+	let output = run_pon(&[
+		"-c",
+		"from enum import Enum\nfrom collections import namedtuple\nclass ASN(namedtuple(\"ASN\", \"nid shortname longname oid\")):\n    __slots__ = ()\n    def __new__(cls, oid):\n        return super().__new__(cls, 1, 'short', 'long', oid)\nclass Purpose(ASN, Enum):\n    SERVER_AUTH = '1.2.3'\nprint(Purpose.SERVER_AUTH.oid)",
+	]);
+
+	assert!(
+		output.status.success(),
+		"zero-arg super enum/namedtuple probe should succeed; status={:?}, stdout={}, stderr={}",
+		output.status.code(),
+		stdout(&output),
+		stderr(&output)
+	);
+	assert_eq!(stdout(&output).trim(), "1.2.3");
+	assert_eq!(output.stderr.as_slice(), b"");
+}
+
+#[test]
 fn inline_code_does_not_materialize_a_file_attribute() {
 	let output = run_pon(&["-c", "print(__file__)"]);
 
