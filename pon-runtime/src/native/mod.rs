@@ -108,6 +108,7 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
 	("_curses", curses_::make_curses_module),
 	("_curses_panel", curses_::make_curses_panel_module),
 	("_ctypes", big_cext::make_ctypes_underscore_module),
+	#[cfg(target_os = "macos")]
 	("_dbm", big_cext::make_dbm_underscore_module),
 	("_datetime", stdlib_small::make_datetime_module),
 	("_functools", stdlib_small::make_functools_module),

@@ -38,13 +38,15 @@ use super::{
 use crate::{
 	abi,
 	intern::intern,
-	object::{PyMappingMethods, PyObject, PyObjectHeader, PyType},
+	object::{PyObject, PyObjectHeader, PyType},
 	thread_state::{pon_err_clear, pon_err_message},
 	types::{
 		bytearray_ as bytearray_type, bytes_ as bytes_type, exc::ExceptionKind,
 		memoryview as memoryview_type, type_,
 	},
 };
+#[cfg(target_os = "macos")]
+use crate::object::PyMappingMethods;
 
 type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
 #[cfg(target_os = "macos")]
@@ -68,6 +70,7 @@ fn runtime_error(message: &str) -> *mut PyObject {
 	raise(ExceptionKind::RuntimeError, message)
 }
 
+#[cfg(target_os = "macos")]
 fn key_error(message: &str) -> *mut PyObject {
 	raise(ExceptionKind::KeyError, message)
 }
@@ -178,6 +181,7 @@ fn str_arg(object: *mut PyObject, name: &str) -> Result<String, *mut PyObject> {
 		.ok_or_else(|| type_error(&format!("{name} must be str, not '{}'", type_name(object))))
 }
 
+#[cfg(target_os = "macos")]
 fn optional_str_arg(
 	args: &[*mut PyObject],
 	index: usize,
@@ -1536,8 +1540,10 @@ pub(super) fn make_sqlite3_underscore_module() -> Result<*mut PyObject, String> 
 }
 
 // ---------------------------------------------------------------------------
-// `_dbm` / `dbm`
+// `_dbm` / `dbm` — Darwin-only: ndbm ships in libSystem there, while glibc
+// hosts need an external gdbm compat library that CI runners lack.
 
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Datum {
@@ -1545,8 +1551,10 @@ struct Datum {
 	dsize: c_int,
 }
 
+#[cfg(target_os = "macos")]
 enum RawDbm {}
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
 	fn dbm_open(file: *const c_char, flags: c_int, mode: libc::mode_t) -> *mut RawDbm;
 	fn dbm_close(db: *mut RawDbm);
@@ -1559,23 +1567,28 @@ unsafe extern "C" {
 	fn dbm_clearerr(db: *mut RawDbm);
 }
 
+#[cfg(target_os = "macos")]
 const DBM_REPLACE: c_int = 1;
 
+#[cfg(target_os = "macos")]
 #[repr(C)]
 struct PyDbm {
 	ob_base: PyObjectHeader,
 	db:      *mut RawDbm,
 }
 
+#[cfg(target_os = "macos")]
 static DBM_ERROR_CLASS: LazyLock<usize> =
 	LazyLock::new(|| exception_class("dbm", "error", "OSError").map_or(0, |class| class as usize));
 
+#[cfg(target_os = "macos")]
 static DBM_MAPPING: PyMappingMethods = PyMappingMethods {
 	mp_length:        Some(dbm_len_slot),
 	mp_subscript:     Some(dbm_subscript_slot),
 	mp_ass_subscript: Some(dbm_ass_subscript_slot),
 };
 
+#[cfg(target_os = "macos")]
 static DBM_TYPE: LazyLock<usize> = LazyLock::new(|| {
 	let mut ty =
 		PyType::new(abi::runtime_type_type().cast_const(), "dbm.dbm", core::mem::size_of::<PyDbm>());
@@ -1585,14 +1598,17 @@ static DBM_TYPE: LazyLock<usize> = LazyLock::new(|| {
 	Box::into_raw(Box::new(ty)) as usize
 });
 
+#[cfg(target_os = "macos")]
 fn dbm_type() -> *mut PyType {
 	*DBM_TYPE as *mut PyType
 }
 
+#[cfg(target_os = "macos")]
 fn raise_dbm_error(message: &str) -> *mut PyObject {
 	raise_class(&DBM_ERROR_CLASS, ExceptionKind::OSError, message)
 }
 
+#[cfg(target_os = "macos")]
 unsafe fn dbm_receiver<'a>(object: *mut PyObject) -> Option<&'a mut PyDbm> {
 	let object = crate::tag::untag_arg(object);
 	if object.is_null() || unsafe { (*object).ob_type } != dbm_type().cast_const() {
@@ -1601,10 +1617,12 @@ unsafe fn dbm_receiver<'a>(object: *mut PyObject) -> Option<&'a mut PyDbm> {
 	Some(unsafe { &mut *object.cast::<PyDbm>() })
 }
 
+#[cfg(target_os = "macos")]
 fn dbm_key_or_value(object: *mut PyObject, name: &str) -> Result<Vec<u8>, *mut PyObject> {
 	bytes_or_text_arg(object, name)
 }
 
+#[cfg(target_os = "macos")]
 fn datum_from_slice(bytes: &[u8]) -> Datum {
 	Datum {
 		dptr:  bytes.as_ptr().cast::<c_char>().cast_mut(),
@@ -1612,6 +1630,7 @@ fn datum_from_slice(bytes: &[u8]) -> Datum {
 	}
 }
 
+#[cfg(target_os = "macos")]
 unsafe fn datum_to_vec(datum: Datum) -> Option<Vec<u8>> {
 	if datum.dptr.is_null() || datum.dsize < 0 {
 		return None;
@@ -1620,6 +1639,7 @@ unsafe fn datum_to_vec(datum: Datum) -> Option<Vec<u8>> {
 	Some(unsafe { core::slice::from_raw_parts(datum.dptr.cast::<u8>(), len) }.to_vec())
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn dbm_open_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 	let args = match args_or_type_error(argv, argc, "open") {
 		Ok(args) => args,
@@ -1662,6 +1682,7 @@ unsafe extern "C" fn dbm_open_entry(argv: *mut *mut PyObject, argc: usize) -> *m
 		.cast::<PyObject>()
 }
 
+#[cfg(target_os = "macos")]
 unsafe fn dbm_live<'a>(object: *mut PyObject) -> Result<&'a mut PyDbm, *mut PyObject> {
 	let Some(dbm) = (unsafe { dbm_receiver(object) }) else {
 		return Err(type_error("dbm operation on non-dbm object"));
@@ -1672,6 +1693,7 @@ unsafe fn dbm_live<'a>(object: *mut PyObject) -> Result<&'a mut PyDbm, *mut PyOb
 	Ok(dbm)
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn dbm_subscript_slot(
 	object: *mut PyObject,
 	key: *mut PyObject,
@@ -1691,6 +1713,7 @@ unsafe extern "C" fn dbm_subscript_slot(
 	py_bytes(&value)
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn dbm_ass_subscript_slot(
 	object: *mut PyObject,
 	key: *mut PyObject,
@@ -1725,6 +1748,7 @@ unsafe extern "C" fn dbm_ass_subscript_slot(
 	0
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn dbm_len_slot(object: *mut PyObject) -> isize {
 	let dbm = match unsafe { dbm_live(object) } {
 		Ok(dbm) => dbm,
@@ -1739,6 +1763,7 @@ unsafe extern "C" fn dbm_len_slot(object: *mut PyObject) -> isize {
 	count
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn dbm_close_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 	let args = match args_or_type_error(argv, argc, "close") {
 		Ok(args) => args,
@@ -1757,6 +1782,7 @@ unsafe extern "C" fn dbm_close_entry(argv: *mut *mut PyObject, argc: usize) -> *
 	none()
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn dbm_keys_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 	let args = match args_or_type_error(argv, argc, "keys") {
 		Ok(args) => args,
@@ -1786,6 +1812,7 @@ unsafe extern "C" fn dbm_keys_entry(argv: *mut *mut PyObject, argc: usize) -> *m
 	alloc_list(out)
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn dbm_exit_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 	let args = match args_or_type_error(argv, argc, "__exit__") {
 		Ok(args) => args,
@@ -1798,6 +1825,7 @@ unsafe extern "C" fn dbm_exit_entry(argv: *mut *mut PyObject, argc: usize) -> *m
 	unsafe { dbm_close_entry(close_args.as_mut_ptr(), close_args.len()) }
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn dbm_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
 	let name = match attr_name(name) {
 		Ok(name) => name,
@@ -1812,6 +1840,7 @@ unsafe extern "C" fn dbm_getattro(object: *mut PyObject, name: *mut PyObject) ->
 	}
 }
 
+#[cfg(target_os = "macos")]
 fn dbm_attrs(name: &str) -> Result<Vec<(u32, *mut PyObject)>, String> {
 	let error = *DBM_ERROR_CLASS;
 	if error == 0 {
@@ -1826,6 +1855,7 @@ fn dbm_attrs(name: &str) -> Result<Vec<(u32, *mut PyObject)>, String> {
 	])
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn make_dbm_underscore_module() -> Result<*mut PyObject, String> {
 	install_module("_dbm", dbm_attrs("_dbm")?)
 }

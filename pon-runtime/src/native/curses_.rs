@@ -70,7 +70,10 @@ struct PyCursesPanel {
 	window_object: *mut PyObject,
 }
 
-#[link(name = "ncurses")]
+// Darwin's libncurses is wide-character-enabled; glibc distros split the
+// wide API into ncursesw/panelw.
+#[cfg_attr(target_os = "macos", link(name = "ncurses"))]
+#[cfg_attr(not(target_os = "macos"), link(name = "ncursesw"))]
 unsafe extern "C" {
 	static mut LINES: c_int;
 	static mut COLS: c_int;
@@ -272,7 +275,8 @@ unsafe extern "C" {
 	fn c_is_term_resized(lines: c_int, cols: c_int) -> c_int;
 }
 
-#[link(name = "panel")]
+#[cfg_attr(target_os = "macos", link(name = "panel"))]
+#[cfg_attr(not(target_os = "macos"), link(name = "panelw"))]
 unsafe extern "C" {
 	#[link_name = "new_panel"]
 	fn c_new_panel(window: *mut CWindow) -> *mut CPanel;
