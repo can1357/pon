@@ -748,7 +748,9 @@ pub unsafe fn get_attr(object: *mut PyObject, name: u32) -> *mut PyObject {
 			crate::thread_state::pon_err_clear();
 			return unsafe { crate::types::type_::canonical_type_object(ty) }.cast::<PyObject>();
 		}
-		ensure_exception("attribute lookup returned NULL without setting an exception");
+		if !crate::thread_state::pon_err_occurred() {
+			return unsafe { crate::abi::exc::pon_raise_attribute_error(object, name) };
+		}
 	}
 	result
 }
@@ -1564,6 +1566,7 @@ unsafe fn object_type(object: *mut PyObject) -> Option<*mut PyType> {
 	}
 	// SAFETY: Non-NULL boxed values are required to begin with PyObjectHeader.
 	let ty = unsafe { (*object).ob_type.cast_mut() };
+	let ty = crate::capi::twin::registered_native_of_foreign(ty.cast()).unwrap_or(ty);
 	(!ty.is_null()).then_some(ty)
 }
 

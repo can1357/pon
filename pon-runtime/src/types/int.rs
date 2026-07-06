@@ -15,6 +15,16 @@ static BIG_INTS: LazyLock<Mutex<HashMap<usize, BigInt>>> = LazyLock::new(|| Mute
 static INT_NUMBER_METHODS: LazyLock<usize> =
     LazyLock::new(|| Box::into_raw(Box::new(make_number_methods())) as usize);
 
+pub(crate) unsafe extern "C" fn finalize_bigint_shell(object: *mut u8) {
+    if object.is_null() {
+        return;
+    }
+    BIG_INTS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .remove(&(object as usize));
+}
+
 /// Returns true when `object` has a runtime type whose name bytes match `expected`.
 #[must_use]
 pub unsafe fn type_name_is(object: *mut PyObject, expected: &str) -> bool {

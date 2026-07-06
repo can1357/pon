@@ -1366,21 +1366,10 @@ pub unsafe extern "C" fn pon_raise_attribute_error(obj: *mut PyObject, name: u32
 	crate::untag_prelude!(obj);
 	super::catch_object_helper(|| {
 		let attribute = intern::resolve(name).unwrap_or_else(|| format!("<intern:{name}>"));
-		let object_name = if obj.is_null() {
-			"NULL".to_owned()
-		} else if is_diagnostic_sentinel(obj) {
-			"diagnostic".to_owned()
-		} else {
-			// SAFETY: A non-NULL non-sentinel `obj` is expected to be a live boxed object.
-			unsafe {
-				let ty = (*obj).ob_type;
-				if ty.is_null() {
-					"object".to_owned()
-				} else {
-					(*ty).name().to_owned()
-				}
-			}
-		};
+		if name == crate::intern::intern("type") {
+			eprintln!("[pon-diag] raise attr type on {:p}\n{}", obj, std::backtrace::Backtrace::force_capture());
+		}
+		let object_name = unsafe { safe_object_type_name(obj) };
 		let text = format!("'{object_name}' object has no attribute '{attribute}'");
 		match ensure_runtime_for_exc() {
 			Ok(()) => match super::with_runtime(|runtime| {
@@ -1392,6 +1381,16 @@ pub unsafe extern "C" fn pon_raise_attribute_error(obj: *mut PyObject, name: u32
 			Err(message) => super::return_null_with_error(message),
 		}
 	})
+}
+
+unsafe fn safe_object_type_name(obj: *mut PyObject) -> String {
+	if obj.is_null() {
+		return "NULL".to_owned();
+	}
+	if is_diagnostic_sentinel(obj) {
+		return "diagnostic".to_owned();
+	}
+	"object".to_owned()
 }
 
 /// Raises `StopIteration(value)` and returns NULL.

@@ -628,10 +628,10 @@ pub unsafe fn unicode_text<'a>(object: *mut PyObject) -> Option<&'a str> {
 /// their existing error/fallthrough paths).
 unsafe fn object_type(object: *mut PyObject) -> *mut PyType {
     if object.is_null() || !crate::tag::is_heap(object) {
-        ptr::null_mut()
-    } else {
-        unsafe { (*object).ob_type.cast_mut() }
+        return ptr::null_mut();
     }
+    let ty = unsafe { (*object).ob_type.cast_mut() };
+    crate::capi::twin::registered_native_of_foreign(ty.cast()).unwrap_or(ty)
 }
 
 /// Copy positional arguments out of the tuple/list carrier used by CPython-style
@@ -2521,7 +2521,10 @@ pub(crate) unsafe fn construction_runs_init(cls: *mut PyType, new: NewFunc, inst
         return false;
     }
     // SAFETY: heap-tagged instances carry a readable header.
-    let instance_type = unsafe { (*instance).ob_type.cast_mut() };
+    let instance_type = crate::capi::twin::registered_native_of_foreign(
+        unsafe { (*instance).ob_type.cast_mut().cast::<crate::capi::twin::ForeignTypeObject>() },
+    )
+    .unwrap_or_else(|| unsafe { (*instance).ob_type.cast_mut() });
     !instance_type.is_null() && unsafe { crate::mro::is_subtype(instance_type, cls) }
 }
 

@@ -1745,7 +1745,7 @@ pub(crate) fn alloc_heap_instance(
 /// occupied slot is visible while `sys` and the other eager modules are
 /// still missing.  Treating "slot occupied" as "initialized" let a second
 /// initializer race into `pon_sys_set_argv` during that window and fail
-/// with "sys module is not initialized" (pon-pm PEP 517 hook flake).
+/// with "sys module is not initialized" (package-manager PEP 517 hook flake).
 ///
 /// The gate closes the window: exactly one thread performs initialization;
 /// concurrent callers block until it reaches `Ready` (or `Failed`), while
@@ -1934,7 +1934,7 @@ fn register_gc_types(heap: &Heap) {
 	heap.register_type(TYPE_ID_LONG, GcTypeInfo {
 		size:     mem::size_of::<PyLong>(),
 		trace:    trace_no_refs,
-		finalize: None,
+		finalize: Some(crate::types::int::finalize_bigint_shell),
 	});
 	heap.register_type(TYPE_ID_UNICODE, GcTypeInfo {
 		size:     mem::size_of::<PyUnicode>(),
@@ -4432,10 +4432,10 @@ pub unsafe extern "C" fn pon_call(
 			} else if object_type_name(callee).as_deref() == Some("method") {
 				Ok(CallTarget::Method)
 			} else if !callee.is_null()
-				&& !(*callee).ob_type.is_null()
-				&& (*(*callee).ob_type).tp_call.is_some()
+				&& !runtime_object_type(callee).is_null()
+				&& (*runtime_object_type(callee)).tp_call.is_some()
 			{
-				Ok(CallTarget::Slot((*(*callee).ob_type).tp_call.expect("checked Some")))
+				Ok(CallTarget::Slot((*runtime_object_type(callee)).tp_call.expect("checked Some")))
 			} else if !callee.is_null() && !(*callee).ob_type.is_null() {
 				Ok(CallTarget::DunderCall)
 			} else {
@@ -4961,6 +4961,10 @@ unsafe fn call_type_from_argv(
 	argv: *mut *mut PyObject,
 	argc: usize,
 ) -> *mut PyObject {
+	let callee = crate::capi::twin::registered_native_of_foreign(
+		callee.cast::<crate::capi::twin::ForeignTypeObject>(),
+	)
+	.map_or(callee, |native| native.cast::<PyObject>());
 	let args = match unsafe { argv_slice(argv, argc) } {
 		Ok(args) => args,
 		Err(message) => return return_null_with_error(message),
@@ -5115,7 +5119,7 @@ unsafe fn is_runtime_type_object(runtime: &Runtime, object: *mut PyObject) -> bo
 	if object.is_null() {
 		return false;
 	}
-	let meta = unsafe { (*object).ob_type.cast_mut() };
+	let meta = unsafe { runtime_object_type(object) };
 	!meta.is_null() && unsafe { crate::mro::is_subtype(meta, runtime._type_type) }
 }
 
@@ -5123,12 +5127,20 @@ unsafe fn object_type_name(object: *mut PyObject) -> Option<String> {
 	if object.is_null() {
 		return None;
 	}
-	let ty = unsafe { (*object).ob_type };
+	let ty = unsafe { runtime_object_type(object) };
 	if ty.is_null() {
 		None
 	} else {
 		Some(unsafe { (*ty).name() }.to_owned())
 	}
+}
+
+unsafe fn runtime_object_type(object: *mut PyObject) -> *mut PyType {
+	if object.is_null() {
+		return ptr::null_mut();
+	}
+	let ty = unsafe { (*object).ob_type.cast_mut() };
+	crate::capi::twin::registered_native_of_foreign(ty.cast()).unwrap_or(ty)
 }
 
 /// Loads the builtin `__build_class__` callable.

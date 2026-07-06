@@ -8,6 +8,7 @@ use std::sync::LazyLock;
 
 use num_bigint::BigInt;
 
+use crate::capi::twin;
 use crate::object::{PyMappingMethods, PyNumberMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType, PyUnicode};
 use crate::thread_state::pon_err_set;
 use core::ops::RangeInclusive;
@@ -1020,7 +1021,25 @@ pub unsafe fn type_name(object: *mut PyObject) -> Option<&'static str> {
     if ty.is_null() {
         return None;
     }
-    Some(unsafe { core::mem::transmute::<&str, &'static str>((*ty).name()) })
+    if let Some(native) = twin::registered_native_of_foreign(ty.cast_mut().cast()) {
+        return Some(unsafe { static_type_name(native) });
+    }
+    if let Some(name) = unsafe { native_type_name_if_plausible(ty) } {
+        return Some(name);
+    }
+    Some("object")
+}
+
+unsafe fn static_type_name(ty: *const PyType) -> &'static str {
+    unsafe { core::mem::transmute::<&str, &'static str>((*ty).name()) }
+}
+
+unsafe fn native_type_name_if_plausible(ty: *const PyType) -> Option<&'static str> {
+    let type_ref = unsafe { &*ty };
+    if type_ref.name.is_null() || type_ref.name_len == 0 || type_ref.name_len > 256 {
+        return None;
+    }
+    Some(unsafe { static_type_name(ty) })
 }
 
 /// Storage-shape witness for the deferred-equality probe: any key-structure

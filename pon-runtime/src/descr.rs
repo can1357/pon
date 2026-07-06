@@ -39,10 +39,10 @@ fn raise_attr_status(message: impl Into<String>) -> c_int {
 /// the tag-discipline contract for this module's entry points.
 unsafe fn object_type(object: *mut PyObject) -> *mut PyType {
 	if object.is_null() || !crate::tag::is_heap(object) {
-		ptr::null_mut()
-	} else {
-		unsafe { (*object).ob_type.cast_mut() }
+		return ptr::null_mut();
 	}
+	let ty = unsafe { (*object).ob_type.cast_mut() };
+	crate::capi::twin::registered_native_of_foreign(ty.cast()).unwrap_or(ty)
 }
 
 unsafe fn name_id(name: *mut PyObject) -> Option<u32> {
@@ -1015,6 +1015,10 @@ pub unsafe fn generic_get_attr_cached(
 		}
 		return base.cast::<PyObject>();
 	}
+	if is_type && name_id == intern::intern("__flags__") {
+		let flags = unsafe { (*object.cast::<PyType>()).tp_flags };
+		return unsafe { abi::pon_const_int(flags as i64) };
+	}
 	if is_type && name_id == intern::intern("__subclasses__") {
 		return unsafe { type_subclasses_method(object) };
 	}
@@ -1177,6 +1181,23 @@ pub unsafe fn generic_get_attr_cached(
 		}
 		crate::thread_state::pon_err_clear();
 		return unsafe { abi::pon_none() };
+	}
+	if name_id == intern::intern("type") {
+		let dict_has = if let Some(dict) = unsafe { dict_from_ptr((*obj_ty).tp_dict) } {
+			dict.get(name_id).is_some()
+		} else {
+			false
+		};
+		eprintln!(
+			"[pon-diag] missing type attr: object {:p} obj_ty {:p} name {} capi {} dict {:p} dict_has {} known {}",
+			object,
+			obj_ty,
+			unsafe { (*obj_ty).name() },
+			unsafe { crate::capi::is_capi_class(obj_ty) },
+			unsafe { (*obj_ty).tp_dict },
+			dict_has,
+			crate::sync::namespaced_types().contains(&obj_ty),
+		);
 	}
 	unsafe { abi::pon_raise_attribute_error(object, name_id) }
 }

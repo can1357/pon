@@ -1741,6 +1741,14 @@ pub unsafe extern "C" fn builtin_issubclass(
 /// metaclass `__subclasscheck__` semantics; bare native shims keep the
 /// historical name comparison.  Returns 1/0 and -1 with a pending exception.
 unsafe fn class_is_subclass(cls: *mut PyObject, classinfo: *mut PyObject) -> c_int {
+	let cls = crate::capi::twin::registered_native_of_foreign(
+		cls.cast::<crate::capi::twin::ForeignTypeObject>(),
+	)
+	.map_or(cls, |native| native.cast::<PyObject>());
+	let classinfo = crate::capi::twin::registered_native_of_foreign(
+		classinfo.cast::<crate::capi::twin::ForeignTypeObject>(),
+	)
+	.map_or(classinfo, |native| native.cast::<PyObject>());
 	if let Some(entries) = unsafe { exact_tuple_entries(classinfo) } {
 		for entry in entries.iter().copied() {
 			let result = unsafe { class_is_subclass(cls, entry) };
@@ -1761,7 +1769,10 @@ unsafe fn is_real_class(object: *mut PyObject) -> bool {
 	if object.is_null() {
 		return false;
 	}
-	let meta = unsafe { (*object).ob_type.cast_mut() };
+	let meta = crate::capi::twin::registered_native_of_foreign(
+		unsafe { (*object).ob_type.cast_mut().cast::<crate::capi::twin::ForeignTypeObject>() },
+	)
+	.unwrap_or_else(|| unsafe { (*object).ob_type.cast_mut() });
 	!meta.is_null() && unsafe { crate::mro::is_subtype(meta, abi::runtime_type_type()) }
 }
 
@@ -3293,6 +3304,10 @@ unsafe fn object_is_instance(object: *mut PyObject, classinfo: *mut PyObject) ->
 	if object.is_null() || classinfo.is_null() {
 		return 0;
 	}
+	let classinfo = crate::capi::twin::registered_native_of_foreign(
+		classinfo.cast::<crate::capi::twin::ForeignTypeObject>(),
+	)
+	.map_or(classinfo, |native| native.cast::<PyObject>());
 	// `type(obj) is cls` wins before any dispatch, so a metaclass
 	// `__instancecheck__` hook is NOT consulted for exact matches.
 	if unsafe { (*object).ob_type }.cast_mut().cast::<PyObject>() == classinfo {
