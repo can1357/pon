@@ -4,7 +4,7 @@
 //! Pre-fix, `init_runtime` published the runtime singleton and released the
 //! runtime mutex BEFORE eager native-module registration ran, so a concurrent
 //! `pon_runtime_init()` caller saw the occupied slot, returned 0, and then hit
-//! "sys module is not initialized" in `pon_sys_set_argv` (pon-pm PEP 517 hook
+//! "sys module is not initialized" in `pon_sys_set_argv` (package-manager PEP 517
 //! flake). Contract: init returning 0 on ANY thread implies the eager runtime
 //! surface — in particular the cached `sys` module — is visible to that thread.
 

@@ -5,7 +5,7 @@ from pathlib import Path
 import subprocess
 
 ROOT = Path('/work/pon')
-PON = Path('/Users/can/.cache/cargo-target/debug/pon-cli')
+PON = Path('/Users/can/.cache/cargo-target/debug/pon')
 TMP = ROOT / 'tmp'
 TARGETS = [
     ('concurrent.futures', TMP / 'stress_concurrent_futures.py'),

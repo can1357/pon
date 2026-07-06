@@ -94,8 +94,8 @@ unsafe fn pon_aot_entry_impl(argc: i32, argv: *const *const u8) -> i32 {
 		return 1;
 	}
 
-	// Mirror the JIT driver (pon-cli `run_file_inner`): top-level code executes
-	// inside a `__main__` module-execution context. The globals()/compiled-slot
+	// Mirror the JIT driver (`pon run`): top-level code executes inside a
+	// `__main__` module-execution context. The globals()/compiled-slot
 	// coherence hooks (`sync_globals_dict_set`,
 	// `sync_global_store_for_active_module`) all key on `active_module_name_id()`;
 	// without this context a dict write through globals() never lands in the store

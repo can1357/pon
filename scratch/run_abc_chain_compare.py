@@ -5,7 +5,7 @@ import subprocess
 
 ROOT = Path('/work/pon')
 PROBE = ROOT / 'tmp' / 'abc_chain_probe.py'
-PON = Path('/Users/can/.cache/cargo-target/debug/pon-cli')
+PON = Path('/Users/can/.cache/cargo-target/debug/pon')
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

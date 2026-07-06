@@ -225,7 +225,7 @@ impl JitEngine {
 /// Compile source text for the runtime dynamic-execution seam.
 ///
 /// `filename` and `mode` are retained for diagnostics and future mode-specific
-/// lowering; today the parser accepts the same module grammar as `pon-cli run`.
+/// lowering; today the parser accepts the same module grammar as `pon run`.
 pub fn compile_source_to_module(
 	source: &str,
 	filename: &str,
