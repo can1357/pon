@@ -49,6 +49,7 @@ mod operator_;
 pub(crate) mod os;
 mod packaging_compat;
 pub(crate) mod pickle;
+mod pon_mod;
 mod posix;
 mod posixshmem;
 mod posixsubprocess;
@@ -172,6 +173,7 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
 	("os.path", os::make_path_module),
 	("packaging._manylinux", packaging_compat::make_manylinux_module),
 	("packaging._musllinux", packaging_compat::make_musllinux_module),
+	("pon", pon_mod::make_module),
 	("pwd", pwd::make_module),
 	("posix", posix::make_module),
 	("readline", readline::make_module),

@@ -11,6 +11,7 @@ pub mod dynexec;
 pub mod feedback;
 pub(crate) mod gcroot;
 pub mod import;
+pub mod inspect;
 pub mod intern;
 pub mod mro;
 pub mod native;
