@@ -715,7 +715,8 @@ unsafe fn call_args<'a>(argv: *mut *mut PyObject, argc: usize) -> &'a [*mut PyOb
 
 fn product_boundary(feature: &str) -> *mut PyObject {
 	unsupported(&format!(
-		"_posixsubprocess.fork_exec product boundary: {feature} requires fork-only child-side behavior; pon uses posix_spawn and does not run child mutation code after fork"
+		"_posixsubprocess.fork_exec product boundary: {feature} requires fork-only child-side \
+		 behavior; pon uses posix_spawn and does not run child mutation code after fork"
 	))
 }
 

@@ -302,9 +302,8 @@ fn meta_path_attr() -> Result<(u32, *mut PyObject), String> {
 fn path_hooks_attr() -> Result<(u32, *mut PyObject), String> {
 	static HOOKS: std::sync::LazyLock<Result<usize, String>> = std::sync::LazyLock::new(|| {
 		crate::native::imp::make_source_importer_module()?;
-		let hook =
-			crate::import::module_attr(intern("_pon_source_importer"), intern("path_hook"))
-				.ok_or_else(|| "failed to load _pon_source_importer.path_hook".to_owned())?;
+		let hook = crate::import::module_attr(intern("_pon_source_importer"), intern("path_hook"))
+			.ok_or_else(|| "failed to load _pon_source_importer.path_hook".to_owned())?;
 		let mut items = [hook];
 		let list = unsafe { crate::abi::seq::pon_build_list(items.as_mut_ptr(), items.len()) };
 		if list.is_null() {

@@ -1485,11 +1485,11 @@ const SEEK_POSITIONS: &[(&str, i32)] =
 /// `os.environ`/`posix.environ` binding that still carries dict storage.
 ///
 /// Remaining documented divergences: `repr(os.environ)` is the dict repr, not
-/// CPython's `environ({...})`; `os.environb` is still a separate bytes snapshot;
-/// `posix.environ` is str-keyed like `os.environ` rather than CPython's raw
-/// bytes table; non-UTF-8 inherited entries are decoded lossily rather than
-/// with CPython's `surrogateescape`; and explicit base-dict calls such as
-/// `dict.__setitem__(os.environ, ...)` bypass write-through.
+/// CPython's `environ({...})`; `os.environb` is still a separate bytes
+/// snapshot; `posix.environ` is str-keyed like `os.environ` rather than
+/// CPython's raw bytes table; non-UTF-8 inherited entries are decoded lossily
+/// rather than with CPython's `surrogateescape`; and explicit base-dict calls
+/// such as `dict.__setitem__(os.environ, ...)` bypass write-through.
 fn environ_mapping(module: &str) -> Result<*mut PyObject, String> {
 	let class = environ_type()?;
 	let namespace = crate::types::type_::new_namespace();
@@ -1538,9 +1538,15 @@ fn environ_type() -> Result<*mut PyObject, String> {
 	];
 	for &(method, entry) in natives {
 		let interned = intern(method);
-		// SAFETY: `entry` is a live builtin entry point with the runtime calling convention.
-		let function =
-			unsafe { crate::abi::pon_make_function(entry as *const u8, crate::builtins::variadic_arity(), interned) };
+		// SAFETY: `entry` is a live builtin entry point with the runtime calling
+		// convention.
+		let function = unsafe {
+			crate::abi::pon_make_function(
+				entry as *const u8,
+				crate::builtins::variadic_arity(),
+				interned,
+			)
+		};
 		if function.is_null() {
 			return Err(format!("failed to allocate os._Environ.{method}"));
 		}
@@ -1639,10 +1645,7 @@ unsafe extern "C" fn environ_setdefault_method(
 	}
 }
 
-unsafe extern "C" fn environ_pop_method(
-	argv: *mut *mut PyObject,
-	argc: usize,
-) -> *mut PyObject {
+unsafe extern "C" fn environ_pop_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 	let (receiver, args) = match unsafe { environ_method_args(argv, argc, "pop") } {
 		Ok(pair) => pair,
 		Err(raised) => return raised,
@@ -1702,10 +1705,7 @@ unsafe extern "C" fn environ_popitem_method(
 	unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) }
 }
 
-unsafe extern "C" fn environ_clear_method(
-	argv: *mut *mut PyObject,
-	argc: usize,
-) -> *mut PyObject {
+unsafe extern "C" fn environ_clear_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 	let (receiver, args) = match unsafe { environ_method_args(argv, argc, "clear") } {
 		Ok(pair) => pair,
 		Err(raised) => return raised,
@@ -1728,10 +1728,7 @@ unsafe extern "C" fn environ_clear_method(
 	unsafe { crate::abi::pon_none() }
 }
 
-unsafe extern "C" fn environ_update_method(
-	argv: *mut *mut PyObject,
-	argc: usize,
-) -> *mut PyObject {
+unsafe extern "C" fn environ_update_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 	let (receiver, args) = match unsafe { environ_method_args(argv, argc, "update") } {
 		Ok(pair) => pair,
 		Err(raised) => return raised,
@@ -1763,7 +1760,9 @@ unsafe extern "C" fn environ_update_method(
 	}
 	for &(name, value) in kw_pairs {
 		let Some(text) = crate::intern::resolve(name) else {
-			return crate::abi::return_null_with_error("os._Environ.update keyword name is not interned");
+			return crate::abi::return_null_with_error(
+				"os._Environ.update keyword name is not interned",
+			);
 		};
 		let key = unsafe { pon_const_str(text.as_ptr(), text.len()) };
 		if key.is_null() {
@@ -1876,7 +1875,8 @@ fn raw_environ_set(
 	key: *mut PyObject,
 	value: *mut PyObject,
 ) -> Result<(), *mut PyObject> {
-	// SAFETY: The caller passes a dict-layout environment object and live key/value objects.
+	// SAFETY: The caller passes a dict-layout environment object and live key/value
+	// objects.
 	if unsafe { crate::abi::map::pon_dict_set_item_status(environ, key, value) } < 0 {
 		return Err(std::ptr::null_mut());
 	}
@@ -1888,7 +1888,8 @@ fn raw_environ_get(
 	key: *mut PyObject,
 ) -> Result<Option<*mut PyObject>, *mut PyObject> {
 	let _guard = crate::sync::begin_critical_section(environ);
-	// SAFETY: The caller passes a dict-layout environment object and a live key object.
+	// SAFETY: The caller passes a dict-layout environment object and a live key
+	// object.
 	match unsafe { crate::types::dict::dict_get(environ, key) } {
 		Ok(value) => Ok(value),
 		Err(message) => Err(crate::abi::return_null_with_error(message)),
@@ -1912,7 +1913,8 @@ fn raw_environ_unset(
 	raise_missing: bool,
 ) -> Result<(), *mut PyObject> {
 	let _guard = crate::sync::begin_critical_section(environ);
-	// SAFETY: The caller passes a dict-layout environment object and a live key object.
+	// SAFETY: The caller passes a dict-layout environment object and a live key
+	// object.
 	match unsafe { crate::types::dict::dict_remove(environ, key) } {
 		Ok(Some(_)) => Ok(()),
 		Ok(None) if raise_missing => Err(unsafe { crate::abi::exc::pon_raise_key_error(key) }),
@@ -1958,12 +1960,16 @@ fn env_set_bytes(name: &[u8], value: &[u8]) -> Result<(), *mut PyObject> {
 	if name.contains(&0) || value.contains(&0) {
 		let message = "embedded null byte";
 		// SAFETY: Typed raise helper.
-		return Err(unsafe { crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) });
+		return Err(unsafe {
+			crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len())
+		});
 	}
 	if name.contains(&b'=') {
 		let message = "illegal environment variable name";
 		// SAFETY: Typed raise helper.
-		return Err(unsafe { crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) });
+		return Err(unsafe {
+			crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len())
+		});
 	}
 	if name.is_empty() {
 		// macOS setenv(3) rejects an empty name; CPython surfaces the errno.
@@ -1984,10 +1990,13 @@ fn env_unset_bytes(name: &[u8]) -> Result<(), *mut PyObject> {
 	if name.contains(&0) {
 		let message = "embedded null byte";
 		// SAFETY: Typed raise helper.
-		return Err(unsafe { crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) });
+		return Err(unsafe {
+			crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len())
+		});
 	}
 	if name.is_empty() || name.contains(&b'=') {
-		// macOS unsetenv(3) rejects empty names and embedded '='; CPython surfaces the errno.
+		// macOS unsetenv(3) rejects empty names and embedded '='; CPython surfaces the
+		// errno.
 		return Err(raise_errno(libc::EINVAL, None));
 	}
 	use std::os::unix::ffi::OsStrExt;
@@ -7762,9 +7771,9 @@ unsafe fn env_bytes_arg(slot: *mut PyObject, what: &str) -> Result<Vec<u8>, *mut
 	Err(fs_codec_hook_type_error(what, raw))
 }
 
-/// `os.putenv(name, value)` / `posix.putenv`: writes through to the real process
-/// environment and keeps cached `os.environ`/`posix.environ` dict-layout
-/// bindings coherent with the new value.
+/// `os.putenv(name, value)` / `posix.putenv`: writes through to the real
+/// process environment and keeps cached `os.environ`/`posix.environ`
+/// dict-layout bindings coherent with the new value.
 unsafe extern "C" fn os_putenv(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 	if argc != 2 || argv.is_null() {
 		return crate::abi::return_null_with_error(format!(

@@ -1088,8 +1088,9 @@ impl SourceLocation {
 		let display_path = self.display_path();
 		let filename = display_path.to_string_lossy();
 		let bytes = match self {
-			Self::File(path) => fs::read(path)
-				.map_err(|error| format!("failed to read source module '{}': {error}", path.display()))?,
+			Self::File(path) => fs::read(path).map_err(|error| {
+				format!("failed to read source module '{}': {error}", path.display())
+			})?,
 			Self::Zip { archive, member } => read_zip_member(archive, member)?,
 		};
 		crate::dynexec::decode_python_source(&bytes, &filename)
@@ -1110,7 +1111,11 @@ impl SourceSpec {
 	}
 
 	fn namespace(search_locations: Vec<PathBuf>) -> Self {
-		Self { location: None, is_package: true, search_locations: Some(search_locations) }
+		Self {
+			location:         None,
+			is_package:       true,
+			search_locations: Some(search_locations),
+		}
 	}
 }
 
@@ -1200,7 +1205,8 @@ unsafe extern "C" fn path_entry_finder_getattro(
 	object: *mut PyObject,
 	name: *mut PyObject,
 ) -> *mut PyObject {
-	let Some(name_text) = (unsafe { crate::types::type_::unicode_text(crate::tag::untag_arg(name)) })
+	let Some(name_text) =
+		(unsafe { crate::types::type_::unicode_text(crate::tag::untag_arg(name)) })
 	else {
 		return return_null_with_error("attribute name must be str");
 	};
@@ -1265,14 +1271,10 @@ unsafe fn finder_receiver_and_args<'a>(
 	}
 	let args = unsafe { core::slice::from_raw_parts(argv, argc) };
 	let Some((&receiver, rest)) = args.split_first() else {
-		return Err(return_null_with_error(format!(
-			"PathEntryFinder.{method} requires a receiver"
-		)));
+		return Err(return_null_with_error(format!("PathEntryFinder.{method} requires a receiver")));
 	};
 	let Some(finder) = (unsafe { as_path_entry_finder(receiver) }) else {
-		return Err(return_null_with_error(format!(
-			"PathEntryFinder.{method} receiver is invalid"
-		)));
+		return Err(return_null_with_error(format!("PathEntryFinder.{method} receiver is invalid")));
 	};
 	Ok((finder, rest))
 }
@@ -1334,7 +1336,8 @@ unsafe extern "C" fn path_entry_finder_invalidate_method(
 	argv: *mut *mut PyObject,
 	argc: usize,
 ) -> *mut PyObject {
-	let (_finder, args) = match unsafe { finder_receiver_and_args(argv, argc, "invalidate_caches") } {
+	let (_finder, args) = match unsafe { finder_receiver_and_args(argv, argc, "invalidate_caches") }
+	{
 		Ok(pair) => pair,
 		Err(raised) => return raised,
 	};
@@ -1449,7 +1452,10 @@ fn find_zip_source(archive: &Path, prefix: &str, relative: &str) -> Option<Sourc
 		));
 	}
 	let namespace_prefix = format!("{}/", base.trim_end_matches('/'));
-	if zip.file_names().any(|name| name.starts_with(&namespace_prefix)) {
+	if zip
+		.file_names()
+		.any(|name| name.starts_with(&namespace_prefix))
+	{
 		return Some(SourceSpec::namespace(vec![archive.join(base)]));
 	}
 	None
@@ -1473,19 +1479,11 @@ fn open_zip_archive(path: &Path) -> Result<zip::ZipArchive<fs::File>, String> {
 fn read_zip_member(archive: &Path, member: &str) -> Result<Vec<u8>, String> {
 	let mut zip = open_zip_archive(archive)?;
 	let mut file = zip.by_name(member).map_err(|error| {
-		format!(
-			"failed to read zip member '{}:{}': {error}",
-			archive.display(),
-			member
-		)
+		format!("failed to read zip member '{}:{}': {error}", archive.display(), member)
 	})?;
 	let mut bytes = Vec::with_capacity(file.size().try_into().unwrap_or(0));
 	file.read_to_end(&mut bytes).map_err(|error| {
-		format!(
-			"failed to read zip member '{}:{}': {error}",
-			archive.display(),
-			member
-		)
+		format!("failed to read zip member '{}:{}': {error}", archive.display(), member)
 	})?;
 	Ok(bytes)
 }
@@ -1669,9 +1667,8 @@ fn iter_directory_modules(root: &Path, prefix: &str) -> Result<Vec<ModuleIterEnt
 	};
 	let mut names = Vec::new();
 	for entry in entries {
-		let entry = entry.map_err(|error| {
-			format!("failed to list import path '{}': {error}", root.display())
-		})?;
+		let entry = entry
+			.map_err(|error| format!("failed to list import path '{}': {error}", root.display()))?;
 		names.push(entry.file_name().to_string_lossy().into_owned());
 	}
 	names.sort();
@@ -1695,10 +1692,7 @@ fn iter_directory_modules(root: &Path, prefix: &str) -> Result<Vec<ModuleIterEnt
 			continue;
 		}
 		if yielded.insert(stem.to_owned()) {
-			out.push(ModuleIterEntry {
-				name:       format!("{prefix}{stem}"),
-				is_package: false,
-			});
+			out.push(ModuleIterEntry { name: format!("{prefix}{stem}"), is_package: false });
 		}
 	}
 	Ok(out)
@@ -1741,10 +1735,7 @@ fn iter_zip_modules(
 			continue;
 		}
 		if yielded.insert(stem.to_owned()) {
-			out.push(ModuleIterEntry {
-				name:       format!("{prefix}{stem}"),
-				is_package: false,
-			});
+			out.push(ModuleIterEntry { name: format!("{prefix}{stem}"), is_package: false });
 		}
 	}
 	Ok(out)
@@ -1759,9 +1750,8 @@ fn list_from_module_iter_entries(entries: &[ModuleIterEntry]) -> *mut PyObject {
 		};
 		let is_package = unsafe { crate::abi::number::pon_const_bool(c_int::from(entry.is_package)) };
 		let mut tuple_items = [name, is_package];
-		let tuple = unsafe {
-			crate::abi::seq::pon_build_tuple(tuple_items.as_mut_ptr(), tuple_items.len())
-		};
+		let tuple =
+			unsafe { crate::abi::seq::pon_build_tuple(tuple_items.as_mut_ptr(), tuple_items.len()) };
 		if tuple.is_null() {
 			return ptr::null_mut();
 		}
@@ -2127,7 +2117,11 @@ pub(crate) fn source_module_file_path(name: &str) -> Option<PathBuf> {
 	{
 		return None;
 	}
-	find_source_module(name).and_then(|spec| spec.location.and_then(|location| location.filesystem_path()))
+	find_source_module(name).and_then(|spec| {
+		spec
+			.location
+			.and_then(|location| location.filesystem_path())
+	})
 }
 
 /// Imports `name` and returns exactly that module — never the root-package
@@ -2435,7 +2429,10 @@ fn source_module_attrs(spec: &SourceSpec) -> Result<Vec<(u32, *mut PyObject)>, S
 	let mut attrs = Vec::with_capacity(2);
 	if let Some(location) = spec.location.as_ref() {
 		let path = location.display_path();
-		let file_path = location.filesystem_path().and_then(|path| std::path::absolute(&path).ok()).unwrap_or(path);
+		let file_path = location
+			.filesystem_path()
+			.and_then(|path| std::path::absolute(&path).ok())
+			.unwrap_or(path);
 		attrs.push((intern("__file__"), runtime_string(&file_path.to_string_lossy())?));
 	} else {
 		attrs.push((intern("__file__"), unsafe { pon_none() }));
