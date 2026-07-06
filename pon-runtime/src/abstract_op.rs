@@ -14,7 +14,9 @@ use core::{ffi::c_int, mem, ptr};
 
 use crate::{
 	abi,
-	object::{BinaryFunc, PyLong, PyObject, PyType, PyUnicode, RichCmpFunc, UnaryFunc},
+	object::{
+		BinaryFunc, PyLong, PyObject, PyType, PyUnicode, RichCmpFunc, UnaryFunc, is_exact_type,
+	},
 	thread_state::pon_err_occurred,
 };
 
@@ -289,7 +291,10 @@ pub unsafe fn rich_compare(op: u8, a: *mut PyObject, b: *mut PyObject) -> *mut P
 		return raise_type_error("right operand is NULL or has no type");
 	};
 
-	if unsafe { (*left_type).name() == "str" && (*right_type).name() == "str" } {
+	let unicode_type = abi::runtime_unicode_type();
+	if !unicode_type.is_null()
+		&& unsafe { is_exact_type(a, unicode_type) && is_exact_type(b, unicode_type) }
+	{
 		let left = unsafe { unicode_bytes(&*a.cast::<PyUnicode>()) };
 		let right = unsafe { unicode_bytes(&*b.cast::<PyUnicode>()) };
 		let result = match op {
@@ -614,7 +619,8 @@ pub unsafe fn is_true(object: *mut PyObject) -> i32 {
 		return i32::from(unsafe { (*object.cast::<PyLong>()).value != 0 });
 	}
 
-	if unsafe { (*ty).name() == "NoneType" } {
+	let none_type = abi::runtime_none_type();
+	if !none_type.is_null() && unsafe { is_exact_type(object, none_type) } {
 		return 0;
 	}
 

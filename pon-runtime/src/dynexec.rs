@@ -141,7 +141,7 @@ fn alloc_code_object(source: String, filename: String, mode: DynCodeMode) -> *mu
 }
 
 unsafe fn as_code_object<'a>(object: *mut PyObject) -> Option<&'a PyCodeObject> {
-	if object.is_null() || unsafe { !int::type_name_is(object, "code") } {
+	if unsafe { !is_exact_type(object, code_type()) } {
 		return None;
 	}
 	Some(unsafe { &*object.cast::<PyCodeObject>() })
@@ -200,7 +200,8 @@ fn argv_slice<'a>(
 }
 
 unsafe fn str_text(object: *mut PyObject) -> Option<String> {
-	if unsafe { !int::type_name_is(object, "str") } {
+	let unicode_type = abi::runtime_unicode_type();
+	if unicode_type.is_null() || unsafe { !is_exact_type(object, unicode_type) } {
 		return None;
 	}
 	let unicode = unsafe { &*object.cast::<PyUnicode>() };
@@ -1275,10 +1276,8 @@ fn collect_fromlist_names(fromlist: *mut PyObject, out: &mut Vec<u32>) {
 	if fromlist.is_null() {
 		return;
 	}
-	if unsafe { int::type_name_is(fromlist, "str") } {
-		if let Some(text) = unsafe { str_text(fromlist) } {
-			out.push(intern(&text));
-		}
+	if let Some(text) = unsafe { str_text(fromlist) } {
+		out.push(intern(&text));
 		return;
 	}
 	let iter = unsafe { abi::pon_get_iter(fromlist, ptr::null_mut()) };

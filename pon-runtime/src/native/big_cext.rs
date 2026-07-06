@@ -252,15 +252,13 @@ fn sequence_items(object: *mut PyObject, name: &str) -> Result<Vec<*mut PyObject
 	if object.is_null() {
 		return Err(type_error(&format!("{name} must be a sequence")));
 	}
-	match unsafe { crate::types::dict::type_name(object) } {
-		Some("list") => {
-			Ok(unsafe { (*object.cast::<crate::types::list::PyList>()).as_slice() }.to_vec())
-		},
-		Some("tuple") => {
-			Ok(unsafe { (*object.cast::<crate::types::tuple::PyTuple>()).as_slice() }.to_vec())
-		},
-		_ => Err(type_error(&format!("{name} must be a sequence, not '{}'", type_name(object)))),
+	if let Some(items) = unsafe { abi::seq::exact_list_slice(object) } {
+		return Ok(items.to_vec());
 	}
+	if let Some(items) = unsafe { abi::seq::exact_tuple_slice(object) } {
+		return Ok(items.to_vec());
+	}
+	Err(type_error(&format!("{name} must be a sequence, not '{}'", type_name(object))))
 }
 
 fn optional_attr(object: *mut PyObject, name: &str) -> Option<*mut PyObject> {
@@ -659,8 +657,7 @@ fn sqlite_params_from_object(
 	if let Some(items) = unsafe { abi::seq::tuple_storage_slice(object) } {
 		return items.iter().copied().map(sqlite_py_to_value).collect();
 	}
-	if unsafe { crate::types::int::type_name_is(object, "list") } {
-		let items = unsafe { (&*object.cast::<crate::types::list::PyList>()).as_slice() };
+	if let Some(items) = unsafe { abi::seq::exact_list_slice(object) } {
 		return items.iter().copied().map(sqlite_py_to_value).collect();
 	}
 	Err(type_error("parameters must be a sequence"))

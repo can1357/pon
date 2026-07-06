@@ -1207,7 +1207,11 @@ fn type_name(object: *mut PyObject) -> &'static str {
 	}
 	// Tagged small-int immediates carry no dereferenceable header.
 	if !crate::tag::is_heap(object) {
-		return if crate::tag::is_small_int(object) { "int" } else { "object" };
+		return if crate::tag::is_small_int(object) {
+			"int"
+		} else {
+			"object"
+		};
 	}
 	let ty = unsafe { (*object).ob_type };
 	if ty.is_null() {

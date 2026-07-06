@@ -22,7 +22,7 @@ use crate::{
 	thread_state::{pon_err_clear, pon_err_message},
 	types::{
 		bool_ as bool_type, bytearray_ as bytearray_type, bytes_ as bytes_type, float as float_type,
-		int as int_type, str_ as str_type, tuple::PyTuple, type_,
+		int as int_type, str_ as str_type, type_,
 	},
 };
 
@@ -1279,10 +1279,10 @@ fn is_template(value: *mut PyObject) -> bool {
 }
 
 fn tuple_items(object: *mut PyObject) -> Result<&'static [*mut PyObject], String> {
-	if object.is_null() || type_name(object) != "tuple" {
+	let Some(items) = (unsafe { super::seq::exact_tuple_slice(object) }) else {
 		return Err("expected tuple".to_owned());
-	}
-	Ok(unsafe { (&*object.cast::<PyTuple>()).as_slice() })
+	};
+	Ok(items)
 }
 
 fn raw_bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {

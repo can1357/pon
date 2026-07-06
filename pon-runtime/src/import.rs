@@ -27,7 +27,7 @@ use crate::{
 		return_minus_one_with_error, return_null_with_error,
 	},
 	intern::{intern, resolve},
-	object::{PyObject, PyObjectHeader, PyType, PyUnicode, as_object_ptr},
+	object::{PyObject, PyObjectHeader, PyType, PyUnicode, as_object_ptr, is_exact_type},
 	thread_state::{pon_err_clear, pon_err_occurred},
 };
 
@@ -449,23 +449,15 @@ pub unsafe extern "C" fn pon_import_star(module: *mut PyObject) -> *mut PyObject
 /// exact).  A copy, not a borrow: the star-import caller re-enters runtime
 /// code between elements, which may reallocate a list's storage.
 fn sequence_items(object: *mut PyObject) -> Option<Vec<*mut PyObject>> {
-	// SAFETY: Type-name probes tolerate any live object; the casts below are
-	// guarded by the exact layout checks, and the slices are copied before
-	// the borrow ends.
+	// SAFETY: `exact_*_slice` guards the concrete storage layout before the
+	// slices are copied; the star-import caller re-enters runtime code between
+	// elements, which may reallocate a list's storage.
 	unsafe {
-		if crate::types::int::type_name_is(object, "tuple") {
-			return Some(
-				(&*object.cast::<crate::types::tuple::PyTuple>())
-					.as_slice()
-					.to_vec(),
-			);
+		if let Some(items) = crate::abi::seq::exact_tuple_slice(object) {
+			return Some(items.to_vec());
 		}
-		if crate::types::int::type_name_is(object, "list") {
-			return Some(
-				(&*object.cast::<crate::types::list::PyList>())
-					.as_slice()
-					.to_vec(),
-			);
+		if let Some(items) = crate::abi::seq::exact_list_slice(object) {
+			return Some(items.to_vec());
 		}
 	}
 	None
@@ -473,12 +465,11 @@ fn sequence_items(object: *mut PyObject) -> Option<Vec<*mut PyObject>> {
 
 /// Exact-`str` payload (no `__str__` dispatch); `None` for other layouts.
 unsafe fn exact_str_text(object: *mut PyObject) -> Option<String> {
-	// SAFETY: Caller passes a live object; the cast is guarded by the exact
-	// layout check.
+	let unicode_type = crate::abi::runtime_unicode_type();
+	if unicode_type.is_null() || unsafe { !is_exact_type(object, unicode_type) } {
+		return None;
+	}
 	unsafe {
-		if !crate::types::int::type_name_is(object, "str") {
-			return None;
-		}
 		let unicode = &*object.cast::<PyUnicode>();
 		if unicode.data.is_null() && unicode.len != 0 {
 			return None;

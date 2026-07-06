@@ -1489,12 +1489,9 @@ fn call_codec_info(
 		return ptr::null_mut();
 	}
 	let result = untag(result);
-	// SAFETY: Heap pointer with a live header.
-	if unsafe { crate::types::dict::type_name(result) } != Some("tuple") {
+	let Some(items) = (unsafe { abi::seq::exact_tuple_slice(result) }) else {
 		return raise_type_error(&format!("codec {method}r must return a tuple"));
-	}
-	// SAFETY: Type check above proved the layout.
-	let items = unsafe { (*result.cast::<crate::types::tuple::PyTuple>()).as_slice() };
+	};
 	match items.first() {
 		Some(&payload) => payload,
 		None => raise_type_error(&format!("codec {method}r must return a non-empty tuple")),
