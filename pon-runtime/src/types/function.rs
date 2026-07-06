@@ -1490,7 +1490,7 @@ fn keyword_name(name: u32) -> String {
     intern::resolve(name).unwrap_or_else(|| name.to_string())
 }
 
-unsafe fn build_tuple_from_slice(values: &[*mut PyObject]) -> Result<*mut PyObject, String> {
+pub(crate) unsafe fn build_tuple_from_slice(values: &[*mut PyObject]) -> Result<*mut PyObject, String> {
     let mut owned = values.to_vec();
     let ptr = if owned.is_empty() {
         ptr::null_mut()
@@ -1505,7 +1505,7 @@ unsafe fn build_tuple_from_slice(values: &[*mut PyObject]) -> Result<*mut PyObje
     }
 }
 
-unsafe fn build_kwargs_dict(pairs: &[(u32, *mut PyObject)]) -> Result<*mut PyObject, String> {
+pub(crate) unsafe fn build_kwargs_dict(pairs: &[(u32, *mut PyObject)]) -> Result<*mut PyObject, String> {
     let mut flat = Vec::with_capacity(pairs.len().saturating_mul(2));
     for (name, value) in pairs {
         let text = keyword_name(*name);

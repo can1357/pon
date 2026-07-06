@@ -393,7 +393,6 @@ pub(crate) fn load_extension_module(name: &str, path: &Path) -> Result<*mut PyOb
 	let path_text = path
 		.to_str()
 		.ok_or_else(|| format!("extension path is not UTF-8: {}", path.display()))?;
-	eprintln!("[pon-diag] load ext {name} {}", path.display());
 	let c_path = CString::new(path_text)
 		.map_err(|_| format!("extension path contains NUL: {}", path.display()))?;
 	let handle = unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
@@ -812,6 +811,27 @@ unsafe extern "C" fn cfunction_call(
 		pin_object(tuple);
 		tuple
 	};
+	// Keyword operands snapshot: tp_call hands kwargs as a dict (or NULL).
+	// The tuple conventions forward the dict itself; the fastcall
+	// convention flattens it into `argv[nargs..]` + a kwnames tuple below.
+	let kwarg_entries: Vec<crate::types::dict::DictEntry> = if _kwargs.is_null() {
+		Vec::new()
+	} else {
+		match unsafe {
+			crate::types::dict::dict_entries_snapshot(crate::tag::untag_arg(_kwargs))
+		} {
+			Ok(entries) => entries,
+			Err(message) => return abi::return_null_with_error(message),
+		}
+	};
+	// CPython: conventions without METH_KEYWORDS reject keyword operands
+	// instead of silently dropping them.
+	if !kwarg_entries.is_empty() && flags & METH_KEYWORDS == 0 {
+		return abi::return_null_with_error(format!(
+			"{}() takes no keyword arguments",
+			crate::intern::resolve(function.name).unwrap_or_default()
+		));
+	}
 	if flags & METH_KEYWORDS != 0 && flags & METH_FASTCALL == 0 {
 		// METH_VARARGS|METH_KEYWORDS: (self, args_tuple, kwargs_dict_or_NULL).
 		let with_keywords: unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut PyObject) -> *mut PyObject =
@@ -834,14 +854,35 @@ unsafe extern "C" fn cfunction_call(
                 // SAFETY: METH_FASTCALL|METH_KEYWORDS certifies the
                 // _PyCFunctionFastWithKeywords signature.
                 unsafe { mem::transmute(method) };
+			// _PyCFunctionFastWithKeywords vectorcall shape: argv holds the
+			// positionals followed by the keyword VALUES, `nargs` counts the
+			// positionals only, and kwnames is a tuple of the keyword name
+			// strings (NULL when no keywords).
+			let mut argv = positional.clone();
+			let mut kwnames = ptr::null_mut();
+			if !kwarg_entries.is_empty() {
+				let mut names: Vec<*mut PyObject> = Vec::with_capacity(kwarg_entries.len());
+				for entry in &kwarg_entries {
+					names.push(foreignize_type_result(entry.key));
+					argv.push(foreignize_type_result(entry.value));
+				}
+				kwnames = unsafe { abi::seq::pon_build_tuple(names.as_mut_ptr(), names.len()) };
+				if kwnames.is_null() {
+					return ptr::null_mut();
+				}
+				pin_object(kwnames);
+			}
 			let result = unsafe {
 				fastcall_kw(
 					self_object,
-					positional.as_ptr(),
+					argv.as_ptr(),
 					positional.len() as isize,
-					ptr::null_mut(),
+					kwnames,
 				)
 			};
+			if !kwnames.is_null() {
+				unpin_object(kwnames);
+			}
 			unpin_object(result);
 			// Faces echoed by C never re-enter pon raw (twin contract).
 			return unsafe { py_normalize_foreign(result) };
