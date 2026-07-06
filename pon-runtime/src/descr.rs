@@ -304,9 +304,15 @@ pub(crate) unsafe fn ensure_builtin_type_surface(ty: *mut PyType) {
 		crate::types::int::ensure_int_type_methods_installed(ty);
 	} else if type_name == "bool" {
 		// `bool.bit_length`-style access inherits int's surface through the
-		// bool→int MRO rung; nothing lands in bool's own tp_dict, keeping
-		// CPython's `bool.bit_length is int.bit_length` identity.
-		crate::types::int::ensure_int_surface_on_global();
+		// bool→int MRO rung; materialize the base (int) surface and register
+		// bool so `lookup_in_type` walks the rung. Nothing lands in bool's
+		// own tp_dict, keeping CPython's `bool.bit_length is int.bit_length`
+		// identity.
+		let base = unsafe { (*ty).tp_base };
+		if !base.is_null() {
+			crate::types::int::ensure_int_type_methods_installed(base);
+		}
+		crate::sync::register_namespaced_type(ty);
 	}
 }
 

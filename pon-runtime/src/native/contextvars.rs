@@ -131,7 +131,11 @@ static TOKEN_TYPE: LazyLock<usize> = LazyLock::new(|| {
 	// SAFETY: `new_namespace` returns a fresh live allocation.
 	unsafe { (*namespace).set(intern("MISSING"), missing_object()) };
 	ty.tp_dict = namespace.cast::<PyObject>();
-	Box::into_raw(Box::new(ty)) as usize
+	let ty = Box::into_raw(Box::new(ty));
+	// Class-attribute reads (`Token.MISSING`) resolve through
+	// `lookup_in_type`, which only walks registered namespaced types.
+	crate::sync::register_namespaced_type(ty);
+	ty as usize
 });
 
 static CONTEXT_TYPE: LazyLock<usize> = LazyLock::new(|| {

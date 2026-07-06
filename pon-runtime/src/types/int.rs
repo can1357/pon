@@ -542,15 +542,6 @@ pub(crate) fn ensure_int_type_methods_installed(ty: *mut PyType) {
 	crate::sync::type_modified(ty);
 }
 
-/// Ensures the GLOBAL `int` type object carries the type-level method
-/// surface.  Trigger for receivers that only reach `int` through their MRO
-/// (`bool.bit_length` after the bool→int base wiring); mirrors
-/// `abi::seq::ensure_list_subclass_surface`.
-pub(crate) fn ensure_int_surface_on_global() {
-	if let Some(ty) = crate::native::builtins_mod::builtin_native_type("int") {
-		ensure_int_type_methods_installed(ty);
-	}
-}
 /// `int.__index__`/`__int__`/`__trunc__`/`__floor__`/`__ceil__`: identity on
 /// exact ints (CPython returns self; the runtime's canonical boxing keeps
 /// value identity).
