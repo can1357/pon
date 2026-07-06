@@ -457,6 +457,26 @@ fn binary_i64(op: NumberOp, left: i64, right: i64) -> *mut PyObject {
 		BINARY_MUL => left
 			.checked_mul(right)
 			.map_or_else(|| binary_i64_fallback(op, left, right), int::from_i64),
+		BINARY_FLOORDIV => {
+			if right == 0 {
+				return raise_zero_division_error("division by zero");
+			}
+			if left == i64::MIN && right == -1 {
+				binary_i64_fallback(op, left, right)
+			} else {
+				int::from_i64(Integer::div_floor(&left, &right))
+			}
+		},
+		BINARY_MOD => {
+			if right == 0 {
+				return raise_zero_division_error("division by zero");
+			}
+			if left == i64::MIN && right == -1 {
+				binary_i64_fallback(op, left, right)
+			} else {
+				int::from_i64(Integer::mod_floor(&left, &right))
+			}
+		},
 		BINARY_AND => int::from_i64(left & right),
 		BINARY_OR => int::from_i64(left | right),
 		BINARY_XOR => int::from_i64(left ^ right),

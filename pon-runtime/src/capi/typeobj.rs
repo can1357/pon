@@ -4282,6 +4282,10 @@ PyMODINIT_FUNC PyInit_capi_fromspec_ext(void) {
 		let drive = module_attr(module_name, intern("drive")).expect("drive registered");
 		let result = unsafe { pon_call(drive, ptr::null_mut(), 0) };
 		assert!(!result.is_null(), "drive() returned NULL: {:?}", pon_err_message());
-		assert_eq!(format_object_for_print(result).as_deref(), Ok("32767"), "C-side bitmask mismatch");
+		assert_eq!(
+			format_object_for_print(result).as_deref(),
+			Ok("32767"),
+			"C-side bitmask mismatch"
+		);
 	}
 }
