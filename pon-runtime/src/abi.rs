@@ -5430,7 +5430,11 @@ unsafe fn call_slot_from_argv(
 			None => return return_null_with_error("runtime is not initialized"),
 		}
 	};
-	unsafe { call(callee, args_object, ptr::null_mut()) }
+	let result = unsafe { call(callee, args_object, ptr::null_mut()) };
+	if result.is_null() && !pon_err_occurred() {
+		return return_null_with_error("C extension call returned NULL without setting an exception");
+	}
+	result
 }
 
 unsafe fn call_type_from_argv(
