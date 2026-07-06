@@ -49,6 +49,7 @@ impl NewlineMode {
 const NEWLINE_SEEN_CR: u8 = 0b001;
 const NEWLINE_SEEN_LF: u8 = 0b010;
 const NEWLINE_SEEN_CRLF: u8 = 0b100;
+const DEFAULT_BUFFER_SIZE: usize = 131_072;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct OpenMode {
@@ -91,6 +92,8 @@ pub(crate) struct PyNativeFile {
 	line_buffering: bool,
 	/// Whether every text write flushes immediately.
 	write_through:  bool,
+	/// Whether closing/dropping this object closes the wrapped host descriptor.
+	closefd:        bool,
 	/// Bitset of newline spellings seen by universal-newline text reads.
 	newline_seen:   u8,
 	/// Per-instance dynamic attributes set from Python.
@@ -116,6 +119,13 @@ unsafe extern "C" fn trace_file(object: *mut u8, visitor: &mut dyn FnMut(*mut u8
 unsafe extern "C" fn finalize_file(object: *mut u8) {
 	if object.is_null() {
 		return;
+	}
+	let file = unsafe { &mut *object.cast::<PyNativeFile>() };
+	if !file.closefd {
+		if let Some(handle) = file.file.take() {
+			use std::os::fd::IntoRawFd;
+			let _ = handle.into_raw_fd();
+		}
 	}
 	unsafe { ptr::drop_in_place(object.cast::<PyNativeFile>()) };
 }
@@ -231,6 +241,7 @@ unsafe extern "C" fn text_file_new(
 		newline_seen:   0,
 		line_buffering: false,
 		write_through:  false,
+		closefd:        true,
 		attrs:          HashMap::new(),
 	})
 }
@@ -1994,6 +2005,98 @@ unsafe extern "C" fn io_base_flush_method(argv: *mut *mut PyObject, argc: usize)
 	}
 }
 
+unsafe extern "C" fn io_base_false_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "flag") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 1 {
+		return raise_type_error(&format!(
+			"flag() expected 0 arguments, got {}",
+			args.len().saturating_sub(1)
+		));
+	}
+	match unsafe { io_base_is_closed(args[0]) } {
+		Ok(true) => raise_value_error("I/O operation on closed file."),
+		Ok(false) => py_bool(false),
+		Err(()) => ptr::null_mut(),
+	}
+}
+
+unsafe extern "C" fn io_base_check_closed_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "_checkClosed") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() > 2 {
+		return raise_type_error(&format!(
+			"_checkClosed() expected at most 1 argument, got {}",
+			args.len().saturating_sub(1)
+		));
+	}
+	match unsafe { io_base_is_closed(args[0]) } {
+		Ok(true) => {
+			let message = args
+				.get(1)
+				.and_then(|object| unsafe { type_::unicode_text(*object) })
+				.unwrap_or("I/O operation on closed file.");
+			raise_value_error(message)
+		},
+		Ok(false) => unsafe { abi::pon_none() },
+		Err(()) => ptr::null_mut(),
+	}
+}
+
+unsafe fn io_base_check_capability(
+	argv: *mut *mut PyObject,
+	argc: usize,
+	name: &str,
+	flag: &str,
+	default_message: &str,
+) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, name) } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() > 2 {
+		return raise_type_error(&format!(
+			"{name}() expected at most 1 argument, got {}",
+			args.len().saturating_sub(1)
+		));
+	}
+	let method = unsafe { crate::abstract_op::get_attr(args[0], intern(flag)) };
+	if method.is_null() {
+		return ptr::null_mut();
+	}
+	let result = unsafe { abi::pon_call(method, ptr::null_mut(), 0) };
+	if result.is_null() {
+		return ptr::null_mut();
+	}
+	match unsafe { crate::abstract_op::is_true(result) } {
+		1 => unsafe { abi::pon_none() },
+		0 => {
+			let message = args
+				.get(1)
+				.and_then(|object| unsafe { type_::unicode_text(*object) })
+				.unwrap_or(default_message);
+			raise_unsupported_error(message)
+		},
+		_ => ptr::null_mut(),
+	}
+}
+
+unsafe extern "C" fn io_base_check_readable_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	unsafe { io_base_check_capability(argv, argc, "_checkReadable", "readable", "File or stream is not readable.") }
+}
+
+unsafe extern "C" fn io_base_check_writable_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	unsafe { io_base_check_capability(argv, argc, "_checkWritable", "writable", "File or stream is not writable.") }
+}
+
+unsafe extern "C" fn io_base_check_seekable_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	unsafe { io_base_check_capability(argv, argc, "_checkSeekable", "seekable", "File or stream is not seekable.") }
+}
+
 /// `IOBase.close()` (CPython `iobase_close`): flush, then mark closed via the
 /// `__IOBase_closed` instance attribute; a flush failure still closes and
 /// propagates.
@@ -2064,6 +2167,1373 @@ unsafe extern "C" fn io_base_exit_method(argv: *mut *mut PyObject, argc: usize) 
 	unsafe { abi::pon_none() }
 }
 
+/// Cooperative no-op base initializer used by `_IOBase` and its abstract
+/// subclasses.  Pure-Python raw objects such as `socket.SocketIO` explicitly
+/// call `io.RawIOBase.__init__(self)`; without this method they fall through to
+/// `object.__init__`, which rejects the receiver argument in pon's current
+/// carrier path.
+unsafe extern "C" fn io_base_init_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "__init__") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 1 {
+		return raise_type_error(&format!(
+			"__init__() expected 0 arguments, got {}",
+			args.len().saturating_sub(1)
+		));
+	}
+	unsafe { abi::pon_none() }
+}
+
+fn py_bool(value: bool) -> *mut PyObject {
+	unsafe { abi::number::pon_const_bool(i32::from(value)) }
+}
+
+fn py_int(value: i64) -> *mut PyObject {
+	unsafe { abi::pon_const_int(value) }
+}
+
+fn py_bytes(bytes: &[u8]) -> *mut PyObject {
+	unsafe { abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) }
+}
+
+fn set_object_attr(receiver: *mut PyObject, name: &str, value: *mut PyObject) -> Result<(), *mut PyObject> {
+	if value.is_null() {
+		return Err(ptr::null_mut());
+	}
+	if unsafe { abi::pon_set_attr(receiver, intern(name), value) } < 0 {
+		Err(ptr::null_mut())
+	} else {
+		Ok(())
+	}
+}
+
+fn set_text_attr(receiver: *mut PyObject, name: &str, value: &str) -> Result<(), *mut PyObject> {
+	let value = alloc_str(value);
+	set_object_attr(receiver, name, value)
+}
+
+fn object_attr(receiver: *mut PyObject, name: &str) -> Result<*mut PyObject, *mut PyObject> {
+	let value = unsafe { crate::abstract_op::get_attr(receiver, intern(name)) };
+	if value.is_null() {
+		Err(ptr::null_mut())
+	} else {
+		Ok(value)
+	}
+}
+
+fn optional_object_attr(receiver: *mut PyObject, name: &str) -> Option<*mut PyObject> {
+	let value = unsafe { crate::abstract_op::get_attr(receiver, intern(name)) };
+	if value.is_null() {
+		pon_err_clear();
+		None
+	} else {
+		Some(value)
+	}
+}
+
+fn call_object_method(
+	receiver: *mut PyObject,
+	name: &str,
+	args: &mut [*mut PyObject],
+) -> Result<*mut PyObject, *mut PyObject> {
+	let method = object_attr(receiver, name)?;
+	let result = unsafe {
+		abi::pon_call(
+			method,
+			if args.is_empty() { ptr::null_mut() } else { args.as_mut_ptr() },
+			args.len(),
+		)
+	};
+	if result.is_null() {
+		Err(ptr::null_mut())
+	} else {
+		Ok(result)
+	}
+}
+
+fn try_call_object_method(
+	receiver: *mut PyObject,
+	name: &str,
+	args: &mut [*mut PyObject],
+) -> Option<Result<*mut PyObject, *mut PyObject>> {
+	let Some(method) = optional_object_attr(receiver, name) else {
+		return None;
+	};
+	let result = unsafe {
+		abi::pon_call(
+			method,
+			if args.is_empty() { ptr::null_mut() } else { args.as_mut_ptr() },
+			args.len(),
+		)
+	};
+	Some(if result.is_null() { Err(ptr::null_mut()) } else { Ok(result) })
+}
+
+fn call_bool_method(receiver: *mut PyObject, name: &str, default: bool) -> Result<bool, *mut PyObject> {
+	match try_call_object_method(receiver, name, &mut []) {
+		Some(Ok(value)) => object_truth(value),
+		Some(Err(error)) => Err(error),
+		None => Ok(default),
+	}
+}
+
+fn ensure_stream_capability(raw: *mut PyObject, method: &str, what: &str) -> Result<(), *mut PyObject> {
+	if call_bool_method(raw, method, true)? {
+		Ok(())
+	} else {
+		Err(raise_unsupported_error(what))
+	}
+}
+
+fn generic_stream_closed(receiver: *mut PyObject) -> Result<bool, *mut PyObject> {
+	unsafe { io_base_is_closed(receiver) }.map_err(|()| ptr::null_mut())
+}
+
+fn ensure_generic_open(receiver: *mut PyObject) -> Result<(), *mut PyObject> {
+	if generic_stream_closed(receiver)? {
+		Err(raise_value_error("I/O operation on closed file."))
+	} else {
+		Ok(())
+	}
+}
+
+fn temp_bytearray(len: usize) -> *mut bytearray_::PyByteArray {
+	let zeros = vec![0_u8; len];
+	bytearray_::boxed_bytearray(&zeros)
+}
+
+fn object_to_usize_count(object: *mut PyObject, owner: &str) -> Result<usize, FileOpError> {
+	let count = expect_int(object, &format!("{owner}() returned non-integer byte count"))
+		.map_err(FileOpError::Type)?;
+	if count < 0 {
+		Err(FileOpError::Value(format!("{owner}() returned negative byte count")))
+	} else {
+		Ok(count as usize)
+	}
+}
+
+fn pending_not_implemented_cleared() -> bool {
+	if crate::abi::exc::pending_exception_is("NotImplementedError") {
+		pon_err_clear();
+		true
+	} else {
+		false
+	}
+}
+
+fn raw_readinto_once(raw: *mut PyObject, len: usize) -> Result<Option<Vec<u8>>, FileOpError> {
+	if len == 0 {
+		return Ok(Some(Vec::new()));
+	}
+	if let Some(file) = unsafe { as_file(raw) } {
+		let mut out = vec![0_u8; len];
+		let count = read_into_file(file, out.as_mut_ptr(), out.len())?;
+		out.truncate(count);
+		return Ok(Some(out));
+	}
+	let temp = temp_bytearray(len);
+	let temp_obj = temp.cast::<PyObject>();
+	let mut argv = [temp_obj];
+	let result = match call_object_method(raw, "readinto", &mut argv) {
+		Ok(result) => result,
+		Err(_) if pending_not_implemented_cleared() => {
+			unsafe {
+				let _ = Box::from_raw(temp);
+			}
+			return Ok(None);
+		},
+		Err(_) => {
+			unsafe {
+				let _ = Box::from_raw(temp);
+			}
+			return Err(FileOpError::Pending);
+		},
+	};
+	if is_none(result) {
+		unsafe {
+			let _ = Box::from_raw(temp);
+		}
+		return Ok(Some(Vec::new()));
+	}
+	let count = object_to_usize_count(result, "readinto")?;
+	let out = {
+		let bytearray = unsafe { &*temp };
+		let count = count.min(bytearray.bytes.len());
+		bytearray.bytes[..count].to_vec()
+	};
+	unsafe {
+		let _ = Box::from_raw(temp);
+	}
+	Ok(Some(out))
+}
+
+fn raw_read_bytes(raw: *mut PyObject, size: Option<usize>) -> Result<Vec<u8>, FileOpError> {
+	if let Some(file) = unsafe { as_file(raw) } {
+		return read_raw(file, size);
+	}
+	let direct_read = match size {
+		Some(size) => {
+			match raw_readinto_once(raw, size)? {
+				Some(bytes) => return Ok(bytes),
+				None => {
+					let mut argv = [py_int(size as i64)];
+					try_call_object_method(raw, "read", &mut argv)
+				},
+			}
+		},
+		None => try_call_object_method(raw, "read", &mut []),
+	};
+	if let Some(result) = direct_read {
+		match result {
+			Ok(object) => {
+				if is_none(object) {
+					return Ok(Vec::new());
+				}
+				return bytes_like_bytes(object).map_err(|error| match error {
+					BioError::Type(message) => FileOpError::Type(message),
+					BioError::Value(message) => FileOpError::Value(message),
+					BioError::Buffer => FileOpError::Value("buffer export pins the source".to_owned()),
+				});
+			},
+			Err(_) if pending_not_implemented_cleared() => {},
+			Err(_) => return Err(FileOpError::Pending),
+		}
+	}
+	match size {
+		Some(size) => raw_readinto_once(raw, size)?
+			.ok_or_else(|| FileOpError::Unsupported("not readable".to_owned())),
+		None => {
+			let mut out = Vec::new();
+			loop {
+				let Some(chunk) = raw_readinto_once(raw, DEFAULT_BUFFER_SIZE)? else {
+					return Err(FileOpError::Unsupported("not readable".to_owned()));
+				};
+				if chunk.is_empty() {
+					break;
+				}
+				out.extend_from_slice(&chunk);
+			}
+			Ok(out)
+		},
+	}
+}
+
+fn raw_write_bytes(raw: *mut PyObject, data: &[u8]) -> Result<usize, FileOpError> {
+	if data.is_empty() {
+		return Ok(0);
+	}
+	if let Some(file) = unsafe { as_file(raw) } {
+		let object = py_bytes(data);
+		if object.is_null() {
+			return Err(FileOpError::Pending);
+		}
+		return write_object(file, object).map(|count| count as usize);
+	}
+	let mut written = 0_usize;
+	while written < data.len() {
+		let object = py_bytes(&data[written..]);
+		if object.is_null() {
+			return Err(FileOpError::Pending);
+		}
+		let mut argv = [object];
+		let result = call_object_method(raw, "write", &mut argv).map_err(|_| FileOpError::Pending)?;
+		if is_none(result) {
+			return Err(FileOpError::Io("BlockingIOError: write could not complete".to_owned()));
+		}
+		let count = object_to_usize_count(result, "write")?;
+		if count == 0 {
+			return Err(FileOpError::Io("OSError: raw write returned zero bytes".to_owned()));
+		}
+		written = written.saturating_add(count.min(data.len() - written));
+	}
+	Ok(written)
+}
+
+fn parse_buffer_size(object: Option<*mut PyObject>, owner: &str) -> Result<usize, *mut PyObject> {
+	let Some(object) = object.map(crate::tag::untag_arg) else {
+		return Ok(DEFAULT_BUFFER_SIZE);
+	};
+	if is_none(object) {
+		return Ok(DEFAULT_BUFFER_SIZE);
+	}
+	let size = match expect_int(object, &format!("{owner}() buffer size must be int")) {
+		Ok(size) => size,
+		Err(message) => return Err(raise_type_error(&message)),
+	};
+	if size <= 0 {
+		Err(raise_value_error("buffer size must be strictly positive"))
+	} else {
+		Ok(size as usize)
+	}
+}
+
+fn init_buffered_common(
+	receiver: *mut PyObject,
+	raw: *mut PyObject,
+	buffer_size: usize,
+	readable: bool,
+	writable: bool,
+) -> Result<(), *mut PyObject> {
+	if readable {
+		ensure_stream_capability(raw, "readable", "not readable")?;
+	}
+	if writable {
+		ensure_stream_capability(raw, "writable", "not writable")?;
+	}
+	set_object_attr(receiver, "_pon_raw", raw)?;
+	set_object_attr(receiver, "raw", raw)?;
+	set_object_attr(receiver, "_pon_readable", py_bool(readable))?;
+	set_object_attr(receiver, "_pon_writable", py_bool(writable))?;
+	set_object_attr(receiver, "_pon_buffer_size", py_int(buffer_size as i64))?;
+	set_object_attr(receiver, "_pon_peek", py_bytes(&[]))?;
+	Ok(())
+}
+
+unsafe extern "C" fn buffered_reader_init_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "__init__") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if !(args.len() == 2 || args.len() == 3) {
+		return raise_type_error(&format!(
+			"BufferedReader() expected 1 or 2 arguments, got {}",
+			args.len().saturating_sub(1)
+		));
+	}
+	let size = match parse_buffer_size(args.get(2).copied(), "BufferedReader") {
+		Ok(size) => size,
+		Err(error) => return error,
+	};
+	match init_buffered_common(args[0], args[1], size, true, false) {
+		Ok(()) => unsafe { abi::pon_none() },
+		Err(error) => error,
+	}
+}
+
+unsafe extern "C" fn buffered_writer_init_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "__init__") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if !(args.len() == 2 || args.len() == 3) {
+		return raise_type_error(&format!(
+			"BufferedWriter() expected 1 or 2 arguments, got {}",
+			args.len().saturating_sub(1)
+		));
+	}
+	let size = match parse_buffer_size(args.get(2).copied(), "BufferedWriter") {
+		Ok(size) => size,
+		Err(error) => return error,
+	};
+	match init_buffered_common(args[0], args[1], size, false, true) {
+		Ok(()) => unsafe { abi::pon_none() },
+		Err(error) => error,
+	}
+}
+
+unsafe extern "C" fn buffered_random_init_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "__init__") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if !(args.len() == 2 || args.len() == 3) {
+		return raise_type_error(&format!(
+			"BufferedRandom() expected 1 or 2 arguments, got {}",
+			args.len().saturating_sub(1)
+		));
+	}
+	if let Err(error) = ensure_stream_capability(args[1], "seekable", "not seekable") {
+		return error;
+	}
+	let size = match parse_buffer_size(args.get(2).copied(), "BufferedRandom") {
+		Ok(size) => size,
+		Err(error) => return error,
+	};
+	match init_buffered_common(args[0], args[1], size, true, true) {
+		Ok(()) => unsafe { abi::pon_none() },
+		Err(error) => error,
+	}
+}
+
+unsafe extern "C" fn buffered_rwpair_init_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "__init__") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if !(args.len() == 3 || args.len() == 4) {
+		return raise_type_error(&format!(
+			"BufferedRWPair() expected 2 or 3 arguments, got {}",
+			args.len().saturating_sub(1)
+		));
+	}
+	if let Err(error) = ensure_stream_capability(args[1], "readable", "not readable") {
+		return error;
+	}
+	if let Err(error) = ensure_stream_capability(args[2], "writable", "not writable") {
+		return error;
+	}
+	let size = match parse_buffer_size(args.get(3).copied(), "BufferedRWPair") {
+		Ok(size) => size,
+		Err(error) => return error,
+	};
+	for (name, value) in [
+		("_pon_reader", args[1]),
+		("_pon_writer", args[2]),
+		("_pon_readable", py_bool(true)),
+		("_pon_writable", py_bool(true)),
+		("_pon_buffer_size", py_int(size as i64)),
+		("_pon_peek", py_bytes(&[])),
+	] {
+		if let Err(error) = set_object_attr(args[0], name, value) {
+			return error;
+		}
+	}
+	unsafe { abi::pon_none() }
+}
+
+fn buffered_bool_attr(receiver: *mut PyObject, name: &str) -> bool {
+	optional_object_attr(receiver, name)
+		.and_then(|object| object_truth(object).ok())
+		.unwrap_or(false)
+}
+
+fn buffered_raw(receiver: *mut PyObject, for_write: bool) -> Result<*mut PyObject, *mut PyObject> {
+	if for_write {
+		if let Some(writer) = optional_object_attr(receiver, "_pon_writer") {
+			return Ok(writer);
+		}
+	} else if let Some(reader) = optional_object_attr(receiver, "_pon_reader") {
+		return Ok(reader);
+	}
+	object_attr(receiver, "_pon_raw")
+}
+
+fn buffered_peek_bytes(receiver: *mut PyObject) -> Vec<u8> {
+	optional_object_attr(receiver, "_pon_peek")
+		.and_then(|object| bytes_like_bytes(object).ok())
+		.unwrap_or_default()
+}
+
+fn set_buffered_peek(receiver: *mut PyObject, bytes: &[u8]) -> Result<(), FileOpError> {
+	let object = py_bytes(bytes);
+	if object.is_null() {
+		return Err(FileOpError::Pending);
+	}
+	set_object_attr(receiver, "_pon_peek", object).map_err(|_| FileOpError::Pending)
+}
+
+fn buffered_read_bytes(receiver: *mut PyObject, size: Option<usize>) -> Result<Vec<u8>, FileOpError> {
+	ensure_generic_open(receiver).map_err(|_| FileOpError::Pending)?;
+	if !buffered_bool_attr(receiver, "_pon_readable") {
+		return Err(FileOpError::Unsupported("not readable".to_owned()));
+	}
+	let raw = buffered_raw(receiver, false).map_err(|_| FileOpError::Pending)?;
+	let mut peek = buffered_peek_bytes(receiver);
+	let mut out = Vec::new();
+	match size {
+		Some(0) => Ok(out),
+		Some(size) => {
+			if !peek.is_empty() {
+				let take = size.min(peek.len());
+				out.extend_from_slice(&peek[..take]);
+				peek.drain(..take);
+				set_buffered_peek(receiver, &peek)?;
+				if out.len() == size {
+					return Ok(out);
+				}
+			}
+			let mut rest = raw_read_bytes(raw, Some(size - out.len()))?;
+			out.append(&mut rest);
+			Ok(out)
+		},
+		None => {
+			out.append(&mut peek);
+			set_buffered_peek(receiver, &[])?;
+			let mut rest = raw_read_bytes(raw, None)?;
+			out.append(&mut rest);
+			Ok(out)
+		},
+	}
+}
+
+unsafe extern "C" fn buffered_read_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "read") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() > 2 {
+		return raise_type_error(&format!("read() expected at most 1 argument, got {}", args.len() - 1));
+	}
+	let size = match optional_size(args.get(1).copied(), "read") {
+		Ok(size) => size,
+		Err(message) => return raise_type_error(&message),
+	};
+	match buffered_read_bytes(args[0], size) {
+		Ok(bytes) => py_bytes(&bytes),
+		Err(error) => raise_file_op_error(error),
+	}
+}
+
+unsafe extern "C" fn buffered_read1_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	unsafe { buffered_read_method(argv, argc) }
+}
+
+unsafe extern "C" fn buffered_peek_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "peek") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() > 2 {
+		return raise_type_error(&format!("peek() expected at most 1 argument, got {}", args.len() - 1));
+	}
+	if let Err(error) = ensure_generic_open(args[0]) {
+		return error;
+	}
+	let want = match optional_size(args.get(1).copied(), "peek") {
+		Ok(Some(0) | None) => 1,
+		Ok(Some(size)) => size,
+		Err(message) => return raise_type_error(&message),
+	};
+	let mut peek = buffered_peek_bytes(args[0]);
+	if peek.is_empty() {
+		let raw = match buffered_raw(args[0], false) {
+			Ok(raw) => raw,
+			Err(error) => return error,
+		};
+		match raw_read_bytes(raw, Some(want)) {
+			Ok(bytes) => {
+				peek = bytes;
+				if let Err(error) = set_buffered_peek(args[0], &peek) {
+					return raise_file_op_error(error);
+				}
+			},
+			Err(error) => return raise_file_op_error(error),
+		}
+	}
+	py_bytes(&peek)
+}
+
+unsafe extern "C" fn buffered_readline_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "readline") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() > 2 {
+		return raise_type_error(&format!(
+			"readline() expected at most 1 argument, got {}",
+			args.len() - 1
+		));
+	}
+	let limit = match optional_size(args.get(1).copied(), "readline") {
+		Ok(size) => size.unwrap_or(usize::MAX),
+		Err(message) => return raise_type_error(&message),
+	};
+	let mut out = Vec::new();
+	while out.len() < limit {
+		match buffered_read_bytes(args[0], Some(1)) {
+			Ok(chunk) if chunk.is_empty() => break,
+			Ok(chunk) => {
+				let newline = chunk == b"\n";
+				out.extend_from_slice(&chunk);
+				if newline {
+					break;
+				}
+			},
+			Err(error) => return raise_file_op_error(error),
+		}
+	}
+	py_bytes(&out)
+}
+
+fn writable_buffer_parts(object: *mut PyObject, owner: &str) -> Result<(*mut u8, usize), *mut PyObject> {
+	let target = crate::tag::untag_arg(object);
+	if target.is_null() {
+		return Err(raise_type_error(&format!(
+			"{owner}() argument must be read-write bytes-like object, not 'NoneType'"
+		)));
+	}
+	let ty = unsafe { (*target).ob_type };
+	if bytearray_::is_bytearray_type(ty) {
+		let bytearray = unsafe { &mut *target.cast::<bytearray_::PyByteArray>() };
+		return Ok((bytearray.bytes.as_mut_ptr(), bytearray.bytes.len()));
+	}
+	if memoryview::is_memoryview_type(ty) {
+		let view = unsafe { &mut *target.cast::<memoryview::PyMemoryView>() };
+		if view.released {
+			return Err(raise_value_error(memoryview::RELEASED_ERROR));
+		}
+		if view.readonly {
+			return Err(raise_type_error(&format!(
+				"{owner}() argument must be read-write bytes-like object, not memoryview"
+			)));
+		}
+		return Ok((view.data, view.len));
+	}
+	let type_name = unsafe { crate::types::dict::type_name(target) }.unwrap_or("object");
+	Err(raise_type_error(&format!(
+		"{owner}() argument must be read-write bytes-like object, not {type_name}"
+	)))
+}
+
+unsafe extern "C" fn buffered_readinto_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "readinto") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 2 {
+		return raise_type_error(&format!("readinto() expected 1 argument, got {}", args.len() - 1));
+	}
+	let (dst, dst_len) = match writable_buffer_parts(args[1], "readinto") {
+		Ok(parts) => parts,
+		Err(error) => return error,
+	};
+	match buffered_read_bytes(args[0], Some(dst_len)) {
+		Ok(bytes) => {
+			let count = bytes.len().min(dst_len);
+			unsafe {
+				ptr::copy_nonoverlapping(bytes.as_ptr(), dst, count);
+				abi::pon_const_int(count as i64)
+			}
+		},
+		Err(error) => raise_file_op_error(error),
+	}
+}
+
+unsafe extern "C" fn buffered_write_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "write") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 2 {
+		return raise_type_error(&format!("write() expected 1 argument, got {}", args.len() - 1));
+	}
+	if let Err(error) = ensure_generic_open(args[0]) {
+		return error;
+	}
+	if !buffered_bool_attr(args[0], "_pon_writable") {
+		return raise_unsupported_error("not writable");
+	}
+	let bytes = match bytes_like_bytes(args[1]) {
+		Ok(bytes) => bytes,
+		Err(error) => return raise_bio(error),
+	};
+	let raw = match buffered_raw(args[0], true) {
+		Ok(raw) => raw,
+		Err(error) => return error,
+	};
+	match raw_write_bytes(raw, &bytes) {
+		Ok(_) => unsafe { abi::pon_const_int(bytes.len() as i64) },
+		Err(error) => raise_file_op_error(error),
+	}
+}
+
+unsafe extern "C" fn buffered_flush_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "flush") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 1 {
+		return raise_type_error(&format!("flush() expected 0 arguments, got {}", args.len() - 1));
+	}
+	if let Err(error) = ensure_generic_open(args[0]) {
+		return error;
+	}
+	let raw = match buffered_raw(args[0], true) {
+		Ok(raw) => raw,
+		Err(_) => return unsafe { abi::pon_none() },
+	};
+	match try_call_object_method(raw, "flush", &mut []) {
+		Some(Ok(_)) | None => unsafe { abi::pon_none() },
+		Some(Err(error)) => error,
+	}
+}
+
+unsafe extern "C" fn buffered_close_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "close") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 1 {
+		return raise_type_error(&format!("close() expected 0 arguments, got {}", args.len() - 1));
+	}
+	if generic_stream_closed(args[0]).unwrap_or(false) {
+		return unsafe { abi::pon_none() };
+	}
+	let flushed = unsafe { buffered_flush_method(argv, argc) };
+	if flushed.is_null() {
+		return ptr::null_mut();
+	}
+	for name in ["_pon_raw", "_pon_reader", "_pon_writer"] {
+		if let Some(raw) = optional_object_attr(args[0], name) {
+			if let Some(Err(error)) = try_call_object_method(raw, "close", &mut []) {
+				return error;
+			}
+		}
+	}
+	let marker = py_bool(true);
+	if unsafe { abi::pon_set_attr(args[0], intern("__IOBase_closed"), marker) } < 0 {
+		return ptr::null_mut();
+	}
+	unsafe { abi::pon_none() }
+}
+
+unsafe extern "C" fn buffered_detach_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "detach") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 1 {
+		return raise_type_error(&format!("detach() expected 0 arguments, got {}", args.len() - 1));
+	}
+	if let Err(error) = ensure_generic_open(args[0]) {
+		return error;
+	}
+	let raw = match buffered_raw(args[0], false).or_else(|_| buffered_raw(args[0], true)) {
+		Ok(raw) => raw,
+		Err(error) => return error,
+	};
+	let marker = py_bool(true);
+	if unsafe { abi::pon_set_attr(args[0], intern("__IOBase_closed"), marker) } < 0 {
+		return ptr::null_mut();
+	}
+	raw
+}
+
+unsafe extern "C" fn buffered_seek_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "seek") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if !(args.len() == 2 || args.len() == 3) {
+		return raise_type_error(&format!("seek() expected 1 or 2 arguments, got {}", args.len() - 1));
+	}
+	if let Err(error) = set_buffered_peek(args[0], &[]) {
+		return raise_file_op_error(error);
+	}
+	let raw = match buffered_raw(args[0], false).or_else(|_| buffered_raw(args[0], true)) {
+		Ok(raw) => raw,
+		Err(error) => return error,
+	};
+	let mut forwarded: Vec<*mut PyObject> = args[1..].to_vec();
+	call_object_method(raw, "seek", &mut forwarded).unwrap_or_else(|error| error)
+}
+
+unsafe extern "C" fn buffered_tell_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "tell") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 1 {
+		return raise_type_error(&format!("tell() expected 0 arguments, got {}", args.len() - 1));
+	}
+	let raw = match buffered_raw(args[0], false).or_else(|_| buffered_raw(args[0], true)) {
+		Ok(raw) => raw,
+		Err(error) => return error,
+	};
+	call_object_method(raw, "tell", &mut []).unwrap_or_else(|error| error)
+}
+
+unsafe extern "C" fn buffered_flag_method(argv: *mut *mut PyObject, argc: usize, attr: &str, method: &str, default: bool) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, method) } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 1 {
+		return raise_type_error(&format!("{method}() expected 0 arguments, got {}", args.len() - 1));
+	}
+	if let Err(error) = ensure_generic_open(args[0]) {
+		return error;
+	}
+	if attr == "_pon_readable" || attr == "_pon_writable" {
+		return py_bool(buffered_bool_attr(args[0], attr));
+	}
+	let raw = match buffered_raw(args[0], false).or_else(|_| buffered_raw(args[0], true)) {
+		Ok(raw) => raw,
+		Err(_) => return py_bool(default),
+	};
+	match call_bool_method(raw, method, default) {
+		Ok(value) => py_bool(value),
+		Err(error) => error,
+	}
+}
+
+unsafe extern "C" fn buffered_readable_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	unsafe { buffered_flag_method(argv, argc, "_pon_readable", "readable", false) }
+}
+
+unsafe extern "C" fn buffered_writable_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	unsafe { buffered_flag_method(argv, argc, "_pon_writable", "writable", false) }
+}
+
+unsafe extern "C" fn buffered_seekable_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	unsafe { buffered_flag_method(argv, argc, "", "seekable", false) }
+}
+
+unsafe extern "C" fn buffered_isatty_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	unsafe { buffered_flag_method(argv, argc, "", "isatty", false) }
+}
+
+unsafe extern "C" fn buffered_fileno_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "fileno") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 1 {
+		return raise_type_error(&format!("fileno() expected 0 arguments, got {}", args.len() - 1));
+	}
+	let raw = match buffered_raw(args[0], false).or_else(|_| buffered_raw(args[0], true)) {
+		Ok(raw) => raw,
+		Err(error) => return error,
+	};
+	call_object_method(raw, "fileno", &mut []).unwrap_or_else(|error| error)
+}
+
+unsafe extern "C" fn buffered_iter_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "__iter__") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 1 {
+		return raise_type_error(&format!("__iter__() expected 0 arguments, got {}", args.len() - 1));
+	}
+	args[0]
+}
+
+unsafe extern "C" fn buffered_next_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let line = unsafe { buffered_readline_method(argv, argc) };
+	if line.is_null() {
+		return ptr::null_mut();
+	}
+	match bytes_like_bytes(line) {
+		Ok(bytes) if bytes.is_empty() => unsafe { abi::pon_raise_stop_iteration(ptr::null_mut()) },
+		_ => line,
+	}
+}
+
+const BUFFERED_METHODS: &[(&str, *const u8)] = &[
+	("read", buffered_read_method as *const u8),
+	("read1", buffered_read1_method as *const u8),
+	("readinto", buffered_readinto_method as *const u8),
+	("readinto1", buffered_readinto_method as *const u8),
+	("readline", buffered_readline_method as *const u8),
+	("peek", buffered_peek_method as *const u8),
+	("write", buffered_write_method as *const u8),
+	("flush", buffered_flush_method as *const u8),
+	("close", buffered_close_method as *const u8),
+	("detach", buffered_detach_method as *const u8),
+	("seek", buffered_seek_method as *const u8),
+	("tell", buffered_tell_method as *const u8),
+	("readable", buffered_readable_method as *const u8),
+	("writable", buffered_writable_method as *const u8),
+	("seekable", buffered_seekable_method as *const u8),
+	("isatty", buffered_isatty_method as *const u8),
+	("fileno", buffered_fileno_method as *const u8),
+	("__iter__", buffered_iter_method as *const u8),
+	("__next__", buffered_next_method as *const u8),
+];
+
+fn text_newline_mode_from_attr(receiver: *mut PyObject) -> NewlineMode {
+	let Some(object) = optional_object_attr(receiver, "_pon_newline") else {
+		return NewlineMode::UniversalTranslate;
+	};
+	if is_none(object) {
+		return NewlineMode::UniversalTranslate;
+	}
+	match unsafe { type_::unicode_text(object) } {
+		Some("") => NewlineMode::UniversalPreserve,
+		Some("\n") => NewlineMode::LineFeed,
+		Some("\r") => NewlineMode::CarriageReturn,
+		Some("\r\n") => NewlineMode::CarriageReturnLineFeed,
+		_ => NewlineMode::UniversalTranslate,
+	}
+}
+
+fn text_encoding_attr(receiver: *mut PyObject) -> String {
+	optional_object_attr(receiver, "encoding")
+		.and_then(|object| unsafe { type_::unicode_text(object) }.map(str::to_owned))
+		.unwrap_or_else(|| "utf-8".to_owned())
+}
+
+fn text_errors_attr(receiver: *mut PyObject) -> String {
+	optional_object_attr(receiver, "errors")
+		.and_then(|object| unsafe { type_::unicode_text(object) }.map(str::to_owned))
+		.unwrap_or_else(|| "strict".to_owned())
+}
+
+fn set_text_newlines(receiver: *mut PyObject, bytes: &[u8], mode: NewlineMode) {
+	if !mode.detects_universal() {
+		return;
+	}
+	let bits = detect_newline_bits(bytes);
+	if bits == 0 {
+		return;
+	}
+	let current = optional_object_attr(receiver, "_pon_newline_seen")
+		.and_then(|object| expect_int(object, "newlines state must be int").ok())
+		.unwrap_or(0);
+	let seen = current as u8 | bits;
+	let _ = set_object_attr(receiver, "_pon_newline_seen", py_int(i64::from(seen)));
+	let pseudo = PyNativeFile {
+		ob_base: PyObjectHeader::new(text_file_type()),
+		file: None,
+		name: String::new(),
+		mode: String::new(),
+		binary: false,
+		readable: true,
+		writable: false,
+		append: false,
+		encoding: Some("utf-8".to_owned()),
+		errors: "strict".to_owned(),
+		newline: mode,
+		line_buffering: false,
+		write_through: false,
+		closefd: true,
+		newline_seen: seen,
+		attrs: HashMap::new(),
+	};
+	let _ = set_object_attr(receiver, "newlines", newline_seen_object(&pseudo));
+}
+
+fn text_bytes_to_object(receiver: *mut PyObject, bytes: Vec<u8>, mode: NewlineMode) -> *mut PyObject {
+	set_text_newlines(receiver, &bytes, mode);
+	let translated = if mode.translates_on_read() {
+		translate_universal_newlines(&bytes)
+	} else {
+		bytes
+	};
+	let encoding = text_encoding_attr(receiver);
+	let errors = text_errors_attr(receiver);
+	match super::codecs::decode_bytes_to_string(&translated, &encoding, &errors) {
+		Ok(text) => alloc_str(&text),
+		Err(()) => ptr::null_mut(),
+	}
+}
+
+fn parse_text_newline_arg(object: *mut PyObject) -> Result<*mut PyObject, *mut PyObject> {
+	let object = crate::tag::untag_arg(object);
+	if is_none(object) {
+		return Ok(unsafe { abi::pon_none() });
+	}
+	let Some(text) = (unsafe { type_::unicode_text(object) }) else {
+		return Err(raise_type_error("newline must be str or None"));
+	};
+	match text {
+		"" | "\n" | "\r" | "\r\n" => Ok(object),
+		_ => Err(raise_value_error("illegal newline value")),
+	}
+}
+
+unsafe extern "C" fn text_wrapper_init_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "__init__") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() < 2 || args.len() > 7 {
+		return raise_type_error(&format!(
+			"TextIOWrapper() expected 1 to 6 arguments, got {}",
+			args.len().saturating_sub(1)
+		));
+	}
+	let encoding = match args.get(2).copied() {
+		Some(value) if !is_none(value) => match unsafe { type_::unicode_text(value) } {
+			Some(text) if super::codecs::canonical_text_encoding(text).is_some() => text.to_owned(),
+			Some(text) => return raise_io_error(&format!("unsupported encoding: {text}")),
+			None => return raise_type_error("TextIOWrapper() encoding must be str or None"),
+		},
+		_ => "utf-8".to_owned(),
+	};
+	let errors = match args.get(3).copied() {
+		Some(value) if !is_none(value) => match unsafe { type_::unicode_text(value) } {
+			Some(text) => text.to_owned(),
+			None => return raise_type_error("TextIOWrapper() errors must be str or None"),
+		},
+		_ => "strict".to_owned(),
+	};
+	let newline = match args.get(4).copied() {
+		Some(value) => match parse_text_newline_arg(value) {
+			Ok(value) => value,
+			Err(error) => return error,
+		},
+		None => unsafe { abi::pon_none() },
+	};
+	let line_buffering = match args.get(5).copied() {
+		Some(value) => match object_truth(value) {
+			Ok(value) => value,
+			Err(error) => return error,
+		},
+		None => false,
+	};
+	let write_through = match args.get(6).copied() {
+		Some(value) => match object_truth(value) {
+			Ok(value) => value,
+			Err(error) => return error,
+		},
+		None => false,
+	};
+	if let Err(error) = set_object_attr(args[0], "_pon_buffer", args[1]) {
+		return error;
+	}
+	if let Err(error) = set_object_attr(args[0], "buffer", args[1]) {
+		return error;
+	}
+	if let Err(error) = set_text_attr(args[0], "encoding", &encoding) {
+		return error;
+	}
+	if let Err(error) = set_text_attr(args[0], "errors", &errors) {
+		return error;
+	}
+	if let Err(error) = set_object_attr(args[0], "_pon_newline", newline) {
+		return error;
+	}
+	if let Err(error) = set_object_attr(args[0], "_pon_newline_seen", py_int(0)) {
+		return error;
+	}
+	if let Err(error) = set_object_attr(args[0], "newlines", unsafe { abi::pon_none() }) {
+		return error;
+	}
+	if let Err(error) = set_object_attr(args[0], "line_buffering", py_bool(line_buffering)) {
+		return error;
+	}
+	if let Err(error) = set_object_attr(args[0], "write_through", py_bool(write_through)) {
+		return error;
+	}
+	unsafe { abi::pon_none() }
+}
+
+fn text_buffer(receiver: *mut PyObject) -> Result<*mut PyObject, *mut PyObject> {
+	ensure_generic_open(receiver)?;
+	let buffer = object_attr(receiver, "_pon_buffer")?;
+	if is_none(buffer) {
+		Err(raise_value_error("underlying buffer has been detached"))
+	} else {
+		Ok(buffer)
+	}
+}
+
+unsafe extern "C" fn text_wrapper_read_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "read") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() > 2 {
+		return raise_type_error(&format!("read() expected at most 1 argument, got {}", args.len() - 1));
+	}
+	let size = match optional_size(args.get(1).copied(), "read") {
+		Ok(size) => size,
+		Err(message) => return raise_type_error(&message),
+	};
+	let buffer = match text_buffer(args[0]) {
+		Ok(buffer) => buffer,
+		Err(error) => return error,
+	};
+	let bytes = match size {
+		Some(size) => {
+			let mut argv = [py_int(size as i64)];
+			call_object_method(buffer, "read", &mut argv)
+		},
+		None => call_object_method(buffer, "read", &mut []),
+	};
+	let bytes = match bytes {
+		Ok(object) => match bytes_like_bytes(object) {
+			Ok(bytes) => bytes,
+			Err(error) => return raise_bio(error),
+		},
+		Err(error) => return error,
+	};
+	let mode = text_newline_mode_from_attr(args[0]);
+	text_bytes_to_object(args[0], bytes, mode)
+}
+
+unsafe extern "C" fn text_wrapper_readline_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "readline") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() > 2 {
+		return raise_type_error(&format!(
+			"readline() expected at most 1 argument, got {}",
+			args.len() - 1
+		));
+	}
+	let buffer = match text_buffer(args[0]) {
+		Ok(buffer) => buffer,
+		Err(error) => return error,
+	};
+	let object = if let Some(&size) = args.get(1) {
+		let mut forwarded = [size];
+		call_object_method(buffer, "readline", &mut forwarded)
+	} else {
+		call_object_method(buffer, "readline", &mut [])
+	};
+	let bytes = match object {
+		Ok(object) => match bytes_like_bytes(object) {
+			Ok(bytes) => bytes,
+			Err(error) => return raise_bio(error),
+		},
+		Err(error) => return error,
+	};
+	let mode = text_newline_mode_from_attr(args[0]);
+	text_bytes_to_object(args[0], bytes, mode)
+}
+
+unsafe extern "C" fn text_wrapper_write_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "write") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 2 {
+		return raise_type_error(&format!("write() expected 1 argument, got {}", args.len() - 1));
+	}
+	let Some(text) = (unsafe { type_::unicode_text(args[1]) }) else {
+		return raise_type_error("write() argument must be str, not bytes");
+	};
+	let buffer = match text_buffer(args[0]) {
+		Ok(buffer) => buffer,
+		Err(error) => return error,
+	};
+	let mode = text_newline_mode_from_attr(args[0]);
+	let payload = translate_write_newlines(mode, text);
+	let bytes = match encode_write_payload(&payload, &text_encoding_attr(args[0]), &text_errors_attr(args[0])) {
+		Ok(bytes) => bytes.into_owned(),
+		Err(error) => return raise_file_op_error(error),
+	};
+	let object = py_bytes(&bytes);
+	if object.is_null() {
+		return ptr::null_mut();
+	}
+	let mut forwarded = [object];
+	if let Err(error) = call_object_method(buffer, "write", &mut forwarded) {
+		return error;
+	}
+	let line_buffering = optional_object_attr(args[0], "line_buffering")
+		.and_then(|object| object_truth(object).ok())
+		.unwrap_or(false);
+	let write_through = optional_object_attr(args[0], "write_through")
+		.and_then(|object| object_truth(object).ok())
+		.unwrap_or(false);
+	if write_through || (line_buffering && bytes.iter().any(|byte| matches!(*byte, b'\n' | b'\r'))) {
+		if let Some(Err(error)) = try_call_object_method(buffer, "flush", &mut []) {
+			return error;
+		}
+	}
+	unsafe { abi::pon_const_int(text.chars().count() as i64) }
+}
+
+unsafe extern "C" fn text_wrapper_delegate0(argv: *mut *mut PyObject, argc: usize, method: &str) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, method) } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 1 {
+		return raise_type_error(&format!("{method}() expected 0 arguments, got {}", args.len() - 1));
+	}
+	let buffer = match text_buffer(args[0]) {
+		Ok(buffer) => buffer,
+		Err(error) => return error,
+	};
+	call_object_method(buffer, method, &mut []).unwrap_or_else(|error| error)
+}
+
+unsafe extern "C" fn text_wrapper_flush_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	unsafe { text_wrapper_delegate0(argv, argc, "flush") }
+}
+
+unsafe extern "C" fn text_wrapper_tell_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	unsafe { text_wrapper_delegate0(argv, argc, "tell") }
+}
+
+unsafe extern "C" fn text_wrapper_fileno_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	unsafe { text_wrapper_delegate0(argv, argc, "fileno") }
+}
+
+unsafe extern "C" fn text_wrapper_detach_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "detach") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 1 {
+		return raise_type_error(&format!("detach() expected 0 arguments, got {}", args.len() - 1));
+	}
+	let buffer = match text_buffer(args[0]) {
+		Ok(buffer) => buffer,
+		Err(error) => return error,
+	};
+	if let Err(error) = set_object_attr(args[0], "_pon_buffer", unsafe { abi::pon_none() }) {
+		return error;
+	}
+	buffer
+}
+
+unsafe extern "C" fn text_wrapper_close_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "close") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 1 {
+		return raise_type_error(&format!("close() expected 0 arguments, got {}", args.len() - 1));
+	}
+	if generic_stream_closed(args[0]).unwrap_or(false) {
+		return unsafe { abi::pon_none() };
+	}
+	if let Ok(buffer) = text_buffer(args[0]) {
+		if let Some(Err(error)) = try_call_object_method(buffer, "close", &mut []) {
+			return error;
+		}
+	}
+	let marker = py_bool(true);
+	if unsafe { abi::pon_set_attr(args[0], intern("__IOBase_closed"), marker) } < 0 {
+		return ptr::null_mut();
+	}
+	unsafe { abi::pon_none() }
+}
+
+unsafe extern "C" fn text_wrapper_seek_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "seek") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if !(args.len() == 2 || args.len() == 3) {
+		return raise_type_error(&format!("seek() expected 1 or 2 arguments, got {}", args.len() - 1));
+	}
+	let buffer = match text_buffer(args[0]) {
+		Ok(buffer) => buffer,
+		Err(error) => return error,
+	};
+	let mut forwarded: Vec<*mut PyObject> = args[1..].to_vec();
+	call_object_method(buffer, "seek", &mut forwarded).unwrap_or_else(|error| error)
+}
+
+unsafe extern "C" fn text_wrapper_flag_method(argv: *mut *mut PyObject, argc: usize, method: &str) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, method) } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 1 {
+		return raise_type_error(&format!("{method}() expected 0 arguments, got {}", args.len() - 1));
+	}
+	let buffer = match text_buffer(args[0]) {
+		Ok(buffer) => buffer,
+		Err(error) => return error,
+	};
+	match call_bool_method(buffer, method, false) {
+		Ok(value) => py_bool(value),
+		Err(error) => error,
+	}
+}
+
+unsafe extern "C" fn text_wrapper_readable_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	unsafe { text_wrapper_flag_method(argv, argc, "readable") }
+}
+
+unsafe extern "C" fn text_wrapper_writable_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	unsafe { text_wrapper_flag_method(argv, argc, "writable") }
+}
+
+unsafe extern "C" fn text_wrapper_seekable_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	unsafe { text_wrapper_flag_method(argv, argc, "seekable") }
+}
+
+unsafe extern "C" fn text_wrapper_isatty_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	unsafe { text_wrapper_flag_method(argv, argc, "isatty") }
+}
+
+unsafe extern "C" fn text_wrapper_reconfigure_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "reconfigure") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 1 && args.len() != 6 {
+		return raise_type_error("reconfigure() takes no positional arguments");
+	}
+	if args.len() == 1 {
+		return unsafe { abi::pon_none() };
+	}
+	if let Some(encoding) = match reconfigure_str_option(args[1], "encoding") {
+		Ok(value) => value,
+		Err(error) => return error,
+	} {
+		if super::codecs::canonical_text_encoding(encoding).is_none() {
+			return raise_value_error(&format!("unsupported encoding: {encoding}"));
+		}
+		if let Err(error) = set_text_attr(args[0], "encoding", encoding) {
+			return error;
+		}
+	}
+	if let Some(errors) = match reconfigure_str_option(args[2], "errors") {
+		Ok(value) => value,
+		Err(error) => return error,
+	} {
+		if let Err(error) = set_text_attr(args[0], "errors", errors) {
+			return error;
+		}
+	}
+	if !is_none(args[3]) {
+		let newline = match parse_text_newline_arg(args[3]) {
+			Ok(value) => value,
+			Err(error) => return error,
+		};
+		if let Err(error) = set_object_attr(args[0], "_pon_newline", newline) {
+			return error;
+		}
+	}
+	if !is_none(args[4]) {
+		let value = match object_truth(args[4]) {
+			Ok(value) => value,
+			Err(error) => return error,
+		};
+		if let Err(error) = set_object_attr(args[0], "line_buffering", py_bool(value)) {
+			return error;
+		}
+	}
+	if !is_none(args[5]) {
+		let value = match object_truth(args[5]) {
+			Ok(value) => value,
+			Err(error) => return error,
+		};
+		if let Err(error) = set_object_attr(args[0], "write_through", py_bool(value)) {
+			return error;
+		}
+	}
+	unsafe { abi::pon_none() }
+}
+
+unsafe extern "C" fn text_wrapper_iter_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	unsafe { buffered_iter_method(argv, argc) }
+}
+
+unsafe extern "C" fn text_wrapper_next_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let line = unsafe { text_wrapper_readline_method(argv, argc) };
+	if line.is_null() {
+		return ptr::null_mut();
+	}
+	match unsafe { type_::unicode_text(line) } {
+		Some("") => unsafe { abi::pon_raise_stop_iteration(ptr::null_mut()) },
+		_ => line,
+	}
+}
+
+const TEXT_WRAPPER_METHODS: &[(&str, *const u8)] = &[
+	("__init__", text_wrapper_init_method as *const u8),
+	("read", text_wrapper_read_method as *const u8),
+	("readline", text_wrapper_readline_method as *const u8),
+	("write", text_wrapper_write_method as *const u8),
+	("flush", text_wrapper_flush_method as *const u8),
+	("close", text_wrapper_close_method as *const u8),
+	("detach", text_wrapper_detach_method as *const u8),
+	("seek", text_wrapper_seek_method as *const u8),
+	("tell", text_wrapper_tell_method as *const u8),
+	("reconfigure", text_wrapper_reconfigure_method as *const u8),
+	("readable", text_wrapper_readable_method as *const u8),
+	("writable", text_wrapper_writable_method as *const u8),
+	("seekable", text_wrapper_seekable_method as *const u8),
+	("isatty", text_wrapper_isatty_method as *const u8),
+	("fileno", text_wrapper_fileno_method as *const u8),
+	("__iter__", text_wrapper_iter_method as *const u8),
+	("__next__", text_wrapper_next_method as *const u8),
+];
+
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
 	let unsupported_operation = unsupported_operation_class()?;
 	let io_base = heap_class_with_methods(
@@ -2072,17 +3542,46 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 		"The abstract base class for all I/O classes.",
 		STREAM_METHOD_STUBS,
 		&[
+			("__init__", io_base_init_method as *const u8),
 			("__enter__", io_base_enter_method as *const u8),
 			("__exit__", io_base_exit_method as *const u8),
 			("close", io_base_close_method as *const u8),
 			("flush", io_base_flush_method as *const u8),
+			("readable", io_base_false_method as *const u8),
+			("writable", io_base_false_method as *const u8),
+			("seekable", io_base_false_method as *const u8),
+			("isatty", io_base_false_method as *const u8),
+			("_checkClosed", io_base_check_closed_method as *const u8),
+			("_checkReadable", io_base_check_readable_method as *const u8),
+			("_checkWritable", io_base_check_writable_method as *const u8),
+			("_checkSeekable", io_base_check_seekable_method as *const u8),
 		],
 		&[("closed", io_base_closed_getter as *const u8)],
 	)?;
-	let raw_io_base = heap_class("_RawIOBase", &[io_base], "Base class for raw binary I/O.", &[])?;
-	let buffered_io_base =
-		heap_class("_BufferedIOBase", &[io_base], "Base class for buffered IO objects.", &[])?;
-	let text_io_base = heap_class("_TextIOBase", &[io_base], "Base class for text I/O.", &[])?;
+	let raw_io_base = heap_class_with_methods(
+		"_RawIOBase",
+		&[io_base],
+		"Base class for raw binary I/O.",
+		&[],
+		&[("__init__", io_base_init_method as *const u8)],
+		&[],
+	)?;
+	let buffered_io_base = heap_class_with_methods(
+		"_BufferedIOBase",
+		&[io_base],
+		"Base class for buffered IO objects.",
+		&[],
+		&[("__init__", io_base_init_method as *const u8)],
+		&[],
+	)?;
+	let text_io_base = heap_class_with_methods(
+		"_TextIOBase",
+		&[io_base],
+		"Base class for text I/O.",
+		&[],
+		&[("__init__", io_base_init_method as *const u8)],
+		&[],
+	)?;
 	// Link the pinned native file types under the fresh abstract bases so
 	// `FileIO.__mro__`/`isinstance` walk the CPython-shaped chain. Guarded for
 	// idempotence: the statics survive module re-creation.
@@ -2108,9 +3607,57 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 			(*string_io).bump_version();
 		}
 	}
+	let mut buffered_reader_methods = vec![("__init__", buffered_reader_init_method as *const u8)];
+	buffered_reader_methods.extend_from_slice(BUFFERED_METHODS);
+	let buffered_reader = heap_class_with_methods(
+		"BufferedReader",
+		&[buffered_io_base],
+		"Create a new buffered reader using the given readable raw IO object.",
+		&[],
+		&buffered_reader_methods,
+		&[],
+	)?;
+	let mut buffered_writer_methods = vec![("__init__", buffered_writer_init_method as *const u8)];
+	buffered_writer_methods.extend_from_slice(BUFFERED_METHODS);
+	let buffered_writer = heap_class_with_methods(
+		"BufferedWriter",
+		&[buffered_io_base],
+		"A buffer for a writeable sequential RawIO object.",
+		&[],
+		&buffered_writer_methods,
+		&[],
+	)?;
+	let mut buffered_random_methods = vec![("__init__", buffered_random_init_method as *const u8)];
+	buffered_random_methods.extend_from_slice(BUFFERED_METHODS);
+	let buffered_random = heap_class_with_methods(
+		"BufferedRandom",
+		&[buffered_io_base],
+		"A buffered interface to random access streams.",
+		&[],
+		&buffered_random_methods,
+		&[],
+	)?;
+	let mut buffered_rwpair_methods = vec![("__init__", buffered_rwpair_init_method as *const u8)];
+	buffered_rwpair_methods.extend_from_slice(BUFFERED_METHODS);
+	let buffered_rwpair = heap_class_with_methods(
+		"BufferedRWPair",
+		&[buffered_io_base],
+		"A buffered reader and writer object together.",
+		&[],
+		&buffered_rwpair_methods,
+		&[],
+	)?;
+	let text_wrapper = heap_class_with_methods(
+		"TextIOWrapper",
+		&[text_io_base],
+		"Character and line based layer over a buffered binary stream.",
+		&[],
+		TEXT_WRAPPER_METHODS,
+		&[("closed", io_base_closed_getter as *const u8)],
+	)?;
 	let attrs = vec![
 		string_attr("__name__", "_io")?,
-		int_attr("DEFAULT_BUFFER_SIZE", 131_072)?,
+		int_attr("DEFAULT_BUFFER_SIZE", DEFAULT_BUFFER_SIZE as i64)?,
 		string_attr("stdout", "<stdout>")?,
 		function_attr("open", builtin_open, VARIADIC_ARITY)?,
 		function_attr("open_code", open_code_entry, 1)?,
@@ -2122,45 +3669,13 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 		(intern("_BufferedIOBase"), buffered_io_base),
 		(intern("_TextIOBase"), text_io_base),
 		(intern("FileIO"), binary_file_type().cast::<PyObject>()),
-		(intern("TextIOWrapper"), text_file_type().cast::<PyObject>()),
+		(intern("TextIOWrapper"), text_wrapper),
 		(intern("BytesIO"), bytesio_type().cast::<PyObject>()),
 		(intern("StringIO"), stringio_type().cast::<PyObject>()),
-		(
-			intern("BufferedReader"),
-			heap_class(
-				"BufferedReader",
-				&[buffered_io_base],
-				"Create a new buffered reader using the given readable raw IO object.",
-				&[],
-			)?,
-		),
-		(
-			intern("BufferedWriter"),
-			heap_class(
-				"BufferedWriter",
-				&[buffered_io_base],
-				"A buffer for a writeable sequential RawIO object.",
-				&[],
-			)?,
-		),
-		(
-			intern("BufferedRandom"),
-			heap_class(
-				"BufferedRandom",
-				&[buffered_io_base],
-				"A buffered interface to random access streams.",
-				&[],
-			)?,
-		),
-		(
-			intern("BufferedRWPair"),
-			heap_class(
-				"BufferedRWPair",
-				&[buffered_io_base],
-				"A buffered reader and writer object together.",
-				&[],
-			)?,
-		),
+		(intern("BufferedReader"), buffered_reader),
+		(intern("BufferedWriter"), buffered_writer),
+		(intern("BufferedRandom"), buffered_random),
+		(intern("BufferedRWPair"), buffered_rwpair),
 		(
 			intern("IncrementalNewlineDecoder"),
 			heap_class(
@@ -2308,6 +3823,7 @@ fn heap_class_with_methods(
 	Ok(class)
 }
 
+
 /// `_io.open_code(path)`: CPython semantics minus audit hooks — a binary
 /// read-only stream over `path`.
 unsafe extern "C" fn open_code_entry(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -2330,6 +3846,7 @@ unsafe extern "C" fn open_code_entry(argv: *mut *mut PyObject, argc: usize) -> *
 		Err(OpenError::Type(message)) => raise_type_error(&message),
 		Err(OpenError::Value(message)) => raise_value_error(&message),
 		Err(OpenError::Io(message)) => raise_io_error(&message),
+		Err(OpenError::Pending) => ptr::null_mut(),
 	}
 }
 
@@ -2375,6 +3892,7 @@ pub(super) unsafe extern "C" fn builtin_open(
 		Err(OpenError::Type(message)) => raise_type_error(&message),
 		Err(OpenError::Value(message)) => raise_value_error(&message),
 		Err(OpenError::Io(message)) => raise_io_error(&message),
+		Err(OpenError::Pending) => ptr::null_mut(),
 	}
 }
 
@@ -2414,48 +3932,71 @@ enum FileSource {
 	Fd(i32),
 }
 
-/// Coerce `open()`'s `file` argument to a path string: a `str` directly, or an
-/// `os.PathLike` via its `__fspath__` hook (so `pathlib.Path` works, matching
-/// CPython).  Returns `None` for anything else — notably an integer fd, or a
-/// `bytes` / `__fspath__`-returns-`bytes` path pon's file layer does not accept
-/// — so the caller falls through to the file-descriptor form.
-fn fspath_coerce(obj: *mut PyObject) -> Option<String> {
+/// Coerce `open()`'s `file` argument to a UTF-8 filesystem path string: `str`,
+/// `bytes` decoded with pon's filesystem codec discipline, or an `os.PathLike`
+/// result from `__fspath__`.  `None` means the caller should try the integer
+/// file-descriptor form.
+fn fspath_coerce(obj: *mut PyObject) -> Result<Option<String>, OpenError> {
 	let raw = crate::tag::untag_arg(obj);
 	if raw.is_null() || crate::tag::is_small_int(raw) {
-		return None;
+		return Ok(None);
 	}
 	if let Some(text) = unsafe { type_::unicode_text(raw) } {
-		return Some(text.to_owned());
+		return Ok(Some(text.to_owned()));
+	}
+	if let Some(path) = bytes_path_to_string(raw)? {
+		return Ok(Some(path));
 	}
 	let ty = unsafe { (*raw).ob_type.cast_mut() };
 	let hook = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern("__fspath__")) };
 	if hook.is_null() {
-		return None;
+		return Ok(None);
 	}
 	let bound = unsafe { crate::descr::descriptor_get(hook, raw, ty) };
 	if bound.is_null() {
-		return None;
+		return Err(OpenError::Pending);
 	}
 	let result =
 		crate::tag::untag_arg(unsafe { crate::abi::pon_call(bound, std::ptr::null_mut(), 0) });
 	if result.is_null() {
-		return None;
+		return Err(OpenError::Pending);
 	}
-	unsafe { type_::unicode_text(result) }.map(str::to_owned)
+	if let Some(text) = unsafe { type_::unicode_text(result) } {
+		return Ok(Some(text.to_owned()));
+	}
+	if let Some(path) = bytes_path_to_string(result)? {
+		return Ok(Some(path));
+	}
+	Err(OpenError::Type(
+		"expected __fspath__() to return str or bytes".to_owned(),
+	))
+}
+
+fn bytes_path_to_string(object: *mut PyObject) -> Result<Option<String>, OpenError> {
+	let object = crate::tag::untag_arg(object);
+	if object.is_null() || crate::tag::is_small_int(object) {
+		return Ok(None);
+	}
+	let ty = unsafe { (*object).ob_type };
+	if !bytes_::is_bytes_type(ty) {
+		return Ok(None);
+	}
+	let bytes = unsafe { (&*object.cast::<bytes_::PyBytes>()).as_slice() };
+	std::str::from_utf8(bytes)
+		.map(|text| Some(text.to_owned()))
+		.map_err(|_| OpenError::Value("embedded null byte or invalid UTF-8 path".to_owned()))
 }
 
 fn open_from_args(args: &[*mut PyObject]) -> Result<*mut PyObject, OpenError> {
 	if args.is_empty() || args.len() > 8 {
 		return Err(OpenError::Type(format!("open() expected 1 to 8 arguments, got {}", args.len())));
 	}
-	// `file` is a path (str) or an existing file descriptor (int), matching
-	// CPython `open(file, ...)` and `os.fdopen`.
-	let source = match fspath_coerce(args[0]) {
+	let source = match fspath_coerce(args[0])? {
 		Some(path) => FileSource::Path(path),
 		None => {
 			let fd = expect_int(
 				args[0],
-				"open() argument must be a str, os.PathLike, or integer file descriptor",
+				"open() argument must be a str, bytes, os.PathLike, or integer file descriptor",
 			)
 			.map_err(OpenError::Type)?;
 			if fd < 0 {
@@ -2466,23 +4007,17 @@ fn open_from_args(args: &[*mut PyObject]) -> Result<*mut PyObject, OpenError> {
 			FileSource::Fd(fd)
 		},
 	};
-	// The keyword binder flattens the full `open(file, mode='r',
-	// buffering=-1, encoding=None, errors=None, newline=None, closefd=True,
-	// opener=None)` signature into eight positional slots with None filling
-	// every absent optional, so a None mode selects the default exactly like
-	// an absent slot does.
 	let mode_text = match args.get(1) {
 		Some(&mode) if !is_none(mode) => expect_str(mode, "open() mode must be str")?.to_owned(),
 		_ => "r".to_owned(),
 	};
 	let mode = parse_mode(&mode_text)?;
-
-	if let Some(&buffering) = args.get(2) {
-		if !is_none(buffering) {
-			let _ = expect_int(buffering, "open() buffering must be int").map_err(OpenError::Type)?;
-		}
-	}
-
+	let buffering = match args.get(2).copied() {
+		Some(buffering) if !is_none(buffering) => {
+			expect_int(buffering, "open() buffering must be int").map_err(OpenError::Type)?
+		},
+		_ => -1,
+	};
 	let encoding = if mode.binary {
 		if args.get(3).copied().is_some_and(|value| !is_none(value)) {
 			return Err(OpenError::Value("binary mode doesn't take an encoding argument".to_owned()));
@@ -2496,13 +4031,11 @@ fn open_from_args(args: &[*mut PyObject]) -> Result<*mut PyObject, OpenError> {
 			if super::codecs::canonical_text_encoding(text).is_none() {
 				return Err(OpenError::Value(format!("unsupported encoding: {text}")));
 			}
-			// Preserve the caller's SPELLING (`f.encoding` reads it back).
 			Some(text.to_owned())
 		}
 	} else {
 		Some("utf-8".to_owned())
 	};
-
 	let errors = if mode.binary {
 		if args.get(4).copied().is_some_and(|value| !is_none(value)) {
 			return Err(OpenError::Value("binary mode doesn't take an errors argument".to_owned()));
@@ -2517,7 +4050,6 @@ fn open_from_args(args: &[*mut PyObject]) -> Result<*mut PyObject, OpenError> {
 	} else {
 		"strict".to_owned()
 	};
-
 	let newline = if mode.binary {
 		if args.get(5).copied().is_some_and(|value| !is_none(value)) {
 			return Err(OpenError::Value("binary mode doesn't take a newline argument".to_owned()));
@@ -2539,29 +4071,192 @@ fn open_from_args(args: &[*mut PyObject]) -> Result<*mut PyObject, OpenError> {
 	} else {
 		NewlineMode::UniversalTranslate
 	};
-
-	if args
-		.get(6)
-		.copied()
-		.is_some_and(|closefd| is_false(closefd))
-	{
-		return Err(OpenError::Value("open() closefd=False is not supported".to_owned()));
-	}
-	if args.get(7).copied().is_some_and(|opener| !is_none(opener)) {
-		return Err(OpenError::Value("open() opener argument is not supported".to_owned()));
+	let closefd = !args.get(6).copied().is_some_and(is_false);
+	let opener = args.get(7).copied().filter(|opener| !is_none(*opener));
+	if matches!(source, FileSource::Path(_)) && !closefd {
+		return Err(OpenError::Value("Cannot use closefd=False with file name".to_owned()));
 	}
 
-	let (file, name) = match source {
-		FileSource::Path(path) => (open_host_file(&path, &mode)?, path),
+	let (file, name, raw_closefd) = match source {
+		FileSource::Path(path) => {
+			if let Some(opener) = opener {
+				let fd = call_opener(opener, args[0], open_flags(&mode)?)?;
+				use std::os::fd::FromRawFd;
+				(unsafe { File::from_raw_fd(fd) }, path, true)
+			} else {
+				(open_host_file(&path, &mode)?, path, true)
+			}
+		},
 		FileSource::Fd(fd) => {
 			use std::os::fd::FromRawFd;
-			// SAFETY: the caller transfers ownership of `fd` (CPython
-			// `closefd=True`, the default — `closefd=False` is rejected above);
-			// the file object closes it on drop.
-			(unsafe { File::from_raw_fd(fd) }, fd.to_string())
+			(unsafe { File::from_raw_fd(fd) }, fd.to_string(), closefd)
 		},
 	};
-	Ok(alloc_file(file, name, mode, encoding, errors, newline))
+
+	let mut raw_mode = mode.clone();
+	raw_mode.binary = true;
+	if !raw_mode.display.contains('b') {
+		raw_mode.display.push('b');
+	}
+	let raw = alloc_file(
+		file,
+		name,
+		raw_mode,
+		None,
+		String::new(),
+		NewlineMode::LineFeed,
+		raw_closefd,
+	);
+	if raw.is_null() {
+		return Err(OpenError::Pending);
+	}
+
+	let mut line_buffering = false;
+	let buffer_size = if buffering == 0 {
+		if mode.binary {
+			return Ok(raw);
+		}
+		return Err(OpenError::Value("can't have unbuffered text I/O".to_owned()));
+	} else if buffering == 1 {
+		if !mode.binary {
+			line_buffering = true;
+		}
+		DEFAULT_BUFFER_SIZE
+	} else if buffering < 0 {
+		if !mode.binary && call_bool_method(raw, "isatty", false).map_err(|_| OpenError::Pending)? {
+			line_buffering = true;
+		}
+		DEFAULT_BUFFER_SIZE
+	} else {
+		buffering as usize
+	};
+
+	let buffer = make_buffered_for_mode(&mode, raw, buffer_size)?;
+	if mode.binary {
+		return Ok(buffer);
+	}
+	let text = make_text_wrapper(
+		buffer,
+		encoding.as_deref().unwrap_or("utf-8"),
+		&errors,
+		newline,
+		line_buffering,
+		false,
+	)?;
+	let mode_obj = alloc_str(&mode_text);
+	if mode_obj.is_null() {
+		return Err(OpenError::Pending);
+	}
+	if unsafe { abi::pon_set_attr(text, intern("mode"), mode_obj) } < 0 {
+		return Err(OpenError::Pending);
+	}
+	Ok(text)
+}
+
+fn open_flags(mode: &OpenMode) -> Result<i32, OpenError> {
+	let mut flags = if mode.readable && mode.writable {
+		libc::O_RDWR
+	} else if mode.writable {
+		libc::O_WRONLY
+	} else if mode.readable {
+		libc::O_RDONLY
+	} else {
+		return Err(OpenError::Value("invalid open mode".to_owned()));
+	};
+	if mode.create || mode.create_new {
+		flags |= libc::O_CREAT;
+	}
+	if mode.truncate {
+		flags |= libc::O_TRUNC;
+	}
+	if mode.append {
+		flags |= libc::O_APPEND;
+	}
+	if mode.create_new {
+		flags |= libc::O_EXCL;
+	}
+	Ok(flags)
+}
+
+fn call_opener(opener: *mut PyObject, path: *mut PyObject, flags: i32) -> Result<i32, OpenError> {
+	let flags = py_int(i64::from(flags));
+	if flags.is_null() {
+		return Err(OpenError::Pending);
+	}
+	let mut argv = [path, flags];
+	let result = unsafe { abi::pon_call(opener, argv.as_mut_ptr(), argv.len()) };
+	if result.is_null() {
+		return Err(OpenError::Pending);
+	}
+	let fd = expect_int(result, "open() opener must return an integer file descriptor")
+		.map_err(OpenError::Type)?;
+	if fd < 0 {
+		return Err(OpenError::Value("opener returned a negative file descriptor".to_owned()));
+	}
+	i32::try_from(fd).map_err(|_| OpenError::Value(format!("opener returned invalid file descriptor: {fd}")))
+}
+
+fn call_io_class(name: &str, argv: &mut [*mut PyObject]) -> Result<*mut PyObject, OpenError> {
+	let class = crate::import::module_attr(intern("_io"), intern(name))
+		.ok_or_else(|| OpenError::Io(format!("_io.{name} is not registered")))?;
+	let result = unsafe { abi::pon_call(class, argv.as_mut_ptr(), argv.len()) };
+	if result.is_null() {
+		Err(OpenError::Pending)
+	} else {
+		Ok(result)
+	}
+}
+
+fn make_buffered_for_mode(
+	mode: &OpenMode,
+	raw: *mut PyObject,
+	buffer_size: usize,
+) -> Result<*mut PyObject, OpenError> {
+	let size = py_int(buffer_size as i64);
+	if size.is_null() {
+		return Err(OpenError::Pending);
+	}
+	let mut argv = [raw, size];
+	if mode.readable && mode.writable {
+		call_io_class("BufferedRandom", &mut argv)
+	} else if mode.writable {
+		call_io_class("BufferedWriter", &mut argv)
+	} else {
+		call_io_class("BufferedReader", &mut argv)
+	}
+}
+
+fn newline_mode_object(mode: NewlineMode) -> *mut PyObject {
+	match mode {
+		NewlineMode::UniversalTranslate => unsafe { abi::pon_none() },
+		NewlineMode::UniversalPreserve => alloc_str(""),
+		NewlineMode::LineFeed => alloc_str("\n"),
+		NewlineMode::CarriageReturn => alloc_str("\r"),
+		NewlineMode::CarriageReturnLineFeed => alloc_str("\r\n"),
+	}
+}
+
+fn make_text_wrapper(
+	buffer: *mut PyObject,
+	encoding: &str,
+	errors: &str,
+	newline: NewlineMode,
+	line_buffering: bool,
+	write_through: bool,
+) -> Result<*mut PyObject, OpenError> {
+	let encoding = alloc_str(encoding);
+	let errors = alloc_str(errors);
+	let newline = newline_mode_object(newline);
+	let line_buffering = py_bool(line_buffering);
+	let write_through = py_bool(write_through);
+	if [encoding, errors, newline, line_buffering, write_through]
+		.iter()
+		.any(|object| object.is_null())
+	{
+		return Err(OpenError::Pending);
+	}
+	let mut argv = [buffer, encoding, errors, newline, line_buffering, write_through];
+	call_io_class("TextIOWrapper", &mut argv)
 }
 
 fn open_host_file(path: &str, mode: &OpenMode) -> Result<File, OpenError> {
@@ -2575,7 +4270,12 @@ fn open_host_file(path: &str, mode: &OpenMode) -> Result<File, OpenError> {
 	options.create(mode.create);
 	options.truncate(mode.truncate);
 	options.create_new(mode.create_new);
-	options.open(path).map_err(|error| {
+	let mut guard = crate::sync::BlockingRegionGuard::enter();
+	let opened = options.open(path);
+	if let Err(message) = guard.leave() {
+		return Err(OpenError::Io(format!("OSError: {message}")));
+	}
+	opened.map_err(|error| {
 		if error.kind() == std::io::ErrorKind::AlreadyExists {
 			OpenError::Io(format!("FileExistsError: [Errno 17] File exists: '{path}'"))
 		} else if error.kind() == std::io::ErrorKind::NotFound {
@@ -2593,6 +4293,7 @@ fn alloc_file(
 	encoding: Option<String>,
 	errors: String,
 	newline: NewlineMode,
+	closefd: bool,
 ) -> *mut PyObject {
 	let ty = if mode.binary {
 		binary_file_type()
@@ -2614,6 +4315,7 @@ fn alloc_file(
 		newline_seen: 0,
 		line_buffering: false,
 		write_through: false,
+		closefd,
 		attrs: HashMap::new(),
 	})
 }
@@ -2655,6 +4357,7 @@ pub(super) fn std_stream_object(fd: i32, name: &str, readable: bool) -> *mut PyO
 		newline_seen: 0,
 		line_buffering: false,
 		write_through: false,
+		closefd: true,
 		attrs: HashMap::new(),
 	})
 }
@@ -3139,8 +4842,12 @@ unsafe extern "C" fn file_close_method(argv: *mut *mut PyObject, argc: usize) ->
 		return raise_type_error("close() receiver is not a native file");
 	};
 	if let Some(mut handle) = file.file.take() {
-		if handle.flush().is_err() {
+		if blocking_file_io(|| handle.flush()).is_err() {
 			return raise_io_error("failed to flush file during close");
+		}
+		if !file.closefd {
+			use std::os::fd::IntoRawFd;
+			let _ = handle.into_raw_fd();
 		}
 	}
 	unsafe { abi::pon_none() }
@@ -3163,7 +4870,7 @@ unsafe extern "C" fn file_flush_method(argv: *mut *mut PyObject, argc: usize) ->
 	let Some(handle) = file.file.as_mut() else {
 		return raise_value_error("I/O operation on closed file.");
 	};
-	if handle.flush().is_err() {
+	if blocking_file_io(|| handle.flush()).is_err() {
 		return raise_io_error("failed to flush file");
 	}
 	unsafe { abi::pon_none() }
@@ -3197,15 +4904,8 @@ unsafe extern "C" fn file_reconfigure_method(
 		Ok(value) => value,
 		Err(error) => return error,
 	} {
-		let current = file.encoding.as_deref().unwrap_or("utf-8");
-		if !same_text_encoding(current, encoding) {
-			return abi::exc::raise_kind_error_text(
-				ExceptionKind::NotImplementedError,
-				&format!(
-					"reconfigure() encoding '{encoding}' is not implemented in pon; only UTF-8 text \
-					 streams can be reconfigured"
-				),
-			);
+		if super::codecs::canonical_text_encoding(encoding).is_none() {
+			return raise_value_error(&format!("unsupported encoding: {encoding}"));
 		}
 		file.encoding = Some(encoding.to_owned());
 	}
@@ -3304,7 +5004,7 @@ unsafe extern "C" fn file_seekable_method(argv: *mut *mut PyObject, argc: usize)
 	let Some(handle) = file.file.as_mut() else {
 		return raise_value_error("I/O operation on closed file");
 	};
-	let seekable = handle.seek(SeekFrom::Current(0)).is_ok();
+	let seekable = blocking_file_io(|| handle.seek(SeekFrom::Current(0))).is_ok();
 	// SAFETY: Boolean boxing helper follows the NULL-sentinel contract.
 	unsafe { abi::number::pon_const_bool(i32::from(seekable)) }
 }
@@ -3374,8 +5074,12 @@ unsafe extern "C" fn file_exit_method(argv: *mut *mut PyObject, argc: usize) -> 
 		return raise_type_error("__exit__() receiver is not a native file");
 	};
 	if let Some(mut handle) = file.file.take() {
-		if handle.flush().is_err() {
+		if blocking_file_io(|| handle.flush()).is_err() {
 			return raise_io_error("failed to flush file during close");
+		}
+		if !file.closefd {
+			use std::os::fd::IntoRawFd;
+			let _ = handle.into_raw_fd();
 		}
 	}
 	unsafe { abi::number::pon_const_bool(0) }
@@ -3417,11 +5121,11 @@ fn read_raw(file: &mut PyNativeFile, size: Option<usize>) -> Result<Vec<u8>, Fil
 		match size {
 			Some(size) => {
 				out.resize(size, 0);
-				let n = handle.read(&mut out).map_err(io_op_error)?;
+				let n = blocking_file_io(|| handle.read(&mut out))?;
 				out.truncate(n);
 			},
 			None => {
-				handle.read_to_end(&mut out).map_err(io_op_error)?;
+				blocking_file_io(|| handle.read_to_end(&mut out))?;
 			},
 		}
 		out
@@ -3445,7 +5149,7 @@ fn read_line_raw(file: &mut PyNativeFile, size: Option<usize>) -> Result<Vec<u8>
 		let mut previous_was_cr = false;
 		while out.len() < limit {
 			let mut byte = [0_u8; 1];
-			let n = handle.read(&mut byte).map_err(io_op_error)?;
+			let n = blocking_file_io(|| handle.read(&mut byte))?;
 			if n == 0 {
 				break;
 			}
@@ -3460,12 +5164,12 @@ fn read_line_raw(file: &mut PyNativeFile, size: Option<usize>) -> Result<Vec<u8>
 							break;
 						}
 						let mut next = [0_u8; 1];
-						let n = handle.read(&mut next).map_err(io_op_error)?;
+						let n = blocking_file_io(|| handle.read(&mut next))?;
 						if n != 0 {
 							if next[0] == b'\n' {
 								out.push(next[0]);
 							} else {
-								handle.seek(SeekFrom::Current(-1)).map_err(io_op_error)?;
+								blocking_file_io(|| handle.seek(SeekFrom::Current(-1)))?;
 							}
 						}
 						break;
@@ -3512,7 +5216,7 @@ fn read_chars_raw(file: &mut PyNativeFile, count: usize) -> Result<Vec<u8>, File
 		let mut chars = 0_usize;
 		while chars < count {
 			let mut byte = [0_u8; 1];
-			if handle.read(&mut byte).map_err(io_op_error)? == 0 {
+			if blocking_file_io(|| handle.read(&mut byte))? == 0 {
 				break;
 			}
 			out.push(byte[0]);
@@ -3526,7 +5230,7 @@ fn read_chars_raw(file: &mut PyNativeFile, count: usize) -> Result<Vec<u8>, File
 			};
 			while pending > 0 {
 				let mut cont = [0_u8; 1];
-				if handle.read(&mut cont).map_err(io_op_error)? == 0 {
+				if blocking_file_io(|| handle.read(&mut cont))? == 0 {
 					// EOF mid-sequence: downstream validation reports it.
 					return Ok(out);
 				}
@@ -3542,11 +5246,11 @@ fn read_chars_raw(file: &mut PyNativeFile, count: usize) -> Result<Vec<u8>, File
 				// `\r\n` collapses to one `\n` downstream: consume the pair as a
 				// single character; a bare `\r` seeks back like `read_line_raw`.
 				let mut next = [0_u8; 1];
-				if handle.read(&mut next).map_err(io_op_error)? != 0 {
+				if blocking_file_io(|| handle.read(&mut next))? != 0 {
 					if next[0] == b'\n' {
 						out.push(next[0]);
 					} else {
-						handle.seek(SeekFrom::Current(-1)).map_err(io_op_error)?;
+						blocking_file_io(|| handle.seek(SeekFrom::Current(-1)))?;
 					}
 				}
 			}
@@ -3571,7 +5275,7 @@ fn read_into_file(
 	}
 	let handle = file.file.as_mut().ok_or_else(closed_error)?;
 	let dst = unsafe { std::slice::from_raw_parts_mut(dst, dst_len) };
-	handle.read(dst).map_err(io_op_error)
+	blocking_file_io(|| handle.read(dst))
 }
 
 fn bytes_to_python(file: &PyNativeFile, bytes: Vec<u8>) -> *mut PyObject {
@@ -3600,7 +5304,7 @@ fn write_object(file: &mut PyNativeFile, object: *mut PyObject) -> Result<i64, F
 			BioError::Buffer => FileOpError::Value("buffer export pins the source".to_owned()),
 		})?;
 		let handle = file.file.as_mut().ok_or_else(closed_error)?;
-		handle.write_all(&bytes).map_err(io_op_error)?;
+		blocking_file_io(|| handle.write_all(&bytes))?;
 		Ok(bytes.len() as i64)
 	} else {
 		let text = unsafe { type_::unicode_text(object) }
@@ -3611,9 +5315,9 @@ fn write_object(file: &mut PyNativeFile, object: *mut PyObject) -> Result<i64, F
 		let should_flush = file.write_through
 			|| (file.line_buffering && bytes.iter().any(|byte| matches!(*byte, b'\n' | b'\r')));
 		let handle = file.file.as_mut().ok_or_else(closed_error)?;
-		handle.write_all(bytes.as_ref()).map_err(io_op_error)?;
+		blocking_file_io(|| handle.write_all(bytes.as_ref()))?;
 		if should_flush {
-			handle.flush().map_err(io_op_error)?;
+			blocking_file_io(|| handle.flush())?;
 		}
 		Ok(text.chars().count() as i64)
 	}
@@ -3645,7 +5349,7 @@ fn seek_file(file: &mut PyNativeFile, offset: i64, whence: i64) -> Result<u64, F
 		2 => SeekFrom::End(offset),
 		_ => return Err(FileOpError::Value("invalid whence".to_owned())),
 	};
-	handle.seek(seek_from).map_err(io_op_error)
+	blocking_file_io(|| handle.seek(seek_from))
 }
 
 fn ensure_readable(file: &PyNativeFile) -> Result<(), FileOpError> {
@@ -3792,18 +5496,6 @@ fn utf8_replace_error_bytes(text: &str) -> Vec<u8> {
 	out
 }
 
-/// True when two encoding spellings resolve to the SAME native codec, so
-/// `reconfigure(encoding=...)` accepts alias re-spellings without a decoder
-/// swap mid-stream.
-fn same_text_encoding(current: &str, requested: &str) -> bool {
-	match (
-		super::codecs::canonical_text_encoding(current),
-		super::codecs::canonical_text_encoding(requested),
-	) {
-		(Some(current), Some(requested)) => current == requested,
-		_ => false,
-	}
-}
 
 fn reconfigure_str_option<'a>(
 	object: *mut PyObject,
@@ -3897,8 +5589,7 @@ fn expect_int(object: *mut PyObject, message: &str) -> Result<i64, String> {
 	if object.is_null() {
 		return Err(message.to_owned());
 	}
-	unsafe { crate::types::int::to_i64_including_bool(object) }
-		.ok_or_else(|| message.to_owned())
+	unsafe { crate::types::int::to_i64_including_bool(object) }.ok_or_else(|| message.to_owned())
 }
 
 fn is_none(object: *mut PyObject) -> bool {
@@ -4004,11 +5695,21 @@ fn io_op_error(error: std::io::Error) -> FileOpError {
 	FileOpError::Io(format!("OSError: {error}"))
 }
 
+fn blocking_file_io<T>(op: impl FnOnce() -> std::io::Result<T>) -> Result<T, FileOpError> {
+	let mut guard = crate::sync::BlockingRegionGuard::enter();
+	let result = op();
+	if let Err(message) = guard.leave() {
+		return Err(FileOpError::Io(format!("OSError: {message}")));
+	}
+	result.map_err(io_op_error)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OpenError {
 	Type(String),
 	Value(String),
 	Io(String),
+	Pending,
 }
 
 enum FileOpError {

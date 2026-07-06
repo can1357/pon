@@ -21,16 +21,13 @@ pub const AOT_INIT_NAMES: &str = "pon_aot_init_names";
 /// Runtime helper imported by the AoT name-id seed hook.
 pub const AOT_INTERN_NAME: &str = "pon_aot_intern_name";
 
-/// Free-threaded generated-code safepoint helper.
-#[cfg(feature = "free-threading")]
+/// Generated-code safepoint helper.
 pub const FT_SAFEPOINT_POLL: &str = "pon_safepoint_poll";
 
-/// Free-threaded generated-code write-barrier helper.
-#[cfg(feature = "free-threading")]
+/// Generated-code write-barrier helper.
 pub const FT_GC_WRITE_BARRIER: &str = "pon_gc_write_barrier";
 
-/// Free-threaded generated-code stop-request query helper.
-#[cfg(feature = "free-threading")]
+/// Generated-code stop-request query helper.
 pub const FT_GC_STOP_REQUESTED: &str = "pon_gc_stop_requested";
 
 /// Local symbol for the real boxed top-level AoT body.
@@ -210,13 +207,12 @@ mod tests {
 			pon_runtime::abi::CURRENT_LINE_SYMBOL,
 			pon_runtime::abi::current_line_cell_address(),
 		);
-		register_free_threading_symbols(&mut builder);
+		register_threading_symbols(&mut builder);
 		cranelift_jit::JITModule::new(builder)
 	}
 
-	#[cfg(feature = "free-threading")]
-	fn register_free_threading_symbols(builder: &mut cranelift_jit::JITBuilder) {
-		unsafe extern "C" fn safepoint_poll() {}
+	fn register_threading_symbols(builder: &mut cranelift_jit::JITBuilder) {
+		unsafe extern "C" fn safepoint_poll() -> i32 { 0 }
 		unsafe extern "C" fn write_barrier(
 			_slot: *mut *mut pon_runtime::object::PyObject,
 			_new: *mut pon_runtime::object::PyObject,
@@ -230,9 +226,6 @@ mod tests {
 		builder.symbol(FT_GC_WRITE_BARRIER, write_barrier as *const u8);
 		builder.symbol(FT_GC_STOP_REQUESTED, stop_requested as *const u8);
 	}
-
-	#[cfg(not(feature = "free-threading"))]
-	fn register_free_threading_symbols(_builder: &mut cranelift_jit::JITBuilder) {}
 
 	fn optimizable_load_local_module() -> IrModule {
 		IrModule {

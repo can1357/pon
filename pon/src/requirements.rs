@@ -26,6 +26,8 @@ pub struct RequirementsFile {
 	pub index_url:        Option<String>,
 	/// `--extra-index-url` values in encounter order.
 	pub extra_index_urls: Vec<String>,
+	/// `--find-links` directories or file indexes in encounter order.
+	pub find_links:       Vec<PathBuf>,
 	/// Whether `--no-index` appeared anywhere in the file tree.
 	pub no_index:         bool,
 	/// Whether prereleases are allowed via `--pre`.
@@ -53,8 +55,9 @@ pub struct RequirementEntry {
 /// Supported grammar: `#` comments at line start or after whitespace, trailing
 /// backslash continuations, `${VAR}` environment expansion with undefined vars
 /// left verbatim, recursive `-r` includes, `-c` constraints, editable local
-/// directories, index options, `--no-index`, `--pre`, `--require-hashes`, and
-/// repeated per-requirement `--hash=algo:hex` options.
+/// directories, index options, `--no-index`, `--find-links`, `--pre`,
+/// `--require-hashes`, and repeated per-requirement `--hash=algo:hex`
+/// options.
 pub fn parse_requirements_file(path: &Path) -> Result<RequirementsFile> {
 	let mut stack = Vec::new();
 	parse_requirements_file_inner(path, &mut stack)
@@ -181,6 +184,22 @@ fn parse_non_include_line(
 			.push(parse_editable_entry(editable, line_number, file_path, base_dir)?);
 		return Ok(());
 	}
+	if first == "-f" || first == "--find-links" {
+		let links = required_option_value(tokens, 0, first, file_path, line_number)?;
+		reject_extra_tokens(tokens, 2, file_path, line_number)?;
+		file
+			.find_links
+			.push(resolve_relative_path(base_dir, links));
+		return Ok(());
+	}
+	if let OptionMatch::Inline(links) = option_name_and_value(first, "--find-links") {
+		let links = require_inline_value(links, "--find-links", file_path, line_number)?;
+		reject_extra_tokens(tokens, 1, file_path, line_number)?;
+		file
+			.find_links
+			.push(resolve_relative_path(base_dir, links));
+		return Ok(());
+	}
 	if first.starts_with('-') {
 		return parse_global_options(tokens, line_number, file_path, file);
 	}
@@ -209,6 +228,7 @@ fn parse_global_options(
 	file_path: &Path,
 	file: &mut RequirementsFile,
 ) -> Result<()> {
+	let base_dir = file_path.parent().unwrap_or_else(|| Path::new("."));
 	let mut index = 0;
 	while index < tokens.len() {
 		let token = &tokens[index].text;
@@ -237,6 +257,11 @@ fn parse_global_options(
 				);
 				index += 2;
 			},
+			"-f" | "--find-links" => {
+				let links = required_option_value(tokens, index, token, file_path, line_number)?;
+				file.find_links.push(resolve_relative_path(base_dir, links));
+				index += 2;
+			},
 			_ => match option_name_and_value(token, "--index-url") {
 				OptionMatch::Inline(value) => {
 					let value = require_inline_value(value, "--index-url", file_path, line_number)?;
@@ -252,7 +277,21 @@ fn parse_global_options(
 							index += 1;
 						},
 						OptionMatch::NoMatch | OptionMatch::Flag => {
-							return Err(unsupported_option(token, file_path, line_number));
+							match option_name_and_value(token, "--find-links") {
+								OptionMatch::Inline(value) => {
+									let value = require_inline_value(
+										value,
+										"--find-links",
+										file_path,
+										line_number,
+									)?;
+									file.find_links.push(resolve_relative_path(base_dir, value));
+									index += 1;
+								},
+								OptionMatch::NoMatch | OptionMatch::Flag => {
+									return Err(unsupported_option(token, file_path, line_number));
+								},
+							}
 						},
 					}
 				},
@@ -349,6 +388,7 @@ fn merge_requirements(target: &mut RequirementsFile, source: RequirementsFile) {
 		target.index_url = source.index_url;
 	}
 	target.extra_index_urls.extend(source.extra_index_urls);
+	target.find_links.extend(source.find_links);
 	target.no_index |= source.no_index;
 	target.pre |= source.pre;
 	target.require_hashes |= source.require_hashes;
@@ -616,6 +656,7 @@ mod tests {
                  --index-url https://${{{env_key}}}/simple\n\
                  --extra-index-url https://${{{env_key}}}/extra # trailing comment\n\
                  --no-index --pre --require-hashes\n\
+                 --find-links ./wheelhouse\n\
                  demo>=1 \\\n\
                      --hash=sha256:abc --hash=sha256:def # hash comment\n\
                  git+https://example.test/org/demo.git#subdirectory=pkg\n\
@@ -629,12 +670,13 @@ mod tests {
 		let unset_reference = format!("${{{unset_key}}}");
 		assert_eq!(parsed.index_url.as_deref(), Some(unset_reference.as_str()));
 		assert_eq!(parsed.extra_index_urls, vec!["https://packages.example.test/extra"]);
+		assert_eq!(parsed.find_links, vec![root.join("wheelhouse")]);
 		assert!(parsed.no_index);
 		assert!(parsed.pre);
 		assert!(parsed.require_hashes);
 		assert_eq!(parsed.entries.len(), 2);
 		assert_eq!(parsed.entries[0].hashes, vec!["sha256:abc", "sha256:def"]);
-		assert_eq!(parsed.entries[0].line, 5);
+		assert_eq!(parsed.entries[0].line, 6);
 		assert!(matches!(parsed.entries[0].input, RequirementInput::Pep508(_)));
 		assert!(matches!(parsed.entries[1].input, RequirementInput::Url { .. }));
 		fs::remove_dir_all(root).ok();

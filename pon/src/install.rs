@@ -701,22 +701,17 @@ mod tests {
 		assert_eq!(report.artifact_kind, "editable");
 		assert_eq!(report.import_names, vec!["demo_pkg".to_owned()]);
 		let installed_import = layout.site_packages.join("demo_pkg");
-		#[cfg(unix)]
-		assert!(
-			fs::symlink_metadata(&installed_import)
-				.expect("installed import metadata")
-				.file_type()
-				.is_symlink()
-		);
+		let editable_pth = layout.site_packages.join("demo-pkg-editable.pth");
+		assert!(!installed_import.exists());
 		assert_eq!(
-			fs::read_to_string(installed_import.join("__init__.py")).expect("linked source"),
-			"VALUE = 1\n"
+			fs::read_to_string(&editable_pth).expect(".pth file"),
+			format!("{}\n", source.join("src").display())
 		);
 
 		let removed = remove_installed_package(&layout, "demo-pkg").expect("remove editable");
 
 		assert_eq!(removed.expect("removed").artifact_kind, "editable");
-		assert!(!installed_import.exists());
+		assert!(!editable_pth.exists());
 		assert_eq!(
 			fs::read_to_string(package_root.join("__init__.py")).expect("source intact"),
 			"VALUE = 1\n"

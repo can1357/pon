@@ -1,29 +1,21 @@
-//! Native `_socket` seed: import surface plus host byte-order/address helpers.
+//! Native `_socket`: host-backed socket objects, address helpers, and resolver glue.
 //!
-//! The CT frontier needs `import socket` to succeed — `unittest.mock` pulls
-//! `asyncio` → `asyncio.base_events` → `socket`, and `socketserver` imports
-//! it directly.  This module gives the vendored `Lib/socket.py` the address,
-//! type, flag, protocol, resolver-error, and socket-option constants CPython's
-//! Darwin build exposes, plus the pure C helper functions that do not require
-//! owning live socket objects (`inet_pton`/`inet_ntop`, interface-name lookup,
-//! ancillary-data sizing, default-timeout state, and `sethostname`).
+//! The vendored `Lib/socket.py` delegates all file-descriptor operations to this
+//! module.  Socket instances own or adopt real host descriptors, track CPython's
+//! blocking/timeout modes, marshal AF_INET/AF_INET6/AF_UNIX addresses, and expose
+//! UDP, stream, ancillary-data, resolver, byte-order, and interface helpers.
 //!
-//! Constants use `libc` where the crate exposes the Darwin header value; a few
+//! Constants use `libc` where the crate exposes the platform header value; a few
 //! CPython-visible Darwin constants missing from `libc` are spelled as their
-//! platform header values below.  `socket.py`'s `IntEnum._convert_` /
-//! `IntFlag._convert_` sweeps pick them up by prefix.
-//!
-//! The `socket` heap type is still only subclassable, not a live fd wrapper:
-//! constructing it raises `OSError`.  Deliberate absences keep stdlib probes
-//! on clean fallback paths: no `_socket.socketpair` (socket.py falls back to
-//! `_fallback_socketpair`) and no `sendmsg`/`recvmsg`/`share` methods on the
-//! socket type (no `send_fds`/`recv_fds`/`fromshare`).  Resolver entry points
-//! that need live socket objects still raise `OSError` loudly at the call site.
+//! platform values below.  `socket.py`'s `IntEnum._convert_` /
+//! `IntFlag._convert_` sweeps pick them up by prefix.  Windows-only entry points
+//! (`ioctl`, `share`, `fromshare`) remain absent instead of being faked.
 
 use std::{
 	ffi::{CStr, CString},
 	ptr,
 	sync::{LazyLock, Mutex},
+	time::{Duration, Instant},
 };
 
 use num_traits::ToPrimitive;
@@ -49,6 +41,7 @@ unsafe extern "C" {
 		size: libc::socklen_t,
 	) -> *const libc::c_char;
 	fn inet_pton(af: libc::c_int, src: *const libc::c_char, dst: *mut libc::c_void) -> libc::c_int;
+	fn inet_aton(cp: *const libc::c_char, inp: *mut libc::in_addr) -> libc::c_int;
 }
 
 const INET6_ADDRSTRLEN: usize = 46;
@@ -291,35 +284,30 @@ const INT_CONSTANTS: &[(&str, i64)] = &[
 const REAL_FUNCTIONS: &[(&str, BuiltinFn)] = &[
 	("CMSG_LEN", socket_cmsg_len),
 	("CMSG_SPACE", socket_cmsg_space),
+	("close", socket_close_real),
+	("dup", socket_dup_real),
 	("getaddrinfo", socket_getaddrinfo_real),
+	("gethostbyaddr", socket_gethostbyaddr_real),
+	("gethostbyname", socket_gethostbyname_real),
+	("gethostbyname_ex", socket_gethostbyname_ex_real),
 	("gethostname", socket_gethostname_real),
+	("getnameinfo", socket_getnameinfo_real),
+	("getprotobyname", socket_getprotobyname_real),
+	("getservbyname", socket_getservbyname_real),
+	("getservbyport", socket_getservbyport_real),
 	("htonl", socket_htonl_real),
 	("htons", socket_htons_real),
 	("if_indextoname", socket_if_indextoname),
 	("if_nameindex", socket_if_nameindex),
 	("if_nametoindex", socket_if_nametoindex),
+	("inet_aton", socket_inet_aton_real),
+	("inet_ntoa", socket_inet_ntoa_real),
 	("inet_ntop", socket_inet_ntop),
 	("inet_pton", socket_inet_pton),
 	("ntohl", socket_ntohl_real),
 	("ntohs", socket_ntohs_real),
 	("sethostname", socket_sethostname),
 	("socketpair", socket_socketpair),
-];
-
-/// Entry points that still need work; each raises `OSError` honestly when
-/// called.
-const NOT_WIRED_FUNCTIONS: &[(&str, BuiltinFn)] = &[
-	("close", socket_close),
-	("dup", socket_dup),
-	("gethostbyaddr", socket_gethostbyaddr),
-	("gethostbyname", socket_gethostbyname),
-	("gethostbyname_ex", socket_gethostbyname_ex),
-	("getnameinfo", socket_getnameinfo),
-	("getprotobyname", socket_getprotobyname),
-	("getservbyname", socket_getservbyname),
-	("getservbyport", socket_getservbyport),
-	("inet_aton", socket_inet_aton),
-	("inet_ntoa", socket_inet_ntoa),
 ];
 
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
@@ -367,7 +355,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 	// CPython's C module exports the type under both names.
 	attrs.push((intern("SocketType"), socket_type));
 
-	for &(function_name, entry) in REAL_FUNCTIONS.iter().chain(NOT_WIRED_FUNCTIONS.iter()) {
+	for &(function_name, entry) in REAL_FUNCTIONS {
 		attrs.push(function_attr(function_name, entry)?);
 	}
 	attrs.push(function_attr("getdefaulttimeout", socket_getdefaulttimeout)?);
@@ -477,13 +465,22 @@ static SOCKET_TYPE: LazyLock<usize> = LazyLock::new(|| {
 			("fileno", socket_fileno_method),
 			("detach", socket_detach_method),
 			("close", socket_close_method),
+			("dup", socket_dup_method),
 			("setblocking", socket_setblocking_method),
 			("settimeout", socket_settimeout_method),
 			("gettimeout", socket_gettimeout_method),
+			("getblocking", socket_getblocking_method),
 			("send", socket_send_method),
 			("sendall", socket_sendall_method),
+			("sendto", socket_sendto_method),
+			("sendmsg", socket_sendmsg_method),
 			("recv", socket_recv_method),
+			("recv_into", socket_recv_into_method),
+			("recvfrom", socket_recvfrom_method),
+			("recvfrom_into", socket_recvfrom_into_method),
+			("recvmsg", socket_recvmsg_method),
 			("connect", socket_connect_method),
+			("connect_ex", socket_connect_ex_method),
 			("bind", socket_bind_method),
 			("listen", socket_listen_method),
 			("_accept", socket_accept_method),
@@ -578,6 +575,7 @@ fn socket_construct(receiver: *mut PyObject, args: &[*mut PyObject]) -> Result<(
 	let proto = int_arg_or(args, 2, 0)?;
 	let proto = if proto == -1 { 0 } else { proto };
 	let fileno = int_arg_or(args, 3, -1)?;
+	let created = fileno < 0;
 	let fd = if fileno >= 0 {
 		fileno as i32
 	} else {
@@ -588,12 +586,22 @@ fn socket_construct(receiver: *mut PyObject, args: &[*mut PyObject]) -> Result<(
 		}
 		fd
 	};
+	let timeout = *DEFAULT_TIMEOUT
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner());
+	if let Err(raised) = set_fd_blocking(fd, timeout.is_none()) {
+		if created {
+			// SAFETY: Best-effort cleanup of the fd just created above.
+			unsafe { libc::close(fd) };
+		}
+		return Err(raised);
+	}
 	live_sockets().insert(untag(receiver) as usize, SockState {
 		fd,
 		family,
 		kind,
 		proto,
-		timeout: None,
+		timeout,
 	});
 	Ok(())
 }
@@ -651,6 +659,149 @@ fn socket_state_fd(receiver: *mut PyObject, name: &str) -> Result<i32, *mut PyOb
 			ExceptionKind::OSError,
 			&format!("socket.{name}: receiver has no live socket state"),
 		)),
+	}
+}
+
+#[derive(Clone, Copy)]
+struct SockSnapshot {
+	fd:      i32,
+	family:  i64,
+	kind:    i64,
+	proto:   i64,
+	timeout: Option<f64>,
+}
+
+fn socket_state_snapshot(receiver: *mut PyObject, name: &str) -> Result<SockSnapshot, *mut PyObject> {
+	match live_sockets().get(&(receiver as usize)) {
+		Some(state) if state.fd >= 0 => Ok(SockSnapshot {
+			fd: state.fd,
+			family: state.family,
+			kind: state.kind,
+			proto: state.proto,
+			timeout: state.timeout,
+		}),
+		Some(_) => Err(crate::native::os::raise_errno(libc::EBADF, None)),
+		None => Err(crate::abi::exc::raise_kind_error_text(
+			ExceptionKind::OSError,
+			&format!("socket.{name}: receiver has no live socket state"),
+		)),
+	}
+}
+
+fn alloc_socket_object_from_snapshot(snapshot: SockSnapshot, fd: i32) -> *mut PyObject {
+	let object = Box::into_raw(Box::new(PySocket {
+		ob_base: PyObjectHeader::new(socket_type().cast_const()),
+	}))
+	.cast::<PyObject>();
+	live_sockets().insert(object as usize, SockState {
+		fd,
+		family: snapshot.family,
+		kind: snapshot.kind,
+		proto: snapshot.proto,
+		timeout: snapshot.timeout,
+	});
+	object
+}
+
+#[derive(Clone, Copy)]
+enum WaitError {
+	Timeout,
+	Errno(i32),
+}
+
+fn timeout_error() -> *mut PyObject {
+	abi::exc::raise_kind_error_text(ExceptionKind::TimeoutError, "timed out")
+}
+
+fn timeout_deadline(timeout: Option<f64>) -> Result<Option<Instant>, *mut PyObject> {
+	let Some(seconds) = timeout else {
+		return Ok(None);
+	};
+	if seconds <= 0.0 {
+		return Ok(None);
+	}
+	let duration = Duration::try_from_secs_f64(seconds)
+		.map_err(|_| raise_overflow_error("timestamp out of range for platform time_t"))?;
+	Instant::now()
+		.checked_add(duration)
+		.map(Some)
+		.ok_or_else(|| raise_overflow_error("timeout value is too large"))
+}
+
+fn is_would_block(errno: i32) -> bool {
+	errno == libc::EAGAIN || errno == libc::EWOULDBLOCK
+}
+
+fn wait_ready_status(
+	fd: i32,
+	want_write: bool,
+	deadline: Option<Instant>,
+) -> Result<(), WaitError> {
+	loop {
+		let timeout_ms = match deadline {
+			Some(deadline) => {
+				let now = Instant::now();
+				if deadline <= now {
+					return Err(WaitError::Timeout);
+				}
+				let millis = deadline.duration_since(now).as_millis();
+				millis.clamp(1, i32::MAX as u128) as libc::c_int
+			},
+			None => -1,
+		};
+		let mut pollfd = libc::pollfd {
+			fd,
+			events: if want_write { libc::POLLOUT } else { libc::POLLIN } as libc::c_short,
+			revents: 0,
+		};
+		let _blocking = crate::sync::enter_blocking_region();
+		// SAFETY: `pollfd` points to one initialized descriptor record.
+		let rc = unsafe { libc::poll((&raw mut pollfd).cast(), 1, timeout_ms) };
+		if let Err(_error) = crate::sync::leave_blocking_region() {
+			return Err(WaitError::Errno(libc::EINTR));
+		}
+		if rc > 0 {
+			return Ok(());
+		}
+		if rc == 0 {
+			return Err(WaitError::Timeout);
+		}
+		let errno = last_socket_errno();
+		if errno == libc::EINTR {
+			continue;
+		}
+		return Err(WaitError::Errno(errno));
+	}
+}
+
+/// Waits until `fd` is readable or writable before an operation retries.
+///
+/// `deadline` is absolute and shared by the whole Python call.  A timed-out
+/// wait raises `TimeoutError("timed out")`; nonblocking callers should avoid
+/// this helper and surface their original `EAGAIN`/`EWOULDBLOCK` instead.
+pub(crate) fn wait_ready(
+	fd: i32,
+	want_write: bool,
+	deadline: Option<Instant>,
+) -> Result<(), *mut PyObject> {
+	match wait_ready_status(fd, want_write, deadline) {
+		Ok(()) => Ok(()),
+		Err(WaitError::Timeout) => Err(timeout_error()),
+		Err(WaitError::Errno(errno)) => Err(crate::native::os::raise_errno(errno, None)),
+	}
+}
+
+fn wait_or_blocking_error(
+	fd: i32,
+	want_write: bool,
+	timeout: Option<f64>,
+	deadline: Option<Instant>,
+	errno: i32,
+) -> Result<(), *mut PyObject> {
+	if matches!(timeout, Some(seconds) if seconds > 0.0) {
+		wait_ready(fd, want_write, deadline)
+	} else {
+		Err(crate::native::os::raise_errno(errno, None))
 	}
 }
 
@@ -779,7 +930,7 @@ unsafe extern "C" fn socket_settimeout_method(
 		return raise_type_error("a float is required");
 	};
 	if let Some(seconds) = timeout {
-		if seconds < 0.0 {
+		if seconds < 0.0 || !seconds.is_finite() {
 			let message = "Timeout value out of range";
 			// SAFETY: Typed raise helper; the message bytes are copied.
 			return unsafe { abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) };
@@ -789,36 +940,12 @@ unsafe extern "C" fn socket_settimeout_method(
 		Ok(fd) => fd,
 		Err(raised) => return raised,
 	};
-	// CPython modes: None -> blocking, 0 -> non-blocking, positive ->
-	// "timeout mode". Pon approximates timeout mode with a blocking fd plus
-	// kernel receive/send deadlines (SO_RCVTIMEO/SO_SNDTIMEO), which bounds
-	// I/O but leaves connect(2) on the system default timeout.
-	let blocking = !matches!(timeout, Some(seconds) if seconds == 0.0);
+	// CPython modes: None -> blocking fd, 0 -> non-blocking fd, positive ->
+	// timeout mode backed by a non-blocking fd plus poll(2) deadlines around
+	// every operation.
+	let blocking = timeout.is_none();
 	if let Err(raised) = set_fd_blocking(fd, blocking) {
 		return raised;
-	}
-	let deadline = match timeout {
-		Some(seconds) if seconds > 0.0 => seconds,
-		_ => 0.0,
-	};
-	let timeval = libc::timeval {
-		tv_sec:  deadline as libc::time_t,
-		tv_usec: ((deadline % 1.0) * 1_000_000.0) as libc::suseconds_t,
-	};
-	for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
-		// SAFETY: Plain setsockopt(2) over a stack timeval.
-		if unsafe {
-			libc::setsockopt(
-				fd,
-				libc::SOL_SOCKET,
-				option,
-				(&raw const timeval).cast(),
-				std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-			)
-		} < 0
-		{
-			return crate::native::os::raise_errno(last_socket_errno(), None);
-		}
 	}
 	if let Some(state) = live_sockets().get_mut(&(receiver as usize)) {
 		state.timeout = timeout;
@@ -846,6 +973,139 @@ unsafe extern "C" fn socket_gettimeout_method(
 	}
 }
 
+unsafe extern "C" fn socket_getblocking_method(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let (receiver, _) = match unsafe { socket_method_args(argv, argc, "getblocking") } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	let blocking = live_sockets()
+		.get(&(receiver as usize))
+		.is_none_or(|state| state.timeout != Some(0.0));
+	// SAFETY: Boolean boxing helper.
+	unsafe { abi::pon_const_bool(i32::from(blocking)) }
+}
+
+unsafe extern "C" fn socket_dup_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let (receiver, _) = match unsafe { socket_method_args(argv, argc, "dup") } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	let snapshot = match socket_state_snapshot(receiver, "dup") {
+		Ok(snapshot) => snapshot,
+		Err(raised) => return raised,
+	};
+	// SAFETY: Plain dup(2) on a validated fd.
+	let fd = unsafe { libc::dup(snapshot.fd) };
+	if fd < 0 {
+		return crate::native::os::raise_errno(last_socket_errno(), None);
+	}
+	alloc_socket_object_from_snapshot(snapshot, fd)
+}
+
+fn send_with_wait(
+	fd: i32,
+	data: &[u8],
+	flags: i32,
+	address: Option<&HostAddress>,
+	timeout: Option<f64>,
+	deadline: Option<Instant>,
+) -> Result<isize, *mut PyObject> {
+	loop {
+		let sent = match address {
+			Some(address) => unsafe {
+				libc::sendto(
+					fd,
+					data.as_ptr().cast(),
+					data.len(),
+					flags,
+					address.as_sockaddr(),
+					address.len,
+				)
+			},
+			None => unsafe { libc::send(fd, data.as_ptr().cast(), data.len(), flags) },
+		};
+		if sent >= 0 {
+			return Ok(sent);
+		}
+		let errno = last_socket_errno();
+		if errno == libc::EINTR {
+			continue;
+		}
+		if is_would_block(errno) {
+			wait_or_blocking_error(fd, true, timeout, deadline, errno)?;
+			continue;
+		}
+		return Err(crate::native::os::raise_errno(errno, None));
+	}
+}
+
+fn recv_with_wait(
+	fd: i32,
+	buffer: *mut u8,
+	len: usize,
+	flags: i32,
+	timeout: Option<f64>,
+	deadline: Option<Instant>,
+) -> Result<usize, *mut PyObject> {
+	loop {
+		// SAFETY: Caller supplies a writable `len`-byte destination.
+		let received = unsafe { libc::recv(fd, buffer.cast(), len, flags) };
+		if received >= 0 {
+			return Ok(received as usize);
+		}
+		let errno = last_socket_errno();
+		if errno == libc::EINTR {
+			continue;
+		}
+		if is_would_block(errno) {
+			wait_or_blocking_error(fd, false, timeout, deadline, errno)?;
+			continue;
+		}
+		return Err(crate::native::os::raise_errno(errno, None));
+	}
+}
+
+fn recvfrom_with_wait(
+	fd: i32,
+	buffer: *mut u8,
+	len: usize,
+	flags: i32,
+	timeout: Option<f64>,
+	deadline: Option<Instant>,
+) -> Result<(usize, HostAddress), *mut PyObject> {
+	loop {
+		// SAFETY: Zeroed sockaddr_storage receives the peer address in place.
+		let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+		let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+		// SAFETY: Caller supplies a writable `len`-byte destination and address storage.
+		let received = unsafe {
+			libc::recvfrom(
+				fd,
+				buffer.cast(),
+				len,
+				flags,
+				(&raw mut storage).cast(),
+				&mut addr_len,
+			)
+		};
+		if received >= 0 {
+			return Ok((received as usize, HostAddress { storage, len: addr_len }));
+		}
+		let errno = last_socket_errno();
+		if errno == libc::EINTR {
+			continue;
+		}
+		if is_would_block(errno) {
+			wait_or_blocking_error(fd, false, timeout, deadline, errno)?;
+			continue;
+		}
+		return Err(crate::native::os::raise_errno(errno, None));
+	}
+}
+
 unsafe extern "C" fn socket_send_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 	let (receiver, args) = match unsafe { socket_method_args(argv, argc, "send") } {
 		Ok(parts) => parts,
@@ -857,17 +1117,22 @@ unsafe extern "C" fn socket_send_method(argv: *mut *mut PyObject, argc: usize) -
 	let Ok(data) = crate::abi::str_::expect_bytes_like(untag(args[0])) else {
 		return raise_type_error("a bytes-like object is required");
 	};
-	let fd = match socket_state_fd(receiver, "send") {
-		Ok(fd) => fd,
+	let flags = match int_arg_or(args, 1, 0) {
+		Ok(flags) => flags as i32,
 		Err(raised) => return raised,
 	};
-	// SAFETY: Plain send(2) over a validated fd and an owned byte buffer.
-	let sent = unsafe { libc::send(fd, data.as_ptr().cast(), data.len(), 0) };
-	if sent < 0 {
-		return crate::native::os::raise_errno(last_socket_errno(), None);
+	let snapshot = match socket_state_snapshot(receiver, "send") {
+		Ok(snapshot) => snapshot,
+		Err(raised) => return raised,
+	};
+	let deadline = match timeout_deadline(snapshot.timeout) {
+		Ok(deadline) => deadline,
+		Err(raised) => return raised,
+	};
+	match send_with_wait(snapshot.fd, &data, flags, None, snapshot.timeout, deadline) {
+		Ok(sent) => unsafe { abi::pon_const_int(sent as i64) },
+		Err(raised) => raised,
 	}
-	// SAFETY: Integer boxing helper.
-	unsafe { abi::pon_const_int(sent as i64) }
 }
 
 unsafe extern "C" fn socket_sendall_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -881,21 +1146,79 @@ unsafe extern "C" fn socket_sendall_method(argv: *mut *mut PyObject, argc: usize
 	let Ok(data) = crate::abi::str_::expect_bytes_like(untag(args[0])) else {
 		return raise_type_error("a bytes-like object is required");
 	};
-	let fd = match socket_state_fd(receiver, "sendall") {
-		Ok(fd) => fd,
+	let flags = match int_arg_or(args, 1, 0) {
+		Ok(flags) => flags as i32,
+		Err(raised) => return raised,
+	};
+	let snapshot = match socket_state_snapshot(receiver, "sendall") {
+		Ok(snapshot) => snapshot,
+		Err(raised) => return raised,
+	};
+	let deadline = match timeout_deadline(snapshot.timeout) {
+		Ok(deadline) => deadline,
 		Err(raised) => return raised,
 	};
 	let mut offset = 0usize;
 	while offset < data.len() {
-		// SAFETY: Plain send(2) over a validated fd and an owned byte buffer.
-		let sent = unsafe { libc::send(fd, data[offset..].as_ptr().cast(), data.len() - offset, 0) };
-		if sent < 0 {
-			return crate::native::os::raise_errno(last_socket_errno(), None);
+		let sent = match send_with_wait(
+			snapshot.fd,
+			&data[offset..],
+			flags,
+			None,
+			snapshot.timeout,
+			deadline,
+		) {
+			Ok(sent) => sent as usize,
+			Err(raised) => return raised,
+		};
+		if sent == 0 {
+			match wait_ready(snapshot.fd, true, deadline) {
+				Ok(()) => continue,
+				Err(raised) => return raised,
+			}
 		}
-		offset += sent as usize;
+		offset += sent;
 	}
 	// SAFETY: Singleton accessor.
 	unsafe { abi::pon_none() }
+}
+
+unsafe extern "C" fn socket_sendto_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let (receiver, args) = match unsafe { socket_method_args(argv, argc, "sendto") } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	if args.len() != 2 && args.len() != 3 {
+		return raise_type_error("sendto() takes 2 or 3 arguments");
+	}
+	let Ok(data) = crate::abi::str_::expect_bytes_like(untag(args[0])) else {
+		return raise_type_error("a bytes-like object is required");
+	};
+	let (flags, address_arg) = if args.len() == 2 {
+		(0, args[1])
+	} else {
+		let flags = match int_arg(args[1], "sendto flags") {
+			Ok(flags) => flags as i32,
+			Err(raised) => return raised,
+		};
+		(flags, args[2])
+	};
+	let snapshot = match socket_state_snapshot(receiver, "sendto") {
+		Ok(snapshot) => snapshot,
+		Err(raised) => return raised,
+	};
+	let address = match parse_address(snapshot.family, address_arg) {
+		Ok(address) => address,
+		Err(raised) => return raised,
+	};
+	let deadline = match timeout_deadline(snapshot.timeout) {
+		Ok(deadline) => deadline,
+		Err(raised) => return raised,
+	};
+	match send_with_wait(snapshot.fd, &data, flags, Some(&address), snapshot.timeout, deadline) {
+		Ok(sent) => unsafe { abi::pon_const_int(sent as i64) },
+		Err(raised) => raised,
+	}
 }
 
 unsafe extern "C" fn socket_recv_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -911,19 +1234,349 @@ unsafe extern "C" fn socket_recv_method(argv: *mut *mut PyObject, argc: usize) -
 		Ok(_) => return raise_type_error("negative buffersize in recv"),
 		Err(raised) => return raised,
 	};
-	let fd = match socket_state_fd(receiver, "recv") {
-		Ok(fd) => fd,
+	let flags = match int_arg_or(args, 1, 0) {
+		Ok(flags) => flags as i32,
+		Err(raised) => return raised,
+	};
+	let snapshot = match socket_state_snapshot(receiver, "recv") {
+		Ok(snapshot) => snapshot,
+		Err(raised) => return raised,
+	};
+	let deadline = match timeout_deadline(snapshot.timeout) {
+		Ok(deadline) => deadline,
 		Err(raised) => return raised,
 	};
 	let mut buffer = vec![0u8; size.max(1)];
-	// SAFETY: Plain recv(2) into an owned buffer of the requested size.
-	let received = unsafe { libc::recv(fd, buffer.as_mut_ptr().cast(), size, 0) };
-	if received < 0 {
-		return crate::native::os::raise_errno(last_socket_errno(), None);
-	}
-	buffer.truncate(received as usize);
+	let received = match recv_with_wait(
+		snapshot.fd,
+		buffer.as_mut_ptr(),
+		size,
+		flags,
+		snapshot.timeout,
+		deadline,
+	) {
+		Ok(received) => received,
+		Err(raised) => return raised,
+	};
+	buffer.truncate(received);
 	// SAFETY: Runtime allocation helper; NULL propagates with the error set.
 	unsafe { abi::str_::pon_const_bytes(buffer.as_ptr(), buffer.len()) }
+}
+
+unsafe extern "C" fn socket_recv_into_method(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let (receiver, args) = match unsafe { socket_method_args(argv, argc, "recv_into") } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	if args.is_empty() || args.len() > 3 {
+		return raise_type_error("recv_into() takes 1 to 3 arguments");
+	}
+	let (dst, dst_len) = match writable_buffer(untag(args[0]), "recv_into") {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	let nbytes = match int_arg_or(args, 1, dst_len as i64) {
+		Ok(nbytes) if nbytes >= 0 => nbytes as usize,
+		Ok(_) => return raise_type_error("negative buffersize in recv_into"),
+		Err(raised) => return raised,
+	};
+	if nbytes > dst_len {
+		return unsafe { abi::exc::pon_raise_value_error(b"nbytes is greater than the length of the buffer".as_ptr(), 49) };
+	}
+	let flags = match int_arg_or(args, 2, 0) {
+		Ok(flags) => flags as i32,
+		Err(raised) => return raised,
+	};
+	let snapshot = match socket_state_snapshot(receiver, "recv_into") {
+		Ok(snapshot) => snapshot,
+		Err(raised) => return raised,
+	};
+	let deadline = match timeout_deadline(snapshot.timeout) {
+		Ok(deadline) => deadline,
+		Err(raised) => return raised,
+	};
+	match recv_with_wait(snapshot.fd, dst, nbytes, flags, snapshot.timeout, deadline) {
+		Ok(received) => unsafe { abi::pon_const_int(received as i64) },
+		Err(raised) => raised,
+	}
+}
+
+unsafe extern "C" fn socket_recvfrom_method(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let (receiver, args) = match unsafe { socket_method_args(argv, argc, "recvfrom") } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	if args.is_empty() || args.len() > 2 {
+		return raise_type_error("recvfrom() takes 1 or 2 arguments");
+	}
+	let size = match int_arg_or(args, 0, -1) {
+		Ok(size) if size >= 0 => size as usize,
+		Ok(_) => return raise_type_error("negative buffersize in recvfrom"),
+		Err(raised) => return raised,
+	};
+	let flags = match int_arg_or(args, 1, 0) {
+		Ok(flags) => flags as i32,
+		Err(raised) => return raised,
+	};
+	let snapshot = match socket_state_snapshot(receiver, "recvfrom") {
+		Ok(snapshot) => snapshot,
+		Err(raised) => return raised,
+	};
+	let deadline = match timeout_deadline(snapshot.timeout) {
+		Ok(deadline) => deadline,
+		Err(raised) => return raised,
+	};
+	let mut buffer = vec![0u8; size.max(1)];
+	let (received, address) = match recvfrom_with_wait(
+		snapshot.fd,
+		buffer.as_mut_ptr(),
+		size,
+		flags,
+		snapshot.timeout,
+		deadline,
+	) {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	buffer.truncate(received);
+	let data = unsafe { abi::str_::pon_const_bytes(buffer.as_ptr(), buffer.len()) };
+	let address = address_to_object(&address);
+	if data.is_null() || address.is_null() {
+		return ptr::null_mut();
+	}
+	build_tuple(vec![data, address])
+}
+
+unsafe extern "C" fn socket_recvfrom_into_method(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let (receiver, args) = match unsafe { socket_method_args(argv, argc, "recvfrom_into") } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	if args.is_empty() || args.len() > 3 {
+		return raise_type_error("recvfrom_into() takes 1 to 3 arguments");
+	}
+	let (dst, dst_len) = match writable_buffer(untag(args[0]), "recvfrom_into") {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	let nbytes = match int_arg_or(args, 1, dst_len as i64) {
+		Ok(nbytes) if nbytes >= 0 => nbytes as usize,
+		Ok(_) => return raise_type_error("negative buffersize in recvfrom_into"),
+		Err(raised) => return raised,
+	};
+	if nbytes > dst_len {
+		return unsafe { abi::exc::pon_raise_value_error(b"nbytes is greater than the length of the buffer".as_ptr(), 49) };
+	}
+	let flags = match int_arg_or(args, 2, 0) {
+		Ok(flags) => flags as i32,
+		Err(raised) => return raised,
+	};
+	let snapshot = match socket_state_snapshot(receiver, "recvfrom_into") {
+		Ok(snapshot) => snapshot,
+		Err(raised) => return raised,
+	};
+	let deadline = match timeout_deadline(snapshot.timeout) {
+		Ok(deadline) => deadline,
+		Err(raised) => return raised,
+	};
+	let (received, address) = match recvfrom_with_wait(
+		snapshot.fd,
+		dst,
+		nbytes,
+		flags,
+		snapshot.timeout,
+		deadline,
+	) {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	let count = unsafe { abi::pon_const_int(received as i64) };
+	let address = address_to_object(&address);
+	if count.is_null() || address.is_null() {
+		return ptr::null_mut();
+	}
+	build_tuple(vec![count, address])
+}
+
+unsafe extern "C" fn socket_sendmsg_method(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let (receiver, args) = match unsafe { socket_method_args(argv, argc, "sendmsg") } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	if args.is_empty() || args.len() > 4 {
+		return raise_type_error("sendmsg() takes 1 to 4 arguments");
+	}
+	let buffers = match sequence_items(args[0], "sendmsg buffers") {
+		Ok(items) => items,
+		Err(raised) => return raised,
+	};
+	let mut data_buffers = Vec::with_capacity(buffers.len());
+	for buffer in buffers {
+		match bytes_like_vec(buffer) {
+			Ok(bytes) => data_buffers.push(bytes),
+			Err(raised) => return raised,
+		}
+	}
+	let ancdata = match args.get(1).copied() {
+		Some(value) if !is_none_like(value) => match build_ancillary_data(value) {
+			Ok(control) => control,
+			Err(raised) => return raised,
+		},
+		_ => Vec::new(),
+	};
+	let flags = match int_arg_or(args, 2, 0) {
+		Ok(flags) => flags as i32,
+		Err(raised) => return raised,
+	};
+	let snapshot = match socket_state_snapshot(receiver, "sendmsg") {
+		Ok(snapshot) => snapshot,
+		Err(raised) => return raised,
+	};
+	let address = match args.get(3).copied() {
+		Some(value) if !is_none_like(value) => match parse_address(snapshot.family, value) {
+			Ok(address) => Some(address),
+			Err(raised) => return raised,
+		},
+		_ => None,
+	};
+	let mut iovecs: Vec<libc::iovec> = data_buffers
+		.iter()
+		.map(|data| libc::iovec {
+			iov_base: if data.is_empty() { ptr::null_mut() } else { data.as_ptr().cast_mut().cast() },
+			iov_len: data.len(),
+		})
+		.collect();
+	let deadline = match timeout_deadline(snapshot.timeout) {
+		Ok(deadline) => deadline,
+		Err(raised) => return raised,
+	};
+	loop {
+		// SAFETY: Zeroed msghdr is filled with pointers to buffers that outlive the syscall.
+		let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+		if !iovecs.is_empty() {
+			msg.msg_iov = iovecs.as_mut_ptr();
+			msg.msg_iovlen = iovecs.len() as _;
+		}
+		if !ancdata.is_empty() {
+			msg.msg_control = ancdata.as_ptr().cast_mut().cast();
+			msg.msg_controllen = ancdata.len() as _;
+		}
+		if let Some(address) = &address {
+			msg.msg_name = address.as_sockaddr().cast_mut().cast();
+			msg.msg_namelen = address.len;
+		}
+		// SAFETY: msghdr points at live immutable send buffers/control data.
+		let sent = unsafe { libc::sendmsg(snapshot.fd, &msg, flags) };
+		if sent >= 0 {
+			return unsafe { abi::pon_const_int(sent as i64) };
+		}
+		let errno = last_socket_errno();
+		if errno == libc::EINTR {
+			continue;
+		}
+		if is_would_block(errno) {
+			if let Err(raised) = wait_or_blocking_error(snapshot.fd, true, snapshot.timeout, deadline, errno) {
+				return raised;
+			}
+			continue;
+		}
+		return crate::native::os::raise_errno(errno, None);
+	}
+}
+
+unsafe extern "C" fn socket_recvmsg_method(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let (receiver, args) = match unsafe { socket_method_args(argv, argc, "recvmsg") } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	if args.is_empty() || args.len() > 3 {
+		return raise_type_error("recvmsg() takes 1 to 3 arguments");
+	}
+	let size = match int_arg_or(args, 0, -1) {
+		Ok(size) if size >= 0 => size as usize,
+		Ok(_) => return raise_type_error("negative buffersize in recvmsg"),
+		Err(raised) => return raised,
+	};
+	let ancbufsize = match int_arg_or(args, 1, 0) {
+		Ok(size) if size >= 0 => size as usize,
+		Ok(_) => return raise_type_error("negative ancbufsize in recvmsg"),
+		Err(raised) => return raised,
+	};
+	let flags = match int_arg_or(args, 2, 0) {
+		Ok(flags) => flags as i32,
+		Err(raised) => return raised,
+	};
+	let snapshot = match socket_state_snapshot(receiver, "recvmsg") {
+		Ok(snapshot) => snapshot,
+		Err(raised) => return raised,
+	};
+	let deadline = match timeout_deadline(snapshot.timeout) {
+		Ok(deadline) => deadline,
+		Err(raised) => return raised,
+	};
+	let mut buffer = vec![0u8; size.max(1)];
+	let mut control = vec![0u8; ancbufsize];
+	loop {
+		// SAFETY: Zeroed sockaddr_storage receives an optional peer address.
+		let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+		let mut iov = libc::iovec {
+			iov_base: if size == 0 { ptr::null_mut() } else { buffer.as_mut_ptr().cast() },
+			iov_len: size,
+		};
+		// SAFETY: Zeroed msghdr is filled with live writable buffers.
+		let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+		msg.msg_name = (&raw mut storage).cast();
+		msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
+		msg.msg_iov = (&raw mut iov).cast();
+		msg.msg_iovlen = 1;
+		if !control.is_empty() {
+			msg.msg_control = control.as_mut_ptr().cast();
+			msg.msg_controllen = control.len() as _;
+		}
+		// SAFETY: msghdr points at live writable data/control/name buffers.
+		let received = unsafe { libc::recvmsg(snapshot.fd, &mut msg, flags) };
+		if received >= 0 {
+			buffer.truncate(received as usize);
+			let data = unsafe { abi::str_::pon_const_bytes(buffer.as_ptr(), buffer.len()) };
+			let ancdata = parse_ancillary_data(&control, msg.msg_controllen as usize);
+			let flags_obj = unsafe { abi::pon_const_int(i64::from(msg.msg_flags)) };
+			let address = if msg.msg_namelen == 0 {
+				unsafe { abi::pon_none() }
+			} else {
+				address_to_object(&HostAddress { storage, len: msg.msg_namelen })
+			};
+			if data.is_null() || ancdata.is_null() || flags_obj.is_null() || address.is_null() {
+				return ptr::null_mut();
+			}
+			return build_tuple(vec![data, ancdata, flags_obj, address]);
+		}
+		let errno = last_socket_errno();
+		if errno == libc::EINTR {
+			continue;
+		}
+		if is_would_block(errno) {
+			if let Err(raised) = wait_or_blocking_error(snapshot.fd, false, snapshot.timeout, deadline, errno) {
+				return raised;
+			}
+			continue;
+		}
+		return crate::native::os::raise_errno(errno, None);
+	}
 }
 
 fn socket_state_property(
@@ -1318,6 +1971,61 @@ fn raise_os_error_text(message: &str) -> *mut PyObject {
 // ---------------------------------------------------------------------------
 // Connection-oriented socket methods
 
+enum ConnectError {
+	Errno(i32),
+	Timeout,
+}
+
+fn socket_so_error(fd: i32) -> Result<i32, i32> {
+	let mut value: i32 = 0;
+	let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+	// SAFETY: Plain getsockopt(2) into a stack int.
+	if unsafe {
+		libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR, (&raw mut value).cast(), &mut len)
+	} < 0
+	{
+		Err(last_socket_errno())
+	} else {
+		Ok(value)
+	}
+}
+
+fn connect_with_timeout(
+	fd: i32,
+	address: &HostAddress,
+	timeout: Option<f64>,
+) -> Result<(), ConnectError> {
+	let deadline = timeout_deadline(timeout).map_err(|_| ConnectError::Errno(libc::EINVAL))?;
+	loop {
+		// SAFETY: Plain connect(2) on a validated fd and a filled sockaddr.
+		let rc = unsafe { libc::connect(fd, address.as_sockaddr(), address.len) };
+		if rc == 0 {
+			return Ok(());
+		}
+		let errno = last_socket_errno();
+		if errno == libc::EINTR {
+			continue;
+		}
+		if errno == libc::EISCONN {
+			return Ok(());
+		}
+		let in_progress = errno == libc::EINPROGRESS || errno == libc::EALREADY || is_would_block(errno);
+		if !in_progress || !matches!(timeout, Some(seconds) if seconds > 0.0) {
+			return Err(ConnectError::Errno(errno));
+		}
+		match wait_ready_status(fd, true, deadline) {
+			Ok(()) => {},
+			Err(WaitError::Timeout) => return Err(ConnectError::Timeout),
+			Err(WaitError::Errno(errno)) => return Err(ConnectError::Errno(errno)),
+		}
+		match socket_so_error(fd) {
+			Ok(0) => return Ok(()),
+			Ok(errno) => return Err(ConnectError::Errno(errno)),
+			Err(errno) => return Err(ConnectError::Errno(errno)),
+		}
+	}
+}
+
 unsafe extern "C" fn socket_connect_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 	let (receiver, args) = match unsafe { socket_method_args(argv, argc, "connect") } {
 		Ok(parts) => parts,
@@ -1326,20 +2034,46 @@ unsafe extern "C" fn socket_connect_method(argv: *mut *mut PyObject, argc: usize
 	if args.len() != 1 {
 		return raise_type_error("connect() takes exactly one argument");
 	}
-	let (fd, family) = match live_sockets().get(&(receiver as usize)) {
-		Some(state) if state.fd >= 0 => (state.fd, state.family),
-		_ => return raise_os_error_text("connect on a closed or unregistered socket"),
+	let snapshot = match socket_state_snapshot(receiver, "connect") {
+		Ok(snapshot) => snapshot,
+		Err(raised) => return raised,
 	};
-	let address = match parse_address(family, args[0]) {
+	let address = match parse_address(snapshot.family, args[0]) {
 		Ok(address) => address,
 		Err(raised) => return raised,
 	};
-	// SAFETY: Plain connect(2) on a validated fd and a filled sockaddr.
-	if unsafe { libc::connect(fd, address.as_sockaddr(), address.len) } < 0 {
-		return crate::native::os::raise_errno(last_socket_errno(), None);
+	match connect_with_timeout(snapshot.fd, &address, snapshot.timeout) {
+		Ok(()) => unsafe { abi::pon_none() },
+		Err(ConnectError::Timeout) => timeout_error(),
+		Err(ConnectError::Errno(errno)) => crate::native::os::raise_errno(errno, None),
 	}
-	// SAFETY: Singleton accessor.
-	unsafe { abi::pon_none() }
+}
+
+unsafe extern "C" fn socket_connect_ex_method(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let (receiver, args) = match unsafe { socket_method_args(argv, argc, "connect_ex") } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	if args.len() != 1 {
+		return raise_type_error("connect_ex() takes exactly one argument");
+	}
+	let snapshot = match socket_state_snapshot(receiver, "connect_ex") {
+		Ok(snapshot) => snapshot,
+		Err(raised) => return raised,
+	};
+	let address = match parse_address(snapshot.family, args[0]) {
+		Ok(address) => address,
+		Err(raised) => return raised,
+	};
+	let errno = match connect_with_timeout(snapshot.fd, &address, snapshot.timeout) {
+		Ok(()) => 0,
+		Err(ConnectError::Timeout) => libc::ETIMEDOUT,
+		Err(ConnectError::Errno(errno)) => errno,
+	};
+	unsafe { abi::pon_const_int(i64::from(errno)) }
 }
 
 unsafe extern "C" fn socket_bind_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -1394,33 +2128,49 @@ unsafe extern "C" fn socket_accept_method(argv: *mut *mut PyObject, argc: usize)
 		Ok(parts) => parts,
 		Err(raised) => return raised,
 	};
-	let fd = match socket_state_fd(receiver, "_accept") {
-		Ok(fd) => fd,
+	let snapshot = match socket_state_snapshot(receiver, "_accept") {
+		Ok(snapshot) => snapshot,
 		Err(raised) => return raised,
 	};
-	// SAFETY: Zeroed sockaddr_storage receives the peer address in place.
-	let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-	let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-	// SAFETY: Plain accept(2) writing into the storage above.
-	let conn = unsafe { libc::accept(fd, (&raw mut storage).cast(), &mut len) };
-	if conn < 0 {
-		return crate::native::os::raise_errno(last_socket_errno(), None);
+	let deadline = match timeout_deadline(snapshot.timeout) {
+		Ok(deadline) => deadline,
+		Err(raised) => return raised,
+	};
+	loop {
+		// SAFETY: Zeroed sockaddr_storage receives the peer address in place.
+		let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+		let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+		// SAFETY: Plain accept(2) writing into the storage above.
+		let conn = unsafe { libc::accept(snapshot.fd, (&raw mut storage).cast(), &mut len) };
+		if conn >= 0 {
+			let address = address_to_object(&HostAddress { storage, len });
+			if address.is_null() {
+				// SAFETY: The freshly accepted fd is owned here until returned.
+				unsafe { libc::close(conn) };
+				return ptr::null_mut();
+			}
+			let fd_object = unsafe { abi::pon_const_int(i64::from(conn)) };
+			if fd_object.is_null() {
+				// SAFETY: Same ownership as above.
+				unsafe { libc::close(conn) };
+				return ptr::null_mut();
+			}
+			let mut pair = [fd_object, address];
+			// SAFETY: Two live slots; the tuple allocator copies them.
+			return unsafe { crate::abi::seq::pon_build_tuple(pair.as_mut_ptr(), 2) };
+		}
+		let errno = last_socket_errno();
+		if errno == libc::EINTR {
+			continue;
+		}
+		if is_would_block(errno) {
+			if let Err(raised) = wait_or_blocking_error(snapshot.fd, false, snapshot.timeout, deadline, errno) {
+				return raised;
+			}
+			continue;
+		}
+		return crate::native::os::raise_errno(errno, None);
 	}
-	let address = address_to_object(&HostAddress { storage, len });
-	if address.is_null() {
-		// SAFETY: The freshly accepted fd is owned here until returned.
-		unsafe { libc::close(conn) };
-		return ptr::null_mut();
-	}
-	let fd_object = unsafe { abi::pon_const_int(i64::from(conn)) };
-	if fd_object.is_null() {
-		// SAFETY: Same ownership as above.
-		unsafe { libc::close(conn) };
-		return ptr::null_mut();
-	}
-	let mut pair = [fd_object, address];
-	// SAFETY: Two live slots; the tuple allocator copies them.
-	unsafe { crate::abi::seq::pon_build_tuple(pair.as_mut_ptr(), 2) }
 }
 
 fn socket_name_method(
@@ -1797,7 +2547,7 @@ unsafe extern "C" fn socket_setdefaulttimeout(
 		return raise_type_error("a float is required");
 	};
 	if let Some(seconds) = timeout {
-		if seconds < 0.0 {
+		if seconds < 0.0 || !seconds.is_finite() {
 			let message = "Timeout value out of range";
 			// SAFETY: Typed raise helper; the message bytes are copied.
 			return unsafe { abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) };
@@ -2032,41 +2782,276 @@ unsafe extern "C" fn socket_sethostname(argv: *mut *mut PyObject, argc: usize) -
 }
 
 // ---------------------------------------------------------------------------
-// Honest not-wired raisers
+// Host-backed module functions that mirror CPython's small socket helpers.
 
-macro_rules! not_wired {
-	($fn_name:ident, $py_name:literal) => {
-		unsafe extern "C" fn $fn_name(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
-			raise_not_wired(concat!("socket.", $py_name))
-		}
+unsafe extern "C" fn socket_close_real(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let fd = match single_int_arg(argv, argc, "close") {
+		Ok(fd) => fd as i32,
+		Err(raised) => return raised,
 	};
+	// SAFETY: Plain close(2) on the caller-provided fd.
+	if unsafe { libc::close(fd) } < 0 {
+		return crate::native::os::raise_errno(last_socket_errno(), None);
+	}
+	unsafe { abi::pon_none() }
 }
 
-not_wired!(socket_close, "close");
-not_wired!(socket_dup, "dup");
-not_wired!(socket_getaddrinfo, "getaddrinfo");
-not_wired!(socket_gethostbyaddr, "gethostbyaddr");
-not_wired!(socket_gethostbyname, "gethostbyname");
-not_wired!(socket_gethostbyname_ex, "gethostbyname_ex");
-not_wired!(socket_gethostname, "gethostname");
-not_wired!(socket_getnameinfo, "getnameinfo");
-not_wired!(socket_getprotobyname, "getprotobyname");
-not_wired!(socket_getservbyname, "getservbyname");
-not_wired!(socket_getservbyport, "getservbyport");
-not_wired!(socket_htonl, "htonl");
-not_wired!(socket_htons, "htons");
-not_wired!(socket_inet_aton, "inet_aton");
-not_wired!(socket_inet_ntoa, "inet_ntoa");
-not_wired!(socket_ntohl, "ntohl");
-not_wired!(socket_ntohs, "ntohs");
+unsafe extern "C" fn socket_dup_real(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let fd = match single_int_arg(argv, argc, "dup") {
+		Ok(fd) => fd as i32,
+		Err(raised) => return raised,
+	};
+	// SAFETY: Plain dup(2) on the caller-provided fd.
+	let duplicated = unsafe { libc::dup(fd) };
+	if duplicated < 0 {
+		return crate::native::os::raise_errno(last_socket_errno(), None);
+	}
+	unsafe { abi::pon_const_int(i64::from(duplicated)) }
+}
 
-/// Honest failure for the not-yet-wired network entry points.  OSError (the
-/// `select` shim's convention) keeps stdlib `except OSError`/`except error`
-/// paths meaningful.
-fn raise_not_wired(which: &str) -> *mut PyObject {
-	let message = format!("{which} is not wired to the host yet in the pon runtime");
-	// SAFETY: Typed raise helper; the message bytes are copied.
-	unsafe { abi::exc::pon_raise_os_error(message.as_ptr(), message.len()) }
+unsafe extern "C" fn socket_gethostbyname_real(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let host = match single_text_arg(argv, argc, "gethostbyname") {
+		Ok(host) => host,
+		Err(raised) => return raised,
+	};
+	let records = match getaddrinfo_records(Some(&host), None, libc::AF_INET, libc::SOCK_STREAM, 0, 0) {
+		Ok(records) => records,
+		Err(raised) => return raised,
+	};
+	for record in records {
+		if record.family == libc::AF_INET {
+			return match numeric_host(&record.address) {
+				Ok(host) => alloc_str_object(&host),
+				Err(raised) => raised,
+			};
+		}
+	}
+	raise_os_error_text("host not found")
+}
+
+unsafe extern "C" fn socket_gethostbyname_ex_real(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let host = match single_text_arg(argv, argc, "gethostbyname_ex") {
+		Ok(host) => host,
+		Err(raised) => return raised,
+	};
+	let records = match getaddrinfo_records(
+		Some(&host),
+		None,
+		libc::AF_INET,
+		libc::SOCK_STREAM,
+		0,
+		libc::AI_CANONNAME,
+	) {
+		Ok(records) => records,
+		Err(raised) => return raised,
+	};
+	let mut addrs: Vec<String> = Vec::new();
+	let mut canonical = host.clone();
+	for record in &records {
+		if !record.canonname.is_empty() && canonical == host {
+			canonical = record.canonname.clone();
+		}
+		if record.family == libc::AF_INET {
+			let addr = match numeric_host(&record.address) {
+				Ok(addr) => addr,
+				Err(raised) => return raised,
+			};
+			if !addrs.contains(&addr) {
+				addrs.push(addr);
+			}
+		}
+	}
+	let name = alloc_str_object(&canonical);
+	let aliases = build_list(Vec::new());
+	let addr_objects = addrs.iter().map(|addr| alloc_str_object(addr)).collect::<Vec<_>>();
+	if name.is_null() || aliases.is_null() || addr_objects.iter().any(|object| object.is_null()) {
+		return ptr::null_mut();
+	}
+	let addr_list = build_list(addr_objects);
+	if addr_list.is_null() {
+		return ptr::null_mut();
+	}
+	build_tuple(vec![name, aliases, addr_list])
+}
+
+unsafe extern "C" fn socket_gethostbyaddr_real(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let host = match single_text_arg(argv, argc, "gethostbyaddr") {
+		Ok(host) => host,
+		Err(raised) => return raised,
+	};
+	let address = match resolve_host(libc::AF_INET, &host, 0) {
+		Ok(address) => address,
+		Err(_) => {
+			pon_err_clear();
+			match resolve_host(libc::AF_INET6, &host, 0) {
+				Ok(address) => address,
+				Err(raised) => return raised,
+			}
+		},
+	};
+	let (name, _) = match getnameinfo_host_service(&address, libc::NI_NAMEREQD) {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	let numeric = match numeric_host(&address) {
+		Ok(numeric) => numeric,
+		Err(raised) => return raised,
+	};
+	let name = alloc_str_object(&name);
+	let aliases = build_list(Vec::new());
+	let addr = alloc_str_object(&numeric);
+	let addr_list = build_list(vec![addr]);
+	if name.is_null() || aliases.is_null() || addr.is_null() || addr_list.is_null() {
+		return ptr::null_mut();
+	}
+	build_tuple(vec![name, aliases, addr_list])
+}
+
+unsafe extern "C" fn socket_getnameinfo_real(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return fail("getnameinfo received a NULL argv pointer");
+	};
+	if args.len() != 2 {
+		return raise_type_error("getnameinfo() takes exactly 2 arguments");
+	}
+	let flags = match int_arg(args[1], "getnameinfo flags") {
+		Ok(flags) => flags as i32,
+		Err(raised) => return raised,
+	};
+	let address = match parse_nameinfo_address(args[0]) {
+		Ok(address) => address,
+		Err(raised) => return raised,
+	};
+	match getnameinfo_host_service(&address, flags) {
+		Ok((host, service)) => build_tuple(vec![alloc_str_object(&host), alloc_str_object(&service)]),
+		Err(raised) => raised,
+	}
+}
+
+unsafe extern "C" fn socket_getprotobyname_real(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let name = match single_cstring_arg(argv, argc, "getprotobyname") {
+		Ok(name) => name,
+		Err(raised) => return raised,
+	};
+	// SAFETY: libc returns a process-static protoent or NULL.
+	let entry = unsafe { libc::getprotobyname(name.as_ptr()) };
+	if entry.is_null() {
+		return raise_os_error_text("protocol not found");
+	}
+	unsafe { abi::pon_const_int(i64::from((*entry).p_proto)) }
+}
+
+unsafe extern "C" fn socket_getservbyname_real(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return fail("getservbyname received a NULL argv pointer");
+	};
+	if args.is_empty() || args.len() > 2 {
+		return raise_type_error("getservbyname() takes 1 or 2 arguments");
+	}
+	let name = match cstring_arg(args[0], "service name") {
+		Ok(name) => name,
+		Err(raised) => return raised,
+	};
+	let proto = match optional_cstring(args.get(1).copied(), "protocol name") {
+		Ok(proto) => proto,
+		Err(raised) => return raised,
+	};
+	// SAFETY: libc returns a process-static servent or NULL.
+	let entry = unsafe { libc::getservbyname(name.as_ptr(), proto.as_ref().map_or(ptr::null(), |p| p.as_ptr())) };
+	if entry.is_null() {
+		return raise_os_error_text("service/proto not found");
+	}
+	let port = u16::from_be(unsafe { (*entry).s_port as u16 });
+	unsafe { abi::pon_const_int(i64::from(port)) }
+}
+
+unsafe extern "C" fn socket_getservbyport_real(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return fail("getservbyport received a NULL argv pointer");
+	};
+	if args.is_empty() || args.len() > 2 {
+		return raise_type_error("getservbyport() takes 1 or 2 arguments");
+	}
+	let port = match int_arg(args[0], "port") {
+		Ok(port) if (0..=65535).contains(&port) => port as u16,
+		Ok(_) => return raise_os_error_text("port must be 0-65535"),
+		Err(raised) => return raised,
+	};
+	let proto = match optional_cstring(args.get(1).copied(), "protocol name") {
+		Ok(proto) => proto,
+		Err(raised) => return raised,
+	};
+	// SAFETY: libc returns a process-static servent or NULL.
+	let entry = unsafe {
+		libc::getservbyport(i32::from(port.to_be()), proto.as_ref().map_or(ptr::null(), |p| p.as_ptr()))
+	};
+	if entry.is_null() {
+		return raise_os_error_text("port/proto not found");
+	}
+	// SAFETY: s_name is NUL-terminated while the static servent is live.
+	let name = unsafe { CStr::from_ptr((*entry).s_name) }.to_string_lossy();
+	alloc_str_object(&name)
+}
+
+unsafe extern "C" fn socket_inet_aton_real(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let address = match single_cstring_arg(argv, argc, "inet_aton") {
+		Ok(address) => address,
+		Err(raised) => return raised,
+	};
+	// SAFETY: Zeroed in_addr is a valid output buffer.
+	let mut out: libc::in_addr = unsafe { std::mem::zeroed() };
+	// SAFETY: inet_aton reads a NUL-terminated address and writes `out`.
+	let rc = unsafe { inet_aton(address.as_ptr(), &mut out) };
+	if rc == 0 {
+		return raise_os_error_text("illegal IP address string passed to inet_aton");
+	}
+	let bytes = out.s_addr.to_ne_bytes();
+	unsafe { abi::str_::pon_const_bytes(bytes.as_ptr(), bytes.len()) }
+}
+
+unsafe extern "C" fn socket_inet_ntoa_real(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return fail("inet_ntoa received a NULL argv pointer");
+	};
+	if args.len() != 1 {
+		return raise_type_error("inet_ntoa() takes exactly one argument");
+	}
+	let packed = match readable_bytes_payload(untag(args[0])) {
+		Ok(packed) => packed,
+		Err(raised) => return raised,
+	};
+	if packed.len() != 4 {
+		return raise_os_error_text("packed IP wrong length for inet_ntoa");
+	}
+	let mut dst = [0 as libc::c_char; INET6_ADDRSTRLEN];
+	// SAFETY: Packed input has exactly four IPv4 bytes and dst is large enough.
+	let ptr = unsafe { inet_ntop(libc::AF_INET, packed.as_ptr().cast(), dst.as_mut_ptr(), dst.len() as _) };
+	if ptr.is_null() {
+		return crate::native::os::raise_errno(last_errno(), None);
+	}
+	let text = unsafe { CStr::from_ptr(ptr) }.to_string_lossy();
+	alloc_str_object(&text)
 }
 
 // ---------------------------------------------------------------------------
@@ -2191,6 +3176,254 @@ fn readable_bytes_payload<'a>(object: *mut PyObject) -> Result<&'a [u8], *mut Py
 		return Ok(unsafe { view.as_slice() });
 	}
 	Err(raise_type_error("a bytes-like object is required"))
+}
+
+fn build_tuple(mut values: Vec<*mut PyObject>) -> *mut PyObject {
+	if values.iter().any(|value| value.is_null()) {
+		return ptr::null_mut();
+	}
+	unsafe {
+		crate::abi::seq::pon_build_tuple(
+			if values.is_empty() { ptr::null_mut() } else { values.as_mut_ptr() },
+			values.len(),
+		)
+	}
+}
+
+fn build_list(mut values: Vec<*mut PyObject>) -> *mut PyObject {
+	if values.iter().any(|value| value.is_null()) {
+		return ptr::null_mut();
+	}
+	unsafe {
+		crate::abi::seq::pon_build_list(
+			if values.is_empty() { ptr::null_mut() } else { values.as_mut_ptr() },
+			values.len(),
+		)
+	}
+}
+
+fn is_none_like(object: *mut PyObject) -> bool {
+	untag(object) == unsafe { abi::pon_none() }
+}
+
+fn single_int_arg(argv: *mut *mut PyObject, argc: usize, name: &str) -> Result<i64, *mut PyObject> {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return Err(fail(format!("{name} received a NULL argv pointer")));
+	};
+	if args.len() != 1 {
+		return Err(raise_type_error(&format!("{name}() takes exactly one argument")));
+	}
+	int_arg(args[0], name)
+}
+
+fn single_text_arg(argv: *mut *mut PyObject, argc: usize, name: &str) -> Result<String, *mut PyObject> {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return Err(fail(format!("{name} received a NULL argv pointer")));
+	};
+	if args.len() != 1 {
+		return Err(raise_type_error(&format!("{name}() takes exactly one argument")));
+	}
+	let bytes = text_or_bytes_arg(args[0], name)?;
+	String::from_utf8(bytes).map_err(|_| raise_type_error(&format!("{name} argument must be UTF-8")))
+}
+
+fn cstring_arg(object: *mut PyObject, what: &str) -> Result<CString, *mut PyObject> {
+	CString::new(text_or_bytes_arg(object, what)?)
+		.map_err(|_| raise_type_error(&format!("{what} must not contain null bytes")))
+}
+
+fn single_cstring_arg(
+	argv: *mut *mut PyObject,
+	argc: usize,
+	name: &str,
+) -> Result<CString, *mut PyObject> {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return Err(fail(format!("{name} received a NULL argv pointer")));
+	};
+	if args.len() != 1 {
+		return Err(raise_type_error(&format!("{name}() takes exactly one argument")));
+	}
+	cstring_arg(args[0], name)
+}
+
+fn optional_cstring(
+	object: Option<*mut PyObject>,
+	what: &str,
+) -> Result<Option<CString>, *mut PyObject> {
+	match object {
+		Some(object) if !object.is_null() && !is_none_like(object) => cstring_arg(object, what).map(Some),
+		_ => Ok(None),
+	}
+}
+
+fn numeric_host(address: &HostAddress) -> Result<String, *mut PyObject> {
+	let (host, _) = getnameinfo_host_service(address, libc::NI_NUMERICHOST | libc::NI_NUMERICSERV)?;
+	Ok(host)
+}
+
+fn getnameinfo_host_service(
+	address: &HostAddress,
+	flags: i32,
+) -> Result<(String, String), *mut PyObject> {
+	let mut host = [0 as libc::c_char; libc::NI_MAXHOST as usize];
+	let mut service = [0 as libc::c_char; 32];
+	// SAFETY: Buffers are writable and sized per getnameinfo(3)'s contract.
+	let rc = unsafe {
+		libc::getnameinfo(
+			address.as_sockaddr(),
+			address.len,
+			host.as_mut_ptr(),
+			host.len() as _,
+			service.as_mut_ptr(),
+			service.len() as _,
+			flags,
+		)
+	};
+	if rc != 0 {
+		let detail = unsafe { CStr::from_ptr(libc::gai_strerror(rc)) }.to_string_lossy();
+		return Err(raise_os_error_text(&format!("[Errno {rc}] {detail}")));
+	}
+	let host = unsafe { CStr::from_ptr(host.as_ptr()) }.to_string_lossy().into_owned();
+	let service = unsafe { CStr::from_ptr(service.as_ptr()) }.to_string_lossy().into_owned();
+	Ok((host, service))
+}
+
+fn parse_nameinfo_address(object: *mut PyObject) -> Result<HostAddress, *mut PyObject> {
+	let object = untag(object);
+	let Some(items) = (unsafe { crate::abi::seq::exact_tuple_slice(object) }) else {
+		return Err(raise_type_error("getnameinfo() argument 1 must be a tuple"));
+	};
+	if items.len() >= 4 {
+		return parse_address(libc::AF_INET6 as i64, object);
+	}
+	if items.len() >= 2 {
+		let host = unsafe { type_mod::unicode_text(untag(items[0])) }.unwrap_or("");
+		let family = if host.contains(':') { libc::AF_INET6 } else { libc::AF_INET };
+		return parse_address(family as i64, object);
+	}
+	Err(raise_type_error("getnameinfo() argument 1 must be a socket address tuple"))
+}
+
+fn writable_buffer(object: *mut PyObject, method: &str) -> Result<(*mut u8, usize), *mut PyObject> {
+	if object.is_null() {
+		return Err(raise_type_error(&format!(
+			"{method}() argument must be read-write bytes-like object, not 'NoneType'"
+		)));
+	}
+	let ty = unsafe { (*object).ob_type };
+	if crate::types::bytearray_::is_bytearray_type(ty) {
+		let bytearray = unsafe { &mut *object.cast::<crate::types::bytearray_::PyByteArray>() };
+		return Ok((bytearray.bytes.as_mut_ptr(), bytearray.bytes.len()));
+	}
+	if crate::types::memoryview::is_memoryview_type(ty) {
+		let view = unsafe { &mut *object.cast::<crate::types::memoryview::PyMemoryView>() };
+		if view.released {
+			return Err(unsafe {
+				abi::exc::pon_raise_value_error(
+					crate::types::memoryview::RELEASED_ERROR.as_ptr(),
+					crate::types::memoryview::RELEASED_ERROR.len(),
+				)
+			});
+		}
+		if view.readonly {
+			return Err(raise_type_error(&format!(
+				"{method}() argument must be read-write bytes-like object, not memoryview"
+			)));
+		}
+		return Ok((view.data, view.len));
+	}
+	let type_name = unsafe { crate::types::dict::type_name(object) }.unwrap_or("object");
+	Err(raise_type_error(&format!(
+		"{method}() argument must be read-write bytes-like object, not {type_name}"
+	)))
+}
+
+fn sequence_items(object: *mut PyObject, name: &str) -> Result<Vec<*mut PyObject>, *mut PyObject> {
+	let object = untag(object);
+	if let Some(items) = unsafe { crate::abi::seq::exact_tuple_slice(object) } {
+		return Ok(items.to_vec());
+	}
+	if let Some(items) = unsafe { crate::abi::seq::exact_list_slice(object) } {
+		return Ok(items.to_vec());
+	}
+	Err(raise_type_error(&format!("{name} must be a list or tuple")))
+}
+
+fn bytes_like_vec(object: *mut PyObject) -> Result<Vec<u8>, *mut PyObject> {
+	let object = untag(object);
+	if let Ok(bytes) = readable_bytes_payload(object) {
+		return Ok(bytes.to_vec());
+	}
+	pon_err_clear();
+	let method = unsafe { abi::pon_get_attr(object, intern("tobytes"), ptr::null_mut()) };
+	if method.is_null() {
+		pon_err_clear();
+		return Err(raise_type_error("a bytes-like object is required"));
+	}
+	let result = untag(unsafe { abi::pon_call(method, ptr::null_mut(), 0) });
+	if result.is_null() {
+		return Err(ptr::null_mut());
+	}
+	readable_bytes_payload(result).map(|bytes| bytes.to_vec())
+}
+
+fn build_ancillary_data(object: *mut PyObject) -> Result<Vec<u8>, *mut PyObject> {
+	let entries = sequence_items(object, "ancillary data")?;
+	let mut control = Vec::<u8>::new();
+	let header_len = cmsg_align(std::mem::size_of::<libc::cmsghdr>());
+	for entry in entries {
+		let parts = sequence_items(entry, "ancillary item")?;
+		if parts.len() != 3 {
+			return Err(raise_type_error("ancillary item must be a (level, type, data) tuple"));
+		}
+		let level = int_arg(parts[0], "ancillary level")? as i32;
+		let kind = int_arg(parts[1], "ancillary type")? as i32;
+		if level != libc::SOL_SOCKET || kind != libc::SCM_RIGHTS {
+			return Err(abi::exc::raise_kind_error_text(
+				ExceptionKind::NotImplementedError,
+				"sendmsg ancillary data currently supports only SCM_RIGHTS",
+			));
+		}
+		let payload = bytes_like_vec(parts[2])?;
+		let offset = cmsg_align(control.len());
+		let space = cmsg_align(header_len + payload.len());
+		control.resize(offset + space, 0);
+		let header = unsafe { control.as_mut_ptr().add(offset).cast::<libc::cmsghdr>() };
+		unsafe {
+			(*header).cmsg_len = (header_len + payload.len()) as _;
+			(*header).cmsg_level = level;
+			(*header).cmsg_type = kind;
+			ptr::copy_nonoverlapping(payload.as_ptr(), control.as_mut_ptr().add(offset + header_len), payload.len());
+		}
+	}
+	Ok(control)
+}
+
+fn parse_ancillary_data(control: &[u8], controllen: usize) -> *mut PyObject {
+	let mut entries = Vec::new();
+	let header_size = std::mem::size_of::<libc::cmsghdr>();
+	let header_len = cmsg_align(header_size);
+	let mut offset = 0usize;
+	let limit = controllen.min(control.len());
+	while offset + header_size <= limit {
+		let header = unsafe { &*control.as_ptr().add(offset).cast::<libc::cmsghdr>() };
+		let cmsg_len = header.cmsg_len as usize;
+		if cmsg_len < header_len || offset + cmsg_len > limit {
+			break;
+		}
+		let data_offset = offset + header_len;
+		let data_len = cmsg_len.saturating_sub(header_len);
+		let data = unsafe { abi::str_::pon_const_bytes(control.as_ptr().add(data_offset), data_len) };
+		let level = unsafe { abi::pon_const_int(i64::from(header.cmsg_level)) };
+		let kind = unsafe { abi::pon_const_int(i64::from(header.cmsg_type)) };
+		let tuple = build_tuple(vec![level, kind, data]);
+		if tuple.is_null() {
+			return ptr::null_mut();
+		}
+		entries.push(tuple);
+		offset += cmsg_align(cmsg_len);
+	}
+	build_list(entries)
 }
 
 fn function_attr(name: &str, entry: BuiltinFn) -> Result<(u32, *mut PyObject), String> {

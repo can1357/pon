@@ -11,6 +11,7 @@ use std::{
 use flate2::read::GzDecoder;
 use pep440_rs::{Operator, Version, VersionSpecifiers};
 use pep508_rs::{ExtraName, MarkerEnvironment, Requirement, VersionOrUrl};
+use sha2::{Digest, Sha256};
 use pubgrub::{
 	DefaultStringReporter, Dependencies, DependencyConstraints, DependencyProvider,
 	PackageResolutionStatistics, PubGrubError, Ranges, Reporter, resolve as pubgrub_resolve,
@@ -1274,17 +1275,35 @@ fn core_metadata_from_pinned(candidate: &PinnedCandidate) -> CoreMetadata {
 
 fn local_project_file(path: &Path, version: Version, kind: PackageKind) -> ProjectFile {
 	let filename = path.display().to_string();
+	let mut hashes = BTreeMap::new();
+	if let Ok(hash) = sha256_file(path) {
+		hashes.insert("sha256".to_owned(), hash);
+	}
 	ProjectFile {
 		url: format!("file://{}", path.display()),
 		filename,
 		version,
 		kind,
-		hashes: BTreeMap::new(),
+		hashes,
 		requires_python: None,
 		requires_python_invalid: false,
 		yanked: None,
 		dist_info_metadata: None,
 	}
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+	let mut file = File::open(path)?;
+	let mut hasher = Sha256::new();
+	let mut buffer = [0_u8; 64 * 1024];
+	loop {
+		let read = file.read(&mut buffer)?;
+		if read == 0 {
+			break;
+		}
+		hasher.update(&buffer[..read]);
+	}
+	Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn read_tar_gz_pyproject(path: &Path) -> Result<(String, String)> {
@@ -1507,7 +1526,7 @@ mod tests {
 				include_str!("../index/fixtures/pkg-c-pep691.json").replace(
 					"\"requires-python\": \">=3.8\",",
 					"\"requires-python\": \">=3.8\", \"dist-info-metadata\": { \"sha256\": \
-					 \"3333333333333333333333333333333333333333333333333333333333333333\" },",
+					 \"d0efcd9f945e523742fa62d41992ce8b19ec9ae77d2253f643813e2c63d21dcc\" },",
 				),
 			),
 		] {

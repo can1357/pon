@@ -16,7 +16,7 @@ mod installed;
 pub(crate) use crate::import::install_module;
 use crate::object::PyObject;
 
-mod array;
+pub(crate) mod array;
 mod ast_;
 pub use ast_::{AstNode, AstValue, NodeSpan, build_ast_object};
 mod asyncio;
@@ -63,6 +63,7 @@ mod select;
 mod sha2;
 pub(crate) mod signal;
 mod socket_;
+mod ssl_;
 mod sre;
 mod statistics;
 pub(crate) mod stdlib_small;
@@ -136,7 +137,7 @@ pub(crate) static NATIVE_MODULES: &[(&str, fn() -> Result<*mut PyObject, String>
 	("_signal", signal::make_module),
 	("_socket", socket_::make_module),
 	("_sqlite3", big_cext::make_sqlite3_underscore_module),
-	("_ssl", big_cext::make_ssl_underscore_module),
+	("_ssl", ssl_::make_module),
 	("_sre", sre::make_module),
 	("_statistics", statistics::make_module),
 	("_string", string_mod::make_module),

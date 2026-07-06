@@ -56,6 +56,11 @@ static SYNC_TIERUP: LazyLock<bool> = LazyLock::new(|| match std::env::var_os("PO
 	Some(value) => !value.as_os_str().is_empty(),
 	None => false,
 });
+static DEBUG_TIER: LazyLock<bool> = LazyLock::new(|| {
+	std::env::var("PON_DEBUG")
+		.is_ok_and(|value| value.split(',').any(|flag| flag.trim() == "tier"))
+});
+static TIER_COMPILE_DISABLE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Process-local owner for tier-up metadata and installed tier-1 modules.
 pub struct TierUpDriver {
@@ -420,7 +425,11 @@ fn process_request(
 		Ok(compilation) if compilation.entry != record.tier0_entry => {
 			install_compilation(shared, function_ref, compilation);
 		},
-		Ok(_) | Err(_) => {
+		Ok(_) => {
+			disable_queued(function_ref);
+		},
+		Err(error) => {
+			log_compile_disable_once(record.function_index, request.reason, &error);
 			disable_queued(function_ref);
 		},
 	}
@@ -576,7 +585,7 @@ fn make_tier1_module() -> JITModule {
 	}
 	builder
 		.symbol(pon_runtime::abi::CURRENT_LINE_SYMBOL, pon_runtime::abi::current_line_cell_address());
-	crate::register_free_threading_symbols(&mut builder);
+	crate::register_threading_symbols(&mut builder);
 	JITModule::new(builder)
 }
 
@@ -710,6 +719,23 @@ fn disable_queued(function: &PyFunction) {
 			.store(function.code.cast_mut(), Ordering::Release);
 		function.osr_entry.store(ptr::null_mut(), Ordering::Release);
 	}
+}
+
+fn log_compile_disable_once(
+	function_index: usize,
+	reason: CompileReason,
+	error: &TierUpCompileError,
+) {
+	if !*DEBUG_TIER {
+		return;
+	}
+	if TIER_COMPILE_DISABLE_LOGGED.swap(true, Ordering::AcqRel) {
+		return;
+	}
+	eprintln!(
+		"pon tier-up: permanently disabled a hot function after tier-1 compile error \
+		 (function_index={function_index}, reason={reason:?}): {error:?}"
+	);
 }
 
 // ─── J0.5 pin: OSR + background compilation (implemented by O1) ─────────────

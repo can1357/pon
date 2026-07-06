@@ -99,18 +99,11 @@ fn store_frame_slot(
 		.ins()
 		.store(MemFlagsData::new(), value, frame, offset);
 
-	#[cfg(feature = "free-threading")]
-	{
-		let slot_addr = builder.ins().iadd_imm(frame, i64::from(offset));
-		builder
-			.ins()
-			.call(helpers.gc_write_barrier, &[slot_addr, value]);
-	}
-
-	#[cfg(not(feature = "free-threading"))]
-	{
-		let _ = (helpers, ptr_ty);
-	}
+	let slot_addr = builder.ins().iadd_imm(frame, i64::from(offset));
+	builder
+		.ins()
+		.call(helpers.gc_write_barrier, &[slot_addr, value]);
+	let _ = ptr_ty;
 	Ok(())
 }
 
@@ -154,7 +147,16 @@ pub(crate) fn compile_generator_function<M: Module>(
 	module.define_function(body_id, &mut body_ctx)?;
 
 	// (2) Stub at the declared FuncId: `(argv, argc) -> obj`.
-	compile_generator_stub(module, helpers, ir_function, entry_arg_count, body_id, ctx, fctx, stack_maps)
+	compile_generator_stub(
+		module,
+		helpers,
+		ir_function,
+		entry_arg_count,
+		body_id,
+		ctx,
+		fctx,
+		stack_maps,
+	)
 }
 
 /// Build the call-time stub: allocate the frame, store bound arguments into
@@ -191,7 +193,7 @@ fn compile_generator_stub<M: Module>(
 	builder.seal_block(entry);
 
 	let argv = builder.func.dfg.block_params(entry)[0];
-	emit_safepoint_poll(&mut builder, &helper_refs);
+	emit_safepoint_poll(&mut builder, &helper_refs, exception_exit);
 
 	// frame = pon_gen_frame_alloc(n_locals + own_cells): every local owns a
 	// spill slot (slot k = local k) and every own closure cell owns one after
@@ -282,7 +284,7 @@ fn compile_generator_body<M: Module>(
 	builder.seal_block(dispatch);
 
 	let frame = builder.func.dfg.block_params(dispatch)[0];
-	emit_safepoint_poll(&mut builder, &helper_refs);
+	emit_safepoint_poll(&mut builder, &helper_refs, exception_exit);
 
 	// state = load frame.resume_state; store RESUME_RUNNING (the body owns
 	// the word from here — closes the re-entrancy window, pin §3.1).

@@ -1,19 +1,16 @@
 //! Native `_thread` module: the surface the vendored 3.14 `threading.py`
-//! binds at import plus the original free-threading hooks.
+//! binds at import.
 //!
-//! Real OS threads exist only under the `free-threading` feature (the GC and
-//! type machinery require registered threads).  Default builds run
-//! `start_joinable_thread` bodies inline on the calling thread under a
-//! synthetic `get_ident()` override, which keeps `threading.Thread`
-//! start/join, `current_thread()` bookkeeping, and `RLock` owner accounting
-//! coherent and deterministic for single-threaded conformance runs.
+//! `threading.Thread` and `_thread.start_new_thread` run on registered OS
+//! threads.  Each thread owns a runtime thread state, publishes blocking-region
+//! metadata for the GC, and uses its real OS-thread-local ident for `RLock` and
+//! `current_thread()` bookkeeping.
 //!
 //! Objects are immortal leaked boxes like the other native seeds; the Python
 //! values held by `_local` instances are reported as GC roots through
 //! [`gc_held_roots`] (the `_contextvars` pattern).
 
 use std::{
-	cell::Cell,
 	collections::HashMap,
 	ffi::{CStr, CString},
 	ptr,
@@ -38,6 +35,7 @@ use crate::{
 	intern::intern,
 	native::builtins_mod::VARIADIC_ARITY,
 	object::{PyObject, PyObjectHeader, PySequenceMethods, PyType},
+	sync::BlockingRegionGuard,
 	thread_state::pon_err_set,
 	types::{exc::ExceptionKind, method, type_},
 };
@@ -376,27 +374,10 @@ unsafe extern "C" fn native_get_ident(_argv: *mut *mut PyObject, _argc: usize) -
 	unsafe { pon_const_int(current_ident()) }
 }
 
-thread_local! {
-	 /// Nonzero while an inline joinable-thread body runs on this OS thread
-	 /// (single-threaded builds); the synthetic value stands in for the ident
-	 /// the body would observe on its own OS thread.
-	 static IDENT_OVERRIDE: Cell<i64> = const { Cell::new(0) };
-}
-
-/// Synthetic idents for inline joinable threads.  The base is far below any
-/// mapped address on supported targets, so values never collide with the
-/// anchor-address idents of real threads.
-static SYNTHETIC_IDENT: AtomicI64 = AtomicI64::new(0x7061_0001);
-
 /// Nonzero integer unique per live thread: the address of a thread-local
 /// cell, stable for the thread's lifetime (shared by `get_ident` and the
-/// `RLock` owner bookkeeping), unless an inline joinable-thread override is
-/// active.
+/// `RLock` owner bookkeeping).
 fn current_ident() -> i64 {
-	let overridden = IDENT_OVERRIDE.with(Cell::get);
-	if overridden != 0 {
-		return overridden;
-	}
 	thread_local! {
 		 static IDENT_ANCHOR: u8 = const { 0 };
 	}
@@ -429,11 +410,15 @@ unsafe extern "C" fn native_daemon_threads_allowed(
 	unsafe { pon_const_bool(1) }
 }
 
-/// `_thread._shutdown()`: joining of straggler non-daemon threads at exit.
-/// Inline threads finish before `start()` returns and real threads are only
-/// spawned under free-threading where process exit does not wait, so there
-/// is nothing to join.
+/// `_thread._shutdown()`: join straggler non-daemon threads at exit.
 unsafe extern "C" fn native_shutdown(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+	let handles = NON_DAEMON_HANDLES
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner())
+		.clone();
+	for handle in handles {
+		handle.join(None);
+	}
 	unsafe { pon_none() }
 }
 
@@ -544,7 +529,7 @@ unsafe extern "C" fn native_set_name(argv: *mut *mut PyObject, argc: usize) -> *
 }
 
 // ---------------------------------------------------------------------------
-// start_new_thread (free-threading stress surface)
+// start_new_thread (no-GIL stress surface)
 
 unsafe extern "C" fn native_start_new_thread(
 	argv: *mut *mut PyObject,
@@ -622,6 +607,8 @@ struct HandleInner {
 	done:  bool,
 }
 
+static NON_DAEMON_HANDLES: Mutex<Vec<Arc<HandleState>>> = Mutex::new(Vec::new());
+
 impl HandleState {
 	fn new(ident: i64) -> Self {
 		Self { inner: Mutex::new(HandleInner { ident, done: false }), done: Condvar::new() }
@@ -658,6 +645,7 @@ impl HandleState {
 		match timeout {
 			None => {
 				while !inner.done {
+					let _region = BlockingRegionGuard::enter();
 					inner = self
 						.done
 						.wait(inner)
@@ -671,6 +659,7 @@ impl HandleState {
 					if now >= deadline {
 						break;
 					}
+					let _region = BlockingRegionGuard::enter();
 					let (guard, _timed_out) = self
 						.done
 						.wait_timeout(inner, deadline - now)
@@ -844,7 +833,7 @@ unsafe extern "C" fn native_make_thread_handle(
 	alloc_thread_handle(Arc::new(HandleState::new(ident)))
 }
 
-/// Payload for a spawned joinable thread (free-threading builds).
+/// Payload for a spawned joinable thread.
 struct JoinableCall {
 	callable: *mut PyObject,
 	state:    Arc<HandleState>,
@@ -867,9 +856,9 @@ unsafe extern "C" fn joinable_trampoline(call: *mut PyObject) -> *mut PyObject {
 
 /// `_thread.start_joinable_thread(function, handle=None, daemon=True)`.
 ///
-/// Free-threading builds spawn a registered OS thread.  Default builds run
-/// `function` inline under a synthetic `get_ident()` override (see module
-/// docs); the handle is done when the call returns, so `join` never blocks.
+/// Spawns a registered OS thread and returns its `_ThreadHandle`.  Non-daemon
+/// handles are retained for `_thread._shutdown()` so interpreter exit waits for
+/// them like CPython.
 unsafe extern "C" fn native_start_joinable_thread(
 	argv: *mut *mut PyObject,
 	argc: usize,
@@ -891,8 +880,14 @@ unsafe extern "C" fn native_start_joinable_thread(
 	} else {
 		none
 	};
-	// Slot 3 (`daemon`) is accepted and ignored: inline threads finish
-	// eagerly and free-threading exit never waits on threads.
+	let mut daemon = true;
+	if argc >= 3 {
+		match unsafe { pon_is_true(*argv.add(2)) } {
+			-1 => return ptr::null_mut(),
+			0 => daemon = false,
+			_ => daemon = true,
+		}
+	}
 	if handle_object.is_null() {
 		return ptr::null_mut();
 	}
@@ -908,26 +903,20 @@ unsafe extern "C" fn native_start_joinable_thread(
 	// The trampoline and joiners must share the one Arc stored in the
 	// handle object.
 	let state = unsafe { &(*handle_object.cast::<PyThreadHandle>()).state }.clone();
-	if cfg!(feature = "free-threading") {
-		let call = Box::new(JoinableCall { callable, state });
-		let call_arg = Box::into_raw(call).cast::<PyObject>();
-		ACTIVE_THREAD_COUNT.fetch_add(1, Ordering::Relaxed);
-		let status = unsafe { pon_thread_start_new(joinable_trampoline as *const u8, call_arg) };
-		if status != 0 {
-			ACTIVE_THREAD_COUNT.fetch_sub(1, Ordering::Relaxed);
-			unsafe { drop(Box::from_raw(call_arg.cast::<JoinableCall>())) };
-			return ptr::null_mut();
-		}
-		return handle_object;
-	}
-	let synthetic = SYNTHETIC_IDENT.fetch_add(2, Ordering::Relaxed);
-	let previous = IDENT_OVERRIDE.with(|cell| cell.replace(synthetic));
-	state.set_ident(synthetic);
-	let result = unsafe { pon_call(callable, ptr::null_mut(), 0) };
-	IDENT_OVERRIDE.with(|cell| cell.set(previous));
-	state.set_done();
-	if result.is_null() {
+	let call = Box::new(JoinableCall { callable, state: Arc::clone(&state) });
+	let call_arg = Box::into_raw(call).cast::<PyObject>();
+	ACTIVE_THREAD_COUNT.fetch_add(1, Ordering::Relaxed);
+	let status = unsafe { pon_thread_start_new(joinable_trampoline as *const u8, call_arg) };
+	if status != 0 {
+		ACTIVE_THREAD_COUNT.fetch_sub(1, Ordering::Relaxed);
+		unsafe { drop(Box::from_raw(call_arg.cast::<JoinableCall>())) };
 		return ptr::null_mut();
+	}
+	if !daemon {
+		NON_DAEMON_HANDLES
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.push(state);
 	}
 	handle_object
 }
@@ -969,6 +958,7 @@ impl LockState {
 	fn acquire(&self) {
 		let mut locked = self.lock();
 		while *locked {
+			let _region = BlockingRegionGuard::enter();
 			locked = self
 				.available
 				.wait(locked)
@@ -995,6 +985,7 @@ impl LockState {
 			if now >= deadline {
 				return false;
 			}
+			let _region = BlockingRegionGuard::enter();
 			let (guard, _timed_out) = self
 				.available
 				.wait_timeout(locked, deadline - now)
@@ -1267,6 +1258,7 @@ impl RLockState {
 			return;
 		}
 		while inner.count != 0 {
+			let _region = BlockingRegionGuard::enter();
 			inner = self
 				.available
 				.wait(inner)

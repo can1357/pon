@@ -31,7 +31,7 @@ type VectorcallFunc =
 	unsafe extern "C" fn(*mut PyObject, *const *mut PyObject, usize, *mut PyObject) -> *mut PyObject;
 
 const PY_VECTORCALL_ARGUMENTS_OFFSET: usize = 1usize << (usize::BITS - 1);
-const TPFLAGS_HAVE_VECTORCALL: u64 = 1 << 11;
+pub(crate) const TPFLAGS_HAVE_VECTORCALL: u64 = 1 << 11;
 const PY_PRINT_RAW: c_int = 1;
 
 type PySsizeT = isize;
@@ -39,6 +39,7 @@ type GetBufferProc = unsafe extern "C" fn(*mut PyObject, *mut PyBuffer, c_int) -
 type ReleaseBufferProc = unsafe extern "C" fn(*mut PyObject, *mut PyBuffer);
 type VisitProc = unsafe extern "C" fn(*mut PyObject, *mut c_void) -> c_int;
 
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub(crate) struct PyBuffer {
 	buf:        *mut c_void,
@@ -85,12 +86,18 @@ const PYBUF_ND: c_int = 0x0008;
 const PYBUF_STRIDES: c_int = 0x0010 | PYBUF_ND;
 const PYBUF_READ: c_int = 0x100;
 const PYBUF_WRITE: c_int = 0x200;
+const PYBUF_C_CONTIGUOUS: c_int = 0x0020 | PYBUF_STRIDES;
+const PYBUF_F_CONTIGUOUS: c_int = 0x0040 | PYBUF_STRIDES;
+const PYBUF_ANY_CONTIGUOUS: c_int = 0x0080 | PYBUF_STRIDES;
+const PYBUF_FULL_RO: c_int = 0x0100 | PYBUF_STRIDES | PYBUF_FORMAT;
 
 static BUFFER_FORMAT_B: &[u8; 2] = b"B\0";
 static BUFFER_FORMAT_I: &[u8; 2] = b"I\0";
 
 thread_local! {
 	 static MEMORYVIEW_BUFFER_CACHE: RefCell<HashMap<usize, Box<PyBuffer>>> = RefCell::new(HashMap::new());
+	 static MEMORYVIEW_SHAPE_CACHE: RefCell<HashMap<usize, Box<[PySsizeT; 2]>>> = RefCell::new(HashMap::new());
+	 static BUFFER_SHAPE_CACHE: RefCell<HashMap<usize, Box<[PySsizeT; 2]>>> = RefCell::new(HashMap::new());
 }
 
 /// C mirror: `include/pon_capi/object.h` `PyPonCapiObject`.
@@ -1470,7 +1477,15 @@ unsafe fn foreign_releasebuffer(object: *mut PyObject) -> Option<ReleaseBufferPr
 	unsafe { slot_function((*procs).bf_releasebuffer) }
 }
 
-unsafe fn pon_bytes_buffer(object: *mut PyObject) -> Option<(*mut c_void, PySsizeT, c_int)> {
+struct PonBufferInfo {
+	buf:      *mut c_void,
+	len:      PySsizeT,
+	readonly: c_int,
+	itemsize: PySsizeT,
+	format:   u8,
+}
+
+unsafe fn pon_contiguous_buffer(object: *mut PyObject) -> Option<PonBufferInfo> {
 	let object = normalize_object_arg(object);
 	if object.is_null() || crate::tag::is_small_int(object) || !crate::tag::is_heap(object) {
 		return None;
@@ -1480,16 +1495,101 @@ unsafe fn pon_bytes_buffer(object: *mut PyObject) -> Option<(*mut c_void, PySsiz
 	if crate::types::bytes_::is_bytes_type(ty) {
 		// SAFETY: the exact type check proves the boxed bytes layout.
 		let bytes = unsafe { (&*object.cast::<crate::types::bytes_::PyBytes>()).as_slice() };
-		return Some((bytes.as_ptr().cast::<c_void>().cast_mut(), bytes.len() as PySsizeT, 1));
+		return Some(PonBufferInfo {
+			buf: bytes.as_ptr().cast::<c_void>().cast_mut(),
+			len: bytes.len() as PySsizeT,
+			readonly: 1,
+			itemsize: 1,
+			format: b'B',
+		});
 	}
 	if crate::types::bytearray_::is_bytearray_type(ty) {
 		// SAFETY: the exact type check proves the boxed bytearray layout; the buffer
 		// API exposes its mutable storage.
 		let bytes =
 			unsafe { (&mut *object.cast::<crate::types::bytearray_::PyByteArray>()).as_mut_slice() };
-		return Some((bytes.as_mut_ptr().cast::<c_void>(), bytes.len() as PySsizeT, 0));
+		return Some(PonBufferInfo {
+			buf: bytes.as_mut_ptr().cast::<c_void>(),
+			len: bytes.len() as PySsizeT,
+			readonly: 0,
+			itemsize: 1,
+			format: b'B',
+		});
+	}
+	if let Some(array) = unsafe { crate::native::array::buffer_view(object) } {
+		return Some(PonBufferInfo {
+			buf: array.data.cast::<c_void>(),
+			len: array.len as PySsizeT,
+			readonly: 0,
+			itemsize: array.itemsize as PySsizeT,
+			format: array.format,
+		});
 	}
 	None
+}
+
+unsafe fn fill_typed_buffer_info_impl(
+	view: *mut PyBuffer,
+	object: *mut PyObject,
+	buffer: PonBufferInfo,
+	flags: c_int,
+) -> c_int {
+	if view.is_null() {
+		return raise_status(
+			ExceptionKind::BufferError,
+			"PyBuffer_FillInfo: view==NULL argument is obsolete",
+		);
+	}
+	if buffer.itemsize <= 0 || buffer.len < 0 || buffer.len % buffer.itemsize != 0 {
+		return raise_status(ExceptionKind::BufferError, "buffer shape is invalid");
+	}
+	if flags != PYBUF_SIMPLE {
+		if flags == PYBUF_READ || flags == PYBUF_WRITE {
+			return raise_status(ExceptionKind::SystemError, "bad argument to internal function");
+		}
+		if (flags & PYBUF_WRITABLE) == PYBUF_WRITABLE && buffer.readonly != 0 {
+			return raise_status(ExceptionKind::BufferError, "Object is not writable.");
+		}
+	}
+	let readonly = c_int::from(buffer.readonly != 0);
+	let count = buffer.len / buffer.itemsize;
+	let (shape, strides) = if (flags & PYBUF_ND) == PYBUF_ND {
+		BUFFER_SHAPE_CACHE.with(|cache| {
+			let mut cache = cache.borrow_mut();
+			let dims = cache.entry(view as usize).or_insert_with(|| Box::new([count, buffer.itemsize]));
+			dims[0] = count;
+			dims[1] = buffer.itemsize;
+			let shape = dims.as_mut_ptr();
+			let strides = if (flags & PYBUF_STRIDES) == PYBUF_STRIDES {
+				unsafe { shape.add(1) }
+			} else {
+				ptr::null_mut()
+			};
+			(shape, strides)
+		})
+	} else {
+		(ptr::null_mut(), ptr::null_mut())
+	};
+	// SAFETY: caller supplied a writable `Py_buffer` out-parameter.
+	unsafe {
+		(*view).obj = object;
+		(*view).buf = buffer.buf;
+		(*view).len = buffer.len;
+		(*view).readonly = readonly;
+		(*view).itemsize = buffer.itemsize;
+		(*view).format = if (flags & PYBUF_FORMAT) == PYBUF_FORMAT {
+			memoryview_format_pointer(buffer.format)
+		} else {
+			ptr::null_mut()
+		};
+		(*view).ndim = 1;
+		(*view).shape = shape;
+		(*view).strides = strides;
+		(*view).suboffsets = ptr::null_mut();
+		(*view).internal = ptr::null_mut();
+	}
+	super::pin_object(object);
+	0
 }
 
 unsafe fn fill_buffer_info_impl(
@@ -1500,49 +1600,14 @@ unsafe fn fill_buffer_info_impl(
 	readonly: c_int,
 	flags: c_int,
 ) -> c_int {
-	if view.is_null() {
-		return raise_status(
-			ExceptionKind::BufferError,
-			"PyBuffer_FillInfo: view==NULL argument is obsolete",
-		);
-	}
-	if flags != PYBUF_SIMPLE {
-		if flags == PYBUF_READ || flags == PYBUF_WRITE {
-			return raise_status(ExceptionKind::SystemError, "bad argument to internal function");
-		}
-		if (flags & PYBUF_WRITABLE) == PYBUF_WRITABLE && readonly != 0 {
-			return raise_status(ExceptionKind::BufferError, "Object is not writable.");
-		}
-	}
-	let readonly = c_int::from(readonly != 0);
-	// SAFETY: caller supplied a writable `Py_buffer` out-parameter.
 	unsafe {
-		(*view).obj = object;
-		(*view).buf = buf;
-		(*view).len = len;
-		(*view).readonly = readonly;
-		(*view).itemsize = 1;
-		(*view).format = if (flags & PYBUF_FORMAT) == PYBUF_FORMAT {
-			BUFFER_FORMAT_B.as_ptr().cast::<c_char>().cast_mut()
-		} else {
-			ptr::null_mut()
-		};
-		(*view).ndim = 1;
-		(*view).shape = if (flags & PYBUF_ND) == PYBUF_ND {
-			ptr::addr_of_mut!((*view).len)
-		} else {
-			ptr::null_mut()
-		};
-		(*view).strides = if (flags & PYBUF_STRIDES) == PYBUF_STRIDES {
-			ptr::addr_of_mut!((*view).itemsize)
-		} else {
-			ptr::null_mut()
-		};
-		(*view).suboffsets = ptr::null_mut();
-		(*view).internal = ptr::null_mut();
+		fill_typed_buffer_info_impl(
+			view,
+			object,
+			PonBufferInfo { buf, len, readonly, itemsize: 1, format: b'B' },
+			flags,
+		)
 	}
-	super::pin_object(object);
-	0
 }
 
 unsafe fn get_buffer_impl(object: *mut PyObject, view: *mut PyBuffer, flags: c_int) -> c_int {
@@ -1557,15 +1622,15 @@ unsafe fn get_buffer_impl(object: *mut PyObject, view: *mut PyBuffer, flags: c_i
 		// SAFETY: foreign slot ABI is `getbufferproc`; the extension owns the callback.
 		return unsafe { getbuffer(object, view, flags) };
 	}
-	if let Some((buf, len, readonly)) = unsafe { pon_bytes_buffer(object) } {
-		return unsafe { fill_buffer_info_impl(view, object, buf, len, readonly, flags) };
+	if let Some(buffer) = unsafe { pon_contiguous_buffer(object) } {
+		return unsafe { fill_typed_buffer_info_impl(view, object, buffer, flags) };
 	}
 	type_error_status("a bytes-like object is required")
 }
 
 unsafe fn object_supports_buffer(object: *mut PyObject) -> bool {
 	let object = normalize_object_arg(object);
-	unsafe { foreign_getbuffer(object).is_some() || pon_bytes_buffer(object).is_some() }
+	unsafe { foreign_getbuffer(object).is_some() || pon_contiguous_buffer(object).is_some() }
 }
 
 unsafe fn zero_buffer(view: *mut PyBuffer) {
@@ -1666,6 +1731,9 @@ unsafe extern "C" fn capi_release_buffer(view: *mut PyBuffer) {
 		if view.is_null() {
 			return;
 		}
+		BUFFER_SHAPE_CACHE.with(|cache| {
+			cache.borrow_mut().remove(&(view as usize));
+		});
 		let object = (*view).obj;
 		if !object.is_null() {
 			if let Some(releasebuffer) = foreign_releasebuffer(object) {
@@ -1702,11 +1770,16 @@ unsafe extern "C" fn capi_check_buffer(object: *mut PyObject) -> c_int {
 unsafe extern "C" fn capi_memoryview_from_object(object: *mut PyObject) -> *mut PyObject {
 	catch_object(|| unsafe {
 		let object = normalize_object_arg(object);
-		if foreign_getbuffer(object).is_some() {
-			return abi::exc::raise_kind_error_text(
-				ExceptionKind::NotImplementedError,
-				"PyMemoryView_FromObject for foreign buffer exporters is not implemented yet",
-			);
+		if let Some(getbuffer) = foreign_getbuffer(object) {
+			if let Err(message) = crate::abi::str_::install_memoryview_slots() {
+				return abi::return_null_with_error(message);
+			}
+			let mut view = PyBuffer::empty();
+			let status = getbuffer(object, &mut view, PYBUF_FULL_RO);
+			if status < 0 {
+				return ptr::null_mut();
+			}
+			return memoryview_from_acquired_buffer(&view);
 		}
 		if let Err(message) = crate::abi::str_::install_memoryview_slots() {
 			return abi::return_null_with_error(message);
@@ -1721,34 +1794,163 @@ unsafe extern "C" fn capi_memoryview_from_object(object: *mut PyObject) -> *mut 
 	})
 }
 
-unsafe extern "C" fn capi_memoryview_from_buffer(_view: *const PyBuffer) -> *mut PyObject {
-	catch_object(|| {
-		abi::exc::raise_kind_error_text(
-			ExceptionKind::NotImplementedError,
-			"PyMemoryView_FromBuffer is not implemented yet",
-		)
+unsafe extern "C" fn capi_memoryview_from_buffer(view: *const PyBuffer) -> *mut PyObject {
+	catch_object(|| unsafe {
+		if view.is_null() {
+			return abi::exc::raise_kind_error_text(
+				ExceptionKind::ValueError,
+				"PyMemoryView_FromBuffer called with NULL view",
+			);
+		}
+		if let Err(message) = crate::abi::str_::install_memoryview_slots() {
+			return abi::return_null_with_error(message);
+		}
+		memoryview_from_acquired_buffer(&*view)
 	})
 }
 
 unsafe extern "C" fn capi_memoryview_from_memory(
-	_mem: *mut c_char,
-	_size: PySsizeT,
-	_flags: c_int,
+	mem: *mut c_char,
+	size: PySsizeT,
+	flags: c_int,
 ) -> *mut PyObject {
 	catch_object(|| {
-		abi::exc::raise_kind_error_text(
-			ExceptionKind::NotImplementedError,
-			"PyMemoryView_FromMemory is not implemented yet: wrapping raw foreign memory is not safe \
-			 under Pon",
+		if size < 0 {
+			return abi::exc::raise_kind_error_text(
+				ExceptionKind::ValueError,
+				"PyMemoryView_FromMemory size must be non-negative",
+			);
+		}
+		if mem.is_null() && size != 0 {
+			return abi::exc::raise_kind_error_text(
+				ExceptionKind::ValueError,
+				"PyMemoryView_FromMemory received NULL memory for non-empty view",
+			);
+		}
+		let readonly = match flags {
+			PYBUF_READ => true,
+			PYBUF_WRITE => false,
+			_ => {
+				return abi::exc::raise_kind_error_text(
+					ExceptionKind::ValueError,
+					"PyMemoryView_FromMemory flags must be PyBUF_READ or PyBUF_WRITE",
+				);
+			},
+		};
+		if let Err(message) = crate::abi::str_::install_memoryview_slots() {
+			return abi::return_null_with_error(message);
+		}
+		crate::types::memoryview::boxed_memoryview_from_raw(
+			ptr::null_mut(),
+			mem.cast::<u8>(),
+			size as usize,
+			readonly,
+			b'B',
 		)
+		.cast::<PyObject>()
 	})
 }
 
-fn memoryview_format_pointer(format: u8) -> *mut c_char {
-	match format {
-		b'I' => BUFFER_FORMAT_I.as_ptr().cast::<c_char>().cast_mut(),
-		_ => BUFFER_FORMAT_B.as_ptr().cast::<c_char>().cast_mut(),
+unsafe fn memoryview_from_acquired_buffer(view: &PyBuffer) -> *mut PyObject {
+	if view.len < 0 {
+		return abi::exc::raise_kind_error_text(
+			ExceptionKind::ValueError,
+			"memoryview buffer length is negative",
+		);
 	}
+	if view.itemsize <= 0 {
+		return abi::exc::raise_kind_error_text(
+			ExceptionKind::ValueError,
+			"memoryview buffer itemsize must be positive",
+		);
+	}
+	if view.buf.is_null() && view.len != 0 {
+		return abi::exc::raise_kind_error_text(
+			ExceptionKind::ValueError,
+			"memoryview buffer pointer is NULL",
+		);
+	}
+	if !unsafe { buffer_is_contiguous_for_memoryview(view) } {
+		return abi::exc::raise_kind_error_text(
+			ExceptionKind::BufferError,
+			"PyMemoryView_FromBuffer requires a contiguous buffer",
+		);
+	}
+	let Some(format) = (unsafe { memoryview_format_from_buffer(view) }) else {
+		return ptr::null_mut();
+	};
+	let buffer_copy = Box::into_raw(Box::new(*view)).cast::<c_void>();
+	if !view.obj.is_null() {
+		super::pin_object(view.obj);
+	}
+	crate::types::memoryview::boxed_memoryview_from_exporter(
+		view.obj,
+		view.buf.cast::<u8>(),
+		view.len as usize,
+		view.readonly != 0,
+		format,
+		buffer_copy,
+		Some(release_owned_memoryview_buffer),
+	)
+	.cast::<PyObject>()
+}
+
+unsafe extern "C" fn release_owned_memoryview_buffer(_base: *mut PyObject, buffer: *mut c_void) {
+	if buffer.is_null() {
+		return;
+	}
+	let mut buffer = unsafe { Box::from_raw(buffer.cast::<PyBuffer>()) };
+	if !buffer.obj.is_null() {
+		if let Some(releasebuffer) = unsafe { foreign_releasebuffer(buffer.obj) } {
+			unsafe { releasebuffer(buffer.obj, buffer.as_mut()) };
+		}
+		super::unpin_object(buffer.obj);
+		buffer.obj = ptr::null_mut();
+	}
+}
+
+unsafe fn buffer_is_contiguous_for_memoryview(view: &PyBuffer) -> bool {
+	if view.suboffsets.is_null() {
+		if view.strides.is_null() || view.ndim <= 1 {
+			return true;
+		}
+		return unsafe { is_c_contiguous(view) || is_fortran_contiguous(view) };
+	}
+	false
+}
+
+unsafe fn memoryview_format_from_buffer(view: &PyBuffer) -> Option<u8> {
+	let format = if view.format.is_null() {
+		b'B'
+	} else {
+		unsafe { *view.format.cast::<u8>() }
+	};
+	if crate::types::memoryview::item_width(format).is_none() {
+		let text = format!("PyMemoryView_FromBuffer does not support format '{}'", format as char);
+		abi::exc::raise_kind_error_text(ExceptionKind::BufferError, &text);
+		return None;
+	}
+	Some(format)
+}
+
+fn memoryview_format_pointer(format: u8) -> *mut c_char {
+	let bytes: &'static [u8; 2] = match format {
+		b'b' => b"b\0",
+		b'B' => BUFFER_FORMAT_B,
+		b'h' => b"h\0",
+		b'H' => b"H\0",
+		b'i' => b"i\0",
+		b'I' => BUFFER_FORMAT_I,
+		b'l' => b"l\0",
+		b'L' => b"L\0",
+		b'q' => b"q\0",
+		b'Q' => b"Q\0",
+		b'f' => b"f\0",
+		b'd' => b"d\0",
+		b'w' => b"w\0",
+		_ => BUFFER_FORMAT_B,
+	};
+	bytes.as_ptr().cast::<c_char>().cast_mut()
 }
 
 unsafe fn memoryview_ref(
@@ -1775,23 +1977,34 @@ unsafe extern "C" fn capi_memoryview_get_buffer(object: *mut PyObject) -> *mut P
 	if view.released {
 		return ptr::null_mut();
 	}
-	MEMORYVIEW_BUFFER_CACHE.with(|cache| {
-		let mut cache = cache.borrow_mut();
-		let entry = cache
+	MEMORYVIEW_SHAPE_CACHE.with(|shapes| {
+		let itemsize = view.itemsize() as PySsizeT;
+		let mut shapes = shapes.borrow_mut();
+		let shape = shapes
 			.entry(object as usize)
-			.or_insert_with(|| Box::new(PyBuffer::empty()));
-		entry.obj = view.base;
-		entry.buf = view.data.cast::<c_void>();
-		entry.len = view.len as PySsizeT;
-		entry.itemsize = view.itemsize() as PySsizeT;
-		entry.readonly = c_int::from(view.readonly);
-		entry.ndim = 1;
-		entry.format = memoryview_format_pointer(view.format);
-		entry.shape = ptr::addr_of_mut!(entry.len);
-		entry.strides = ptr::addr_of_mut!(entry.itemsize);
-		entry.suboffsets = ptr::null_mut();
-		entry.internal = ptr::null_mut();
-		entry.as_mut() as *mut PyBuffer
+			.or_insert_with(|| Box::new([0, itemsize]));
+		shape[0] = (view.len / view.itemsize()) as PySsizeT;
+		shape[1] = itemsize;
+		let shape_ptr = shape.as_mut_ptr();
+		let stride_ptr = unsafe { shape_ptr.add(1) };
+		MEMORYVIEW_BUFFER_CACHE.with(|cache| {
+			let mut cache = cache.borrow_mut();
+			let entry = cache
+				.entry(object as usize)
+				.or_insert_with(|| Box::new(PyBuffer::empty()));
+			entry.obj = view.base;
+			entry.buf = view.data.cast::<c_void>();
+			entry.len = view.len as PySsizeT;
+			entry.itemsize = itemsize;
+			entry.readonly = c_int::from(view.readonly);
+			entry.ndim = 1;
+			entry.format = memoryview_format_pointer(view.format);
+			entry.shape = shape_ptr;
+			entry.strides = stride_ptr;
+			entry.suboffsets = ptr::null_mut();
+			entry.internal = ptr::null_mut();
+			entry.as_mut() as *mut PyBuffer
+		})
 	})
 }
 
@@ -2953,6 +3166,63 @@ static PyObject *drive(PyObject *self, PyObject *args) {
         }
     }
 
+
+    PyObject *mv_object = exporter == NULL ? NULL : PyMemoryView_FromObject(exporter);
+    Py_buffer *mv_object_view = mv_object == NULL ? NULL : PyMemoryView_GET_BUFFER(mv_object);
+    if (mv_object != NULL
+            && PyMemoryView_Check(mv_object)
+            && PyMemoryView_GET_BASE(mv_object) == exporter
+            && mv_object_view != NULL
+            && mv_object_view->buf == exported
+            && mv_object_view->len == 8
+            && mv_object_view->readonly == 0
+            && mv_object_view->format != NULL
+            && strcmp(mv_object_view->format, "B") == 0) {
+        mask |= BIT(7);
+    } else {
+        PyErr_Clear();
+    }
+
+    memset(&view, 0x7F, sizeof(view));
+    PyObject *mv_buffer = NULL;
+    if (exporter != NULL && PyObject_GetBuffer(exporter, &view, PyBUF_FORMAT | PyBUF_ND | PyBUF_STRIDES) == 0) {
+        mv_buffer = PyMemoryView_FromBuffer(&view);
+        Py_buffer *mv_buffer_view = mv_buffer == NULL ? NULL : PyMemoryView_GET_BUFFER(mv_buffer);
+        if (mv_buffer != NULL
+                && PyMemoryView_GET_BASE(mv_buffer) == exporter
+                && mv_buffer_view != NULL
+                && mv_buffer_view->buf == exported
+                && mv_buffer_view->len == 8
+                && mv_buffer_view->shape != NULL
+                && mv_buffer_view->shape[0] == 8
+                && mv_buffer_view->strides != NULL
+                && mv_buffer_view->strides[0] == 1) {
+            mask |= BIT(8);
+        }
+    } else {
+        PyErr_Clear();
+    }
+
+    char raw[4] = {'a', 'b', 'c', 'd'};
+    PyObject *mv_memory = PyMemoryView_FromMemory(raw, 4, PyBUF_WRITE);
+    Py_buffer *mv_memory_view = mv_memory == NULL ? NULL : PyMemoryView_GET_BUFFER(mv_memory);
+    if (mv_memory != NULL
+            && PyMemoryView_GET_BASE(mv_memory) == NULL
+            && mv_memory_view != NULL
+            && mv_memory_view->buf == raw
+            && mv_memory_view->len == 4
+            && mv_memory_view->readonly == 0) {
+        ((char *)mv_memory_view->buf)[1] = 'Z';
+        if (memcmp(raw, "aZcd", 4) == 0) {
+            mask |= BIT(9);
+        }
+    } else {
+        PyErr_Clear();
+    }
+
+    Py_XDECREF(mv_object);
+    Py_XDECREF(mv_buffer);
+    Py_XDECREF(mv_memory);
     Py_XDECREF(exporter);
     Py_XDECREF(bytes);
     Py_XDECREF(bytearray);
@@ -2992,7 +3262,7 @@ PyMODINIT_FUNC PyInit_capi_buffer_protocol_ext(void) {
 		assert!(!result.is_null(), "drive() returned NULL: {:?}", pon_err_message());
 		assert_eq!(
 			format_object(result).as_deref(),
-			Ok("127"),
+			Ok("1023"),
 			"buffer protocol bitmask mismatch: {:?}",
 			pon_err_message()
 		);

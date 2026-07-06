@@ -18,10 +18,11 @@
 //! false-retention hazard that argv-array scrubbing exists for
 //! (aot-parity `weakref_basic`) cannot re-enter through the pool.
 //!
-//! Scope: pon collects only on an explicit `gc.collect()` call, and only
-//! user code can make one, so helpers that never invoke a user callable
-//! (allocation from evaluated operands, local/cell moves, module-dict
-//! access) cannot collect and are not spill points.  Two residuals are out
+//! Scope: pon collection can be reached from explicit `gc.collect()` in user
+//! code, including Python signal handlers drained by generated-code
+//! safepoints. Helpers that never invoke a user callable (allocation from
+//! evaluated operands, local/cell moves, module-dict access) cannot collect and
+//! are not spill points. Two residuals are out
 //! of scope here: values passed INTO a collecting helper are the runtime's
 //! rooting concern (argv arrays already live in scanned frame slots), and
 //! the Phase-D optimizing tier carries its own precise-map plan.
@@ -281,8 +282,10 @@ fn sorted(live: &HashSet<IrValue>) -> Vec<IrValue> {
 /// user code, so new `InstKind` variants default to being spill points
 /// (sound by default, opt out for performance):
 /// - constant materialization and container/function/cell construction from
-///   already-evaluated operands only allocate, and allocation never collects in
-///   pon;
+///   already-evaluated operands only allocate; allocation does not
+///   synchronously enter the collector on this mutator.  A concurrent collector
+///   stops generated code only at emitted safepoints, and live locals are
+///   mirrored in frame slots before those stops;
 /// - local/cell/global moves touch frame variables or module dicts with
 ///   interned-string keys (no user hooks); `LoadName` is NOT excluded because
 ///   class bodies execute against user `__prepare__` mappings;
@@ -339,12 +342,17 @@ fn inst_spill_point(kind: &InstKind) -> bool {
 
 /// True when the terminator's lowering may invoke a user callable:
 /// `Branch`/`CondBranch` truth-test through `pon_is_true` (user
-/// `__bool__`/`__len__`).  `ForLoop` only branches on the preceding
-/// `ForNext` result (its stop path reads the runtime StopIteration stash),
-/// `Suspend`/`Return` route through the generator frame machinery, and
-/// `Jump`'s backedge polls never run user code.
+/// `__bool__`/`__len__`).  Backedge `Jump` terminators drain pending signal
+/// handlers through `pon_safepoint_poll`, so they are conservatively spill
+/// points even though forward jumps usually only transfer control.  `ForLoop`
+/// only branches on the preceding `ForNext` result (its stop path reads the
+/// runtime StopIteration stash), and `Suspend`/`Return` route through the
+/// generator frame machinery.
 fn term_spill_point(term: &Terminator) -> bool {
-	matches!(term, Terminator::Branch { .. } | Terminator::CondBranch { .. })
+	matches!(
+		term,
+		Terminator::Branch { .. } | Terminator::CondBranch { .. } | Terminator::Jump(_)
+	)
 }
 
 #[cfg(test)]

@@ -34,6 +34,7 @@ pub struct SimpleJsonIndex {
 	base_url:           String,
 	cache_dir:          PathBuf,
 	artifact_cache_dir: PathBuf,
+	allow_unhashed:    bool,
 }
 
 impl SimpleJsonIndex {
@@ -41,14 +42,23 @@ impl SimpleJsonIndex {
 	pub fn new(base_url: impl Into<String>) -> Self {
 		let cache_dir = default_cache_dir();
 		let artifact_cache_dir = artifact_cache_dir_for(&cache_dir);
-		Self { base_url: base_url.into(), cache_dir, artifact_cache_dir }
+		Self { base_url: base_url.into(), cache_dir, artifact_cache_dir, allow_unhashed: false }
 	}
 
 	#[must_use]
 	pub fn with_cache_dir(base_url: impl Into<String>, cache_dir: impl Into<PathBuf>) -> Self {
+		Self::with_cache_dir_and_hash_policy(base_url, cache_dir, false)
+	}
+
+	#[must_use]
+	pub fn with_cache_dir_and_hash_policy(
+		base_url: impl Into<String>,
+		cache_dir: impl Into<PathBuf>,
+		allow_unhashed: bool,
+	) -> Self {
 		let cache_dir = cache_dir.into();
 		let artifact_cache_dir = artifact_cache_dir_for(&cache_dir);
-		Self { base_url: base_url.into(), cache_dir, artifact_cache_dir }
+		Self { base_url: base_url.into(), cache_dir, artifact_cache_dir, allow_unhashed }
 	}
 
 	#[must_use]
@@ -139,6 +149,7 @@ impl SimpleJsonIndex {
 
 		if cache_is_fresh(&cache_path, &metadata_path)? {
 			if let Some(body) = read_cache_text(&cache_path)? {
+				verify_metadata_hash(file, &url, &body)?;
 				return Ok(Some(body));
 			}
 			let _ = fs::remove_file(&cache_path);
@@ -147,12 +158,14 @@ impl SimpleJsonIndex {
 		let etag = cached_etag(&cache_path, &metadata_path)?;
 		match fetch_simple_json(&url, etag.as_deref()) {
 			Ok(FetchOutcome::Found { body, etag, max_age, .. }) => {
+				verify_metadata_hash(file, &url, &body)?;
 				write_cache_entry(&cache_path, &metadata_path, &body, etag.as_deref(), max_age)?;
 				Ok(Some(body))
 			},
 			Ok(FetchOutcome::NotModified) => {
 				refresh_cache_metadata(&metadata_path)?;
 				if let Some(body) = read_cache_text(&cache_path)? {
+					verify_metadata_hash(file, &url, &body)?;
 					Ok(Some(body))
 				} else {
 					let _ = fs::remove_file(&cache_path);
@@ -164,6 +177,7 @@ impl SimpleJsonIndex {
 				let Some(body) = read_cache_text(&cache_path)? else {
 					return Err(error);
 				};
+				verify_metadata_hash(file, &url, &body)?;
 				Ok(Some(body))
 			},
 			Err(error) => Err(error),
@@ -186,7 +200,7 @@ impl PackageIndex for SimpleJsonIndex {
 			&self.artifact_cache_dir,
 			&file.url,
 			&file.filename,
-			&HashPolicy::Index(&file.hashes),
+			&HashPolicy::Index { hashes: &file.hashes, allow_unhashed: self.allow_unhashed },
 		)
 	}
 }
@@ -471,6 +485,40 @@ fn metadata_url(file: &ProjectFile) -> String {
 	format!("{}.metadata", file.url)
 }
 
+fn verify_metadata_hash(file: &ProjectFile, url: &str, body: &str) -> Result<()> {
+	let Some(metadata) = file.dist_info_metadata.as_ref() else {
+		return Ok(());
+	};
+	let Some(expected) = metadata
+		.hashes
+		.iter()
+		.find(|(algorithm, _)| algorithm.eq_ignore_ascii_case("sha256"))
+		.map(|(_, digest)| digest)
+	else {
+		return Ok(());
+	};
+	let actual = sha256_hex(body.as_bytes());
+	if expected.eq_ignore_ascii_case(&actual) {
+		Ok(())
+	} else {
+		Err(Error::Index(format!(
+			"hash mismatch for PEP 658 metadata `{url}`: expected sha256:{expected}, got \
+			 sha256:{actual}"
+		)))
+	}
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+	const HEX: &[u8; 16] = b"0123456789abcdef";
+	let digest = Sha256::digest(bytes);
+	let mut output = String::with_capacity(digest.len() * 2);
+	for byte in digest {
+		output.push(HEX[(byte >> 4) as usize] as char);
+		output.push(HEX[(byte & 0x0f) as usize] as char);
+	}
+	output
+}
+
 fn is_refcount_cpython_abi(tag: &str) -> bool {
 	tag.starts_with("cp") && tag != "abi3" && tag != "none"
 }
@@ -717,5 +765,39 @@ mod tests {
 				"/tmp/pon-cache/076d218a1c917b1bbd6081d99e9ab17dffae1a1a754da32cb695038783ec7186.json"
 			)
 		);
+	}
+
+	#[test]
+	fn verifies_advertised_pep_658_metadata_hashes() {
+		let body = "Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
+		let mut hashes = BTreeMap::new();
+		hashes.insert("sha256".to_owned(), sha256_hex(body.as_bytes()));
+		let mut file = project_file_from_parts(
+			"demo-1.0-py3-none-any.whl".to_owned(),
+			"https://files.example/demo-1.0-py3-none-any.whl".to_owned(),
+			BTreeMap::new(),
+			None,
+			None,
+			Some(DistInfoMetadata { hashes }),
+		)
+		.expect("file");
+
+		verify_metadata_hash(&file, "https://files.example/demo-1.0-py3-none-any.whl.metadata", body)
+			.expect("matching metadata hash");
+		file
+			.dist_info_metadata
+			.as_mut()
+			.expect("metadata")
+			.hashes
+			.insert("sha256".to_owned(), "0".repeat(64));
+
+		let error = verify_metadata_hash(
+			&file,
+			"https://files.example/demo-1.0-py3-none-any.whl.metadata",
+			body,
+		)
+		.expect_err("mismatched metadata hash");
+
+		assert!(error.to_string().contains("hash mismatch for PEP 658 metadata"));
 	}
 }

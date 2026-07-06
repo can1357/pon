@@ -22,6 +22,10 @@ use crate::{
 		source::{PackageKind, PackageRecord},
 	},
 	vcs,
+	wheel::{
+		compat::{any_supported, default_supported_tags},
+		filename::WheelFilename,
+	},
 };
 
 pub const LOCK_VERSION: &str = "1.0";
@@ -326,7 +330,7 @@ impl LockedPackage {
 		project_root: &Path,
 		cache_dir: &Path,
 	) -> Result<ResolvedRecord> {
-		if let Some(wheel) = self.wheels.first() {
+		if let Some(wheel) = self.compatible_wheel() {
 			return wheel.to_resolved_record(self, cache_dir);
 		}
 		if let Some(sdist) = &self.sdist {
@@ -345,6 +349,14 @@ impl LockedPackage {
 		}
 
 		Err(Error::Cli(format!("pon.lock package `{}` has no installable artifact", self.name)))
+	}
+
+	fn compatible_wheel(&self) -> Option<&LockedWheel> {
+		self.wheels.iter().find(|wheel| {
+			WheelFilename::parse(&wheel.name)
+				.map(|filename| any_supported(&filename.tags(), &default_supported_tags()))
+				.unwrap_or(false)
+		})
 	}
 
 	fn to_table(&self) -> Table {
@@ -622,12 +634,24 @@ pub fn compute_project_input_hash_with_overrides(
 	let effective_index_url = index_url.or_else(|| pyproject.tool_pon_index_url());
 	let effective_allow_prerelease =
 		allow_prerelease.unwrap_or_else(|| pyproject.tool_pon_allow_prerelease());
+	let mut entries = vec![
+		format!("tool.pon.index-url={}", effective_index_url.unwrap_or_default()),
+		format!("tool.pon.allow-prerelease={effective_allow_prerelease}"),
+	];
+	for (name, source) in pyproject.sources() {
+		entries.push(format!(
+			"tool.pon.sources.{name}=path:{} editable:{} git:{} rev:{}",
+			source
+				.path
+				.as_ref()
+				.map_or_else(String::new, |path| path.display().to_string()),
+			source.editable,
+			source.git.as_deref().unwrap_or_default(),
+			source.rev.as_deref().unwrap_or_default()
+		));
+	}
 
-	compute_input_hash(
-		dependencies.iter().map(String::as_str),
-		effective_index_url,
-		effective_allow_prerelease,
-	)
+	compute_input_hash_with_entries(dependencies.iter().map(String::as_str), entries)
 }
 
 #[must_use]
@@ -640,19 +664,36 @@ where
 	I: IntoIterator<Item = S>,
 	S: AsRef<str>,
 {
-	let mut dependency_lines = dependencies
+	compute_input_hash_with_entries(
+		dependencies,
+		[
+			format!("tool.pon.index-url={}", index_url.unwrap_or_default()),
+			format!("tool.pon.allow-prerelease={allow_prerelease}"),
+		],
+	)
+}
+
+#[must_use]
+pub fn compute_input_hash_with_entries<I, S, E, T>(dependencies: I, extra_entries: E) -> String
+where
+	I: IntoIterator<Item = S>,
+	S: AsRef<str>,
+	E: IntoIterator<Item = T>,
+	T: AsRef<str>,
+{
+	let mut input = dependencies
 		.into_iter()
 		.map(|dependency| dependency.as_ref().trim().to_owned())
 		.filter(|dependency| !dependency.is_empty())
-		.collect::<Vec<_>>();
-	dependency_lines.sort_unstable();
-
-	let mut input = dependency_lines
-		.into_iter()
 		.map(|dependency| format!("project.dependencies={dependency}"))
 		.collect::<Vec<_>>();
-	input.push(format!("tool.pon.index-url={}", index_url.unwrap_or_default()));
-	input.push(format!("tool.pon.allow-prerelease={allow_prerelease}"));
+	input.extend(
+		extra_entries
+			.into_iter()
+			.map(|entry| entry.as_ref().trim().to_owned())
+			.filter(|entry| !entry.is_empty()),
+	);
+	input.sort_unstable();
 
 	format!("sha256:{}", sha256_hex(input.join("\n").as_bytes()))
 }
@@ -675,10 +716,12 @@ fn fetch_locked_artifact(
 ) -> Result<PathBuf> {
 	let required_hashes = required_hash_entries(hashes);
 	if required_hashes.is_empty() {
-		download_artifact(cache_dir, url, filename, &HashPolicy::Index(hashes))
-	} else {
-		download_artifact(cache_dir, url, filename, &HashPolicy::Required(&required_hashes))
+		return Err(Error::Index(format!(
+			"locked artifact `{filename}` has no sha256 hash; regenerate pon.lock or pass \
+			 --allow-unhashed before locking"
+		)));
 	}
+	download_artifact(cache_dir, url, filename, &HashPolicy::Required(&required_hashes))
 }
 
 fn required_hash_entries(hashes: &BTreeMap<String, String>) -> Vec<String> {
@@ -1042,6 +1085,59 @@ mod tests {
 		assert_eq!(read_back, lock);
 	}
 
+
+	#[test]
+	fn serializes_and_reads_all_wheel_artifacts() {
+		let mut first_hashes = BTreeMap::new();
+		first_hashes.insert("sha256".to_owned(), "aaa".to_owned());
+		let mut second_hashes = BTreeMap::new();
+		second_hashes.insert("sha256".to_owned(), "bbb".to_owned());
+		let mut package = LockedPackage::pure("demo", "1.0");
+		package.wheels.push(LockedWheel {
+			name:   "demo-1.0-py3-none-any.whl".to_owned(),
+			url:    "https://files.example/demo-1.0-py3-none-any.whl".to_owned(),
+			hashes: first_hashes,
+		});
+		package.wheels.push(LockedWheel {
+			name:   "demo-1.0-py3-none-macosx_11_0_arm64.whl".to_owned(),
+			url:    "https://files.example/demo-1.0-py3-none-macosx_11_0_arm64.whl".to_owned(),
+			hashes: second_hashes,
+		});
+		let lock = LockFile::with_input_hash(vec![package], ">=3.14", "sha256:fixture");
+
+		let read_back = lock.to_string().parse::<LockFile>().expect("parse lock");
+
+		assert_eq!(read_back.packages[0].wheels.len(), 2);
+		assert_eq!(read_back, lock);
+	}
+
+	#[test]
+	fn project_input_hash_changes_when_tool_sources_change() {
+		let without_source = PyProject::from_str(
+			"pyproject.toml",
+			r#"
+[project]
+dependencies = ["demo"]
+"#,
+		)
+		.expect("parse pyproject");
+		let with_source = PyProject::from_str(
+			"pyproject.toml",
+			r#"
+[project]
+dependencies = ["demo"]
+
+[tool.pon.sources]
+demo = { path = "vendor/demo", editable = true }
+"#,
+		)
+		.expect("parse pyproject");
+
+		assert_ne!(
+			compute_project_input_hash(&without_source),
+			compute_project_input_hash(&with_source)
+		);
+	}
 	#[test]
 	fn project_input_hash_uses_pyproject_settings_and_overrides() {
 		let pyproject = PyProject::from_str(

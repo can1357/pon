@@ -16,12 +16,11 @@
 //!
 //! Surface: construction from bytes/str/iterables, `append`/`extend`/
 //! `insert`/`tolist`/`tobytes`/`frombytes`/`fromlist`/`count`/`index`/
-//! `remove`/`pop`/`clear`/`reverse`, `typecode`/`itemsize` attributes,
-//! `len`/`getitem`/`setitem`/`delitem`, iteration (dedicated iterator type),
-//! `in`, `==`/`!=` (value-based, cross-typecode like CPython), `repr`, and
-//! truthiness.  Not implemented: the buffer protocol (`memoryview(arr)`,
-//! `readinto`), slicing, ordering comparisons, `byteswap`,
-//! `array_reconstructor`.
+//! `remove`/`pop`/`clear`/`reverse`/`byteswap`, `typecode`/`itemsize`
+//! attributes, `len`/index and slice get/set/del, iteration (dedicated
+//! iterator type), `in`, value-based rich comparisons, `repr`, truthiness,
+//! `_array_reconstructor`, and writable native-endian buffer exports for
+//! `memoryview(array)`.
 
 use core::ffi::c_int;
 use std::{
@@ -35,11 +34,11 @@ use num_traits::{Signed, ToPrimitive};
 use super::{builtins_mod::VARIADIC_ARITY, install_module};
 use crate::{
 	abi,
-	abstract_op::{RICH_EQ, RICH_NE},
+	abstract_op::{RICH_EQ, RICH_GE, RICH_GT, RICH_LE, RICH_LT, RICH_NE},
 	intern::intern,
-	object::{PyObject, PyObjectHeader, PySequenceMethods, PyType},
+	object::{PyMappingMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType},
 	thread_state::pon_err_clear,
-	types::{exc::ExceptionKind, type_::unicode_text},
+	types::{exc::ExceptionKind, slice_::PySlice, type_::unicode_text},
 };
 
 type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
@@ -78,6 +77,12 @@ static ARRAY_SEQUENCE: PySequenceMethods = PySequenceMethods {
 	..PySequenceMethods::EMPTY
 };
 
+static ARRAY_MAPPING: PyMappingMethods = PyMappingMethods {
+	mp_length:        Some(array_len_slot),
+	mp_subscript:     Some(array_subscript_slot),
+	mp_ass_subscript: Some(array_ass_subscript_slot),
+};
+
 static ARRAY_TYPE: LazyLock<usize> = LazyLock::new(|| {
 	let mut ty = PyType::new(
 		abi::runtime_type_type().cast_const(),
@@ -94,6 +99,7 @@ static ARRAY_TYPE: LazyLock<usize> = LazyLock::new(|| {
 	ty.tp_iter = Some(array_iter);
 	ty.tp_richcmp = Some(array_richcmp_slot);
 	ty.tp_as_sequence = ptr::addr_of!(ARRAY_SEQUENCE).cast_mut();
+	ty.tp_as_mapping = ptr::addr_of!(ARRAY_MAPPING).cast_mut();
 	Box::into_raw(Box::new(ty)) as usize
 });
 
@@ -145,6 +151,29 @@ unsafe fn as_array<'a>(object: *mut PyObject) -> Option<&'a mut PyArrayObject> {
 	}
 	// SAFETY: The type check above proved the layout.
 	Some(unsafe { &mut *object.cast::<PyArrayObject>() })
+}
+
+/// Contiguous writable buffer exported by an array for memoryview/C-API seams.
+pub(crate) struct ArrayBufferView {
+	/// Pointer to the first payload byte.
+	pub data:     *mut u8,
+	/// Payload length in bytes.
+	pub len:      usize,
+	/// PEP-3118/native-memory format code exposed by `memoryview(array)`.
+	pub format:   u8,
+	/// Width in bytes of one array element.
+	pub itemsize: usize,
+}
+
+/// Borrows an exact array as a raw contiguous native-endian buffer.
+pub(crate) unsafe fn buffer_view(object: *mut PyObject) -> Option<ArrayBufferView> {
+	let array = unsafe { as_array(object) }?;
+	Some(ArrayBufferView {
+		data: array.data.as_mut_ptr(),
+		len: array.data.len(),
+		format: buffer_format(array.typecode),
+		itemsize: item_size(array.typecode),
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -238,6 +267,16 @@ fn item_size(typecode: u8) -> usize {
 		b'h' | b'H' => 2,
 		b'i' | b'I' | b'f' | b'u' | b'w' => 4,
 		_ => 8,
+	}
+}
+
+fn buffer_format(typecode: u8) -> u8 {
+	match typecode {
+		// CPython exposes both unicode array typecodes through the PEP-3118 `w`
+		// format.  `memoryview.tolist()` refuses that format rather than
+		// pretending it is an integer array.
+		b'u' | b'w' => b'w',
+		other => other,
 	}
 }
 
@@ -648,6 +687,7 @@ unsafe extern "C" fn array_getattro(object: *mut PyObject, name: *mut PyObject) 
 		"pop" => bound_method(object, name_text, array_pop_method),
 		"clear" => bound_method(object, name_text, array_clear_method),
 		"reverse" => bound_method(object, name_text, array_reverse_method),
+		"byteswap" => bound_method(object, name_text, array_byteswap_method),
 		// SAFETY: Raise helper with the interned attribute name.
 		_ => unsafe { abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
 	}
@@ -756,6 +796,176 @@ unsafe extern "C" fn array_ass_item_slot(
 	}
 }
 
+fn array_slice_data(array: &PyArrayObject, indices: crate::types::slice_::SliceIndices) -> Vec<u8> {
+	let size = item_size(array.typecode);
+	if indices.len == 0 {
+		return Vec::new();
+	}
+	if indices.step == 1 {
+		let start = indices.start as usize * size;
+		let stop = indices.stop as usize * size;
+		return array.data[start..stop].to_vec();
+	}
+	let mut out = Vec::with_capacity(indices.len * size);
+	let mut index = indices.start;
+	for _ in 0..indices.len {
+		let offset = index as usize * size;
+		out.extend_from_slice(&array.data[offset..offset + size]);
+		index = index.saturating_add(indices.step);
+	}
+	out
+}
+
+fn raise_slice_error(message: String) -> *mut PyObject {
+	if message == "slice step cannot be zero" {
+		raise_value_error(&message)
+	} else {
+		raise_type_error(&message)
+	}
+}
+
+unsafe extern "C" fn array_subscript_slot(
+	object: *mut PyObject,
+	key: *mut PyObject,
+) -> *mut PyObject {
+	let Some(array) = (unsafe { as_array(object) }) else {
+		return fail("array receiver is invalid");
+	};
+	if crate::abi::seq::is_slice(key) {
+		let indices = match crate::abi::seq::normalize_slice(
+			unsafe { &*key.cast::<PySlice>() },
+			element_count(array),
+		) {
+			Ok(indices) => indices,
+			Err(message) => return raise_slice_error(message),
+		};
+		return alloc_array(array.typecode, array_slice_data(array, indices));
+	}
+	let Some(raw) = (unsafe { crate::types::int::to_i64_including_bool(untag(key)) }) else {
+		return raise_type_error("array indices must be integers or slices");
+	};
+	let Ok(index) = isize::try_from(raw) else {
+		return raise_type_error("array index is out of range for this platform");
+	};
+	unsafe { array_item_slot(object, index) }
+}
+
+fn array_delete_slice(
+	array: &mut PyArrayObject,
+	indices: crate::types::slice_::SliceIndices,
+) {
+	let size = item_size(array.typecode);
+	if indices.step == 1 {
+		let start = indices.start as usize * size;
+		let stop = indices.stop as usize * size;
+		array.data.drain(start..stop);
+		return;
+	}
+	let mut positions = Vec::with_capacity(indices.len);
+	let mut index = indices.start;
+	for _ in 0..indices.len {
+		positions.push(index as usize);
+		index = index.saturating_add(indices.step);
+	}
+	positions.sort_unstable_by(|left, right| right.cmp(left));
+	for index in positions {
+		let offset = index * size;
+		array.data.drain(offset..offset + size);
+	}
+}
+
+fn array_assign_slice(
+	array: &mut PyArrayObject,
+	indices: crate::types::slice_::SliceIndices,
+	replacement: Vec<u8>,
+) -> Result<(), String> {
+	let size = item_size(array.typecode);
+	let replacement_len = replacement.len() / size;
+	if indices.step == 1 {
+		let start = indices.start as usize * size;
+		let stop = indices.stop as usize * size;
+		array.data.splice(start..stop, replacement);
+		return Ok(());
+	}
+	if replacement_len != indices.len {
+		return Err(format!(
+			"attempt to assign array of size {} to extended slice of size {}",
+			replacement_len, indices.len
+		));
+	}
+	let mut index = indices.start;
+	for chunk in replacement.chunks_exact(size) {
+		let offset = index as usize * size;
+		array.data[offset..offset + size].copy_from_slice(chunk);
+		index = index.saturating_add(indices.step);
+	}
+	Ok(())
+}
+
+unsafe extern "C" fn array_ass_subscript_slot(
+	object: *mut PyObject,
+	key: *mut PyObject,
+	value: *mut PyObject,
+) -> c_int {
+	if crate::abi::seq::is_slice(key) {
+		let (replacement_typecode, replacement) = if value.is_null() {
+			(0, Vec::new())
+		} else {
+			let Some(other) = (unsafe { as_array(value) }) else {
+				let _ = raise_type_error(&format!(
+					"can only assign array (not \"{}\") to array slice",
+					value_type_name(untag(value))
+				));
+				return -1;
+			};
+			(other.typecode, other.data.clone())
+		};
+		let Some(array) = (unsafe { as_array(object) }) else {
+			let _ = fail("array receiver is invalid");
+			return -1;
+		};
+		if !value.is_null() && replacement_typecode != array.typecode {
+			let _ = raise_type_error("bad argument type for built-in operation");
+			return -1;
+		}
+		let indices = match crate::abi::seq::normalize_slice(
+			unsafe { &*key.cast::<PySlice>() },
+			element_count(array),
+		) {
+			Ok(indices) => indices,
+			Err(message) => {
+				let _ = raise_slice_error(message);
+				return -1;
+			},
+		};
+		if value.is_null() {
+			array_delete_slice(array, indices);
+			return 0;
+		}
+		match array_assign_slice(array, indices, replacement) {
+			Ok(()) => 0,
+			Err(message) if message == "slice step cannot be zero" => {
+				let _ = raise_value_error(&message);
+				-1
+			},
+			Err(message) => {
+				let _ = raise_value_error(&message);
+				-1
+			},
+		}
+	} else {
+		let Some(raw) = (unsafe { crate::types::int::to_i64_including_bool(untag(key)) }) else {
+			let _ = raise_type_error("array indices must be integers");
+			return -1;
+		};
+		let Ok(index) = isize::try_from(raw) else {
+			let _ = raise_type_error("array index is out of range for this platform");
+			return -1;
+		};
+		unsafe { array_ass_item_slot(object, index, value) }
+	}
+}
+
 unsafe extern "C" fn identity_iter(object: *mut PyObject) -> *mut PyObject {
 	object
 }
@@ -811,57 +1021,93 @@ fn value_equal(lhs: *mut PyObject, rhs: *mut PyObject) -> Result<bool, ()> {
 	}
 }
 
-/// `tp_richcmp` for array: element-wise value `==`/`!=` against another array
-/// (cross-typecode, like CPython's boxed-item comparison); everything else is
-/// NotImplemented so the dispatcher applies identity/reflected fallbacks.
+/// `tp_richcmp` for array: lexicographic value comparison against another
+/// array (cross-typecode, like CPython's boxed-item comparison); everything
+/// else is NotImplemented so the dispatcher applies identity/reflected
+/// fallbacks.
+fn value_compare_truth(lhs: *mut PyObject, rhs: *mut PyObject, op: u8) -> Result<bool, ()> {
+	if op == RICH_EQ {
+		return value_equal(lhs, rhs);
+	}
+	// SAFETY: Comparison helper follows the NULL-sentinel error contract.
+	let result = unsafe { crate::abstract_op::rich_compare(op, lhs, rhs) };
+	if result.is_null() {
+		return Err(());
+	}
+	// SAFETY: Truthiness helper follows the error-sentinel contract.
+	match unsafe { abi::pon_is_true(result) } {
+		0 => Ok(false),
+		1 => Ok(true),
+		_ => Err(()),
+	}
+}
+
+fn length_compare(op: u8, lhs: usize, rhs: usize) -> bool {
+	match op {
+		RICH_LT => lhs < rhs,
+		RICH_LE => lhs <= rhs,
+		RICH_EQ => lhs == rhs,
+		RICH_NE => lhs != rhs,
+		RICH_GT => lhs > rhs,
+		RICH_GE => lhs >= rhs,
+		_ => false,
+	}
+}
+
+fn lexicographic_array_compare(lhs: &PyArrayObject, rhs: &PyArrayObject, op: u8) -> Result<bool, ()> {
+	if core::ptr::eq(lhs, rhs) {
+		return Ok(length_compare(op, 0, 0));
+	}
+	let lhs_len = element_count(lhs);
+	let rhs_len = element_count(rhs);
+	if lhs.typecode == rhs.typecode && lhs.data == rhs.data {
+		return Ok(length_compare(op, lhs_len, rhs_len));
+	}
+	let shared = lhs_len.min(rhs_len);
+	for index in 0..shared {
+		let a = item_to_object(lhs, index);
+		let b = item_to_object(rhs, index);
+		if a.is_null() || b.is_null() {
+			return Err(());
+		}
+		if !value_equal(a, b)? {
+			return match op {
+				RICH_EQ => Ok(false),
+				RICH_NE => Ok(true),
+				RICH_LT | RICH_LE => value_compare_truth(a, b, RICH_LT),
+				RICH_GT | RICH_GE => value_compare_truth(a, b, RICH_GT),
+				_ => Ok(false),
+			};
+		}
+	}
+	Ok(length_compare(op, lhs_len, rhs_len))
+}
+
 unsafe extern "C" fn array_richcmp_slot(
 	left: *mut PyObject,
 	right: *mut PyObject,
 	op: c_int,
 ) -> *mut PyObject {
-	let want_equal = match u8::try_from(op) {
-		Ok(RICH_EQ) => true,
-		Ok(RICH_NE) => false,
+	let Ok(op) = u8::try_from(op) else {
 		// SAFETY: Singleton accessor.
-		_ => return unsafe { abi::pon_not_implemented() },
+		return unsafe { abi::pon_not_implemented() };
 	};
+	if !matches!(op, RICH_LT | RICH_LE | RICH_EQ | RICH_NE | RICH_GT | RICH_GE) {
+		// SAFETY: Singleton accessor.
+		return unsafe { abi::pon_not_implemented() };
+	}
 	let (Some(_), Some(_)) = (unsafe { as_array(left) }, unsafe { as_array(right) }) else {
 		// SAFETY: Singleton accessor.
 		return unsafe { abi::pon_not_implemented() };
 	};
 	let lhs = untag(left).cast::<PyArrayObject>();
 	let rhs = untag(right).cast::<PyArrayObject>();
-	let equal = if lhs == rhs {
-		true
-	} else {
-		// SAFETY: Both layouts were proved by `as_array` above.
-		let (lhs, rhs) = unsafe { (&*lhs, &*rhs) };
-		if lhs.typecode == rhs.typecode && lhs.data == rhs.data {
-			true
-		} else if element_count(lhs) != element_count(rhs) {
-			false
-		} else {
-			let mut all = true;
-			for index in 0..element_count(lhs) {
-				let a = item_to_object(lhs, index);
-				let b = item_to_object(rhs, index);
-				if a.is_null() || b.is_null() {
-					return ptr::null_mut();
-				}
-				match value_equal(a, b) {
-					Ok(true) => {},
-					Ok(false) => {
-						all = false;
-						break;
-					},
-					Err(()) => return ptr::null_mut(),
-				}
-			}
-			all
-		}
-	};
-	// SAFETY: Boolean constant allocator.
-	unsafe { abi::pon_const_bool(c_int::from(equal == want_equal)) }
+	// SAFETY: Both layouts were proved by `as_array` above.
+	let ordered = unsafe { lexicographic_array_compare(&*lhs, &*rhs, op) };
+	match ordered {
+		Ok(value) => unsafe { abi::pon_const_bool(c_int::from(value)) },
+		Err(()) => ptr::null_mut(),
+	}
 }
 
 /// `sq_contains`: linear value-equality scan (1 found, 0 absent, -1 error).
@@ -1256,8 +1502,94 @@ unsafe extern "C" fn array_reverse_method(argv: *mut *mut PyObject, argc: usize)
 	none()
 }
 
+unsafe extern "C" fn array_byteswap_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let (array, rest) = match unsafe { array_receiver_and_args(argv, argc, "byteswap") } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	if let Err(raised) = expect_args(rest, 0, "byteswap") {
+		return raised;
+	}
+	let size = item_size(array.typecode);
+	for chunk in array.data.chunks_exact_mut(size) {
+		chunk.reverse();
+	}
+	none()
+}
+
 fn int_of(object: *mut PyObject) -> Option<i64> {
 	unsafe { crate::types::int::to_i64(object) }
+}
+
+fn reconstructor_typecode(typecode: u8, mformat_code: i64) -> Result<u8, String> {
+	match mformat_code {
+		0 => Ok(b'B'),
+		1 => Ok(b'b'),
+		2 | 3 => Ok(b'H'),
+		4 | 5 => Ok(b'h'),
+		6 | 7 => Ok(b'I'),
+		8 | 9 => Ok(b'i'),
+		10 | 11 if typecode == b'L' => Ok(b'L'),
+		10 | 11 => Ok(b'Q'),
+		12 | 13 if typecode == b'l' => Ok(b'l'),
+		12 | 13 => Ok(b'q'),
+		14..=17 => Ok(typecode),
+		18..=21 if matches!(typecode, b'u' | b'w') => Ok(typecode),
+		_ => Err("third argument must be a valid machine format code.".to_owned()),
+	}
+}
+
+unsafe extern "C" fn array_reconstructor_method(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return fail("_array_reconstructor received a null argv pointer");
+	};
+	if args.len() != 4 {
+		return raise_type_error("_array_reconstructor() takes exactly 4 arguments");
+	}
+	if untag(args[0]) != array_type().cast::<PyObject>() {
+		return raise_type_error("first argument must be array.array");
+	}
+	let Some(typecode_text) = (unsafe { unicode_text(untag(args[1])) }) else {
+		return raise_type_error("second argument must be a valid type code");
+	};
+	let mut chars = typecode_text.chars();
+	let (Some(typecode_char), None) = (chars.next(), chars.next()) else {
+		return raise_value_error("second argument must be a valid type code");
+	};
+	if !typecode_char.is_ascii() || !is_typecode(typecode_char as u8) {
+		return raise_value_error("second argument must be a valid type code");
+	}
+	let Some(mformat_code) = int_of(untag(args[2])) else {
+		return raise_type_error("third argument must be an int");
+	};
+	let typecode = match reconstructor_typecode(typecode_char as u8, mformat_code) {
+		Ok(typecode) => typecode,
+		Err(message) => return raise_value_error(&message),
+	};
+	let Some(payload) = bytes_like(untag(args[3])) else {
+		return raise_type_error(&format!(
+			"fourth argument should be bytes, not {}",
+			value_type_name(untag(args[3]))
+		));
+	};
+	if payload.len() % item_size(typecode) != 0 {
+		return raise_value_error("bytes length not a multiple of item size");
+	}
+	alloc_array(typecode, payload.to_vec())
+}
+
+fn function_attr(name: &str, entry: BuiltinFn) -> Result<(u32, *mut PyObject), String> {
+	// SAFETY: Live builtin entry point with the runtime calling convention.
+	let function =
+		unsafe { abi::pon_make_function(entry as *const u8, VARIADIC_ARITY, intern(name)) };
+	if function.is_null() {
+		Err(format!("failed to allocate array.{name}"))
+	} else {
+		Ok((intern(name), function))
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1278,5 +1610,122 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 		(intern("array"), array_type().cast::<PyObject>()),
 		(intern("ArrayType"), array_type().cast::<PyObject>()),
 		(intern("typecodes"), typecodes),
+		function_attr("_array_reconstructor", array_reconstructor_method)?,
 	])
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{
+		thread_state::{pon_err_message, test_state_lock},
+		types::memoryview::MemoryViewListValue,
+	};
+
+	fn init_runtime() {
+		assert_eq!(unsafe { abi::pon_runtime_init() }, 0);
+		pon_err_clear();
+	}
+
+	fn int_object(value: i64) -> *mut PyObject {
+		unsafe { abi::pon_const_int(value) }
+	}
+
+	fn i32_array(values: &[i32]) -> *mut PyObject {
+		let mut data = Vec::with_capacity(values.len() * 4);
+		for value in values {
+			data.extend_from_slice(&value.to_ne_bytes());
+		}
+		alloc_array(b'i', data)
+	}
+
+	fn i16_array(values: &[i16]) -> *mut PyObject {
+		let mut data = Vec::with_capacity(values.len() * 2);
+		for value in values {
+			data.extend_from_slice(&value.to_ne_bytes());
+		}
+		alloc_array(b'h', data)
+	}
+
+	fn i32_values(object: *mut PyObject) -> Vec<i32> {
+		let array = unsafe { as_array(object) }.expect("expected test array");
+		array
+			.data
+			.chunks_exact(4)
+			.map(|chunk| i32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+			.collect()
+	}
+
+	fn slice_object(start: Option<i64>, stop: Option<i64>, step: Option<i64>) -> *mut PyObject {
+		let none = unsafe { abi::pon_none() };
+		let slice = crate::types::slice_::PySlice {
+			ob_base: PyObjectHeader::new(crate::abi::seq::slice_type().cast_const()),
+			start:   start.map_or(none, int_object),
+			stop:    stop.map_or(none, int_object),
+			step:    step.map_or(none, int_object),
+		};
+		Box::into_raw(Box::new(slice)).cast::<PyObject>()
+	}
+
+	#[test]
+	fn array_slice_get_set_delete_probe() {
+		let _guard = test_state_lock();
+		init_runtime();
+		let array = i32_array(&[1, 2, 3, 4, 5]);
+		let key = slice_object(Some(1), Some(4), None);
+		let sliced = unsafe { array_subscript_slot(array, key) };
+		assert!(!sliced.is_null(), "slice get failed: {:?}", pon_err_message());
+		assert_eq!(i32_values(sliced), vec![2, 3, 4]);
+
+		let replacement = i32_array(&[9, 8]);
+		let status = unsafe { array_ass_subscript_slot(array, key, replacement) };
+		assert_eq!(status, 0, "slice set failed: {:?}", pon_err_message());
+		assert_eq!(i32_values(array), vec![1, 9, 8, 5]);
+
+		let delete_key = slice_object(None, None, Some(2));
+		let status = unsafe { array_ass_subscript_slot(array, delete_key, ptr::null_mut()) };
+		assert_eq!(status, 0, "slice delete failed: {:?}", pon_err_message());
+		assert_eq!(i32_values(array), vec![9, 5]);
+	}
+
+	#[test]
+	fn array_byteswap_ordering_reconstructor_and_memoryview_probe() {
+		let _guard = test_state_lock();
+		init_runtime();
+
+		let swap = i16_array(&[0x0102]);
+		let mut argv = [swap];
+		let result = unsafe { array_byteswap_method(argv.as_mut_ptr(), argv.len()) };
+		assert!(!result.is_null(), "byteswap failed: {:?}", pon_err_message());
+		let mut expected = 0x0102_i16.to_ne_bytes();
+		expected.reverse();
+		assert_eq!(unsafe { as_array(swap) }.unwrap().data, expected);
+
+		let left = i32_array(&[1, 2]);
+		let right = i32_array(&[1, 3]);
+		let ordered = unsafe { array_richcmp_slot(left, right, RICH_LT as c_int) };
+		assert!(!ordered.is_null(), "ordering failed: {:?}", pon_err_message());
+		assert_eq!(unsafe { abi::pon_is_true(ordered) }, 1);
+
+		let mut payload = Vec::new();
+		payload.extend_from_slice(&1_i32.to_ne_bytes());
+		payload.extend_from_slice(&2_i32.to_ne_bytes());
+		let typecode = alloc_str_object("i");
+		let bytes = crate::types::bytes_::boxed_bytes(&payload).cast::<PyObject>();
+		let mut args = [array_type().cast::<PyObject>(), typecode, int_object(8), bytes];
+		let rebuilt = unsafe { array_reconstructor_method(args.as_mut_ptr(), args.len()) };
+		assert!(!rebuilt.is_null(), "reconstructor failed: {:?}", pon_err_message());
+		assert_eq!(i32_values(rebuilt), vec![1, 2]);
+
+		let view_source = i16_array(&[1, -2]);
+		let view = unsafe { crate::types::memoryview::boxed_memoryview_from_object(view_source) }
+			.expect("memoryview(array) should succeed");
+		assert_eq!(unsafe { (*view).format }, b'h');
+		let values = unsafe { crate::types::memoryview::tolist(&*view) }
+			.expect("memoryview(array).tolist() should decode h format");
+		assert_eq!(
+			values,
+			vec![MemoryViewListValue::Int(1), MemoryViewListValue::Int(-2)]
+		);
+	}
 }

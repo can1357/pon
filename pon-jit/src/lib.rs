@@ -119,7 +119,7 @@ impl JitEngine {
 			pon_runtime::abi::CURRENT_LINE_SYMBOL,
 			pon_runtime::abi::current_line_cell_address(),
 		);
-		register_free_threading_symbols(&mut builder);
+		register_threading_symbols(&mut builder);
 		let module = JITModule::new(builder);
 		let ctx = module.make_context();
 		let fctx = FunctionBuilderContext::new();
@@ -321,29 +321,20 @@ fn runtime_message() -> String {
 	pon_err_message().unwrap_or_else(|| "runtime returned NULL without a diagnostic".to_owned())
 }
 
-#[cfg(feature = "free-threading")]
-fn register_free_threading_symbols(builder: &mut JITBuilder) {
+fn register_threading_symbols(builder: &mut JITBuilder) {
 	builder.symbol(pon_codegen::FT_SAFEPOINT_POLL, jit_safepoint_poll as *const u8);
 	builder.symbol(pon_codegen::FT_GC_WRITE_BARRIER, jit_gc_write_barrier as *const u8);
 	builder.symbol(pon_codegen::FT_GC_STOP_REQUESTED, jit_gc_stop_requested as *const u8);
 }
 
-#[cfg(not(feature = "free-threading"))]
-fn register_free_threading_symbols(_builder: &mut JITBuilder) {}
-
-#[cfg(feature = "free-threading")]
-unsafe extern "C" fn jit_safepoint_poll() {
-	if pon_gc::gc_stop_requested() {
-		std::hint::spin_loop();
-	}
+unsafe extern "C" fn jit_safepoint_poll() -> i32 {
+	pon_runtime::sync::safepoint_poll()
 }
 
-#[cfg(feature = "free-threading")]
 unsafe extern "C" fn jit_gc_write_barrier(slot: *mut *mut PyObject, new: *mut PyObject) {
 	pon_gc::WriteBarrier::record(slot.cast::<*mut u8>(), new.cast::<u8>());
 }
 
-#[cfg(feature = "free-threading")]
 unsafe extern "C" fn jit_gc_stop_requested() -> bool {
 	pon_gc::gc_stop_requested()
 }

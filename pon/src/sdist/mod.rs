@@ -110,6 +110,7 @@ mod tests {
 
 	#[test]
 	fn builds_flit_fixture_sdist_and_installs_wheel_contents() {
+		let _guard = EnvGuard::set("PON_TEST_ALLOW_FIXTURE_BRIDGE", "1");
 		let layout = EnvLayout::new(temp_project("flit-fixture-sdist"));
 		let path = fixture_sdist_path("pon-flit-fixture-0.1.0.tar.gz");
 		let filename = path.display().to_string();
@@ -177,6 +178,33 @@ mod tests {
 			.join("fixtures")
 			.join("sdists")
 			.join(filename)
+	}
+
+	struct EnvGuard {
+		key: &'static str,
+		previous: Option<std::ffi::OsString>,
+	}
+
+	impl EnvGuard {
+		fn set(key: &'static str, value: &str) -> Self {
+			let previous = std::env::var_os(key);
+			unsafe {
+				std::env::set_var(key, value);
+			}
+			Self { key, previous }
+		}
+	}
+
+	impl Drop for EnvGuard {
+		fn drop(&mut self) {
+			unsafe {
+				if let Some(previous) = &self.previous {
+					std::env::set_var(self.key, previous);
+				} else {
+					std::env::remove_var(self.key);
+				}
+			}
+		}
 	}
 
 	fn temp_project(label: &str) -> std::path::PathBuf {

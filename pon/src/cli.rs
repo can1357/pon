@@ -4,10 +4,11 @@ use std::{
 	ffi::OsString,
 	fs,
 	io::{self, IsTerminal, Read},
-	path::{Path, PathBuf},
+	path::{Component, Path, PathBuf},
 	str::FromStr,
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use anyhow::{Context, anyhow};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use pep440_rs::{Operator, Version, VersionSpecifiers};
@@ -23,8 +24,8 @@ use crate::{
 		remove_installed_package,
 	},
 	lock::{
-		DEFAULT_REQUIRES_PYTHON, LockFile, compute_input_hash, missing_frozen_lock_error,
-		stale_lock_error,
+		DEFAULT_REQUIRES_PYTHON, LockFile, compute_input_hash_with_entries,
+		missing_frozen_lock_error, stale_lock_error,
 	},
 	marker::pon_marker_env,
 	metadata::{CoreMetadata, parse_core_metadata},
@@ -38,6 +39,7 @@ use crate::{
 		resolve_root,
 		source::{IndexSource, PackageKind, PackageRecord},
 	},
+	wheel::record::parse_record,
 };
 
 #[derive(Debug, Parser)]
@@ -98,6 +100,8 @@ struct IndexArgs {
 	index_url:       Option<String>,
 	#[arg(long, value_name = "url")]
 	extra_index_url: Vec<String>,
+	#[arg(short = 'f', long = "find-links", value_name = "path")]
+	find_links:      Vec<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -108,6 +112,8 @@ struct AddArgs {
 	editable:     bool,
 	#[arg(long)]
 	pre:          bool,
+	#[arg(long)]
+	allow_unhashed: bool,
 	#[command(flatten)]
 	manifest:     ManifestArgs,
 	#[command(flatten)]
@@ -144,6 +150,8 @@ struct InstallArgs {
 	frozen:            bool,
 	#[arg(long)]
 	no_index:          bool,
+	#[arg(long)]
+	allow_unhashed:    bool,
 	#[command(flatten)]
 	manifest:          ManifestArgs,
 	#[command(flatten)]
@@ -156,6 +164,8 @@ struct LockArgs {
 	manifest: ManifestArgs,
 	#[command(flatten)]
 	index:    IndexArgs,
+	#[arg(long)]
+	allow_unhashed: bool,
 }
 
 #[derive(Debug, Args)]
@@ -211,6 +221,8 @@ struct DownloadArgs {
 	no_deps:           bool,
 	#[arg(long)]
 	no_index:          bool,
+	#[arg(long)]
+	allow_unhashed:    bool,
 	#[command(flatten)]
 	manifest:          ManifestArgs,
 	#[command(flatten)]
@@ -248,6 +260,7 @@ struct CollectedInputs {
 	constraints:      Vec<PathBuf>,
 	index_url:        Option<String>,
 	extra_index_urls: Vec<String>,
+	find_links:       Vec<PathBuf>,
 	no_index:         bool,
 	pre:              bool,
 	require_hashes:   bool,
@@ -414,6 +427,8 @@ fn add_command(args: AddArgs) -> Result<()> {
 		args.index.index_url.as_deref(),
 		&args.index.extra_index_url,
 		false,
+		&args.index.find_links,
+		args.allow_unhashed,
 	)?;
 	let requirements = args
 		.requirements
@@ -438,10 +453,13 @@ fn add_command(args: AddArgs) -> Result<()> {
 		&manifest_path,
 		&layout,
 		args.index.index_url.as_deref(),
+		&args.index.extra_index_url,
 		false,
-		allow_prerelease,
+		&args.index.find_links,
+		&options,
+		index_shape(args.index.index_url.as_deref(), false),
 	)?;
-	write_lock(&layout, &dependencies, &input_hash)?;
+	write_lock(&layout, &dependencies, &input_hash, &index)?;
 
 	if changed {
 		println!("updated {}", manifest_path.display());
@@ -467,12 +485,20 @@ fn install_command(args: InstallArgs) -> Result<()> {
 	let index_url = args.index.index_url.clone().or(collected.index_url.clone());
 	let extra_index_urls =
 		merged_extra_index_urls(&args.index.extra_index_url, &collected.extra_index_urls);
+	let find_links = merged_find_links(&args.index.find_links, &collected.find_links);
 	let no_index = args.no_index || collected.no_index;
 	let allow_prerelease = args.pre || collected.pre || manifest.tool_pon_allow_prerelease();
 	let constraints = collect_constraints(&collected.constraints)?;
 	let options = ResolveOptions { allow_prerelease, no_deps: args.no_deps, constraints };
-	let index =
-		selected_index(&manifest_path, &layout, index_url.as_deref(), &extra_index_urls, no_index)?;
+	let index = selected_index(
+		&manifest_path,
+		&layout,
+		index_url.as_deref(),
+		&extra_index_urls,
+		no_index,
+		&find_links,
+		args.allow_unhashed,
+	)?;
 	let hash_mode = args.require_hashes
 		|| collected.require_hashes
 		|| collected
@@ -497,7 +523,9 @@ fn install_command(args: InstallArgs) -> Result<()> {
 			&index,
 			&options,
 			index_url.as_deref(),
+			&extra_index_urls,
 			no_index,
+			&find_links,
 			hash_mode || args.require_hashes,
 			args.dry_run,
 			args.frozen,
@@ -533,7 +561,9 @@ fn install_project(
 	index: &impl PackageIndex,
 	options: &ResolveOptions,
 	index_url: Option<&str>,
+	extra_index_urls: &[String],
 	no_index: bool,
+	find_links: &[PathBuf],
 	hash_mode: bool,
 	dry_run: bool,
 	frozen: bool,
@@ -544,8 +574,11 @@ fn install_project(
 		manifest_path,
 		layout,
 		index_url,
+		extra_index_urls,
 		no_index,
-		options.allow_prerelease,
+		find_links,
+		options,
+		index_shape(index_url, no_index),
 	)?;
 	let lock_path = layout.project_root.join("pon.lock");
 	if options.constraints.is_empty() && !hash_mode && lock_path.is_file() {
@@ -581,7 +614,7 @@ fn install_project(
 		return Ok(());
 	}
 	install_dependencies(layout, &dependencies, index, hash_requirements.as_ref())?;
-	write_lock(layout, &dependencies, &input_hash)?;
+	write_lock(layout, &dependencies, &input_hash, index)?;
 	println!("installed {} package(s)", dependencies.len());
 	Ok(())
 }
@@ -601,7 +634,7 @@ fn remove_one(manifest_path: &Path, name: &str) -> Result<()> {
 	manifest.write()?;
 	let layout = layout_for_manifest(manifest_path);
 	let manifest = PyProject::read(manifest_path)?;
-	let index = selected_index(manifest_path, &layout, None, &[], false)?;
+	let index = selected_index(manifest_path, &layout, None, &[], false, &[], false)?;
 	let options = ResolveOptions {
 		allow_prerelease: manifest.tool_pon_allow_prerelease(),
 		no_deps:          false,
@@ -614,10 +647,13 @@ fn remove_one(manifest_path: &Path, name: &str) -> Result<()> {
 		manifest_path,
 		&layout,
 		None,
+		&[],
 		false,
-		options.allow_prerelease,
+		&[],
+		&options,
+		index_shape(None, false),
 	)?;
-	write_lock(&layout, &dependencies, &input_hash)?;
+	write_lock(&layout, &dependencies, &input_hash, &index)?;
 	if changed {
 		println!("updated {}", manifest_path.display());
 	} else {
@@ -641,6 +677,8 @@ fn lock_command(args: LockArgs) -> Result<()> {
 		args.index.index_url.as_deref(),
 		&args.index.extra_index_url,
 		false,
+		&args.index.find_links,
+		args.allow_unhashed,
 	)?;
 	let options = ResolveOptions {
 		allow_prerelease: manifest.tool_pon_allow_prerelease(),
@@ -653,10 +691,13 @@ fn lock_command(args: LockArgs) -> Result<()> {
 		&manifest_path,
 		&layout,
 		args.index.index_url.as_deref(),
+		&args.index.extra_index_url,
 		false,
-		options.allow_prerelease,
+		&args.index.find_links,
+		&options,
+		index_shape(args.index.index_url.as_deref(), false),
 	)?;
-	write_lock(&layout, &dependencies, &input_hash)?;
+	write_lock(&layout, &dependencies, &input_hash, &index)?;
 	println!("wrote {}", layout.project_root.join("pon.lock").display());
 	Ok(())
 }
@@ -758,6 +799,7 @@ fn download_command(args: DownloadArgs) -> Result<()> {
 	let index_url = args.index.index_url.clone().or(collected.index_url.clone());
 	let extra_index_urls =
 		merged_extra_index_urls(&args.index.extra_index_url, &collected.extra_index_urls);
+	let find_links = merged_find_links(&args.index.find_links, &collected.find_links);
 	let no_index = args.no_index || collected.no_index;
 	let allow_prerelease = args.pre || collected.pre || manifest.tool_pon_allow_prerelease();
 	let options = ResolveOptions {
@@ -765,8 +807,15 @@ fn download_command(args: DownloadArgs) -> Result<()> {
 		no_deps: args.no_deps,
 		constraints: collect_constraints(&collected.constraints)?,
 	};
-	let index =
-		selected_index(&manifest_path, &layout, index_url.as_deref(), &extra_index_urls, no_index)?;
+	let index = selected_index(
+		&manifest_path,
+		&layout,
+		index_url.as_deref(),
+		&extra_index_urls,
+		no_index,
+		&find_links,
+		args.allow_unhashed,
+	)?;
 	let hash_mode = args.require_hashes
 		|| collected.require_hashes
 		|| collected
@@ -794,7 +843,9 @@ fn check_command() -> Result<()> {
 	let marker_env = pon_marker_env();
 	let mut violations = Vec::new();
 	for package in &packages {
+		violations.extend(check_record_integrity(&layout, package)?);
 		let Some(metadata) = read_installed_core_metadata(&layout, package)? else {
+			violations.push(format!("package `{}` is missing METADATA", package.name));
 			continue;
 		};
 		for requirement in metadata.requires_dist {
@@ -930,6 +981,7 @@ fn merge_requirements_file(collected: &mut CollectedInputs, file: RequirementsFi
 		collected.index_url = file.index_url;
 	}
 	collected.extra_index_urls.extend(file.extra_index_urls);
+	collected.find_links.extend(file.find_links);
 	collected.no_index |= file.no_index;
 	collected.pre |= file.pre;
 	collected.require_hashes |= file.require_hashes;
@@ -1424,12 +1476,52 @@ fn cabi_error(record: &PackageRecord) -> Error {
 		record.name
 	))
 }
-
-fn write_lock(layout: &EnvLayout, dependencies: &[ResolvedDist], input_hash: &str) -> Result<()> {
+fn write_lock(
+	layout: &EnvLayout,
+	dependencies: &[ResolvedDist],
+	input_hash: &str,
+	index: &impl PackageIndex,
+) -> Result<()> {
 	fs::create_dir_all(&layout.project_root)?;
 	let resolution = Resolution { dists: dependencies.to_vec() };
-	LockFile::from_resolution(&resolution, DEFAULT_REQUIRES_PYTHON, input_hash)
-		.write_to_path(layout.project_root.join("pon.lock"))
+	let mut lock = LockFile::from_resolution(&resolution, DEFAULT_REQUIRES_PYTHON, input_hash);
+	enrich_lock_wheels(&mut lock, dependencies, index)?;
+	lock.write_to_path(layout.project_root.join("pon.lock"))
+}
+
+fn enrich_lock_wheels(
+	lock: &mut LockFile,
+	dependencies: &[ResolvedDist],
+	index: &impl PackageIndex,
+) -> Result<()> {
+	for package in &mut lock.packages {
+		let Some(dist) = dependencies
+			.iter()
+			.find(|dist| names::normalize(&dist.name) == names::normalize(&package.name))
+		else {
+			continue;
+		};
+		if !matches!(dist.artifact, ResolvedArtifact::Wheel(_)) {
+			continue;
+		}
+		let Some(page) = index.lookup(&dist.name)? else {
+			continue;
+		};
+		let mut wheels = page
+			.files
+			.into_iter()
+			.filter(|file| file.version == dist.version)
+			.filter(|file| file.filename.ends_with(".whl"))
+			.filter(|file| matches!(file.kind, PackageKind::Pure))
+			.map(|file| crate::lock::LockedWheel::from_project_file(&file))
+			.collect::<Vec<_>>();
+		wheels.sort_by(|left, right| left.name.cmp(&right.name).then_with(|| left.url.cmp(&right.url)));
+		wheels.dedup_by(|left, right| left.name == right.name && left.url == right.url);
+		if !wheels.is_empty() {
+			package.wheels = wheels;
+		}
+	}
+	Ok(())
 }
 
 fn manifest_input_hash(
@@ -1437,14 +1529,51 @@ fn manifest_input_hash(
 	manifest_path: &Path,
 	layout: &EnvLayout,
 	index_url: Option<&str>,
+	extra_index_urls: &[String],
 	no_index: bool,
-	allow_prerelease: bool,
+	find_links: &[PathBuf],
+	options: &ResolveOptions,
+	_index_shape: &'static str,
 ) -> Result<String> {
 	let effective = effective_index_url(manifest_path, layout, index_url, no_index)?;
-	Ok(compute_input_hash(
+	let actual_index_shape = if no_index {
+		"local"
+	} else if effective == "catalog:" {
+		"catalog"
+	} else {
+		"simple-json"
+	};
+	let mut entries = vec![
+		format!("tool.pon.index-url={effective}"),
+		format!("tool.pon.no-index={no_index}"),
+		format!("tool.pon.allow-prerelease={}", options.allow_prerelease),
+		format!("tool.pon.no-deps={}", options.no_deps),
+		format!("tool.pon.index-shape={actual_index_shape}"),
+	];
+	for url in extra_index_urls {
+		entries.push(format!("tool.pon.extra-index-url={url}"));
+	}
+	for path in find_links {
+		entries.push(format!("tool.pon.find-links={}", path.display()));
+	}
+	for (name, specifiers) in options.constraints.iter() {
+		entries.push(format!("constraints.{name}={specifiers}"));
+	}
+	for (name, source) in manifest.sources() {
+		entries.push(format!(
+			"tool.pon.sources.{name}=path:{} editable:{} git:{} rev:{}",
+			source
+				.path
+				.as_ref()
+				.map_or_else(String::new, |path| path.display().to_string()),
+			source.editable,
+			source.git.as_deref().unwrap_or_default(),
+			source.rev.as_deref().unwrap_or_default()
+		));
+	}
+	Ok(compute_input_hash_with_entries(
 		manifest.dependencies().iter().map(String::as_str),
-		Some(effective.as_str()),
-		allow_prerelease,
+		entries,
 	))
 }
 
@@ -1493,15 +1622,42 @@ fn selected_index(
 	index_url: Option<&str>,
 	extra_index_urls: &[String],
 	no_index: bool,
+	find_links: &[PathBuf],
+	allow_unhashed: bool,
 ) -> Result<SelectedIndex> {
-	let base_url = effective_index_url(manifest_path, layout, index_url, no_index)?;
+	if no_index {
+		return Ok(SelectedIndex::local(cache_root(layout), find_links.to_vec()));
+	}
+	let base_url = effective_index_url(manifest_path, layout, index_url, false)?;
 	if base_url == "catalog:" {
+		ensure_catalog_fixture_allowed()?;
 		Ok(SelectedIndex::catalog())
 	} else {
 		let mut index_urls = Vec::with_capacity(extra_index_urls.len() + 1);
 		index_urls.push(base_url);
 		index_urls.extend(extra_index_urls.iter().cloned());
-		Ok(SelectedIndex::simple_json(index_urls, pon_home(layout)))
+		Ok(SelectedIndex::simple_json(index_urls, pon_home(layout), allow_unhashed))
+	}
+}
+
+fn ensure_catalog_fixture_allowed() -> Result<()> {
+	if cfg!(test) || env::var_os("PON_TEST_ALLOW_CATALOG").is_some() {
+		Ok(())
+	} else {
+		Err(Error::Cli(
+			"`catalog:` is a test fixture index; set PON_TEST_ALLOW_CATALOG=1 for hermetic tests"
+				.to_owned(),
+		))
+	}
+}
+
+fn index_shape(index_url: Option<&str>, no_index: bool) -> &'static str {
+	if no_index {
+		"local"
+	} else if index_url == Some("catalog:") {
+		"catalog"
+	} else {
+		"simple-json"
 	}
 }
 
@@ -1512,7 +1668,7 @@ fn effective_index_url(
 	no_index: bool,
 ) -> Result<String> {
 	if no_index {
-		return Ok("catalog:".to_owned());
+		return Ok("no-index".to_owned());
 	}
 	if let Some(url) = index_url.filter(|url| !url.trim().is_empty()) {
 		return Ok(url.to_owned());
@@ -1536,6 +1692,13 @@ fn cache_root(layout: &EnvLayout) -> PathBuf {
 }
 
 fn merged_extra_index_urls(cli: &[String], files: &[String]) -> Vec<String> {
+	let mut merged = Vec::with_capacity(cli.len() + files.len());
+	merged.extend(cli.iter().cloned());
+	merged.extend(files.iter().cloned());
+	merged
+}
+
+fn merged_find_links(cli: &[PathBuf], files: &[PathBuf]) -> Vec<PathBuf> {
 	let mut merged = Vec::with_capacity(cli.len() + files.len());
 	merged.extend(cli.iter().cloned());
 	merged.extend(files.iter().cloned());
@@ -1692,6 +1855,109 @@ fn read_installed_metadata_text(
 	}
 }
 
+fn check_record_integrity(
+	layout: &EnvLayout,
+	package: &InstalledPackageRecord,
+) -> Result<Vec<String>> {
+	let Some(record_path) = installed_record_path(layout, package)? else {
+		return Ok(vec![format!("package `{}` is missing RECORD", package.name)]);
+	};
+	if !record_path.is_file() {
+		return Ok(vec![format!(
+			"package `{}` RECORD `{}` is missing",
+			package.name,
+			record_path.display()
+		)]);
+	}
+	let label = record_path.display().to_string();
+	let record_text = fs::read_to_string(&record_path)?;
+	let entries = parse_record(&record_text, &label)?;
+	let mut violations = Vec::new();
+	for entry in entries {
+		let Some(relative) = safe_record_entry_path(&entry.path) else {
+			violations.push(format!(
+				"package `{}` RECORD contains unsafe path `{}`",
+				package.name, entry.path
+			));
+			continue;
+		};
+		let path = layout.site_packages.join(&relative);
+		if !path.exists() {
+			violations.push(format!(
+				"package `{}` RECORD entry `{}` is missing",
+				package.name, entry.path
+			));
+			continue;
+		}
+		if let Some(expected_size) = entry.size {
+			let actual_size = fs::metadata(&path)?.len();
+			if actual_size != expected_size {
+				violations.push(format!(
+					"package `{}` RECORD entry `{}` size mismatch: expected {}, got {}",
+					package.name, entry.path, expected_size, actual_size
+				));
+			}
+		}
+		if let Some(expected_hash) = entry.hash.as_deref() {
+			if let Some(expected) = expected_hash.strip_prefix("sha256=") {
+				let actual = record_sha256(&path)?;
+				if expected != actual {
+					violations.push(format!(
+						"package `{}` RECORD entry `{}` hash mismatch: expected sha256={}, got \
+						 sha256={}",
+						package.name, entry.path, expected, actual
+					));
+				}
+			} else {
+				violations.push(format!(
+					"package `{}` RECORD entry `{}` uses unsupported hash `{}`",
+					package.name, entry.path, expected_hash
+				));
+			}
+		}
+	}
+	Ok(violations)
+}
+
+fn installed_record_path(
+	layout: &EnvLayout,
+	package: &InstalledPackageRecord,
+) -> Result<Option<PathBuf>> {
+	if let Some(record_path) = &package.record_path {
+		return Ok(Some(layout.site_packages.join(record_path)));
+	}
+	Ok(find_dist_info_dir(layout, package)?.map(|dist_info| dist_info.join("RECORD")))
+}
+
+fn safe_record_entry_path(path: &str) -> Option<PathBuf> {
+	let candidate = Path::new(path);
+	let is_unsafe = candidate.components().any(|component| {
+		matches!(
+			component,
+			Component::Prefix(_) | Component::RootDir | Component::ParentDir
+		)
+	});
+	if is_unsafe {
+		None
+	} else {
+		Some(candidate.to_path_buf())
+	}
+}
+
+fn record_sha256(path: &Path) -> Result<String> {
+	let mut file = fs::File::open(path)?;
+	let mut hasher = Sha256::new();
+	let mut buffer = [0_u8; 64 * 1024];
+	loop {
+		let read = file.read(&mut buffer)?;
+		if read == 0 {
+			break;
+		}
+		hasher.update(&buffer[..read]);
+	}
+	Ok(URL_SAFE_NO_PAD.encode(hasher.finalize()))
+}
+
 fn find_dist_info_dir(
 	layout: &EnvLayout,
 	package: &InstalledPackageRecord,
@@ -1789,6 +2055,33 @@ mod tests {
 		std::env::temp_dir().join(unique)
 	}
 
+	struct EnvGuard {
+		key: &'static str,
+		previous: Option<std::ffi::OsString>,
+	}
+
+	impl EnvGuard {
+		fn set(key: &'static str, value: &str) -> Self {
+			let previous = std::env::var_os(key);
+			unsafe {
+				std::env::set_var(key, value);
+			}
+			Self { key, previous }
+		}
+	}
+
+	impl Drop for EnvGuard {
+		fn drop(&mut self) {
+			unsafe {
+				if let Some(previous) = &self.previous {
+					std::env::set_var(self.key, previous);
+				} else {
+					std::env::remove_var(self.key);
+				}
+			}
+		}
+	}
+
 	#[test]
 	fn clap_accepts_manifest_and_index_urls_for_resolving_commands() {
 		let cli = Cli::try_parse_from([
@@ -1802,6 +2095,8 @@ mod tests {
 			"https://mirror-one.example/simple/",
 			"--extra-index-url",
 			"https://mirror-two.example/simple/",
+			"--find-links",
+			"wheelhouse",
 		])
 		.expect("parse");
 
@@ -1814,6 +2109,7 @@ mod tests {
 			"https://mirror-one.example/simple/".to_owned(),
 			"https://mirror-two.example/simple/".to_owned()
 		]);
+		assert_eq!(options.index.find_links, vec![PathBuf::from("wheelhouse")]);
 	}
 
 	#[test]
@@ -1834,6 +2130,9 @@ mod tests {
 			"--dry-run",
 			"--frozen",
 			"--no-index",
+			"--allow-unhashed",
+			"--find-links",
+			"wheelhouse",
 		])
 		.expect("parse");
 
@@ -1850,6 +2149,8 @@ mod tests {
 		assert!(options.dry_run);
 		assert!(options.frozen);
 		assert!(options.no_index);
+		assert!(options.allow_unhashed);
+		assert_eq!(options.index.find_links, vec![PathBuf::from("wheelhouse")]);
 	}
 
 	#[test]
@@ -1960,6 +2261,7 @@ mod tests {
 		let root = temp_project("add");
 		let manifest = root.join("pyproject.toml");
 		fs::create_dir_all(&root).expect("root");
+		let _catalog = EnvGuard::set("PON_TEST_ALLOW_CATALOG", "1");
 
 		run_from_args([
 			"pon".to_owned(),
@@ -1989,11 +2291,13 @@ mod tests {
 		let root = temp_project("add-sdist");
 		let manifest = root.join("pyproject.toml");
 		fs::create_dir_all(&root).expect("root");
+		let _catalog = EnvGuard::set("PON_TEST_ALLOW_CATALOG", "1");
 		let sdist_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 			.join("fixtures")
 			.join("sdists")
 			.join("pon-flit-fixture-0.1.0.tar.gz");
 		let raw_path = sdist_path.display().to_string();
+		let _guard = EnvGuard::set("PON_TEST_ALLOW_FIXTURE_BRIDGE", "1");
 
 		run_from_args([
 			"pon".to_owned(),
@@ -2032,6 +2336,7 @@ mod tests {
 		let root = temp_project("remove");
 		let manifest = root.join("pyproject.toml");
 		fs::create_dir_all(&root).expect("root");
+		let _catalog = EnvGuard::set("PON_TEST_ALLOW_CATALOG", "1");
 		run_from_args([
 			"pon".to_owned(),
 			"add".to_owned(),
@@ -2052,6 +2357,7 @@ mod tests {
 		])
 		.expect("remove");
 
+
 		let pyproject = fs::read_to_string(&manifest).expect("pyproject");
 		assert!(!pyproject.contains("\"idna\""));
 		assert!(!root.join(".pon/packages/site-packages/idna").exists());
@@ -2066,10 +2372,85 @@ mod tests {
 	}
 
 	#[test]
+	fn locked_install_rejects_tampered_cached_wheel_hash() {
+		let root = temp_project("tampered-lock");
+		let layout = EnvLayout::new(&root);
+		let cache_wheel_dir = cache_root(&layout).join("wheels").join("tampered");
+		fs::create_dir_all(&cache_wheel_dir).expect("cache dir");
+		let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+			.join("fixtures")
+			.join("wheels")
+			.join("idna-3.10-py3-none-any.whl");
+		let expected_hash = sha256_file(&fixture).expect("fixture hash");
+		let cached_wheel = cache_wheel_dir.join("idna-3.10-py3-none-any.whl");
+		fs::write(&cached_wheel, b"tampered wheel bytes").expect("tamper cached wheel");
+		let mut hashes = BTreeMap::new();
+		hashes.insert("sha256".to_owned(), expected_hash);
+		let mut package = crate::lock::LockedPackage::pure("idna", "3.10");
+		package.wheels.push(crate::lock::LockedWheel {
+			name:   "idna-3.10-py3-none-any.whl".to_owned(),
+			url:    format!("file://{}", cached_wheel.display()),
+			hashes,
+		});
+		let lock = LockFile::with_input_hash(
+			vec![package],
+			DEFAULT_REQUIRES_PYTHON,
+			"sha256:tampered-test",
+		);
+
+		let error = install_locked_packages(&layout, &lock).expect_err("tampered wheel rejected");
+
+		assert!(
+			error.to_string().contains("hash mismatch"),
+			"expected hash mismatch, got {error}"
+		);
+	}
+
+
+	#[test]
+	fn check_record_integrity_reports_record_violations() {
+		let root = temp_project("record-check");
+		let layout = EnvLayout::new(&root);
+		let package_dir = layout.site_packages.join("demo");
+		let dist_info = layout.site_packages.join("demo-1.0.dist-info");
+		fs::create_dir_all(&package_dir).expect("package dir");
+		fs::create_dir_all(&dist_info).expect("dist-info");
+		let module_path = package_dir.join("__init__.py");
+		fs::write(&module_path, b"ok\n").expect("module");
+		let module_hash = record_sha256(&module_path).expect("hash");
+		let module_size = fs::metadata(&module_path).expect("metadata").len();
+		fs::write(
+			dist_info.join("RECORD"),
+			format!(
+				"demo/__init__.py,sha256={module_hash},{module_size}\n../escape.py,,\ndemo-1.0.dist-info/RECORD,,\n"
+			),
+		)
+		.expect("record");
+		let package = InstalledPackageRecord {
+			name:          "demo".to_owned(),
+			version:       "1.0".to_owned(),
+			artifact_kind: "wheel".to_owned(),
+			import_names:  vec!["demo".to_owned()],
+			record_path:   Some(PathBuf::from("demo-1.0.dist-info/RECORD")),
+		};
+
+		let violations = check_record_integrity(&layout, &package).expect("record check");
+		assert_eq!(violations.len(), 1);
+		assert!(violations[0].contains("unsafe path"));
+
+		fs::write(&module_path, b"tampered\n").expect("tamper");
+		let violations = check_record_integrity(&layout, &package).expect("record check");
+
+		assert!(violations.iter().any(|violation| violation.contains("hash mismatch")));
+		assert!(violations.iter().any(|violation| violation.contains("size mismatch")));
+		let _ = fs::remove_dir_all(root);
+	}
+	#[test]
 	fn add_refuses_c_abi_catalog_package() {
 		let root = temp_project("numpy");
 		let manifest = root.join("pyproject.toml");
 		fs::create_dir_all(&root).expect("root");
+		let _catalog = EnvGuard::set("PON_TEST_ALLOW_CATALOG", "1");
 
 		let error = run_from_args([
 			"pon".to_owned(),

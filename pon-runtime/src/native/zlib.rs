@@ -1,11 +1,11 @@
 //! Native `zlib` shim for stdlib imports.
 //!
-//! The vendored `gzip` module imports `zlib` at module load and binds a small
-//! constant/function surface into class definitions.  `crc32`/`adler32` are
-//! pure-Rust; `compress`/`decompress` run on `flate2` (Cython's Code.py
-//! compresses its C string tables with `zlib.compress(..., level=9)`).  The
-//! streaming `compressobj`/`decompressobj` surface stays a loud
-//! `NotImplementedError` until a concrete caller needs it.
+//! The vendored `gzip` module imports `zlib` at module load and binds the
+//! checksum, one-shot, and streaming deflate surfaces into class definitions.
+//! `crc32`/`adler32` are pure Rust; one-shot `compress`/`decompress` and
+//! streaming `compressobj`/`decompressobj` run on `flate2`.  Streaming gzip
+//! windows use manual RFC 1952 framing around raw deflate so callers see the
+//! same CRC/ISIZE trailer behavior as CPython's zlib wrapper.
 
 use core::mem;
 use std::sync::LazyLock;
@@ -14,6 +14,7 @@ use num_traits::ToPrimitive;
 
 use super::{builtins_mod::VARIADIC_ARITY, install_module};
 use crate::{
+	abi::{CodeInfo, ParamSpec},
 	intern::intern,
 	object::{PyObject, PyObjectHeader, PyType},
 	types::exc::ExceptionKind,
@@ -87,17 +88,6 @@ fn adler32_core(data: &[u8], adler: u32) -> u32 {
 	(s2 << 16) | s1
 }
 
-fn zlib_decompressor_type() -> *mut PyType {
-	static TYPE: LazyLock<usize> = LazyLock::new(|| {
-		let type_type = crate::abi::runtime_type_type();
-		Box::into_raw(Box::new(PyType::new(
-			type_type.cast_const(),
-			"_ZlibDecompressor",
-			mem::size_of::<PyObjectHeader>(),
-		))) as usize
-	});
-	*TYPE as *mut PyType
-}
 
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
 	let name = "zlib";
@@ -109,11 +99,7 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 	if error.is_null() {
 		return Err("failed to build zlib.error".to_owned());
 	}
-	let mut attrs = vec![
-		(intern("__name__"), name_object),
-		(intern("error"), error),
-		(intern("_ZlibDecompressor"), zlib_decompressor_type().cast::<PyObject>()),
-	];
+	let mut attrs = vec![(intern("__name__"), name_object), (intern("error"), error)];
 	for &(const_name, value) in &[
 		("DEFLATED", DEFLATED),
 		("DEF_BUF_SIZE", DEF_BUF_SIZE),
@@ -153,13 +139,34 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 		}
 		attrs.push((intern(const_name), object));
 	}
+	let mut compressobj_defaults = [
+		unsafe { crate::abi::pon_const_int(Z_DEFAULT_COMPRESSION) },
+		unsafe { crate::abi::pon_const_int(DEFLATED) },
+		unsafe { crate::abi::pon_const_int(MAX_WBITS) },
+		unsafe { crate::abi::pon_const_int(DEF_MEM_LEVEL) },
+		unsafe { crate::abi::pon_const_int(Z_DEFAULT_STRATEGY) },
+		unsafe { crate::abi::pon_none() },
+	];
+	let compressobj_function = make_zlib_keyword_function(
+		"compressobj",
+		compressobj_entry as BuiltinFn,
+		&["level", "method", "wbits", "memLevel", "strategy", "zdict"],
+		&mut compressobj_defaults,
+	)?;
+	let mut decompressobj_defaults =
+		[unsafe { crate::abi::pon_const_int(MAX_WBITS) }, unsafe { crate::abi::pon_none() }];
+	let decompressobj_function = make_zlib_keyword_function(
+		"decompressobj",
+		decompressobj_entry as BuiltinFn,
+		&["wbits", "zdict"],
+		&mut decompressobj_defaults,
+	)?;
+	attrs.push((intern("_ZlibDecompressor"), decompressobj_function));
 	for &(function_name, entry) in &[
 		("adler32", adler32_entry as BuiltinFn),
 		("compress", compress_entry as BuiltinFn),
-		("compressobj", compressobj_entry as BuiltinFn),
 		("crc32", crc32_entry as BuiltinFn),
 		("decompress", decompress_entry as BuiltinFn),
-		("decompressobj", decompressobj_entry as BuiltinFn),
 	] {
 		let function = unsafe {
 			crate::abi::pon_make_function(entry as *const u8, VARIADIC_ARITY, intern(function_name))
@@ -169,7 +176,60 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 		}
 		attrs.push((intern(function_name), function));
 	}
+	attrs.push((intern("compressobj"), compressobj_function));
+	attrs.push((intern("decompressobj"), decompressobj_function));
 	install_module(name, attrs)
+}
+
+fn make_zlib_keyword_function(
+	name: &str,
+	entry: BuiltinFn,
+	parameter_names: &[&str],
+	defaults: &mut [*mut PyObject],
+) -> Result<*mut PyObject, String> {
+	if let Some(index) = defaults.iter().position(|value| value.is_null()) {
+		return Err(format!("failed to allocate zlib.{name} default {index}"));
+	}
+	let interned_names: Vec<u32> = parameter_names.iter().map(|name| intern(name)).collect();
+	let params = ParamSpec {
+		names:                 interned_names.as_ptr(),
+		total_param_count:     interned_names.len() as u32,
+		positional_only_count: 0,
+		positional_count:      interned_names.len() as u32,
+		keyword_only_count:    0,
+		varargs_name:          0,
+		varkw_name:            0,
+	};
+	let code = CodeInfo {
+		entry:         entry as *const u8,
+		params:        &params,
+		name_interned: intern(name),
+		n_locals:      0,
+		n_feedback:    0,
+		flags:         0,
+	};
+	let function = unsafe {
+		crate::abi::call::pon_make_function_full(
+			&code,
+			if defaults.is_empty() {
+				core::ptr::null_mut()
+			} else {
+				defaults.as_mut_ptr()
+			},
+			defaults.len(),
+			core::ptr::null(),
+			core::ptr::null_mut(),
+			0,
+			core::ptr::null(),
+			core::ptr::null_mut(),
+			0,
+		)
+	};
+	if function.is_null() {
+		return Err(format!("failed to allocate zlib.{name}"));
+	}
+	crate::types::function::mark_native_function(function);
+	Ok(function)
 }
 
 fn raise_not_implemented(name: &str) -> *mut PyObject {
@@ -346,21 +406,53 @@ fn window_from_wbits(wbits: i64) -> Option<Window> {
 #[repr(C)]
 struct PyZlibCompressor {
 	ob_base: PyObjectHeader,
-	stream:  std::sync::Mutex<flate2::Compress>,
+	state:   std::sync::Mutex<DeflateState>,
+}
+
+/// Mutable encoder state.  `gzip` is present when `wbits` requested an RFC 1952
+/// stream; the underlying flate2 stream is raw deflate in that case.
+struct DeflateState {
+	stream:   flate2::Compress,
+	gzip:     Option<GzipCompressState>,
+	finished: bool,
+}
+
+struct GzipCompressState {
+	header_emitted: bool,
+	crc:            u32,
+	isize:          u32,
 }
 
 /// `zlib.decompressobj(...)` product: a streaming inflate decoder with the
-/// CPython-visible `eof`/`unconsumed_tail` state.
+/// CPython-visible `eof`/`unconsumed_tail`/`unused_data` state.
 #[repr(C)]
 struct PyZlibDecompressorObj {
 	ob_base: PyObjectHeader,
 	state:   std::sync::Mutex<InflateState>,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GzipInflateStage {
+	Header,
+	Body,
+	Trailer,
+	Done,
+}
+
+struct GzipInflateState {
+	stage:  GzipInflateStage,
+	buffer: Vec<u8>,
+	crc:    u32,
+	isize:  u32,
+}
+
 struct InflateState {
-	stream:     flate2::Decompress,
-	unconsumed: Vec<u8>,
-	eof:        bool,
+	stream:      flate2::Decompress,
+	gzip:        Option<GzipInflateState>,
+	unconsumed:  Vec<u8>,
+	unused:      Vec<u8>,
+	eof:         bool,
+	needs_input: bool,
 }
 
 fn zlib_compressor_type() -> *mut PyType {
@@ -473,36 +565,81 @@ unsafe extern "C" fn decompressor_getattro(
 				.unwrap_or_else(|poison| poison.into_inner());
 			alloc_bytes(&state.unconsumed)
 		},
-		"unused_data" => alloc_bytes(&[]),
+		"unused_data" => {
+			let state = decompressor
+				.state
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner());
+			alloc_bytes(&state.unused)
+		},
+		"needs_input" => {
+			let state = decompressor
+				.state
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner());
+			unsafe { crate::abi::pon_const_bool(i32::from(state.needs_input)) }
+		},
 		_ => raise_attribute(name),
 	}
 }
 
-/// Streams `input` through `stream` into a growing buffer. `flush` follows
+const GZIP_HEADER: [u8; 10] = [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255];
+
+fn append_gzip_header(gzip: &mut GzipCompressState, out: &mut Vec<u8>) {
+	if !gzip.header_emitted {
+		out.extend_from_slice(&GZIP_HEADER);
+		gzip.header_emitted = true;
+	}
+}
+
+fn append_gzip_trailer(gzip: &GzipCompressState, out: &mut Vec<u8>) {
+	out.extend_from_slice(&gzip.crc.to_le_bytes());
+	out.extend_from_slice(&gzip.isize.to_le_bytes());
+}
+
+/// Streams `input` through `state` into a growing buffer. `flush` follows
 /// flate2 semantics (`None` for incremental feed, `Finish` to terminate).
 fn deflate_chunks(
-	stream: &mut flate2::Compress,
+	state: &mut DeflateState,
 	input: &[u8],
 	flush: flate2::FlushCompress,
 ) -> Result<Vec<u8>, String> {
+	if state.finished {
+		return Err("Error -2 while compressing data: inconsistent stream state".to_owned());
+	}
 	let mut out = Vec::new();
+	if let Some(gzip) = state.gzip.as_mut() {
+		append_gzip_header(gzip, &mut out);
+		gzip.crc = crc32_core(input, gzip.crc);
+		gzip.isize = gzip.isize.wrapping_add(input.len() as u32);
+	}
 	let mut scratch = vec![0u8; 64 * 1024];
 	let mut consumed = 0usize;
 	loop {
-		let before_in = stream.total_in();
-		let before_out = stream.total_out();
-		let status = stream
+		let before_in = state.stream.total_in();
+		let before_out = state.stream.total_out();
+		let status = state
+			.stream
 			.compress(&input[consumed..], &mut scratch, flush)
 			.map_err(|error| format!("Error {error} while compressing data"))?;
-		consumed += (stream.total_in() - before_in) as usize;
-		let produced = (stream.total_out() - before_out) as usize;
+		let consumed_now = (state.stream.total_in() - before_in) as usize;
+		consumed += consumed_now;
+		let produced = (state.stream.total_out() - before_out) as usize;
 		out.extend_from_slice(&scratch[..produced]);
+		let made_progress = consumed_now != 0 || produced != 0;
 		match status {
 			flate2::Status::StreamEnd => break,
-			_ if flush == flate2::FlushCompress::None && consumed == input.len() && produced == 0 => {
-				break;
+			_ if !made_progress && consumed == input.len() => break,
+			_ if !made_progress => {
+				return Err("Error no progress while compressing data".to_owned());
 			},
 			_ => {},
+		}
+	}
+	if flush == flate2::FlushCompress::Finish {
+		state.finished = true;
+		if let Some(gzip) = state.gzip.as_ref() {
+			append_gzip_trailer(gzip, &mut out);
 		}
 	}
 	Ok(out)
@@ -526,11 +663,11 @@ unsafe extern "C" fn compressor_compress_entry(
 			.unwrap_or("object");
 		return raise_type_error(&format!("a bytes-like object is required, not '{got}'"));
 	};
-	let mut stream = compressor
-		.stream
+	let mut state = compressor
+		.state
 		.lock()
 		.unwrap_or_else(|poison| poison.into_inner());
-	match deflate_chunks(&mut stream, data, flate2::FlushCompress::None) {
+	match deflate_chunks(&mut state, data, flate2::FlushCompress::None) {
 		Ok(bytes) => alloc_bytes(&bytes),
 		Err(message) => raise_zlib_error(&message),
 	}
@@ -560,14 +697,264 @@ unsafe extern "C" fn compressor_flush_entry(
 	} else {
 		flate2::FlushCompress::Sync
 	};
-	let mut stream = compressor
-		.stream
+	let mut state = compressor
+		.state
 		.lock()
 		.unwrap_or_else(|poison| poison.into_inner());
-	match deflate_chunks(&mut stream, &[], flush) {
+	match deflate_chunks(&mut state, &[], flush) {
 		Ok(bytes) => alloc_bytes(&bytes),
 		Err(message) => raise_zlib_error(&message),
 	}
+}
+
+struct InflateRun {
+	consumed:       usize,
+	stream_end:     bool,
+	output_limited: bool,
+}
+
+fn inflate_chunks(
+	stream: &mut flate2::Decompress,
+	input: &[u8],
+	max_length: Option<usize>,
+	out: &mut Vec<u8>,
+) -> Result<InflateRun, String> {
+	let mut scratch = vec![0u8; 64 * 1024];
+	let mut consumed = 0usize;
+	loop {
+		let remaining_budget = match max_length {
+			Some(max) => max.saturating_sub(out.len()),
+			None => scratch.len(),
+		};
+		if remaining_budget == 0 {
+			return Ok(InflateRun { consumed, stream_end: false, output_limited: true });
+		}
+		let window = remaining_budget.min(scratch.len());
+		let before_in = stream.total_in();
+		let before_out = stream.total_out();
+		let status = stream
+			.decompress(&input[consumed..], &mut scratch[..window], flate2::FlushDecompress::None)
+			.map_err(|error| format!("Error {error} while decompressing data"))?;
+		let consumed_now = (stream.total_in() - before_in) as usize;
+		consumed += consumed_now;
+		let produced = (stream.total_out() - before_out) as usize;
+		out.extend_from_slice(&scratch[..produced]);
+		let made_progress = consumed_now != 0 || produced != 0;
+		match status {
+			flate2::Status::StreamEnd => {
+				return Ok(InflateRun { consumed, stream_end: true, output_limited: false });
+			},
+			_ if !made_progress => {
+				return Ok(InflateRun { consumed, stream_end: false, output_limited: false });
+			},
+			_ => {},
+		}
+	}
+}
+
+fn gzip_header_length(bytes: &[u8]) -> Result<Option<usize>, String> {
+	if bytes.is_empty() {
+		return Ok(None);
+	}
+	if bytes[0] != 0x1f {
+		return Err("incorrect header check".to_owned());
+	}
+	if bytes.len() < 2 {
+		return Ok(None);
+	}
+	if bytes[1] != 0x8b {
+		return Err("incorrect header check".to_owned());
+	}
+	if bytes.len() < 3 {
+		return Ok(None);
+	}
+	if bytes[2] != 8 {
+		return Err("unknown compression method".to_owned());
+	}
+	if bytes.len() < 4 {
+		return Ok(None);
+	}
+	let flags = bytes[3];
+	if flags & 0xe0 != 0 {
+		return Err("unknown header flags set".to_owned());
+	}
+	if bytes.len() < 10 {
+		return Ok(None);
+	}
+	let mut position = 10usize;
+	if flags & 0x04 != 0 {
+		if bytes.len() < position + 2 {
+			return Ok(None);
+		}
+		let extra_len = u16::from_le_bytes([bytes[position], bytes[position + 1]]) as usize;
+		position += 2;
+		if bytes.len() < position + extra_len {
+			return Ok(None);
+		}
+		position += extra_len;
+	}
+	if flags & 0x08 != 0 {
+		let Some(offset) = bytes[position..].iter().position(|byte| *byte == 0) else {
+			return Ok(None);
+		};
+		position += offset + 1;
+	}
+	if flags & 0x10 != 0 {
+		let Some(offset) = bytes[position..].iter().position(|byte| *byte == 0) else {
+			return Ok(None);
+		};
+		position += offset + 1;
+	}
+	if flags & 0x02 != 0 {
+		if bytes.len() < position + 2 {
+			return Ok(None);
+		}
+		position += 2;
+	}
+	Ok(Some(position))
+}
+
+fn decompress_state(
+	state: &mut InflateState,
+	data: &[u8],
+	max_length: Option<usize>,
+) -> Result<Vec<u8>, String> {
+	let mut combined = Vec::new();
+	let input = if state.unconsumed.is_empty() {
+		data
+	} else {
+		combined.reserve(state.unconsumed.len() + data.len());
+		combined.extend_from_slice(&state.unconsumed);
+		combined.extend_from_slice(data);
+		combined.as_slice()
+	};
+	state.unconsumed.clear();
+	let mut out = Vec::new();
+	if state.eof {
+		state.unused.extend_from_slice(input);
+		state.needs_input = true;
+		return Ok(out);
+	}
+	if state.gzip.is_some() {
+		inflate_gzip_state(state, input, max_length, &mut out)?;
+	} else {
+		inflate_plain_state(state, input, max_length, &mut out)?;
+	}
+	Ok(out)
+}
+
+fn inflate_plain_state(
+	state: &mut InflateState,
+	input: &[u8],
+	max_length: Option<usize>,
+	out: &mut Vec<u8>,
+) -> Result<(), String> {
+	let run = inflate_chunks(&mut state.stream, input, max_length, out)?;
+	if run.stream_end {
+		state.eof = true;
+		state.unused.extend_from_slice(&input[run.consumed..]);
+		state.unconsumed.clear();
+		state.needs_input = true;
+	} else if run.output_limited || run.consumed < input.len() {
+		state.unconsumed = input[run.consumed..].to_vec();
+		state.needs_input = false;
+	} else {
+		state.unconsumed.clear();
+		state.needs_input = true;
+	}
+	Ok(())
+}
+
+fn inflate_gzip_state(
+	state: &mut InflateState,
+	input: &[u8],
+	max_length: Option<usize>,
+	out: &mut Vec<u8>,
+) -> Result<(), String> {
+	let mut position = 0usize;
+	loop {
+		let stage = state.gzip.as_ref().expect("gzip state").stage;
+		match stage {
+			GzipInflateStage::Header => {
+				let gzip = state.gzip.as_mut().expect("gzip state");
+				let buffered = gzip.buffer.len();
+				gzip.buffer.extend_from_slice(&input[position..]);
+				let Some(header_len) = gzip_header_length(&gzip.buffer)? else {
+					state.needs_input = true;
+					break;
+				};
+				position += header_len - buffered;
+				gzip.buffer.clear();
+				gzip.stage = GzipInflateStage::Body;
+			},
+			GzipInflateStage::Body => {
+				let before_len = out.len();
+				let run = inflate_chunks(&mut state.stream, &input[position..], max_length, out)?;
+				let produced = out.len() - before_len;
+				if produced != 0 {
+					let gzip = state.gzip.as_mut().expect("gzip state");
+					gzip.crc = crc32_core(&out[before_len..], gzip.crc);
+					gzip.isize = gzip.isize.wrapping_add(produced as u32);
+				}
+				position += run.consumed;
+				if run.stream_end {
+					state.gzip.as_mut().expect("gzip state").stage = GzipInflateStage::Trailer;
+					continue;
+				}
+				if run.output_limited || position < input.len() {
+					state.unconsumed = input[position..].to_vec();
+					state.needs_input = false;
+				} else {
+					state.unconsumed.clear();
+					state.needs_input = true;
+				}
+				break;
+			},
+			GzipInflateStage::Trailer => {
+				let gzip = state.gzip.as_mut().expect("gzip state");
+				let needed = 8usize.saturating_sub(gzip.buffer.len());
+				let available = input.len().saturating_sub(position);
+				let take = needed.min(available);
+				gzip.buffer.extend_from_slice(&input[position..position + take]);
+				position += take;
+				if gzip.buffer.len() < 8 {
+					state.needs_input = true;
+					break;
+				}
+				let expected_crc = u32::from_le_bytes([
+					gzip.buffer[0],
+					gzip.buffer[1],
+					gzip.buffer[2],
+					gzip.buffer[3],
+				]);
+				let expected_size = u32::from_le_bytes([
+					gzip.buffer[4],
+					gzip.buffer[5],
+					gzip.buffer[6],
+					gzip.buffer[7],
+				]);
+				if expected_crc != gzip.crc {
+					return Err("incorrect data check".to_owned());
+				}
+				if expected_size != gzip.isize {
+					return Err("incorrect length check".to_owned());
+				}
+				gzip.buffer.clear();
+				gzip.stage = GzipInflateStage::Done;
+				state.eof = true;
+				state.needs_input = true;
+				state.unused.extend_from_slice(&input[position..]);
+				break;
+			},
+			GzipInflateStage::Done => {
+				state.eof = true;
+				state.needs_input = true;
+				state.unused.extend_from_slice(&input[position..]);
+				break;
+			},
+		}
+	}
+	Ok(())
 }
 
 unsafe extern "C" fn decompressor_decompress_entry(
@@ -602,46 +989,10 @@ unsafe extern "C" fn decompressor_decompress_entry(
 		.lock()
 		.unwrap_or_else(|poison| poison.into_inner());
 	let state = &mut *state;
-	let mut out = Vec::new();
-	let mut scratch = vec![0u8; 64 * 1024];
-	let mut consumed = 0usize;
-	loop {
-		let remaining_budget = match max_length {
-			Some(max) => max.saturating_sub(out.len()),
-			None => scratch.len(),
-		};
-		if remaining_budget == 0 {
-			break;
-		}
-		let window = remaining_budget.min(scratch.len());
-		let before_in = state.stream.total_in();
-		let before_out = state.stream.total_out();
-		let status = match state.stream.decompress(
-			&data[consumed..],
-			&mut scratch[..window],
-			flate2::FlushDecompress::None,
-		) {
-			Ok(status) => status,
-			Err(error) => return raise_zlib_error(&format!("Error {error} while decompressing data")),
-		};
-		consumed += (state.stream.total_in() - before_in) as usize;
-		let produced = (state.stream.total_out() - before_out) as usize;
-		out.extend_from_slice(&scratch[..produced]);
-		match status {
-			flate2::Status::StreamEnd => {
-				state.eof = true;
-				break;
-			},
-			_ if consumed == data.len() && produced == 0 => break,
-			_ => {},
-		}
+	match decompress_state(state, data, max_length) {
+		Ok(bytes) => alloc_bytes(&bytes),
+		Err(message) => raise_zlib_error(&message),
 	}
-	state.unconsumed = if state.eof {
-		Vec::new()
-	} else {
-		data[consumed..].to_vec()
-	};
-	alloc_bytes(&out)
 }
 
 unsafe extern "C" fn decompressor_flush_entry(
@@ -705,16 +1056,18 @@ unsafe extern "C" fn compressobj_entry(argv: *mut *mut PyObject, argc: usize) ->
 	} else {
 		flate2::Compression::new(level as u32)
 	};
-	let stream = match window {
-		Window::Raw => flate2::Compress::new(level, false),
-		Window::Zlib => flate2::Compress::new(level, true),
-		// flate2's gzip stream constructors are zlib-backend-gated; no caller
-		// needs streaming gzip yet (gzip.py wraps raw deflate itself).
-		Window::Gzip => return raise_not_implemented("compressobj(wbits=gzip)"),
+	let (stream, gzip) = match window {
+		Window::Raw => (flate2::Compress::new(level, false), None),
+		Window::Zlib => (flate2::Compress::new(level, true), None),
+		Window::Gzip => (flate2::Compress::new(level, false), Some(GzipCompressState {
+			header_emitted: false,
+			crc:            0,
+			isize:          0,
+		})),
 	};
 	Box::into_raw(Box::new(PyZlibCompressor {
 		ob_base: PyObjectHeader::new(zlib_compressor_type().cast_const()),
-		stream:  std::sync::Mutex::new(stream),
+		state:   std::sync::Mutex::new(DeflateState { stream, gzip, finished: false }),
 	}))
 	.cast::<PyObject>()
 }
@@ -873,14 +1226,26 @@ unsafe extern "C" fn decompressobj_entry(argv: *mut *mut PyObject, argc: usize) 
 	if args.len() > 1 && !args[1].is_null() && args[1] != unsafe { crate::abi::pon_none() } {
 		return raise_not_implemented("decompressobj(zdict=...)");
 	}
-	let stream = match window {
-		Window::Raw => flate2::Decompress::new(false),
-		Window::Zlib => flate2::Decompress::new(true),
-		Window::Gzip => return raise_not_implemented("decompressobj(wbits=gzip)"),
+	let (stream, gzip) = match window {
+		Window::Raw => (flate2::Decompress::new(false), None),
+		Window::Zlib => (flate2::Decompress::new(true), None),
+		Window::Gzip => (flate2::Decompress::new(false), Some(GzipInflateState {
+			stage:  GzipInflateStage::Header,
+			buffer: Vec::new(),
+			crc:    0,
+			isize:  0,
+		})),
 	};
 	Box::into_raw(Box::new(PyZlibDecompressorObj {
 		ob_base: PyObjectHeader::new(zlib_decompressorobj_type().cast_const()),
-		state:   std::sync::Mutex::new(InflateState { stream, unconsumed: Vec::new(), eof: false }),
+		state:   std::sync::Mutex::new(InflateState {
+			stream,
+			gzip,
+			unconsumed: Vec::new(),
+			unused: Vec::new(),
+			eof: false,
+			needs_input: true,
+		}),
 	}))
 	.cast::<PyObject>()
 }

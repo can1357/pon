@@ -25,16 +25,13 @@ struct EditableManifest {
 	dependencies:    Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SourceKind {
-	PackageDir,
-	ModuleFile,
-}
-
 struct SourceRoot {
-	path:                 PathBuf,
-	relative_import_path: PathBuf,
-	kind:                 SourceKind,
+	/// Directory that must be placed on `sys.path` for the editable import to
+	/// resolve (`project/src` or the project root).
+	import_base:          PathBuf,
+	/// Legacy symlink/copy location from the pre-.pth installer, removed on
+	/// reinstall so the .pth convention is the only live import path.
+	legacy_relative_path: PathBuf,
 }
 
 struct RecordFile {
@@ -43,16 +40,14 @@ struct RecordFile {
 	size: Option<u64>,
 }
 
-/// Install `path` as an editable package by linking its import root into
-/// `site-packages`.
+/// Install `path` as an editable package by writing a standard `.pth` file
+/// into `site-packages`.
 ///
 /// The import root is selected from `[tool.pon].import-name`, or from the
 /// normalized project name with `-` replaced by `_` when the setting is absent.
 /// Resolution checks `src/<import>`, `<import>`, and module-file variants in
-/// that order. The installer writes normal dist-info metadata and a registry
-/// row; it never creates `.pth` files. On Windows, where symlink creation can
-/// require privileges, a failed symlink attempt falls back to copying the
-/// source root and emits a warning.
+/// that order. The installer writes normal dist-info metadata, a PEP 610
+/// `direct_url.json`, a RECORD that includes the `.pth`, and a registry row.
 pub fn install_editable(
 	env: &EnvLayout,
 	resolved_record: &ResolvedRecord,
@@ -62,18 +57,20 @@ pub fn install_editable(
 	validate_resolved_record(&manifest, resolved_record, path)?;
 
 	let source = package_source_path(path, &manifest.import_name)?;
-	let destination_relative = destination_relative_path(&source);
-	let destination = env.site_packages.join(&destination_relative);
+	let legacy_destination = env.site_packages.join(&source.legacy_relative_path);
+	let pth_relative = editable_pth_relative_path(&manifest);
+	let pth_path = env.site_packages.join(&pth_relative);
 	let dist_info_dir = format!("{}-{}.dist-info", manifest.normalized_name, manifest.version);
 	let dist_info_relative = PathBuf::from(&dist_info_dir);
 	let dist_info_path = env.site_packages.join(&dist_info_relative);
 	let record_relative = dist_info_relative.join("RECORD");
 
 	env.create_dirs()?;
-	remove_existing_path(&destination)?;
+	remove_existing_path(&legacy_destination)?;
+	remove_existing_path(&pth_path)?;
 	remove_existing_path(&dist_info_path)?;
 
-	let mut record_files = install_source_root(&source, &destination, &destination_relative)?;
+	let mut record_files = vec![write_editable_pth(&pth_path, &pth_relative, &source)?];
 
 	fs::create_dir_all(&dist_info_path)?;
 	record_files.push(write_dist_info_file(
@@ -178,18 +175,16 @@ fn package_source_path(root: &Path, import_name: &str) -> Result<SourceRoot> {
 		let package_dir = base.join(&relative);
 		if package_dir.join("__init__.py").is_file() {
 			return Ok(SourceRoot {
-				path:                 package_dir,
-				relative_import_path: relative.clone(),
-				kind:                 SourceKind::PackageDir,
+				import_base:          base,
+				legacy_relative_path: relative.clone(),
 			});
 		}
 
 		let module_file = base.join(&relative).with_extension("py");
 		if module_file.is_file() {
 			return Ok(SourceRoot {
-				path:                 module_file,
-				relative_import_path: relative.clone(),
-				kind:                 SourceKind::ModuleFile,
+				import_base:          base,
+				legacy_relative_path: relative.with_extension("py"),
 			});
 		}
 	}
@@ -200,131 +195,21 @@ fn package_source_path(root: &Path, import_name: &str) -> Result<SourceRoot> {
 	)))
 }
 
-fn destination_relative_path(source: &SourceRoot) -> PathBuf {
-	match source.kind {
-		SourceKind::PackageDir => source.relative_import_path.clone(),
-		SourceKind::ModuleFile => source.relative_import_path.with_extension("py"),
-	}
+fn editable_pth_relative_path(manifest: &EditableManifest) -> PathBuf {
+	PathBuf::from(format!("{}-editable.pth", manifest.normalized_name))
 }
 
-fn install_source_root(
+fn write_editable_pth(
+	path: &Path,
+	relative_path: &Path,
 	source: &SourceRoot,
-	destination: &Path,
-	destination_relative: &Path,
-) -> Result<Vec<RecordFile>> {
-	if let Some(parent) = destination.parent() {
+) -> Result<RecordFile> {
+	if let Some(parent) = path.parent() {
 		fs::create_dir_all(parent)?;
 	}
-
-	let link_source = absolute_path(&source.path)?;
-	match create_editable_link(&link_source, destination, source.kind)? {
-		LinkOutcome::Linked => Ok(vec![RecordFile {
-			path: record_path_string(destination_relative),
-			hash: None,
-			size: None,
-		}]),
-		LinkOutcome::Copied => {
-			let mut files = Vec::new();
-			match source.kind {
-				SourceKind::PackageDir => {
-					copy_tree(&source.path, destination, destination_relative, &mut files)?
-				},
-				SourceKind::ModuleFile => {
-					copy_file(&source.path, destination)?;
-					files.push(record_file_from_path(destination, destination_relative)?);
-				},
-			}
-			Ok(files)
-		},
-	}
-}
-
-enum LinkOutcome {
-	Linked,
-	#[cfg_attr(
-		unix,
-		allow(
-			dead_code,
-			reason = "constructed only by the windows and fallback create_editable_link impls"
-		)
-	)]
-	Copied,
-}
-
-#[cfg(unix)]
-fn create_editable_link(
-	source: &Path,
-	destination: &Path,
-	_kind: SourceKind,
-) -> Result<LinkOutcome> {
-	std::os::unix::fs::symlink(source, destination)?;
-	Ok(LinkOutcome::Linked)
-}
-
-#[cfg(windows)]
-fn create_editable_link(
-	source: &Path,
-	destination: &Path,
-	kind: SourceKind,
-) -> Result<LinkOutcome> {
-	let result = match kind {
-		SourceKind::PackageDir => std::os::windows::fs::symlink_dir(source, destination),
-		SourceKind::ModuleFile => std::os::windows::fs::symlink_file(source, destination),
-	};
-	match result {
-		Ok(()) => Ok(LinkOutcome::Linked),
-		Err(error) => {
-			eprintln!(
-				"warning: editable install copied files (symlinks unavailable: {error}); re-run `pon \
-				 install` after edits"
-			);
-			Ok(LinkOutcome::Copied)
-		},
-	}
-}
-
-#[cfg(not(any(unix, windows)))]
-fn create_editable_link(
-	_source: &Path,
-	_destination: &Path,
-	_kind: SourceKind,
-) -> Result<LinkOutcome> {
-	Ok(LinkOutcome::Copied)
-}
-
-fn copy_tree(
-	source: &Path,
-	destination: &Path,
-	record_prefix: &Path,
-	record_files: &mut Vec<RecordFile>,
-) -> Result<()> {
-	fs::create_dir_all(destination)?;
-	for entry in fs::read_dir(source)? {
-		let entry = entry?;
-		let file_name = entry.file_name();
-		if file_name == "__pycache__" {
-			continue;
-		}
-
-		let source_path = entry.path();
-		let destination_path = destination.join(&file_name);
-		let record_path = record_prefix.join(&file_name);
-		if source_path.is_dir() {
-			copy_tree(&source_path, &destination_path, &record_path, record_files)?;
-		} else if source_path.is_file() {
-			copy_file(&source_path, &destination_path)?;
-			record_files.push(record_file_from_path(&destination_path, &record_path)?);
-		}
-	}
-	Ok(())
-}
-
-fn copy_file(source: &Path, destination: &Path) -> Result<()> {
-	if let Some(parent) = destination.parent() {
-		fs::create_dir_all(parent)?;
-	}
-	fs::copy(source, destination)?;
-	Ok(())
+	let import_base = absolute_path(&source.import_base)?;
+	fs::write(path, format!("{}\n", import_base.display()))?;
+	record_file_from_path(path, relative_path)
 }
 
 fn remove_existing_path(path: &Path) -> Result<()> {

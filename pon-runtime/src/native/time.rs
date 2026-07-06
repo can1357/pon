@@ -20,12 +20,13 @@ const CLOCK_PROCESS_CPUTIME_ID_VALUE: i64 = 12;
 const CLOCK_THREAD_CPUTIME_ID_VALUE: i64 = 16;
 
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
+	let timezone = timezone_info()?;
 	let attrs = [
 		string_attr("__name__", "time"),
-		int_attr("timezone", 0),
-		tzname_attr(),
-		int_attr("daylight", 0),
-		int_attr("altzone", 0),
+		int_attr("timezone", timezone.timezone),
+		tzname_attr(&timezone.tzname),
+		int_attr("daylight", timezone.daylight),
+		int_attr("altzone", timezone.altzone),
 		int_attr("CLOCK_REALTIME", CLOCK_REALTIME_ID),
 		int_attr("CLOCK_MONOTONIC", CLOCK_MONOTONIC_ID),
 		int_attr("CLOCK_MONOTONIC_RAW", CLOCK_MONOTONIC_RAW_ID),
@@ -402,7 +403,9 @@ unsafe extern "C" fn time_tzset(_argv: *mut *mut PyObject, argc: usize) -> *mut 
 	if argc != 0 {
 		return raise_type_error(&format!("tzset() takes no arguments ({argc} given)"));
 	}
-	unsafe { tzset() };
+	if let Err(message) = refresh_timezone_attrs() {
+		return return_null_with_error(message);
+	}
 	unsafe { crate::abi::pon_none() }
 }
 
@@ -576,13 +579,143 @@ fn int_attr(name: &str, value: i64) -> Result<(u32, *mut PyObject), String> {
 		.ok_or_else(|| format!("failed to allocate time.{name}"))
 }
 
-fn tzname_attr() -> Result<(u32, *mut PyObject), String> {
-	// SAFETY: Runtime allocation helpers return NULL with a diagnostic on failure.
-	let utc = unsafe { pon_const_str("UTC".as_ptr(), 3) };
-	if utc.is_null() {
+#[derive(Clone)]
+struct TimezoneInfo {
+	timezone: i64,
+	daylight: i64,
+	altzone:  i64,
+	tzname:   [String; 2],
+}
+
+#[derive(Clone)]
+struct LocalTimezoneSample {
+	offset_east: i64,
+	is_dst:      bool,
+	zone:        String,
+}
+
+fn timezone_info() -> Result<TimezoneInfo, String> {
+	// SAFETY: `tzset(3)` refreshes libc's process-global timezone rules from
+	// the current environment; CPython's `time` module does the same before
+	// reading timezone metadata.
+	unsafe { tzset() };
+	let samples = local_timezone_samples()?;
+	let first = samples
+		.first()
+		.ok_or_else(|| "failed to sample local timezone".to_owned())?;
+	let standard = samples.iter().find(|sample| !sample.is_dst).unwrap_or(first);
+	let daylight_sample = samples.iter().find(|sample| sample.is_dst);
+	let daylight = if daylight_sample.is_some() { 1 } else { 0 };
+	let alternate = daylight_sample.unwrap_or(standard);
+	Ok(TimezoneInfo {
+		timezone: -standard.offset_east,
+		daylight,
+		altzone:  if daylight != 0 { -alternate.offset_east } else { -standard.offset_east },
+		tzname:   [
+			standard.zone.clone(),
+			if daylight != 0 {
+				alternate.zone.clone()
+			} else {
+				standard.zone.clone()
+			},
+		],
+	})
+}
+
+fn refresh_timezone_attrs() -> Result<(), String> {
+	let timezone = timezone_info()?;
+	for (name, value) in [
+		int_attr("timezone", timezone.timezone)?,
+		tzname_attr(&timezone.tzname)?,
+		int_attr("daylight", timezone.daylight)?,
+		int_attr("altzone", timezone.altzone)?,
+	] {
+		if !crate::import::store_module_attr(intern("time"), name, value) {
+			return Err("failed to update time timezone attributes".to_owned());
+		}
+	}
+	Ok(())
+}
+
+fn local_timezone_samples() -> Result<Vec<LocalTimezoneSample>, String> {
+	let now = std::time::SystemTime::now()
+		.duration_since(std::time::UNIX_EPOCH)
+		.map_or(0.0, |duration| duration.as_secs_f64());
+	let current_year = utc_fields(now)[0];
+	let mut samples = Vec::with_capacity(24);
+	for year in [current_year, current_year + 1] {
+		for month in 1..=12 {
+			let timestamp = days_from_civil(year, month, 15) * 86_400 + 12 * 3_600;
+			if let Some(sample) = local_timezone_sample(timestamp) {
+				samples.push(sample);
+			}
+		}
+	}
+	if samples.is_empty() {
+		return Err("failed to sample local timezone through localtime".to_owned());
+	}
+	Ok(samples)
+}
+
+fn local_timezone_sample(timestamp: i64) -> Option<LocalTimezoneSample> {
+	let raw = timestamp as libc::time_t;
+	if raw as i64 != timestamp {
+		return None;
+	}
+	let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
+	// SAFETY: `raw` points to a valid time_t and `tm` points to writable storage.
+	let out = unsafe { libc::localtime_r(&raw, tm.as_mut_ptr()) };
+	if out.is_null() {
+		return None;
+	}
+	// SAFETY: `localtime_r` returned non-NULL, so it initialized `tm`.
+	let tm = unsafe { tm.assume_init() };
+	Some(LocalTimezoneSample {
+		offset_east: local_offset_east(&tm, timestamp),
+		is_dst:      tm.tm_isdst > 0,
+		zone:        strftime_zone_name(&tm),
+	})
+}
+
+fn local_offset_east(tm: &libc::tm, timestamp: i64) -> i64 {
+	let year = i64::from(tm.tm_year) + 1900;
+	let month = u32::try_from(tm.tm_mon + 1).unwrap_or(1);
+	let day = u32::try_from(tm.tm_mday).unwrap_or(1);
+	let local_as_utc = days_from_civil(year, month, day) * 86_400
+		+ i64::from(tm.tm_hour) * 3_600
+		+ i64::from(tm.tm_min) * 60
+		+ i64::from(tm.tm_sec);
+	local_as_utc - timestamp
+}
+
+fn strftime_zone_name(tm: &libc::tm) -> String {
+	let mut buffer = [0 as libc::c_char; 128];
+	let format = b"%Z\0";
+	// SAFETY: `buffer` is writable, `format` is NUL-terminated, and `tm` is a
+	// valid libc `struct tm` produced by `localtime_r`.
+	let written = unsafe {
+		libc::strftime(
+			buffer.as_mut_ptr(),
+			buffer.len(),
+			format.as_ptr().cast(),
+			tm as *const libc::tm,
+		)
+	};
+	if written == 0 {
+		return String::new();
+	}
+	// SAFETY: `strftime` wrote exactly `written` non-NUL payload bytes.
+	let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), written) };
+	String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn tzname_attr(names: &[String; 2]) -> Result<(u32, *mut PyObject), String> {
+	let first = unsafe { pon_const_str(names[0].as_ptr(), names[0].len()) };
+	let second = unsafe { pon_const_str(names[1].as_ptr(), names[1].len()) };
+	if first.is_null() || second.is_null() {
 		return Err("failed to allocate time.tzname element".to_owned());
 	}
-	let mut items = [utc, utc];
+	let mut items = [first, second];
 	// SAFETY: `items` is a live window for the duration of the call.
 	let tuple = unsafe { crate::abi::seq::pon_build_tuple(items.as_mut_ptr(), items.len()) };
 	(!tuple.is_null())

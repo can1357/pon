@@ -1,33 +1,27 @@
 //! Native `_signal` module (unittest chain: `unittest.signals` -> `signal`).
 //!
-//! Serves exactly the surface `Lib/signal.py` and `Lib/unittest/signals.py`
-//! consume: the host's `SIG*` numbers (via `libc`, mirroring `errno`), the
-//! `SIG_DFL`/`SIG_IGN` sentinel ints, `NSIG`, `signal()`/`getsignal()`
-//! registration, and `default_int_handler`.
+//! The module owns process signal disposition for Python-visible handlers:
+//! `signal.signal()` installs a small async-signal-safe `sigaction` trampoline,
+//! records the signal in an atomic pending mask, and optionally writes the
+//! signal byte to `set_wakeup_fd()` for selector/event-loop wakeups.  Python
+//! handlers never run from the OS signal frame; they are drained on the main
+//! runtime thread by [`process_pending_signals`] (called by signal-owned waits
+//! here and by the WS3 safepoint/blocking-region substrate).
 //!
-//! DIVERGENCE (documented, deliberate): pon installs NO real OS signal
-//! handlers.  The runtime has no safe asynchronous reentry point — a signal
-//! can arrive while compiled code holds the thread-state or GC locks, so
-//! there is no point at which a Python-level handler could run.  `signal()`
-//! is registration bookkeeping only: it validates, swaps the process-level
-//! handler table entry, and returns the prior handler with CPython's
-//! semantics (including `SIG_DFL`/`SIG_IGN` pass-through), but a registered
-//! handler is never invoked by an actual signal.  `default_int_handler`
-//! raises `KeyboardInterrupt` when *called* (unittest's `_InterruptHandler`
-//! delegates to it explicitly).  CPython's main-thread-only restriction on
-//! `signal()` is not enforced, and handler callability is checked
-//! permissively (ints other than the two sentinels and `None` are rejected;
-//! any other object is accepted) because pon has no generic
-//! `PyCallable_Check` equivalent.
+//! Remaining product boundary: frame objects are not yet materialized for the
+//! handler's second argument, so handlers receive `None` for `frame`.
 
 use std::sync::{
 	Mutex,
-	atomic::{AtomicI32, Ordering},
+	atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
 };
 
 use super::install_module;
 use crate::{
-	abi::{exc::raise_kind_error_no_args, pon_const_int, pon_make_function, return_null_with_error},
+	abi::{
+		exc::raise_kind_error_no_args, pon_call, pon_const_int, pon_make_function,
+		return_null_with_error,
+	},
 	intern::intern,
 	object::{PyObject, PyType},
 	types::exc::{ExceptionKind, PyBaseException},
@@ -100,6 +94,23 @@ const POSIX_CONSTANTS: &[(&str, i64)] = &[
 
 static WAKEUP_FD: AtomicI32 = AtomicI32::new(-1);
 
+/// Fast-path flag checked by safepoints and blocking-region exits.  The no-work
+/// path is exactly one relaxed atomic load; the heavier pending mask is touched
+/// only after this flag is observed set.
+static PENDING_SIGNAL_FLAG: AtomicBool = AtomicBool::new(false);
+static PENDING_SIGNALS: [AtomicU64; PENDING_WORDS] =
+	[AtomicU64::new(0), AtomicU64::new(0)];
+const PENDING_WORDS: usize = 2;
+
+/// OS thread selected to run Python signal handlers.  CPython uses the main
+/// interpreter thread; pon records the thread that initializes the runtime.
+static MAIN_THREAD_ID: AtomicUsize = AtomicUsize::new(0);
+
+/// Startup installs pon's SIGINT trampoline before `_signal` itself is imported.
+/// Until the module table contains `default_int_handler`, this flag tells the
+/// pending-signal drain to raise `KeyboardInterrupt` for SIGINT directly.
+static DEFAULT_SIGINT_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 static ITIMER_ERROR_TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
 	let base = crate::import::module_attr(intern("builtins"), intern("OSError"))
 		.map_or(std::ptr::null_mut(), |object| object.cast::<PyType>());
@@ -169,7 +180,199 @@ pub(crate) fn gc_held_roots() -> Vec<*mut PyObject> {
 		.collect()
 }
 
+/// Installs process-start signal state that must exist even before Python code
+/// imports `signal`: the main-thread identity and pon's default SIGINT handler.
+pub(crate) fn init_main_thread_signal_handlers() -> Result<(), String> {
+	note_main_thread();
+	install_signal_trampoline(libc::SIGINT as usize).map_err(|errno| {
+		format!("failed to install SIGINT handler: {}", errno_message(errno))
+	})?;
+	DEFAULT_SIGINT_ACTIVE.store(true, Ordering::Release);
+	Ok(())
+}
+
+fn note_main_thread() {
+	let current = pthread_self_word();
+	let _ = MAIN_THREAD_ID.compare_exchange(0, current, Ordering::AcqRel, Ordering::Acquire);
+}
+
+fn pthread_self_word() -> usize {
+	unsafe { libc::pthread_self() as usize }
+}
+
+fn running_on_main_thread() -> bool {
+	let main = MAIN_THREAD_ID.load(Ordering::Relaxed);
+	main != 0 && pthread_self_word() == main
+}
+
+/// Returns whether any OS signal has been recorded by the trampoline.  This is
+/// the hot-path predicate for safepoints and blocking-region exits.
+#[must_use]
+pub(crate) fn has_pending_signals() -> bool {
+	PENDING_SIGNAL_FLAG.load(Ordering::Relaxed)
+}
+
+/// C-shaped helper for generated-code poll bodies.  Returns `0` when no Python
+/// exception is pending and `-1` when draining a signal raised one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pon_signal_check_pending() -> libc::c_int {
+	match unsafe { process_pending_signals() } {
+		Ok(()) => 0,
+		Err(_) => -1,
+	}
+}
+
+/// Runs pending Python signal handlers on the main runtime thread.
+///
+/// Non-main threads leave the pending flag set so the next main-thread
+/// interruption point will perform the drain.  On a raising handler, unprocessed
+/// signals are restored to the atomic mask.
+pub(crate) unsafe fn process_pending_signals() -> Result<(), *mut PyObject> {
+	if !has_pending_signals() {
+		return Ok(());
+	}
+	if !running_on_main_thread() {
+		return Ok(());
+	}
+
+	let mut words = take_pending_words();
+	for signalnum in 1..NSIG as usize {
+		let Some((word, bit)) = signal_bit(signalnum) else {
+			continue;
+		};
+		if words[word] & bit == 0 {
+			continue;
+		}
+		words[word] &= !bit;
+		if let Err(error) = unsafe { run_python_signal_handler(signalnum) } {
+			restore_pending_words(words);
+			return Err(error);
+		}
+	}
+	Ok(())
+}
+
+fn take_pending_words() -> [u64; PENDING_WORDS] {
+	PENDING_SIGNAL_FLAG.store(false, Ordering::Relaxed);
+	let mut words = [0; PENDING_WORDS];
+	for (index, word) in PENDING_SIGNALS.iter().enumerate() {
+		words[index] = word.swap(0, Ordering::AcqRel);
+	}
+	words
+}
+
+fn restore_pending_words(words: [u64; PENDING_WORDS]) {
+	let mut restored = false;
+	for (index, bits) in words.into_iter().enumerate() {
+		if bits != 0 {
+			PENDING_SIGNALS[index].fetch_or(bits, Ordering::AcqRel);
+			restored = true;
+		}
+	}
+	if restored {
+		PENDING_SIGNAL_FLAG.store(true, Ordering::Release);
+	}
+}
+
+unsafe fn run_python_signal_handler(signalnum: usize) -> Result<(), *mut PyObject> {
+	let slot = handlers_lock()[signalnum];
+	match slot {
+		StoredHandler::Object(handler) => {
+			let signal_object = unsafe { pon_const_int(signalnum as i64) };
+			if signal_object.is_null() {
+				return Err(std::ptr::null_mut());
+			}
+			let frame = unsafe { crate::abi::pon_none() };
+			if frame.is_null() {
+				return Err(std::ptr::null_mut());
+			}
+			let mut args = [signal_object, frame];
+			let result =
+				unsafe { pon_call(handler as *mut PyObject, args.as_mut_ptr(), args.len()) };
+			if result.is_null() {
+				Err(std::ptr::null_mut())
+			} else {
+				Ok(())
+			}
+		},
+		StoredHandler::Dfl
+			if signalnum == libc::SIGINT as usize
+				&& DEFAULT_SIGINT_ACTIVE.load(Ordering::Relaxed) =>
+		{
+			Err(raise_kind_error_no_args(ExceptionKind::KeyboardInterrupt))
+		},
+		StoredHandler::Dfl | StoredHandler::Ign => Ok(()),
+	}
+}
+
+extern "C" fn signal_trampoline(signalnum: libc::c_int) {
+	mark_signal_pending(signalnum);
+}
+
+fn mark_signal_pending(signalnum: libc::c_int) {
+	let Ok(signalnum) = usize::try_from(signalnum) else {
+		return;
+	};
+	if signalnum == 0 || signalnum >= NSIG as usize {
+		return;
+	}
+	let Some((word, bit)) = signal_bit(signalnum) else {
+		return;
+	};
+	PENDING_SIGNALS[word].fetch_or(bit, Ordering::Relaxed);
+	PENDING_SIGNAL_FLAG.store(true, Ordering::Relaxed);
+
+	let fd = WAKEUP_FD.load(Ordering::Relaxed);
+	if fd >= 0 {
+		let byte = [signalnum as u8];
+		unsafe {
+			let _ = libc::write(fd, byte.as_ptr().cast::<libc::c_void>(), byte.len());
+		}
+	}
+}
+
+fn signal_bit(signalnum: usize) -> Option<(usize, u64)> {
+	let word = signalnum / u64::BITS as usize;
+	let shift = signalnum % u64::BITS as usize;
+	(word < PENDING_WORDS).then_some((word, 1_u64 << shift))
+}
+
+fn install_signal_disposition(signalnum: usize, handler: StoredHandler) -> Result<(), i32> {
+	match handler {
+		StoredHandler::Dfl => install_sigaction(signalnum, libc::SIG_DFL, 0),
+		StoredHandler::Ign => install_sigaction(signalnum, libc::SIG_IGN, 0),
+		StoredHandler::Object(_) => install_signal_trampoline(signalnum),
+	}
+}
+
+fn install_signal_trampoline(signalnum: usize) -> Result<(), i32> {
+	install_sigaction(signalnum, signal_trampoline as *const () as libc::sighandler_t, 0)
+}
+
+fn install_sigaction(
+	signalnum: usize,
+	handler: libc::sighandler_t,
+	flags: libc::c_int,
+) -> Result<(), i32> {
+	let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+	action.sa_sigaction = handler;
+	action.sa_flags = flags;
+	unsafe { libc::sigemptyset(&mut action.sa_mask) };
+	if unsafe { libc::sigaction(signalnum as libc::c_int, &action, std::ptr::null_mut()) } != 0 {
+		Err(last_errno())
+	} else {
+		Ok(())
+	}
+}
+
+fn errno_message(errno: i32) -> String {
+	unsafe { std::ffi::CStr::from_ptr(libc::strerror(errno)) }
+		.to_string_lossy()
+		.into_owned()
+}
+
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
+	init_main_thread_signal_handlers()?;
 	let name = "_signal";
 	// SAFETY: Runtime allocation helper; NULL is checked below.
 	let name_obj = unsafe { crate::abi::pon_const_str(name.as_ptr(), name.len()) };
@@ -187,6 +390,8 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 	attrs.push(int_attr("SIG_IGN", SIG_IGN)?);
 	attrs.push(int_attr("NSIG", NSIG)?);
 	attrs.push((intern("ItimerError"), itimer_error_type().cast::<PyObject>()));
+	#[cfg(target_os = "linux")]
+	attrs.push((intern("struct_siginfo"), siginfo_result_type().cast::<PyObject>()));
 	let default_int_handler = function_attr("default_int_handler", signal_default_int_handler)?;
 	// CPython's module init registers `default_int_handler` for SIGINT; the
 	// table mirrors that so `getsignal(SIGINT)` observes it at startup.
@@ -205,6 +410,8 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 	attrs.push(function_attr("siginterrupt", signal_siginterrupt)?);
 	attrs.push(function_attr("sigpending", signal_sigpending)?);
 	attrs.push(function_attr("sigwait", signal_sigwait)?);
+	#[cfg(target_os = "linux")]
+	attrs.push(function_attr("sigwaitinfo", signal_sigwaitinfo)?);
 	attrs.push(function_attr("strsignal", signal_strsignal)?);
 	attrs.push(function_attr("valid_signals", signal_valid_signals)?);
 	install_module(name, attrs)
@@ -310,6 +517,12 @@ unsafe extern "C" fn signal_signal(argv: *mut *mut PyObject, argc: usize) -> *mu
 			StoredHandler::Object(handler as usize)
 		},
 	};
+	if let Err(errno) = install_signal_disposition(signalnum, new_slot) {
+		return raise_errno_text(errno);
+	}
+	if signalnum == libc::SIGINT as usize {
+		DEFAULT_SIGINT_ACTIVE.store(false, Ordering::Release);
+	}
 	let previous = {
 		let mut table = handlers_lock();
 		core::mem::replace(&mut table[signalnum], new_slot)
@@ -409,15 +622,27 @@ unsafe extern "C" fn signal_pause(_argv: *mut *mut PyObject, argc: usize) -> *mu
 	if argc != 0 {
 		return return_null_with_error(format!("pause() takes no arguments ({argc} given)"));
 	}
-	let result = unsafe { libc::pause() };
-	if result == -1 {
-		let errno = last_errno();
-		if errno == libc::EINTR {
-			return unsafe { crate::abi::pon_none() };
+	loop {
+		crate::sync::enter_blocking_region();
+		let result = unsafe { libc::pause() };
+		let leave_result = crate::sync::leave_blocking_region();
+		if crate::thread_state::pon_err_occurred() {
+			return std::ptr::null_mut();
 		}
-		return raise_errno_text(errno);
+		if let Err(message) = leave_result {
+			return return_null_with_error(message);
+		}
+		if result == -1 {
+			let errno = last_errno();
+			if errno == libc::EINTR {
+				return match unsafe { process_pending_signals() } {
+					Ok(()) => unsafe { crate::abi::pon_none() },
+					Err(error) => error,
+				};
+			}
+			return raise_errno_text(errno);
+		}
 	}
-	unsafe { crate::abi::pon_none() }
 }
 
 unsafe extern "C" fn signal_pthread_kill(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -484,7 +709,10 @@ unsafe extern "C" fn signal_raise_signal(argv: *mut *mut PyObject, argc: usize) 
 	if unsafe { libc::raise(signalnum) } != 0 {
 		return raise_errno_text(last_errno());
 	}
-	unsafe { crate::abi::pon_none() }
+	match unsafe { process_pending_signals() } {
+		Ok(()) => unsafe { crate::abi::pon_none() },
+		Err(error) => error,
+	}
 }
 
 unsafe extern "C" fn signal_set_wakeup_fd(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -507,6 +735,18 @@ unsafe extern "C" fn signal_set_wakeup_fd(argv: *mut *mut PyObject, argc: usize)
 				37,
 			)
 		};
+	}
+	if fd != -1 {
+		let flags = unsafe { libc::fcntl(fd as libc::c_int, libc::F_GETFL) };
+		if flags == -1 {
+			return raise_errno_text(last_errno());
+		}
+		if flags & libc::O_NONBLOCK == 0 {
+			let message = format!("the fd {fd} must be in non-blocking mode");
+			return unsafe {
+				crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len())
+			};
+		}
 	}
 	let previous = WAKEUP_FD.swap(fd as i32, Ordering::SeqCst);
 	unsafe { pon_const_int(i64::from(previous)) }
@@ -571,11 +811,166 @@ unsafe extern "C" fn signal_sigwait(argv: *mut *mut PyObject, argc: usize) -> *m
 		Err(error) => return error,
 	};
 	let mut signum = 0;
-	let errno = unsafe { libc::sigwait(&set, &mut signum) };
-	if errno != 0 {
+	loop {
+		crate::sync::enter_blocking_region();
+		let errno = unsafe { libc::sigwait(&set, &mut signum) };
+		let leave_result = crate::sync::leave_blocking_region();
+		if crate::thread_state::pon_err_occurred() {
+			return std::ptr::null_mut();
+		}
+		if let Err(message) = leave_result {
+			return return_null_with_error(message);
+		}
+		if errno == 0 {
+			return unsafe { pon_const_int(i64::from(signum)) };
+		}
+		if errno == libc::EINTR {
+			if let Err(error) = unsafe { process_pending_signals() } {
+				return error;
+			}
+			continue;
+		}
 		return raise_errno_text(errno);
 	}
-	unsafe { pon_const_int(i64::from(signum)) }
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn signal_sigwaitinfo(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	if argc != 1 || argv.is_null() {
+		return return_null_with_error(format!(
+			"sigwaitinfo() takes exactly 1 argument ({argc} given)"
+		));
+	}
+	let set = match signal_set_arg(unsafe { *argv }, "sigwaitinfo") {
+		Ok(Some(set)) => set,
+		Ok(None) => {
+			return unsafe {
+				crate::abi::exc::pon_raise_type_error(
+					b"sigwaitinfo() arg must be an iterable of signals".as_ptr(),
+					47,
+				)
+			};
+		},
+		Err(error) => return error,
+	};
+	loop {
+		let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+		crate::sync::enter_blocking_region();
+		let signalnum = unsafe { libc::sigwaitinfo(&set, info.as_mut_ptr()) };
+		let leave_result = crate::sync::leave_blocking_region();
+		if crate::thread_state::pon_err_occurred() {
+			return std::ptr::null_mut();
+		}
+		if let Err(message) = leave_result {
+			return return_null_with_error(message);
+		}
+		if signalnum >= 0 {
+			return siginfo_result_object(&unsafe { info.assume_init() });
+		}
+		let errno = last_errno();
+		if errno == libc::EINTR {
+			if let Err(error) = unsafe { process_pending_signals() } {
+				return error;
+			}
+			continue;
+		}
+		return raise_errno_text(errno);
+	}
+}
+
+#[cfg(target_os = "linux")]
+const SIGINFO_FIELDS: [&str; 7] = [
+	"si_signo",
+	"si_code",
+	"si_errno",
+	"si_pid",
+	"si_uid",
+	"si_status",
+	"si_band",
+];
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct PySiginfoResult {
+	ob_base: crate::object::PyObjectHeader,
+	values:  [i64; 7],
+}
+
+#[cfg(target_os = "linux")]
+static SIGINFO_SEQUENCE: std::sync::LazyLock<crate::object::PySequenceMethods> =
+	std::sync::LazyLock::new(|| crate::object::PySequenceMethods {
+		sq_length: Some(siginfo_result_len),
+		sq_item: Some(siginfo_result_item),
+		..crate::object::PySequenceMethods::EMPTY
+	});
+
+#[cfg(target_os = "linux")]
+fn siginfo_result_type() -> *mut PyType {
+	static TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+		let mut ty = PyType::new(
+			crate::abi::runtime_type_type().cast_const(),
+			"signal.struct_siginfo",
+			std::mem::size_of::<PySiginfoResult>(),
+		);
+		ty.tp_as_sequence = &*SIGINFO_SEQUENCE as *const crate::object::PySequenceMethods
+			as *mut crate::object::PySequenceMethods;
+		ty.tp_getattro = Some(siginfo_result_getattro);
+		Box::into_raw(Box::new(ty)) as usize
+	});
+	*TYPE as *mut PyType
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn siginfo_result_len(_object: *mut PyObject) -> isize {
+	SIGINFO_FIELDS.len() as isize
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn siginfo_result_item(object: *mut PyObject, index: isize) -> *mut PyObject {
+	if index < 0 || index as usize >= SIGINFO_FIELDS.len() {
+		return crate::abi::exc::raise_kind_error_text(
+			ExceptionKind::IndexError,
+			"struct_siginfo index out of range",
+		);
+	}
+	let result = object.cast::<PySiginfoResult>();
+	unsafe { pon_const_int((*result).values[index as usize]) }
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn siginfo_result_getattro(
+	object: *mut PyObject,
+	name: *mut PyObject,
+) -> *mut PyObject {
+	let name = crate::tag::untag_arg(name);
+	let Some(name_text) = (unsafe { crate::types::type_::unicode_text(name) }) else {
+		return crate::abi::exc::raise_kind_error_text(
+			ExceptionKind::TypeError,
+			"attribute name must be str",
+		);
+	};
+	if let Some(index) = SIGINFO_FIELDS.iter().position(|field| *field == name_text) {
+		return unsafe { siginfo_result_item(object, index as isize) };
+	}
+	unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) }
+}
+
+#[cfg(target_os = "linux")]
+fn siginfo_result_object(info: &libc::siginfo_t) -> *mut PyObject {
+	let values = [
+		i64::from(info.si_signo),
+		i64::from(info.si_code),
+		i64::from(info.si_errno),
+		unsafe { info.si_pid() } as i64,
+		unsafe { info.si_uid() } as i64,
+		unsafe { info.si_status() } as i64,
+		0,
+	];
+	Box::into_raw(Box::new(PySiginfoResult {
+		ob_base: crate::object::PyObjectHeader::new(siginfo_result_type()),
+		values,
+	}))
+	.cast::<PyObject>()
 }
 
 unsafe extern "C" fn signal_strsignal(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {

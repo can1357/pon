@@ -14,10 +14,13 @@ use crate::error::{Error, Result};
 /// Hash verification mode for an artifact download.
 #[derive(Debug)]
 pub enum HashPolicy<'a> {
-	/// Verify against index-provided hashes when a sha256 digest is present.
+	/// Verify against index-provided hashes.
 	///
-	/// If the index provided no sha256 digest, the artifact is accepted.
-	Index(&'a BTreeMap<String, String>),
+	/// A sha256 digest is required unless `allow_unhashed` is true.
+	Index {
+		hashes: &'a BTreeMap<String, String>,
+		allow_unhashed: bool,
+	},
 	/// Require the artifact to match one of the provided `algo:hex` hashes.
 	///
 	/// Only `sha256` is supported. Unsupported algorithms are rejected before
@@ -185,14 +188,22 @@ struct ExpectedHashes {
 
 fn expected_hashes(policy: &HashPolicy<'_>) -> Result<Option<ExpectedHashes>> {
 	match policy {
-		HashPolicy::Index(hashes) => {
+		HashPolicy::Index { hashes, allow_unhashed } => {
 			let sha256 = hashes
 				.iter()
 				.filter(|(algorithm, _)| algorithm.eq_ignore_ascii_case("sha256"))
 				.map(|(_, hash)| hash.to_owned())
 				.collect::<Vec<_>>();
 			if sha256.is_empty() {
-				Ok(None)
+				if *allow_unhashed {
+					Ok(None)
+				} else {
+					Err(Error::Index(
+						"artifact has no sha256 hash; pass --allow-unhashed to accept unhashed \
+						 downloads"
+							.to_owned(),
+					))
+				}
 			} else {
 				Ok(Some(ExpectedHashes { display: display_hashes(&sha256), sha256 }))
 			}
@@ -319,5 +330,34 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
 		Ok(()) => Ok(()),
 		Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
 		Err(error) => Err(Error::from(error)),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn index_hash_policy_requires_sha256_by_default() {
+		let hashes = BTreeMap::new();
+		let error = expected_hashes(&HashPolicy::Index {
+			hashes: &hashes,
+			allow_unhashed: false,
+		})
+		.expect_err("missing index hash must be rejected");
+
+		assert!(error.to_string().contains("has no sha256 hash"));
+	}
+
+	#[test]
+	fn index_hash_policy_can_explicitly_allow_unhashed_artifacts() {
+		let hashes = BTreeMap::new();
+		let expected = expected_hashes(&HashPolicy::Index {
+			hashes: &hashes,
+			allow_unhashed: true,
+		})
+		.expect("allow unhashed");
+
+		assert_eq!(expected, None);
 	}
 }

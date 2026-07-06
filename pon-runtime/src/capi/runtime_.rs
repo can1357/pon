@@ -175,6 +175,7 @@ unsafe impl Sync for PyThreadState {}
 /// GC id for C-API-created code objects.  It lives in the C-extension carrier
 /// range next to the other capi-only heap payloads.
 const TYPE_ID_CAPI_CODE: TypeId = TypeId(143);
+const TYPE_ID_CAPI_CAPSULE: TypeId = TypeId(144);
 
 #[repr(C)]
 struct PyCapiCodeObject {
@@ -317,7 +318,8 @@ pub(crate) fn build() -> PyPonCapiRuntime {
 #[must_use]
 pub(crate) fn capsule_type() -> *mut PyType {
 	static CAPSULE_TYPE: LazyLock<usize> = LazyLock::new(|| {
-		let ty = PyType::new(ptr::null(), "PyCapsule", mem::size_of::<PyCapsule>());
+		let mut ty = PyType::new(ptr::null(), "PyCapsule", mem::size_of::<PyCapsule>());
+		ty.gc_type_id = TYPE_ID_CAPI_CAPSULE.0 as usize;
 		Box::into_raw(Box::new(ty)) as usize
 	});
 	*CAPSULE_TYPE as *mut PyType
@@ -387,14 +389,35 @@ unsafe extern "C" fn capi_eval_get_builtins() -> *mut PyObject {
 	unsafe { capi_module_get_dict(builtins) }
 }
 
-unsafe extern "C" fn capi_frame_get_back(_frame: *mut c_void) -> *mut c_void {
-	raise_system_error("PyFrame_GetBack is not implemented: Pon exposes no C-visible frame objects");
-	ptr::null_mut()
+unsafe extern "C" fn capi_frame_get_back(frame: *mut c_void) -> *mut c_void {
+	if frame.is_null() {
+		raise_system_error("PyFrame_GetBack called with NULL frame");
+		return ptr::null_mut();
+	}
+	let back = crate::types::frame::frame_get_back_for_capi(frame.cast::<PyObject>());
+	if back.is_null() {
+		ptr::null_mut()
+	} else {
+		new_reference(back).cast::<c_void>()
+	}
 }
 
-unsafe extern "C" fn capi_frame_get_code(_frame: *mut c_void) -> *mut c_void {
-	raise_system_error("PyFrame_GetCode is not implemented: Pon exposes no C-visible frame objects");
-	ptr::null_mut()
+unsafe extern "C" fn capi_frame_get_code(frame: *mut c_void) -> *mut c_void {
+	if frame.is_null() {
+		raise_system_error("PyFrame_GetCode called with NULL frame");
+		return ptr::null_mut();
+	}
+	let frame = frame.cast::<abi::PyFrame>();
+	let code = unsafe { (*frame).parent };
+	if !code.is_null() && unsafe { is_capi_code_object(code) } {
+		return new_reference(code).cast::<c_void>();
+	}
+	let code = crate::types::frame::frame_get_code_for_capi(frame.cast::<PyObject>());
+	if code.is_null() {
+		ptr::null_mut()
+	} else {
+		new_reference(code).cast::<c_void>()
+	}
 }
 
 unsafe extern "C" fn capi_frame_new(
@@ -426,6 +449,7 @@ unsafe extern "C" fn capi_frame_new(
 	unsafe {
 		ptr::write(frame, abi::PyFrame::new(frame_type.cast_const(), 0, ptr::null_mut()));
 		(*frame).line = line;
+		(*frame).parent = code.cast::<PyObject>();
 	}
 	new_reference(frame.cast::<PyObject>()).cast::<c_void>()
 }
@@ -599,6 +623,13 @@ fn capi_code_type() -> *mut PyType {
 		Box::into_raw(Box::new(ty)) as usize
 	});
 	*CODE_TYPE as *mut PyType
+}
+
+unsafe fn is_capi_code_object(object: *mut PyObject) -> bool {
+	if object.is_null() || crate::tag::is_small_int(object) || !crate::tag::is_heap(object) {
+		return false;
+	}
+	unsafe { (*object).ob_type == capi_code_type().cast_const() }
 }
 
 unsafe extern "C" fn capi_code_getattro(
@@ -792,8 +823,8 @@ fn build_datetime_capi() -> Result<PyDateTimeCapi, String> {
 		time_from_time: capi_datetime_time_from_time,
 		delta_from_delta: capi_datetime_delta_from_delta,
 		timezone_from_timezone: capi_datetime_unsupported_timezone_from_timezone,
-		datetime_from_timestamp: capi_datetime_unsupported_datetime_from_timestamp,
-		date_from_timestamp: capi_datetime_unsupported_date_from_timestamp,
+		datetime_from_timestamp: capi_datetime_datetime_from_timestamp,
+		date_from_timestamp: capi_datetime_date_from_timestamp,
 		datetime_from_date_and_time_and_fold: capi_datetime_datetime_from_date_and_time_and_fold,
 		time_from_time_and_fold: capi_datetime_time_from_time_and_fold,
 	};
@@ -1614,26 +1645,181 @@ unsafe extern "C" fn capi_datetime_unsupported_timezone_from_timezone(
 	ptr::null_mut()
 }
 
-unsafe extern "C" fn capi_datetime_unsupported_datetime_from_timestamp(
-	_cls: *mut PyObject,
-	_args: *mut PyObject,
-	_kwargs: *mut PyObject,
+unsafe extern "C" fn capi_datetime_datetime_from_timestamp(
+	cls: *mut PyObject,
+	args: *mut PyObject,
+	kwargs: *mut PyObject,
 ) -> *mut PyObject {
-	raise_not_implemented(
-		"PyDateTimeAPI->DateTime_FromTimestamp is not implemented by Pon's numpy datetime C-API \
-		 surface",
-	);
-	ptr::null_mut()
+	if !kwargs.is_null() && kwargs != unsafe { abi::pon_none() } {
+		raise_not_implemented(
+			"PyDateTimeAPI->DateTime_FromTimestamp with keyword arguments is not implemented",
+		);
+		return ptr::null_mut();
+	}
+	let Some(cls) =
+		(unsafe { datetime_type_arg(cls, datetime_datetime_type(), "DateTime_FromTimestamp") })
+	else {
+		return ptr::null_mut();
+	};
+	let Some((timestamp, tzinfo)) =
+		(unsafe { datetime_timestamp_args(args, true, "DateTime_FromTimestamp") })
+	else {
+		return ptr::null_mut();
+	};
+	let Some(parts) = timestamp_to_parts(timestamp, tzinfo == datetime_utc()) else {
+		return ptr::null_mut();
+	};
+	alloc_datetime_datetime(
+		cls,
+		parts.year,
+		parts.month,
+		parts.day,
+		parts.hour,
+		parts.minute,
+		parts.second,
+		parts.microsecond,
+		0,
+		tzinfo,
+	)
 }
 
-unsafe extern "C" fn capi_datetime_unsupported_date_from_timestamp(
-	_cls: *mut PyObject,
-	_args: *mut PyObject,
+unsafe extern "C" fn capi_datetime_date_from_timestamp(
+	cls: *mut PyObject,
+	args: *mut PyObject,
 ) -> *mut PyObject {
-	raise_not_implemented(
-		"PyDateTimeAPI->Date_FromTimestamp is not implemented by Pon's numpy datetime C-API surface",
-	);
-	ptr::null_mut()
+	let Some(cls) = (unsafe { datetime_type_arg(cls, datetime_date_type(), "Date_FromTimestamp") })
+	else {
+		return ptr::null_mut();
+	};
+	let Some((timestamp, _tzinfo)) =
+		(unsafe { datetime_timestamp_args(args, false, "Date_FromTimestamp") })
+	else {
+		return ptr::null_mut();
+	};
+	let Some(parts) = timestamp_to_parts(timestamp, false) else {
+		return ptr::null_mut();
+	};
+	alloc_datetime_date(cls, parts.year, parts.month, parts.day)
+}
+
+struct TimestampParts {
+	year:        c_int,
+	month:       c_int,
+	day:         c_int,
+	hour:        c_int,
+	minute:      c_int,
+	second:      c_int,
+	microsecond: c_int,
+}
+
+unsafe fn datetime_type_arg(
+	cls: *mut PyObject,
+	default: *mut PyType,
+	symbol: &str,
+) -> Option<*mut PyType> {
+	if cls.is_null() {
+		return Some(default);
+	}
+	if let Some(native) = twin::registered_native_of_foreign(cls.cast::<ForeignTypeObject>()) {
+		return Some(native);
+	}
+	let cls = crate::tag::untag_arg(cls);
+	if !cls.is_null()
+		&& crate::tag::is_heap(cls)
+		&& unsafe { crate::types::type_::is_type_object(cls) }
+	{
+		return Some(cls.cast::<PyType>());
+	}
+	raise_type_error(&format!("PyDateTimeAPI->{symbol} received a non-type cls"));
+	None
+}
+
+unsafe fn datetime_timestamp_args(
+	args: *mut PyObject,
+	allow_tz: bool,
+	symbol: &str,
+) -> Option<(f64, *mut PyObject)> {
+	let positional = match unsafe { crate::types::type_::positional_args_from_object(args) } {
+		Ok(positional) => positional,
+		Err(message) => {
+			raise_type_error(&message);
+			return None;
+		},
+	};
+	let max = if allow_tz { 2 } else { 1 };
+	if positional.is_empty() || positional.len() > max {
+		raise_type_error(&format!(
+			"PyDateTimeAPI->{symbol} expected 1{} positional argument{}, got {}",
+			if allow_tz { " or 2" } else { "" },
+			if allow_tz { "s" } else { "" },
+			positional.len()
+		));
+		return None;
+	}
+	let timestamp = unsafe { timestamp_to_f64(positional[0]) }?;
+	let tzinfo = positional.get(1).copied().unwrap_or_else(|| unsafe { abi::pon_none() });
+	if tzinfo.is_null() {
+		return None;
+	}
+	if allow_tz && tzinfo != unsafe { abi::pon_none() } && tzinfo != datetime_utc() {
+		raise_not_implemented(
+			"PyDateTimeAPI->DateTime_FromTimestamp only supports tz=None or datetime.timezone.utc",
+		);
+		return None;
+	}
+	Some((timestamp, tzinfo))
+}
+
+unsafe fn timestamp_to_f64(object: *mut PyObject) -> Option<f64> {
+	let object = crate::tag::untag_arg(object);
+	if let Some(value) = unsafe { crate::types::float::to_f64(object) } {
+		return Some(value);
+	}
+	if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(object) } {
+		return value.to_f64().or_else(|| {
+			raise_type_error("timestamp is too large to convert to float");
+			None
+		});
+	}
+	raise_type_error("timestamp must be int or float");
+	None
+}
+
+fn timestamp_to_parts(timestamp: f64, utc: bool) -> Option<TimestampParts> {
+	if !timestamp.is_finite() {
+		raise_value_error("timestamp out of range for platform time_t");
+		return None;
+	}
+	let mut seconds = timestamp.floor();
+	let mut microsecond = ((timestamp - seconds) * 1_000_000.0).round() as c_int;
+	if microsecond >= 1_000_000 {
+		seconds += 1.0;
+		microsecond -= 1_000_000;
+	}
+	if seconds < libc::time_t::MIN as f64 || seconds > libc::time_t::MAX as f64 {
+		raise_value_error("timestamp out of range for platform time_t");
+		return None;
+	}
+	let time = seconds as libc::time_t;
+	let mut out: libc::tm = unsafe { mem::zeroed() };
+	let tm = if utc {
+		unsafe { libc::gmtime_r(&time, &mut out) }
+	} else {
+		unsafe { libc::localtime_r(&time, &mut out) }
+	};
+	if tm.is_null() {
+		raise_value_error("timestamp out of range for platform time conversion");
+		return None;
+	}
+	Some(TimestampParts {
+		year:        out.tm_year + 1900,
+		month:       out.tm_mon + 1,
+		day:         out.tm_mday,
+		hour:        out.tm_hour,
+		minute:      out.tm_min,
+		second:      out.tm_sec,
+		microsecond,
+	})
 }
 
 unsafe extern "C" fn capi_capsule_new(
@@ -1645,16 +1831,39 @@ unsafe extern "C" fn capi_capsule_new(
 		raise_value_error("PyCapsule_New called with null pointer");
 		return ptr::null_mut();
 	}
-	new_reference(
-		Box::into_raw(Box::new(PyCapsule {
+	let info = GcTypeInfo {
+		size:     mem::size_of::<PyCapsule>(),
+		trace:    trace_capsule,
+		finalize: Some(finalize_capsule),
+	};
+	let block = match abi::alloc_gc_object(TYPE_ID_CAPI_CAPSULE, info) {
+		Ok(block) => block,
+		Err(message) => return raise_system_error_null(&message),
+	};
+	let capsule = block.cast::<PyCapsule>();
+	unsafe {
+		ptr::write(capsule, PyCapsule {
 			ob_base: PyObjectHeader::new(capsule_type()),
 			pointer,
 			name,
 			destructor,
 			context: ptr::null_mut(),
-		}))
-		.cast::<PyObject>(),
-	)
+		});
+	}
+	new_reference(capsule.cast::<PyObject>())
+}
+
+unsafe extern "C" fn trace_capsule(_object: *mut u8, _visitor: &mut dyn FnMut(*mut u8)) {}
+
+unsafe extern "C" fn finalize_capsule(object: *mut u8) {
+	if object.is_null() {
+		return;
+	}
+	let capsule = unsafe { &mut *object.cast::<PyCapsule>() };
+	let Some(destructor) = capsule.destructor.take() else {
+		return;
+	};
+	unsafe { destructor(object.cast::<PyObject>()) };
 }
 
 unsafe extern "C" fn capi_capsule_get_pointer(
@@ -2095,6 +2304,13 @@ mod tests {
 
 static int capsule_payload = 123;
 static int capsule_context = 19;
+static int capsule_destructor_count = 0;
+
+static void capsule_destructor(PyObject *capsule) {
+    if (PyCapsule_CheckExact(capsule)) {
+        capsule_destructor_count += 1;
+    }
+}
 
 static PyObject *fail(const char *message) {
     PyErr_SetString(PyExc_RuntimeError, message);
@@ -2133,6 +2349,18 @@ static PyObject *capsule_roundtrip(PyObject *self, PyObject *args) {
         return NULL;
     }
     return PyLong_FromLong(*payload);
+}
+
+static PyObject *make_destructor_capsule(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    return PyCapsule_New(&capsule_payload, "pon.runtime.destructor", capsule_destructor);
+}
+
+static PyObject *destructor_count(PyObject *self, PyObject *args) {
+    (void)self;
+    (void)args;
+    return PyLong_FromLong(capsule_destructor_count);
 }
 
 static PyObject *format_error_value(PyObject *self, PyObject *args) {
@@ -2214,6 +2442,8 @@ static PyObject *import_sys_maxsize(PyObject *self, PyObject *args) {
 
 static PyMethodDef methods[] = {
     {"capsule_roundtrip", capsule_roundtrip, METH_NOARGS, "exercise capsules"},
+    {"make_destructor_capsule", make_destructor_capsule, METH_NOARGS, "create a capsule with a destructor"},
+    {"destructor_count", destructor_count, METH_NOARGS, "report destructor calls"},
     {"format_error_value", format_error_value, METH_NOARGS, "return a fetched formatted error value"},
     {"exception_matches_subclass", exception_matches_subclass, METH_NOARGS, "exercise exception subclass matching"},
     {"thread_bracket", thread_bracket, METH_NOARGS, "exercise thread no-op brackets"},
@@ -2249,6 +2479,11 @@ PyMODINIT_FUNC PyInit_capi_runtime_test_ext(void) {
 		let message = unsafe { (*value.cast::<PyBaseException>()).message };
 		assert_eq!(format_object_for_print(message).as_deref(), Ok("bad thing -7 8 9 X %"));
 
+		create_and_drop_destructor_capsule(module_name);
+		crate::abi::collect().expect("first collect");
+		crate::abi::collect().expect("second collect");
+		assert_noargs_text(module_name, "destructor_count", "1");
+
 		reset_import_state_for_tests();
 	}
 
@@ -2266,6 +2501,8 @@ PyMODINIT_FUNC PyInit_capi_runtime_test_ext(void) {
 			"capi_runtime_structural_ext",
 			r#"
 #include <Python.h>
+#include <frameobject.h>
+#include <traceback.h>
 
 enum {
     THREAD_STATE_STABLE = 1L << 0,
@@ -2279,7 +2516,10 @@ enum {
     CONTEXTVAR_NULL_DEFAULT = 1L << 8,
     BUILTINS_LEN = 1L << 9,
     FRAME_BACK_SYSTEM_ERROR = 1L << 10,
-    FRAME_CODE_SYSTEM_ERROR = 1L << 11
+    FRAME_CODE_SYSTEM_ERROR = 1L << 11,
+    FRAME_NEW_CODE_ROUNDTRIP = 1L << 12,
+    FRAME_NEW_BACK_NULL = 1L << 13,
+    TRACEBACK_HERE_PRESERVES_EXCEPTION = 1L << 14
 };
 
 static PyObject *runtime_structural_mask(PyObject *self, PyObject *args) {
@@ -2368,6 +2608,47 @@ static PyObject *runtime_structural_mask(PyObject *self, PyObject *args) {
     }
     PyErr_Clear();
 
+    PyCodeObject *made_code = PyCode_NewEmpty("capi_file.py", "capi_func", 123);
+    PyFrameObject *made_frame = made_code == NULL ? NULL : PyFrame_New(first, made_code, NULL, NULL);
+    PyCodeObject *roundtrip_code = made_frame == NULL ? NULL : PyFrame_GetCode(made_frame);
+    if (made_code != NULL && made_frame != NULL && roundtrip_code == made_code) {
+        mask |= FRAME_NEW_CODE_ROUNDTRIP;
+    } else if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+    Py_XDECREF(roundtrip_code);
+
+    PyFrameObject *made_back = made_frame == NULL ? NULL : PyFrame_GetBack(made_frame);
+    if (made_frame != NULL && made_back == NULL && PyErr_Occurred() == NULL) {
+        mask |= FRAME_NEW_BACK_NULL;
+    } else if (PyErr_Occurred() != NULL) {
+        PyErr_Clear();
+    }
+    Py_XDECREF(made_back);
+
+    if (made_frame != NULL) {
+        made_frame->f_lineno = 321;
+        PyErr_SetString(PyExc_ValueError, "traceback marker");
+        if (PyTraceBack_Here(made_frame) == 0 && PyErr_ExceptionMatches(PyExc_ValueError)) {
+            PyObject *ptype = NULL;
+            PyObject *pvalue = NULL;
+            PyObject *ptb = NULL;
+            PyErr_Fetch(&ptype, &pvalue, &ptb);
+            if (ptype != NULL
+                    && PyErr_GivenExceptionMatches(ptype, PyExc_ValueError)
+                    && ptb != NULL) {
+                mask |= TRACEBACK_HERE_PRESERVES_EXCEPTION;
+            }
+            Py_XDECREF(ptype);
+            Py_XDECREF(pvalue);
+            Py_XDECREF(ptb);
+        } else {
+            PyErr_Clear();
+        }
+    }
+    Py_XDECREF(made_frame);
+    Py_XDECREF(made_code);
+
     if (PyErr_Occurred() != NULL) {
         return NULL;
     }
@@ -2400,7 +2681,7 @@ PyMODINIT_FUNC PyInit_capi_runtime_structural_ext(void) {
 		assert!(!module.is_null(), "extension loader returned NULL module");
 
 		let module_name = intern("capi_runtime_structural_ext");
-		assert_noargs_text(module_name, "runtime_structural_mask", "4095");
+		assert_noargs_text(module_name, "runtime_structural_mask", "16383");
 
 		reset_import_state_for_tests();
 	}
@@ -2439,7 +2720,10 @@ enum {
     TIME_CHECKS = 1L << 14,
     UTC_TZINFO = 1L << 15,
     CAPSULE_DIRECT = 1L << 16,
-    EXACT_CHECKS = 1L << 17
+    EXACT_CHECKS = 1L << 17,
+    DATETIME_FROM_TIMESTAMP_LOCAL = 1L << 18,
+    DATE_FROM_TIMESTAMP_LOCAL = 1L << 19,
+    DATETIME_FROM_TIMESTAMP_UTC = 1L << 20
 };
 
 static void clear_unexpected_error(void) {
@@ -2583,6 +2867,44 @@ static PyObject *datetime_mask(PyObject *self, PyObject *args) {
         clear_unexpected_error();
     }
 
+
+    PyObject *epoch = PyLong_FromLong(0);
+    PyObject *timestamp_args = epoch == NULL ? NULL : PyTuple_Pack(1, epoch);
+    PyObject *timestamp_dt = timestamp_args == NULL ? NULL : PyDateTime_FromTimestamp(timestamp_args);
+    if (timestamp_dt != NULL && PyDateTime_CheckExact(timestamp_dt)) {
+        mask |= DATETIME_FROM_TIMESTAMP_LOCAL;
+    } else {
+        clear_unexpected_error();
+    }
+
+    PyObject *timestamp_date = timestamp_args == NULL ? NULL : PyDate_FromTimestamp(timestamp_args);
+    if (timestamp_date != NULL && PyDate_CheckExact(timestamp_date) && !PyDateTime_CheckExact(timestamp_date)) {
+        mask |= DATE_FROM_TIMESTAMP_LOCAL;
+    } else {
+        clear_unexpected_error();
+    }
+
+    PyObject *utc_args = epoch == NULL ? NULL : PyTuple_Pack(2, epoch, PyDateTime_TimeZone_UTC);
+    PyObject *utc_dt = utc_args == NULL ? NULL
+        : PyDateTimeAPI->DateTime_FromTimestamp((PyObject *)PyDateTimeAPI->DateTimeType, utc_args, NULL);
+    if (utc_dt != NULL
+            && PyDateTime_CheckExact(utc_dt)
+            && PyDateTime_GET_YEAR(utc_dt) == 1970
+            && PyDateTime_GET_MONTH(utc_dt) == 1
+            && PyDateTime_GET_DAY(utc_dt) == 1
+            && PyDateTime_DATE_GET_HOUR(utc_dt) == 0
+            && PyDateTime_DATE_GET_MINUTE(utc_dt) == 0
+            && PyDateTime_DATE_GET_SECOND(utc_dt) == 0) {
+        mask |= DATETIME_FROM_TIMESTAMP_UTC;
+    } else {
+        clear_unexpected_error();
+    }
+    Py_XDECREF(utc_dt);
+    Py_XDECREF(utc_args);
+    Py_XDECREF(timestamp_date);
+    Py_XDECREF(timestamp_dt);
+    Py_XDECREF(timestamp_args);
+    Py_XDECREF(epoch);
     clear_unexpected_error();
     return PyLong_FromLong(mask);
 }
@@ -2611,9 +2933,15 @@ PyMODINIT_FUNC PyInit_capi_runtime_datetime_ext(void) {
 		assert!(!module.is_null(), "extension loader returned NULL module");
 
 		let module_name = intern("capi_runtime_datetime_ext");
-		assert_noargs_text(module_name, "datetime_mask", "262143");
+		assert_noargs_text(module_name, "datetime_mask", "2097151");
 
 		reset_import_state_for_tests();
+	}
+
+	#[inline(never)]
+	fn create_and_drop_destructor_capsule(module_name: u32) {
+		let capsule = call_noargs(module_name, "make_destructor_capsule");
+		assert!(!capsule.is_null(), "make_destructor_capsule returned NULL");
 	}
 
 	fn assert_noargs_text(module_name: u32, method_name: &str, expected: &str) {

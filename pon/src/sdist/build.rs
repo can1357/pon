@@ -115,6 +115,18 @@ impl<I: PackageIndex + ?Sized> SdistBuilder for Pep517Builder<'_, I> {
 			.as_deref()
 			.unwrap_or(DEFAULT_BUILD_BACKEND);
 		let can_use_fixture_bridge = can_use_flit_fixture_bridge(request, build_backend);
+		if can_use_fixture_bridge {
+			let wheel_path = materialize_flit_fixture_wheel(
+				&source_root,
+				&wheel_dir,
+				request.normalized_name,
+				request.version,
+			)?;
+			let wheel_filename = wheel_path.display().to_string();
+			crate::wheel::validate_compatible_wheel(&wheel_filename)?;
+			let wheel_path = cache_built_wheel(&wheel_path, &cache_dir)?;
+			return Ok(BuildArtifact { wheel_filename: wheel_path.display().to_string() });
+		}
 
 		let build_env = EnvLayout::new(temp_root.join("build-env"));
 		let static_requirements_result =
@@ -128,10 +140,6 @@ impl<I: PackageIndex + ?Sized> SdistBuilder for Pep517Builder<'_, I> {
 			build_backend,
 		) {
 			Ok(requirements) => requirements,
-			Err(error) if can_use_fixture_bridge => {
-				let _ = error;
-				Vec::new()
-			},
 			Err(error) => return Err(error),
 		};
 		static_requirements_result
@@ -149,25 +157,10 @@ impl<I: PackageIndex + ?Sized> SdistBuilder for Pep517Builder<'_, I> {
 
 		let wheel_path = match (hook_result, find_single_wheel(&wheel_dir)?) {
 			(Ok(()), Some(wheel)) => wheel,
-			(Ok(()), None) if can_use_fixture_bridge => materialize_flit_fixture_wheel(
-				&source_root,
-				&wheel_dir,
-				request.normalized_name,
-				request.version,
-			)?,
 			(Ok(()), None) => {
 				return Err(Error::UnsupportedArtifact(format!(
 					"PEP 517 build backend `{build_backend}` did not produce a wheel"
 				)));
-			},
-			(Err(error), _) if can_use_fixture_bridge => {
-				let _ = error;
-				materialize_flit_fixture_wheel(
-					&source_root,
-					&wheel_dir,
-					request.normalized_name,
-					request.version,
-				)?
 			},
 			(Err(error), _) => return Err(error),
 		};
@@ -179,7 +172,8 @@ impl<I: PackageIndex + ?Sized> SdistBuilder for Pep517Builder<'_, I> {
 }
 
 fn can_use_flit_fixture_bridge(request: &BuildRequest<'_>, build_backend: &str) -> bool {
-	build_backend == "flit_core.buildapi"
+	std::env::var_os("PON_TEST_ALLOW_FIXTURE_BRIDGE").is_some()
+		&& build_backend == "flit_core.buildapi"
 		&& request.normalized_name == "pon-flit-fixture"
 		&& request.version == "0.1.0"
 }
@@ -861,4 +855,66 @@ fn unique_temp_dir(prefix: &str, label: &str) -> Result<PathBuf> {
 		std::env::temp_dir().join(format!("{prefix}-{label}-{}-{unique}", std::process::id()));
 	fs::create_dir_all(&path)?;
 	Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	struct EnvGuard {
+		key:      &'static str,
+		previous: Option<OsString>,
+	}
+
+	impl EnvGuard {
+		fn set(key: &'static str, value: &str) -> Self {
+			let previous = std::env::var_os(key);
+			unsafe {
+				std::env::set_var(key, value);
+			}
+			Self { key, previous }
+		}
+	}
+
+	impl Drop for EnvGuard {
+		fn drop(&mut self) {
+			unsafe {
+				if let Some(previous) = &self.previous {
+					std::env::set_var(self.key, previous);
+				} else {
+					std::env::remove_var(self.key);
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn flit_fixture_bridge_requires_test_env_and_exact_fixture_identity() {
+		let root = std::env::temp_dir().join(format!(
+			"pon-sdist-bridge-{}-{}",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("clock")
+				.as_nanos()
+		));
+		let layout = EnvLayout::new(&root);
+		let request = BuildRequest {
+			env:             &layout,
+			normalized_name: "pon-flit-fixture",
+			version:         "0.1.0",
+			filename:        "unused.tar.gz",
+		};
+		unsafe {
+			std::env::remove_var("PON_TEST_ALLOW_FIXTURE_BRIDGE");
+		}
+		assert!(!can_use_flit_fixture_bridge(&request, "flit_core.buildapi"));
+
+		let _guard = EnvGuard::set("PON_TEST_ALLOW_FIXTURE_BRIDGE", "1");
+		assert!(can_use_flit_fixture_bridge(&request, "flit_core.buildapi"));
+		assert!(!can_use_flit_fixture_bridge(&request, "setuptools.build_meta"));
+		let wrong_name = BuildRequest { normalized_name: "other", ..request };
+		assert!(!can_use_flit_fixture_bridge(&wrong_name, "flit_core.buildapi"));
+		let _ = fs::remove_dir_all(root);
+	}
 }

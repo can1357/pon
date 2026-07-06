@@ -14,7 +14,8 @@ use pon_jit::JitEngine;
 use pon_runtime::{
 	PyObject,
 	dynexec::{
-		DynCodeMode, DynCompileRequest, DynExecuteRequest, set_ast_parse_hook, set_dynamic_code_hooks,
+		DynCodeMode, DynCompileRequest, DynExecuteRequest, decode_python_source, set_ast_parse_hook,
+		set_dynamic_code_hooks,
 	},
 	import::{
 		SourceModuleRequest, active_module_attr, begin_module_execution, cached_module,
@@ -169,8 +170,10 @@ fn run_file_inner_with_package(
 	argv: &[String],
 	main_package: Option<&str>,
 ) -> Result<()> {
-	let source = fs::read_to_string(path)
-		.with_context(|| format!("failed to read UTF-8 source `{}`", path.display()))?;
+	let bytes = fs::read(path).with_context(|| format!("failed to read source `{}`", path.display()))?;
+	let source = decode_python_source(&bytes, &path.to_string_lossy())
+		.map_err(anyhow::Error::msg)
+		.with_context(|| format!("failed to decode source `{}`", path.display()))?;
 	let mut script_path_guard = EnvOverlay::new();
 	// `pon -m` already placed the cwd at the head of the import path; only
 	// direct script runs prepend the script's own directory (CPython
@@ -218,6 +221,7 @@ pub(crate) fn boot_runtime(argv: &[String], stack_base_marker: *mut u8) -> Resul
 	if unsafe { pon_sys_set_argv(argv_ptrs.len() as i32, argv_ptrs.as_ptr()) } != 0 {
 		bail!("runtime initialization failed");
 	}
+	pon_runtime::import::process_site_pth_files();
 	Ok(())
 }
 
@@ -334,6 +338,7 @@ fn dynexec_single_source(source: &str) -> String {
 			"__pon_dyn_single_result = ({})\n",
 			"if __pon_dyn_single_result is not None:\n",
 			"    print(repr(__pon_dyn_single_result))\n",
+			"    _ = __pon_dyn_single_result\n",
 		),
 		source
 	);

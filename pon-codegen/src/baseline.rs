@@ -254,9 +254,7 @@ pub(crate) struct HelperFuncRefs {
 	pub(crate) none:                  FuncRef,
 	pub(crate) osr_poll:              FuncRef,
 	pub(crate) deopt_note:            FuncRef,
-	#[cfg(feature = "free-threading")]
 	pub(crate) safepoint_poll:        FuncRef,
-	#[cfg(feature = "free-threading")]
 	pub(crate) gc_write_barrier:      FuncRef,
 }
 
@@ -481,7 +479,7 @@ pub fn compile_function<M: Module>(
 		ir,
 		ptr_ty,
 	)?;
-	emit_safepoint_poll(&mut builder, &helper_refs);
+	emit_safepoint_poll(&mut builder, &helper_refs, exception_exit);
 
 	let block_map: Vec<(pon_ir::ir::BlockId, ir::Block)> = ir
 		.blocks
@@ -1127,9 +1125,7 @@ pub(crate) fn declare_helper_refs<M: Module>(
 		none: module.declare_func_in_func(helpers.none, func),
 		osr_poll: module.declare_func_in_func(helpers.osr_poll, func),
 		deopt_note: module.declare_func_in_func(helpers.deopt_note, func),
-		#[cfg(feature = "free-threading")]
 		safepoint_poll: module.declare_func_in_func(helpers.safepoint_poll, func),
-		#[cfg(feature = "free-threading")]
 		gc_write_barrier: module.declare_func_in_func(helpers.gc_write_barrier, func),
 	}
 }
@@ -2128,27 +2124,29 @@ fn store_stack_pyobject(
 ) {
 	builder.ins().stack_store(value, slot, offset);
 
-	#[cfg(feature = "free-threading")]
-	{
-		let slot_addr = builder.ins().stack_addr(ptr_ty, slot, offset);
-		builder
-			.ins()
-			.call(helpers.gc_write_barrier, &[slot_addr, value]);
-	}
-
-	#[cfg(not(feature = "free-threading"))]
-	{
-		let _ = (helpers, ptr_ty);
-	}
+	let slot_addr = builder.ins().stack_addr(ptr_ty, slot, offset);
+	builder
+		.ins()
+		.call(helpers.gc_write_barrier, &[slot_addr, value]);
 }
 
-#[cfg(feature = "free-threading")]
-pub(crate) fn emit_safepoint_poll(builder: &mut FunctionBuilder<'_>, helpers: &HelperFuncRefs) {
-	builder.ins().call(helpers.safepoint_poll, &[]);
+pub(crate) fn emit_safepoint_poll(
+	builder: &mut FunctionBuilder<'_>,
+	helpers: &HelperFuncRefs,
+	exception_exit: ir::Block,
+) {
+	let call = builder.ins().call(helpers.safepoint_poll, &[]);
+	let status = builder.func.dfg.inst_results(call)[0];
+	let ok = builder
+		.ins()
+		.icmp_imm(IntCC::SignedGreaterThanOrEqual, status, 0);
+	let continue_block = builder.create_block();
+	builder
+		.ins()
+		.brif(ok, continue_block, &[], exception_exit, &[]);
+	builder.switch_to_block(continue_block);
+	builder.seal_block(continue_block);
 }
-
-#[cfg(not(feature = "free-threading"))]
-pub(crate) fn emit_safepoint_poll(_builder: &mut FunctionBuilder<'_>, _helpers: &HelperFuncRefs) {}
 
 pub(crate) fn call_pyobject_helper(
 	builder: &mut FunctionBuilder<'_>,
@@ -2327,13 +2325,12 @@ mod tests {
 			pon_runtime::abi::CURRENT_LINE_SYMBOL,
 			pon_runtime::abi::current_line_cell_address(),
 		);
-		register_free_threading_symbols(&mut builder);
+		register_threading_symbols(&mut builder);
 		cranelift_jit::JITModule::new(builder)
 	}
 
-	#[cfg(feature = "free-threading")]
-	fn register_free_threading_symbols(builder: &mut cranelift_jit::JITBuilder) {
-		unsafe extern "C" fn safepoint_poll() {}
+	fn register_threading_symbols(builder: &mut cranelift_jit::JITBuilder) {
+		unsafe extern "C" fn safepoint_poll() -> i32 { 0 }
 		unsafe extern "C" fn write_barrier(
 			_slot: *mut *mut pon_runtime::object::PyObject,
 			_new: *mut pon_runtime::object::PyObject,
@@ -2347,9 +2344,6 @@ mod tests {
 		builder.symbol(crate::FT_GC_WRITE_BARRIER, write_barrier as *const u8);
 		builder.symbol(crate::FT_GC_STOP_REQUESTED, stop_requested as *const u8);
 	}
-
-	#[cfg(not(feature = "free-threading"))]
-	fn register_free_threading_symbols(_builder: &mut cranelift_jit::JITBuilder) {}
 
 	fn compiled_clif(ir_module: &IrModule, function_index: usize) -> String {
 		let mut module = jit_module();
@@ -2694,8 +2688,7 @@ mod tests {
 	}
 
 	#[test]
-	#[cfg(feature = "free-threading")]
-	fn free_threading_clif_polls_function_entry_and_loop_backedge() {
+	fn nogil_clif_polls_function_entry_and_loop_backedge() {
 		let ir = IrModule {
 			functions: vec![Function {
 				name:               "loop_poll".to_owned(),
@@ -2738,7 +2731,7 @@ mod tests {
 		let clif = compiled_clif(&ir, 0);
 
 		assert!(clif.contains(crate::FT_SAFEPOINT_POLL));
-		// `pon_safepoint_poll` is the unique zero-arg, no-return helper. Resolve
+		// `pon_safepoint_poll` is the unique zero-arg status helper. Resolve
 		// its CLIF func ref structurally so the assertion survives helper-table
 		// reordering (a hard-coded `fnN` breaks whenever a helper is inserted).
 		let poll_sig = clif
@@ -2746,10 +2739,10 @@ mod tests {
 			.find_map(|line| {
 				line.trim().strip_prefix("sig").and_then(|rest| {
 					let (num, tail) = rest.split_once(" = ")?;
-					(tail.starts_with("()") && !tail.contains("->")).then(|| num.to_owned())
+					tail.starts_with("() -> i32").then(|| num.to_owned())
 				})
 			})
-			.expect("a zero-arg no-return signature for pon_safepoint_poll");
+			.expect("a zero-arg i32 status signature for pon_safepoint_poll");
 		let poll_fn = clif
 			.lines()
 			.find_map(|line| {
@@ -2764,36 +2757,6 @@ mod tests {
 		assert!(
 			clif.matches(&format!("call fn{poll_fn}()")).count() >= 2,
 			"expected function-entry and loop-backedge safepoint calls in CLIF:\n{clif}"
-		);
-	}
-
-	#[test]
-	#[cfg(not(feature = "free-threading"))]
-	fn default_clif_does_not_import_safepoint_poll() {
-		let ir = IrModule {
-			functions: vec![Function {
-				name:               "no_poll".to_owned(),
-				arity:              0,
-				is_coroutine:       false,
-				is_generator:       false,
-				is_async_generator: false,
-				params:             Default::default(),
-				n_locals:           0,
-				blocks:             vec![Block {
-					id:    BlockId(0),
-					insts: vec![Inst::new(Value(0), InstKind::Const(PyConst::None))],
-					term:  Terminator::Return(Value(0)),
-				}],
-			}],
-			main:      FunctionId(0),
-			names:     vec![],
-		};
-
-		let clif = compiled_clif(&ir, 0);
-
-		assert!(
-			!clif.contains("pon_safepoint_poll"),
-			"default CLIF must not import FT safepoint polls:\n{clif}"
 		);
 	}
 

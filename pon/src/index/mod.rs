@@ -1,15 +1,22 @@
 use std::{
 	collections::BTreeMap,
+	fs,
+	io::Read,
 	path::{Path, PathBuf},
 	str::FromStr,
 };
 
 use pep440_rs::{Version, VersionSpecifiers};
+use sha2::{Digest, Sha256};
 
 use crate::{
 	error::{Error, Result},
 	names,
 	resolve::source::PackageKind,
+	wheel::{
+		compat::{any_supported, default_supported_tags},
+		filename::WheelFilename,
+	},
 };
 
 pub mod download;
@@ -119,6 +126,7 @@ impl<T: PackageIndex + ?Sized> PackageIndex for &T {
 pub enum SelectedIndex {
 	Catalog(CatalogIndex),
 	SimpleJson(MultiIndex),
+	Local(LocalIndex),
 }
 
 impl SelectedIndex {
@@ -128,7 +136,11 @@ impl SelectedIndex {
 	}
 
 	#[must_use]
-	pub fn simple_json<I, U>(index_urls: I, pon_home: impl Into<PathBuf>) -> Self
+	pub fn simple_json<I, U>(
+		index_urls: I,
+		pon_home: impl Into<PathBuf>,
+		allow_unhashed: bool,
+	) -> Self
 	where
 		I: IntoIterator<Item = U>,
 		U: Into<String>,
@@ -136,9 +148,20 @@ impl SelectedIndex {
 		let cache_dir = pon_home.into().join("cache/http");
 		let indexes = index_urls
 			.into_iter()
-			.map(|url| SimpleJsonIndex::with_cache_dir(url, cache_dir.clone()))
+			.map(|url| {
+				SimpleJsonIndex::with_cache_dir_and_hash_policy(
+					url,
+					cache_dir.clone(),
+					allow_unhashed,
+				)
+			})
 			.collect();
 		Self::SimpleJson(MultiIndex::new(indexes))
+	}
+
+	#[must_use]
+	pub fn local(cache_root: impl Into<PathBuf>, find_links: Vec<PathBuf>) -> Self {
+		Self::Local(LocalIndex::new(cache_root, find_links))
 	}
 }
 
@@ -147,6 +170,7 @@ impl PackageIndex for SelectedIndex {
 		match self {
 			Self::Catalog(index) => index.lookup(name),
 			Self::SimpleJson(index) => index.lookup(name),
+			Self::Local(index) => index.lookup(name),
 		}
 	}
 
@@ -154,6 +178,7 @@ impl PackageIndex for SelectedIndex {
 		match self {
 			Self::Catalog(index) => index.distribution_metadata(file),
 			Self::SimpleJson(index) => index.distribution_metadata(file),
+			Self::Local(index) => index.distribution_metadata(file),
 		}
 	}
 
@@ -161,9 +186,70 @@ impl PackageIndex for SelectedIndex {
 		match self {
 			Self::Catalog(index) => index.fetch_artifact(file),
 			Self::SimpleJson(index) => index.fetch_artifact(file),
+			Self::Local(index) => index.fetch_artifact(file),
 		}
 	}
 }
+
+/// Local-only package index backed by the artifact cache and explicit find-links roots.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalIndex {
+	roots: Vec<PathBuf>,
+}
+
+impl LocalIndex {
+	#[must_use]
+	pub fn new(cache_root: impl Into<PathBuf>, find_links: Vec<PathBuf>) -> Self {
+		let mut roots = vec![cache_root.into()];
+		roots.extend(find_links);
+		Self { roots }
+	}
+}
+
+impl PackageIndex for LocalIndex {
+	fn lookup(&self, name: &str) -> Result<Option<ProjectPage>> {
+		let normalized = normalized_project_name(name)?;
+		let mut files = Vec::new();
+		for root in &self.roots {
+			for path in local_artifact_paths(root)? {
+				let Some(file) = local_project_file(&path)? else {
+					continue;
+				};
+				if project_name_from_filename(&file.filename).as_deref() == Some(normalized.as_str()) {
+					files.push(file);
+				}
+			}
+		}
+		files.sort_by(|left, right| {
+			left
+				.version
+				.cmp(&right.version)
+				.then_with(|| left.filename.cmp(&right.filename))
+				.then_with(|| left.url.cmp(&right.url))
+		});
+		files.dedup_by(|left, right| left.filename == right.filename && left.url == right.url);
+		Ok((!files.is_empty()).then_some(ProjectPage {
+			meta_api_version: "local".to_owned(),
+			name: normalized,
+			files,
+		}))
+	}
+
+	fn fetch_artifact(&self, file: &ProjectFile) -> Result<PathBuf> {
+		if let Some(path) = file_url_path(&file.url).filter(|path| path.is_file()) {
+			return Ok(path);
+		}
+		let path = Path::new(&file.filename);
+		if path.is_file() {
+			return Ok(path.to_path_buf());
+		}
+		Err(Error::UnsupportedArtifact(format!(
+			"artifact `{}` is not available in the local cache or find-links roots",
+			file.filename
+		)))
+	}
+}
+
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CatalogIndex;
@@ -257,18 +343,160 @@ fn project<const N: usize>(name: &str, files: [ProjectFile; N]) -> ProjectPage {
 }
 
 fn file(filename: &str, version: &str, kind: PackageKind) -> Result<ProjectFile> {
+	let fixture_path = fixture_artifact_path(filename);
+	let (url, hashes) = if let Some(path) = fixture_path.as_ref() {
+		let mut hashes = BTreeMap::new();
+		hashes.insert("sha256".to_owned(), sha256_file(path)?);
+		(format!("file://{}", path.display()), hashes)
+	} else {
+		(format!("{DEFAULT_INDEX_URL}{filename}"), BTreeMap::new())
+	};
 	Ok(ProjectFile {
 		filename: filename.to_owned(),
-		url: format!("{DEFAULT_INDEX_URL}{filename}"),
+		url,
 		version: Version::from_str(version)
 			.map_err(|_| Error::InvalidRequirement(filename.to_owned()))?,
 		kind,
-		hashes: BTreeMap::new(),
+		hashes,
 		requires_python: None,
 		requires_python_invalid: false,
 		yanked: None,
 		dist_info_metadata: None,
 	})
+}
+
+fn fixture_artifact_path(filename: &str) -> Option<PathBuf> {
+	for fixture_kind in ["wheels", "sdists"] {
+		let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+			.join("fixtures")
+			.join(fixture_kind)
+			.join(filename);
+		if path.is_file() {
+			return Some(path);
+		}
+	}
+	None
+}
+
+fn local_artifact_paths(root: &Path) -> Result<Vec<PathBuf>> {
+	if !root.exists() {
+		return Ok(Vec::new());
+	}
+	let mut pending = vec![root.to_path_buf()];
+	let mut paths = Vec::new();
+	while let Some(path) = pending.pop() {
+		let metadata = match fs::metadata(&path) {
+			Ok(metadata) => metadata,
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+			Err(error) => return Err(error.into()),
+		};
+		if metadata.is_dir() {
+			for entry in fs::read_dir(&path)? {
+				pending.push(entry?.path());
+			}
+		} else if metadata.is_file() && supported_artifact_filename(&path) {
+			paths.push(path);
+		}
+	}
+	Ok(paths)
+}
+
+fn supported_artifact_filename(path: &Path) -> bool {
+	path
+		.file_name()
+		.and_then(|name| name.to_str())
+		.is_some_and(|name| name.ends_with(".whl") || name.ends_with(".tar.gz") || name.ends_with(".zip"))
+}
+
+fn local_project_file(path: &Path) -> Result<Option<ProjectFile>> {
+	let Some(filename) = path.file_name().and_then(|name| name.to_str()) else {
+		return Ok(None);
+	};
+	let Some(version) = version_from_filename(filename) else {
+		return Ok(None);
+	};
+	let Some(kind) = kind_from_filename(filename) else {
+		return Ok(None);
+	};
+	let mut hashes = BTreeMap::new();
+	hashes.insert("sha256".to_owned(), sha256_file(path)?);
+	Ok(Some(ProjectFile {
+		filename: filename.to_owned(),
+		url: format!("file://{}", path.display()),
+		version,
+		kind,
+		hashes,
+		requires_python: None,
+		requires_python_invalid: false,
+		yanked: None,
+		dist_info_metadata: None,
+	}))
+}
+
+fn project_name_from_filename(filename: &str) -> Option<String> {
+	if let Ok(wheel) = WheelFilename::parse(filename) {
+		return Some(wheel.normalized_distribution);
+	}
+	let stem = filename
+		.strip_suffix(".tar.gz")
+		.or_else(|| filename.strip_suffix(".zip"))?;
+	let (name, version) = stem.rsplit_once('-')?;
+	Version::from_str(version).ok()?;
+	Some(names::normalize(name))
+}
+
+fn version_from_filename(filename: &str) -> Option<Version> {
+	if let Ok(wheel) = WheelFilename::parse(filename) {
+		return Version::from_str(&wheel.version).ok();
+	}
+	let stem = filename
+		.strip_suffix(".tar.gz")
+		.or_else(|| filename.strip_suffix(".zip"))?;
+	let (_, version) = stem.rsplit_once('-')?;
+	Version::from_str(version).ok()
+}
+
+fn kind_from_filename(filename: &str) -> Option<PackageKind> {
+	let Ok(wheel) = WheelFilename::parse(filename) else {
+		return Some(PackageKind::Pure);
+	};
+	if any_supported(&wheel.tags(), &default_supported_tags()) {
+		return Some(PackageKind::Pure);
+	}
+	if wheel.abi_tag.split('.').any(is_refcount_cpython_abi) {
+		return Some(PackageKind::CAbiRefused {
+			reason: NO_OB_REFCNT_C_ABI_REFUSAL.to_owned(),
+		});
+	}
+	Some(PackageKind::Native)
+}
+
+fn is_refcount_cpython_abi(tag: &str) -> bool {
+	tag.starts_with("cp") && tag != "abi3" && tag != "none"
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+	let mut file = fs::File::open(path)?;
+	let mut hasher = Sha256::new();
+	let mut buffer = [0_u8; 64 * 1024];
+	loop {
+		let read = file.read(&mut buffer)?;
+		if read == 0 {
+			break;
+		}
+		hasher.update(&buffer[..read]);
+	}
+	Ok(hex_bytes(&hasher.finalize()))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+	const HEX: &[u8; 16] = b"0123456789abcdef";
+	let mut output = String::with_capacity(bytes.len() * 2);
+	for byte in bytes {
+		output.push(HEX[(byte >> 4) as usize] as char);
+		output.push(HEX[(byte & 0x0f) as usize] as char);
+	}
+	output
 }
 
 #[cfg(test)]
@@ -285,7 +513,10 @@ mod tests {
 		assert_eq!(project.meta_api_version, "1.0");
 		assert_eq!(project.name, "flit-core");
 		assert_eq!(project.files[0].filename, "flit_core-3.12.0-py3-none-any.whl");
-		assert!(project.files[0].hashes.is_empty());
+		assert_eq!(
+			project.files[0].hashes.get("sha256").map(String::as_str),
+			Some("c3c2f513473d9910010bca2c91dcc8a3f13f73153a600119830af6ebff01d4df")
+		);
 		assert!(project.files[0].requires_python.is_none());
 		assert!(!project.files[0].requires_python_invalid);
 		assert_eq!(project.files[0].yanked, None);
@@ -338,5 +569,38 @@ mod tests {
 		assert_eq!(project.files[0].kind, PackageKind::CAbiRefused {
 			reason: NO_OB_REFCNT_C_ABI_REFUSAL.to_owned(),
 		});
+	}
+
+	#[test]
+	fn local_index_reads_find_links_artifacts_with_hashes() {
+		let temp = std::env::temp_dir().join(format!(
+			"pon-local-index-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.expect("clock")
+				.as_nanos()
+		));
+		let wheelhouse = temp.join("wheelhouse");
+		fs::create_dir_all(&wheelhouse).expect("wheelhouse");
+		let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+			.join("fixtures")
+			.join("wheels")
+			.join("idna-3.10-py3-none-any.whl");
+		let copied = wheelhouse.join("idna-3.10-py3-none-any.whl");
+		fs::copy(&fixture, &copied).expect("copy fixture wheel");
+		let index = LocalIndex::new(temp.join("cache"), vec![wheelhouse]);
+
+		let project = index.lookup("IDNA").expect("lookup").expect("project");
+
+		assert_eq!(project.name, "idna");
+		assert_eq!(project.files.len(), 1);
+		assert_eq!(project.files[0].filename, "idna-3.10-py3-none-any.whl");
+		let copied_hash = sha256_file(&copied).expect("hash");
+		assert_eq!(
+			project.files[0].hashes.get("sha256").map(String::as_str),
+			Some(copied_hash.as_str())
+		);
+		let _ = fs::remove_dir_all(temp);
 	}
 }

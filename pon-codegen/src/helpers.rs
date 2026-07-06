@@ -232,13 +232,10 @@ pub struct HelperRefs {
 	/// `pon_deopt_note(function_or_null) -> i32`.
 	pub deopt_note:            FuncId,
 	/// `pon_safepoint_poll()`.
-	#[cfg(feature = "free-threading")]
 	pub safepoint_poll:        FuncId,
 	/// `pon_gc_write_barrier(slot, value)`.
-	#[cfg(feature = "free-threading")]
 	pub gc_write_barrier:      FuncId,
 	/// `pon_gc_stop_requested() -> bool`.
-	#[cfg(feature = "free-threading")]
 	pub gc_stop_requested:     FuncId,
 }
 
@@ -1285,17 +1282,19 @@ pub fn declare_helpers<M: Module>(module: &mut M) -> ModuleResult<HelperRefs> {
 		runtime_init: declare_one(module, "pon_runtime_init")?,
 		osr_poll: declare_one(module, "pon_osr_poll")?,
 		deopt_note: declare_one(module, "pon_deopt_note")?,
-		#[cfg(feature = "free-threading")]
-		safepoint_poll: declare_free_threading_helper(module, crate::FT_SAFEPOINT_POLL, &[], None)?,
-		#[cfg(feature = "free-threading")]
-		gc_write_barrier: declare_free_threading_helper(
+		safepoint_poll: declare_threading_helper(
+			module,
+			crate::FT_SAFEPOINT_POLL,
+			&[],
+			Some(ir::types::I32),
+		)?,
+		gc_write_barrier: declare_threading_helper(
 			module,
 			crate::FT_GC_WRITE_BARRIER,
 			&[module.target_config().pointer_type(), module.target_config().pointer_type()],
 			None,
 		)?,
-		#[cfg(feature = "free-threading")]
-		gc_stop_requested: declare_free_threading_helper(
+		gc_stop_requested: declare_threading_helper(
 			module,
 			crate::FT_GC_STOP_REQUESTED,
 			&[],
@@ -1313,8 +1312,7 @@ fn declare_one<M: Module>(module: &mut M, symbol: &str) -> ModuleResult<FuncId> 
 	module.declare_function(decl.symbol, Linkage::Import, &sig)
 }
 
-#[cfg(feature = "free-threading")]
-fn declare_free_threading_helper<M: Module>(
+fn declare_threading_helper<M: Module>(
 	module: &mut M,
 	symbol: &str,
 	params: &[ir::Type],

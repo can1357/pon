@@ -330,7 +330,7 @@ pub fn compile_function<M: Module>(
 	let primary_blocks = make_block_map(function, entry, &mut builder);
 	let cold_blocks = make_cold_block_map(function, &mut builder);
 	append_cold_region_entry_params(&mut builder, &cold_blocks, &plan.region, ptr_ty)?;
-	let int_type = initialize_int_type(&mut builder, &helper_refs, ptr_ty, exception_exit);
+	let int_type = builder.ins().iconst(ptr_ty, 0);
 	let region_blocks = region_block_set(&plan.region);
 	let range_iter_specs = range_iter_specs(function);
 	// Shared GC temp-spill schedule for both copies: primary boxed escapes
@@ -581,10 +581,7 @@ fn define_trusted_region_live_ins(
 			continue;
 		}
 		let boxed = state.boxed.value(input.value)?;
-		let offset = pylong_value_offset_i32(ptr_bytes)?;
-		let value = builder
-			.ins()
-			.load(types::I64, MemFlagsData::new(), boxed, offset);
+		let value = trusted_int_object_to_i64(builder, boxed, ptr_bytes)?;
 		state.define_unboxed(input.value, Type::IntI64, value);
 	}
 	Ok(())
@@ -1650,38 +1647,61 @@ fn guard_and_unbox_i64(
 	helpers: &HelperFuncRefs,
 	state: &mut FastLowerState,
 	ptr_ty: ir::Type,
-	ptr_bytes: usize,
+	_ptr_bytes: usize,
 	exception_exit: ir::Block,
 	object: ir::Value,
-	int_type: ir::Value,
+	_int_type: ir::Value,
 	cold_target: ir::Block,
 ) -> Result<ir::Value, CodegenError> {
-	guard_ptr_non_null(builder, helpers, state, ptr_ty, exception_exit, object, cold_target)?;
-	let object_type = builder.ins().load(ptr_ty, MemFlagsData::new(), object, 0);
-	let is_int = builder.ins().icmp(IntCC::Equal, object_type, int_type);
-	side_exit_unless(builder, helpers, state, ptr_ty, exception_exit, is_int, cold_target)?;
+	let is_small_int = tagged_small_int_cond(builder, object);
+	side_exit_unless(builder, helpers, state, ptr_ty, exception_exit, is_small_int, cold_target)?;
+	Ok(untag_small_int_i64(builder, object))
+}
+
+fn trusted_int_object_to_i64(
+	builder: &mut FunctionBuilder<'_>,
+	object: ir::Value,
+	ptr_bytes: usize,
+) -> Result<ir::Value, CodegenError> {
+	let small_block = builder.create_block();
+	let heap_block = builder.create_block();
+	let done_block = builder.create_block();
+	builder.append_block_param(done_block, types::I64);
+
+	let is_small_int = tagged_small_int_cond(builder, object);
+	builder.ins().brif(is_small_int, small_block, &[], heap_block, &[]);
+
+	builder.switch_to_block(small_block);
+	let untagged = untag_small_int_i64(builder, object);
+	builder.ins().jump(done_block, &[ir::BlockArg::Value(untagged)]);
+	builder.seal_block(small_block);
+
+	builder.switch_to_block(heap_block);
 	let offset = pylong_value_offset_i32(ptr_bytes)?;
-	Ok(builder
+	let boxed_value = builder.ins().load(types::I64, MemFlagsData::new(), object, offset);
+	builder.ins().jump(done_block, &[ir::BlockArg::Value(boxed_value)]);
+	builder.seal_block(heap_block);
+
+	builder.switch_to_block(done_block);
+	builder.seal_block(done_block);
+	Ok(builder.block_params(done_block)[0])
+}
+
+fn tagged_small_int_cond(builder: &mut FunctionBuilder<'_>, object: ir::Value) -> ir::Value {
+	let tag = builder
 		.ins()
-		.load(types::I64, MemFlagsData::new(), object, offset))
+		.band_imm(object, pon_runtime::tag::TAG_INT_BIT as i64);
+	builder.ins().icmp_imm(IntCC::NotEqual, tag, 0)
+}
+
+fn untag_small_int_i64(builder: &mut FunctionBuilder<'_>, object: ir::Value) -> ir::Value {
+	builder.ins().sshr_imm(object, 1)
 }
 
 pub(crate) fn pylong_value_offset_i32(ptr_bytes: usize) -> Result<i32, CodegenError> {
 	baseline::offset_i32(ptr_bytes * 2)
 }
 
-fn guard_ptr_non_null(
-	builder: &mut FunctionBuilder<'_>,
-	helpers: &HelperFuncRefs,
-	state: &mut FastLowerState,
-	ptr_ty: ir::Type,
-	exception_exit: ir::Block,
-	object: ir::Value,
-	cold_target: ir::Block,
-) -> Result<(), CodegenError> {
-	let non_null = builder.ins().icmp_imm(IntCC::NotEqual, object, 0);
-	side_exit_unless(builder, helpers, state, ptr_ty, exception_exit, non_null, cold_target)
-}
 
 fn guard_i64_non_zero(
 	builder: &mut FunctionBuilder<'_>,
@@ -1737,16 +1757,6 @@ fn box_i64(
 	baseline::call_pyobject_helper(builder, helpers.const_int, &[value], ptr_ty, exception_exit)
 }
 
-fn initialize_int_type(
-	builder: &mut FunctionBuilder<'_>,
-	helpers: &HelperFuncRefs,
-	ptr_ty: ir::Type,
-	exception_exit: ir::Block,
-) -> ir::Value {
-	let zero = builder.ins().iconst(types::I64, 0);
-	let object = box_i64(builder, helpers, ptr_ty, exception_exit, zero);
-	builder.ins().load(ptr_ty, MemFlagsData::new(), object, 0)
-}
 
 fn lower_binary_i64(
 	builder: &mut FunctionBuilder<'_>,

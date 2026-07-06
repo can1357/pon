@@ -24,7 +24,9 @@ pub(crate) fn lower_const_int(
 	ptr_ty: ir::Type,
 	exception_exit: ir::Block,
 ) -> Result<ir::Value, CodegenError> {
-	if ptr_ty.bytes() == 8 && (pon_runtime::tag::SMALL_INT_MIN..=pon_runtime::tag::SMALL_INT_MAX).contains(&value) {
+	if ptr_ty.bytes() == 8
+		&& (pon_runtime::tag::SMALL_INT_MIN..=pon_runtime::tag::SMALL_INT_MAX).contains(&value)
+	{
 		let bits = ((value as u64) << 1) | pon_runtime::tag::TAG_INT_BIT as u64;
 		return Ok(builder.ins().iconst(ptr_ty, bits as i64));
 	}

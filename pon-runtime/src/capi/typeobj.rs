@@ -27,7 +27,7 @@ use core::{
 	mem, ptr,
 };
 use std::{
-	collections::HashSet,
+	collections::{HashMap, HashSet},
 	ffi::CString,
 	sync::{LazyLock, Mutex},
 };
@@ -167,6 +167,26 @@ struct PyBufferProcs {
 	bf_releasebuffer: *mut c_void,
 }
 
+#[repr(C)]
+struct FromSpecHeapTypeObject {
+	ht_type:        ForeignTypeObject,
+	as_async:       [*mut (); 4],
+	as_number:      [*mut (); 36],
+	as_mapping:     [*mut (); 3],
+	as_sequence:    [*mut (); 10],
+	as_buffer:      [*mut (); 2],
+	ht_name:        *mut PyObject,
+	ht_slots:       *mut PyObject,
+	ht_qualname:    *mut PyObject,
+	ht_cached_keys: *mut (),
+	ht_module:      *mut PyObject,
+	ht_tpname:      *mut c_char,
+	ht_token:       *mut (),
+	spec_getitem:   *mut PyObject,
+	spec_version:   c_uint,
+	spec_init:      *mut PyObject,
+}
+
 /// C-facing `PyNumberMethods`: exact CPython 3.14 `object.h` field order.
 /// Do not reuse [`PyNumberMethods`]: Pon's native table adds reflected slots.
 #[repr(C)]
@@ -252,6 +272,8 @@ static FROMSPEC_MAPPING_TABLES: LazyLock<Mutex<HashSet<usize>>> =
 	LazyLock::new(|| Mutex::new(HashSet::new()));
 static FROMSPEC_ASYNC_TABLES: LazyLock<Mutex<HashSet<usize>>> =
 	LazyLock::new(|| Mutex::new(HashSet::new()));
+static FROMSPEC_TOKENS: LazyLock<Mutex<HashMap<usize, usize>>> =
+	LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Addresses of live C-extension instances allocated on the GC heap.
 /// `PyObject_Free` must no-op for these (the GC owns the block); the
@@ -409,6 +431,18 @@ fn checked_capi_instance_size(
 			return Err(format!(
 				"PyType_GenericAlloc: tp_dictoffset {} exceeds fixed instance size {fixed}",
 				foreign.tp_dictoffset
+			));
+		}
+	}
+	if foreign.tp_vectorcall_offset > 0 {
+		let vectorcall_offset = foreign.tp_vectorcall_offset as usize;
+		let vectorcall_end = vectorcall_offset
+			.checked_add(mem::size_of::<*mut ()>())
+			.ok_or_else(|| "PyType_GenericAlloc: tp_vectorcall_offset overflow".to_owned())?;
+		if vectorcall_end > fixed {
+			return Err(format!(
+				"PyType_GenericAlloc: tp_vectorcall_offset {} exceeds fixed instance size {fixed}",
+				foreign.tp_vectorcall_offset
 			));
 		}
 	}
@@ -618,12 +652,10 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
 		if let Some(hash) = slot(foreign_ref.tp_hash) {
 			ty.tp_hash = Some(hash);
 		}
-		if let Some(call) = slot(foreign_ref.tp_call) {
-			ty.tp_call = if foreign_ref.tp_vectorcall_offset > 0 {
-				Some(crate::capi::object_::capi_vectorcall_call)
-			} else {
-				Some(call)
-			};
+		if foreign_ref.tp_vectorcall_offset > 0 && !foreign_ref.tp_vectorcall.is_null() {
+			ty.tp_call = Some(crate::capi::object_::capi_vectorcall_call);
+		} else if let Some(call) = slot(foreign_ref.tp_call) {
+			ty.tp_call = Some(call);
 		}
 		if let Some(richcmp) = slot(foreign_ref.tp_richcompare) {
 			ty.tp_richcmp = Some(richcmp);
@@ -653,6 +685,13 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
 	// Publish the twin BEFORE filling the foreign back-references so
 	// trampolines can translate from either side.
 	twin::register_foreign_twin(foreign, native_ty);
+	if let Some(token) = FROMSPEC_TOKENS
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner())
+		.remove(&(foreign as usize))
+	{
+		unsafe { (*foreign.cast::<FromSpecHeapTypeObject>()).ht_token = token as *mut () };
+	}
 
 	// Fill the foreign struct's runtime-owned fields (CPython PyType_Ready
 	// parity: inherited slots surface in the static struct).
@@ -781,31 +820,60 @@ unsafe fn type_from_metaclass_impl(
 		return ptr::null_mut();
 	}
 
-	// SAFETY: ForeignTypeObject is a POD C mirror; all-zero is NULL/0.
-	let mut foreign: ForeignTypeObject = unsafe { core::mem::zeroed() };
+	// SAFETY: the explicit `PyType_FromSpec` face is a heap type and must carry
+	// the `PyHeapTypeObject` tail (notably `ht_token`) even though Pon only
+	// currently consumes the leading `PyTypeObject` prefix.
+	let mut foreign_heap: FromSpecHeapTypeObject = unsafe { core::mem::zeroed() };
+	let foreign = &mut foreign_heap.ht_type;
 	foreign.ob_type = metaclass;
 	foreign.tp_basicsize = spec_ref.basicsize as isize;
 	foreign.tp_itemsize = spec_ref.itemsize as isize;
 	foreign.tp_flags = spec_ref.flags as u64;
 
-	if unsafe { !apply_type_spec_slots(&mut foreign, spec_ref.slots, &name_full) } {
+	if unsafe { !apply_type_spec_slots(foreign, spec_ref.slots, &name_full) } {
+		FROMSPEC_TOKENS
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.remove(&(foreign as *mut ForeignTypeObject as usize));
 		return ptr::null_mut();
 	}
-	if !bases.is_null() && unsafe { !apply_type_spec_bases(&mut foreign, bases, &name_full) } {
+	if !bases.is_null() && unsafe { !apply_type_spec_bases(foreign, bases, &name_full) } {
+		FROMSPEC_TOKENS
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.remove(&(foreign as *mut ForeignTypeObject as usize));
 		return ptr::null_mut();
 	}
 
 	let Ok(name_copy) = CString::new(name_full.as_bytes()) else {
 		raise_type_error(format!("PyType_FromSpec: type name contains NUL: {name_full}"));
+		FROMSPEC_TOKENS
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.remove(&(foreign as *mut ForeignTypeObject as usize));
 		return ptr::null_mut();
 	};
 	foreign.tp_name = name_copy.into_raw().cast_const();
 
-	let foreign_ptr = Box::into_raw(Box::new(foreign));
-	if unsafe { capi_type_ready(foreign_ptr) } < 0 {
+	let stack_token_key = foreign as *mut ForeignTypeObject as usize;
+	let foreign_ptr = Box::into_raw(Box::new(foreign_heap));
+	let foreign = unsafe { ptr::addr_of_mut!((*foreign_ptr).ht_type) };
+	{
+		let mut tokens = FROMSPEC_TOKENS
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner());
+		if let Some(token) = tokens.remove(&stack_token_key) {
+			tokens.insert(foreign as usize, token);
+		}
+	}
+	if unsafe { capi_type_ready(foreign) } < 0 {
+		FROMSPEC_TOKENS
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.remove(&(foreign as usize));
 		return ptr::null_mut();
 	}
-	new_reference(foreign_ptr.cast::<PyObject>())
+	new_reference(foreign.cast::<PyObject>())
 }
 
 unsafe fn apply_type_spec_slots(
@@ -953,12 +1021,21 @@ unsafe fn apply_type_spec_slots(
 			PY_TP_TRAVERSE => foreign.tp_traverse = field,
 			PY_TP_FREE => foreign.tp_free = field,
 			PY_TP_FINALIZE => foreign.tp_finalize = field,
+			PY_TP_VECTORCALL => {
+				foreign.tp_vectorcall = field;
+				foreign.tp_flags |= crate::capi::object_::TPFLAGS_HAVE_VECTORCALL;
+			},
+			PY_TP_TOKEN => {
+				FROMSPEC_TOKENS
+					.lock()
+					.unwrap_or_else(|poison| poison.into_inner())
+					.insert(foreign as *mut ForeignTypeObject as usize, slot.pfunc as usize);
+			},
 			PY_AM_AWAIT => unsafe { ensure_fromspec_async_table(foreign).am_await = field },
 			PY_AM_AITER => unsafe { ensure_fromspec_async_table(foreign).am_aiter = field },
 			PY_AM_ANEXT => unsafe { ensure_fromspec_async_table(foreign).am_anext = field },
 			PY_AM_SEND => unsafe { ensure_fromspec_async_table(foreign).am_send = field },
-			PY_TP_DEL | PY_TP_GETATTR | PY_TP_IS_GC | PY_TP_SETATTR | PY_TP_VECTORCALL
-			| PY_TP_TOKEN => {
+			PY_TP_DEL | PY_TP_GETATTR | PY_TP_IS_GC | PY_TP_SETATTR => {
 				raise_type_error(format!(
 					"PyType_FromSpec: slot id {} is not supported yet for {type_name}",
 					slot.slot
@@ -1362,6 +1439,13 @@ unsafe extern "C" fn capi_generic_alloc(
 				.add(mem::size_of::<PyObjectHeader>())
 				.cast::<isize>()
 				.write(nitems);
+		}
+		if foreign_ref.tp_vectorcall_offset > 0 {
+			object
+				.cast::<u8>()
+				.add(foreign_ref.tp_vectorcall_offset as usize)
+				.cast::<*mut ()>()
+				.write(foreign_ref.tp_vectorcall);
 		}
 		if let Some(dict_slot) = capi_instance_dict_slot(block, native) {
 			dict_slot.write(ptr::null_mut());
@@ -3958,6 +4042,7 @@ mod fromspec_tests {
 typedef struct {
     PyObject_HEAD
     long value;
+    vectorcallfunc vectorcall;
 } FromSpecObject;
 
 static PyTypeObject *FromSpec_Type = NULL;
@@ -4002,6 +4087,23 @@ static Py_ssize_t FromSpec_len(PyObject *self) {
     return 12;
 }
 
+static PyObject *FromSpec_vectorcall(PyObject *callable, PyObject *const *args, size_t nargsf, PyObject *kwnames) {
+    long total = ((FromSpecObject *)callable)->value;
+    Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
+    if (kwnames != NULL) {
+        total += 1000;
+    }
+    for (Py_ssize_t i = 0; i < nargs; i++) {
+        total += PyLong_AsLong(args[i]);
+        if (PyErr_Occurred() != NULL) {
+            return NULL;
+        }
+    }
+    return PyLong_FromLong(total);
+}
+
+static int token_anchor = 0;
+
 static PyObject *Bad_await(PyObject *self) {
     (void)self;
     Py_RETURN_NONE;
@@ -4014,6 +4116,7 @@ static PyMethodDef FromSpec_methods[] = {
 
 static PyMemberDef FromSpec_members[] = {
     {"value", T_LONG, offsetof(FromSpecObject, value), 0, "stored value"},
+    {"__vectorcalloffset__", T_PYSSIZET, offsetof(FromSpecObject, vectorcall), READONLY, "vectorcall field"},
     {NULL, 0, 0, 0, NULL},
 };
 
@@ -4025,6 +4128,8 @@ static PyType_Slot FromSpec_slots[] = {
     {Py_tp_repr, FromSpec_repr},
     {Py_nb_add, FromSpec_add},
     {Py_sq_length, FromSpec_len},
+    {Py_tp_vectorcall, FromSpec_vectorcall},
+    {Py_tp_token, &token_anchor},
     {0, NULL},
 };
 
@@ -4036,19 +4141,17 @@ static PyType_Spec FromSpec_spec = {
     FromSpec_slots,
 };
 
-/* Py_tp_vectorcall remains unsupported by PyType_FromSpec (async slots are
- * accepted since the Cython coroutine bring-up). */
-static PyType_Slot Bad_slots[] = {
-    {Py_tp_vectorcall, Bad_await},
+static PyType_Slot Refused_slots[] = {
+    {Py_tp_getattr, Bad_await},
     {0, NULL},
 };
 
-static PyType_Spec Bad_spec = {
-    "capi_fromspec_ext.Bad",
+static PyType_Spec Refused_spec = {
+    "capi_fromspec_ext.Refused",
     sizeof(FromSpecObject),
     0,
     Py_TPFLAGS_DEFAULT,
-    Bad_slots,
+    Refused_slots,
 };
 
 static PyObject *drive(PyObject *self, PyObject *args) {
@@ -4105,14 +4208,26 @@ static PyObject *drive(PyObject *self, PyObject *args) {
     }
     if (PyErr_Occurred() != NULL) PyErr_Clear();
 
-    PyObject *bad = PyType_FromSpec(&Bad_spec);
-    if (bad == NULL && PyErr_ExceptionMatches(PyExc_TypeError)) {
+    PyObject *two = PyLong_FromLong(2);
+    PyObject *three = PyLong_FromLong(3);
+    PyObject *vargs[2] = {two, three};
+    PyObject *vector_result = obj == NULL ? NULL : PyObject_Vectorcall(obj, vargs, 2, NULL);
+    if (vector_result != NULL && PyLong_AsLong(vector_result) == 46) ok |= 1L << 10;
+    Py_XDECREF(vector_result);
+    if (obj != NULL && PyVectorcall_Function(obj) == FromSpec_vectorcall) ok |= 1L << 11;
+    if ((FromSpec_Type->tp_flags & Py_TPFLAGS_HAVE_VECTORCALL) != 0
+            && FromSpec_Type->tp_vectorcall == FromSpec_vectorcall) ok |= 1L << 12;
+    if (((PyHeapTypeObject *)FromSpec_Type)->ht_token == &token_anchor) ok |= 1L << 13;
+    PyObject *refused = PyType_FromSpec(&Refused_spec);
+    if (refused == NULL && PyErr_ExceptionMatches(PyExc_TypeError)) {
         PyErr_Clear();
-        ok |= 1L << 10;
+        ok |= 1L << 14;
     } else {
-        Py_XDECREF(bad);
+        Py_XDECREF(refused);
         if (PyErr_Occurred() != NULL) PyErr_Clear();
     }
+    Py_XDECREF(two);
+    Py_XDECREF(three);
 
     Py_XDECREF(obj);
     return PyLong_FromLong(ok);
@@ -4167,6 +4282,6 @@ PyMODINIT_FUNC PyInit_capi_fromspec_ext(void) {
 		let drive = module_attr(module_name, intern("drive")).expect("drive registered");
 		let result = unsafe { pon_call(drive, ptr::null_mut(), 0) };
 		assert!(!result.is_null(), "drive() returned NULL: {:?}", pon_err_message());
-		assert_eq!(format_object_for_print(result).as_deref(), Ok("2047"), "C-side bitmask mismatch");
+		assert_eq!(format_object_for_print(result).as_deref(), Ok("32767"), "C-side bitmask mismatch");
 	}
 }

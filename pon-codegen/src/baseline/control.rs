@@ -6,7 +6,6 @@ use cranelift_codegen::ir::{
 use cranelift_frontend::FunctionBuilder;
 use pon_ir::ir::{BlockId, Function, Terminator};
 
-#[cfg(feature = "free-threading")]
 use super::emit_safepoint_poll;
 use super::{
 	CodegenError, HelperFuncRefs, LowerState, call_pyobject_helper, offset_i32, osr_live_values,
@@ -88,6 +87,7 @@ pub(crate) fn lower_terminator_with_blocks(
 				state,
 				helpers,
 				ptr_ty,
+				exception_exit,
 				current_block,
 				*target,
 				function,
@@ -173,13 +173,23 @@ fn emit_loop_backedge_safepoint(
 	state: &LowerState,
 	helpers: &HelperFuncRefs,
 	ptr_ty: ir::Type,
+	exception_exit: ir::Block,
 	current_block: BlockId,
 	target: BlockId,
 	function: &Function,
 	enable_osr: bool,
 ) -> Result<(), CodegenError> {
 	if target.0 <= current_block.0 {
-		emit_backedge_instrumentation(builder, state, helpers, ptr_ty, target, function, enable_osr)?;
+		emit_backedge_instrumentation(
+			builder,
+			state,
+			helpers,
+			ptr_ty,
+			exception_exit,
+			target,
+			function,
+			enable_osr,
+		)?;
 	}
 	Ok(())
 }
@@ -189,12 +199,12 @@ fn emit_backedge_instrumentation(
 	state: &LowerState,
 	helpers: &HelperFuncRefs,
 	ptr_ty: ir::Type,
+	exception_exit: ir::Block,
 	target: BlockId,
 	function: &Function,
 	enable_osr: bool,
 ) -> Result<(), CodegenError> {
-	#[cfg(feature = "free-threading")]
-	emit_safepoint_poll(builder, helpers);
+	emit_safepoint_poll(builder, helpers, exception_exit);
 
 	if enable_osr {
 		emit_osr_poll_and_transfer(builder, state, helpers, ptr_ty, target, function)?;
@@ -302,7 +312,7 @@ fn lower_conditional_branch(
 	let truth = call_is_true(builder, helpers.is_true, cond, exception_exit);
 	let then_target = clif_block(block_map, then_block)?;
 	let else_target = clif_block(block_map, else_block)?;
-	let instrument_backedges = enable_osr || cfg!(feature = "free-threading");
+	let instrument_backedges = true;
 	let then_backedge = instrument_backedges && then_block.0 <= current_block.0;
 	let else_backedge = instrument_backedges && else_block.0 <= current_block.0;
 	if !then_backedge && !else_backedge {
@@ -328,7 +338,7 @@ fn lower_conditional_branch(
 		builder.switch_to_block(then_route);
 		builder.seal_block(then_route);
 		emit_backedge_instrumentation(
-			builder, state, helpers, ptr_ty, then_block, function, enable_osr,
+			builder, state, helpers, ptr_ty, exception_exit, then_block, function, enable_osr,
 		)?;
 		builder.ins().jump(then_target, &[]);
 	}
@@ -336,7 +346,7 @@ fn lower_conditional_branch(
 		builder.switch_to_block(else_route);
 		builder.seal_block(else_route);
 		emit_backedge_instrumentation(
-			builder, state, helpers, ptr_ty, else_block, function, enable_osr,
+			builder, state, helpers, ptr_ty, exception_exit, else_block, function, enable_osr,
 		)?;
 		builder.ins().jump(else_target, &[]);
 	}

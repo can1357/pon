@@ -859,11 +859,22 @@ unsafe extern "C" fn capi_number_power(
 	right: *mut PyObject,
 	modulo: *mut PyObject,
 ) -> *mut PyObject {
-	if unsafe { !modulo_is_none(modulo) } {
-		raise_type("PyNumber_Power with non-None modulo is not supported");
-		return ptr::null_mut();
+	if unsafe { modulo_is_none(modulo) } {
+		return unsafe { capi_number_binary(abi::number::BINARY_POW, left, right) };
 	}
-	unsafe { capi_number_binary(abi::number::BINARY_POW, left, right) }
+	let Some(left) = normalize_arg(left) else {
+		return ptr::null_mut();
+	};
+	let Some(right) = normalize_arg(right) else {
+		return ptr::null_mut();
+	};
+	let Some(modulo) = normalize_arg(modulo) else {
+		return ptr::null_mut();
+	};
+	let mut args = [left, right, modulo];
+	new_reference(unsafe {
+		crate::native::builtins_batch::builtin_pow(args.as_mut_ptr(), args.len())
+	})
 }
 
 unsafe extern "C" fn capi_number_negative(object: *mut PyObject) -> *mut PyObject {
@@ -1458,6 +1469,9 @@ unsafe fn coerce_f64(object: *mut PyObject) -> Result<f64, ()> {
 }
 
 unsafe fn coerce_index_bigint(object: *mut PyObject) -> Result<BigInt, ()> {
+	let Some(object) = normalize_arg(object) else {
+		return Err(());
+	};
 	if object.is_null() || !crate::tag::is_heap(object) {
 		raise_type("'object' object cannot be interpreted as an integer");
 		return Err(());
@@ -1501,6 +1515,11 @@ unsafe fn coerce_index_bigint(object: *mut PyObject) -> Result<BigInt, ()> {
 unsafe fn try_get_attr(object: *mut PyObject, name: &str) -> Option<*mut PyObject> {
 	let result = unsafe { crate::abstract_op::get_attr(object, crate::intern::intern(name)) };
 	if result.is_null() {
+		if crate::thread_state::pon_err_occurred()
+			&& !crate::abi::exc::pending_exception_is("AttributeError")
+		{
+			return None;
+		}
 		crate::thread_state::pon_err_clear();
 		None
 	} else {
@@ -1650,6 +1669,7 @@ static PyObject *abstract_number_surface(PyObject *self, PyObject *args) {
     PyObject *two = PyLong_FromLong(2);
     PyObject *three = PyLong_FromLong(3);
     PyObject *ten = PyLong_FromLong(10);
+    PyObject *five = PyLong_FromLong(5);
 
     PyObject *sum = PyNumber_Add(two, three);
     if (long_equals(sum, 5)) {
@@ -1673,6 +1693,12 @@ static PyObject *abstract_number_surface(PyObject *self, PyObject *args) {
         mask |= BIT(2);
     }
     Py_XDECREF(power);
+
+    PyObject *power_mod = PyNumber_Power(two, ten, five);
+    if (long_equals(power_mod, 4)) {
+        mask |= BIT(12);
+    }
+    Py_XDECREF(power_mod);
 
     PyObject *negative = PyNumber_Negative(three);
     if (long_equals(negative, -3)) {
@@ -1941,7 +1967,7 @@ PyMODINIT_FUNC PyInit_capi_numbers_test_ext(void) {
 			("float_complex_roundtrips", "1"),
 			("index_and_number_protocol", "1"),
 			("type_check_macros", "1"),
-			("abstract_number_surface", "4095"),
+			("abstract_number_surface", "8191"),
 		] {
 			let method = module_attr(module_name, intern(method_name))
 				.unwrap_or_else(|| panic!("{method_name} method registered"));
