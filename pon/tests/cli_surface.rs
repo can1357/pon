@@ -230,7 +230,7 @@ fn run_file_in_markerless_directory_does_not_create_project_environment() {
 
 #[test]
 fn repl_piped_input_preserves_state_between_entries() {
-	let output = run_pon_with_stdin(&["repl"], "x = 20\nx + 22\n");
+	let output = run_pon_with_stdin(&["repl"], "1 + 1\n_\nif True:\n    y = 40\ny + _\n");
 
 	assert!(
 		output.status.success(),
@@ -241,10 +241,121 @@ fn repl_piped_input_preserves_state_between_entries() {
 	);
 	let stdout = stdout(&output);
 	assert!(
-		stdout.contains("42"),
-		"repl should print expression result from later entry; stdout={stdout}"
+		stdout.contains("\n2\n2\n42\n") || stdout.ends_with("\n2\n2\n42\n"),
+		"repl should bind `_` and continue multiline input until parse-complete; stdout={stdout}"
 	);
 	assert_eq!(output.stderr.as_slice(), b"");
+}
+
+
+#[test]
+fn package_manager_no_index_installs_from_find_links() {
+	let fixture_dir = TempDir::new("pon-surface-pkg-no-index");
+	let manifest = fixture_dir.path().join("pyproject.toml");
+	let init = pon_command()
+		.arg("init")
+		.arg("--manifest")
+		.arg(&manifest)
+		.output()
+		.expect("pon init");
+	assert!(
+		init.status.success(),
+		"pon init should succeed; status={:?}, stdout={}, stderr={}",
+		init.status.code(),
+		stdout(&init),
+		stderr(&init)
+	);
+	let wheelhouse = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+		.join("fixtures")
+		.join("wheels");
+
+	let install = pon_command()
+		.arg("install")
+		.arg("idna")
+		.arg("--manifest")
+		.arg(&manifest)
+		.arg("--no-index")
+		.arg("--find-links")
+		.arg(&wheelhouse)
+		.output()
+		.expect("pon install");
+	assert!(
+		install.status.success(),
+		"pon install should resolve from find-links without index access; status={:?}, stdout={}, stderr={}",
+		install.status.code(),
+		stdout(&install),
+		stderr(&install)
+	);
+
+	let run = pon_command()
+		.arg("run")
+		.arg("-c")
+		.arg("import idna; print(idna.__version__)")
+		.current_dir(fixture_dir.path())
+		.output()
+		.expect("pon run");
+	assert!(
+		run.status.success(),
+		"pon run should import package installed from find-links; status={:?}, stdout={}, stderr={}",
+		run.status.code(),
+		stdout(&run),
+		stderr(&run)
+	);
+	assert_eq!(stdout(&run).trim(), "3.10");
+	assert_eq!(run.stderr.as_slice(), b"");
+}
+#[test]
+fn package_manager_catalog_e2e() {
+	let fixture_dir = TempDir::new("pon-surface-pkg-e2e");
+	let manifest = fixture_dir.path().join("pyproject.toml");
+	let init = pon_command()
+		.arg("init")
+		.arg("--manifest")
+		.arg(&manifest)
+		.output()
+		.expect("pon init");
+	assert!(
+		init.status.success(),
+		"pon init should succeed; status={:?}, stdout={}, stderr={}",
+		init.status.code(),
+		stdout(&init),
+		stderr(&init)
+	);
+
+	let add = pon_command()
+		.arg("add")
+		.arg("idna")
+		.arg("--manifest")
+		.arg(&manifest)
+		.arg("--index-url")
+		.arg("catalog:")
+		.env("PON_TEST_ALLOW_CATALOG", "1")
+		.output()
+		.expect("pon add");
+	assert!(
+		add.status.success(),
+		"pon add should install from catalog fixture; status={:?}, stdout={}, stderr={}",
+		add.status.code(),
+		stdout(&add),
+		stderr(&add)
+	);
+
+	let run = pon_command()
+		.arg("run")
+		.arg("-c")
+		.arg("import idna; print(idna.__version__)")
+		.current_dir(fixture_dir.path())
+		.output()
+		.expect("pon run");
+	assert!(
+		run.status.success(),
+		"pon run should import installed package; status={:?}, stdout={}, stderr={}",
+		run.status.code(),
+		stdout(&run),
+		stderr(&run)
+	);
+	assert_eq!(stdout(&run).trim(), "3.10");
+	assert_eq!(run.stderr.as_slice(), b"");
 }
 
 #[test]
