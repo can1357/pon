@@ -1,0 +1,11 @@
+path = "target/pon_file_io_probe.txt"
+f = open(path, "w")
+print("type:", type(f), type(f).__mro__ if hasattr(type(f), "__mro__") else "?")
+print("write:", f.write("alpha"))
+print("about to writelines")
+f.writelines(["x", "y"])
+print("writelines ok")
+f.flush()
+print("flush ok")
+f.close()
+print("closed", f.closed)
