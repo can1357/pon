@@ -2544,6 +2544,20 @@ pub(crate) unsafe fn construction_init_override(cls: *mut PyType) -> *mut PyObje
     }
     init
 }
+/// CPython `type_call` parity: `__init__` runs on the type of the object
+/// `__new__` actually produced (`Py_TYPE(obj)`), not the class being called —
+/// a `__new__` returning a subclass instance initializes through the subclass.
+pub(crate) unsafe fn construction_init_receiver_type(cls: *mut PyType, instance: *mut PyObject) -> *mut PyType {
+    if !crate::tag::is_heap(instance) {
+        return cls;
+    }
+    // SAFETY: heap-tagged instances carry a readable header.
+    let ty = crate::capi::twin::registered_native_of_foreign(
+        unsafe { (*instance).ob_type.cast_mut().cast::<crate::capi::twin::ForeignTypeObject>() },
+    )
+    .unwrap_or_else(|| unsafe { (*instance).ob_type.cast_mut() });
+    if ty.is_null() { cls } else { ty }
+}
 
 /// `type.__call__`: allocate via `__new__`, then invoke `__init__` when present.
 #[unsafe(no_mangle)]
@@ -2564,14 +2578,20 @@ pub unsafe extern "C" fn type_call(cls_obj: *mut PyObject, args: *mut PyObject, 
     if instance.is_null() {
         return ptr::null_mut();
     }
+    // CPython `type_call`: `type(x)` with exactly one argument is a pure
+    // type query — the answer never runs `__init__`.
+    if explicit_args.len() == 1 && cls == abi::runtime_type_type() {
+        return instance;
+    }
 
     if !unsafe { construction_runs_init(cls, new, instance) } {
         return instance;
     }
 
-    let init = unsafe { construction_init_override(cls) };
+    let init_cls = unsafe { construction_init_receiver_type(cls, instance) };
+    let init = unsafe { construction_init_override(init_cls) };
     if !init.is_null() {
-        let bound = unsafe { descr::descriptor_get(init, instance, cls) };
+        let bound = unsafe { descr::descriptor_get(init, instance, init_cls) };
         if bound.is_null() {
             return ptr::null_mut();
         }
@@ -2586,10 +2606,10 @@ pub unsafe extern "C" fn type_call(cls_obj: *mut PyObject, args: *mut PyObject, 
         if result.is_null() {
             return ptr::null_mut();
         }
-    } else if let Some(init_slot) = unsafe { (*cls).tp_init } {
+    } else if let Some(init_slot) = unsafe { (*init_cls).tp_init } {
         // A C-extension class's bridged `tp_init` follows the CPython
         // contract: a real (possibly empty) tuple, never NULL.
-        let args_object = if args.is_null() && unsafe { crate::capi::is_capi_class(cls) } {
+        let args_object = if args.is_null() && unsafe { crate::capi::is_capi_class(init_cls) } {
             match abi::empty_args_tuple() {
                 Ok(tuple) => tuple,
                 Err(message) => return raise_object(message),
