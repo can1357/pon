@@ -942,6 +942,17 @@ pub unsafe extern "C" fn pon_await(
 		if ty.is_null() {
 			return raise_type_error("awaitable has null type");
 		}
+		let types = match ensure_gen_runtime() {
+			Ok(types) => types,
+			Err(message) => return super::return_null_with_error(message),
+		};
+		// `@types.coroutine`-wrapped generators (CPython CO_ITERABLE_COROUTINE,
+		// e.g. asyncio's `__sleep0`): pon code objects carry no flags, so any
+		// generator is accepted as its own await iterator — a permissive
+		// superset of CPython.
+		if unsafe { generator_kind_for(awaitable, types) } == Some(GeneratorKind::Generator) {
+			return awaitable;
+		}
 		// SAFETY: `ty` is the object's live type descriptor.
 		let slot = unsafe {
 			(*ty)
@@ -963,10 +974,6 @@ pub unsafe extern "C" fn pon_await(
 		if iterator.is_null() {
 			return ptr::null_mut();
 		}
-		let types = match ensure_gen_runtime() {
-			Ok(types) => types,
-			Err(message) => return super::return_null_with_error(message),
-		};
 		if unsafe { generator_kind_for(iterator, types) } == Some(GeneratorKind::Coroutine) {
 			return iterator;
 		}

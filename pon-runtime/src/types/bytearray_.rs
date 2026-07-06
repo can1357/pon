@@ -332,6 +332,12 @@ pub fn set_index(array: &mut PyByteArray, index: isize, value: u8) -> Result<(),
 	array.bytes[index] = value;
 	Ok(())
 }
+/// `del array[index]` (negative indices normalize; out-of-range errors).
+pub fn delete_index(array: &mut PyByteArray, index: isize) -> Result<(), String> {
+	let index = normalize_existing_index(index, array.bytes.len())?;
+	array.bytes.remove(index);
+	Ok(())
+}
 
 pub fn set_slice(array: &mut PyByteArray, start: usize, end: usize, values: &[u8]) {
 	let start = start.min(array.bytes.len());

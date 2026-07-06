@@ -1262,6 +1262,15 @@ unsafe extern "C" fn bytearray_ass_item_slot(
 	index: isize,
 	value: *mut PyObject,
 ) -> c_int {
+	// CPython convention: a NULL value is `del array[index]`.
+	if value.is_null() {
+		return match bytearray_object_mut(object)
+			.and_then(|array| bytearray_type::delete_index(array, index))
+		{
+			Ok(()) => 0,
+			Err(message) => return_minus_one_with_byte_index_error(message),
+		};
+	}
 	match expect_byte(value).and_then(|byte| {
 		bytearray_object_mut(object).and_then(|array| bytearray_type::set_index(array, index, byte))
 	}) {
@@ -1276,6 +1285,13 @@ unsafe extern "C" fn bytearray_ass_subscript_slot(
 	value: *mut PyObject,
 ) -> c_int {
 	if unsafe { crate::types::dict::type_name(key) } == Some("slice") {
+		// CPython convention: a NULL value is `del array[slice]`.
+		if value.is_null() {
+			return match bytearray_delete_slice(object, key) {
+				Ok(()) => 0,
+				Err(message) => bytearray_slice_store_error(message),
+			};
+		}
 		let replacement = match expect_bytes_like(value) {
 			Ok(bytes) => bytes,
 			Err(message) => {
@@ -4545,6 +4561,32 @@ fn bytearray_assign_slice(
 		array.bytes[index as usize] = *byte;
 		index = index.saturating_add(indices.step);
 	}
+	Ok(())
+}
+
+/// `del array[slice]`: step-1 ranges splice out in place; extended slices
+/// rebuild the buffer without the selected indices (CPython parity).
+fn bytearray_delete_slice(object: *mut PyObject, key: *mut PyObject) -> Result<(), String> {
+	let array = bytearray_object_mut(object)?;
+	let indices = normalize_str_slice(unsafe { &*key.cast::<PySlice>() }, array.bytes.len())?;
+	if indices.step == 1 {
+		bytearray_type::set_slice(array, indices.start as usize, indices.stop as usize, &[]);
+		return Ok(());
+	}
+	let mut selected = std::collections::HashSet::with_capacity(indices.len);
+	let mut index = indices.start;
+	for _ in 0..indices.len {
+		selected.insert(index);
+		index = index.saturating_add(indices.step);
+	}
+	let kept: Vec<u8> = array
+		.bytes
+		.iter()
+		.enumerate()
+		.filter(|(position, _)| !selected.contains(&(*position as isize)))
+		.map(|(_, byte)| *byte)
+		.collect();
+	array.bytes = kept;
 	Ok(())
 }
 
