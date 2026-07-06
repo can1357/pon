@@ -1757,7 +1757,10 @@ unsafe fn datetime_timestamp_args(
 		return None;
 	}
 	let timestamp = unsafe { timestamp_to_f64(positional[0]) }?;
-	let tzinfo = positional.get(1).copied().unwrap_or_else(|| unsafe { abi::pon_none() });
+	let tzinfo = positional
+		.get(1)
+		.copied()
+		.unwrap_or_else(|| unsafe { abi::pon_none() });
 	if tzinfo.is_null() {
 		return None;
 	}
@@ -1812,12 +1815,12 @@ fn timestamp_to_parts(timestamp: f64, utc: bool) -> Option<TimestampParts> {
 		return None;
 	}
 	Some(TimestampParts {
-		year:        out.tm_year + 1900,
-		month:       out.tm_mon + 1,
-		day:         out.tm_mday,
-		hour:        out.tm_hour,
-		minute:      out.tm_min,
-		second:      out.tm_sec,
+		year: out.tm_year + 1900,
+		month: out.tm_mon + 1,
+		day: out.tm_mday,
+		hour: out.tm_hour,
+		minute: out.tm_min,
+		second: out.tm_sec,
 		microsecond,
 	})
 }

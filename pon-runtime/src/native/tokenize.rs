@@ -234,15 +234,11 @@ unsafe fn line_object_to_text(
 	if unsafe { dict::type_name(object) } == Some("bytes") {
 		let bytes = unsafe { (&*object.cast::<PyBytes>()).as_slice() };
 		let Some(encoding) = encoding else {
-			return Err(raise_type_error(
-				"TokenizerIter() source returned bytes without an encoding",
-			));
+			return Err(raise_type_error("TokenizerIter() source returned bytes without an encoding"));
 		};
 		return decode_bytes_line(bytes, encoding);
 	}
-	Err(raise_type_error(
-		"TokenizerIter() source must return str, bytes, or stop iteration",
-	))
+	Err(raise_type_error("TokenizerIter() source must return str, bytes, or stop iteration"))
 }
 
 fn decode_bytes_line(bytes: &[u8], encoding: &str) -> Result<String, *mut PyObject> {
@@ -285,13 +281,12 @@ fn tokenize_source(source: &str, extra_tokens: bool) -> Vec<NativeToken> {
 		let end = range.end().to_usize().min(source.len());
 		let text = token_text(source, kind, start, end);
 		let mut start_pos = lines.position(start);
-		let mut end_pos = if matches!(kind, TokenKind::Newline | TokenKind::NonLogicalNewline)
-			&& end > start
-		{
-			(start_pos.0, start_pos.1 + text.chars().count() as i64)
-		} else {
-			lines.position(end)
-		};
+		let mut end_pos =
+			if matches!(kind, TokenKind::Newline | TokenKind::NonLogicalNewline) && end > start {
+				(start_pos.0, start_pos.1 + text.chars().count() as i64)
+			} else {
+				lines.position(end)
+			};
 		if matches!(kind, TokenKind::Newline) && start == end && implicit_final_newline(source) {
 			end_pos.1 += 1;
 		}
@@ -310,11 +305,11 @@ fn tokenize_source(source: &str, extra_tokens: bool) -> Vec<NativeToken> {
 
 	let eof = eof_position(source, &lines);
 	tokens.push(NativeToken {
-		kind: ENDMARKER,
-		text: String::new(),
+		kind:  ENDMARKER,
+		text:  String::new(),
 		start: eof,
-		end: eof,
-		line: String::new(),
+		end:   eof,
+		line:  String::new(),
 	});
 
 	tokens
@@ -398,7 +393,9 @@ impl LineIndex {
 	fn position(&self, offset: usize) -> (i64, i64) {
 		let index = self.line_index(offset);
 		let line_start = self.starts[index];
-		let byte_col = offset.saturating_sub(line_start).min(self.lines[index].len());
+		let byte_col = offset
+			.saturating_sub(line_start)
+			.min(self.lines[index].len());
 		let col = self.lines[index][..byte_col].chars().count();
 		((index + 1) as i64, col as i64)
 	}

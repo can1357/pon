@@ -169,9 +169,9 @@ pub(crate) struct ArrayBufferView {
 pub(crate) unsafe fn buffer_view(object: *mut PyObject) -> Option<ArrayBufferView> {
 	let array = unsafe { as_array(object) }?;
 	Some(ArrayBufferView {
-		data: array.data.as_mut_ptr(),
-		len: array.data.len(),
-		format: buffer_format(array.typecode),
+		data:     array.data.as_mut_ptr(),
+		len:      array.data.len(),
+		format:   buffer_format(array.typecode),
 		itemsize: item_size(array.typecode),
 	})
 }
@@ -850,10 +850,7 @@ unsafe extern "C" fn array_subscript_slot(
 	unsafe { array_item_slot(object, index) }
 }
 
-fn array_delete_slice(
-	array: &mut PyArrayObject,
-	indices: crate::types::slice_::SliceIndices,
-) {
+fn array_delete_slice(array: &mut PyArrayObject, indices: crate::types::slice_::SliceIndices) {
 	let size = item_size(array.typecode);
 	if indices.step == 1 {
 		let start = indices.start as usize * size;
@@ -1054,7 +1051,11 @@ fn length_compare(op: u8, lhs: usize, rhs: usize) -> bool {
 	}
 }
 
-fn lexicographic_array_compare(lhs: &PyArrayObject, rhs: &PyArrayObject, op: u8) -> Result<bool, ()> {
+fn lexicographic_array_compare(
+	lhs: &PyArrayObject,
+	rhs: &PyArrayObject,
+	op: u8,
+) -> Result<bool, ()> {
 	if core::ptr::eq(lhs, rhs) {
 		return Ok(length_compare(op, 0, 0));
 	}
@@ -1723,9 +1724,6 @@ mod tests {
 		assert_eq!(unsafe { (*view).format }, b'h');
 		let values = unsafe { crate::types::memoryview::tolist(&*view) }
 			.expect("memoryview(array).tolist() should decode h format");
-		assert_eq!(
-			values,
-			vec![MemoryViewListValue::Int(1), MemoryViewListValue::Int(-2)]
-		);
+		assert_eq!(values, vec![MemoryViewListValue::Int(1), MemoryViewListValue::Int(-2)]);
 	}
 }

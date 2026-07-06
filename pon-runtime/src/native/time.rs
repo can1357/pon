@@ -603,15 +603,22 @@ fn timezone_info() -> Result<TimezoneInfo, String> {
 	let first = samples
 		.first()
 		.ok_or_else(|| "failed to sample local timezone".to_owned())?;
-	let standard = samples.iter().find(|sample| !sample.is_dst).unwrap_or(first);
+	let standard = samples
+		.iter()
+		.find(|sample| !sample.is_dst)
+		.unwrap_or(first);
 	let daylight_sample = samples.iter().find(|sample| sample.is_dst);
 	let daylight = if daylight_sample.is_some() { 1 } else { 0 };
 	let alternate = daylight_sample.unwrap_or(standard);
 	Ok(TimezoneInfo {
 		timezone: -standard.offset_east,
 		daylight,
-		altzone:  if daylight != 0 { -alternate.offset_east } else { -standard.offset_east },
-		tzname:   [
+		altzone: if daylight != 0 {
+			-alternate.offset_east
+		} else {
+			-standard.offset_east
+		},
+		tzname: [
 			standard.zone.clone(),
 			if daylight != 0 {
 				alternate.zone.clone()

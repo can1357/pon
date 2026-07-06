@@ -98,17 +98,17 @@ static WAKEUP_FD: AtomicI32 = AtomicI32::new(-1);
 /// path is exactly one relaxed atomic load; the heavier pending mask is touched
 /// only after this flag is observed set.
 static PENDING_SIGNAL_FLAG: AtomicBool = AtomicBool::new(false);
-static PENDING_SIGNALS: [AtomicU64; PENDING_WORDS] =
-	[AtomicU64::new(0), AtomicU64::new(0)];
+static PENDING_SIGNALS: [AtomicU64; PENDING_WORDS] = [AtomicU64::new(0), AtomicU64::new(0)];
 const PENDING_WORDS: usize = 2;
 
 /// OS thread selected to run Python signal handlers.  CPython uses the main
 /// interpreter thread; pon records the thread that initializes the runtime.
 static MAIN_THREAD_ID: AtomicUsize = AtomicUsize::new(0);
 
-/// Startup installs pon's SIGINT trampoline before `_signal` itself is imported.
-/// Until the module table contains `default_int_handler`, this flag tells the
-/// pending-signal drain to raise `KeyboardInterrupt` for SIGINT directly.
+/// Startup installs pon's SIGINT trampoline before `_signal` itself is
+/// imported. Until the module table contains `default_int_handler`, this flag
+/// tells the pending-signal drain to raise `KeyboardInterrupt` for SIGINT
+/// directly.
 static DEFAULT_SIGINT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 static ITIMER_ERROR_TYPE: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
@@ -184,9 +184,8 @@ pub(crate) fn gc_held_roots() -> Vec<*mut PyObject> {
 /// imports `signal`: the main-thread identity and pon's default SIGINT handler.
 pub(crate) fn init_main_thread_signal_handlers() -> Result<(), String> {
 	note_main_thread();
-	install_signal_trampoline(libc::SIGINT as usize).map_err(|errno| {
-		format!("failed to install SIGINT handler: {}", errno_message(errno))
-	})?;
+	install_signal_trampoline(libc::SIGINT as usize)
+		.map_err(|errno| format!("failed to install SIGINT handler: {}", errno_message(errno)))?;
 	DEFAULT_SIGINT_ACTIVE.store(true, Ordering::Release);
 	Ok(())
 }
@@ -225,8 +224,8 @@ pub unsafe extern "C" fn pon_signal_check_pending() -> libc::c_int {
 /// Runs pending Python signal handlers on the main runtime thread.
 ///
 /// Non-main threads leave the pending flag set so the next main-thread
-/// interruption point will perform the drain.  On a raising handler, unprocessed
-/// signals are restored to the atomic mask.
+/// interruption point will perform the drain.  On a raising handler,
+/// unprocessed signals are restored to the atomic mask.
 pub(crate) unsafe fn process_pending_signals() -> Result<(), *mut PyObject> {
 	if !has_pending_signals() {
 		return Ok(());
@@ -287,8 +286,7 @@ unsafe fn run_python_signal_handler(signalnum: usize) -> Result<(), *mut PyObjec
 				return Err(std::ptr::null_mut());
 			}
 			let mut args = [signal_object, frame];
-			let result =
-				unsafe { pon_call(handler as *mut PyObject, args.as_mut_ptr(), args.len()) };
+			let result = unsafe { pon_call(handler as *mut PyObject, args.as_mut_ptr(), args.len()) };
 			if result.is_null() {
 				Err(std::ptr::null_mut())
 			} else {
@@ -296,8 +294,7 @@ unsafe fn run_python_signal_handler(signalnum: usize) -> Result<(), *mut PyObjec
 			}
 		},
 		StoredHandler::Dfl
-			if signalnum == libc::SIGINT as usize
-				&& DEFAULT_SIGINT_ACTIVE.load(Ordering::Relaxed) =>
+			if signalnum == libc::SIGINT as usize && DEFAULT_SIGINT_ACTIVE.load(Ordering::Relaxed) =>
 		{
 			Err(raise_kind_error_no_args(ExceptionKind::KeyboardInterrupt))
 		},
@@ -743,9 +740,7 @@ unsafe extern "C" fn signal_set_wakeup_fd(argv: *mut *mut PyObject, argc: usize)
 		}
 		if flags & libc::O_NONBLOCK == 0 {
 			let message = format!("the fd {fd} must be in non-blocking mode");
-			return unsafe {
-				crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len())
-			};
+			return unsafe { crate::abi::exc::pon_raise_value_error(message.as_ptr(), message.len()) };
 		}
 	}
 	let previous = WAKEUP_FD.swap(fd as i32, Ordering::SeqCst);
@@ -879,15 +874,8 @@ unsafe extern "C" fn signal_sigwaitinfo(argv: *mut *mut PyObject, argc: usize) -
 }
 
 #[cfg(target_os = "linux")]
-const SIGINFO_FIELDS: [&str; 7] = [
-	"si_signo",
-	"si_code",
-	"si_errno",
-	"si_pid",
-	"si_uid",
-	"si_status",
-	"si_band",
-];
+const SIGINFO_FIELDS: [&str; 7] =
+	["si_signo", "si_code", "si_errno", "si_pid", "si_uid", "si_status", "si_band"];
 
 #[cfg(target_os = "linux")]
 #[repr(C)]
