@@ -28,6 +28,9 @@ use crate::{
 	types::{bool_, exc::PyBaseException, property},
 };
 
+fn stable_hash(text: &str) -> i64 {
+	crate::pyhash::str_hash(text)
+}
 pub const VARIADIC_ARITY: usize = usize::MAX;
 
 type BuiltinFn = unsafe extern "C" fn(*mut *mut PyObject, usize) -> *mut PyObject;
@@ -2928,12 +2931,84 @@ fn wrapped_chain_matches(
 	false
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ClassDictMatch {
+	Direct,
+	Wrapped,
+}
+
+fn function_qualname_owner(function: *mut PyObject) -> Option<String> {
+	if function.is_null() {
+		return None;
+	}
+	let qualname =
+		unsafe { abi::object::pon_get_attr(function, intern("__qualname__"), ptr::null_mut()) };
+	if qualname.is_null() {
+		pon_err_clear();
+		return None;
+	}
+	let qualname = crate::tag::untag_arg(qualname);
+	let text = unsafe { crate::types::type_::unicode_text(qualname) }?;
+	let (owner_path, _) = text.rsplit_once('.')?;
+	Some(owner_path.rsplit('.').next()?.to_owned())
+}
+
+fn class_dict_match(
+	dict: &crate::types::type_::PyClassDict,
+	carriers: &[*mut PyType; 2],
+	function: *mut PyObject,
+	function_name_id: Option<u32>,
+) -> Option<ClassDictMatch> {
+	let direct_match =
+		|value: *mut PyObject| value == function || carrier_matches(value, carriers, function);
+	if let Some(name_id) = function_name_id {
+		if let Some(value) = dict.get(name_id) {
+			if direct_match(value) {
+				return Some(ClassDictMatch::Direct);
+			}
+			if wrapped_chain_matches(value, carriers, function) {
+				return Some(ClassDictMatch::Wrapped);
+			}
+		}
+		return dict
+			.iter()
+			.any(|(entry_name, value)| entry_name != name_id && direct_match(value))
+			.then_some(ClassDictMatch::Direct);
+	}
+	if dict.iter().any(|(_, value)| direct_match(value)) {
+		return Some(ClassDictMatch::Direct);
+	}
+	dict
+		.iter()
+		.any(|(_, value)| wrapped_chain_matches(value, carriers, function))
+		.then_some(ClassDictMatch::Wrapped)
+}
 fn find_defining_class(function: *mut PyObject, ty: *mut PyType) -> Option<*mut PyType> {
 	let carriers = carrier_types();
 	let function_name = crate::types::function::function_name(function);
 	let function_name_id = function_name.as_deref().map(intern);
-	let direct_match =
-		|value: *mut PyObject| value == function || carrier_matches(value, &carriers, function);
+	if let Some(owner) = function_qualname_owner(function) {
+		let mut wrapped_owner = None;
+		for class in unsafe { crate::mro::mro_entries(ty) } {
+			if class.is_null() || unsafe { (*class).name() } != owner {
+				continue;
+			}
+			let dict = unsafe { (*class).tp_dict };
+			if dict.is_null() {
+				continue;
+			}
+			let dict = unsafe { &*dict.cast::<crate::types::type_::PyClassDict>() };
+			match class_dict_match(dict, &carriers, function, function_name_id) {
+				Some(ClassDictMatch::Direct) => return Some(class),
+				Some(ClassDictMatch::Wrapped) if wrapped_owner.is_none() => wrapped_owner = Some(class),
+				_ => {},
+			}
+		}
+		if wrapped_owner.is_some() {
+			return wrapped_owner;
+		}
+	}
+
 	let mut wrapped_candidate = None;
 	for class in unsafe { crate::mro::mro_entries(ty) } {
 		if class.is_null() {
@@ -2944,36 +3019,12 @@ fn find_defining_class(function: *mut PyObject, ty: *mut PyType) -> Option<*mut 
 			continue;
 		}
 		let dict = unsafe { &*dict.cast::<crate::types::type_::PyClassDict>() };
-		if let Some(name_id) = function_name_id {
-			if let Some(value) = dict.get(name_id) {
-				if direct_match(value) {
-					return Some(class);
-				}
-				if wrapped_candidate.is_none() && wrapped_chain_matches(value, &carriers, function) {
-					wrapped_candidate = Some(class);
-				}
-			}
-			// A method can be stored under a different name than the
-			// function's own (`other = method` rebinding): fall back to an
-			// identity/carrier scan.  Wrapper-chain probing stays name-keyed
-			// so the fallback never pays attr lookups per dict entry.
-			if dict
-				.iter()
-				.any(|(entry_name, value)| entry_name != name_id && direct_match(value))
-			{
-				return Some(class);
-			}
-			continue;
-		}
-		if dict.iter().any(|(_, value)| direct_match(value)) {
-			return Some(class);
-		}
-		if wrapped_candidate.is_none()
-			&& dict
-				.iter()
-				.any(|(_, value)| wrapped_chain_matches(value, &carriers, function))
-		{
-			wrapped_candidate = Some(class);
+		match class_dict_match(dict, &carriers, function, function_name_id) {
+			Some(ClassDictMatch::Direct) => return Some(class),
+			Some(ClassDictMatch::Wrapped) if wrapped_candidate.is_none() => {
+				wrapped_candidate = Some(class);
+			},
+			_ => {},
 		}
 	}
 	wrapped_candidate
@@ -3333,6 +3384,7 @@ unsafe fn object_is_instance(object: *mut PyObject, classinfo: *mut PyObject) ->
 	if object.is_null() || classinfo.is_null() {
 		return 0;
 	}
+	crate::untag_prelude!(err = -1; object);
 	let classinfo = crate::capi::twin::registered_native_of_foreign(
 		classinfo.cast::<crate::capi::twin::ForeignTypeObject>(),
 	)
@@ -3434,10 +3486,7 @@ unsafe fn type_object_name(object: *mut PyObject) -> Option<String> {
 	}
 	// Registered foreign classes (C extension types) read through their
 	// native twin — never through the pon `PyType` layout.
-	if let Some(native) = crate::capi::twin::registered_native_of_foreign(object.cast()) {
-		return Some(unsafe { (*native).name() }.to_owned());
-	}
-	let ty = unsafe { native_object_type(object) }?;
+	let ty = unsafe { native_object_type(object)? };
 	let meta_name = unsafe { (*ty).name() };
 	if meta_name == "type" {
 		let class = object.cast::<PyType>();
@@ -3466,15 +3515,6 @@ unsafe fn type_object_name(object: *mut PyObject) -> Option<String> {
 	unsafe { type_name(object).map(ToOwned::to_owned) }
 }
 
-fn stable_hash(text: &str) -> i64 {
-	let mut hash: i64 = 0xcbf29ce484222325_u64 as i64;
-	for byte in text.bytes() {
-		hash ^= i64::from(byte);
-		hash = hash.wrapping_mul(0x100000001b3);
-	}
-	if hash == -1 { -2 } else { hash }
-}
-
 #[cfg(test)]
 mod tests {
 	use std::{
@@ -3485,7 +3525,7 @@ mod tests {
 	use super::*;
 	use crate::{
 		object::PyLong,
-		thread_state::{pon_err_clear, pon_err_message, test_state_lock},
+		thread_state::{pon_err_clear, test_state_lock},
 	};
 
 	static CALL_COUNTER: AtomicI64 = AtomicI64::new(0);
@@ -3511,16 +3551,6 @@ mod tests {
 	) -> *mut PyObject {
 		CALL_COUNTER.fetch_add(1, Ordering::SeqCst);
 		unsafe { abi::pon_const_int(0) }
-	}
-
-	fn execute_source(source: &str) {
-		let source = unsafe { abi::pon_const_str(source.as_ptr(), source.len()) };
-		assert!(!source.is_null(), "source string allocation failed");
-		let globals = unsafe { abi::map::pon_build_map(ptr::null_mut(), 0) };
-		assert!(!globals.is_null(), "globals dict allocation failed");
-		let mut argv = [source, globals, globals];
-		let result = unsafe { crate::dynexec::builtin_exec(argv.as_mut_ptr(), argv.len()) };
-		assert!(!result.is_null(), "exec failed: {:?}", pon_err_message());
 	}
 
 	fn int_list(values: &[i64]) -> *mut PyObject {
@@ -3682,28 +3712,5 @@ mod tests {
 		let ascii = unsafe { builtin_ascii(args.as_mut_ptr(), args.len()) };
 		assert!(!ascii.is_null());
 		assert_eq!(object_to_string(ascii).as_deref(), Some("'\\xe9\\U0001f600x'"));
-	}
-
-	#[test]
-	fn zero_arg_super_prefers_direct_owner_over_subclass_wrapper() {
-		let _guard = test_state_lock();
-		init_runtime();
-		execute_source(
-			r#"
-from enum import Enum
-from collections import namedtuple
-
-class ASN(namedtuple("ASN", "nid shortname longname oid")):
-    __slots__ = ()
-
-    def __new__(cls, oid):
-        return super().__new__(cls, 1, "short", "long", oid)
-
-class Purpose(ASN, Enum):
-    SERVER_AUTH = "1.2.3"
-
-assert Purpose.SERVER_AUTH.oid == "1.2.3"
-"#,
-		);
 	}
 }

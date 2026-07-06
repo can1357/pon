@@ -185,7 +185,8 @@ pub fn from_literal_token(text: &str) -> *mut PyObject {
 	}
 }
 
-/// Extracts an integer payload from exact `int`, tagged small int, and `bool` objects.
+/// Extracts an integer payload from exact `int`, tagged small int, and `bool`
+/// objects.
 #[must_use]
 pub unsafe fn to_bigint_including_bool(object: *mut PyObject) -> Option<BigInt> {
 	if crate::tag::is_small_int(object) {
@@ -197,7 +198,8 @@ pub unsafe fn to_bigint_including_bool(object: *mut PyObject) -> Option<BigInt> 
 	unsafe { to_bigint(object) }
 }
 
-/// Extracts an `i64` payload from exact `int`, tagged small int, and `bool` objects.
+/// Extracts an `i64` payload from exact `int`, tagged small int, and `bool`
+/// objects.
 #[must_use]
 pub unsafe fn to_i64_including_bool(object: *mut PyObject) -> Option<i64> {
 	if crate::tag::is_small_int(object) {

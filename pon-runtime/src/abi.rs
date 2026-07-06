@@ -174,13 +174,13 @@ struct CurrentCall {
 #[derive(Clone, Debug)]
 pub(crate) struct LsprofCallSnapshot {
 	/// Callee function object whose `__code__` identifies the pstats row.
-	pub function:      *mut PyObject,
+	pub function:       *mut PyObject,
 	/// Calls observed for this caller/callee edge.
-	pub callcount:     u64,
+	pub callcount:      u64,
 	/// Recursive calls observed for this caller/callee edge.
-	pub reccallcount:  u64,
+	pub reccallcount:   u64,
 	/// Cumulative seconds spent in the callee for this edge.
-	pub total_seconds: f64,
+	pub total_seconds:  f64,
 	/// Seconds spent in the callee body excluding recorded children.
 	pub inline_seconds: f64,
 }
@@ -189,17 +189,17 @@ pub(crate) struct LsprofCallSnapshot {
 #[derive(Clone, Debug)]
 pub(crate) struct LsprofEntrySnapshot {
 	/// Function object whose `__code__` identifies the pstats row.
-	pub function:      *mut PyObject,
+	pub function:       *mut PyObject,
 	/// Total calls observed for this function.
-	pub callcount:     u64,
+	pub callcount:      u64,
 	/// Recursive calls observed for this function.
-	pub reccallcount:  u64,
+	pub reccallcount:   u64,
 	/// Cumulative seconds spent in this function.
-	pub total_seconds: f64,
+	pub total_seconds:  f64,
 	/// Seconds spent in this function excluding recorded children.
 	pub inline_seconds: f64,
 	/// Per-callee stats emitted as this entry's `calls` list.
-	pub calls:         Vec<LsprofCallSnapshot>,
+	pub calls:          Vec<LsprofCallSnapshot>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -229,7 +229,7 @@ struct LsprofActiveFrame {
 
 #[derive(Clone, Debug, Default)]
 struct LsprofRuntimeState {
-	enabled: bool,
+	enabled:  bool,
 	subcalls: bool,
 	builtins: bool,
 	stats:    HashMap<usize, LsprofFunctionStats>,
@@ -246,11 +246,7 @@ static LSPROF_REGISTRY: LazyLock<Mutex<LsprofRegistry>> =
 	LazyLock::new(|| Mutex::new(LsprofRegistry::default()));
 
 /// Register or reset one `_lsprof.Profiler` runtime record.
-pub(crate) fn lsprof_register_profiler(
-	profiler: *mut PyObject,
-	subcalls: bool,
-	builtins: bool,
-) {
+pub(crate) fn lsprof_register_profiler(profiler: *mut PyObject, subcalls: bool, builtins: bool) {
 	if profiler.is_null() {
 		return;
 	}
@@ -269,11 +265,7 @@ pub(crate) fn lsprof_register_profiler(
 }
 
 /// Enable one `_lsprof.Profiler`, preserving accumulated stats.
-pub(crate) fn lsprof_enable_profiler(
-	profiler: *mut PyObject,
-	subcalls: bool,
-	builtins: bool,
-) {
+pub(crate) fn lsprof_enable_profiler(profiler: *mut PyObject, subcalls: bool, builtins: bool) {
 	if profiler.is_null() {
 		return;
 	}
@@ -291,7 +283,8 @@ pub(crate) fn lsprof_enable_profiler(
 	}
 }
 
-/// Disable one `_lsprof.Profiler`, closing active frames at a monotonic instant.
+/// Disable one `_lsprof.Profiler`, closing active frames at a monotonic
+/// instant.
 pub(crate) fn lsprof_disable_profiler(profiler: *mut PyObject) {
 	if profiler.is_null() {
 		return;
@@ -353,10 +346,10 @@ pub(crate) fn lsprof_stats_snapshot(profiler: *mut PyObject) -> Vec<LsprofEntryS
 				.collect::<Vec<_>>();
 			calls.sort_by_key(|call| lsprof_function_sort_key(call.function as usize));
 			LsprofEntrySnapshot {
-				function:       function as *mut PyObject,
-				callcount:      stats.callcount,
-				reccallcount:   stats.reccallcount,
-				total_seconds:  ns_to_seconds(stats.total_ns),
+				function: function as *mut PyObject,
+				callcount: stats.callcount,
+				reccallcount: stats.reccallcount,
+				total_seconds: ns_to_seconds(stats.total_ns),
 				inline_seconds: ns_to_seconds(stats.inline_ns),
 				calls,
 			}
@@ -387,7 +380,10 @@ fn lsprof_call_enter(function: *mut PyFunction) {
 			continue;
 		}
 		let function_key = function as usize;
-		let recursive = state.stack.iter().any(|frame| frame.function == function_key);
+		let recursive = state
+			.stack
+			.iter()
+			.any(|frame| frame.function == function_key);
 		state.stack.push(LsprofActiveFrame {
 			function: function_key,
 			start: now,
@@ -4547,18 +4543,10 @@ unsafe fn type_tag_for_object(object: *mut PyObject) -> TypeTag {
 	TypeTag::Other
 }
 
-/// Creates a Python integer, using a tagged immediate when the value fits.
+/// Creates a boxed Python integer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_const_int(value: i64) -> *mut PyObject {
-	catch_object_helper(|| {
-		if let Err(message) = ensure_runtime_initialized() {
-			return return_null_with_error(message);
-		}
-		if let Some(object) = crate::tag::try_tag_small_int(value) {
-			return object;
-		}
-		boxed_const_int_uncaught(value)
-	})
+	catch_object_helper(|| boxed_const_int_uncaught(value))
 }
 
 /// Creates a boxed Phase-A UTF-8 string from raw bytes.
@@ -5072,9 +5060,11 @@ impl CurrentFunctionGuard {
 					.borrow_mut()
 					.push(CurrentCall { function, argv, argc, caller_line })
 			});
-			thread_state_lock()
-				.current_call_roots
-				.push(GcCallRoots { callable: function.cast::<PyObject>(), argv, argc });
+			thread_state_lock().current_call_roots.push(GcCallRoots {
+				callable: function.cast::<PyObject>(),
+				argv,
+				argc,
+			});
 			lsprof_call_enter(function);
 			return Self { pushed: true, function };
 		}
@@ -6672,7 +6662,9 @@ fn lock_collect_mutex() -> MutexGuard<'static, ()> {
 		Err(TryLockError::Poisoned(poison)) => poison.into_inner(),
 		Err(TryLockError::WouldBlock) => {
 			let mut region = crate::sync::BlockingRegionGuard::enter();
-			let guard = COLLECT_MUTEX.lock().unwrap_or_else(|poison| poison.into_inner());
+			let guard = COLLECT_MUTEX
+				.lock()
+				.unwrap_or_else(|poison| poison.into_inner());
 			let _ = region.leave();
 			guard
 		},
@@ -6745,7 +6737,11 @@ fn push_thread_state_roots(state: &PonThreadState, roots: &mut Vec<*mut u8>) {
 			roots.push(value.cast::<u8>());
 		}
 	}
-	for call in state.current_call_roots.iter().chain(state.helper_call_roots.iter()) {
+	for call in state
+		.current_call_roots
+		.iter()
+		.chain(state.helper_call_roots.iter())
+	{
 		if !call.callable.is_null() {
 			roots.push(call.callable.cast::<u8>());
 		}

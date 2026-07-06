@@ -4635,9 +4635,7 @@ fn memoryview_item_object(object: *mut PyObject, index: isize) -> Result<*mut Py
 	}
 	let itemsize = view.itemsize();
 	let index = normalize_byte_index(index, view.len / itemsize)?;
-	Ok(memoryview_scalar_object(unsafe {
-		memoryview_type::element_value(view, index)?
-	}))
+	Ok(memoryview_scalar_object(unsafe { memoryview_type::element_value(view, index)? }))
 }
 
 fn memoryview_slice_object(
