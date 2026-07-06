@@ -186,7 +186,7 @@ pub(crate) fn format_object_with_spec(value: *mut PyObject, spec: &str) -> Resul
 	if spec.is_empty() {
 		object_to_str(value)
 	} else {
-		Err(format!("unsupported format string passed to {}.__format__ [spec-fallthrough]", type_name(value)))
+		Err(format!("unsupported format string passed to {}.__format__", type_name(value)))
 	}
 }
 

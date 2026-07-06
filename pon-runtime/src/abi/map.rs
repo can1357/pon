@@ -2561,6 +2561,25 @@ unsafe extern "C" fn set_copy_method_trampoline(
 	}
 }
 
+/// Explicit `s.__iter__()` lookup (configparser-style direct dunder calls);
+/// same iterator as the `tp_iter` slot.
+unsafe extern "C" fn set_iter_method_trampoline(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let args = match map_method_args(argv, argc, "set.__iter__") {
+		Ok(args) => args,
+		Err(message) => return null_error(message),
+	};
+	if args.len() != 1 {
+		return raise_map_type_error(format!(
+			"set.__iter__() expected 0 arguments, got {}",
+			args.len().saturating_sub(1)
+		));
+	}
+	unsafe { pon_set_iter(args[0]) }
+}
+
 unsafe extern "C" fn set_remove_method_trampoline(
 	argv: *mut *mut PyObject,
 	argc: usize,
@@ -2968,6 +2987,7 @@ pub unsafe fn pon_set_bound_method(set: *mut PyObject, name: &str) -> *mut PyObj
 		"issuperset" => alloc_bound_native_method(set, name, set_issuperset_method_trampoline),
 		"isdisjoint" => alloc_bound_native_method(set, name, set_isdisjoint_method_trampoline),
 		"__contains__" => alloc_bound_native_method(set, name, set_contains_method_trampoline),
+		"__iter__" => alloc_bound_native_method(set, name, set_iter_method_trampoline),
 		"copy" => alloc_bound_native_method(set, name, set_copy_method_trampoline),
 		"remove" => alloc_bound_native_method(set, name, set_remove_method_trampoline),
 		"clear" => alloc_bound_native_method(set, name, set_clear_method_trampoline),

@@ -125,6 +125,10 @@ static OBJECT_DUNDER_STR_CARRIER: AtomicPtr<PyObject> = AtomicPtr::new(ptr::null
 /// `object_reduce_ex`'s override probe treats a hook resolving to it as "no
 /// user override" (calling it would recurse into the protocol-0 default).
 static OBJECT_DUNDER_REDUCE_CARRIER: AtomicPtr<PyObject> = AtomicPtr::new(ptr::null_mut());
+/// Identity anchor for the default `object.__format__` carrier: `format()`
+/// treats a hook resolving to it as "no user override" and routes builtins
+/// through the native spec formatter (the carrier rejects non-empty specs).
+static OBJECT_DUNDER_FORMAT_CARRIER: AtomicPtr<PyObject> = AtomicPtr::new(ptr::null_mut());
 
 pub(crate) fn object_dunder_repr_carrier() -> *mut PyObject {
 	OBJECT_DUNDER_REPR_CARRIER.load(Ordering::Acquire)
@@ -136,6 +140,9 @@ pub(crate) fn object_dunder_str_carrier() -> *mut PyObject {
 
 pub(crate) fn object_dunder_init_carrier() -> *mut PyObject {
 	OBJECT_DUNDER_INIT_CARRIER.load(Ordering::Acquire)
+}
+pub(crate) fn object_dunder_format_carrier() -> *mut PyObject {
+	OBJECT_DUNDER_FORMAT_CARRIER.load(Ordering::Acquire)
 }
 
 /// Freshly allocated empty tuple for slot calls whose C contract requires a
@@ -2479,6 +2486,10 @@ fn install_type_check_dunders(runtime: &mut Runtime) {
 			continue;
 		};
 		crate::types::function::mark_native_function(function);
+		// Method-descriptor marking makes `function_descr_get` bind these to
+		// the class receiver — `super().__instancecheck__(x)` must arrive as
+		// `(cls, x)`.
+		crate::types::function::mark_native_method_descriptor(function);
 		unsafe {
 			let type_type = runtime._type_type;
 			let mut dict = (*type_type).tp_dict.cast::<type_::PyClassDict>();
@@ -3048,6 +3059,9 @@ fn install_object_dunders(runtime: &mut Runtime, object_type: *mut PyType) {
 			},
 			"__str__" => {
 				OBJECT_DUNDER_STR_CARRIER.store(function.cast::<PyObject>(), Ordering::Release)
+			},
+			"__format__" => {
+				OBJECT_DUNDER_FORMAT_CARRIER.store(function.cast::<PyObject>(), Ordering::Release)
 			},
 			"__reduce__" => {
 				OBJECT_DUNDER_REDUCE_CARRIER.store(function.cast::<PyObject>(), Ordering::Release)
@@ -7102,6 +7116,33 @@ unsafe extern "C" fn data_type_dunder_str_native(
 	let text = crate::native::builtins_mod::str_text(receiver);
 	unsafe { pon_const_str(text.as_ptr(), text.len()) }
 }
+/// `<data type>.__format__(self, spec)` — native spec formatting of the
+/// receiver's canonical value. Installed on `int`/`str`/`float` so payload
+/// subclasses (enum members copy `int.__format__` into their class dicts)
+/// format through the builtin path; spec errors are ValueError (CPython's
+/// "Unknown format code" kind).
+unsafe extern "C" fn data_type_dunder_format_native(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	if argv.is_null() || argc != 2 {
+		let message = format!(
+			"__format__() takes exactly one argument ({} given)",
+			argc.saturating_sub(1)
+		);
+		return unsafe { exc::pon_raise_type_error(message.as_ptr(), message.len()) };
+	}
+	let receiver = unsafe { *argv };
+	let spec_object = crate::tag::untag_arg(unsafe { *argv.add(1) });
+	let Some(spec) = (unsafe { type_::unicode_text(spec_object) }) else {
+		const MESSAGE: &str = "__format__() argument must be str";
+		return unsafe { exc::pon_raise_type_error(MESSAGE.as_ptr(), MESSAGE.len()) };
+	};
+	match str_::format_object_with_spec(receiver, spec) {
+		Ok(text) => unsafe { pon_const_str(text.as_ptr(), text.len()) },
+		Err(message) => unsafe { exc::pon_raise_value_error(message.as_ptr(), message.len()) },
+	}
+}
 
 /// Data-type dunder surface for `int`, `str`, and `bytes`: a real `__new__`
 /// (staticmethod carrier, payload-subclass aware) plus `__repr__` (and
@@ -7163,6 +7204,32 @@ fn install_data_type_dunders(runtime: &mut Runtime) {
 					(&mut *dict).set(str_name, function.cast::<PyObject>());
 				}
 			}
+			crate::sync::register_namespaced_type(ty);
+		}
+	}
+
+	// `__format__` rides the same surface plus `float` (which keeps its own
+	// `tp_new`, so it stays out of the loop above).
+	let float_type = unsafe { (*float::from_f64(0.0)).ob_type.cast_mut() };
+	for ty in [long_type, unicode_type, float_type] {
+		if ty.is_null() {
+			continue;
+		}
+		let format_name = crate::intern::intern("__format__");
+		let Ok(function) =
+			alloc_function(runtime, data_type_dunder_format_native as *const u8, 2, format_name)
+		else {
+			continue;
+		};
+		crate::types::function::mark_native_function(function);
+		crate::types::function::mark_native_method_descriptor(function);
+		unsafe {
+			let mut dict = (*ty).tp_dict.cast::<type_::PyClassDict>();
+			if dict.is_null() {
+				dict = type_::new_namespace();
+				(*ty).tp_dict = dict.cast::<PyObject>();
+			}
+			(&mut *dict).set(format_name, function.cast::<PyObject>());
 			crate::sync::register_namespaced_type(ty);
 		}
 	}

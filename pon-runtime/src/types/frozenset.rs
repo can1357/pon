@@ -270,6 +270,7 @@ unsafe extern "C" fn frozenset_getattro_slot(
 		| "issuperset"
 		| "isdisjoint"
 		| "__contains__"
+		| "__iter__"
 		| "copy"
 		| "__reduce__"
 		| "__reduce_ex__" => unsafe { crate::abi::map::pon_set_bound_method(object, name) },

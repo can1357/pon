@@ -628,6 +628,7 @@ unsafe extern "C" fn set_getattro_slot(
 		| "issuperset"
 		| "isdisjoint"
 		| "__contains__"
+		| "__iter__"
 		| "copy"
 		| "remove"
 		| "clear"

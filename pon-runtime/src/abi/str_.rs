@@ -3072,6 +3072,13 @@ fn str_maketrans_method(args: &[*mut PyObject]) -> *mut PyObject {
 		Ok(value) => value,
 		Err(message) => return raise_type_error(message),
 	};
+	// CPython: the two-string form zips positionally and rejects ragged
+	// pairs up front.
+	if from.chars().count() != to.chars().count() {
+		return raise_value_error(
+			"the first two maketrans arguments must have equal length".to_owned(),
+		);
+	}
 	let delete = match args.get(2).copied().map(expect_str).transpose() {
 		Ok(value) => value,
 		Err(message) => return raise_type_error(message),
