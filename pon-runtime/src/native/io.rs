@@ -1949,9 +1949,7 @@ const STREAM_METHOD_STUBS: &[&str] = &[
 	"read1",
 	"readinto",
 	"readline",
-	"readlines",
 	"write",
-	"writelines",
 	"seek",
 	"tell",
 	"truncate",
@@ -2131,6 +2129,146 @@ unsafe extern "C" fn io_base_check_seekable_method(
 			"File or stream is not seekable.",
 		)
 	}
+}
+
+/// `IOBase.writelines(lines)` (CPython `_io__IOBase_writelines`): closed
+/// check, then `self.write(line)` per item with the write result discarded;
+/// `write` resolves through the receiver so subclass overrides apply.
+unsafe extern "C" fn io_base_writelines_method(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "writelines") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() != 2 {
+		return raise_type_error(&format!(
+			"writelines() expected 1 argument, got {}",
+			args.len().saturating_sub(1)
+		));
+	}
+	let receiver = args[0];
+	if let Err(error) = ensure_generic_open(receiver) {
+		return error;
+	}
+	// SAFETY: Iteration helpers follow the NULL-sentinel error contract.
+	let iterator = unsafe { crate::abstract_op::get_iter(args[1]) };
+	if iterator.is_null() {
+		return ptr::null_mut();
+	}
+	loop {
+		// SAFETY: `iterator` is live; NULL return distinguishes exhaustion via
+		// the pending-StopIteration check below.
+		let item = unsafe { crate::abstract_op::iter_next(iterator) };
+		if item.is_null() {
+			if stop_iteration_pending() || !pon_err_occurred() {
+				pon_err_clear();
+				break;
+			}
+			return ptr::null_mut();
+		}
+		let mut write_argv = [item];
+		if let Err(error) = call_object_method(receiver, "write", &mut write_argv) {
+			return error;
+		}
+	}
+	unsafe { abi::pon_none() }
+}
+
+/// `IOBase.readlines(hint=-1)` (CPython `_io__IOBase_readlines`): collects
+/// lines by iterating `self`; a positive `hint` stops once the accumulated
+/// line lengths reach it.
+unsafe extern "C" fn io_base_readlines_method(
+	argv: *mut *mut PyObject,
+	argc: usize,
+) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "readlines") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	if args.len() > 2 {
+		return raise_type_error(&format!(
+			"readlines() expected at most 1 argument, got {}",
+			args.len().saturating_sub(1)
+		));
+	}
+	let hint = match args.get(1).copied() {
+		None => -1,
+		Some(value) if is_none(value) => -1,
+		Some(value) => match expect_int(value, "readlines() hint must be an integer") {
+			Ok(hint) => hint,
+			Err(message) => return raise_type_error(&message),
+		},
+	};
+	// SAFETY: Iteration helpers follow the NULL-sentinel error contract.
+	let iterator = unsafe { crate::abstract_op::get_iter(args[0]) };
+	if iterator.is_null() {
+		return ptr::null_mut();
+	}
+	let mut lines: Vec<*mut PyObject> = Vec::new();
+	let mut collected = 0i64;
+	loop {
+		// SAFETY: `iterator` is live; NULL return distinguishes exhaustion via
+		// the pending-StopIteration check below.
+		let item = unsafe { crate::abstract_op::iter_next(iterator) };
+		if item.is_null() {
+			if stop_iteration_pending() || !pon_err_occurred() {
+				pon_err_clear();
+				break;
+			}
+			return ptr::null_mut();
+		}
+		lines.push(item);
+		if hint > 0 {
+			// SAFETY: `item` is a live line object; -1 signals a raised error.
+			let length = unsafe { abi::seq::pon_seq_len(item) };
+			if length < 0 {
+				return ptr::null_mut();
+			}
+			collected += length as i64;
+			if collected >= hint {
+				break;
+			}
+		}
+	}
+	// SAFETY: `lines` holds live objects collected above.
+	unsafe { abi::seq::pon_build_list(lines.as_mut_ptr(), lines.len()) }
+}
+
+/// `IOBase.__iter__` (CPython `iobase_iter`): closed check, then `self`.
+unsafe extern "C" fn io_base_iter_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "__iter__") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	match ensure_generic_open(args[0]) {
+		Ok(()) => args[0],
+		Err(error) => error,
+	}
+}
+
+/// `IOBase.__next__` (CPython `iobase_iternext`): `self.readline()`, with an
+/// empty line ending the iteration.
+unsafe extern "C" fn io_base_next_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let args = match unsafe { method_args(argv, argc, "__next__") } {
+		Ok(args) => args,
+		Err(message) => return raise_type_error(&message),
+	};
+	let line = match call_object_method(args[0], "readline", &mut []) {
+		Ok(line) => line,
+		Err(error) => return error,
+	};
+	// SAFETY: `line` is the live readline result; -1 signals a raised error.
+	let length = unsafe { abi::seq::pon_seq_len(line) };
+	if length < 0 {
+		return ptr::null_mut();
+	}
+	if length == 0 {
+		// SAFETY: Typed raise helper.
+		return unsafe { abi::pon_raise_stop_iteration(ptr::null_mut()) };
+	}
+	line
 }
 
 /// `IOBase.close()` (CPython `iobase_close`): flush, then mark closed via the
@@ -3735,6 +3873,10 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 			("__exit__", io_base_exit_method as *const u8),
 			("close", io_base_close_method as *const u8),
 			("flush", io_base_flush_method as *const u8),
+			("readlines", io_base_readlines_method as *const u8),
+			("writelines", io_base_writelines_method as *const u8),
+			("__iter__", io_base_iter_method as *const u8),
+			("__next__", io_base_next_method as *const u8),
 			("readable", io_base_false_method as *const u8),
 			("writable", io_base_false_method as *const u8),
 			("seekable", io_base_false_method as *const u8),

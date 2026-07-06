@@ -2186,6 +2186,10 @@ fn is_re_match_receiver(positional: &[*mut PyObject]) -> bool {
 	first_positional_type_name(positional) == Some("re.Match")
 }
 
+fn is_text_io_wrapper_receiver(positional: &[*mut PyObject]) -> bool {
+	first_positional_type_name(positional) == Some("TextIOWrapper")
+}
+
 pub(crate) fn bind_native_keywords_for_name(
 	name: &str,
 	positional: &[*mut PyObject],
@@ -2224,6 +2228,19 @@ pub(crate) fn bind_native_keywords_for_name(
 		"groups" | "groupdict" if is_re_match_receiver(positional) => {
 			bind_optional_named_keywords(positional, keywords, name, &["self", "default"], 2)
 		},
+		// `_io.TextIOWrapper(buffer, encoding=None, errors=None, newline=None,
+		// line_buffering=False, write_through=False)`: subprocess wraps pipe
+		// streams by keyword (`text=True` → `io.TextIOWrapper(self.stdout,
+		// encoding=..., errors=...)`).  Receiver-dispatched because the heap
+		// class's native `__init__` carries no Phase-B metadata and the bare
+		// name is shared by every native `__init__`.
+		"__init__" if is_text_io_wrapper_receiver(positional) => bind_optional_named_keywords(
+			positional,
+			keywords,
+			"TextIOWrapper",
+			&["self", "buffer", "encoding", "errors", "newline", "line_buffering", "write_through"],
+			7,
+		),
 		// `re.Pattern.sub(repl, string, count=0)` and `subn` share a shape.
 		"sub" | "subn" if is_re_pattern_receiver(positional) => bind_optional_named_keywords(
 			positional,
