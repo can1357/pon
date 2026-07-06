@@ -239,6 +239,7 @@ fn compile_generator_stub<M: Module>(
 	let null = builder.ins().iconst(ptr_ty, 0);
 	builder.ins().return_(&[null]);
 	builder.seal_all_blocks();
+	super::declare_gc_values(&mut builder, ptr_ty);
 	builder.finalize();
 
 	Ok(())
@@ -395,6 +396,7 @@ fn compile_generator_body<M: Module>(
 	let unwind_result = builder.func.dfg.inst_results(unwind_call)[0];
 	builder.ins().return_(&[unwind_result]);
 	builder.seal_all_blocks();
+	super::declare_gc_values(&mut builder, ptr_ty);
 	builder.finalize();
 
 	Ok(())

@@ -514,6 +514,7 @@ pub fn compile_function<M: Module>(
 	let null = builder.ins().iconst(ptr_ty, 0);
 	builder.ins().return_(&[null]);
 	builder.seal_all_blocks();
+	declare_gc_values(&mut builder, ptr_ty);
 	builder.finalize();
 
 	Ok(())
@@ -612,10 +613,29 @@ pub fn compile_osr_function<M: Module>(
 	let null = builder.ins().iconst(ptr_ty, 0);
 	builder.ins().return_(&[null]);
 	builder.seal_all_blocks();
+	declare_gc_values(&mut builder, ptr_ty);
 	builder.finalize();
 	Ok(())
 }
 
+/// Declares every pointer-typed SSA value as a stack-map root before
+/// `finalize()`, so Cranelift's safepoint pass spills the values LIVE across
+/// each helper call into mapped sized slots and records a `UserStackMap` per
+/// call site.  The maps (surfaced through `MachBufferFinalized::
+/// user_stack_maps`) let the collector scan tier-0 frames precisely: dead
+/// values parked in regalloc spill slots or callee-saved registers stop
+/// pinning garbage, which conservative scanning cannot avoid (corpus
+/// `weakref_dicts` on x86-64).  Non-reference `i64`s (argc, raw addresses)
+/// are over-approximated as roots; the GC's pointer classifier already
+/// ignores non-heap words, mirroring the conservative scan's tolerance.
+pub(crate) fn declare_gc_values(builder: &mut FunctionBuilder<'_>, ptr_ty: ir::Type) {
+	let values: Vec<ir::Value> = builder.func.dfg.values().collect();
+	for value in values {
+		if builder.func.dfg.value_type(value) == ptr_ty {
+			builder.declare_value_needs_stack_map(value);
+		}
+	}
+}
 type ExceptionTargetStack = Vec<BlockId>;
 
 fn merge_exception_entry_stack(

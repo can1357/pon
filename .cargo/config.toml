@@ -1,0 +1,8 @@
+# Frame pointers are load-bearing: the collector's mixed-precision stack
+# scan (pon-runtime/src/stackmap.rs) walks the native frame-pointer chain
+# through runtime dispatch frames to reach generated-code frames and their
+# safepoint maps.  x86-64 Linux omits frame pointers by default, which
+# breaks the chain and silently degrades the scan to fully conservative
+# (dead-value ghosts then pin garbage; corpus `weakref_dicts`).
+[build]
+rustflags = ["-Cforce-frame-pointers=yes"]

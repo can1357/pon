@@ -140,6 +140,10 @@ impl JitEngine {
 		let names = NameMap::from_ir_module(ir_module);
 		let entry_arg_counts = pon_codegen::baseline::entry_arg_counts(ir_module);
 
+		// Safepoint metadata gathered per function while the compiled result
+		// is still in `ctx`: (function, code size, [(return-address offset,
+		// fp-relative root offsets)]).
+		let mut pending_maps = Vec::with_capacity(ir_module.functions.len());
 		for (index, function) in ir_module.functions.iter().enumerate() {
 			compile_function(
 				&mut self.module,
@@ -155,9 +159,46 @@ impl JitEngine {
 			self
 				.module
 				.define_function(func_ids[index], &mut self.ctx)?;
+			if let Some(compiled) = self.ctx.compiled_code() {
+				let sites = compiled
+					.buffer
+					.user_stack_maps()
+					.iter()
+					.map(|(return_offset, _span, map)| {
+						// Map offsets are SP-relative at the safepoint; the
+						// walker addresses them off the callee frame record,
+						// which sits 16 bytes (saved FP + return address)
+						// below the caller's SP on both supported targets.
+						let roots = map
+							.entries()
+							.map(|(_ty, sp_offset)| {
+								pon_runtime::stackmap::StackRootSlot::new(16 + sp_offset as isize)
+							})
+							.collect::<Vec<_>>();
+						(*return_offset, roots)
+					})
+					.collect::<Vec<_>>();
+				pending_maps.push((index, compiled.buffer.total_size(), sites));
+			}
 		}
 
 		self.module.finalize_definitions()?;
+
+		// Publish tier-0 safepoint maps and code ranges: the collector scans
+		// these frames precisely, so dead values parked in spill slots or
+		// callee-saved register saves stop pinning garbage.
+		let mut map_index = pon_runtime::stackmap::StackMapIndex::default();
+		for (index, code_size, sites) in pending_maps {
+			let base = self.module.get_finalized_function(func_ids[index]);
+			pon_runtime::stackmap::register_mapped_code_range(base, code_size as usize);
+			for (return_offset, roots) in sites {
+				map_index.insert(pon_runtime::stackmap::SafepointMap::new(
+					base.wrapping_add(return_offset as usize),
+					roots,
+				));
+			}
+		}
+		pon_runtime::stackmap::register_stack_map_index(map_index);
 
 		self
 			.tierup
