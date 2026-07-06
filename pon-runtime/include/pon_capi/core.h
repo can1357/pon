@@ -26,7 +26,8 @@
 #define PON_TID_MEMORYVIEW 15
 #define PON_TID_CAPSULE 16
 #define PON_TID_NONE_TYPE 17
-#define PON_BUILTIN_TYPE_COUNT 18
+#define PON_TID_RANGE 18
+#define PON_BUILTIN_TYPE_COUNT 19
 
 typedef struct PyPonCapiCore {
     PyObject *(*module_create2)(PyModuleDef *, int);

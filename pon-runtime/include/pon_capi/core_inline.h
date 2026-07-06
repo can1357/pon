@@ -33,6 +33,7 @@ extern PyTypeObject PySlice_Type;
 extern PyTypeObject PyMemoryView_Type;
 extern PyTypeObject PyCapsule_Type;
 extern PyTypeObject _PyNone_Type;
+extern PyTypeObject PyRange_Type;
 
 /* Local twin lookup array, indexed by PON_TID_*; storage in the bootstrap. */
 extern PyTypeObject *const _PyPon_LocalTwins[PON_BUILTIN_TYPE_COUNT];

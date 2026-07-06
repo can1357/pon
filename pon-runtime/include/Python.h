@@ -1147,7 +1147,6 @@ typedef struct {
 
 static PyTypeObject _PyPon_CFunction_Type_CompileOnly;
 static PyTypeObject _PyPon_MemberDescr_Type_CompileOnly;
-static PyTypeObject _PyPon_Range_Type_CompileOnly;
 
 static PyTypeObject _PyPon_GetSetDescr_Type_CompileOnly;
 static PyTypeObject _PyPon_MethodDescr_Type_CompileOnly;
@@ -1156,7 +1155,6 @@ static PyTypeObject _PyPon_MethodDescr_Type_CompileOnly;
 #define PyMemberDescr_Type _PyPon_MemberDescr_Type_CompileOnly
 #define PyGetSetDescr_Type _PyPon_GetSetDescr_Type_CompileOnly
 #define PyMethodDescr_Type _PyPon_MethodDescr_Type_CompileOnly
-#define PyRange_Type _PyPon_Range_Type_CompileOnly
 
 
 static inline int PyCFunction_Check(PyObject *object) {

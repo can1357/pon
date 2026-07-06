@@ -24,6 +24,7 @@ PyTypeObject PySlice_Type;
 PyTypeObject PyMemoryView_Type;
 PyTypeObject PyCapsule_Type;
 PyTypeObject _PyNone_Type;
+PyTypeObject PyRange_Type;
 
 PyTypeObject *const _PyPon_LocalTwins[PON_BUILTIN_TYPE_COUNT] = {
     [PON_TID_TYPE] = &PyType_Type,
@@ -44,6 +45,7 @@ PyTypeObject *const _PyPon_LocalTwins[PON_BUILTIN_TYPE_COUNT] = {
     [PON_TID_MEMORYVIEW] = &PyMemoryView_Type,
     [PON_TID_CAPSULE] = &PyCapsule_Type,
     [PON_TID_NONE_TYPE] = &_PyNone_Type,
+    [PON_TID_RANGE] = &PyRange_Type,
 };
 
 int PyPon_SetCapi(const PyPonCapi *api) {

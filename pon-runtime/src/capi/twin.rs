@@ -53,7 +53,8 @@ pub(crate) const TID_SLICE: usize = 14;
 pub(crate) const TID_MEMORYVIEW: usize = 15;
 pub(crate) const TID_CAPSULE: usize = 16;
 pub(crate) const TID_NONE_TYPE: usize = 17;
-pub(crate) const BUILTIN_TYPE_COUNT: usize = 18;
+pub(crate) const TID_RANGE: usize = 18;
+pub(crate) const BUILTIN_TYPE_COUNT: usize = 19;
 
 // CPython type-flag bits mirrored in include/Python.h.
 const TPFLAGS_BASETYPE: u64 = 1 << 10;
@@ -128,6 +129,33 @@ pub(crate) struct ForeignTypeObject {
 
 unsafe impl Send for ForeignTypeObject {}
 unsafe impl Sync for ForeignTypeObject {}
+/// Size-only mirror of `include/Python.h`'s `PyHeapTypeObject`.
+///
+/// Reported as the `type` face's `tp_basicsize` (Python-visible
+/// `type.__basicsize__`): extension binary-compat probes (Cython's
+/// `__Pyx_ImportType(..., sizeof(PyHeapTypeObject), ...)`) compare it
+/// against their compile-time expectation and refuse to load on mismatch.
+/// Field-for-field layout mirrors the header; only the SIZE is consumed.
+#[repr(C)]
+struct ForeignHeapTypeObject {
+	ht_type:        ForeignTypeObject,
+	as_async:       [*mut (); 4],
+	as_number:      [*mut (); 36],
+	as_mapping:     [*mut (); 3],
+	as_sequence:    [*mut (); 10],
+	as_buffer:      [*mut (); 2],
+	ht_name:        *mut PyObject,
+	ht_slots:       *mut PyObject,
+	ht_qualname:    *mut PyObject,
+	ht_cached_keys: *mut (),
+	ht_module:      *mut PyObject,
+	ht_tpname:      *mut c_char,
+	ht_token:       *mut (),
+	/// `struct _specialization_cache`: two pointers with a u32 between.
+	spec_getitem:   *mut PyObject,
+	spec_version:   c_uint,
+	spec_init:      *mut PyObject,
+}
 
 #[derive(Default)]
 struct TwinRegistry {
@@ -211,6 +239,10 @@ fn collect_builtin_keys() -> Vec<BuiltinKey> {
 	push(TID_MEMORYVIEW, crate::types::memoryview::memoryview_type());
 	push(TID_CAPSULE, super::runtime_::capsule_type());
 	push(TID_NONE_TYPE, abi::runtime_none_type());
+	push(
+		TID_RANGE,
+		crate::native::builtins_mod::builtin_native_type("range").unwrap_or(ptr::null_mut()),
+	);
 	keys
 }
 
@@ -388,7 +420,19 @@ fn fill_twin(
 	unsafe {
 		let name = (*native).name().to_owned();
 		(*twin).tp_name = CString::new(name).map_or(ptr::null(), |text| text.into_raw().cast_const());
-		(*twin).tp_basicsize = (*native).tp_basicsize as isize;
+		// Faces report C-header-shaped instance sizes where extension
+		// binary-compat probes (Cython `__Pyx_ImportType`) compare them
+		// against compile-time `sizeof(...)` expectations: the `type` face
+		// reports `sizeof(PyHeapTypeObject)`, `bool` the CPython
+		// `PyLongObject`-shaped 16 bytes (bool is unsubclassable, so the
+		// size never drives an allocation).
+		(*twin).tp_basicsize = if tid == Some(TID_TYPE) || native == type_type {
+			core::mem::size_of::<ForeignHeapTypeObject>() as isize
+		} else if tid == Some(TID_BOOL) {
+			16
+		} else {
+			(*native).tp_basicsize as isize
+		};
 		(*twin).tp_itemsize = (*native).tp_itemsize;
 		(*twin).tp_flags = twin_flags(native, tid, type_type);
 		(*twin).tp_pon_twin = native;
@@ -397,6 +441,12 @@ fn fill_twin(
 		(*twin).ob_type = resolve_in_batch(meta, batch);
 		let base = (*native).tp_base;
 		(*twin).tp_base = resolve_in_batch(base, batch);
+		if tid == Some(TID_FLOAT) {
+			// C float subclasses (numpy's float64) delegate `__new__` to
+			// `PyFloat_Type.tp_new`; the generic-alloc backfill would drop
+			// the constructor argument on the floor.
+			(*twin).tp_new = crate::capi::typeobj::capi_float_face_new as *mut ();
+		}
 	}
 }
 
@@ -413,7 +463,10 @@ fn twin_flags(native: *mut PyType, tid: Option<usize>, type_type: *mut PyType) -
 		_ => 0,
 	};
 	let unsubclassable =
-		matches!(tid, Some(TID_BOOL | TID_NONE_TYPE | TID_SLICE | TID_MEMORYVIEW | TID_CAPSULE));
+		matches!(
+			tid,
+			Some(TID_BOOL | TID_NONE_TYPE | TID_SLICE | TID_MEMORYVIEW | TID_CAPSULE | TID_RANGE)
+		);
 	if !unsubclassable {
 		flags |= TPFLAGS_BASETYPE;
 	}
