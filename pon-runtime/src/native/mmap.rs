@@ -67,12 +67,10 @@ const CONSTANTS: &[(&str, i64)] = &[
 	("ACCESS_DEFAULT", ACCESS_DEFAULT),
 	("ACCESS_READ", ACCESS_READ),
 	("ACCESS_WRITE", ACCESS_WRITE),
-	("ALLOCATIONGRANULARITY", libc::PAGESIZE as i64),
 	("MAP_ANON", libc::MAP_ANON as i64),
 	("MAP_ANONYMOUS", libc::MAP_ANONYMOUS as i64),
 	("MAP_PRIVATE", libc::MAP_PRIVATE as i64),
 	("MAP_SHARED", libc::MAP_SHARED as i64),
-	("PAGESIZE", libc::PAGESIZE as i64),
 	("PROT_EXEC", libc::PROT_EXEC as i64),
 	("PROT_READ", libc::PROT_READ as i64),
 	("PROT_WRITE", libc::PROT_WRITE as i64),
@@ -121,6 +119,13 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 	}));
 	for &(const_name, value) in CONSTANTS {
 		attrs.push(int_attr(const_name, value)?);
+	}
+	#[cfg(not(target_os = "macos"))]
+	{
+		// Page granularity is a runtime property outside Darwin.
+		let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as i64;
+		attrs.push(int_attr("ALLOCATIONGRANULARITY", page)?);
+		attrs.push(int_attr("PAGESIZE", page)?);
 	}
 	install_module(name, attrs)
 }

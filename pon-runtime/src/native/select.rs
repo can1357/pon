@@ -103,6 +103,7 @@ fn poll_type() -> *mut PyType {
 	*POLL_TYPE as *mut PyType
 }
 
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Debug)]
 struct PyKqueue {
@@ -111,6 +112,7 @@ struct PyKqueue {
 	closed:  bool,
 }
 
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Debug)]
 struct PyKevent {
@@ -123,6 +125,7 @@ struct PyKevent {
 	udata:   usize,
 }
 
+#[cfg(target_os = "macos")]
 static KQUEUE_TYPE: LazyLock<usize> = LazyLock::new(|| {
 	let mut ty = PyType::new(
 		crate::abi::runtime_type_type().cast_const(),
@@ -133,6 +136,7 @@ static KQUEUE_TYPE: LazyLock<usize> = LazyLock::new(|| {
 	Box::into_raw(Box::new(ty)) as usize
 });
 
+#[cfg(target_os = "macos")]
 static KEVENT_TYPE: LazyLock<usize> = LazyLock::new(|| {
 	let mut ty = PyType::new(
 		crate::abi::runtime_type_type().cast_const(),
@@ -144,10 +148,12 @@ static KEVENT_TYPE: LazyLock<usize> = LazyLock::new(|| {
 	Box::into_raw(Box::new(ty)) as usize
 });
 
+#[cfg(target_os = "macos")]
 fn kqueue_type() -> *mut PyType {
 	*KQUEUE_TYPE as *mut PyType
 }
 
+#[cfg(target_os = "macos")]
 fn kevent_type() -> *mut PyType {
 	*KEVENT_TYPE as *mut PyType
 }

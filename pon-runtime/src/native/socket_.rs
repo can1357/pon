@@ -54,28 +54,33 @@ unsafe extern "C" {
 const INET6_ADDRSTRLEN: usize = 46;
 
 /// Address-family, socket-kind, message-flag, address-info, protocol, and
-/// socket-option constants CPython's Darwin `_socket` exposes.
+/// socket-option constants the host CPython's `_socket` exposes.
 const INT_CONSTANTS: &[(&str, i64)] = &[
 	("AF_APPLETALK", libc::AF_APPLETALK as i64),
 	("AF_DECnet", libc::AF_DECnet as i64),
 	("AF_INET", libc::AF_INET as i64),
 	("AF_INET6", libc::AF_INET6 as i64),
 	("AF_IPX", libc::AF_IPX as i64),
+	#[cfg(target_os = "macos")]
 	("AF_LINK", libc::AF_LINK as i64),
 	("AF_ROUTE", libc::AF_ROUTE as i64),
 	("AF_SNA", libc::AF_SNA as i64),
+	#[cfg(target_os = "macos")]
 	("AF_SYSTEM", libc::AF_SYSTEM as i64),
 	("AF_UNIX", libc::AF_UNIX as i64),
 	("AF_UNSPEC", libc::AF_UNSPEC as i64),
 	("AI_ADDRCONFIG", libc::AI_ADDRCONFIG as i64),
 	("AI_ALL", libc::AI_ALL as i64),
 	("AI_CANONNAME", libc::AI_CANONNAME as i64),
+	#[cfg(target_os = "macos")]
 	("AI_DEFAULT", libc::AI_DEFAULT as i64),
+	#[cfg(target_os = "macos")]
 	("AI_MASK", libc::AI_MASK as i64),
 	("AI_NUMERICHOST", libc::AI_NUMERICHOST as i64),
 	("AI_NUMERICSERV", libc::AI_NUMERICSERV as i64),
 	("AI_PASSIVE", libc::AI_PASSIVE as i64),
 	("AI_V4MAPPED", libc::AI_V4MAPPED as i64),
+	#[cfg(target_os = "macos")]
 	("AI_V4MAPPED_CFG", libc::AI_V4MAPPED_CFG as i64),
 	// Darwin getaddrinfo(3) values exposed by CPython but not all by libc.
 	("EAI_ADDRFAMILY", 1),
@@ -110,11 +115,14 @@ const INT_CONSTANTS: &[(&str, i64)] = &[
 	("IPPROTO_AH", libc::IPPROTO_AH as i64),
 	("IPPROTO_DSTOPTS", libc::IPPROTO_DSTOPTS as i64),
 	("IPPROTO_EGP", libc::IPPROTO_EGP as i64),
+	#[cfg(target_os = "macos")]
 	("IPPROTO_EON", libc::IPPROTO_EON as i64),
 	("IPPROTO_ESP", libc::IPPROTO_ESP as i64),
 	("IPPROTO_FRAGMENT", libc::IPPROTO_FRAGMENT as i64),
+	#[cfg(target_os = "macos")]
 	("IPPROTO_GGP", libc::IPPROTO_GGP as i64),
 	("IPPROTO_GRE", libc::IPPROTO_GRE as i64),
+	#[cfg(target_os = "macos")]
 	("IPPROTO_HELLO", libc::IPPROTO_HELLO as i64),
 	("IPPROTO_HOPOPTS", libc::IPPROTO_HOPOPTS as i64),
 	("IPPROTO_ICMP", libc::IPPROTO_ICMP as i64),
@@ -122,11 +130,13 @@ const INT_CONSTANTS: &[(&str, i64)] = &[
 	("IPPROTO_IDP", libc::IPPROTO_IDP as i64),
 	("IPPROTO_IGMP", libc::IPPROTO_IGMP as i64),
 	("IPPROTO_IP", libc::IPPROTO_IP as i64),
+	#[cfg(target_os = "macos")]
 	("IPPROTO_IPCOMP", libc::IPPROTO_IPCOMP as i64),
 	("IPPROTO_IPIP", libc::IPPROTO_IPIP as i64),
 	("IPPROTO_IPV4", libc::IPPROTO_IPIP as i64),
 	("IPPROTO_IPV6", libc::IPPROTO_IPV6 as i64),
 	("IPPROTO_MAX", libc::IPPROTO_MAX as i64),
+	#[cfg(target_os = "macos")]
 	("IPPROTO_ND", libc::IPPROTO_ND as i64),
 	("IPPROTO_NONE", libc::IPPROTO_NONE as i64),
 	("IPPROTO_PIM", libc::IPPROTO_PIM as i64),
@@ -138,14 +148,21 @@ const INT_CONSTANTS: &[(&str, i64)] = &[
 	("IPPROTO_TCP", libc::IPPROTO_TCP as i64),
 	("IPPROTO_TP", libc::IPPROTO_TP as i64),
 	("IPPROTO_UDP", libc::IPPROTO_UDP as i64),
+	#[cfg(target_os = "macos")]
 	("IPPROTO_XTP", libc::IPPROTO_XTP as i64),
 	("IPV6_CHECKSUM", libc::IPV6_CHECKSUM as i64),
 	("IPV6_DONTFRAG", libc::IPV6_DONTFRAG as i64),
 	("IPV6_DSTOPTS", 50),
 	("IPV6_HOPLIMIT", libc::IPV6_HOPLIMIT as i64),
 	("IPV6_HOPOPTS", 49),
+	#[cfg(target_os = "macos")]
 	("IPV6_JOIN_GROUP", libc::IPV6_JOIN_GROUP as i64),
+	#[cfg(target_os = "linux")]
+	("IPV6_JOIN_GROUP", libc::IPV6_ADD_MEMBERSHIP as i64),
+	#[cfg(target_os = "macos")]
 	("IPV6_LEAVE_GROUP", libc::IPV6_LEAVE_GROUP as i64),
+	#[cfg(target_os = "linux")]
+	("IPV6_LEAVE_GROUP", libc::IPV6_DROP_MEMBERSHIP as i64),
 	("IPV6_MULTICAST_HOPS", libc::IPV6_MULTICAST_HOPS as i64),
 	("IPV6_MULTICAST_IF", libc::IPV6_MULTICAST_IF as i64),
 	("IPV6_MULTICAST_LOOP", libc::IPV6_MULTICAST_LOOP as i64),
@@ -180,6 +197,7 @@ const INT_CONSTANTS: &[(&str, i64)] = &[
 	("IP_MULTICAST_TTL", libc::IP_MULTICAST_TTL as i64),
 	("IP_OPTIONS", 1),
 	("IP_PKTINFO", libc::IP_PKTINFO as i64),
+	#[cfg(target_os = "macos")]
 	("IP_RECVDSTADDR", libc::IP_RECVDSTADDR as i64),
 	("IP_RECVOPTS", 5),
 	("IP_RECVRETOPTS", 6),
@@ -189,10 +207,12 @@ const INT_CONSTANTS: &[(&str, i64)] = &[
 	("IP_TOS", libc::IP_TOS as i64),
 	("IP_TTL", libc::IP_TTL as i64),
 	("IP_UNBLOCK_SOURCE", libc::IP_UNBLOCK_SOURCE as i64),
+	#[cfg(target_os = "macos")]
 	("LOCAL_PEERCRED", libc::LOCAL_PEERCRED as i64),
 	("MSG_CTRUNC", libc::MSG_CTRUNC as i64),
 	("MSG_DONTROUTE", libc::MSG_DONTROUTE as i64),
 	("MSG_DONTWAIT", libc::MSG_DONTWAIT as i64),
+	#[cfg(target_os = "macos")]
 	("MSG_EOF", libc::MSG_EOF as i64),
 	("MSG_EOR", libc::MSG_EOR as i64),
 	("MSG_NOSIGNAL", libc::MSG_NOSIGNAL as i64),
@@ -202,12 +222,18 @@ const INT_CONSTANTS: &[(&str, i64)] = &[
 	("MSG_WAITALL", libc::MSG_WAITALL as i64),
 	("NI_DGRAM", libc::NI_DGRAM as i64),
 	("NI_MAXHOST", libc::NI_MAXHOST as i64),
+	#[cfg(target_os = "macos")]
 	("NI_MAXSERV", libc::NI_MAXSERV as i64),
+	// glibc's netdb.h NI_MAXSERV is not exposed by the libc crate.
+	#[cfg(target_os = "linux")]
+	("NI_MAXSERV", 32),
 	("NI_NAMEREQD", libc::NI_NAMEREQD as i64),
 	("NI_NOFQDN", libc::NI_NOFQDN as i64),
 	("NI_NUMERICHOST", libc::NI_NUMERICHOST as i64),
 	("NI_NUMERICSERV", libc::NI_NUMERICSERV as i64),
+	#[cfg(target_os = "macos")]
 	("PF_SYSTEM", libc::PF_SYSTEM as i64),
+	#[cfg(target_os = "macos")]
 	("SCM_CREDS", libc::SCM_CREDS as i64),
 	("SCM_RIGHTS", libc::SCM_RIGHTS as i64),
 	("SHUT_RD", libc::SHUT_RD as i64),
@@ -241,8 +267,11 @@ const INT_CONSTANTS: &[(&str, i64)] = &[
 	("SO_SNDLOWAT", libc::SO_SNDLOWAT as i64),
 	("SO_SNDTIMEO", libc::SO_SNDTIMEO as i64),
 	("SO_TYPE", libc::SO_TYPE as i64),
+	#[cfg(target_os = "macos")]
 	("SO_USELOOPBACK", libc::SO_USELOOPBACK as i64),
+	#[cfg(target_os = "macos")]
 	("SYSPROTO_CONTROL", libc::SYSPROTO_CONTROL as i64),
+	#[cfg(target_os = "macos")]
 	("TCP_CONNECTION_INFO", libc::TCP_CONNECTION_INFO as i64),
 	("TCP_FASTOPEN", libc::TCP_FASTOPEN as i64),
 	#[cfg(target_os = "macos")]
@@ -999,7 +1028,10 @@ fn parse_address(family: i64, object: *mut PyObject) -> Result<HostAddress, *mut
 				for (slot, byte) in (*sun).sun_path.iter_mut().zip(bytes) {
 					*slot = *byte as libc::c_char;
 				}
-				(*sun).sun_len = (std::mem::size_of::<libc::sockaddr_un>()) as u8;
+				#[cfg(target_os = "macos")]
+				{
+					(*sun).sun_len = std::mem::size_of::<libc::sockaddr_un>() as u8;
+				}
 			}
 			Ok(HostAddress {
 				storage,
@@ -1058,7 +1090,10 @@ fn resolve_host(family: i32, host: &str, port: u16) -> Result<HostAddress, *mut 
 			unsafe {
 				(*sin).sin_family = libc::AF_INET as libc::sa_family_t;
 				(*sin).sin_port = port.to_be();
-				(*sin).sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+				#[cfg(target_os = "macos")]
+				{
+					(*sin).sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+				}
 			}
 			return Ok(HostAddress {
 				storage,
@@ -1075,7 +1110,10 @@ fn resolve_host(family: i32, host: &str, port: u16) -> Result<HostAddress, *mut 
 			unsafe {
 				(*sin6).sin6_family = libc::AF_INET6 as libc::sa_family_t;
 				(*sin6).sin6_port = port.to_be();
-				(*sin6).sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+				#[cfg(target_os = "macos")]
+				{
+					(*sin6).sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+				}
 			}
 			return Ok(HostAddress {
 				storage,
@@ -1984,9 +2022,9 @@ unsafe extern "C" fn socket_sethostname(argv: *mut *mut PyObject, argc: usize) -
 	if name.contains(&0) {
 		return raise_type_error("sethostname() argument must not contain null bytes");
 	}
-	// SAFETY: `name` points to `len` initialized bytes; Darwin's sethostname
-	// length is explicit and does not require NUL termination.
-	let rc = unsafe { libc::sethostname(name.as_ptr().cast(), name.len() as libc::c_int) };
+	// SAFETY: `name` points to `len` initialized bytes; sethostname takes an
+	// explicit length and does not require NUL termination.
+	let rc = unsafe { libc::sethostname(name.as_ptr().cast(), name.len() as _) };
 	if rc < 0 {
 		return super::os::raise_errno(last_errno(), None);
 	}

@@ -169,7 +169,7 @@ unsafe extern "C" fn resource_getrlimit(argv: *mut *mut PyObject, argc: usize) -
 		Err(error) => return error,
 	};
 	let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-	if unsafe { libc::getrlimit(resource, limit.as_mut_ptr()) } != 0 {
+	if unsafe { libc::getrlimit(resource as _, limit.as_mut_ptr()) } != 0 {
 		return raise_errno();
 	}
 	let limit = unsafe { limit.assume_init() };
@@ -201,7 +201,7 @@ unsafe extern "C" fn resource_setrlimit(argv: *mut *mut PyObject, argc: usize) -
 			Err(error) => return error,
 		},
 	};
-	if unsafe { libc::setrlimit(resource, &limit) } != 0 {
+	if unsafe { libc::setrlimit(resource as _, &limit) } != 0 {
 		return raise_errno();
 	}
 	unsafe { abi::pon_none() }

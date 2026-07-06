@@ -11,7 +11,9 @@ use crate::{
 };
 unsafe extern "C" {
 	fn ctermid(s: *mut libc::c_char) -> *mut libc::c_char;
+	#[cfg(target_os = "macos")]
 	fn lchflags(path: *const libc::c_char, flags: libc::c_uint) -> libc::c_int;
+	#[cfg(target_os = "macos")]
 	fn lchmod(path: *const libc::c_char, mode: libc::mode_t) -> libc::c_int;
 	fn fstatvfs(fd: libc::c_int, buf: *mut libc::statvfs) -> libc::c_int;
 	fn statvfs(path: *const libc::c_char, buf: *mut libc::statvfs) -> libc::c_int;
@@ -1146,9 +1148,9 @@ fn int_name_map_attr(
 	Ok((intern(name), map))
 }
 
-/// `open(2)` flag constants shared by macOS and Linux (errno.rs's
-/// portable-POSIX policy), sorted by name. Values come from libc, so they
-/// always match the host CPython's.
+/// `open(2)` flag constants: the portable-POSIX set plus cfg-gated host
+/// extras, sorted by name. Values come from libc, so they always match the
+/// host CPython's.
 const OPEN_FLAGS: &[(&str, i32)] = &[
 	("O_ACCMODE", libc::O_ACCMODE),
 	("O_APPEND", libc::O_APPEND),
@@ -1157,21 +1159,28 @@ const OPEN_FLAGS: &[(&str, i32)] = &[
 	("O_CREAT", libc::O_CREAT),
 	("O_DIRECTORY", libc::O_DIRECTORY),
 	("O_DSYNC", libc::O_DSYNC),
+	#[cfg(target_os = "macos")]
 	("O_EVTONLY", libc::O_EVTONLY),
 	("O_EXCL", libc::O_EXCL),
+	#[cfg(target_os = "macos")]
 	("O_EXEC", libc::O_EXEC),
+	#[cfg(target_os = "macos")]
 	("O_EXLOCK", libc::O_EXLOCK),
 	("O_FSYNC", libc::O_FSYNC),
 	("O_NDELAY", libc::O_NDELAY),
 	("O_NOCTTY", libc::O_NOCTTY),
 	("O_NOFOLLOW", libc::O_NOFOLLOW),
+	#[cfg(target_os = "macos")]
 	("O_NOFOLLOW_ANY", libc::O_NOFOLLOW_ANY),
 	("O_NONBLOCK", libc::O_NONBLOCK),
 	("O_RDONLY", libc::O_RDONLY),
 	("O_RDWR", libc::O_RDWR),
+	#[cfg(target_os = "macos")]
 	("O_SEARCH", libc::O_SEARCH),
+	#[cfg(target_os = "macos")]
 	("O_SHLOCK", libc::O_SHLOCK),
 	("O_SYNC", libc::O_SYNC),
+	#[cfg(target_os = "macos")]
 	("O_SYMLINK", libc::O_SYMLINK),
 	("O_TRUNC", libc::O_TRUNC),
 	("O_WRONLY", libc::O_WRONLY),
@@ -1216,19 +1225,26 @@ const POSIX_CONSTANTS: &[(&str, i32)] = &[
 	("F_TEST", libc::F_TEST),
 	("F_TLOCK", libc::F_TLOCK),
 	("F_ULOCK", libc::F_ULOCK),
-	// Darwin's compile-time NGROUPS_MAX is not exposed by libc.
+	// Compile-time NGROUPS_MAX (Darwin 16, Linux 65536) is not exposed by libc.
+	#[cfg(target_os = "macos")]
 	("NGROUPS_MAX", 16),
+	#[cfg(not(target_os = "macos"))]
+	("NGROUPS_MAX", 65536),
 	// posix_spawn file-action tags from Darwin spawn.h.
 	("POSIX_SPAWN_CLOSE", 1),
 	("POSIX_SPAWN_DUP2", 2),
 	("POSIX_SPAWN_OPEN", 0),
+	#[cfg(target_os = "macos")]
 	("PRIO_DARWIN_BG", libc::PRIO_DARWIN_BG),
+	#[cfg(target_os = "macos")]
 	("PRIO_DARWIN_NONUI", libc::PRIO_DARWIN_NONUI),
+	#[cfg(target_os = "macos")]
 	("PRIO_DARWIN_PROCESS", libc::PRIO_DARWIN_PROCESS),
+	#[cfg(target_os = "macos")]
 	("PRIO_DARWIN_THREAD", libc::PRIO_DARWIN_THREAD),
-	("PRIO_PGRP", libc::PRIO_PGRP),
-	("PRIO_PROCESS", libc::PRIO_PROCESS),
-	("PRIO_USER", libc::PRIO_USER),
+	("PRIO_PGRP", libc::PRIO_PGRP as i32),
+	("PRIO_PROCESS", libc::PRIO_PROCESS as i32),
+	("PRIO_USER", libc::PRIO_USER as i32),
 	("P_ALL", libc::P_ALL as i32),
 	("P_PGID", libc::P_PGID as i32),
 	("P_PID", libc::P_PID as i32),
@@ -1238,10 +1254,19 @@ const POSIX_CONSTANTS: &[(&str, i32)] = &[
 	("RTLD_NODELETE", libc::RTLD_NODELETE),
 	("RTLD_NOLOAD", libc::RTLD_NOLOAD),
 	("RTLD_NOW", libc::RTLD_NOW),
-	// sched.h Darwin policy constants missing from the libc crate.
+	// sched.h policy constants; the Darwin values are missing from libc.
+	#[cfg(target_os = "macos")]
 	("SCHED_FIFO", 4),
+	#[cfg(target_os = "macos")]
 	("SCHED_OTHER", 1),
+	#[cfg(target_os = "macos")]
 	("SCHED_RR", 2),
+	#[cfg(not(target_os = "macos"))]
+	("SCHED_FIFO", libc::SCHED_FIFO),
+	#[cfg(not(target_os = "macos"))]
+	("SCHED_OTHER", libc::SCHED_OTHER),
+	#[cfg(not(target_os = "macos"))]
+	("SCHED_RR", libc::SCHED_RR),
 	("ST_NOSUID", libc::ST_NOSUID as i32),
 	("ST_RDONLY", libc::ST_RDONLY as i32),
 	("TMP_MAX", libc::TMP_MAX as i32),
@@ -1250,11 +1275,16 @@ const POSIX_CONSTANTS: &[(&str, i32)] = &[
 	("WSTOPPED", libc::WSTOPPED),
 ];
 
-/// Private Darwin constants present on `posix` but not re-exported by `os.py`.
+/// Private Darwin constants present on `posix` but not re-exported by
+/// `os.py`; empty elsewhere.
 const POSIX_PRIVATE_CONSTANTS: &[(&str, i32)] = &[
+	#[cfg(target_os = "macos")]
 	("_COPYFILE_ACL", libc::COPYFILE_ACL as i32),
+	#[cfg(target_os = "macos")]
 	("_COPYFILE_DATA", libc::COPYFILE_DATA as i32),
+	#[cfg(target_os = "macos")]
 	("_COPYFILE_STAT", libc::COPYFILE_STAT as i32),
+	#[cfg(target_os = "macos")]
 	("_COPYFILE_XATTR", libc::COPYFILE_XATTR as i32),
 ];
 
@@ -2521,6 +2551,7 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
 	("abort", os_abort, 0),
 	("access", os_access, 2),
 	("chdir", os_chdir, 1),
+	#[cfg(target_os = "macos")]
 	("chflags", os_chflags, 2),
 	("chown", os_chown, 3),
 	("chroot", os_chroot, 1),
@@ -2563,7 +2594,9 @@ const SYSCALL_FUNCTIONS: &[(&str, BuiltinFn, usize)] = &[
 	("isatty", os_isatty, 1),
 	("kill", os_kill, 2),
 	("killpg", os_killpg, 2),
+	#[cfg(target_os = "macos")]
 	("lchflags", os_lchflags, 2),
+	#[cfg(target_os = "macos")]
 	("lchmod", os_lchmod, 2),
 	("lchown", os_lchown, 3),
 	("link", os_link, crate::native::builtins_mod::VARIADIC_ARITY),
@@ -3173,7 +3206,7 @@ unsafe extern "C" fn os_sendfile(argv: *mut *mut PyObject, argc: usize) -> *mut 
 		Ok(offset) => offset as libc::off_t,
 		Err(error) => return error,
 	};
-	let mut count = match int_arg(args[3], "sendfile count") {
+	let count = match int_arg(args[3], "sendfile count") {
 		Ok(count) if count >= 0 => count as libc::off_t,
 		Ok(_) => {
 			return crate::abi::exc::raise_kind_error_text(
@@ -3200,12 +3233,28 @@ unsafe extern "C" fn os_sendfile(argv: *mut *mut PyObject, argc: usize) -> *mut 
 		},
 		None => 0,
 	};
-	let result =
-		unsafe { libc::sendfile(in_fd, out_fd, offset, &mut count, std::ptr::null_mut(), flags) };
-	if result < 0 && count == 0 {
-		return raise_errno(last_errno(), None);
+	#[cfg(target_os = "macos")]
+	{
+		let mut count = count;
+		let result =
+			unsafe { libc::sendfile(in_fd, out_fd, offset, &mut count, std::ptr::null_mut(), flags) };
+		if result < 0 && count == 0 {
+			return raise_errno(last_errno(), None);
+		}
+		unsafe { crate::abi::pon_const_int(count as i64) }
 	}
-	unsafe { crate::abi::pon_const_int(count as i64) }
+	#[cfg(not(target_os = "macos"))]
+	{
+		// Linux sendfile(2) reports progress through the offset pointer and
+		// returns the byte count; the Darwin-only flags word does not apply.
+		let _ = flags;
+		let mut offset = offset;
+		let sent = unsafe { libc::sendfile(out_fd, in_fd, &mut offset, count as usize) };
+		if sent < 0 {
+			return raise_errno(last_errno(), None);
+		}
+		unsafe { crate::abi::pon_const_int(sent as i64) }
+	}
 }
 
 unsafe extern "C" fn os_wait3(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -4263,7 +4312,7 @@ unsafe extern "C" fn os_getpriority(argv: *mut *mut PyObject, argc: usize) -> *m
 		Ok(who) => who,
 		Err(error) => return error,
 	};
-	let value = unsafe { libc::getpriority(which as libc::c_int, who as libc::id_t) };
+	let value = unsafe { libc::getpriority(which as _, who as libc::id_t) };
 	if value == -1 && last_errno() != 0 {
 		return raise_errno(last_errno(), None);
 	}
@@ -4480,7 +4529,7 @@ unsafe extern "C" fn os_setpriority(argv: *mut *mut PyObject, argc: usize) -> *m
 		Ok(value) => value,
 		Err(error) => return error,
 	};
-	if unsafe { libc::setpriority(which as libc::c_int, who as libc::id_t, priority as libc::c_int) }
+	if unsafe { libc::setpriority(which as _, who as libc::id_t, priority as libc::c_int) }
 		< 0
 	{
 		return raise_errno(last_errno(), None);
@@ -4633,14 +4682,17 @@ fn chown_like(
 	unsafe { crate::abi::pon_none() }
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn os_chflags(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 	chflags_like(argv, argc, "chflags", libc::chflags)
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn os_lchflags(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 	chflags_like(argv, argc, "lchflags", lchflags)
 }
 
+#[cfg(target_os = "macos")]
 fn chflags_like(
 	argv: *mut *mut PyObject,
 	argc: usize,
@@ -4669,6 +4721,7 @@ fn chflags_like(
 	unsafe { crate::abi::pon_none() }
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" fn os_lchmod(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 	let args = unsafe { call_args(argv, argc) };
 	if args.len() != 2 {
@@ -5399,11 +5452,17 @@ unsafe extern "C" fn os_initgroups(argv: *mut *mut PyObject, argc: usize) -> *mu
 			);
 		},
 	};
-	if unsafe { libc::initgroups(c_user.as_ptr(), gid as libc::c_int) } < 0 {
+	if unsafe { libc::initgroups(c_user.as_ptr(), gid as _) } < 0 {
 		return raise_errno(last_errno(), None);
 	}
 	unsafe { crate::abi::pon_none() }
 }
+
+/// `getgrouplist(3)` group-buffer element: `int` on Darwin, `gid_t` on Linux.
+#[cfg(target_os = "macos")]
+type GroupId = libc::c_int;
+#[cfg(not(target_os = "macos"))]
+type GroupId = libc::gid_t;
 
 unsafe extern "C" fn os_getgrouplist(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 	let args = unsafe { call_args(argv, argc) };
@@ -5429,16 +5488,16 @@ unsafe extern "C" fn os_getgrouplist(argv: *mut *mut PyObject, argc: usize) -> *
 	};
 	let mut ngroups = 0 as libc::c_int;
 	unsafe {
-		libc::getgrouplist(c_user.as_ptr(), gid as libc::c_int, std::ptr::null_mut(), &mut ngroups)
+		libc::getgrouplist(c_user.as_ptr(), gid as _, std::ptr::null_mut(), &mut ngroups)
 	};
 	if ngroups <= 0 {
 		ngroups = 16;
 	}
 	loop {
-		let mut groups = vec![0 as libc::c_int; ngroups as usize];
+		let mut groups = vec![0 as GroupId; ngroups as usize];
 		let mut capacity = ngroups;
 		let rc = unsafe {
-			libc::getgrouplist(c_user.as_ptr(), gid as libc::c_int, groups.as_mut_ptr(), &mut capacity)
+			libc::getgrouplist(c_user.as_ptr(), gid as _, groups.as_mut_ptr(), &mut capacity)
 		};
 		if rc >= 0 {
 			let mut objects = Vec::with_capacity(capacity as usize);
@@ -5475,7 +5534,7 @@ unsafe extern "C" fn os_setgroups(argv: *mut *mut PyObject, argc: usize) -> *mut
 		};
 		groups.push(group as libc::gid_t);
 	}
-	if unsafe { libc::setgroups(groups.len() as libc::c_int, groups.as_ptr()) } < 0 {
+	if unsafe { libc::setgroups(groups.len() as _, groups.as_ptr()) } < 0 {
 		return raise_errno(last_errno(), None);
 	}
 	unsafe { crate::abi::pon_none() }
@@ -5574,12 +5633,19 @@ fn sysconf_result(value: libc::c_long) -> *mut PyObject {
 	unsafe { crate::abi::pon_const_int(value as i64) }
 }
 
+#[cfg(target_os = "macos")]
+use libc::__error as errno_location;
+#[cfg(not(target_os = "macos"))]
+use libc::__errno_location as errno_location;
+
 fn clear_errno() {
-	unsafe { *libc::__error() = 0 };
+	// SAFETY: `errno_location` returns the calling thread's live errno slot.
+	unsafe { *errno_location() = 0 };
 }
 
 fn current_errno() -> i32 {
-	unsafe { *libc::__error() }
+	// SAFETY: `errno_location` returns the calling thread's live errno slot.
+	unsafe { *errno_location() }
 }
 
 unsafe extern "C" fn os_device_encoding(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
