@@ -5856,7 +5856,11 @@ fn errno_exception(errno: i32) -> (ExceptionKind, &'static str) {
 		libc::EPIPE => (ExceptionKind::BrokenPipeError, "BrokenPipeError"),
 		libc::ECHILD => (ExceptionKind::ChildProcessError, "ChildProcessError"),
 		libc::ESRCH => (ExceptionKind::ProcessLookupError, "ProcessLookupError"),
-		libc::EAGAIN => (ExceptionKind::BlockingIOError, "BlockingIOError"),
+		// PEP 3151 groups the whole would-block family (non-blocking
+		// connect reports EINPROGRESS/EALREADY) under BlockingIOError.
+		libc::EAGAIN | libc::EINPROGRESS | libc::EALREADY => {
+			(ExceptionKind::BlockingIOError, "BlockingIOError")
+		},
 		libc::ETIMEDOUT => (ExceptionKind::TimeoutError, "TimeoutError"),
 		libc::ECONNABORTED => (ExceptionKind::ConnectionAbortedError, "ConnectionAbortedError"),
 		libc::ECONNREFUSED => (ExceptionKind::ConnectionRefusedError, "ConnectionRefusedError"),

@@ -256,40 +256,41 @@ const INT_CONSTANTS: &[(&str, i64)] = &[
 	("TCP_NOTSENT_LOWAT", 0x201),
 ];
 
-/// Pure C helper functions plus the live `socketpair(2)` seed (asyncio's
-/// self-pipe; `socket.py` wraps the raw pair through `detach()`).
+/// Host-backed module functions: address helpers, the live `socketpair(2)`
+/// seed (asyncio's self-pipe), the blocking `getaddrinfo(3)` resolver, and
+/// the byte-order primitives.
 const REAL_FUNCTIONS: &[(&str, BuiltinFn)] = &[
 	("CMSG_LEN", socket_cmsg_len),
 	("CMSG_SPACE", socket_cmsg_space),
+	("getaddrinfo", socket_getaddrinfo_real),
+	("gethostname", socket_gethostname_real),
+	("htonl", socket_htonl_real),
+	("htons", socket_htons_real),
 	("if_indextoname", socket_if_indextoname),
 	("if_nameindex", socket_if_nameindex),
 	("if_nametoindex", socket_if_nametoindex),
 	("inet_ntop", socket_inet_ntop),
 	("inet_pton", socket_inet_pton),
+	("ntohl", socket_ntohl_real),
+	("ntohs", socket_ntohs_real),
 	("sethostname", socket_sethostname),
 	("socketpair", socket_socketpair),
 ];
 
-/// Resolver and byte-order entry points that still need a live network stack;
-/// each raises `OSError` honestly when called.
+/// Entry points that still need work; each raises `OSError` honestly when
+/// called.
 const NOT_WIRED_FUNCTIONS: &[(&str, BuiltinFn)] = &[
 	("close", socket_close),
 	("dup", socket_dup),
-	("getaddrinfo", socket_getaddrinfo),
 	("gethostbyaddr", socket_gethostbyaddr),
 	("gethostbyname", socket_gethostbyname),
 	("gethostbyname_ex", socket_gethostbyname_ex),
-	("gethostname", socket_gethostname),
 	("getnameinfo", socket_getnameinfo),
 	("getprotobyname", socket_getprotobyname),
 	("getservbyname", socket_getservbyname),
 	("getservbyport", socket_getservbyport),
-	("htonl", socket_htonl),
-	("htons", socket_htons),
 	("inet_aton", socket_inet_aton),
 	("inet_ntoa", socket_inet_ntoa),
-	("ntohl", socket_ntohl),
-	("ntohs", socket_ntohs),
 ];
 
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
@@ -450,6 +451,15 @@ static SOCKET_TYPE: LazyLock<usize> = LazyLock::new(|| {
 			("send", socket_send_method),
 			("sendall", socket_sendall_method),
 			("recv", socket_recv_method),
+			("connect", socket_connect_method),
+			("bind", socket_bind_method),
+			("listen", socket_listen_method),
+			("_accept", socket_accept_method),
+			("getsockname", socket_getsockname_method),
+			("getpeername", socket_getpeername_method),
+			("setsockopt", socket_setsockopt_method),
+			("getsockopt", socket_getsockopt_method),
+			("shutdown", socket_shutdown_method),
 		];
 		for &(name, entry) in methods {
 			// SAFETY: `entry` is a live builtin entry point with the runtime
@@ -915,6 +925,713 @@ unsafe extern "C" fn socket_socketpair(argv: *mut *mut PyObject, argc: usize) ->
 	}
 	// SAFETY: Two live socket objects; the tuple allocator copies the slots.
 	unsafe { crate::abi::seq::pon_build_tuple(pair.as_mut_ptr(), 2) }
+}
+
+// ---------------------------------------------------------------------------
+// Address marshalling (AF_INET / AF_INET6 / AF_UNIX)
+
+/// A filled `sockaddr_storage` plus its meaningful length.
+struct HostAddress {
+	storage: libc::sockaddr_storage,
+	len:     libc::socklen_t,
+}
+
+impl HostAddress {
+	fn as_sockaddr(&self) -> *const libc::sockaddr {
+		(&raw const self.storage).cast()
+	}
+}
+
+/// Parses a Python address argument (`(host, port)` tuples for INET
+/// families, a path string for AF_UNIX) into a host sockaddr. Non-numeric
+/// INET hosts resolve through `getaddrinfo(3)`.
+fn parse_address(family: i64, object: *mut PyObject) -> Result<HostAddress, *mut PyObject> {
+	let object = untag(object);
+	// SAFETY: Zeroed sockaddr_storage is a valid all-families baseline.
+	let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+	match family as i32 {
+		libc::AF_UNIX => {
+			let Some(path) = (unsafe { type_mod::unicode_text(object) }) else {
+				return Err(raise_type_error("AF_UNIX address must be str"));
+			};
+			let sun = (&raw mut storage).cast::<libc::sockaddr_un>();
+			// SAFETY: `sockaddr_un` fits inside `sockaddr_storage`.
+			unsafe {
+				(*sun).sun_family = libc::AF_UNIX as libc::sa_family_t;
+				let bytes = path.as_bytes();
+				if bytes.len() >= (*sun).sun_path.len() {
+					return Err(raise_os_error_text("AF_UNIX path too long"));
+				}
+				for (slot, byte) in (*sun).sun_path.iter_mut().zip(bytes) {
+					*slot = *byte as libc::c_char;
+				}
+				(*sun).sun_len = (std::mem::size_of::<libc::sockaddr_un>()) as u8;
+			}
+			Ok(HostAddress {
+				storage,
+				len: std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+			})
+		},
+		libc::AF_INET | libc::AF_INET6 => {
+			let Some(items) = (unsafe { crate::abi::seq::exact_tuple_slice(object) }) else {
+				return Err(raise_type_error("socket address must be a (host, port) tuple"));
+			};
+			if items.len() < 2 {
+				return Err(raise_type_error("socket address must be a (host, port) tuple"));
+			}
+			let Some(host) = (unsafe { type_mod::unicode_text(untag(items[0])) }) else {
+				return Err(raise_type_error("socket address host must be str"));
+			};
+			let port = match int_arg_or(items, 1, -1) {
+				Ok(port) if (0..=65535).contains(&port) => port as u16,
+				Ok(_) => return Err(raise_os_error_text("port must be 0-65535")),
+				Err(raised) => return Err(raised),
+			};
+			let host: &str = if host.is_empty() {
+				if family as i32 == libc::AF_INET { "0.0.0.0" } else { "::" }
+			} else if host == "<broadcast>" {
+				"255.255.255.255"
+			} else {
+				host
+			};
+			resolve_host(family as i32, host, port)
+		},
+		other => Err(raise_os_error_text(&format!(
+			"address family {other} is not supported by the pon runtime"
+		))),
+	}
+}
+
+/// Numeric fast path via `inet_pton(3)`, then a blocking `getaddrinfo(3)`
+/// resolution for names.
+fn resolve_host(family: i32, host: &str, port: u16) -> Result<HostAddress, *mut PyObject> {
+	// SAFETY: Zeroed sockaddr_storage is a valid all-families baseline.
+	let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+	let Ok(c_host) = CString::new(host) else {
+		return Err(raise_type_error("socket address host contains NUL"));
+	};
+	if family == libc::AF_INET {
+		let sin = (&raw mut storage).cast::<libc::sockaddr_in>();
+		// SAFETY: `sockaddr_in` fits inside `sockaddr_storage`.
+		let numeric = unsafe { inet_pton(libc::AF_INET, c_host.as_ptr(), (&raw mut (*sin).sin_addr).cast()) };
+		if numeric == 1 {
+			// SAFETY: Same live struct as above.
+			unsafe {
+				(*sin).sin_family = libc::AF_INET as libc::sa_family_t;
+				(*sin).sin_port = port.to_be();
+				(*sin).sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+			}
+			return Ok(HostAddress {
+				storage,
+				len: std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+			});
+		}
+	} else {
+		let sin6 = (&raw mut storage).cast::<libc::sockaddr_in6>();
+		// SAFETY: `sockaddr_in6` fits inside `sockaddr_storage`.
+		let numeric = unsafe { inet_pton(libc::AF_INET6, c_host.as_ptr(), (&raw mut (*sin6).sin6_addr).cast()) };
+		if numeric == 1 {
+			// SAFETY: Same live struct as above.
+			unsafe {
+				(*sin6).sin6_family = libc::AF_INET6 as libc::sa_family_t;
+				(*sin6).sin6_port = port.to_be();
+				(*sin6).sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+			}
+			return Ok(HostAddress {
+				storage,
+				len: std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+			});
+		}
+	}
+	// Name resolution: first getaddrinfo(3) record of the requested family.
+	let records = getaddrinfo_records(Some(host), Some(&port.to_string()), family, 0, 0, 0)?;
+	records
+		.into_iter()
+		.next()
+		.map(|record| record.address)
+		.ok_or_else(|| raise_os_error_text(&format!("no address records for host {host:?}")))
+}
+
+/// One `getaddrinfo(3)` record in CPython result order.
+struct AddrInfoRecord {
+	family:    i32,
+	kind:      i32,
+	proto:     i32,
+	canonname: String,
+	address:   HostAddress,
+}
+
+fn getaddrinfo_records(
+	host: Option<&str>,
+	service: Option<&str>,
+	family: i32,
+	kind: i32,
+	proto: i32,
+	flags: i32,
+) -> Result<Vec<AddrInfoRecord>, *mut PyObject> {
+	let c_host = match host {
+		Some(host) => match CString::new(host) {
+			Ok(c_host) => Some(c_host),
+			Err(_) => return Err(raise_type_error("host contains NUL")),
+		},
+		None => None,
+	};
+	let c_service = match service {
+		Some(service) => match CString::new(service) {
+			Ok(c_service) => Some(c_service),
+			Err(_) => return Err(raise_type_error("service contains NUL")),
+		},
+		None => None,
+	};
+	// SAFETY: Zeroed hints struct is the documented getaddrinfo(3) baseline.
+	let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
+	hints.ai_family = family;
+	hints.ai_socktype = kind;
+	hints.ai_protocol = proto;
+	hints.ai_flags = flags;
+	let mut result: *mut libc::addrinfo = ptr::null_mut();
+	// SAFETY: All pointers are live for the call; result is freed below.
+	let status = unsafe {
+		libc::getaddrinfo(
+			c_host.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+			c_service.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+			&hints,
+			&mut result,
+		)
+	};
+	if status != 0 {
+		// SAFETY: gai_strerror returns a static message for the status code.
+		let detail = unsafe { CStr::from_ptr(libc::gai_strerror(status)) }
+			.to_string_lossy()
+			.into_owned();
+		return Err(raise_os_error_text(&format!("[Errno {status}] {detail}")));
+	}
+	let mut records = Vec::new();
+	let mut cursor = result;
+	while !cursor.is_null() {
+		// SAFETY: The chain entries stay live until freeaddrinfo below.
+		let entry = unsafe { &*cursor };
+		// SAFETY: Zeroed baseline, then a bounded copy of ai_addrlen bytes.
+		let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+		let len = entry
+			.ai_addrlen
+			.min(std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t);
+		// SAFETY: `ai_addr` points at `ai_addrlen` readable bytes.
+		unsafe {
+			ptr::copy_nonoverlapping(entry.ai_addr.cast::<u8>(), (&raw mut storage).cast::<u8>(), len as usize);
+		}
+		let canonname = if entry.ai_canonname.is_null() {
+			String::new()
+		} else {
+			// SAFETY: Non-null canonname is a NUL-terminated C string.
+			unsafe { CStr::from_ptr(entry.ai_canonname) }
+				.to_string_lossy()
+				.into_owned()
+		};
+		records.push(AddrInfoRecord {
+			family: entry.ai_family,
+			kind: entry.ai_socktype,
+			proto: entry.ai_protocol,
+			canonname,
+			address: HostAddress { storage, len },
+		});
+		cursor = entry.ai_next;
+	}
+	// SAFETY: `result` came from a successful getaddrinfo call.
+	unsafe { libc::freeaddrinfo(result) };
+	Ok(records)
+}
+
+/// Renders a sockaddr as CPython's Python-level address value:
+/// `(host, port)` for AF_INET, `(host, port, flowinfo, scope_id)` for
+/// AF_INET6, a path string for AF_UNIX.
+fn address_to_object(address: &HostAddress) -> *mut PyObject {
+	match i32::from(address.storage.ss_family) {
+		libc::AF_INET => {
+			let sin = (&raw const address.storage).cast::<libc::sockaddr_in>();
+			let mut text = [0i8; INET6_ADDRSTRLEN];
+			// SAFETY: Live sockaddr_in and a correctly sized text buffer.
+			let rendered = unsafe {
+				inet_ntop(
+					libc::AF_INET,
+					(&raw const (*sin).sin_addr).cast(),
+					text.as_mut_ptr(),
+					INET6_ADDRSTRLEN as libc::socklen_t,
+				)
+			};
+			if rendered.is_null() {
+				return crate::native::os::raise_errno(last_socket_errno(), None);
+			}
+			// SAFETY: inet_ntop wrote a NUL-terminated string.
+			let host = unsafe { CStr::from_ptr(text.as_ptr()) }.to_string_lossy();
+			// SAFETY: Live struct; port is stored big-endian.
+			let port = u16::from_be(unsafe { (*sin).sin_port });
+			let host_object = unsafe { abi::pon_const_str(host.as_ptr(), host.len()) };
+			let port_object = unsafe { abi::pon_const_int(i64::from(port)) };
+			if host_object.is_null() || port_object.is_null() {
+				return ptr::null_mut();
+			}
+			let mut pair = [host_object, port_object];
+			// SAFETY: Two live slots; the tuple allocator copies them.
+			unsafe { crate::abi::seq::pon_build_tuple(pair.as_mut_ptr(), 2) }
+		},
+		libc::AF_INET6 => {
+			let sin6 = (&raw const address.storage).cast::<libc::sockaddr_in6>();
+			let mut text = [0i8; INET6_ADDRSTRLEN];
+			// SAFETY: Live sockaddr_in6 and a correctly sized text buffer.
+			let rendered = unsafe {
+				inet_ntop(
+					libc::AF_INET6,
+					(&raw const (*sin6).sin6_addr).cast(),
+					text.as_mut_ptr(),
+					INET6_ADDRSTRLEN as libc::socklen_t,
+				)
+			};
+			if rendered.is_null() {
+				return crate::native::os::raise_errno(last_socket_errno(), None);
+			}
+			// SAFETY: inet_ntop wrote a NUL-terminated string.
+			let host = unsafe { CStr::from_ptr(text.as_ptr()) }.to_string_lossy();
+			// SAFETY: Live struct; port/flowinfo stored big-endian.
+			let (port, flowinfo, scope) = unsafe {
+				(
+					u16::from_be((*sin6).sin6_port),
+					u32::from_be((*sin6).sin6_flowinfo),
+					(*sin6).sin6_scope_id,
+				)
+			};
+			let host_object = unsafe { abi::pon_const_str(host.as_ptr(), host.len()) };
+			let port_object = unsafe { abi::pon_const_int(i64::from(port)) };
+			let flow_object = unsafe { abi::pon_const_int(i64::from(flowinfo)) };
+			let scope_object = unsafe { abi::pon_const_int(i64::from(scope)) };
+			if host_object.is_null() || port_object.is_null() || flow_object.is_null() || scope_object.is_null() {
+				return ptr::null_mut();
+			}
+			let mut parts = [host_object, port_object, flow_object, scope_object];
+			// SAFETY: Four live slots; the tuple allocator copies them.
+			unsafe { crate::abi::seq::pon_build_tuple(parts.as_mut_ptr(), 4) }
+		},
+		libc::AF_UNIX => {
+			let sun = (&raw const address.storage).cast::<libc::sockaddr_un>();
+			// SAFETY: sun_path is NUL-terminated for bound/parsed addresses.
+			let path = unsafe { CStr::from_ptr((*sun).sun_path.as_ptr()) }.to_string_lossy();
+			unsafe { abi::pon_const_str(path.as_ptr(), path.len()) }
+		},
+		_ => {
+			// Unknown family: CPython falls back to the raw bytes; an empty
+			// tuple keeps consumers alive without inventing structure.
+			unsafe { crate::abi::seq::pon_build_tuple(ptr::null_mut(), 0) }
+		},
+	}
+}
+
+fn raise_os_error_text(message: &str) -> *mut PyObject {
+	crate::abi::exc::raise_kind_error_text(ExceptionKind::OSError, message)
+}
+
+// ---------------------------------------------------------------------------
+// Connection-oriented socket methods
+
+unsafe extern "C" fn socket_connect_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let (receiver, args) = match unsafe { socket_method_args(argv, argc, "connect") } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	if args.len() != 1 {
+		return raise_type_error("connect() takes exactly one argument");
+	}
+	let (fd, family) = match live_sockets().get(&(receiver as usize)) {
+		Some(state) if state.fd >= 0 => (state.fd, state.family),
+		_ => return raise_os_error_text("connect on a closed or unregistered socket"),
+	};
+	let address = match parse_address(family, args[0]) {
+		Ok(address) => address,
+		Err(raised) => return raised,
+	};
+	// SAFETY: Plain connect(2) on a validated fd and a filled sockaddr.
+	if unsafe { libc::connect(fd, address.as_sockaddr(), address.len) } < 0 {
+		return crate::native::os::raise_errno(last_socket_errno(), None);
+	}
+	// SAFETY: Singleton accessor.
+	unsafe { abi::pon_none() }
+}
+
+unsafe extern "C" fn socket_bind_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let (receiver, args) = match unsafe { socket_method_args(argv, argc, "bind") } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	if args.len() != 1 {
+		return raise_type_error("bind() takes exactly one argument");
+	}
+	let (fd, family) = match live_sockets().get(&(receiver as usize)) {
+		Some(state) if state.fd >= 0 => (state.fd, state.family),
+		_ => return raise_os_error_text("bind on a closed or unregistered socket"),
+	};
+	let address = match parse_address(family, args[0]) {
+		Ok(address) => address,
+		Err(raised) => return raised,
+	};
+	// SAFETY: Plain bind(2) on a validated fd and a filled sockaddr.
+	if unsafe { libc::bind(fd, address.as_sockaddr(), address.len) } < 0 {
+		return crate::native::os::raise_errno(last_socket_errno(), None);
+	}
+	// SAFETY: Singleton accessor.
+	unsafe { abi::pon_none() }
+}
+
+unsafe extern "C" fn socket_listen_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let (receiver, args) = match unsafe { socket_method_args(argv, argc, "listen") } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	let backlog = match int_arg_or(args, 0, 128) {
+		Ok(backlog) => backlog,
+		Err(raised) => return raised,
+	};
+	let fd = match socket_state_fd(receiver, "listen") {
+		Ok(fd) => fd,
+		Err(raised) => return raised,
+	};
+	// SAFETY: Plain listen(2) on a validated fd.
+	if unsafe { libc::listen(fd, backlog as i32) } < 0 {
+		return crate::native::os::raise_errno(last_socket_errno(), None);
+	}
+	// SAFETY: Singleton accessor.
+	unsafe { abi::pon_none() }
+}
+
+/// `_socket.socket._accept()`: CPython's raw accept — `(fd, address)`;
+/// `socket.py` wraps the fd via `socket(..., fileno=fd)`.
+unsafe extern "C" fn socket_accept_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let (receiver, _) = match unsafe { socket_method_args(argv, argc, "_accept") } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	let fd = match socket_state_fd(receiver, "_accept") {
+		Ok(fd) => fd,
+		Err(raised) => return raised,
+	};
+	// SAFETY: Zeroed sockaddr_storage receives the peer address in place.
+	let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+	let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+	// SAFETY: Plain accept(2) writing into the storage above.
+	let conn = unsafe { libc::accept(fd, (&raw mut storage).cast(), &mut len) };
+	if conn < 0 {
+		return crate::native::os::raise_errno(last_socket_errno(), None);
+	}
+	let address = address_to_object(&HostAddress { storage, len });
+	if address.is_null() {
+		// SAFETY: The freshly accepted fd is owned here until returned.
+		unsafe { libc::close(conn) };
+		return ptr::null_mut();
+	}
+	let fd_object = unsafe { abi::pon_const_int(i64::from(conn)) };
+	if fd_object.is_null() {
+		// SAFETY: Same ownership as above.
+		unsafe { libc::close(conn) };
+		return ptr::null_mut();
+	}
+	let mut pair = [fd_object, address];
+	// SAFETY: Two live slots; the tuple allocator copies them.
+	unsafe { crate::abi::seq::pon_build_tuple(pair.as_mut_ptr(), 2) }
+}
+
+fn socket_name_method(
+	argv: *mut *mut PyObject,
+	argc: usize,
+	name: &str,
+	read: unsafe fn(i32, *mut libc::sockaddr, *mut libc::socklen_t) -> i32,
+) -> *mut PyObject {
+	let (receiver, _) = match unsafe { socket_method_args(argv, argc, name) } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	let fd = match socket_state_fd(receiver, name) {
+		Ok(fd) => fd,
+		Err(raised) => return raised,
+	};
+	// SAFETY: Zeroed sockaddr_storage receives the address in place.
+	let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+	let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+	// SAFETY: Plain getsockname/getpeername on a validated fd.
+	if unsafe { read(fd, (&raw mut storage).cast(), &mut len) } < 0 {
+		return crate::native::os::raise_errno(last_socket_errno(), None);
+	}
+	address_to_object(&HostAddress { storage, len })
+}
+
+unsafe extern "C" fn socket_getsockname_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	socket_name_method(argv, argc, "getsockname", |fd, addr, len| unsafe {
+		libc::getsockname(fd, addr, len)
+	})
+}
+
+unsafe extern "C" fn socket_getpeername_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	socket_name_method(argv, argc, "getpeername", |fd, addr, len| unsafe {
+		libc::getpeername(fd, addr, len)
+	})
+}
+
+unsafe extern "C" fn socket_setsockopt_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let (receiver, args) = match unsafe { socket_method_args(argv, argc, "setsockopt") } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	if args.len() != 3 {
+		return raise_type_error("setsockopt() takes exactly three arguments");
+	}
+	let fd = match socket_state_fd(receiver, "setsockopt") {
+		Ok(fd) => fd,
+		Err(raised) => return raised,
+	};
+	let level = match int_arg_or(args, 0, -1) {
+		Ok(level) => level as i32,
+		Err(raised) => return raised,
+	};
+	let option = match int_arg_or(args, 1, -1) {
+		Ok(option) => option as i32,
+		Err(raised) => return raised,
+	};
+	// Value: int (the common case) or a bytes-like buffer.
+	let status = if let Ok(buffer) = crate::abi::str_::expect_bytes_like(untag(args[2])) {
+		// SAFETY: Plain setsockopt(2) over an owned buffer.
+		unsafe {
+			libc::setsockopt(fd, level, option, buffer.as_ptr().cast(), buffer.len() as libc::socklen_t)
+		}
+	} else {
+		let value = match int_arg_or(args, 2, -1) {
+			Ok(value) => value as i32,
+			Err(raised) => return raised,
+		};
+		// SAFETY: Plain setsockopt(2) over a stack int.
+		unsafe {
+			libc::setsockopt(
+				fd,
+				level,
+				option,
+				(&raw const value).cast(),
+				std::mem::size_of::<i32>() as libc::socklen_t,
+			)
+		}
+	};
+	if status < 0 {
+		return crate::native::os::raise_errno(last_socket_errno(), None);
+	}
+	// SAFETY: Singleton accessor.
+	unsafe { abi::pon_none() }
+}
+
+unsafe extern "C" fn socket_getsockopt_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let (receiver, args) = match unsafe { socket_method_args(argv, argc, "getsockopt") } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	if args.len() < 2 || args.len() > 3 {
+		return raise_type_error("getsockopt() takes two or three arguments");
+	}
+	let fd = match socket_state_fd(receiver, "getsockopt") {
+		Ok(fd) => fd,
+		Err(raised) => return raised,
+	};
+	let level = match int_arg_or(args, 0, -1) {
+		Ok(level) => level as i32,
+		Err(raised) => return raised,
+	};
+	let option = match int_arg_or(args, 1, -1) {
+		Ok(option) => option as i32,
+		Err(raised) => return raised,
+	};
+	let buflen = match int_arg_or(args, 2, 0) {
+		Ok(buflen) => buflen,
+		Err(raised) => return raised,
+	};
+	if buflen == 0 {
+		let mut value: i32 = 0;
+		let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+		// SAFETY: Plain getsockopt(2) into a stack int.
+		if unsafe { libc::getsockopt(fd, level, option, (&raw mut value).cast(), &mut len) } < 0 {
+			return crate::native::os::raise_errno(last_socket_errno(), None);
+		}
+		// SAFETY: Integer boxing helper.
+		return unsafe { abi::pon_const_int(i64::from(value)) };
+	}
+	if !(0..=1024).contains(&buflen) {
+		return raise_os_error_text("getsockopt buflen out of range");
+	}
+	let mut buffer = vec![0u8; buflen as usize];
+	let mut len = buflen as libc::socklen_t;
+	// SAFETY: Plain getsockopt(2) into an owned buffer.
+	if unsafe { libc::getsockopt(fd, level, option, buffer.as_mut_ptr().cast(), &mut len) } < 0 {
+		return crate::native::os::raise_errno(last_socket_errno(), None);
+	}
+	buffer.truncate(len as usize);
+	// SAFETY: Runtime allocation helper; NULL propagates with the error set.
+	unsafe { abi::str_::pon_const_bytes(buffer.as_ptr(), buffer.len()) }
+}
+
+unsafe extern "C" fn socket_shutdown_method(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let (receiver, args) = match unsafe { socket_method_args(argv, argc, "shutdown") } {
+		Ok(parts) => parts,
+		Err(raised) => return raised,
+	};
+	let how = match int_arg_or(args, 0, libc::SHUT_RDWR as i64) {
+		Ok(how) => how as i32,
+		Err(raised) => return raised,
+	};
+	let fd = match socket_state_fd(receiver, "shutdown") {
+		Ok(fd) => fd,
+		Err(raised) => return raised,
+	};
+	// SAFETY: Plain shutdown(2) on a validated fd.
+	if unsafe { libc::shutdown(fd, how) } < 0 {
+		return crate::native::os::raise_errno(last_socket_errno(), None);
+	}
+	// SAFETY: Singleton accessor.
+	unsafe { abi::pon_none() }
+}
+
+/// `_socket.getaddrinfo(host, port, family=0, type=0, proto=0, flags=0)`.
+unsafe extern "C" fn socket_getaddrinfo_real(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return fail("getaddrinfo received a NULL argv pointer");
+	};
+	if args.len() < 2 {
+		return raise_type_error("getaddrinfo() requires host and port");
+	}
+	let none = unsafe { abi::pon_none() };
+	let host_object = untag(args[0]);
+	let host = if host_object == none {
+		None
+	} else if let Some(text) = unsafe { type_mod::unicode_text(host_object) } {
+		Some(text.to_owned())
+	} else if let Ok(bytes) = crate::abi::str_::expect_bytes_like(host_object) {
+		match String::from_utf8(bytes) {
+			Ok(text) => Some(text),
+			Err(_) => return raise_type_error("getaddrinfo host bytes must be UTF-8"),
+		}
+	} else {
+		return raise_type_error("getaddrinfo() argument 1 must be string, bytes or None");
+	};
+	let port_object = untag(args[1]);
+	let service = if port_object == none {
+		None
+	} else if let Some(text) = unsafe { type_mod::unicode_text(port_object) } {
+		Some(text.to_owned())
+	} else if let Some(port) =
+		unsafe { crate::types::int::to_bigint_including_bool(port_object) }.and_then(|big| big.to_i64())
+	{
+		Some(port.to_string())
+	} else {
+		return raise_type_error("getaddrinfo() argument 2 must be integer, string or None");
+	};
+	let family = match int_arg_or(args, 2, 0) {
+		Ok(value) => value as i32,
+		Err(raised) => return raised,
+	};
+	let kind = match int_arg_or(args, 3, 0) {
+		Ok(value) => value as i32,
+		Err(raised) => return raised,
+	};
+	let proto = match int_arg_or(args, 4, 0) {
+		Ok(value) => value as i32,
+		Err(raised) => return raised,
+	};
+	let flags = match int_arg_or(args, 5, 0) {
+		Ok(value) => value as i32,
+		Err(raised) => return raised,
+	};
+	let records = match getaddrinfo_records(host.as_deref(), service.as_deref(), family, kind, proto, flags) {
+		Ok(records) => records,
+		Err(raised) => return raised,
+	};
+	let mut items = Vec::with_capacity(records.len());
+	for record in &records {
+		let family_object = unsafe { abi::pon_const_int(i64::from(record.family)) };
+		let kind_object = unsafe { abi::pon_const_int(i64::from(record.kind)) };
+		let proto_object = unsafe { abi::pon_const_int(i64::from(record.proto)) };
+		let canon_object =
+			unsafe { abi::pon_const_str(record.canonname.as_ptr(), record.canonname.len()) };
+		let address = address_to_object(&record.address);
+		if family_object.is_null()
+			|| kind_object.is_null()
+			|| proto_object.is_null()
+			|| canon_object.is_null()
+			|| address.is_null()
+		{
+			return ptr::null_mut();
+		}
+		let mut parts = [family_object, kind_object, proto_object, canon_object, address];
+		// SAFETY: Five live slots; the tuple allocator copies them.
+		let record_tuple = unsafe { crate::abi::seq::pon_build_tuple(parts.as_mut_ptr(), 5) };
+		if record_tuple.is_null() {
+			return ptr::null_mut();
+		}
+		items.push(record_tuple);
+	}
+	// SAFETY: Live tuple slots; the list allocator copies them.
+	unsafe { crate::abi::seq::pon_build_list(items.as_mut_ptr(), items.len()) }
+}
+
+/// `_socket.gethostname()`.
+unsafe extern "C" fn socket_gethostname_real(_argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	if argc != 0 {
+		return raise_type_error("gethostname() takes no arguments");
+	}
+	let mut buffer = [0i8; 256];
+	// SAFETY: Plain gethostname(3) into a stack buffer.
+	if unsafe { libc::gethostname(buffer.as_mut_ptr(), buffer.len()) } < 0 {
+		return crate::native::os::raise_errno(last_socket_errno(), None);
+	}
+	// SAFETY: gethostname wrote a NUL-terminated string.
+	let name = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_string_lossy();
+	unsafe { abi::pon_const_str(name.as_ptr(), name.len()) }
+}
+
+/// Shared 16/32-bit byte-swap core for `htons`/`ntohs`/`htonl`/`ntohl`
+/// (identical swap on both directions for a big-endian wire format).
+fn byteswap_entry(argv: *mut *mut PyObject, argc: usize, name: &str, wide: bool) -> *mut PyObject {
+	let Some(args) = (unsafe { arg_slice(argv, argc) }) else {
+		return fail(format!("{name} received a NULL argv pointer"));
+	};
+	if args.len() != 1 {
+		return raise_type_error(&format!("{name}() takes exactly one argument"));
+	}
+	let value = match int_arg_or(args, 0, -1) {
+		Ok(value) if value >= 0 => value,
+		Ok(_) => return raise_os_error_text(&format!("{name}() argument out of range")),
+		Err(raised) => return raised,
+	};
+	let swapped = if wide {
+		if value > i64::from(u32::MAX) {
+			return raise_os_error_text(&format!("{name}() argument out of range"));
+		}
+		i64::from((value as u32).swap_bytes())
+	} else {
+		if value > i64::from(u16::MAX) {
+			return raise_os_error_text(&format!("{name}() argument out of range"));
+		}
+		i64::from((value as u16).swap_bytes())
+	};
+	let swapped = if cfg!(target_endian = "big") { value } else { swapped };
+	// SAFETY: Integer boxing helper.
+	unsafe { abi::pon_const_int(swapped) }
+}
+
+unsafe extern "C" fn socket_htons_real(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	byteswap_entry(argv, argc, "htons", false)
+}
+
+unsafe extern "C" fn socket_ntohs_real(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	byteswap_entry(argv, argc, "ntohs", false)
+}
+
+unsafe extern "C" fn socket_htonl_real(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	byteswap_entry(argv, argc, "htonl", true)
+}
+
+unsafe extern "C" fn socket_ntohl_real(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	byteswap_entry(argv, argc, "ntohl", true)
 }
 
 // ---------------------------------------------------------------------------
