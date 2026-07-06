@@ -1,8 +1,8 @@
 //! Native `_ssl` module backed by OpenSSL where Pon exposes the surface.
 //!
-//! Context construction, defaults, certificate-store loading, MemoryBIO storage,
-//! random bytes, OpenSSL version/ASN.1 helpers, and the CPython exception
-//! hierarchy are real.  Network/BIO TLS wrapping remains an explicit
+//! Context construction, defaults, certificate-store loading, MemoryBIO
+//! storage, random bytes, OpenSSL version/ASN.1 helpers, and the CPython
+//! exception hierarchy are real.  Network/BIO TLS wrapping remains an explicit
 //! `NotImplementedError` boundary until the runtime grows a safe owner for
 //! OpenSSL streams over Python socket and BIO objects.
 
@@ -1127,7 +1127,9 @@ unsafe extern "C" fn ssl_context_load_cert_chain_entry(
 				builder
 					.set_private_key_file(private_key, SslFiletype::PEM)
 					.map_err(|error| error.to_string())?;
-				builder.check_private_key().map_err(|error| error.to_string())
+				builder
+					.check_private_key()
+					.map_err(|error| error.to_string())
 			})
 		})
 	};
@@ -1580,4 +1582,3 @@ fn ssl_attrs(name: &str) -> Result<Vec<(u32, *mut PyObject)>, String> {
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
 	install_module("_ssl", ssl_attrs("_ssl")?)
 }
-

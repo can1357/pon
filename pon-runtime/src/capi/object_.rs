@@ -1496,11 +1496,11 @@ unsafe fn pon_contiguous_buffer(object: *mut PyObject) -> Option<PonBufferInfo> 
 		// SAFETY: the exact type check proves the boxed bytes layout.
 		let bytes = unsafe { (&*object.cast::<crate::types::bytes_::PyBytes>()).as_slice() };
 		return Some(PonBufferInfo {
-			buf: bytes.as_ptr().cast::<c_void>().cast_mut(),
-			len: bytes.len() as PySsizeT,
+			buf:      bytes.as_ptr().cast::<c_void>().cast_mut(),
+			len:      bytes.len() as PySsizeT,
 			readonly: 1,
 			itemsize: 1,
-			format: b'B',
+			format:   b'B',
 		});
 	}
 	if crate::types::bytearray_::is_bytearray_type(ty) {
@@ -1509,20 +1509,20 @@ unsafe fn pon_contiguous_buffer(object: *mut PyObject) -> Option<PonBufferInfo> 
 		let bytes =
 			unsafe { (&mut *object.cast::<crate::types::bytearray_::PyByteArray>()).as_mut_slice() };
 		return Some(PonBufferInfo {
-			buf: bytes.as_mut_ptr().cast::<c_void>(),
-			len: bytes.len() as PySsizeT,
+			buf:      bytes.as_mut_ptr().cast::<c_void>(),
+			len:      bytes.len() as PySsizeT,
 			readonly: 0,
 			itemsize: 1,
-			format: b'B',
+			format:   b'B',
 		});
 	}
 	if let Some(array) = unsafe { crate::native::array::buffer_view(object) } {
 		return Some(PonBufferInfo {
-			buf: array.data.cast::<c_void>(),
-			len: array.len as PySsizeT,
+			buf:      array.data.cast::<c_void>(),
+			len:      array.len as PySsizeT,
 			readonly: 0,
 			itemsize: array.itemsize as PySsizeT,
-			format: array.format,
+			format:   array.format,
 		});
 	}
 	None
@@ -1556,7 +1556,9 @@ unsafe fn fill_typed_buffer_info_impl(
 	let (shape, strides) = if (flags & PYBUF_ND) == PYBUF_ND {
 		BUFFER_SHAPE_CACHE.with(|cache| {
 			let mut cache = cache.borrow_mut();
-			let dims = cache.entry(view as usize).or_insert_with(|| Box::new([count, buffer.itemsize]));
+			let dims = cache
+				.entry(view as usize)
+				.or_insert_with(|| Box::new([count, buffer.itemsize]));
 			dims[0] = count;
 			dims[1] = buffer.itemsize;
 			let shape = dims.as_mut_ptr();
