@@ -21,19 +21,20 @@ use crate::{scoreboard::Status, suite::SuiteName};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Cli {
-	suite:        SuiteName,
-	mode:         Mode,
-	check_floor:  bool,
-	update_floor: bool,
-	diff_floor:   bool,
-	modules:      Vec<String>,
-	timeout:      Option<u64>,
-	shard:        Option<(u32, u32)>,
-	jobs:         Option<usize>,
-	seed:         Option<u64>,
-	count:        Option<usize>,
-	bench:        bool,
-	bench_python: bool,
+	suite:             SuiteName,
+	mode:              Mode,
+	check_floor:       bool,
+	update_floor:      bool,
+	diff_floor:        bool,
+	modules:           Vec<String>,
+	timeout:           Option<u64>,
+	shard:             Option<(u32, u32)>,
+	jobs:              Option<usize>,
+	seed:              Option<u64>,
+	count:             Option<usize>,
+	bench:             bool,
+	bench_python:      bool,
+	bench_python_sync: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -106,10 +107,15 @@ fn run_cli() -> Result<()> {
 	// Path-taking suites convert selectors to workspace/vendored paths verbatim.
 	let module_paths = cli.modules.iter().map(PathBuf::from).collect::<Vec<_>>();
 
-	if cli.bench && cli.bench_python {
-		bail!("`--bench` and `--bench-python` are mutually exclusive")
+	if [cli.bench, cli.bench_python, cli.bench_python_sync]
+		.into_iter()
+		.filter(|enabled| *enabled)
+		.count()
+		> 1
+	{
+		bail!("benchmark modes are mutually exclusive")
 	}
-	if cli.bench || cli.bench_python {
+	if cli.bench || cli.bench_python || cli.bench_python_sync {
 		if cli.mode != Mode::Jit {
 			bail!("benchmark modes use the JIT tier-up path; omit `--mode` or pass `--mode jit`")
 		}
@@ -120,8 +126,8 @@ fn run_cli() -> Result<()> {
 			bail!("floor checks are not defined for benchmark modes")
 		}
 
-		if cli.bench_python {
-			run_python_bench_gate(&root, &module_paths)?;
+		if cli.bench_python || cli.bench_python_sync {
+			run_python_bench_gate(&root, &module_paths, cli.bench_python_sync)?;
 		} else {
 			run_bench_gate(&root, &module_paths)?;
 		}
@@ -305,6 +311,7 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
 	let mut count = None;
 	let mut bench = false;
 	let mut bench_python = false;
+	let mut bench_python_sync = false;
 	let mut args = args.into_iter().peekable();
 
 	while let Some(arg) = args.next() {
@@ -322,6 +329,7 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
 			"--diff-floor" => diff_floor = true,
 			"--bench" => bench = true,
 			"--bench-python" => bench_python = true,
+			"--bench-python-sync" => bench_python_sync = true,
 			"--timeout" => {
 				let value = args.next().ok_or_else(usage)?;
 				let secs = value
@@ -388,6 +396,7 @@ fn parse_cli(args: impl IntoIterator<Item = String>) -> Result<Cli> {
 		diff_floor,
 		bench,
 		bench_python,
+		bench_python_sync,
 		modules,
 		timeout,
 		shard,
@@ -425,10 +434,10 @@ fn default_jobs() -> usize {
 
 fn usage() -> anyhow::Error {
 	anyhow::anyhow!(
-		"usage: pon-conformance [--bench|--bench-python] [--mode jit|aot] [--suite \
-		 slice|cpython|cpython-aot-subset|aot-parity|cpython-full|ft-stress|fuzz] [--check-floor] \
-		 [--update-floor] [--diff-floor] [--modules <selectors...>] [--timeout <secs>] [--shard \
-		 <i>/<N>] [--jobs <J>] [--seed N] [--count K]"
+		"usage: pon-conformance [--bench|--bench-python|--bench-python-sync] [--mode jit|aot] \
+		 [--suite slice|cpython|cpython-aot-subset|aot-parity|cpython-full|ft-stress|fuzz] \
+		 [--check-floor] [--update-floor] [--diff-floor] [--modules <selectors...>] [--timeout \
+		 <secs>] [--shard <i>/<N>] [--jobs <J>] [--seed N] [--count K]"
 	)
 }
 
@@ -536,22 +545,36 @@ fn run_bench_gate(root: &Path, requested_modules: &[PathBuf]) -> Result<()> {
 	Ok(())
 }
 
-fn run_python_bench_gate(root: &Path, requested_modules: &[PathBuf]) -> Result<()> {
+fn run_python_bench_gate(
+	root: &Path,
+	requested_modules: &[PathBuf],
+	sync_tierup: bool,
+) -> Result<()> {
 	let scripts = bench_scripts(root, requested_modules)?;
 	if !suite::python314_available() {
 		bail!("python3.14 reference interpreter is not available")
 	}
 	let runner_binary = ensure_bench_runner(root, BenchRunnerProfile::Release)?;
 	let mut failures = Vec::new();
+	let pon_config = if sync_tierup {
+		BenchRunConfig::SYNC_TIER_UP
+	} else {
+		BenchRunConfig::DEFAULT_TIER_UP
+	};
+	let tierup_mode = if sync_tierup {
+		"sync tier-up with PON_SYNC_TIERUP=1"
+	} else {
+		"default async tier-up"
+	};
 
 	println!(
-		"Python comparison bench: {} kernel(s), pon tier-up with {SYNC_TIERUP_ENV}=1 vs python3.14",
+		"Python comparison bench: {} kernel(s), pon {tierup_mode} vs python3.14",
 		scripts.len()
 	);
 
 	for script in scripts {
 		let label = suite::display_path(root, &script);
-		let pon = measure_bench_variant(root, &runner_binary, &script, BenchRunConfig::SYNC_TIER_UP)
+		let pon = measure_bench_variant(root, &runner_binary, &script, pon_config)
 			.with_context(|| format!("failed to measure pon benchmark `{label}`"))?;
 		let python = measure_python_bench(root, &script)
 			.with_context(|| format!("failed to measure python3.14 benchmark `{label}`"))?;

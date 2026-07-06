@@ -336,7 +336,6 @@ pub(crate) fn ensure_pon(root: &Path) -> Result<PathBuf> {
 	Ok(binary)
 }
 
-
 pub(crate) fn target_dir(root: &Path) -> Result<PathBuf> {
 	let output = Command::new("cargo")
 		.arg("metadata")
