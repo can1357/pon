@@ -231,7 +231,15 @@ pub unsafe extern "C" fn builtin_format(argv: *mut *mut PyObject, argc: usize) -
 	}
 	let spec = unsafe { object_to_string(spec_object) }.unwrap_or_default();
 
-	if let Some(format_method) = unsafe { try_get_attr(args[0], "__format__") } {
+	// A `__format__` resolving to object's default carrier is "no user
+	// override": the carrier rejects every non-empty spec, while the native
+	// spec formatter below owns the builtin (str/int/float/complex) formats.
+	let format_method = unsafe { try_get_attr(args[0], "__format__") }.filter(|method| {
+		let function = crate::types::method::bound_method_parts(*method)
+			.map_or(*method, |(function, _receiver)| function);
+		function != abi::object_dunder_format_carrier()
+	});
+	if let Some(format_method) = format_method {
 		let mut call_args = [spec_object];
 		let result = unsafe { abi::pon_call(format_method, call_args.as_mut_ptr(), 1) };
 		if result.is_null() {

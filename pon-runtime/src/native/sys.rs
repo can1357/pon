@@ -968,11 +968,11 @@ unsafe extern "C" fn version_info_repr(argv: *mut *mut PyObject, argc: usize) ->
 //   `SHIFT`/`BASE`), and pon does not enforce the str-digit guards
 //   (`sys.set_int_max_str_digits` is unserved).
 // - `thread_info`: `name='pthread'` honestly describes pon threads (std::thread
-//   over pthreads on every POSIX pon target); `lock='mutex+cond'` is the host
-//   oracle's value and describes CPython's lock implementation, not pon's
-//   (documented divergence — `test.test_threadsignals` branches on exactly this
-//   pair at import); `version=None` matches the macOS oracle (no pthread
-//   version string).
+//   over pthreads on every POSIX pon target); `lock` and `version` mirror the
+//   host oracle — Darwin CPython reports `('mutex+cond', None)`, glibc CPython
+//   `('semaphore', 'NPTL x.y')` — and describe CPython's lock implementation,
+//   not pon's (documented divergence — `test.test_threadsignals` branches on
+//   exactly this pair at import).
 // ---------------------------------------------------------------------------
 
 /// One structseq family: class identity plus its named-field table.
@@ -1278,16 +1278,45 @@ unsafe extern "C" fn thread_info_repr(argv: *mut *mut PyObject, argc: usize) -> 
 fn thread_info_attr() -> Result<(u32, *mut PyObject), String> {
 	static THREAD_INFO: std::sync::LazyLock<Result<usize, String>> =
 		std::sync::LazyLock::new(|| {
-			build_structseq(&THREAD_INFO_SPEC, &[
-				SeqValue::Str("pthread"),
-				SeqValue::Str("mutex+cond"),
-				SeqValue::None,
-			])
-			.map(|object| object as usize)
+			#[cfg(target_os = "macos")]
+			let (lock, version) = (SeqValue::Str("mutex+cond"), SeqValue::None);
+			#[cfg(not(target_os = "macos"))]
+			let (lock, version) = (
+				SeqValue::Str("semaphore"),
+				glibc_pthread_version().map_or(SeqValue::None, SeqValue::Str),
+			);
+			build_structseq(&THREAD_INFO_SPEC, &[SeqValue::Str("pthread"), lock, version])
+				.map(|object| object as usize)
 		});
 	THREAD_INFO
 		.clone()
 		.map(|object| (intern("thread_info"), object as *mut PyObject))
+}
+
+/// glibc's pthread banner (e.g. "NPTL 2.39") via
+/// `confstr(_CS_GNU_LIBPTHREAD_VERSION)`, matching CPython's thread_info seed.
+#[cfg(not(target_os = "macos"))]
+fn glibc_pthread_version() -> Option<&'static str> {
+	static VERSION: std::sync::LazyLock<Option<String>> = std::sync::LazyLock::new(|| {
+		// SAFETY: A NULL buffer with length 0 only queries the needed size.
+		let size =
+			unsafe { libc::confstr(libc::_CS_GNU_LIBPTHREAD_VERSION, std::ptr::null_mut(), 0) };
+		if size == 0 {
+			return None;
+		}
+		let mut buffer = vec![0u8; size];
+		// SAFETY: The buffer spans `size` writable bytes.
+		let written = unsafe {
+			libc::confstr(libc::_CS_GNU_LIBPTHREAD_VERSION, buffer.as_mut_ptr().cast(), buffer.len())
+		};
+		if written == 0 {
+			return None;
+		}
+		// `written` counts the trailing NUL.
+		buffer.truncate(written.saturating_sub(1));
+		String::from_utf8(buffer).ok()
+	});
+	VERSION.as_deref()
 }
 
 // ---------------------------------------------------------------------------

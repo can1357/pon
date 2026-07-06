@@ -1290,6 +1290,7 @@ const POSIX_PRIVATE_CONSTANTS: &[(&str, i32)] = &[
 
 /// `os.py`-only constants.
 const OS_ONLY_CONSTANTS: &[(&str, i32)] = &[("P_NOWAIT", 1), ("P_NOWAITO", 1), ("P_WAIT", 0)];
+#[cfg(target_os = "macos")]
 const CONFSTR_NAMES: &[(&str, i32)] = &[
 	("CS_PATH", 1),
 	("CS_XBS5_ILP32_OFF32_CFLAGS", 20),
@@ -1308,6 +1309,38 @@ const CONFSTR_NAMES: &[(&str, i32)] = &[
 	("CS_XBS5_LPBIG_OFFBIG_LDFLAGS", 33),
 	("CS_XBS5_LPBIG_OFFBIG_LIBS", 34),
 	("CS_XBS5_LPBIG_OFFBIG_LINTFLAGS", 35),
+];
+
+#[cfg(not(target_os = "macos"))]
+const CONFSTR_NAMES: &[(&str, i32)] = &[
+	("CS_GNU_LIBC_VERSION", 2),
+	("CS_GNU_LIBPTHREAD_VERSION", 3),
+	("CS_LFS64_CFLAGS", 1004),
+	("CS_LFS64_LDFLAGS", 1005),
+	("CS_LFS64_LIBS", 1006),
+	("CS_LFS64_LINTFLAGS", 1007),
+	("CS_LFS_CFLAGS", 1000),
+	("CS_LFS_LDFLAGS", 1001),
+	("CS_LFS_LIBS", 1002),
+	("CS_LFS_LINTFLAGS", 1003),
+	("CS_PATH", 0),
+	("CS_V6_WIDTH_RESTRICTED_ENVS", 1),
+	("CS_XBS5_ILP32_OFF32_CFLAGS", 1100),
+	("CS_XBS5_ILP32_OFF32_LDFLAGS", 1101),
+	("CS_XBS5_ILP32_OFF32_LIBS", 1102),
+	("CS_XBS5_ILP32_OFF32_LINTFLAGS", 1103),
+	("CS_XBS5_ILP32_OFFBIG_CFLAGS", 1104),
+	("CS_XBS5_ILP32_OFFBIG_LDFLAGS", 1105),
+	("CS_XBS5_ILP32_OFFBIG_LIBS", 1106),
+	("CS_XBS5_ILP32_OFFBIG_LINTFLAGS", 1107),
+	("CS_XBS5_LP64_OFF64_CFLAGS", 1108),
+	("CS_XBS5_LP64_OFF64_LDFLAGS", 1109),
+	("CS_XBS5_LP64_OFF64_LIBS", 1110),
+	("CS_XBS5_LP64_OFF64_LINTFLAGS", 1111),
+	("CS_XBS5_LPBIG_OFFBIG_CFLAGS", 1112),
+	("CS_XBS5_LPBIG_OFFBIG_LDFLAGS", 1113),
+	("CS_XBS5_LPBIG_OFFBIG_LIBS", 1114),
+	("CS_XBS5_LPBIG_OFFBIG_LINTFLAGS", 1115),
 ];
 
 const PATHCONF_NAMES: &[(&str, i32)] = &[
@@ -5554,8 +5587,35 @@ unsafe extern "C" fn os_sysconf(argv: *mut *mut PyObject, argc: usize) -> *mut P
 	sysconf_result(unsafe { libc::sysconf(name as libc::c_int) })
 }
 
+/// CPython's `conv_confname`: the integer itself, or a string key of the
+/// module-level `*_names` map (`ValueError` on unknown names).
+fn confname_arg(
+	object: *mut PyObject,
+	names: &[(&str, i32)],
+) -> Result<libc::c_int, *mut PyObject> {
+	// Tagged immediates are integers; only heap objects can be str.
+	if !object.is_null() && !crate::tag::is_small_int(object) {
+		// SAFETY: Heap pointer with a live header after the tag check.
+		if let Some(text) = unsafe { crate::types::type_::unicode_text(object) } {
+			return names.iter().find(|(name, _)| *name == text).map(|&(_, value)| value).ok_or_else(
+				|| {
+					crate::abi::exc::raise_kind_error_text(
+						ExceptionKind::ValueError,
+						"unrecognized configuration name",
+					)
+				},
+			);
+		}
+	}
+	int_arg(object, "confstr").map(|value| value as libc::c_int)
+}
+
 unsafe extern "C" fn os_confstr(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
-	let name = match single_int_arg(argv, argc, "confstr") {
+	let args = unsafe { call_args(argv, argc) };
+	if args.len() != 1 {
+		return crate::abi::return_null_with_error("os.confstr expected one argument");
+	}
+	let name = match confname_arg(args[0], CONFSTR_NAMES) {
 		Ok(value) => value,
 		Err(error) => return error,
 	};

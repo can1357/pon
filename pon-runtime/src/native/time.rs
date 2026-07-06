@@ -1229,6 +1229,49 @@ fn render(format: &str, tm: &Tm, out: &mut String) {
 	}
 }
 
+/// Host `strftime(3)` on glibc targets: the reference CPython delegates to
+/// libc, so quirk-for-quirk parity (flag handling, unknown directives, year
+/// padding, `%Z`) comes from doing the same. `None` when the format or the
+/// year cannot round-trip into C types; the caller falls back to the
+/// portable renderer.
+#[cfg(not(target_os = "macos"))]
+fn host_strftime(format: &str, tm: &Tm, isdst: i64, zone: Option<&'static str>) -> Option<String> {
+	let c_format = std::ffi::CString::new(format).ok()?;
+	let tm_year = i32::try_from(tm.year - 1900).ok()?;
+	// SAFETY: Zeroed `tm` is a valid baseline; the used fields are set below.
+	let mut ctm: libc::tm = unsafe { std::mem::zeroed() };
+	ctm.tm_sec = tm.sec as libc::c_int;
+	ctm.tm_min = tm.min as libc::c_int;
+	ctm.tm_hour = tm.hour as libc::c_int;
+	ctm.tm_mday = tm.mday as libc::c_int;
+	ctm.tm_mon = tm.mon0 as libc::c_int;
+	ctm.tm_year = tm_year;
+	ctm.tm_wday = tm.c_wday as libc::c_int;
+	ctm.tm_yday = tm.yday0 as libc::c_int;
+	ctm.tm_isdst = isdst as libc::c_int;
+	ctm.tm_zone = zone.map_or(core::ptr::null(), |zone| zone.as_ptr().cast());
+	let mut capacity = 1024usize;
+	let limit = format.len().saturating_mul(256).max(1024);
+	loop {
+		let mut buffer = vec![0u8; capacity];
+		// SAFETY: The buffer spans `capacity` writable bytes; format and tm
+		// are live for the duration of the call.
+		let written = unsafe {
+			libc::strftime(buffer.as_mut_ptr().cast(), buffer.len(), c_format.as_ptr(), &ctm)
+		};
+		if written > 0 {
+			buffer.truncate(written);
+			return String::from_utf8(buffer).ok();
+		}
+		// CPython's growth loop: a buffer 256x the format length is not
+		// failing for lack of room; the output is genuinely empty.
+		if capacity >= limit {
+			return Some(String::new());
+		}
+		capacity *= 2;
+	}
+}
+
 /// `time.strftime(format[, t])`: C-locale formatting of a nine-field time
 /// tuple (default: the current time, which is UTC under the pinned
 /// environment), with CPython's exact argument errors.
@@ -1272,6 +1315,34 @@ unsafe extern "C" fn time_strftime(argv: *mut *mut PyObject, argc: usize) -> *mu
 		Ok(tm) => tm,
 		Err(raised) => return raised,
 	};
+	#[cfg(not(target_os = "macos"))]
+	{
+		if format.as_bytes().contains(&0) {
+			return crate::abi::exc::raise_kind_error_text(
+				crate::types::exc::ExceptionKind::ValueError,
+				"embedded null character",
+			);
+		}
+		// glibc's %Z prints `tm_zone` verbatim (empty when NULL): gmtime-
+		// derived struct_time carries "GMT" on glibc hosts, hand-built exact
+		// tuples carry NULL, and the no-argument default is the pinned UTC.
+		let zone: Option<&'static str> = if argc == 2 {
+			// SAFETY: Live argument slot; NULL was rejected while parsing.
+			let tuple = crate::tag::untag_arg(unsafe { *argv.add(1) });
+			// SAFETY: Heap pointer per the parse above.
+			if unsafe { crate::abi::seq::exact_tuple_slice(tuple) }.is_some() {
+				None
+			} else {
+				Some("GMT\0")
+			}
+		} else {
+			Some("UTC\0")
+		};
+		if let Some(text) = host_strftime(&format, &tm, fields[8], zone) {
+			// SAFETY: String allocation helper follows the NULL-sentinel contract.
+			return unsafe { pon_const_str(text.as_ptr(), text.len()) };
+		}
+	}
 	let mut text = String::with_capacity(format.len() * 2);
 	render(&format, &tm, &mut text);
 	// SAFETY: String allocation helper follows the NULL-sentinel contract.

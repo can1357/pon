@@ -518,7 +518,21 @@ func1!(
 func1!(math_asinh, "asinh", false, None, f64::asinh);
 func1!(math_atan, "atan", false, None, f64::atan);
 func1!(math_atanh, "atanh", false, Some("expected a number between -1 and 1, got %s"), f64::atanh);
+#[cfg(target_os = "macos")]
 func1!(math_cbrt, "cbrt", false, None, f64::cbrt);
+#[cfg(not(target_os = "macos"))]
+func1!(math_cbrt, "cbrt", false, None, host_cbrt);
+
+/// libm `cbrt(3)`: Rust's portable cube root drifts an ulp from glibc's,
+/// and the reference CPython calls libm.
+#[cfg(not(target_os = "macos"))]
+fn host_cbrt(x: f64) -> f64 {
+	unsafe extern "C" {
+		fn cbrt(x: f64) -> f64;
+	}
+	// SAFETY: Pure libm function.
+	unsafe { cbrt(x) }
+}
 func1!(math_cos, "cos", false, Some("expected a finite input, got %s"), f64::cos);
 func1!(math_cosh, "cosh", true, None, f64::cosh);
 func1!(math_exp, "exp", true, None, f64::exp);
