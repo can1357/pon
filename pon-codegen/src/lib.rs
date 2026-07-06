@@ -77,6 +77,10 @@ pub fn compile_ir_module<M: ClifModule>(
 			entry_arg_counts[index],
 			ctx,
 			fctx,
+			// AoT executables have no map-registration path yet; their
+			// frames stay on the conservative scan (see baseline::
+			// declare_gc_values).
+			mode == CompileMode::Jit,
 		)?;
 		module.define_function(func_ids[index], ctx)?;
 	}
@@ -117,6 +121,7 @@ pub fn compile_optimized_ir_module<M: ClifModule>(
 				entry_arg_counts[index],
 				ctx,
 				fctx,
+				mode == CompileMode::Jit,
 			)?,
 		}
 		module.define_function(func_ids[index], ctx)?;

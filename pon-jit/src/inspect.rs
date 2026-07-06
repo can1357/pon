@@ -113,6 +113,9 @@ fn lower_into(
 		counts[function_index],
 		&mut ctx,
 		&mut fctx,
+		// Match the executing tier-0 lowering so `pon.clif`/`pon.asm`
+		// render the code that actually runs (incl. safepoint spills).
+		true,
 	)
 	.map_err(render_error)?;
 	if !want_asm {

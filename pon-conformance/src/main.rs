@@ -432,8 +432,15 @@ fn usage() -> anyhow::Error {
 	)
 }
 
-const BENCH_KERNELS: &[&str] =
-	&["int_loop.py", "fib.py", "nbody.py", "comprehension.py", "generator.py"];
+const BENCH_KERNELS: &[&str] = &[
+	"int_loop.py",
+	"global_loop.py",
+	"attr_loop.py",
+	"fib.py",
+	"nbody.py",
+	"comprehension.py",
+	"generator.py",
+];
 const BENCH_SPEEDUP_RATCHETS: &[(&str, f64)] = &[
 	("int_loop.py", 5.0),
 	("fib.py", 1.0),
@@ -445,6 +452,7 @@ const BENCH_SPEEDUP_NOISE_ALLOWANCE: f64 = 0.05;
 const BENCH_WARMUP_REPS: usize = 1;
 const BENCH_TIMED_REPS: usize = 5;
 const TIER0_ONLY_ENV: &str = "PON_TIER0_ONLY";
+const SYNC_TIERUP_ENV: &str = "PON_SYNC_TIERUP";
 
 #[derive(Clone, Debug)]
 struct BenchMeasurement {
@@ -467,6 +475,18 @@ impl BenchRunnerProfile {
 	}
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BenchRunConfig {
+	tier0_only:  bool,
+	sync_tierup: bool,
+}
+
+impl BenchRunConfig {
+	const DEFAULT_TIER_UP: Self = Self { tier0_only: false, sync_tierup: false };
+	const SYNC_TIER_UP: Self = Self { tier0_only: false, sync_tierup: true };
+	const TIER0_ONLY: Self = Self { tier0_only: true, sync_tierup: false };
+}
+
 fn run_bench_gate(root: &Path, requested_modules: &[PathBuf]) -> Result<()> {
 	let scripts = bench_scripts(root, requested_modules)?;
 	let runner_binary = ensure_bench_runner(root, BenchRunnerProfile::Debug)?;
@@ -480,10 +500,11 @@ fn run_bench_gate(root: &Path, requested_modules: &[PathBuf]) -> Result<()> {
 
 	for script in scripts {
 		let label = suite::display_path(root, &script);
-		let tier0 = measure_bench_variant(root, &runner_binary, &script, true)
+		let tier0 = measure_bench_variant(root, &runner_binary, &script, BenchRunConfig::TIER0_ONLY)
 			.with_context(|| format!("failed to measure tier-0-only benchmark `{label}`"))?;
-		let tier1 = measure_bench_variant(root, &runner_binary, &script, false)
-			.with_context(|| format!("failed to measure tier-up benchmark `{label}`"))?;
+		let tier1 =
+			measure_bench_variant(root, &runner_binary, &script, BenchRunConfig::DEFAULT_TIER_UP)
+				.with_context(|| format!("failed to measure tier-up benchmark `{label}`"))?;
 
 		if tier0.output != tier1.output {
 			failures.push(format!(
@@ -523,11 +544,14 @@ fn run_python_bench_gate(root: &Path, requested_modules: &[PathBuf]) -> Result<(
 	let runner_binary = ensure_bench_runner(root, BenchRunnerProfile::Release)?;
 	let mut failures = Vec::new();
 
-	println!("Python comparison bench: {} kernel(s), pon tier-up vs python3.14", scripts.len());
+	println!(
+		"Python comparison bench: {} kernel(s), pon tier-up with {SYNC_TIERUP_ENV}=1 vs python3.14",
+		scripts.len()
+	);
 
 	for script in scripts {
 		let label = suite::display_path(root, &script);
-		let pon = measure_bench_variant(root, &runner_binary, &script, false)
+		let pon = measure_bench_variant(root, &runner_binary, &script, BenchRunConfig::SYNC_TIER_UP)
 			.with_context(|| format!("failed to measure pon benchmark `{label}`"))?;
 		let python = measure_python_bench(root, &script)
 			.with_context(|| format!("failed to measure python3.14 benchmark `{label}`"))?;
@@ -734,10 +758,14 @@ fn measure_bench_variant(
 	root: &Path,
 	runner_binary: &Path,
 	script: &Path,
-	tier0_only: bool,
+	config: BenchRunConfig,
 ) -> Result<BenchMeasurement> {
-	let variant = if tier0_only { "tier-0-only" } else { "tier-up" };
-	measure_bench(script, variant, || run_pon_bench(root, runner_binary, script, tier0_only))
+	let variant = if config.tier0_only {
+		"tier-0-only"
+	} else {
+		"tier-up"
+	};
+	measure_bench(script, variant, || run_pon_bench(root, runner_binary, script, config))
 }
 
 fn measure_python_bench(root: &Path, script: &Path) -> Result<BenchMeasurement> {
@@ -778,14 +806,19 @@ fn run_pon_bench(
 	root: &Path,
 	runner_binary: &Path,
 	script: &Path,
-	tier0_only: bool,
+	config: BenchRunConfig,
 ) -> Result<suite::RunResult> {
 	let mut command = Command::new(runner_binary);
 	command.arg(script).current_dir(root);
-	if tier0_only {
+	if config.tier0_only {
 		command.env(TIER0_ONLY_ENV, "1");
 	} else {
 		command.env_remove(TIER0_ONLY_ENV);
+	}
+	if config.sync_tierup {
+		command.env(SYNC_TIERUP_ENV, "1");
+	} else {
+		command.env_remove(SYNC_TIERUP_ENV);
 	}
 	suite::run_command(&mut command)
 }

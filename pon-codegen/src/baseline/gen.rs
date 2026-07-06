@@ -128,6 +128,7 @@ pub(crate) fn compile_generator_function<M: Module>(
 	entry_arg_count: usize,
 	ctx: &mut Context,
 	fctx: &mut FunctionBuilderContext,
+	stack_maps: bool,
 ) -> Result<(), CodegenError> {
 	let ptr_ty = module.target_config().pointer_type();
 
@@ -148,16 +149,18 @@ pub(crate) fn compile_generator_function<M: Module>(
 		ir_function,
 		&mut body_ctx,
 		fctx,
+		stack_maps,
 	)?;
 	module.define_function(body_id, &mut body_ctx)?;
 
 	// (2) Stub at the declared FuncId: `(argv, argc) -> obj`.
-	compile_generator_stub(module, helpers, ir_function, entry_arg_count, body_id, ctx, fctx)
+	compile_generator_stub(module, helpers, ir_function, entry_arg_count, body_id, ctx, fctx, stack_maps)
 }
 
 /// Build the call-time stub: allocate the frame, store bound arguments into
 /// their parameter slots, wrap frame + body address in a generator object
 /// (pin J0.1 §4.0 — no user code runs).
+#[allow(clippy::too_many_arguments)]
 fn compile_generator_stub<M: Module>(
 	module: &mut M,
 	helpers: &HelperRefs,
@@ -166,6 +169,7 @@ fn compile_generator_stub<M: Module>(
 	body_id: FuncId,
 	ctx: &mut Context,
 	fctx: &mut FunctionBuilderContext,
+	stack_maps: bool,
 ) -> Result<(), CodegenError> {
 	module.clear_context(ctx);
 	let ptr_ty = module.target_config().pointer_type();
@@ -239,7 +243,9 @@ fn compile_generator_stub<M: Module>(
 	let null = builder.ins().iconst(ptr_ty, 0);
 	builder.ins().return_(&[null]);
 	builder.seal_all_blocks();
-	super::declare_gc_values(&mut builder, ptr_ty);
+	if stack_maps {
+		super::declare_gc_values(&mut builder, ptr_ty);
+	}
 	builder.finalize();
 
 	Ok(())
@@ -256,6 +262,7 @@ fn compile_generator_body<M: Module>(
 	ir_function: &Function,
 	ctx: &mut Context,
 	fctx: &mut FunctionBuilderContext,
+	stack_maps: bool,
 ) -> Result<(), CodegenError> {
 	let ptr_ty = module.target_config().pointer_type();
 	let ptr_bytes = ptr_ty.bytes() as usize;
@@ -396,7 +403,9 @@ fn compile_generator_body<M: Module>(
 	let unwind_result = builder.func.dfg.inst_results(unwind_call)[0];
 	builder.ins().return_(&[unwind_result]);
 	builder.seal_all_blocks();
-	super::declare_gc_values(&mut builder, ptr_ty);
+	if stack_maps {
+		super::declare_gc_values(&mut builder, ptr_ty);
+	}
 	builder.finalize();
 
 	Ok(())

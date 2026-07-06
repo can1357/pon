@@ -11,7 +11,7 @@ use std::{
 	ffi::c_void,
 	ptr,
 	sync::{
-		Arc, Mutex,
+		Arc, LazyLock, Mutex,
 		atomic::{AtomicBool, AtomicPtr, Ordering},
 		mpsc,
 	},
@@ -52,6 +52,10 @@ pub const CALL_THRESHOLD: u32 = TIER1_CALL_THRESHOLD;
 pub const LOOP_THRESHOLD: u32 = TIER1_LOOP_THRESHOLD;
 
 static ACTIVE_DRIVER: AtomicPtr<TierUpDriver> = AtomicPtr::new(ptr::null_mut());
+static SYNC_TIERUP: LazyLock<bool> = LazyLock::new(|| match std::env::var_os("PON_SYNC_TIERUP") {
+	Some(value) => !value.as_os_str().is_empty(),
+	None => false,
+});
 
 /// Process-local owner for tier-up metadata and installed tier-1 modules.
 pub struct TierUpDriver {
@@ -192,11 +196,12 @@ impl TierUpDriver {
 		crate::inspect::register_functions(&ir, inspect_entries);
 	}
 
-	/// Synchronous compile+install used only by tier-up unit tests; the
-	/// production path goes through `enqueue` and the background worker.
-	#[cfg(test)]
-	unsafe fn compile_and_install(&self, function: *mut PyFunction) {
-		let Some(request) = (unsafe { self.prepare_request(function, CompileReason::Call) }) else {
+	/// Compile and install a queued function on the current thread.
+	///
+	/// Request preparation, pinning, state transitions, and retirement all flow
+	/// through the same processor used by the background compiler.
+	unsafe fn compile_and_install(&self, function: *mut PyFunction, reason: CompileReason) {
+		let Some(request) = (unsafe { self.prepare_request(function, reason) }) else {
 			return;
 		};
 		process_request(&self.shared, &self.pins, &self.shutting_down, request);
@@ -320,7 +325,13 @@ unsafe extern "C" fn tierup_hook(function: *mut PyFunction, reason: u32) {
 	}
 
 	let reason = decode_reason(reason);
-	unsafe { (*driver).enqueue(function, reason) };
+	unsafe {
+		if *SYNC_TIERUP {
+			(*driver).compile_and_install(function, reason);
+		} else {
+			(*driver).enqueue(function, reason);
+		}
+	};
 }
 
 unsafe extern "C" fn tierup_pin_roots(visit: TierUpRootVisit, ctx: *mut c_void) {
@@ -508,6 +519,9 @@ fn compile_tier1_module(
 				entry_arg_counts[index],
 				&mut ctx,
 				&mut fctx,
+				// Tier-1 modules never register safepoint maps; keep their
+				// baseline companions on the conservative scan path.
+				false,
 			)?;
 		}
 		module.define_function(func_ids[index], &mut ctx)?;
@@ -760,7 +774,7 @@ impl SendPtr {
 	}
 }
 
-/// Why a function was submitted to the background compiler.
+/// Why a function was submitted for tier-1 compilation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(dead_code, reason = "J0.5 pin: consumed by O1 in a later wave")]
 pub enum CompileReason {
@@ -777,10 +791,10 @@ pub enum CompileReason {
 #[allow(dead_code, reason = "J0.5 pin: consumed by O1 in a later wave")]
 pub struct IrSnapshotId(pub u32);
 
-/// One unit of work for the background compiler thread.
+/// One unit of tier-1 compilation work.
 ///
-/// Everything the compiler needs is captured on the enqueuing (mutator) thread:
-/// the feedback snapshot is taken at enqueue time so the compiler never reads
+/// Everything the compiler needs is captured on the submitting thread: the
+/// feedback snapshot is taken before compilation so the compiler never reads
 /// the function's live `FeedbackVec` cells concurrently with mutator writes.
 #[allow(dead_code, reason = "J0.5 pin: consumed by O1 in a later wave")]
 pub struct CompileRequest {
@@ -894,7 +908,7 @@ mod tests {
 			.store(TIER_STATE_QUEUED, Ordering::Release);
 		function.hotness.store(CALL_THRESHOLD, Ordering::Release);
 
-		unsafe { driver.compile_and_install(&mut function) };
+		unsafe { driver.compile_and_install(&mut function, CompileReason::Call) };
 
 		assert_eq!(
 			inferred_type(&driver.shared.lock().expect("test tier-up mutex").modules[0].ir, Value(7)),
@@ -929,6 +943,44 @@ mod tests {
 	}
 
 	#[test]
+	fn synchronous_compile_preserves_loop_backedge_reason_for_osr() {
+		let tier0_entry = 1_usize as *const u8;
+		let driver = TierUpDriver::new();
+		{
+			let mut shared = driver.shared.lock().expect("test tier-up mutex");
+			shared
+				.modules
+				.push(RegisteredModule { ir: Arc::new(arithmetic_range_loop_module()) });
+			shared.functions.push(RegisteredFunction {
+				tier0_entry,
+				module_index: 0,
+				function_index: 0,
+				feedback_len: 0,
+			});
+		}
+
+		let mut function = PyFunction::new(std::ptr::null(), tier0_entry, 0, 0);
+		function
+			.tier_state
+			.store(TIER_STATE_QUEUED, Ordering::Release);
+
+		unsafe {
+			driver.compile_and_install(&mut function, CompileReason::LoopBackEdge(BlockId(1)));
+		};
+
+		assert_eq!(function.tier_state.load(Ordering::Acquire), TIER_STATE_TIER1);
+		assert_eq!(
+			function.osr_loop_header.load(Ordering::Relaxed),
+			1,
+			"synchronous tier-up should retain the decoded loop-backedge header"
+		);
+		assert!(
+			!function.osr_entry.load(Ordering::Acquire).is_null(),
+			"loop-backedge tier-up should publish an OSR entry"
+		);
+	}
+
+	#[test]
 	fn failed_tier_up_disables_future_queue_attempts() {
 		let tier0_entry = 1_usize as *const u8;
 		let unknown_entry = 2_usize as *const u8;
@@ -954,7 +1006,7 @@ mod tests {
 			.tier_state
 			.store(TIER_STATE_QUEUED, Ordering::Release);
 
-		unsafe { driver.compile_and_install(&mut function) };
+		unsafe { driver.compile_and_install(&mut function, CompileReason::Call) };
 
 		assert_eq!(
 			function.tier_state.load(Ordering::Acquire),

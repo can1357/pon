@@ -418,6 +418,7 @@ pub fn compile_function<M: Module>(
 	entry_arg_count: usize,
 	ctx: &mut Context,
 	fctx: &mut FunctionBuilderContext,
+	stack_maps: bool,
 ) -> Result<(), CodegenError> {
 	if ir.is_generator {
 		// Pin J0.1 two-function scheme: allocation stub at the declared
@@ -432,6 +433,7 @@ pub fn compile_function<M: Module>(
 			entry_arg_count,
 			ctx,
 			fctx,
+			stack_maps,
 		);
 	}
 	module.clear_context(ctx);
@@ -514,7 +516,9 @@ pub fn compile_function<M: Module>(
 	let null = builder.ins().iconst(ptr_ty, 0);
 	builder.ins().return_(&[null]);
 	builder.seal_all_blocks();
-	declare_gc_values(&mut builder, ptr_ty);
+	if stack_maps {
+		declare_gc_values(&mut builder, ptr_ty);
+	}
 	builder.finalize();
 
 	Ok(())
@@ -613,7 +617,8 @@ pub fn compile_osr_function<M: Module>(
 	let null = builder.ins().iconst(ptr_ty, 0);
 	builder.ins().return_(&[null]);
 	builder.seal_all_blocks();
-	declare_gc_values(&mut builder, ptr_ty);
+	// OSR entries are never map-registered (tier-up owns their lifetime);
+	// their frames stay on the conservative scan path.
 	builder.finalize();
 	Ok(())
 }
@@ -2304,7 +2309,7 @@ mod tests {
 	use cranelift_module::{Linkage, Module};
 	use pon_ir::ir::{
 		BinOp, Block, BlockId, CellId, FunctionId, Inst, LocalId, Module as IrModule, NameId,
-		Terminator, UnOp, Value,
+		PyConst, Terminator, UnOp, Value,
 	};
 	use pon_runtime::abi::HELPERS;
 
@@ -2380,6 +2385,7 @@ mod tests {
 				entry_arg_counts[index],
 				&mut ctx,
 				&mut fctx,
+				false,
 			)
 			.expect("function compiles");
 
@@ -2434,8 +2440,84 @@ mod tests {
 			entry_arg_counts[0],
 			&mut ctx,
 			&mut fctx,
+			false,
 		)
 		.expect_err("unsupported IR returns typed error")
+	}
+
+	fn const_int_ir(value: i64) -> IrModule {
+		IrModule {
+			functions: vec![Function {
+				name:               "literal".to_owned(),
+				arity:              0,
+				is_coroutine:       false,
+				is_generator:       false,
+				is_async_generator: false,
+				params:             Default::default(),
+				n_locals:           0,
+				blocks:             vec![Block {
+					id:    BlockId(0),
+					insts: vec![Inst::new(Value(0), InstKind::Const(PyConst::Int(value)))],
+					term:  Terminator::Return(Value(0)),
+				}],
+			}],
+			main:      FunctionId(0),
+			names:     vec![],
+		}
+	}
+
+	fn helper_func_ref(clif: &str, symbol: &str) -> String {
+		let helper_id = clif
+			.lines()
+			.take_while(|line| !line.starts_with("function "))
+			.position(|line| line == symbol)
+			.unwrap_or_else(|| panic!("missing helper symbol {symbol} in CLIF:\n{clif}"));
+		clif
+			.lines()
+			.find_map(|line| {
+				let line = line.trim();
+				let rest = line.strip_prefix("fn")?;
+				let (number, tail) = rest.split_once(" = ")?;
+				tail
+					.starts_with(&format!("u0:{helper_id} "))
+					.then(|| format!("fn{number}"))
+			})
+			.unwrap_or_else(|| panic!("missing function reference for {symbol} in CLIF:\n{clif}"))
+	}
+
+	fn helper_call_count(clif: &str, symbol: &str) -> usize {
+		let func_ref = helper_func_ref(clif, symbol);
+		clif
+			.lines()
+			.filter(|line| {
+				let line = line.trim_start();
+				line.starts_with(&format!("call {func_ref}("))
+					|| line.contains(&format!(" = call {func_ref}("))
+			})
+			.count()
+	}
+
+	#[test]
+	fn small_int_literal_clif_materializes_tagged_pointer_without_const_int_call() {
+		let clif = compiled_clif(&const_int_ir(42), 0);
+		let tagged_bits = ((42_i64 as u64) << 1) | pon_runtime::tag::TAG_INT_BIT as u64;
+
+		assert!(
+			clif.contains(&format!("iconst.i64 {}", tagged_bits as i64)),
+			"small int literal should materialize its tagged pointer bits:\n{clif}",
+		);
+		assert_eq!(
+			helper_call_count(&clif, "pon_const_int"),
+			0,
+			"small int literal should not call pon_const_int:\n{clif}",
+		);
+
+		let boxed_clif = compiled_clif(&const_int_ir(pon_runtime::tag::SMALL_INT_MAX + 1), 0);
+		assert_eq!(
+			helper_call_count(&boxed_clif, "pon_const_int"),
+			1,
+			"out-of-range i64 literal should still lower through pon_const_int:\n{boxed_clif}",
+		);
 	}
 
 	fn binary_ir(op: BinOp) -> IrModule {

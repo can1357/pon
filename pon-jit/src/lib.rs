@@ -155,6 +155,7 @@ impl JitEngine {
 				entry_arg_counts[index],
 				&mut self.ctx,
 				&mut self.fctx,
+				true,
 			)?;
 			self
 				.module

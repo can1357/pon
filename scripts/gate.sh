@@ -24,9 +24,10 @@ run() {
 run build   cargo build --workspace -q
 run test    cargo test --workspace -q
 run floor   cargo run -q -p pon-conformance -- --suite cpython --check-floor
-run aot     cargo run -q -p pon-conformance -- --mode aot --suite cpython-aot-subset --check-floor
+run aotparity cargo run -q -p pon-conformance -- --mode aot --suite aot-parity --check-floor
 
 if [ "$MODE" = "full" ]; then
+  run fullsuite cargo run -q -p pon-conformance -- --suite cpython-full --check-floor
   run ft       cargo test --workspace --features free-threading -q
   run ftstress cargo run -q -p pon-conformance --features free-threading -- --suite ft-stress
   run bench    cargo run -q -p pon-conformance -- --bench

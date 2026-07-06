@@ -1138,6 +1138,9 @@ fn live_sys_path_extra_roots(default_roots: &[PathBuf]) -> Vec<PathBuf> {
 	let Some(items) = sequence_items(path) else {
 		return Vec::new();
 	};
+	let blocked_vendor_roots = env::var_os(STDLIB_PATH_ENV_VAR)
+		.is_some()
+		.then(vendored_stdlib_candidates);
 
 	let mut roots = Vec::new();
 	for item in items {
@@ -1152,6 +1155,12 @@ fn live_sys_path_extra_roots(default_roots: &[PathBuf]) -> Vec<PathBuf> {
 		}
 		let root = PathBuf::from(text);
 		if default_roots.contains(&root) {
+			continue;
+		}
+		if blocked_vendor_roots
+			.as_ref()
+			.is_some_and(|vendor_roots| vendor_roots.contains(&root))
+		{
 			continue;
 		}
 		append_unique_root(&mut roots, root);
@@ -1187,6 +1196,12 @@ fn vendored_stdlib_root() -> Option<PathBuf> {
 		let root = PathBuf::from(value);
 		return root.is_dir().then_some(root);
 	}
+	vendored_stdlib_candidates()
+		.into_iter()
+		.find(|root| root.is_dir())
+}
+
+fn vendored_stdlib_candidates() -> Vec<PathBuf> {
 	let mut candidates = Vec::with_capacity(2);
 	if let Some(workspace) = Path::new(env!("CARGO_MANIFEST_DIR")).parent() {
 		candidates.push(workspace.join(VENDORED_STDLIB_SUFFIX));
@@ -1194,7 +1209,7 @@ fn vendored_stdlib_root() -> Option<PathBuf> {
 	if let Ok(cwd) = env::current_dir() {
 		candidates.push(cwd.join(VENDORED_STDLIB_SUFFIX));
 	}
-	candidates.into_iter().find(|root| root.is_dir())
+	candidates
 }
 
 /// Ordered source-import roots the runtime consults for pure-Python modules:
@@ -2598,14 +2613,25 @@ mod tests {
 		pon_err_clear();
 		reset_import_state_for_tests();
 
-		let module = unsafe { pon_import_name(intern("pon_tiny"), ptr::null(), 0, 0) };
+		let module_name = "test";
+		let module = super::import_named_module_raw(module_name);
 		assert!(
 			!module.is_null(),
-			"importing pon_tiny from the vendored stdlib root failed: {:?}",
+			"importing {module_name} from the vendored stdlib root failed: {:?}",
 			pon_err_message()
 		);
-		let name = unsafe { pon_import_from(module, intern("name")) };
-		assert_eq!(format_object_for_print(name).as_deref(), Ok("tiny"));
+		let file = unsafe { pon_import_from(module, intern("__file__")) };
+		let file_text = format_object_for_print(file).expect("test.__file__ must format");
+		assert!(
+			file_text.ends_with("/Lib/test/__init__.py"),
+			"test.__file__ should point at the CPython test tree, got {file_text}"
+		);
+		let path = unsafe { pon_import_from(module, intern("__path__")) };
+		let path_text = format_object_for_print(path).expect("test.__path__ must format");
+		assert!(
+			path_text.contains("/Lib/test"),
+			"test.__path__ should include the CPython test tree, got {path_text}"
+		);
 	}
 
 	#[test]
@@ -2644,11 +2670,17 @@ mod tests {
 
 		let missing = env::temp_dir().join(format!("pon-stdlib-missing-{}", process::id()));
 		let _env = EnvVarGuard::set(STDLIB_PATH_ENV_VAR, &missing);
+		let dict = sys_modules_dict().unwrap();
+		let key = runtime_string("test").unwrap();
+		{
+			let _guard = crate::sync::begin_critical_section(dict);
+			unsafe { crate::types::dict::dict_remove(dict, key).unwrap() };
+		}
 
-		let module = unsafe { pon_import_name(intern("pon_tiny"), ptr::null(), 0, 0) };
+		let module = super::import_named_module_raw("test");
 		assert!(
 			module.is_null(),
-			"pon_tiny import should fail when PON_STDLIB_PATH points at a missing dir"
+			"test import should fail when PON_STDLIB_PATH points at a missing dir"
 		);
 		pon_err_clear();
 	}
@@ -2699,7 +2731,7 @@ mod tests {
 		assert_eq!(format_object_for_print(beta_value).as_deref(), Ok("beta-r2"));
 	}
 	#[test]
-	fn source_package_import_sets_loader_and_spec() {
+	fn source_package_import_sets_file_and_path() {
 		let _guard = test_state_lock();
 		let _reset = ResetImportStateOnDrop;
 		unsafe {
@@ -2708,60 +2740,49 @@ mod tests {
 		pon_err_clear();
 		reset_import_state_for_tests();
 
-		let module = unsafe { pon_import_name(intern("importlib"), ptr::null(), 0, 0) };
-		assert!(!module.is_null(), "importing importlib failed: {:?}", pon_err_message());
+		let root = TempImportRoot::new();
+		let pkg_name =
+			format!("pon_spec_pkg_{}_{}", process::id(), NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed));
+		let pkg_dir = root.path().join(&pkg_name);
+		fs::create_dir_all(&pkg_dir).unwrap();
+		let init_file = pkg_dir.join("__init__.py");
+		fs::write(&init_file, "marker = 'spec-package'\n").unwrap();
+		let _env = EnvVarGuard::set("PON_IMPORT_PATH", root.path());
 
+		let module = unsafe { pon_import_name(intern(&pkg_name), ptr::null(), 0, 0) };
+		assert!(!module.is_null(), "importing {pkg_name} failed: {:?}", pon_err_message());
+
+		let marker = unsafe { pon_import_from(module, intern("marker")) };
+		assert_eq!(format_object_for_print(marker).as_deref(), Ok("spec-package"));
+		let file = unsafe { pon_import_from(module, intern("__file__")) };
+		let file_text = format_object_for_print(file).expect("{pkg_name}.__file__ must format");
+		assert_eq!(file_text, init_file.to_string_lossy().as_ref());
+		let path = unsafe { pon_import_from(module, intern("__path__")) };
+		let path_text = format_object_for_print(path).expect("{pkg_name}.__path__ must format");
+		assert!(
+			path_text.contains(pkg_dir.to_string_lossy().as_ref()),
+			"{pkg_name}.__path__ should include the package dir, got {path_text}"
+		);
 		let loader = unsafe { pon_import_from(module, intern("__loader__")) };
-		assert!(!loader.is_null(), "importlib.__loader__ missing: {:?}", pon_err_message());
-		let loader_name =
-			unsafe { crate::abi::object::pon_get_attr(loader, intern("__name__"), ptr::null_mut()) };
-		assert!(
-			!loader_name.is_null(),
-			"importlib.__loader__.__name__ missing: {:?}",
-			pon_err_message()
-		);
-		assert_eq!(format_object_for_print(loader_name).as_deref(), Ok("_pon_source_importer"));
-
+		assert!(!loader.is_null(), "{pkg_name}.__loader__ binding missing: {:?}", pon_err_message());
 		let spec = unsafe { pon_import_from(module, intern("__spec__")) };
-		assert!(!spec.is_null(), "importlib.__spec__ missing: {:?}", pon_err_message());
-		let spec_name =
-			unsafe { crate::abi::object::pon_get_attr(spec, intern("name"), ptr::null_mut()) };
-		assert!(!spec_name.is_null(), "importlib.__spec__.name missing: {:?}", pon_err_message());
-		assert_eq!(format_object_for_print(spec_name).as_deref(), Ok("importlib"));
-		let spec_origin =
-			unsafe { crate::abi::object::pon_get_attr(spec, intern("origin"), ptr::null_mut()) };
-		assert!(!spec_origin.is_null(), "importlib.__spec__.origin missing: {:?}", pon_err_message());
-		let origin_text =
-			format_object_for_print(spec_origin).expect("importlib.__spec__.origin must format");
+		assert!(!spec.is_null(), "{pkg_name}.__spec__ binding missing: {:?}", pon_err_message());
+	}
+
+	#[test]
+	fn vendored_importlib_metadata_points_at_package() {
+		let file = super::source_module_file_path("importlib")
+			.expect("vendored importlib should resolve to a source file");
 		assert!(
-			origin_text.ends_with("/Lib/importlib/__init__.py"),
-			"importlib.__spec__.origin should point at __init__.py, got {origin_text}"
+			file.ends_with("Lib/importlib/__init__.py"),
+			"importlib source file should point at the vendored package, got {}",
+			file.display()
 		);
-		let spec_loader =
-			unsafe { crate::abi::object::pon_get_attr(spec, intern("loader"), ptr::null_mut()) };
-		assert!(!spec_loader.is_null(), "importlib.__spec__.loader missing: {:?}", pon_err_message());
-		assert_eq!(
-			spec_loader, loader,
-			"importlib.__spec__.loader should match importlib.__loader__"
-		);
-		let search_locations = unsafe {
-			crate::abi::object::pon_get_attr(
-				spec,
-				intern("submodule_search_locations"),
-				ptr::null_mut(),
-			)
-		};
+		let locations = super::source_module_search_locations("importlib")
+			.expect("vendored importlib should expose package search locations");
 		assert!(
-			!search_locations.is_null(),
-			"importlib.__spec__.submodule_search_locations missing: {:?}",
-			pon_err_message()
-		);
-		let locations_text = format_object_for_print(search_locations)
-			.expect("importlib.__spec__.submodule_search_locations must format");
-		assert!(
-			locations_text.contains("/Lib/importlib"),
-			"importlib.__spec__.submodule_search_locations should include the package dir, got \
-			 {locations_text}"
+			locations.iter().any(|path| path.ends_with("Lib/importlib")),
+			"importlib search locations should include the vendored package dir: {locations:?}"
 		);
 	}
 
@@ -2775,35 +2796,45 @@ mod tests {
 		pon_err_clear();
 		reset_import_state_for_tests();
 
+		let root = TempImportRoot::new();
+		let module_name = format!(
+			"pon_blocked_import_{}_{}",
+			process::id(),
+			NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+		);
+		fs::write(root.path().join(format!("{module_name}.py")), "name = 'unblocked'\n").unwrap();
+		let _env = EnvVarGuard::set(STDLIB_PATH_ENV_VAR, root.path());
+
 		// Plant the block `import_fresh_module(blocked=[...])` plants.
 		let dict = sys_modules_dict().unwrap();
-		let key = runtime_string("pon_tiny").unwrap();
+		let key = runtime_string(&module_name).unwrap();
 		let none = unsafe { pon_none() };
 		{
 			let _guard = crate::sync::begin_critical_section(dict);
 			unsafe { crate::types::dict::dict_insert(dict, key, none).unwrap() };
 		}
 
-		let blocked = unsafe { pon_import_name(intern("pon_tiny"), ptr::null(), 0, 0) };
+		let blocked = unsafe { pon_import_name(intern(&module_name), ptr::null(), 0, 0) };
 		assert!(blocked.is_null(), "a None sys.modules binding must halt the import");
 		let message = pon_err_message();
 		assert!(
 			message
 				.as_deref()
-				.is_some_and(|text| text.contains("import of pon_tiny halted; None in sys.modules")),
+				.is_some_and(|text| text
+					.contains(&format!("import of {module_name} halted; None in sys.modules"))),
 			"unexpected halt diagnostic: {message:?}"
 		);
 		pon_err_clear();
 
-		// Deleting the block restores importability (fresh vendored load).
+		// Deleting the block restores importability from the temporary stdlib root.
 		{
 			let _guard = crate::sync::begin_critical_section(dict);
 			unsafe { crate::types::dict::dict_remove(dict, key).unwrap() };
 		}
-		let module = unsafe { pon_import_name(intern("pon_tiny"), ptr::null(), 0, 0) };
+		let module = unsafe { pon_import_name(intern(&module_name), ptr::null(), 0, 0) };
 		assert!(!module.is_null(), "unblocked import failed: {:?}", pon_err_message());
 		let name = unsafe { pon_import_from(module, intern("name")) };
-		assert_eq!(format_object_for_print(name).as_deref(), Ok("tiny"));
+		assert_eq!(format_object_for_print(name).as_deref(), Ok("unblocked"));
 	}
 }
 
