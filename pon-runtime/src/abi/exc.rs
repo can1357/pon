@@ -1366,9 +1366,6 @@ pub unsafe extern "C" fn pon_raise_attribute_error(obj: *mut PyObject, name: u32
 	crate::untag_prelude!(obj);
 	super::catch_object_helper(|| {
 		let attribute = intern::resolve(name).unwrap_or_else(|| format!("<intern:{name}>"));
-		if name == crate::intern::intern("type") {
-			eprintln!("[pon-diag] raise attr type on {:p}\n{}", obj, std::backtrace::Backtrace::force_capture());
-		}
 		let object_name = unsafe { safe_object_type_name(obj) };
 		let text = format!("'{object_name}' object has no attribute '{attribute}'");
 		match ensure_runtime_for_exc() {

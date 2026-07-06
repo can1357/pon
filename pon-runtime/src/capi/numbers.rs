@@ -259,13 +259,6 @@ unsafe extern "C" fn capi_long_as_long(object: *mut PyObject) -> c_long {
 	match bigint_to_c_long(&value) {
 		Some(value) => value,
 		None => {
-			eprintln!(
-				"[pon-diag] PyLong_AsLong overflow object {:p} type {} capi_instance {} value {}",
-				object,
-				unsafe { crate::types::dict::type_name(object) }.unwrap_or("object"),
-				crate::capi::typeobj::is_capi_instance(object.cast()),
-				value
-			);
 			raise_overflow("Python int too large to convert to C long");
 			-1
 		},

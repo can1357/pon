@@ -985,29 +985,7 @@ fn hash_object_non_numeric(object: *mut PyObject) -> Result<isize, String> {
             None => object as usize as isize,
         },
         Some(_) => object as usize as isize,
-        None => {
-            // TEMP diagnostic: identify the null-typed object crossing the boundary.
-            unsafe {
-                let words = core::slice::from_raw_parts(object.cast::<usize>(), 8);
-                let as_str = |w: usize| -> String {
-                    if w > 0x1000 {
-                        let p = w as *const core::ffi::c_char;
-                        core::ffi::CStr::from_ptr(p).to_string_lossy().chars().take(48).collect()
-                    } else {
-                        String::new()
-                    }
-                };
-                eprintln!("[pon-diag] null-type object at {:p}: words {:x?}", object, words);
-                for (i, &w) in words.iter().enumerate() {
-                    let text = as_str(w);
-                    if text.chars().take(4).all(|c| c.is_ascii_graphic()) && text.len() > 3 {
-                        eprintln!("[pon-diag]   word[{i}] -> {text:?}");
-                    }
-                }
-            }
-            eprintln!("[pon-diag] backtrace:\n{}", std::backtrace::Backtrace::force_capture());
-            return Err("object has null type".to_owned());
-        }
+        None => return Err("object has null type".to_owned()),
     };
     Ok(hash)
 }
@@ -1034,7 +1012,7 @@ unsafe fn static_type_name(ty: *const PyType) -> &'static str {
     unsafe { core::mem::transmute::<&str, &'static str>((*ty).name()) }
 }
 
-unsafe fn native_type_name_if_plausible(ty: *const PyType) -> Option<&'static str> {
+pub(crate) unsafe fn native_type_name_if_plausible(ty: *const PyType) -> Option<&'static str> {
     let type_ref = unsafe { &*ty };
     if type_ref.name.is_null() || type_ref.name_len == 0 || type_ref.name_len > 256 {
         return None;

@@ -856,17 +856,6 @@ unsafe extern "C" fn capi_set_attr_string(
 			// interned name.
 			unsafe { abi::pon_set_attr(object, name, value) }
 		};
-		if status < 0 {
-			// TEMP diagnostic for numpy bring-up.
-			let ty = unsafe { crate::types::dict::type_name(object) }.unwrap_or("<untyped>");
-			let attr = crate::intern::resolve(name).unwrap_or_default();
-			eprintln!(
-				"[pon-diag] capi setattr failed: type '{}' attr '{}' err {:?}",
-				ty,
-				attr,
-				crate::thread_state::pon_err_message()
-			);
-		}
 		status
 	})
 }

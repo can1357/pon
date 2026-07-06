@@ -1182,23 +1182,6 @@ pub unsafe fn generic_get_attr_cached(
 		crate::thread_state::pon_err_clear();
 		return unsafe { abi::pon_none() };
 	}
-	if name_id == intern::intern("type") {
-		let dict_has = if let Some(dict) = unsafe { dict_from_ptr((*obj_ty).tp_dict) } {
-			dict.get(name_id).is_some()
-		} else {
-			false
-		};
-		eprintln!(
-			"[pon-diag] missing type attr: object {:p} obj_ty {:p} name {} capi {} dict {:p} dict_has {} known {}",
-			object,
-			obj_ty,
-			unsafe { (*obj_ty).name() },
-			unsafe { crate::capi::is_capi_class(obj_ty) },
-			unsafe { (*obj_ty).tp_dict },
-			dict_has,
-			crate::sync::namespaced_types().contains(&obj_ty),
-		);
-	}
 	unsafe { abi::pon_raise_attribute_error(object, name_id) }
 }
 

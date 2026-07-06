@@ -243,12 +243,6 @@ fn tuple_slice(object: *mut PyObject) -> Option<&'static [*mut PyObject]> {
 	unsafe { abi::seq::tuple_storage_slice(object) }
 }
 
-/// TEMP diagnostic for numpy bring-up: identify non-tuple operands.
-fn tuple_expected_diag(object: *mut PyObject) {
-	let ty_name = unsafe { crate::types::dict::type_name(object) }.unwrap_or("<null-or-untyped>");
-	eprintln!("[pon-diag] expected tuple, got {:p} type '{}'", object, ty_name);
-	eprintln!("[pon-diag] backtrace:\n{}", std::backtrace::Backtrace::force_capture());
-}
 
 fn exact_tuple_mut(object: *mut PyObject) -> Option<&'static mut tuple::PyTuple> {
 	if object.is_null() || !crate::tag::is_heap(object) {
@@ -405,7 +399,6 @@ unsafe extern "C" fn capi_tuple_size(tuple: *mut PyObject) -> isize {
 	catch_size(|| {
 		let tuple = crate::tag::untag_arg(tuple);
 		let Some(items) = tuple_slice(tuple) else {
-			tuple_expected_diag(tuple);
 			let _ = type_error("expected tuple object");
 			return -1;
 		};
@@ -417,7 +410,6 @@ unsafe extern "C" fn capi_tuple_get_item(tuple: *mut PyObject, index: isize) -> 
 	catch_borrowed_object(|| {
 		let tuple = crate::tag::untag_arg(tuple);
 		let Some(items) = tuple_slice(tuple) else {
-			tuple_expected_diag(tuple);
 			return type_error("expected tuple object");
 		};
 		let index = match checked_index(index, items.len(), "tuple") {
@@ -436,7 +428,7 @@ unsafe extern "C" fn capi_tuple_set_item(
 	catch_status(|| {
 		let tuple = crate::tag::untag_arg(tuple);
 		let original_item = item;
-		let item = crate::tag::untag_arg(normalize_object_arg(item));
+		let item = crate::tag::untag_arg(item);
 		if item.is_null() {
 			return status_type_error("tuple item must not be NULL");
 		}
@@ -469,7 +461,7 @@ unsafe extern "C" fn capi_tuple_pack(items: *mut *mut PyObject, size: isize) -> 
 		}
 		let mut values = Vec::with_capacity(size);
 		for index in 0..size {
-			let value = crate::tag::untag_arg(normalize_object_arg(unsafe { *items.add(index) }));
+			let value = crate::tag::untag_arg(unsafe { *items.add(index) });
 			if value.is_null() {
 				return type_error("tuple item must not be NULL");
 			}
@@ -487,7 +479,6 @@ unsafe extern "C" fn capi_tuple_get_slice(
 	catch_object(|| {
 		let tuple = crate::tag::untag_arg(tuple);
 		let Some(items) = tuple_slice(tuple) else {
-			tuple_expected_diag(tuple);
 			return type_error("expected tuple object");
 		};
 		let len = items.len() as isize;
