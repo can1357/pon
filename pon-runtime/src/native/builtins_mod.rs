@@ -1983,6 +1983,10 @@ unsafe fn mapping_keys_attr(source: *mut PyObject) -> Result<Option<*mut PyObjec
 	// Slotless native receivers (int, float, ...) cannot carry `keys` at all;
 	// skipping the probe lets the pairs leg report CPython's "'int' object is
 	// not iterable" instead of the slotless attribute-lookup diagnostic.
+	// Tagged small-int immediates carry no dereferenceable header at all.
+	if !crate::tag::is_heap(source) {
+		return Ok(None);
+	}
 	let ty = unsafe { (*source).ob_type };
 	if ty.is_null() || unsafe { (*ty).tp_getattro }.is_none() {
 		return Ok(None);
