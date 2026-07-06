@@ -1,8 +1,8 @@
 //! Native `_lsprof` compatibility surface.
 //!
-//! Pon records completed `PyFunction` call spans through the compiled-call stack
-//! hooks in `abi::CurrentFunctionGuard`, using monotonic runtime timing.  The
-//! `Profiler` object is stateful (`enable`, `disable`, `clear`) and
+//! Pon records completed `PyFunction` call spans through the compiled-call
+//! stack hooks in `abi::CurrentFunctionGuard`, using monotonic runtime timing.
+//! The `Profiler` object is stateful (`enable`, `disable`, `clear`) and
 //! `getstats()` returns cProfile-compatible entry objects with `code`, call
 //! counts, timings, and subcall lists.
 //!
@@ -30,7 +30,6 @@ struct PyProfilerEntry {
 	inline_seconds: f64,
 	calls:          *mut PyObject,
 }
-
 
 pub(super) fn make_module() -> Result<*mut PyObject, String> {
 	let name = "_lsprof";
@@ -179,8 +178,8 @@ unsafe extern "C" fn profiler_init(argv: *mut *mut PyObject, argc: usize) -> *mu
 		if !is_none_object(timeunit) {
 			return raise(
 				ExceptionKind::NotImplementedError,
-				"_lsprof.Profiler timeunit is only meaningful with a custom timer, which pon does \
-				 not implement",
+				"_lsprof.Profiler timeunit is only meaningful with a custom timer, which pon does not \
+				 implement",
 			);
 		}
 	}
@@ -465,7 +464,6 @@ unsafe extern "C" fn profiler_entry_getattro(
 		_ => unsafe { crate::abi::exc::pon_raise_attribute_error(object, intern(name_text)) },
 	}
 }
-
 
 unsafe fn method_args<'a>(
 	argv: *mut *mut PyObject,
