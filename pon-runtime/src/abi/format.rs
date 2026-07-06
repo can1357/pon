@@ -1212,6 +1212,9 @@ fn object_to_str(value: *mut PyObject) -> Result<String, String> {
 	if value.is_null() {
 		return Err("cannot format NULL object".to_owned());
 	}
+	if crate::tag::is_small_int(value) {
+		return Ok(crate::tag::untag_small_int(value).to_string());
+	}
 	let ty = unsafe { (*value).ob_type };
 	if bytes_type::is_bytes_type(ty) || bytearray_type::is_bytearray_type(ty) {
 		return object_to_repr(value);
@@ -1222,6 +1225,9 @@ fn object_to_str(value: *mut PyObject) -> Result<String, String> {
 fn object_to_repr(value: *mut PyObject) -> Result<String, String> {
 	if value.is_null() {
 		return Err("cannot repr NULL object".to_owned());
+	}
+	if crate::tag::is_small_int(value) {
+		return Ok(crate::tag::untag_small_int(value).to_string());
 	}
 	let ty = unsafe { (*value).ob_type };
 	if bytes_type::is_bytes_type(ty) {
@@ -1254,6 +1260,9 @@ fn object_to_repr(value: *mut PyObject) -> Result<String, String> {
 fn type_name(value: *mut PyObject) -> String {
 	if value.is_null() {
 		return "NULL".to_owned();
+	}
+	if crate::tag::is_small_int(value) {
+		return "int".to_owned();
 	}
 	unsafe {
 		let ty = (*value).ob_type;

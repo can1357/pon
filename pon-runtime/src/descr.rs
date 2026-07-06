@@ -75,6 +75,11 @@ unsafe fn object_type_display(object: *mut PyObject) -> String {
 	if object.is_null() {
 		return "NULL".to_owned();
 	}
+	// Tagged immediates carry no dereferenceable type ([`object_type`]
+	// reports NULL by contract) but must still name `int` in diagnostics.
+	if crate::tag::is_small_int(object) {
+		return "int".to_owned();
+	}
 	let ty = unsafe { object_type(object) };
 	if ty.is_null() {
 		"object".to_owned()

@@ -653,12 +653,20 @@ pub unsafe fn unicode_text<'a>(object: *mut PyObject) -> Option<&'a str> {
 	unsafe { unicode_text(value) }
 }
 
-/// Type of `object`, or NULL when `object` is NULL or a tagged immediate
-/// (immediates carry no dereferenceable type; callers route NULL through
-/// their existing error/fallthrough paths).
+/// Type of `object`: the canonical `int` type for tagged small-int
+/// immediates (CPython: `type(3) is int`), or NULL when `object` is NULL or
+/// a reserved immediate (callers route NULL through their existing
+/// error/fallthrough paths).
 unsafe fn object_type(object: *mut PyObject) -> *mut PyType {
-	if object.is_null() || !crate::tag::is_heap(object) {
+	if object.is_null() {
 		return ptr::null_mut();
+	}
+	if !crate::tag::is_heap(object) {
+		return if crate::tag::is_small_int(object) {
+			abi::runtime_long_type()
+		} else {
+			ptr::null_mut()
+		};
 	}
 	let ty = unsafe { (*object).ob_type.cast_mut() };
 	crate::capi::twin::registered_native_of_foreign(ty.cast()).unwrap_or(ty)

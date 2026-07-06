@@ -396,7 +396,7 @@ pub unsafe fn type_is_dict_subclass(ty: *mut PyType) -> bool {
 /// Returns whether `object` is a dict-subclass heap instance.
 #[must_use]
 pub unsafe fn is_dict_subclass_instance(object: *mut PyObject) -> bool {
-	if object.is_null() {
+	if object.is_null() || !crate::tag::is_heap(object) {
 		return false;
 	}
 	unsafe { type_is_dict_subclass((*object).ob_type.cast_mut()) }
