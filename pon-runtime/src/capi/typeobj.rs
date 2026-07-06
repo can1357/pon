@@ -4006,8 +4006,10 @@ static PyType_Spec FromSpec_spec = {
     FromSpec_slots,
 };
 
+/* Py_tp_vectorcall remains unsupported by PyType_FromSpec (async slots are
+ * accepted since the Cython coroutine bring-up). */
 static PyType_Slot Bad_slots[] = {
-    {Py_am_await, Bad_await},
+    {Py_tp_vectorcall, Bad_await},
     {0, NULL},
 };
 
