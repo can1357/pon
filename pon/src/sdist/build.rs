@@ -534,7 +534,13 @@ fn python_string_literal(value: &str) -> String {
 }
 
 fn classify_hook_error(backend: &str, error: impl std::fmt::Display) -> Error {
-	let message = format!("{error:#}");
+	let mut message = format!("{error:#}");
+	if let Some(runtime_message) = pon_runtime::pon_err_message() {
+		if !message.contains(&runtime_message) {
+			message = format!("{message}: {runtime_message}");
+		}
+		pon_runtime::thread_state::pon_err_clear();
+	}
 	if is_import_failure_message(&message) {
 		Error::UnsupportedArtifact(format!(
 			"unsupported PEP 517 build backend `{backend}`: backend import failed under pon: \

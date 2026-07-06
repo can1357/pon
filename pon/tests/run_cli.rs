@@ -46,10 +46,13 @@ fn run_serves_sysconfig_build_time_config() {
 	let fixture_path = fixture_dir.path().join("sysconfig_probe.py");
 	fs::write(
 		&fixture_path,
-		"import sysconfig\ncflags = \
-		 sysconfig.get_config_var('CFLAGS')\nprint(type(cflags).__name__)\nprint(repr(cflags))\\
-		 nprint(repr(sysconfig.get_config_var('Py_GIL_DISABLED')))\nprint(repr(sysconfig.get_config_var('\
-		 no_such_var_probe')))\n",
+		r#"import sysconfig
+cflags = sysconfig.get_config_var('CFLAGS')
+print(type(cflags).__name__)
+print(repr(cflags))
+print(repr(sysconfig.get_config_var('Py_GIL_DISABLED')))
+print(repr(sysconfig.get_config_var('no_such_var_probe')))
+"#,
 	)
 	.expect("write sysconfig_probe.py fixture");
 

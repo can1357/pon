@@ -846,6 +846,10 @@ mod tests {
 			.join(crate::suite::CPYTHON_VENDOR_DIR)
 			.join("Lib")
 			.join("test");
+		if !test_root.is_dir() {
+			eprintln!("skipping CPython-full discovery test; `{}` is not present", test_root.display());
+			return;
+		}
 		let units = discover_units(&test_root).expect("vendored tree discoverable");
 
 		assert!(units.len() > 700, "expected the full vendored suite, found {}", units.len());

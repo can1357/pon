@@ -26,7 +26,18 @@ pub fn link_executable(
 	command.args(objects).arg(runtime_a).arg("-o").arg(out);
 
 	if triple.binary_format == BinaryFormat::Elf {
-		command.args(["-lpthread", "-ldl", "-lm"]);
+		command.args(["-lpthread", "-ldl", "-lm", "-lpanel", "-lncurses", "-llzma"]);
+	} else if triple.binary_format == BinaryFormat::Macho {
+		command.args([
+			"-lpanel",
+			"-lncurses",
+			"-liconv",
+			"-llzma",
+			"-framework",
+			"SystemConfiguration",
+			"-framework",
+			"CoreFoundation",
+		]);
 	}
 
 	let rendered = render_command(&cc, objects, runtime_a, out, triple);
@@ -108,7 +119,25 @@ fn render_command(
 	parts.extend(objects.iter().map(|obj| obj.display().to_string()));
 	parts.extend([runtime_a.display().to_string(), "-o".to_owned(), out.display().to_string()]);
 	if triple.binary_format == BinaryFormat::Elf {
-		parts.extend(["-lpthread".to_owned(), "-ldl".to_owned(), "-lm".to_owned()]);
+		parts.extend([
+			"-lpthread".to_owned(),
+			"-ldl".to_owned(),
+			"-lm".to_owned(),
+			"-lpanel".to_owned(),
+			"-lncurses".to_owned(),
+			"-llzma".to_owned(),
+		]);
+	} else if triple.binary_format == BinaryFormat::Macho {
+		parts.extend([
+			"-lpanel".to_owned(),
+			"-lncurses".to_owned(),
+			"-liconv".to_owned(),
+			"-llzma".to_owned(),
+			"-framework".to_owned(),
+			"SystemConfiguration".to_owned(),
+			"-framework".to_owned(),
+			"CoreFoundation".to_owned(),
+		]);
 	}
 	parts.join(" ")
 }
