@@ -84,6 +84,79 @@ print(repr(sysconfig.get_config_var('no_such_var_probe')))
 	assert_eq!(lines[3], "None");
 }
 
+#[test]
+fn run_exposes_pon_debug_module() {
+	let fixture_dir = TempDir::new("pon-run-debug-module");
+	let fixture_path = fixture_dir.path().join("debug_module.py");
+	fs::write(
+		&fixture_path,
+		r#"import pon
+
+def add(a, b):
+    total = a + b
+    return total
+
+class Accumulator:
+    def method(self, value):
+        total = value + 1
+        return total
+
+ir = pon.ir(add)
+clif = pon.clif(add)
+asm = pon.asm(add)
+print("IR_OK", "add(a, b)" in ir and "block0:" in ir and "BinaryOp" in ir and "return v" in ir)
+print("CLIF_OK", "function u0:" in clif)
+print("ASM_OK", len(asm) > 0 and "block0:" in asm)
+
+method_ir = pon.ir(Accumulator().method)
+print("METHOD_IR_OK", "method(self, value)" in method_ir and "BinaryOp" in method_ir)
+
+try:
+    pon.ir(1)
+except TypeError as exc:
+    print("TYPE_ERROR_OK", "expected a Python function, got int" in str(exc))
+else:
+    print("TYPE_ERROR_OK", False)
+
+try:
+    pon.asm(len)
+except ValueError as exc:
+    print("VALUE_ERROR_OK", "was not compiled by the pon JIT" in str(exc))
+else:
+    print("VALUE_ERROR_OK", False)
+"#,
+	)
+	.expect("write debug_module.py fixture");
+
+	let output = Command::new(env!("CARGO_BIN_EXE_pon"))
+		.arg("run")
+		.arg(&fixture_path)
+		.output()
+		.expect("run pon binary");
+
+	assert!(
+		output.status.success(),
+		"debug module probe should exit successfully; status={:?}, stderr={}",
+		output.status.code(),
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(output.stderr.as_slice(), b"");
+	let stdout = String::from_utf8_lossy(&output.stdout);
+	let lines = stdout.lines().collect::<Vec<_>>();
+	assert_eq!(
+		lines.as_slice(),
+		&[
+			"IR_OK True",
+			"CLIF_OK True",
+			"ASM_OK True",
+			"METHOD_IR_OK True",
+			"TYPE_ERROR_OK True",
+			"VALUE_ERROR_OK True",
+		],
+		"unexpected debug module output: {stdout}"
+	);
+}
+
 struct TempDir {
 	path: PathBuf,
 }
