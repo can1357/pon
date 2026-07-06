@@ -612,11 +612,10 @@ pub unsafe fn unicode_text<'a>(object: *mut PyObject) -> Option<&'a str> {
     if object.is_null() || !crate::tag::is_heap(object) {
         return None;
     }
-    let ty = unsafe { (*object).ob_type };
-    if ty.is_null() {
-        return None;
-    }
-    if unsafe { (*ty).name() } == "str" {
+    // Foreign-safe type identification: C-extension instances (numpy dtype
+    // objects, ...) carry raw `PyTypeObject` headers that must never be read
+    // through the pon `PyType` layout.
+    if unsafe { crate::types::dict::type_name(object) }? == "str" {
         return unsafe { (*object.cast::<PyUnicode>()).as_str() };
     }
     let value = unsafe { payload_subclass_value(object) }?;

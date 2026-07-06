@@ -1766,14 +1766,10 @@ unsafe fn class_is_subclass(cls: *mut PyObject, classinfo: *mut PyObject) -> c_i
 
 /// True for objects whose metatype inherits from the builtin `type`.
 unsafe fn is_real_class(object: *mut PyObject) -> bool {
-	if object.is_null() {
+	let Some(meta) = (unsafe { native_object_type(object) }) else {
 		return false;
-	}
-	let meta = crate::capi::twin::registered_native_of_foreign(
-		unsafe { (*object).ob_type.cast_mut().cast::<crate::capi::twin::ForeignTypeObject>() },
-	)
-	.unwrap_or_else(|| unsafe { (*object).ob_type.cast_mut() });
-	!meta.is_null() && unsafe { crate::mro::is_subtype(meta, abi::runtime_type_type()) }
+	};
+	unsafe { crate::mro::is_subtype(meta, abi::runtime_type_type()) }
 }
 
 pub unsafe extern "C" fn builtin_int(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
@@ -2312,12 +2308,11 @@ fn dispatch_text_slot(
 	if object.is_null() || !crate::tag::is_heap(object) {
 		return None;
 	}
-	// SAFETY: `object` is a heap pointer per the tag check above.
-	let ty = unsafe { (*object).ob_type };
-	if ty.is_null() {
-		return None;
-	}
-	// SAFETY: non-NULL `ob_type` references a live type object.
+	// Twin-normalized, plausibility-guarded type: foreign C headers (numpy
+	// dtype instances, ...) must never have slots read at pon offsets; their
+	// registered native twins carry the bridged tp_repr/tp_str.
+	let ty = unsafe { native_object_type(object) }?;
+	// SAFETY: `native_object_type` returned a live native type object.
 	let slot = pick(unsafe { &*ty })?;
 	// SAFETY: `slot` is a live slot function registered by the receiver's type.
 	let result = unsafe { slot(object) };
@@ -2651,7 +2646,7 @@ fn object_to_f64(object: *mut PyObject) -> Option<f64> {
 }
 
 fn object_to_string(object: *mut PyObject) -> Option<String> {
-	if object.is_null() {
+	if object.is_null() || !crate::tag::is_heap(object) {
 		return None;
 	}
 	unsafe {
@@ -2663,6 +2658,12 @@ fn object_to_string(object: *mut PyObject) -> Option<String> {
 		// (e.g. cython's EncodedString returned from __str__/__repr__ hooks).
 		if let Some(text) = crate::types::type_::unicode_text(object) {
 			return Some(text.to_owned());
+		}
+		// C-extension instances carry foreign `PyTypeObject` headers with no
+		// pon exception layout; leave them to the tp_str/tp_repr slot
+		// dispatch stage instead of walking their bases as pon types.
+		if crate::capi::twin::registered_native_of_foreign(ty.cast_mut().cast()).is_some() {
+			return None;
 		}
 		exception_message_text(object, ty)
 	}
@@ -2767,15 +2768,11 @@ unsafe fn os_error_str(args: *mut PyObject) -> Option<String> {
 	})
 }
 
+/// Whitelisted builtin-shim type name of `object`; `None` for anything else.
+/// Reads through the foreign-safe `dict::type_name` so C-extension instances
+/// never get their raw headers read as pon `PyType`.
 unsafe fn type_name(object: *mut PyObject) -> Option<&'static str> {
-	if object.is_null() {
-		return None;
-	}
-	let ty = unsafe { (*object).ob_type };
-	if ty.is_null() {
-		return None;
-	}
-	let name = unsafe { (*ty).name() };
+	let name = unsafe { crate::types::dict::type_name(object) }?;
 	Some(match name {
 		"int" => "int",
 		"bool" => "bool",
@@ -3339,15 +3336,13 @@ unsafe fn object_is_instance(object: *mut PyObject, classinfo: *mut PyObject) ->
 	if let Some(expected_name) =
 		unsafe { type_object_name(classinfo) }.filter(|name| is_builtin_class_name(name))
 	{
-		let object_type = unsafe { (*object).ob_type };
-		if object_type.is_null() {
+		let Some(object_type) = (unsafe { native_object_type(object) }) else {
 			return 0;
-		}
-		let matches_exact = unsafe {
-			(*object_type).name() == expected_name
-				|| ((*object_type).name() == "bool" && expected_name == "int")
 		};
-		if matches_exact {
+		let object_type_name = unsafe { (*object_type).name() };
+		if object_type_name == expected_name
+			|| (object_type_name == "bool" && expected_name == "int")
+		{
 			return 1;
 		}
 		// Builtin-name classinfo with a subclass receiver: accept when any
@@ -3355,7 +3350,7 @@ unsafe fn object_is_instance(object: *mut PyObject, classinfo: *mut PyObject) ->
 		// for `class D(dict)`), excluding heap types so a user class merely
 		// NAMED like a builtin does not qualify.
 		return i32::from(
-			unsafe { crate::mro::mro_entries(object_type.cast_mut()) }
+			unsafe { crate::mro::mro_entries(object_type) }
 				.iter()
 				.any(|ancestor| {
 					!ancestor.is_null()
@@ -3367,20 +3362,15 @@ unsafe fn object_is_instance(object: *mut PyObject, classinfo: *mut PyObject) ->
 				}),
 		);
 	}
-	let classinfo_type = unsafe { (*classinfo).ob_type.cast_mut() };
-	if !classinfo_type.is_null()
-		&& unsafe { crate::mro::is_subtype(classinfo_type, abi::runtime_type_type()) }
-	{
-		return unsafe { crate::descr::isinstance(object, classinfo) };
-	}
-	let object_type = unsafe { (*object).ob_type };
-	if object_type.is_null() {
-		return 0;
+	if let Some(classinfo_type) = unsafe { native_object_type(classinfo) } {
+		if unsafe { crate::mro::is_subtype(classinfo_type, abi::runtime_type_type()) } {
+			return unsafe { crate::descr::isinstance(object, classinfo) };
+		}
 	}
 	let Some(expected_name) = (unsafe { type_object_name(classinfo) }) else {
 		return 0;
 	};
-	i32::from(unsafe { (*object_type).name() == expected_name })
+	i32::from(unsafe { crate::types::dict::type_name(object) } == Some(expected_name.as_str()))
 }
 
 /// Elements of an exact seq-family `PyTuple` (isinstance classinfo,
@@ -3389,15 +3379,41 @@ unsafe fn exact_tuple_entries<'a>(object: *mut PyObject) -> Option<&'a [*mut PyO
 	unsafe { abi::seq::exact_tuple_slice(object) }
 }
 
+/// Twin-normalized pon `PyType` of `object`'s type: the native twin for
+/// registered foreign faces, the raw header type when it already looks like
+/// a native type, `None` for unregistered foreign C headers (whose layout
+/// must never be read as pon `PyType`).
+unsafe fn native_object_type(object: *mut PyObject) -> Option<*mut PyType> {
+	if object.is_null() || !crate::tag::is_heap(object) {
+		return None;
+	}
+	let ty = unsafe { (*object).ob_type.cast_mut() };
+	if ty.is_null() {
+		return None;
+	}
+	if let Some(native) = crate::capi::twin::registered_native_of_foreign(ty.cast()) {
+		return Some(native);
+	}
+	unsafe { crate::types::dict::native_type_name_if_plausible(ty) }.map(|_| ty)
+}
+
 unsafe fn type_object_name(object: *mut PyObject) -> Option<String> {
 	if object.is_null() {
 		return None;
 	}
-	let ty = unsafe { (*object).ob_type };
-	if !ty.is_null() && unsafe { (*ty).name() } == "type" {
-		return Some(unsafe { (*object.cast::<PyType>()).name() }.to_owned());
+	// Registered foreign classes (C extension types) read through their
+	// native twin — never through the pon `PyType` layout.
+	if let Some(native) = crate::capi::twin::registered_native_of_foreign(object.cast()) {
+		return Some(unsafe { (*native).name() }.to_owned());
 	}
-	if !ty.is_null() && unsafe { (*ty).name() } == "function" {
+	let ty = unsafe { native_object_type(object) }?;
+	let meta_name = unsafe { (*ty).name() };
+	if meta_name == "type" {
+		let class = object.cast::<PyType>();
+		return unsafe { crate::types::dict::native_type_name_if_plausible(class) }
+			.map(ToOwned::to_owned);
+	}
+	if meta_name == "function" {
 		let name = resolve(unsafe { (*object.cast::<PyFunction>()).name_interned })?;
 		if matches!(
 			name.as_str(),

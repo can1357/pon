@@ -2599,6 +2599,10 @@ unsafe extern "C" fn getset_descr_get(
 	if instance.is_null() {
 		return descriptor;
 	}
+	// Twin contract, inbound-to-C leg: a registered native TYPE receiver
+	// (e.g. a numpy DTypeMeta class read through its twin) must cross into
+	// C as its foreign face — the getter reads C struct fields off `self`.
+	let instance = super::foreignize_type_result(instance);
 	let Some(get) = (unsafe {
 		slot::<unsafe extern "C" fn(*mut PyObject, *mut c_void) -> *mut PyObject>(descr.get)
 	}) else {
@@ -2615,6 +2619,7 @@ unsafe extern "C" fn getset_descr_set(
 ) -> c_int {
 	// SAFETY: dispatched only for PyGetSetDescr values.
 	let descr = unsafe { &*descriptor.cast::<PyGetSetDescr>() };
+	let instance = super::foreignize_type_result(instance);
 	let Some(set) = (unsafe {
 		slot::<unsafe extern "C" fn(*mut PyObject, *mut PyObject, *mut c_void) -> c_int>(descr.set)
 	}) else {
@@ -2728,6 +2733,9 @@ unsafe extern "C" fn member_descr_get(
 	if instance.is_null() {
 		return descriptor;
 	}
+	// Twin contract: type receivers cross as their foreign face — the
+	// declared offset indexes the extension's own C struct layout.
+	let instance = super::foreignize_type_result(instance);
 	// SAFETY: the member offset was declared by the extension against its
 	// own instance layout; `instance` is one of its instances.
 	let field = unsafe { instance.cast::<u8>().offset(descr.offset) };
@@ -2833,6 +2841,7 @@ unsafe extern "C" fn member_descr_set(
 		raise_type_error("member assignment needs an instance");
 		return -1;
 	}
+	let instance = super::foreignize_type_result(instance);
 	// SAFETY: extension-declared offset into one of its instances.
 	let field = unsafe { instance.cast::<u8>().offset(descr.offset) };
 	unsafe { write_member(field, descr, value) }
