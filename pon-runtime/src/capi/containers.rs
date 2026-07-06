@@ -243,7 +243,6 @@ fn tuple_slice(object: *mut PyObject) -> Option<&'static [*mut PyObject]> {
 	unsafe { abi::seq::tuple_storage_slice(object) }
 }
 
-
 fn exact_tuple_mut(object: *mut PyObject) -> Option<&'static mut tuple::PyTuple> {
 	if object.is_null() || !crate::tag::is_heap(object) {
 		return None;

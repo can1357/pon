@@ -20,11 +20,9 @@ pub unsafe extern "C" fn pon_load_builtin(name_interned: u32) -> *mut PyObject {
 		if let Err(message) = super::ensure_runtime_initialized() {
 			return super::return_null_with_error(message);
 		}
-		super::resolve_global_binding(name_interned)
-			.unwrap_or_else(|| {
-				let name =
-					resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
-				super::exc::raise_name_error_text(&format!("name '{name}' is not defined"))
-			})
+		super::resolve_global_binding(name_interned).unwrap_or_else(|| {
+			let name = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
+			super::exc::raise_name_error_text(&format!("name '{name}' is not defined"))
+		})
 	})
 }

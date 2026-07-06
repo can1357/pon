@@ -398,8 +398,7 @@ fn attach_current_traceback(runtime: &Runtime, exception: *mut PyObject) {
 			.map(|call| {
 				// SAFETY: Stack entries hold live function objects for the call's duration.
 				let name = unsafe { (*call.function).name_interned };
-				let module =
-					crate::types::function::function_module(call.function.cast::<PyObject>());
+				let module = crate::types::function::function_module(call.function.cast::<PyObject>());
 				(module, Some(name))
 			})
 			.collect();
@@ -2578,12 +2577,24 @@ mod tests {
 		}
 	}
 
+	unsafe extern "C" fn test_stack_fn(_argv: *mut *mut PyObject, _argc: usize) -> *mut PyObject {
+		ptr::null_mut()
+	}
+
 	#[test]
 	fn raising_snapshots_one_entry_per_active_python_call() {
 		let _guard = test_state_lock();
 		unsafe {
 			reset_exception_state();
-			let function = core::ptr::NonNull::<crate::object::PyFunction>::dangling().as_ptr();
+			// A live function object: traceback capture reads its interned
+			// name and module at raise time.
+			let function = crate::abi::pon_make_function(
+				test_stack_fn as *const u8,
+				crate::builtins::variadic_arity(),
+				crate::intern::intern("test_stack_fn"),
+			)
+			.cast::<crate::object::PyFunction>();
+			assert!(!function.is_null());
 			super::super::set_current_line(2);
 			let outer = super::super::push_current_call(function, ptr::null_mut(), 0);
 			super::super::set_current_line(4);

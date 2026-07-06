@@ -462,11 +462,10 @@ fn twin_flags(native: *mut PyType, tid: Option<usize>, type_type: *mut PyType) -
 		None if native == type_type => TPFLAGS_TYPE_SUBCLASS,
 		_ => 0,
 	};
-	let unsubclassable =
-		matches!(
-			tid,
-			Some(TID_BOOL | TID_NONE_TYPE | TID_SLICE | TID_MEMORYVIEW | TID_CAPSULE | TID_RANGE)
-		);
+	let unsubclassable = matches!(
+		tid,
+		Some(TID_BOOL | TID_NONE_TYPE | TID_SLICE | TID_MEMORYVIEW | TID_CAPSULE | TID_RANGE)
+	);
 	if !unsubclassable {
 		flags |= TPFLAGS_BASETYPE;
 	}

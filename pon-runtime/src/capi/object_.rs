@@ -476,8 +476,10 @@ unsafe fn vectorcall_through_pon(
 		Err(error) => return error,
 	};
 	if let Some(vectorcall) = unsafe { vectorcall_function_for(callable) } {
-		let mut c_args: Vec<*mut PyObject> =
-			positional.into_iter().map(super::foreignize_type_result).collect();
+		let mut c_args: Vec<*mut PyObject> = positional
+			.into_iter()
+			.map(super::foreignize_type_result)
+			.collect();
 		if !names.is_empty() {
 			let kw_values = match unsafe { normalize_vectorcall_slice(args, nargs, names.len()) } {
 				Ok(values) => values,
@@ -536,8 +538,10 @@ unsafe fn vectorcall_through_pon_dict(
 		Err(error) => return error,
 	};
 	if let Some(vectorcall) = unsafe { vectorcall_function_for(callable) } {
-		let mut c_args: Vec<*mut PyObject> =
-			positional.into_iter().map(super::foreignize_type_result).collect();
+		let mut c_args: Vec<*mut PyObject> = positional
+			.into_iter()
+			.map(super::foreignize_type_result)
+			.collect();
 		let kwnames = match unsafe { dict_keywords_for_vectorcall(kwargs, &mut c_args) } {
 			Ok(kwnames) => kwnames,
 			Err(error) => return error,
@@ -1016,8 +1020,10 @@ pub(crate) unsafe extern "C" fn capi_vectorcall_call(
 			Err(error) => return error,
 		};
 		if let Some(vectorcall) = unsafe { vectorcall_function_for(callable) } {
-			let mut c_args: Vec<*mut PyObject> =
-				positional.into_iter().map(super::foreignize_type_result).collect();
+			let mut c_args: Vec<*mut PyObject> = positional
+				.into_iter()
+				.map(super::foreignize_type_result)
+				.collect();
 			let positional_count = c_args.len();
 			let kwnames = match unsafe { dict_keywords_for_vectorcall(kwargs, &mut c_args) } {
 				Ok(kwnames) => kwnames,

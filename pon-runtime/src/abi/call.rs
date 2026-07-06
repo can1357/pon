@@ -224,11 +224,11 @@ pub unsafe extern "C" fn pon_call_ex(
 			let ty = unsafe { super::runtime_object_type(callee) };
 			if !ty.is_null() {
 				if let Some(call) = unsafe { (*ty).tp_call } {
-					let args_tuple =
-						match unsafe { function::build_tuple_from_slice(&flat_positional) } {
-							Ok(tuple) => tuple,
-							Err(message) => return return_null_with_error(message),
-						};
+					let args_tuple = match unsafe { function::build_tuple_from_slice(&flat_positional) }
+					{
+						Ok(tuple) => tuple,
+						Err(message) => return return_null_with_error(message),
+					};
 					let pairs: Vec<(u32, *mut PyObject)> = flat_names
 						.iter()
 						.copied()

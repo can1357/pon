@@ -281,7 +281,7 @@ pub(crate) struct PyPonCapiTypeObj {
 		*mut PyTypeSpec,
 		*mut PyObject,
 	) -> *mut PyObject,
-	generic_alias: unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
+	generic_alias:             unsafe extern "C" fn(*mut PyObject, *mut PyObject) -> *mut PyObject,
 }
 
 unsafe impl Send for PyPonCapiTypeObj {}
@@ -619,8 +619,7 @@ pub(crate) unsafe extern "C" fn capi_type_ready(foreign: *mut ForeignTypeObject)
 			ty.tp_hash = Some(hash);
 		}
 		if let Some(call) = slot(foreign_ref.tp_call) {
-			ty.tp_call = if foreign_ref.tp_vectorcall_offset > 0
-			{
+			ty.tp_call = if foreign_ref.tp_vectorcall_offset > 0 {
 				Some(crate::capi::object_::capi_vectorcall_call)
 			} else {
 				Some(call)
@@ -958,11 +957,7 @@ unsafe fn apply_type_spec_slots(
 			PY_AM_AITER => unsafe { ensure_fromspec_async_table(foreign).am_aiter = field },
 			PY_AM_ANEXT => unsafe { ensure_fromspec_async_table(foreign).am_anext = field },
 			PY_AM_SEND => unsafe { ensure_fromspec_async_table(foreign).am_send = field },
-			PY_TP_DEL
-			| PY_TP_GETATTR
-			| PY_TP_IS_GC
-			| PY_TP_SETATTR
-			| PY_TP_VECTORCALL
+			PY_TP_DEL | PY_TP_GETATTR | PY_TP_IS_GC | PY_TP_SETATTR | PY_TP_VECTORCALL
 			| PY_TP_TOKEN => {
 				raise_type_error(format!(
 					"PyType_FromSpec: slot id {} is not supported yet for {type_name}",
@@ -1258,10 +1253,9 @@ pub(crate) unsafe extern "C" fn capi_float_face_new(
 	kwargs: *mut PyObject,
 ) -> *mut PyObject {
 	if !kwargs.is_null() {
-		let non_empty = unsafe {
-			crate::types::dict::dict_entries_snapshot(crate::tag::untag_arg(kwargs))
-		}
-		.is_ok_and(|entries| !entries.is_empty());
+		let non_empty =
+			unsafe { crate::types::dict::dict_entries_snapshot(crate::tag::untag_arg(kwargs)) }
+				.is_ok_and(|entries| !entries.is_empty());
 		if non_empty {
 			raise_type_error("float() takes no keyword arguments");
 			return ptr::null_mut();
@@ -1272,10 +1266,7 @@ pub(crate) unsafe extern "C" fn capi_float_face_new(
 		Err(message) => return abi::return_null_with_error(message),
 	};
 	if values.len() > 1 {
-		raise_type_error(format!(
-			"float expected at most 1 argument, got {}",
-			values.len()
-		));
+		raise_type_error(format!("float expected at most 1 argument, got {}", values.len()));
 		return ptr::null_mut();
 	}
 	let value = match values.first() {
@@ -1705,7 +1696,10 @@ fn set_descriptor_doc(doc: &mut *const c_char, value: *mut PyObject) -> c_int {
 	0
 }
 
-unsafe extern "C" fn slot_wrapper_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn slot_wrapper_getattro(
+	object: *mut PyObject,
+	name: *mut PyObject,
+) -> *mut PyObject {
 	let attr = unsafe { crate::types::type_::unicode_text(name) };
 	let wrapper = unsafe { &*object.cast::<PySlotWrapper>() };
 	match attr {
@@ -2173,12 +2167,42 @@ unsafe fn install_slot_wrappers(ns: &mut PyClassDict, foreign: &ForeignTypeObjec
 		)?;
 	}
 	if !foreign.tp_richcompare.is_null() {
-		install_richcompare_slot_wrapper(ns, "__lt__", foreign.tp_richcompare, abi::object::RICH_LT as c_int)?;
-		install_richcompare_slot_wrapper(ns, "__le__", foreign.tp_richcompare, abi::object::RICH_LE as c_int)?;
-		install_richcompare_slot_wrapper(ns, "__eq__", foreign.tp_richcompare, abi::object::RICH_EQ as c_int)?;
-		install_richcompare_slot_wrapper(ns, "__ne__", foreign.tp_richcompare, abi::object::RICH_NE as c_int)?;
-		install_richcompare_slot_wrapper(ns, "__gt__", foreign.tp_richcompare, abi::object::RICH_GT as c_int)?;
-		install_richcompare_slot_wrapper(ns, "__ge__", foreign.tp_richcompare, abi::object::RICH_GE as c_int)?;
+		install_richcompare_slot_wrapper(
+			ns,
+			"__lt__",
+			foreign.tp_richcompare,
+			abi::object::RICH_LT as c_int,
+		)?;
+		install_richcompare_slot_wrapper(
+			ns,
+			"__le__",
+			foreign.tp_richcompare,
+			abi::object::RICH_LE as c_int,
+		)?;
+		install_richcompare_slot_wrapper(
+			ns,
+			"__eq__",
+			foreign.tp_richcompare,
+			abi::object::RICH_EQ as c_int,
+		)?;
+		install_richcompare_slot_wrapper(
+			ns,
+			"__ne__",
+			foreign.tp_richcompare,
+			abi::object::RICH_NE as c_int,
+		)?;
+		install_richcompare_slot_wrapper(
+			ns,
+			"__gt__",
+			foreign.tp_richcompare,
+			abi::object::RICH_GT as c_int,
+		)?;
+		install_richcompare_slot_wrapper(
+			ns,
+			"__ge__",
+			foreign.tp_richcompare,
+			abi::object::RICH_GE as c_int,
+		)?;
 	}
 
 	if !foreign.tp_as_sequence.is_null() {
@@ -2768,7 +2792,10 @@ unsafe extern "C" fn getset_descr_set(
 	unsafe { set(instance, value, descr.closure) }
 }
 
-unsafe extern "C" fn getset_descr_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn getset_descr_getattro(
+	object: *mut PyObject,
+	name: *mut PyObject,
+) -> *mut PyObject {
 	let attr = unsafe { crate::types::type_::unicode_text(name) };
 	let descr = unsafe { &*object.cast::<PyGetSetDescr>() };
 	match attr {
@@ -2880,7 +2907,10 @@ unsafe extern "C" fn member_descr_get(
 	unsafe { read_member(field, descr) }
 }
 
-unsafe extern "C" fn member_descr_getattro(object: *mut PyObject, name: *mut PyObject) -> *mut PyObject {
+unsafe extern "C" fn member_descr_getattro(
+	object: *mut PyObject,
+	name: *mut PyObject,
+) -> *mut PyObject {
 	let attr = unsafe { crate::types::type_::unicode_text(name) };
 	let descr = unsafe { &*object.cast::<PyCMemberDescr>() };
 	match attr {

@@ -62,8 +62,48 @@ fn supported_python_rank(python: &str) -> Option<u8> {
 	}
 }
 
+/// True when `tag` names a wheel pon built for its own ABI on this host:
+/// interpreter `pon3<minor>`, ABI `pon`, and a platform tag for the current
+/// OS/architecture (`any` accepted). These wheels come out of pon's own PEP
+/// 517 builds — the CPython C-ABI refusal does not apply to them.
+#[must_use]
+pub fn pon_native_tag(tag: &Tag) -> bool {
+	if tag.python != format!("pon3{CURRENT_PYTHON_MINOR}") || tag.abi != "pon" {
+		return false;
+	}
+	platform_matches_host(&tag.platform)
+}
+
+fn platform_matches_host(platform: &str) -> bool {
+	if platform == "any" {
+		return true;
+	}
+	let os_matches = if cfg!(target_os = "macos") {
+		platform.starts_with("macosx")
+	} else if cfg!(target_os = "linux") {
+		platform.contains("linux")
+	} else if cfg!(windows) {
+		platform.starts_with("win")
+	} else {
+		false
+	};
+	let arch_matches = if cfg!(target_arch = "aarch64") {
+		platform.ends_with("arm64") || platform.ends_with("aarch64")
+	} else if cfg!(target_arch = "x86_64") {
+		platform.ends_with("x86_64") || platform.ends_with("amd64")
+	} else {
+		false
+	};
+	os_matches && arch_matches
+}
+
 #[must_use]
 pub fn supported_tag_rank(tag: &Tag) -> Option<u8> {
+	if pon_native_tag(tag) {
+		// Outranks every pure-Python tag: a host-ABI build is the most
+		// specific artifact pon can install.
+		return Some(CURRENT_PYTHON_MINOR + 2);
+	}
 	if tag.abi == "none" && tag.platform == "any" {
 		supported_python_rank(&tag.python)
 	} else {
@@ -88,9 +128,9 @@ pub fn default_supported_tags() -> BTreeSet<Tag> {
 
 #[must_use]
 pub fn any_supported(candidate: &[Tag], supported: &BTreeSet<Tag>) -> bool {
-	candidate
-		.iter()
-		.any(|tag| supported.contains(tag) && supported_tag_rank(tag).is_some())
+	candidate.iter().any(|tag| {
+		pon_native_tag(tag) || (supported.contains(tag) && supported_tag_rank(tag).is_some())
+	})
 }
 
 #[must_use]
@@ -112,8 +152,13 @@ pub fn classify_tags(candidate: &[Tag], supported: &BTreeSet<Tag>) -> WheelCompa
 	}
 }
 
+/// `Root-Is-Purelib` gate. `pon_native` wheels legitimately install into
+/// platlib (`Root-Is-Purelib: false`); everything else must be purelib.
 #[must_use]
-pub fn classify_root_is_purelib(metadata: &str) -> WheelCompatibility {
+pub fn classify_root_is_purelib(metadata: &str, pon_native: bool) -> WheelCompatibility {
+	if pon_native {
+		return WheelCompatibility::PurePython;
+	}
 	for line in metadata.lines() {
 		let Some((key, value)) = line.split_once(':') else {
 			continue;
@@ -131,8 +176,13 @@ pub fn classify_root_is_purelib(metadata: &str) -> WheelCompatibility {
 	WheelCompatibility::CAbiRefused { reason: "wheel metadata omits Root-Is-Purelib".to_owned() }
 }
 
+/// Native-extension member gate. Pon's own `.pon.so` extensions are the one
+/// allowed native shape; CPython `.so`/`.pyd`/`.dylib` members stay refused.
 #[must_use]
 pub fn classify_archive_member(path: &str) -> WheelCompatibility {
+	if path.ends_with(".pon.so") {
+		return WheelCompatibility::PurePython;
+	}
 	let extension = Path::new(path)
 		.extension()
 		.and_then(|extension| extension.to_str())
@@ -200,13 +250,18 @@ mod tests {
 	#[test]
 	fn classifies_root_is_purelib_metadata() {
 		assert_eq!(
-			classify_root_is_purelib("Wheel-Version: 1.0\nRoot-Is-Purelib: true\n"),
+			classify_root_is_purelib("Wheel-Version: 1.0\nRoot-Is-Purelib: true\n", false),
 			WheelCompatibility::PurePython
 		);
 		assert!(matches!(
-			classify_root_is_purelib("Wheel-Version: 1.0\nRoot-Is-Purelib: false\n"),
+			classify_root_is_purelib("Wheel-Version: 1.0\nRoot-Is-Purelib: false\n", false),
 			WheelCompatibility::CAbiRefused { .. }
 		));
+		// pon-native wheels install into platlib by design.
+		assert_eq!(
+			classify_root_is_purelib("Wheel-Version: 1.0\nRoot-Is-Purelib: false\n", true),
+			WheelCompatibility::PurePython
+		);
 	}
 
 	#[test]
@@ -214,6 +269,38 @@ mod tests {
 		assert_eq!(classify_archive_member("pkg/__init__.py"), WheelCompatibility::PurePython);
 		assert!(matches!(
 			classify_archive_member("pkg/_speedups.cpython-314-darwin.so"),
+			WheelCompatibility::CAbiRefused { .. }
+		));
+		// Pon's own extension suffix is the one allowed native member shape.
+		assert_eq!(
+			classify_archive_member("numpy/_core/_multiarray_umath.pon.so"),
+			WheelCompatibility::PurePython
+		);
+	}
+
+	#[test]
+	fn accepts_pon_native_wheel_tags_for_this_host() {
+		let host_platform = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+			"macosx_26_0_arm64"
+		} else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+			"linux_x86_64"
+		} else {
+			"any"
+		};
+		let native = Tag::new("pon314", "pon", host_platform);
+		assert!(pon_native_tag(&native));
+		assert!(any_supported(&[native.clone()], &default_supported_tags()));
+		// Native host builds outrank every pure-Python tag.
+		let py314 = supported_tag_rank(&Tag::new("py314", "none", "any")).unwrap();
+		assert!(supported_tag_rank(&native).unwrap() > py314);
+		// CPython ABI tags and foreign-platform pon tags stay refused.
+		assert!(!pon_native_tag(&Tag::new("cp314", "cp314", host_platform)));
+		assert!(!pon_native_tag(&Tag::new("pon314", "pon", "sunos5_sparc")));
+		assert!(matches!(
+			classify_tags(
+				&parse_tag_set("cp314", "cp314", "macosx_11_0_arm64"),
+				&default_supported_tags()
+			),
 			WheelCompatibility::CAbiRefused { .. }
 		));
 	}

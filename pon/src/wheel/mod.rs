@@ -149,6 +149,9 @@ fn open_archive(path: &Path, label: &str) -> Result<ZipArchive<File>> {
 }
 
 fn inspect_archive(filename: &str, archive: &mut ZipArchive<File>) -> Result<WheelInspection> {
+	let pon_native = WheelFilename::parse(filename)
+		.map(|wheel| wheel.tags().iter().any(compat::pon_native_tag))
+		.unwrap_or(false);
 	let mut wheel_metadata = None;
 	let mut record_path = None;
 	let mut record_text = None;
@@ -190,7 +193,7 @@ fn inspect_archive(filename: &str, archive: &mut ZipArchive<File>) -> Result<Whe
 			"wheel `{filename}` does not contain a .dist-info/WHEEL member"
 		))
 	})?;
-	match classify_root_is_purelib(&metadata) {
+	match classify_root_is_purelib(&metadata, pon_native) {
 		WheelCompatibility::PurePython => {},
 		WheelCompatibility::CAbiRefused { reason } => return Err(cabi_refused(filename, &reason)),
 	}

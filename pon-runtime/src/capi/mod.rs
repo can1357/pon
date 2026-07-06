@@ -41,6 +41,18 @@ use crate::{
 
 const METH_VARARGS: c_int = 0x0001;
 const METH_KEYWORDS: c_int = 0x0002;
+/// Compile-time paths of the C-API source shim: the `Python.h` include root
+/// plus the bootstrap and argument-parser translation units every extension
+/// links. Package-manager build flows (meson) compile these once and inject
+/// the objects through the linker environment.
+#[must_use]
+pub fn capi_shim_paths() -> (&'static str, &'static str, &'static str) {
+	(
+		concat!(env!("CARGO_MANIFEST_DIR"), "/include"),
+		concat!(env!("CARGO_MANIFEST_DIR"), "/capi/pon_capi_bootstrap.c"),
+		concat!(env!("CARGO_MANIFEST_DIR"), "/capi/pon_capi_args.c"),
+	)
+}
 const METH_NOARGS: c_int = 0x0004;
 const METH_O: c_int = 0x0008;
 const METH_CLASS: c_int = 0x0010;
@@ -820,9 +832,7 @@ unsafe extern "C" fn cfunction_call(
 	let kwarg_entries: Vec<crate::types::dict::DictEntry> = if _kwargs.is_null() {
 		Vec::new()
 	} else {
-		match unsafe {
-			crate::types::dict::dict_entries_snapshot(crate::tag::untag_arg(_kwargs))
-		} {
+		match unsafe { crate::types::dict::dict_entries_snapshot(crate::tag::untag_arg(_kwargs)) } {
 			Ok(entries) => entries,
 			Err(message) => return abi::return_null_with_error(message),
 		}
@@ -875,14 +885,8 @@ unsafe extern "C" fn cfunction_call(
 				}
 				pin_object(kwnames);
 			}
-			let result = unsafe {
-				fastcall_kw(
-					self_object,
-					argv.as_ptr(),
-					positional.len() as isize,
-					kwnames,
-				)
-			};
+			let result =
+				unsafe { fastcall_kw(self_object, argv.as_ptr(), positional.len() as isize, kwnames) };
 			if !kwnames.is_null() {
 				unpin_object(kwnames);
 			}

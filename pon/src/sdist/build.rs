@@ -408,7 +408,7 @@ fn run_get_requires_for_build_wheel_hook(
 	let cwd = CwdGuard::enter(source_root);
 	let result = crate::run::run_file_with_env(
 		&script_path,
-		build_runtime_env(build_env, source_root, backend_path),
+		build_runtime_env(build_env, source_root, backend_path, backend),
 		&argv,
 	)
 	.map_err(|error| classify_hook_error(backend, error));
@@ -452,7 +452,7 @@ fn run_build_wheel_hook(
 	let cwd = CwdGuard::enter(source_root);
 	let result = crate::run::run_file_with_env(
 		&script_path,
-		build_runtime_env(build_env, source_root, backend_path),
+		build_runtime_env(build_env, source_root, backend_path, backend),
 		&argv,
 	)
 	.map_err(|error| classify_hook_error(backend, error));
@@ -465,9 +465,10 @@ fn build_runtime_env(
 	build_env: &EnvLayout,
 	source_root: &Path,
 	backend_path: &[String],
+	backend: &str,
 ) -> Vec<(OsString, OsString)> {
 	let import_path = build_import_path(build_env, source_root, backend_path);
-	vec![
+	let mut env = vec![
 		(OsString::from("PON_HOME"), build_env.pon_dir.clone().into_os_string()),
 		(OsString::from("PONPATH"), import_path.clone()),
 		(OsString::from("PON_IMPORT_PATH"), import_path),
@@ -477,7 +478,56 @@ fn build_runtime_env(
 			OsString::from("PON_NATIVE_MODULE_REGISTRY"),
 			build_env.native_registry_path.clone().into_os_string(),
 		),
-	]
+	];
+	// Meson links extensions itself (never through sysconfig's LDSHARED), so
+	// the C-API bootstrap/arg-parser objects ride the linker environment;
+	// distutils-style backends keep getting the sources through LDSHARED.
+	if backend.starts_with("mesonpy") {
+		match capi_shim_link_flags(build_env) {
+			Ok(flags) => env.push((OsString::from("LDFLAGS"), flags)),
+			Err(error) => {
+				eprintln!("pon: warning: C-API shim objects unavailable for meson build: {error}");
+			},
+		}
+	}
+	env
+}
+
+/// Compiles the C-API bootstrap and argument-parser shims once per build env
+/// and returns their object paths as linker flags (`LDFLAGS` payload).
+fn capi_shim_link_flags(build_env: &EnvLayout) -> Result<OsString> {
+	let (include_dir, bootstrap_c, args_c) = pon_runtime::capi::capi_shim_paths();
+	let object_dir = build_env.pon_dir.join("capi-shim");
+	fs::create_dir_all(&object_dir)?;
+	let mut flags = OsString::new();
+	for (source, object_name) in [(bootstrap_c, "pon_capi_bootstrap.o"), (args_c, "pon_capi_args.o")]
+	{
+		let object_path = object_dir.join(object_name);
+		if !object_path.exists() {
+			let output = std::process::Command::new("cc")
+				.arg("-c")
+				.arg("-fPIC")
+				.arg(format!("-I{include_dir}"))
+				.arg(source)
+				.arg("-o")
+				.arg(&object_path)
+				.output()
+				.map_err(|error| {
+					Error::UnsupportedArtifact(format!("failed to spawn cc for C-API shim: {error}"))
+				})?;
+			if !output.status.success() {
+				return Err(Error::UnsupportedArtifact(format!(
+					"C-API shim compile failed: {}",
+					String::from_utf8_lossy(&output.stderr)
+				)));
+			}
+		}
+		if !flags.is_empty() {
+			flags.push(" ");
+		}
+		flags.push(&object_path);
+	}
+	Ok(flags)
 }
 
 fn build_hook_path(build_env: &EnvLayout) -> OsString {

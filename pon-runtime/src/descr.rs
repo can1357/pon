@@ -1302,8 +1302,7 @@ pub unsafe extern "C" fn generic_set_attr(
 
 	if !is_type
 		&& unsafe { crate::capi::is_capi_class(obj_ty) }
-		&& (unsafe { (*obj_ty).tp_dictoffset > 0 }
-			|| unsafe { capi_sidetable_dict_eligible(obj_ty) })
+		&& (unsafe { (*obj_ty).tp_dictoffset > 0 } || unsafe { capi_sidetable_dict_eligible(obj_ty) })
 	{
 		if value.is_null() {
 			return match unsafe { capi_dict_del_attr(object, obj_ty, name_id) } {

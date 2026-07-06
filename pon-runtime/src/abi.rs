@@ -2756,9 +2756,7 @@ unsafe fn call_reduce_override(receiver: *mut PyObject) -> Option<*mut PyObject>
 	let name = crate::intern::intern("__reduce__");
 	let cls = unsafe { (*receiver).ob_type.cast_mut() };
 	let descriptor = unsafe { crate::descr::lookup_in_type(cls, name) };
-	if descriptor.is_null()
-		|| descriptor == OBJECT_DUNDER_REDUCE_CARRIER.load(Ordering::Acquire)
-	{
+	if descriptor.is_null() || descriptor == OBJECT_DUNDER_REDUCE_CARRIER.load(Ordering::Acquire) {
 		return None;
 	}
 	let method = unsafe { pon_get_attr(receiver, name, ptr::null_mut()) };
@@ -4463,16 +4461,14 @@ pub unsafe extern "C" fn pon_call(
 				&& !runtime_object_type(callee).is_null()
 				&& (*runtime_object_type(callee)).tp_call.is_some()
 			{
-				Ok(CallTarget::Slot((*runtime_object_type(callee)).tp_call.expect("checked Some")))
+				Ok(CallTarget::Slot(
+					(*runtime_object_type(callee))
+						.tp_call
+						.expect("checked Some"),
+				))
 			} else if !callee.is_null() && !(*callee).ob_type.is_null() {
 				Ok(CallTarget::DunderCall)
 			} else {
-				// TEMP diag
-				eprintln!(
-					"[dbg] not-callable callee {:p} ty {:p}",
-					callee,
-					if callee.is_null() { ptr::null_mut() } else { (*callee).ob_type.cast_mut() },
-				);
 				Err("callee is not callable".to_owned())
 			}
 		}) {
@@ -5872,12 +5868,10 @@ pub unsafe extern "C" fn pon_load_name(name_interned: u32) -> *mut PyObject {
 				return value;
 			}
 		}
-		resolve_global_binding(name_interned)
-			.unwrap_or_else(|| {
-				let name =
-					resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
-				exc::raise_name_error_text(&format!("name '{name}' is not defined"))
-			})
+		resolve_global_binding(name_interned).unwrap_or_else(|| {
+			let name = resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
+			exc::raise_name_error_text(&format!("name '{name}' is not defined"))
+		})
 	})
 }
 
@@ -6585,8 +6579,7 @@ pub(crate) fn resolve_global_binding(name: u32) -> Option<*mut PyObject> {
 		},
 		None => crate::import::active_module_attr(name),
 	};
-	module_attr
-		.or_else(|| with_runtime(|runtime| runtime.globals.get(&name).copied()).flatten())
+	module_attr.or_else(|| with_runtime(|runtime| runtime.globals.get(&name).copied()).flatten())
 }
 
 /// Call chain captured for `sys._getframe(depth)`: `chain[0]` describes the

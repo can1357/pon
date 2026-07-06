@@ -217,8 +217,7 @@ pub unsafe extern "C" fn pon_index(object: *mut PyObject) -> *mut PyObject {
 			crate::capi::twin::registered_native_of_foreign(raw.cast()).unwrap_or(raw)
 		};
 		if !ty.is_null() {
-			let hook =
-				unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern("__index__")) };
+			let hook = unsafe { crate::descr::lookup_in_type(ty, crate::intern::intern("__index__")) };
 			if !hook.is_null() {
 				let bound = unsafe { crate::descr::descriptor_get(hook, object, ty) };
 				if bound.is_null() {
