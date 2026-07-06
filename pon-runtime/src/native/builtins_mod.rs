@@ -3364,8 +3364,7 @@ unsafe fn object_is_instance(object: *mut PyObject, classinfo: *mut PyObject) ->
 			return 0;
 		};
 		let object_type_name = unsafe { (*object_type).name() };
-		if object_type_name == expected_name
-			|| (object_type_name == "bool" && expected_name == "int")
+		if object_type_name == expected_name || (object_type_name == "bool" && expected_name == "int")
 		{
 			return 1;
 		}

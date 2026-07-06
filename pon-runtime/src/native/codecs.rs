@@ -1787,7 +1787,7 @@ fn charmap_mapped_char(mapping: *mut PyObject, byte: u8) -> Result<Option<String
 		return Ok(None);
 	}
 	if let Some(code) = object_int_value(value) {
-		if !(0..=0x10_FFFF).contains(&code) {
+		if !(0..=0x10_ffff).contains(&code) {
 			return Ok(None);
 		}
 		return Ok(match char::from_u32(code as u32) {
@@ -1834,7 +1834,8 @@ unsafe extern "C" fn charmap_decode_entry(argv: *mut *mut PyObject, argc: usize)
 			Ok(None) => match errors {
 				"strict" => {
 					return CoreError::Decode(format!(
-						"'charmap' codec can't decode byte 0x{byte:02x} in position {position}: character maps to <undefined>"
+						"'charmap' codec can't decode byte 0x{byte:02x} in position {position}: \
+						 character maps to <undefined>"
 					))
 					.raise();
 				},
@@ -1905,7 +1906,8 @@ unsafe extern "C" fn charmap_encode_entry(argv: *mut *mut PyObject, argc: usize)
 			Ok(None) => match errors {
 				"strict" => {
 					return CoreError::Encode(format!(
-						"'charmap' codec can't encode character '{}' in position {position}: character maps to <undefined>",
+						"'charmap' codec can't encode character '{}' in position {position}: character \
+						 maps to <undefined>",
 						escape_char(ch)
 					))
 					.raise();

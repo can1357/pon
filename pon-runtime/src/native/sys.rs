@@ -198,6 +198,8 @@ pub(super) fn make_module() -> Result<*mut PyObject, String> {
 		function_attr("audit", sys_audit),
 		function_attr("addaudithook", sys_addaudithook),
 		function_attr("getsizeof", sys_getsizeof),
+		function_attr("get_asyncgen_hooks", sys_get_asyncgen_hooks),
+		function_attr("set_asyncgen_hooks", sys_set_asyncgen_hooks),
 		std_stream_attr("stdin", 0),
 		std_stream_attr("stdout", 1),
 		std_stream_attr("stderr", 2),
@@ -1931,15 +1933,71 @@ unsafe extern "C" fn sys_setrecursionlimit(argv: *mut *mut PyObject, argc: usize
 /// rooted via [`gc_held_roots`]).
 static AUDIT_HOOKS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
-/// GC roots held by native `sys` state: the registered audit hooks.
-/// Consumed by `crate::abi::collect` (the `_contextvars` pattern).
+/// `sys.set_asyncgen_hooks` state: `(firstiter, finalizer)` raw addresses
+/// (0 = unset/None), rooted via [`gc_held_roots`]. asyncio's event loop
+/// saves/installs/restores these around `run_forever`.
+static ASYNCGEN_HOOKS: std::sync::Mutex<(usize, usize)> = std::sync::Mutex::new((0, 0));
+
+/// GC roots held by native `sys` state: the registered audit hooks and the
+/// installed asyncgen hooks. Consumed by `crate::abi::collect` (the
+/// `_contextvars` pattern).
 pub(crate) fn gc_held_roots() -> Vec<*mut PyObject> {
-	AUDIT_HOOKS
+	let mut roots: Vec<*mut PyObject> = AUDIT_HOOKS
 		.lock()
 		.unwrap_or_else(|poison| poison.into_inner())
 		.iter()
 		.map(|&address| address as *mut PyObject)
-		.collect()
+		.collect();
+	let hooks = *ASYNCGEN_HOOKS.lock().unwrap_or_else(|poison| poison.into_inner());
+	for address in [hooks.0, hooks.1] {
+		if address != 0 {
+			roots.push(address as *mut PyObject);
+		}
+	}
+	roots
+}
+
+/// `sys.get_asyncgen_hooks()`: the stored `(firstiter, finalizer)` pair.
+/// CPython returns a named tuple; the consumers (`asyncio`'s save/restore)
+/// only unpack positionally.
+unsafe extern "C" fn sys_get_asyncgen_hooks(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	let _ = argv;
+	if argc != 0 {
+		return raise_type_error(&format!("get_asyncgen_hooks() takes no arguments ({argc} given)"));
+	}
+	let hooks = *ASYNCGEN_HOOKS.lock().unwrap_or_else(|poison| poison.into_inner());
+	// SAFETY: Singleton accessor.
+	let none = unsafe { crate::abi::pon_none() };
+	let mut pair = [
+		if hooks.0 == 0 { none } else { hooks.0 as *mut PyObject },
+		if hooks.1 == 0 { none } else { hooks.1 as *mut PyObject },
+	];
+	// SAFETY: Two live slots; the tuple allocator copies them.
+	unsafe { crate::abi::seq::pon_build_tuple(pair.as_mut_ptr(), 2) }
+}
+
+/// `sys.set_asyncgen_hooks(firstiter=None, finalizer=None)`: stores the
+/// hooks (the keyword binder delivers the canonical two-slot layout).
+unsafe extern "C" fn sys_set_asyncgen_hooks(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
+	// SAFETY: Live argument slots per the runtime calling convention.
+	let args = unsafe { call_args(argv, argc) };
+	if args.len() > 2 {
+		return raise_type_error(&format!(
+			"set_asyncgen_hooks() takes at most 2 arguments ({} given)",
+			args.len()
+		));
+	}
+	// SAFETY: Singleton accessor.
+	let none = unsafe { crate::abi::pon_none() };
+	let mut hooks = ASYNCGEN_HOOKS.lock().unwrap_or_else(|poison| poison.into_inner());
+	if let Some(&firstiter) = args.first() {
+		hooks.0 = if crate::tag::untag_arg(firstiter) == none { 0 } else { firstiter as usize };
+	}
+	if let Some(&finalizer) = args.get(1) {
+		hooks.1 = if crate::tag::untag_arg(finalizer) == none { 0 } else { finalizer as usize };
+	}
+	// SAFETY: Singleton fetch follows the NULL-sentinel contract.
+	unsafe { crate::abi::pon_none() }
 }
 
 /// `sys.addaudithook(hook)`: stores the hook.  CPython performs no
