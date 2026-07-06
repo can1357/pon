@@ -847,7 +847,10 @@ mod tests {
 			.join("Lib")
 			.join("test");
 		if !test_root.is_dir() {
-			eprintln!("skipping CPython-full discovery test; `{}` is not present", test_root.display());
+			eprintln!(
+				"skipping CPython-full discovery test; `{}` is not present",
+				test_root.display()
+			);
 			return;
 		}
 		let units = discover_units(&test_root).expect("vendored tree discoverable");
