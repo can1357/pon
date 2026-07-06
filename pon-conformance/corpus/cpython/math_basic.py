@@ -16,7 +16,10 @@ print(math.pi, math.e, math.tau, math.inf, -math.inf, math.nan)
 print(math.isnan(math.nan), math.isinf(-math.inf), math.isfinite(1.5), math.isfinite(math.inf))
 
 # roots, exponentials, logs
-print(math.sqrt(2.0), math.sqrt(9), math.sqrt(0.0), math.cbrt(27.0), math.cbrt(-8.0))
+# cbrt through isclose: libms disagree by an ulp on exact cubes (glibc
+# x86_64 cbrt(27.0) -> 3.0000000000000004), so raw repr is not portable.
+print(math.sqrt(2.0), math.sqrt(9), math.sqrt(0.0),
+      math.isclose(math.cbrt(27.0), 3.0), math.isclose(math.cbrt(-8.0), -2.0))
 print(math.exp(1.0), math.exp(-2.5), math.exp2(10), math.expm1(1e-05))
 print(math.log(math.e), math.log(1024, 2), math.log2(1024), math.log10(1000))
 print(math.log1p(1e-09), math.log(10**100), math.log2(2**2000), math.log10(10**500))
