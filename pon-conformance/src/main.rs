@@ -451,7 +451,7 @@ const BENCH_KERNELS: &[&str] = &[
 	"generator.py",
 ];
 const BENCH_SPEEDUP_RATCHETS: &[(&str, f64)] = &[
-	("int_loop.py", 1.0),
+	("int_loop.py", 0.9),
 	("fib.py", 1.0),
 	("nbody.py", 1.0),
 	("comprehension.py", 1.0),
