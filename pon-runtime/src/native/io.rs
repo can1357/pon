@@ -15,7 +15,7 @@ use crate::{
 	abi::{self, pon_const_str},
 	builtins,
 	intern::intern,
-	object::{PyLong, PyObject, PyObjectHeader, PyType},
+	object::{PyObject, PyObjectHeader, PyType},
 	thread_state::{pon_err_clear, pon_err_message, pon_err_occurred, pon_err_set},
 	types::{bytearray_, bytes_, exc::ExceptionKind, memoryview, method, type_},
 };
@@ -604,16 +604,13 @@ fn bytes_like_bytes(object: *mut PyObject) -> Result<Vec<u8>, BioError> {
 
 /// Integer argument with CPython's index-coercion diagnostic.
 fn bio_index_arg(object: *mut PyObject) -> Result<i64, BioError> {
-	let object = crate::tag::untag_arg(object);
 	if object.is_null() {
 		return Err(BioError::Type(
 			"'NoneType' object cannot be interpreted as an integer".to_owned(),
 		));
 	}
-	// SAFETY: Untagged live pointer; the name check gates the PyLong read.
-	let ty = unsafe { (*object).ob_type };
-	if !ty.is_null() && unsafe { (*ty).name() == "int" || (*ty).name() == "bool" } {
-		return Ok(unsafe { (*object.cast::<PyLong>()).value });
+	if let Some(value) = unsafe { crate::types::int::to_i64_including_bool(object) } {
+		return Ok(value);
 	}
 	let type_name = unsafe { crate::types::dict::type_name(object) }.unwrap_or("object");
 	Err(BioError::Type(format!("'{type_name}' object cannot be interpreted as an integer")))
@@ -3900,29 +3897,16 @@ fn expect_int(object: *mut PyObject, message: &str) -> Result<i64, String> {
 	if object.is_null() {
 		return Err(message.to_owned());
 	}
-	let ty = unsafe { (*object).ob_type };
-	if ty.is_null() || unsafe { (*ty).name() != "int" && (*ty).name() != "bool" } {
-		return Err(message.to_owned());
-	}
-	Some(unsafe { (*object.cast::<PyLong>()).value }).ok_or_else(|| message.to_owned())
+	unsafe { crate::types::int::to_i64_including_bool(object) }
+		.ok_or_else(|| message.to_owned())
 }
 
 fn is_none(object: *mut PyObject) -> bool {
-	if object.is_null() {
-		return false;
-	}
-	let ty = unsafe { (*object).ob_type };
-	!ty.is_null() && unsafe { (*ty).name() == "NoneType" }
+	unsafe { crate::types::dict::type_name(object) == Some("NoneType") }
 }
 
 fn is_false(object: *mut PyObject) -> bool {
-	if object.is_null() {
-		return false;
-	}
-	let ty = unsafe { (*object).ob_type };
-	!ty.is_null()
-		&& unsafe { (*ty).name() == "bool" }
-		&& unsafe { (*object.cast::<PyLong>()).value == 0 }
+	unsafe { crate::types::bool_::to_bool(object) == Some(false) }
 }
 
 fn stop_iteration_pending() -> bool {
@@ -4118,11 +4102,11 @@ mod tests {
 		let mut seek_args = [object, int_obj(3)];
 		let position = unsafe { file_seek_method(seek_args.as_mut_ptr(), seek_args.len()) };
 		assert!(!position.is_null());
-		assert_eq!(unsafe { (*position.cast::<PyLong>()).value }, 3);
+		assert_eq!(unsafe { crate::types::int::to_i64(position) }, Some(3));
 		let mut tell_args = [object];
 		let tell = unsafe { file_tell_method(tell_args.as_mut_ptr(), tell_args.len()) };
 		assert!(!tell.is_null());
-		assert_eq!(unsafe { (*tell.cast::<PyLong>()).value }, 3);
+		assert_eq!(unsafe { crate::types::int::to_i64(tell) }, Some(3));
 		let _ = std::fs::remove_file(path);
 	}
 

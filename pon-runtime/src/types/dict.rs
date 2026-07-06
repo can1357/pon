@@ -1025,7 +1025,10 @@ fn hash_object_non_numeric(object: *mut PyObject) -> Result<isize, String> {
 /// Returns a boxed object's type name.
 #[must_use]
 pub unsafe fn type_name(object: *mut PyObject) -> Option<&'static str> {
-	if object.is_null() {
+	if crate::tag::is_small_int(object) {
+		return Some("int");
+	}
+	if object.is_null() || !crate::tag::is_heap(object) {
 		return None;
 	}
 	let ty = unsafe { (*object).ob_type };

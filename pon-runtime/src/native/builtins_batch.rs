@@ -1287,14 +1287,16 @@ pub(super) unsafe fn type_dunder(object: *mut PyObject, name: &str) -> Option<*m
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::{object::PyLong, thread_state::test_state_lock};
+	use crate::thread_state::test_state_lock;
 
 	unsafe extern "C" fn negating_key(argv: *mut *mut PyObject, argc: usize) -> *mut PyObject {
 		if argc != 1 || argv.is_null() {
 			return raise_type_error("negating_key expected 1 argument");
 		}
 		let item = unsafe { *argv };
-		let value = unsafe { (*item.cast::<PyLong>()).value };
+		let Some(value) = (unsafe { crate::types::int::to_i64(item) }) else {
+			return raise_type_error("negating_key expected int argument");
+		};
 		unsafe { abi::pon_const_int(-value) }
 	}
 
@@ -1308,7 +1310,7 @@ mod tests {
 
 	fn int_value(object: *mut PyObject) -> i64 {
 		assert!(!object.is_null());
-		unsafe { (*object.cast::<PyLong>()).value }
+		unsafe { crate::types::int::to_i64(object).expect("expected int result") }
 	}
 
 	#[test]

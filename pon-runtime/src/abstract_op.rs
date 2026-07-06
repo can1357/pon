@@ -81,6 +81,12 @@ pub(crate) unsafe fn binary_op_flavored(
 	b: *mut PyObject,
 	inplace: bool,
 ) -> *mut PyObject {
+	if crate::tag::is_small_int(a) || crate::tag::is_small_int(b) {
+		let Some((a, b)) = normalize_binary_args(a, b) else {
+			return ptr::null_mut();
+		};
+		return unsafe { binary_op_flavored(op, a, b, inplace) };
+	}
 	if op == BINARY_ADD && unsafe { is_exact_pylong(a) && is_exact_pylong(b) } {
 		// SAFETY: The exact-type checks above prove both operands use PyLong's layout.
 		let left = unsafe { (*a.cast::<PyLong>()).value };
@@ -218,6 +224,12 @@ pub(crate) unsafe fn binary_op_flavored(
 
 /// Dispatches a Python unary operation through the numeric protocol table.
 pub unsafe fn unary_op(op: u8, operand: *mut PyObject) -> *mut PyObject {
+	if crate::tag::is_small_int(operand) {
+		let Some(operand) = normalize_tagged_arg(operand) else {
+			return ptr::null_mut();
+		};
+		return unsafe { unary_op(op, operand) };
+	}
 	let Some(ty) = (unsafe { object_type(operand) }) else {
 		return raise_type_error("operand is NULL or has no type");
 	};
@@ -266,6 +278,9 @@ pub unsafe fn rich_compare(op: u8, a: *mut PyObject, b: *mut PyObject) -> *mut P
 	if let Some(result) = unsafe { rich_compare_numeric(op, a, b) } {
 		return result;
 	}
+	let Some((a, b)) = normalize_binary_args(a, b) else {
+		return ptr::null_mut();
+	};
 
 	let Some(left_type) = (unsafe { object_type(a) }) else {
 		return raise_type_error("left operand is NULL or has no type");
@@ -402,6 +417,7 @@ fn const_bool_object(value: bool) -> *mut PyObject {
 }
 
 enum RichNumericValue {
+	IntI64(i64),
 	Int(num_bigint::BigInt),
 	Float(f64),
 	Complex(f64, f64),
@@ -425,11 +441,26 @@ unsafe fn rich_compare_numeric(
 		(other, RichNumericValue::Complex(real, imag)) => {
 			rich_compare_complex_to_real(swapped_rich_op(op), real, imag, other)
 		},
+		(RichNumericValue::IntI64(left), RichNumericValue::IntI64(right)) => {
+			rich_compare_ordering(op, left.cmp(&right))
+		},
+		(RichNumericValue::IntI64(left), RichNumericValue::Int(right)) => {
+			rich_compare_ordering(op, num_bigint::BigInt::from(left).cmp(&right))
+		},
+		(RichNumericValue::Int(left), RichNumericValue::IntI64(right)) => {
+			rich_compare_ordering(op, left.cmp(&num_bigint::BigInt::from(right)))
+		},
 		(RichNumericValue::Int(left), RichNumericValue::Int(right)) => {
 			rich_compare_ordering(op, left.cmp(&right))
 		},
+		(RichNumericValue::IntI64(left), RichNumericValue::Float(right)) => {
+			rich_compare_int_float(op, &num_bigint::BigInt::from(left), right)
+		},
 		(RichNumericValue::Int(left), RichNumericValue::Float(right)) => {
 			rich_compare_int_float(op, &left, right)
+		},
+		(RichNumericValue::Float(left), RichNumericValue::IntI64(right)) => {
+			rich_compare_int_float(swapped_rich_op(op), &num_bigint::BigInt::from(right), left)
 		},
 		(RichNumericValue::Float(left), RichNumericValue::Int(right)) => {
 			rich_compare_int_float(swapped_rich_op(op), &right, left)
@@ -441,7 +472,10 @@ unsafe fn rich_compare_numeric(
 }
 
 unsafe fn rich_numeric_value(object: *mut PyObject) -> Option<RichNumericValue> {
-	if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(object) } {
+	if let Some(value) = unsafe { crate::types::int::to_i64_including_bool(object) } {
+		return Some(RichNumericValue::IntI64(value));
+	}
+	if let Some(value) = unsafe { crate::types::int::to_bigint(object) } {
 		return Some(RichNumericValue::Int(value));
 	}
 	if let Some(value) = unsafe { crate::types::float::to_f64(object) } {
@@ -462,6 +496,10 @@ fn rich_compare_complex_to_real(
 	match op {
 		RICH_EQ | RICH_NE => {
 			let real_equal = match other {
+				RichNumericValue::IntI64(value) => {
+					compare_int_float(&num_bigint::BigInt::from(value), real)
+						.is_some_and(core::cmp::Ordering::is_eq)
+				},
 				RichNumericValue::Int(value) => {
 					compare_int_float(&value, real).is_some_and(core::cmp::Ordering::is_eq)
 				},
@@ -564,6 +602,9 @@ fn compare_int_float(integer: &num_bigint::BigInt, float: f64) -> Option<core::c
 /// Returns `1` for true, `0` for false, and `-1` with the current exception set
 /// on error.
 pub unsafe fn is_true(object: *mut PyObject) -> i32 {
+	if crate::tag::is_small_int(object) {
+		return i32::from(crate::tag::untag_small_int(object) != 0);
+	}
 	let Some(ty) = (unsafe { object_type(object) }) else {
 		return raise_type_error_status("truth operand is NULL or has no type");
 	};
@@ -959,11 +1000,9 @@ pub unsafe fn subscript_get(object: *mut PyObject, key: *mut PyObject) -> *mut P
 			.as_ref()
 			.and_then(|methods| methods.sq_item)
 	} {
-		if !unsafe { is_exact_pylong(key) } {
+		let Some(value) = (unsafe { crate::types::int::to_i64_including_bool(key) }) else {
 			return raise_type_error("sequence index must be an int");
-		}
-		// SAFETY: The exact-type check above proves PyLong layout.
-		let value = unsafe { (*key.cast::<PyLong>()).value };
+		};
 		let Ok(index) = isize::try_from(value) else {
 			return raise_type_error("sequence index is out of range for this platform");
 		};
@@ -1053,10 +1092,9 @@ pub unsafe fn subscript_del(object: *mut PyObject, key: *mut PyObject) -> *mut P
 			.as_ref()
 			.and_then(|methods| methods.sq_ass_item)
 	} {
-		if !unsafe { is_exact_pylong(key) } {
+		let Some(value) = (unsafe { crate::types::int::to_i64_including_bool(key) }) else {
 			return raise_type_error("sequence index must be an int");
-		}
-		let value = unsafe { (*key.cast::<PyLong>()).value };
+		};
 		let Ok(index) = isize::try_from(value) else {
 			return raise_type_error("sequence index is out of range for this platform");
 		};
@@ -1085,7 +1123,7 @@ pub unsafe fn subscript_del(object: *mut PyObject, key: *mut PyObject) -> *mut P
 	// CPython wording differs by key kind: integer keys reach the
 	// `PySequence_DelItem` error ("doesn't"), everything else the
 	// `PyObject_DelItem` error ("does not").
-	let verb = if unsafe { is_exact_pylong(key) } {
+	let verb = if unsafe { crate::types::int::to_i64_including_bool(key).is_some() } {
 		"doesn't"
 	} else {
 		"does not"
@@ -1560,11 +1598,27 @@ fn interned_name_object(name: u32) -> Option<*mut PyObject> {
 	(!object.is_null()).then_some(object)
 }
 
+fn normalize_tagged_arg(object: *mut PyObject) -> Option<*mut PyObject> {
+	let normalized = crate::tag::untag_arg(object);
+	if crate::tag::is_small_int(object) && normalized.is_null() {
+		None
+	} else {
+		Some(normalized)
+	}
+}
+
+fn normalize_binary_args(
+	a: *mut PyObject,
+	b: *mut PyObject,
+) -> Option<(*mut PyObject, *mut PyObject)> {
+	Some((normalize_tagged_arg(a)?, normalize_tagged_arg(b)?))
+}
+
 unsafe fn object_type(object: *mut PyObject) -> Option<*mut PyType> {
-	if object.is_null() {
+	if object.is_null() || !crate::tag::is_heap(object) {
 		return None;
 	}
-	// SAFETY: Non-NULL boxed values are required to begin with PyObjectHeader.
+	// SAFETY: Non-NULL heap values are required to begin with PyObjectHeader.
 	let ty = unsafe { (*object).ob_type.cast_mut() };
 	let ty = crate::capi::twin::registered_native_of_foreign(ty.cast()).unwrap_or(ty);
 	(!ty.is_null()).then_some(ty)

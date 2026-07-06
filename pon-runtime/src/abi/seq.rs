@@ -22,7 +22,7 @@ use crate::{
 	abstract_op::{self, RICH_EQ, RICH_GE, RICH_GT, RICH_LE, RICH_LT, RICH_NE},
 	feedback::FeedbackCell,
 	object::{
-		PyLong, PyMappingMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType, PyUnicode,
+		PyMappingMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType, PyUnicode,
 		as_object_ptr, is_exact_type,
 	},
 	thread_state::{pon_err_clear, pon_err_occurred, pon_err_set},
@@ -798,19 +798,10 @@ fn long_value(object: *mut PyObject) -> Result<i64, String> {
 	// `bool <: int`: True/False are valid everywhere an int operand is
 	// (sequence indexes, slice bounds, repeat counts — CPython reads them
 	// through the shared long payload).
-	if let Some(value) = unsafe { crate::types::bool_::to_bool(object) } {
-		return Ok(i64::from(value));
+	if let Some(value) = unsafe { crate::types::int::to_i64_including_bool(object) } {
+		return Ok(value);
 	}
-	let Some(result) = with_runtime(|runtime| unsafe {
-		if is_exact_type(object, runtime.long_type) {
-			Ok((*object.cast::<PyLong>()).value)
-		} else {
-			Err(format!("expected int, got {}", object_type_name(object)))
-		}
-	}) else {
-		return Err("runtime is not initialized".to_owned());
-	};
-	result
+	Err(format!("expected int, got {}", object_type_name(object)))
 }
 
 fn index_value(object: *mut PyObject) -> Result<isize, String> {
@@ -1903,11 +1894,10 @@ fn py_hash(object: *mut PyObject) -> Result<isize, String> {
 	if object.is_null() {
 		return Err("cannot hash NULL".to_owned());
 	}
+	if let Some(value) = unsafe { crate::types::int::to_bigint_including_bool(object) } {
+		return Ok(crate::types::int::hash_bigint(&value));
+	}
 	with_runtime(|runtime| unsafe {
-		if is_exact_type(object, runtime.long_type) {
-			let value = (*object.cast::<PyLong>()).value;
-			return Ok(if value == -1 { -2 } else { value as isize });
-		}
 		if is_exact_type(object, runtime.unicode_type) {
 			let unicode = &*object.cast::<PyUnicode>();
 			let text = unicode
@@ -3528,7 +3518,7 @@ mod tests {
 
 	unsafe fn long_at(list: *mut PyObject, index: isize) -> i64 {
 		let item = sequence_item_raw(list, index).unwrap();
-		unsafe { (*item.cast::<PyLong>()).value }
+		unsafe { crate::types::int::to_i64(item).expect("list item should be an int") }
 	}
 
 	#[test]

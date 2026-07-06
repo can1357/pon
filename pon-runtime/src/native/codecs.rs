@@ -436,15 +436,7 @@ fn errors_arg<'a>(args: &[*mut PyObject], idx: usize) -> Result<&'a str, String>
 }
 
 fn int_of(object: *mut PyObject) -> Option<i64> {
-	if crate::tag::is_small_int(object) {
-		return Some(crate::tag::untag_small_int(object));
-	}
-	if object.is_null() {
-		return None;
-	}
-	// SAFETY: Heap pointer with a live header; layout proved by the name check.
-	(unsafe { crate::types::dict::type_name(object) } == Some("int"))
-		.then(|| unsafe { (*object.cast::<crate::object::PyLong>()).value })
+	unsafe { crate::types::int::to_i64(object) }
 }
 
 fn getattr(object: *mut PyObject, name: &str) -> *mut PyObject {

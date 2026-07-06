@@ -4038,6 +4038,23 @@ fn alloc_long(runtime: &Runtime, value: i64) -> Result<*mut PyObject, String> {
 	Ok(as_object_ptr(object))
 }
 
+fn boxed_const_int_uncaught(value: i64) -> *mut PyObject {
+	if let Err(message) = ensure_runtime_initialized() {
+		return return_null_with_error(message);
+	}
+	match with_runtime(|runtime| alloc_long(runtime, value)) {
+		Some(Ok(object)) => object,
+		Some(Err(message)) => return_null_with_error(message),
+		None => return_null_with_error("runtime is not initialized"),
+	}
+}
+
+/// Allocates a heap `PyLong` even when tagged integer immediates are enabled.
+#[must_use]
+pub(crate) fn boxed_const_int(value: i64) -> *mut PyObject {
+	catch_object_helper(|| boxed_const_int_uncaught(value))
+}
+
 fn alloc_unicode(runtime: &Runtime, bytes: &[u8]) -> Result<*mut PyObject, String> {
 	if core::str::from_utf8(bytes).is_err() {
 		return Err("string constant is not valid UTF-8".to_owned());
@@ -4186,6 +4203,12 @@ unsafe fn type_tag_for_object(object: *mut PyObject) -> TypeTag {
 	if object.is_null() {
 		return TypeTag::Other;
 	}
+	if crate::tag::is_small_int(object) {
+		return TypeTag::IntI64;
+	}
+	if !crate::tag::is_heap(object) {
+		return TypeTag::Other;
+	}
 	if unsafe { bool_::is_exact_bool(object) } {
 		return TypeTag::Bool;
 	}
@@ -4206,18 +4229,17 @@ unsafe fn type_tag_for_object(object: *mut PyObject) -> TypeTag {
 	TypeTag::Other
 }
 
-/// Creates a boxed Phase-A integer.
+/// Creates a Python integer, using a tagged immediate when the value fits.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_const_int(value: i64) -> *mut PyObject {
 	catch_object_helper(|| {
 		if let Err(message) = ensure_runtime_initialized() {
 			return return_null_with_error(message);
 		}
-		match with_runtime(|runtime| alloc_long(runtime, value)) {
-			Some(Ok(object)) => object,
-			Some(Err(message)) => return_null_with_error(message),
-			None => return_null_with_error("runtime is not initialized"),
+		if let Some(object) = crate::tag::try_tag_small_int(value) {
+			return object;
 		}
+		boxed_const_int_uncaught(value)
 	})
 }
 
@@ -4245,10 +4267,12 @@ pub unsafe extern "C" fn pon_const_str(ptr: *const u8, len: usize) -> *mut PyObj
 	})
 }
 
-/// Adds two boxed Phase-A integers through the Phase-B binary dispatcher.
+/// Adds two Python integers through the Phase-B binary dispatcher.
+///
+/// TAG-OK: `number::pon_binary_op` consumes tagged int operands before boxed
+/// fallback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_binary_add(a: *mut PyObject, b: *mut PyObject) -> *mut PyObject {
-	crate::untag_prelude!(a, b);
 	unsafe { number::pon_binary_op(crate::abstract_op::BINARY_ADD, a, b, ptr::null_mut()) }
 }
 
@@ -4479,6 +4503,8 @@ fn maybe_auto_collect() {
 /// pointer — captured before this frame saves any callee-saved register — as
 /// the dispatch record's scan-floor candidate (see [`dispatch_scan_floor`]),
 /// then tail-jumps into [`pon_call_dispatch`].
+///
+/// TAG-OK: the naked shim cannot run Rust; `pon_call_dispatch` normalizes `callee`.
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_call(
@@ -6148,6 +6174,12 @@ pub fn format_object_for_print(value: *mut PyObject) -> Result<String, String> {
 	let fast = with_runtime(|runtime| {
 		// SAFETY: The type checks ensure exact concrete casts.
 		unsafe {
+			if crate::tag::is_small_int(value) {
+				return Some(Ok(crate::tag::untag_small_int(value).to_string()));
+			}
+			if !crate::tag::is_heap(value) {
+				return Some(Err("cannot print non-object immediate".to_owned()));
+			}
 			if let Some(value) = bool_::to_bool(value) {
 				return Some(Ok(if value {
 					"True".to_owned()

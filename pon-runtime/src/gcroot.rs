@@ -193,7 +193,6 @@ mod tests {
 		assert_eq!(registry.held_roots(), vec![kept]);
 	}
 
-	#[cfg(feature = "tagged-ints")]
 	#[test]
 	fn held_roots_drops_tagged_immediates() {
 		let registry = RootRegistry::new();

@@ -4,6 +4,7 @@ use std::{
 };
 
 use pon_runtime::{
+	PyObject,
 	abi::{
 		HELPERS, format_object_for_print,
 		iter::pon_get_iter,
@@ -13,11 +14,18 @@ use pon_runtime::{
 		seq::{pon_build_list, pon_get_len},
 	},
 	pon_err_clear, pon_err_message, pon_err_occurred,
+	tag::{self, SMALL_INT_MAX, SMALL_INT_MIN},
+	types::int,
 };
 
 static RUNTIME_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 const NUMBER_ADD: NumberOp = 0;
+const NUMBER_SUB: NumberOp = 1;
+const NUMBER_MUL: NumberOp = 2;
+const NUMBER_AND: NumberOp = 10;
+const NUMBER_OR: NumberOp = 11;
+const NUMBER_XOR: NumberOp = 12;
 
 const RICH_LT: RichCompareOp = 0;
 const RICH_EQ: RichCompareOp = 2;
@@ -52,6 +60,29 @@ unsafe fn const_str(bytes: &[u8]) -> *mut pon_runtime::PyObject {
 	object
 }
 
+unsafe extern "C" fn prelude_passthrough(object: *mut PyObject) -> *mut PyObject {
+	pon_runtime::untag_prelude!(object);
+	object
+}
+
+#[track_caller]
+fn assert_tagged_int_value(object: *mut PyObject, expected: i64) {
+	assert!(tag::is_small_int(object), "expected tagged immediate for {expected}");
+	assert_eq!(tag::untag_small_int(object), expected);
+}
+
+#[track_caller]
+fn assert_heap_int_value(object: *mut PyObject, expected: &str) {
+	assert!(!object.is_null(), "expected heap int {expected}, got NULL");
+	assert!(tag::is_heap(object), "expected heap pointer for {expected}");
+	assert!(!tag::is_small_int(object), "heap int {expected} must not be tagged");
+	assert!(unsafe { int::is_exact_int(object) }, "expected exact PyLong for {expected}");
+	assert_eq!(
+		unsafe { int::to_bigint(object) }.map(|value| value.to_string()).as_deref(),
+		Some(expected),
+	);
+}
+
 fn assert_prints(object: *mut pon_runtime::PyObject, expected: &str) {
 	assert_eq!(format_object_for_print(object).as_deref(), Ok(expected));
 }
@@ -66,6 +97,109 @@ fn assert_pending_error_mentions_any(expected_fragments: &[&str]) {
 			.any(|fragment| message.contains(fragment)),
 		"expected diagnostic {message:?} to mention one of {expected_fragments:?}",
 	);
+}
+
+#[test]
+fn const_int_tags_in_range_and_boxes_adjacent_out_of_range_i64s() {
+	with_clean_runtime(|| unsafe {
+		for value in [
+			SMALL_INT_MIN,
+			SMALL_INT_MIN + 1,
+			-1,
+			0,
+			1,
+			SMALL_INT_MAX - 1,
+			SMALL_INT_MAX,
+		] {
+			let object = const_int(value);
+			assert_tagged_int_value(object, value);
+		}
+
+		for value in [SMALL_INT_MIN - 1, SMALL_INT_MAX + 1] {
+			let object = const_int(value);
+			assert_heap_int_value(object, &value.to_string());
+		}
+	});
+}
+
+#[test]
+fn untag_arg_and_prelude_box_tagged_ints_to_heap_pylongs() {
+	with_clean_runtime(|| unsafe {
+		let tagged = const_int(-17);
+		assert_tagged_int_value(tagged, -17);
+
+		let direct = tag::untag_arg(tagged);
+		assert_heap_int_value(direct, "-17");
+
+		let through_prelude = prelude_passthrough(tagged);
+		assert_heap_int_value(through_prelude, "-17");
+	});
+}
+
+#[test]
+fn numeric_helpers_keep_small_tagged_results_and_promote_large_int_results() {
+	with_clean_runtime(|| unsafe {
+		for (name, op, left, right, expected) in [
+			("add", NUMBER_ADD, 20, 22, 42),
+			("sub", NUMBER_SUB, 5, 9, -4),
+			("mul", NUMBER_MUL, 7, -6, -42),
+			("and", NUMBER_AND, 0b1100, 0b1010, 0b1000),
+			("or", NUMBER_OR, 0b1100, 0b1010, 0b1110),
+			("xor", NUMBER_XOR, 0b1100, 0b1010, 0b0110),
+		] {
+			pon_err_clear();
+			let result = pon_binary_op(op, const_int(left), const_int(right), ptr::null_mut());
+			assert!(!result.is_null(), "pon_binary_op({name}) returned NULL");
+			assert!(!pon_err_occurred(), "pon_binary_op({name}) left an exception pending");
+			assert_tagged_int_value(result, expected);
+		}
+
+		let just_outside_small = pon_binary_op(
+			NUMBER_ADD,
+			const_int(SMALL_INT_MAX),
+			const_int(1),
+			ptr::null_mut(),
+		);
+		let expected = (SMALL_INT_MAX as i128 + 1).to_string();
+		assert_heap_int_value(just_outside_small, &expected);
+
+		let factor = 3_037_000_500_i64;
+		let large_product = pon_binary_op(NUMBER_MUL, const_int(factor), const_int(factor), ptr::null_mut());
+		let expected = ((factor as i128) * (factor as i128)).to_string();
+		assert_heap_int_value(large_product, &expected);
+	});
+}
+
+#[test]
+fn truth_and_rich_compare_accept_raw_tagged_ints() {
+	with_clean_runtime(|| unsafe {
+		let zero = const_int(0);
+		let minus_three = const_int(-3);
+		let two = const_int(2);
+		assert_tagged_int_value(zero, 0);
+		assert_tagged_int_value(minus_three, -3);
+		assert_tagged_int_value(two, 2);
+
+		assert_eq!(pon_is_true(zero), 0, "tagged zero should be false");
+		assert!(!pon_err_occurred(), "pon_is_true(tagged zero) left an exception pending");
+		assert_eq!(pon_is_true(minus_three), 1, "tagged non-zero int should be true");
+		assert!(
+			!pon_err_occurred(),
+			"pon_is_true(tagged non-zero int) left an exception pending",
+		);
+
+		for (name, op, left, right, expected_truth) in [
+			("-3 < 2", RICH_LT, minus_three, two, 1),
+			("-3 == 0", RICH_EQ, minus_three, zero, 0),
+			("2 > 0", RICH_GT, two, zero, 1),
+		] {
+			pon_err_clear();
+			let comparison = pon_rich_compare(op, left, right, ptr::null_mut());
+			assert!(!comparison.is_null(), "pon_rich_compare({name}) returned NULL");
+			assert!(!pon_err_occurred(), "pon_rich_compare({name}) left an exception pending");
+			assert_eq!(pon_is_true(comparison), expected_truth, "unexpected truth for {name}");
+		}
+	});
 }
 
 #[test]

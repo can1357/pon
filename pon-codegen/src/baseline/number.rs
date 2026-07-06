@@ -15,7 +15,8 @@ use pon_runtime::abstract_op::{
 
 use super::{CodegenError, HelperFuncRefs, LowerState, call_pyobject_helper, declare_string_data};
 
-/// Lower a Phase-A integer literal through `pon_const_int`.
+/// Lower a Phase-A integer literal, directly materializing tagged immediates
+/// when the value fits the runtime tag range.
 pub(crate) fn lower_const_int(
 	builder: &mut FunctionBuilder<'_>,
 	helpers: &HelperFuncRefs,
@@ -23,6 +24,11 @@ pub(crate) fn lower_const_int(
 	ptr_ty: ir::Type,
 	exception_exit: ir::Block,
 ) -> Result<ir::Value, CodegenError> {
+	if ptr_ty.bytes() == 8 && (pon_runtime::tag::SMALL_INT_MIN..=pon_runtime::tag::SMALL_INT_MAX).contains(&value) {
+		let bits = ((value as u64) << 1) | pon_runtime::tag::TAG_INT_BIT as u64;
+		return Ok(builder.ins().iconst(ptr_ty, bits as i64));
+	}
+
 	let arg = builder.ins().iconst(ir::types::I64, value);
 	Ok(call_pyobject_helper(builder, helpers.const_int, &[arg], ptr_ty, exception_exit))
 }

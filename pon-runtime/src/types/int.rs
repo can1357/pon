@@ -33,7 +33,10 @@ pub(crate) unsafe extern "C" fn finalize_bigint_shell(object: *mut u8) {
 /// `expected`.
 #[must_use]
 pub unsafe fn type_name_is(object: *mut PyObject, expected: &str) -> bool {
-	if object.is_null() {
+	if crate::tag::is_small_int(object) {
+		return expected == "int";
+	}
+	if object.is_null() || !crate::tag::is_heap(object) {
 		return false;
 	}
 	let ty = unsafe { (*object).ob_type };
@@ -54,14 +57,18 @@ pub unsafe fn is_exact_int(object: *mut PyObject) -> bool {
 	unsafe { type_name_is(object, "int") }
 }
 
-/// Extracts the arbitrary-precision integer payload for an exact `int` or an
-/// int-subclass instance (IntEnum members, `_NamedIntConstant`, ...), reading
-/// the latter through its embedded canonical payload.
+/// Extracts the arbitrary-precision integer payload for an exact `int`, tagged
+/// small int, or int-subclass instance (IntEnum members, `_NamedIntConstant`,
+/// ...), reading subclasses through their embedded canonical payload.
 #[must_use]
 pub unsafe fn to_bigint(object: *mut PyObject) -> Option<BigInt> {
-	let object = unsafe { crate::types::type_::payload_subclass_value(object) }
-		.map(crate::tag::untag_arg)
-		.unwrap_or(object);
+	if crate::tag::is_small_int(object) {
+		return Some(BigInt::from(crate::tag::untag_small_int(object)));
+	}
+	let object = unsafe { crate::types::type_::payload_subclass_value(object) }.unwrap_or(object);
+	if crate::tag::is_small_int(object) {
+		return Some(BigInt::from(crate::tag::untag_small_int(object)));
+	}
 	if !unsafe { is_exact_int(object) } {
 		return None;
 	}
@@ -76,18 +83,76 @@ pub unsafe fn to_bigint(object: *mut PyObject) -> Option<BigInt> {
 	Some(BigInt::from(unsafe { (*object.cast::<PyLong>()).value }))
 }
 
-/// Boxes an arbitrary-precision integer as a `PyLong`.
+/// Extracts an `i64` payload without allocating when the integer is compact.
+#[must_use]
+pub unsafe fn to_i64(object: *mut PyObject) -> Option<i64> {
+	if crate::tag::is_small_int(object) {
+		return Some(crate::tag::untag_small_int(object));
+	}
+	let object = unsafe { crate::types::type_::payload_subclass_value(object) }.unwrap_or(object);
+	if crate::tag::is_small_int(object) {
+		return Some(crate::tag::untag_small_int(object));
+	}
+	if !unsafe { is_exact_int(object) } {
+		return None;
+	}
+	let key = object as usize;
+	if let Some(value) = BIG_INTS
+		.lock()
+		.unwrap_or_else(|poison| poison.into_inner())
+		.get(&key)
+	{
+		return value.to_i64();
+	}
+	Some(unsafe { (*object.cast::<PyLong>()).value })
+}
+
+/// Extracts an inline `i64` from a tagged immediate or exact boxed `int`.
 ///
-/// Values that fit in the Phase-A inline `i64` payload keep using
-/// `pon_const_int`, preserving the existing small-integer path. Wider values
-/// are represented by a normal `PyLong` shell plus an out-of-line BigInt
-/// payload keyed by object address.
+/// Out-of-line `BIG_INTS` payloads and int subclasses return `None` so callers
+/// can fall back to arbitrary precision or full numeric dispatch.
+#[must_use]
+pub unsafe fn to_exact_inline_i64(object: *mut PyObject) -> Option<i64> {
+	if crate::tag::is_small_int(object) {
+		return Some(crate::tag::untag_small_int(object));
+	}
+	if !unsafe { is_exact_int(object) } {
+		return None;
+	}
+	let value = unsafe { (*object.cast::<PyLong>()).value };
+	// `from_bigint` builds every out-of-line shell with value 0, so nonzero
+	// exact ints never need to take the `BIG_INTS` lock.
+	if value == 0
+		&& BIG_INTS
+			.lock()
+			.unwrap_or_else(|poison| poison.into_inner())
+			.contains_key(&(object as usize))
+	{
+		return None;
+	}
+	Some(value)
+}
+
+/// Extracts an inline `i64` from exact built-in `int` or `bool` objects.
+#[must_use]
+pub unsafe fn to_exact_inline_i64_including_bool(object: *mut PyObject) -> Option<i64> {
+	if let Some(value) = unsafe { crate::types::bool_::to_bool(object) } {
+		return Some(i64::from(value));
+	}
+	unsafe { to_exact_inline_i64(object) }
+}
+
+/// Creates a Python integer from an arbitrary-precision payload.
+///
+/// Values that fit in `i64` use `pon_const_int`, which returns a tagged
+/// immediate for the small-int range. Wider values are represented by a normal
+/// `PyLong` shell plus an out-of-line BigInt payload keyed by object address.
 #[must_use]
 pub fn from_bigint(value: BigInt) -> *mut PyObject {
 	if let Some(inline) = value.to_i64() {
 		return unsafe { abi::pon_const_int(inline) };
 	}
-	let template = unsafe { abi::pon_const_int(0) };
+	let template = crate::abi::boxed_const_int(0);
 	if template.is_null() {
 		return template;
 	}
@@ -101,7 +166,7 @@ pub fn from_bigint(value: BigInt) -> *mut PyObject {
 	object
 }
 
-/// Boxes a signed 64-bit integer through the compatibility constructor.
+/// Creates a Python integer from a signed 64-bit payload.
 #[must_use]
 pub fn from_i64(value: i64) -> *mut PyObject {
 	unsafe { abi::pon_const_int(value) }
@@ -120,13 +185,28 @@ pub fn from_literal_token(text: &str) -> *mut PyObject {
 	}
 }
 
-/// Extracts an integer payload from exact `int` and `bool` objects.
+/// Extracts an integer payload from exact `int`, tagged small int, and `bool` objects.
 #[must_use]
 pub unsafe fn to_bigint_including_bool(object: *mut PyObject) -> Option<BigInt> {
+	if crate::tag::is_small_int(object) {
+		return Some(BigInt::from(crate::tag::untag_small_int(object)));
+	}
 	if let Some(value) = unsafe { crate::types::bool_::to_bool(object) } {
 		return Some(BigInt::from(i32::from(value)));
 	}
 	unsafe { to_bigint(object) }
+}
+
+/// Extracts an `i64` payload from exact `int`, tagged small int, and `bool` objects.
+#[must_use]
+pub unsafe fn to_i64_including_bool(object: *mut PyObject) -> Option<i64> {
+	if crate::tag::is_small_int(object) {
+		return Some(crate::tag::untag_small_int(object));
+	}
+	if let Some(value) = unsafe { crate::types::bool_::to_bool(object) } {
+		return Some(i64::from(value));
+	}
+	unsafe { to_i64(object) }
 }
 
 /// Implements the built-in `int()` constructor once the builtin shim has sliced
@@ -415,7 +495,7 @@ fn python_string_repr(text: &str) -> String {
 
 /// Installs integer slots on the runtime `int` type reached from an object.
 pub unsafe fn install_slots_for_object(object: *mut PyObject) {
-	if !unsafe { is_exact_int(object) } {
+	if object.is_null() || !crate::tag::is_heap(object) || !unsafe { is_exact_int(object) } {
 		return;
 	}
 	let ty = unsafe { (*object).ob_type.cast_mut() };

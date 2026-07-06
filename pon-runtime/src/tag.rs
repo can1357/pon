@@ -44,41 +44,20 @@ const _: () = assert!(
 );
 
 /// Returns true when `p` is a tagged immediate small integer.
-///
-/// With `tagged-ints` disabled this is a constant `false`, so guarded
-/// call sites fold away and behave exactly as before the tagging cutover.
 #[inline(always)]
 #[must_use]
 pub fn is_small_int(p: *mut PyObject) -> bool {
-	#[cfg(feature = "tagged-ints")]
-	{
-		p.addr() & TAG_INT_BIT != 0
-	}
-	#[cfg(not(feature = "tagged-ints"))]
-	{
-		let _ = p;
-		false
-	}
+	p.addr() & TAG_INT_BIT != 0
 }
 
 /// Returns true when `p` is an ordinary heap object pointer (low bits `00`).
 ///
 /// NULL also reports true: it is not an immediate, and every helper keeps its
-/// existing NULL-sentinel discipline ahead of any tag test.  With
-/// `tagged-ints` disabled every value is a heap pointer, so this is a
-/// constant `true` and write-once call sites need no cfg guard.
+/// existing NULL-sentinel discipline ahead of any tag test.
 #[inline(always)]
 #[must_use]
 pub fn is_heap(p: *mut PyObject) -> bool {
-	#[cfg(feature = "tagged-ints")]
-	{
-		p.addr() & TAG_MASK == TAG_HEAP
-	}
-	#[cfg(not(feature = "tagged-ints"))]
-	{
-		let _ = p;
-		true
-	}
+	p.addr() & TAG_MASK == TAG_HEAP
 }
 
 /// Encodes an in-range value as a tagged immediate: `(v << 1) | 1`.
@@ -90,19 +69,11 @@ pub fn is_heap(p: *mut PyObject) -> bool {
 #[inline(always)]
 #[must_use]
 pub fn tag_small_int(v: i64) -> *mut PyObject {
-	#[cfg(feature = "tagged-ints")]
-	{
-		debug_assert!(
-			(SMALL_INT_MIN..=SMALL_INT_MAX).contains(&v),
-			"tag_small_int: {v} outside the 63-bit immediate range",
-		);
-		core::ptr::without_provenance_mut::<PyObject>(((v as usize) << 1) | TAG_INT_BIT)
-	}
-	#[cfg(not(feature = "tagged-ints"))]
-	{
-		let _ = v;
-		unreachable!("tag_small_int called without the tagged-ints feature")
-	}
+	debug_assert!(
+		(SMALL_INT_MIN..=SMALL_INT_MAX).contains(&v),
+		"tag_small_int: {v} outside the 63-bit immediate range",
+	);
+	core::ptr::without_provenance_mut::<PyObject>(((v as usize) << 1) | TAG_INT_BIT)
 }
 
 /// Decodes a tagged immediate produced by [`tag_small_int`].
@@ -113,37 +84,18 @@ pub fn tag_small_int(v: i64) -> *mut PyObject {
 #[inline(always)]
 #[must_use]
 pub fn untag_small_int(p: *mut PyObject) -> i64 {
-	#[cfg(feature = "tagged-ints")]
-	{
-		debug_assert!(is_small_int(p), "untag_small_int on a non-immediate value");
-		(p.addr() as i64) >> 1
-	}
-	#[cfg(not(feature = "tagged-ints"))]
-	{
-		let _ = p;
-		unreachable!("untag_small_int called without the tagged-ints feature")
-	}
+	debug_assert!(is_small_int(p), "untag_small_int on a non-immediate value");
+	(p.addr() as i64) >> 1
 }
 
 /// Encodes `v` as a tagged immediate, or returns `None` when it does not fit
 /// the 63-bit range.
-///
-/// With `tagged-ints` disabled this is a constant `None`: producers written
-/// once against this API keep boxing every integer until the cutover.
 #[inline(always)]
 #[must_use]
 pub fn try_tag_small_int(v: i64) -> Option<*mut PyObject> {
-	#[cfg(feature = "tagged-ints")]
-	{
-		if (SMALL_INT_MIN..=SMALL_INT_MAX).contains(&v) {
-			Some(tag_small_int(v))
-		} else {
-			None
-		}
-	}
-	#[cfg(not(feature = "tagged-ints"))]
-	{
-		let _ = v;
+	if (SMALL_INT_MIN..=SMALL_INT_MAX).contains(&v) {
+		Some(tag_small_int(v))
+	} else {
 		None
 	}
 }
@@ -151,9 +103,9 @@ pub fn try_tag_small_int(v: i64) -> Option<*mut PyObject> {
 /// Normalizes a possibly-tagged helper argument into a boxed `*mut PyObject`.
 ///
 /// Heap pointers (and NULL) pass through untouched.  A tagged immediate is
-/// boxed through [`crate::types::int::from_i64`] (the Phase-A `pon_const_int`
-/// path); on allocation failure this returns NULL with the thread-state error
-/// already set, exactly like every other allocating helper.
+/// boxed through [`crate::abi::boxed_const_int`], which deliberately bypasses
+/// `pon_const_int` so enabling tagged producers cannot make normalization loop.
+/// On allocation failure this returns NULL with the thread-state error already set.
 ///
 /// This is the slow-path floor used by [`untag_prelude!`]; helpers with a
 /// dedicated immediate fast path test [`is_small_int`] themselves instead and
@@ -162,7 +114,7 @@ pub fn try_tag_small_int(v: i64) -> Option<*mut PyObject> {
 #[must_use]
 pub fn untag_arg(p: *mut PyObject) -> *mut PyObject {
 	if is_small_int(p) {
-		crate::types::int::from_i64(untag_small_int(p))
+		crate::abi::boxed_const_int(untag_small_int(p))
 	} else {
 		p
 	}
@@ -214,8 +166,8 @@ macro_rules! untag_prelude {
 mod macro_tests {
 	use crate::object::PyObject;
 
-	/// Shape-A helper compiled in BOTH feature configurations: proves the
-	/// macro expands and type-checks with the default NULL sentinel.
+	/// Shape-A helper proves the macro expands and type-checks with the default
+	/// NULL sentinel.
 	unsafe extern "C" fn passthrough(o: *mut PyObject) -> *mut PyObject {
 		untag_prelude!(o);
 		o
@@ -242,7 +194,6 @@ mod macro_tests {
 		}
 	}
 
-	#[cfg(feature = "tagged-ints")]
 	#[test]
 	fn prelude_boxes_tagged_arguments() {
 		let _guard = crate::thread_state::test_state_lock();
@@ -262,7 +213,7 @@ mod macro_tests {
 	}
 }
 
-#[cfg(all(test, feature = "tagged-ints"))]
+#[cfg(test)]
 mod tests {
 	use super::*;
 

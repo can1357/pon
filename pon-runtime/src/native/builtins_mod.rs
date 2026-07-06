@@ -3494,7 +3494,7 @@ mod tests {
 
 	fn int_value(object: *mut PyObject) -> i64 {
 		assert!(!object.is_null());
-		unsafe { (*object.cast::<PyLong>()).value }
+		unsafe { crate::types::int::to_i64(object).expect("expected int result") }
 	}
 
 	unsafe extern "C" fn constant_zero_key(

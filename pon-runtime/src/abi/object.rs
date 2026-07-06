@@ -13,6 +13,8 @@ pub use abstract_op::{RICH_EQ, RICH_GE, RICH_GT, RICH_LE, RICH_LT, RICH_NE};
 
 /// Dispatches a Python rich comparison and returns the raw result object
 /// (a user dunder's return value passes through uncoerced, as in CPython).
+///
+/// TAG-OK: numeric tagged operands are handled before boxed generic fallback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_rich_compare(
 	op: RichCompareOp,
@@ -20,16 +22,17 @@ pub unsafe extern "C" fn pon_rich_compare(
 	b: *mut PyObject,
 	feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
-	crate::untag_prelude!(a, b);
 	unsafe { super::record_feedback_binary(feedback, a, b) };
 	super::catch_object_helper(|| unsafe { abstract_op::rich_compare(op, a, b) })
 }
 
 /// Computes Python truth.  Returns `1`, `0`, or `-1` with the current
 /// exception.
+///
+/// TAG-OK: tagged small ints truth-test without boxing in
+/// `abstract_op::is_true`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_is_true(object: *mut PyObject) -> i32 {
-	crate::untag_prelude!(err = -1; object);
 	super::catch_status_helper(|| unsafe { abstract_op::is_true(object) })
 }
 

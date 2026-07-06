@@ -11,7 +11,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use pon_gc::{GcTypeInfo, TypeId};
 
 use crate::{
-	object::{PyLong, PyObject, PyType, as_object_ptr},
+	object::{PyObject, PyType, as_object_ptr},
 	thread_state::pon_err_set,
 	types::{dict, frozenset, method, set_},
 };
@@ -488,10 +488,9 @@ pub unsafe extern "C" fn pon_subscript_set(
 					.as_ref()
 					.and_then(|methods| methods.sq_ass_item)
 			} {
-				if unsafe { dict::type_name(key) } != Some("int") {
+				let Some(index) = (unsafe { crate::types::int::to_i64_including_bool(key) }) else {
 					return raise_map_type_error("sequence index must be an int");
-				}
-				let index = unsafe { (*key.cast::<PyLong>()).value };
+				};
 				let Ok(index) = isize::try_from(index) else {
 					return null_error("sequence index is out of range for this platform");
 				};
@@ -3021,7 +3020,6 @@ mod tests {
 	use super::*;
 	use crate::{
 		abi::{pon_const_int, pon_runtime_init},
-		object::PyLong,
 		thread_state::test_state_lock,
 	};
 
@@ -3041,12 +3039,16 @@ mod tests {
 			assert_eq!(pon_map_insert(dict, key, new_value), dict);
 			let loaded = pon_dict_get_item(dict, key);
 			assert!(!loaded.is_null());
-			assert_eq!((*loaded.cast::<PyLong>()).value, 3);
+			assert_eq!(crate::types::int::to_i64(loaded), Some(3));
 
 			let default_key = pon_const_int(4);
 			let default_value = pon_const_int(5);
-			assert_eq!(pon_dict_setdefault(dict, default_key, default_value), default_value);
-			assert_eq!(pon_dict_pop(dict, default_key, ptr::null_mut()), default_value);
+			let inserted_default = pon_dict_setdefault(dict, default_key, default_value);
+			assert!(!inserted_default.is_null());
+			assert_eq!(crate::types::int::to_i64(inserted_default), Some(5));
+			let popped_default = pon_dict_pop(dict, default_key, ptr::null_mut());
+			assert!(!popped_default.is_null());
+			assert_eq!(crate::types::int::to_i64(popped_default), Some(5));
 
 			let set = pon_build_set(ptr::null_mut(), 0);
 			assert!(!set.is_null());

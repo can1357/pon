@@ -26,6 +26,7 @@ pub use abstract_op::{
 };
 
 enum NumericValue {
+	IntI64(i64),
 	Int(BigInt),
 	Float(f64),
 	Complex(f64, f64),
@@ -69,6 +70,9 @@ pub unsafe extern "C" fn pon_const_bigint(ptr: *const u8, len: usize) -> *mut Py
 
 /// Dispatches a Python binary operation and returns NULL with the current
 /// exception set on error.
+///
+/// TAG-OK: tagged integer operands are consumed by `numeric_value` before boxed
+/// fallback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_binary_op(
 	op: NumberOp,
@@ -76,7 +80,6 @@ pub unsafe extern "C" fn pon_binary_op(
 	b: *mut PyObject,
 	feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
-	crate::untag_prelude!(a, b);
 	unsafe { super::record_feedback_binary(feedback, a, b) };
 	unsafe { binary_op_with_flavor(op, a, b, false) }
 }
@@ -92,23 +95,16 @@ pub(crate) unsafe fn binary_op_with_flavor(
 	b: *mut PyObject,
 	inplace: bool,
 ) -> *mut PyObject {
-	super::catch_object_helper(|| {
-		unsafe {
-			install_runtime_int_slots(a);
-			install_runtime_int_slots(b);
-		}
-
-		match unsafe { (numeric_value(a), numeric_value(b)) } {
-			(Some(left), Some(right)) => {
-				let result = binary_numeric(op, left, right);
-				if !result.is_null() && unsafe { abstract_op::is_not_implemented(result) } {
-					unsafe { abstract_op::binary_op_flavored(op, a, b, inplace) }
-				} else {
-					result
-				}
-			},
-			_ => unsafe { abstract_op::binary_op_flavored(op, a, b, inplace) },
-		}
+	super::catch_object_helper(|| match unsafe { (numeric_value(a), numeric_value(b)) } {
+		(Some(left), Some(right)) => {
+			let result = binary_numeric(op, left, right);
+			if !result.is_null() && unsafe { abstract_op::is_not_implemented(result) } {
+				unsafe { binary_fallback(op, a, b, inplace) }
+			} else {
+				result
+			}
+		},
+		_ => unsafe { binary_fallback(op, a, b, inplace) },
 	})
 }
 
@@ -128,6 +124,8 @@ pub unsafe fn pon_binary_numeric_slot(
 }
 
 /// Phase-B helper-table alias for binary numeric dispatch.
+///
+/// TAG-OK: `pon_binary_op` handles tagged operands before boxed fallback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_number_binary(
 	op: NumberOp,
@@ -135,39 +133,36 @@ pub unsafe extern "C" fn pon_number_binary(
 	b: *mut PyObject,
 	feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
-	crate::untag_prelude!(a, b);
 	unsafe { pon_binary_op(op, a, b, feedback) }
 }
 
 /// Dispatches a Python unary operation and returns NULL with the current
 /// exception set on error.
+///
+/// TAG-OK: tagged integer operands are consumed by `numeric_value` before boxed
+/// fallback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_unary_op(
 	op: NumberOp,
 	a: *mut PyObject,
 	feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
-	crate::untag_prelude!(a);
 	unsafe { super::record_feedback_unary(feedback, a) };
-	super::catch_object_helper(|| {
-		unsafe {
-			install_runtime_int_slots(a);
-		}
-		match unsafe { numeric_value(a) } {
-			Some(value) => unary_numeric(op, value),
-			None => unsafe { abstract_op::unary_op(op, a) },
-		}
+	super::catch_object_helper(|| match unsafe { numeric_value(a) } {
+		Some(value) => unary_numeric(op, value),
+		None => unsafe { unary_fallback(op, a) },
 	})
 }
 
 /// Phase-B helper-table alias for unary numeric dispatch.
+///
+/// TAG-OK: `pon_unary_op` handles tagged operands before boxed fallback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_number_unary(
 	op: NumberOp,
 	a: *mut PyObject,
 	feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
-	crate::untag_prelude!(a);
 	unsafe { pon_unary_op(op, a, feedback) }
 }
 
@@ -175,6 +170,9 @@ pub unsafe extern "C" fn pon_number_unary(
 /// first (CPython `binary_iop1`; PEP 584 `dict.__ior__` mutates and returns
 /// the SAME object); anything unhandled falls back to the plain binary
 /// dispatch, whose terminal TypeError uses the `=`-suffixed spelling.
+///
+/// TAG-OK: exact tagged-int receivers have no in-place hooks and go through the
+/// numeric path.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_number_inplace(
 	op: NumberOp,
@@ -182,21 +180,32 @@ pub unsafe extern "C" fn pon_number_inplace(
 	b: *mut PyObject,
 	feedback: *mut FeedbackCell,
 ) -> *mut PyObject {
-	crate::untag_prelude!(a, b);
 	unsafe { super::record_feedback_binary(feedback, a, b) };
 	super::catch_object_helper(|| {
-		if let Some(result) = unsafe { abstract_op::try_inplace_binary(op, a, b) } {
-			return result;
+		if crate::tag::is_small_int(a) {
+			if let (Some(left), Some(right)) = unsafe { (numeric_value(a), numeric_value(b)) } {
+				let result = binary_numeric(op, left, right);
+				if result.is_null() || !unsafe { abstract_op::is_not_implemented(result) } {
+					return result;
+				}
+			}
 		}
-		unsafe { binary_op_with_flavor(op, a, b, true) }
+		unsafe { inplace_binary_fallback(op, a, b) }
 	})
 }
 
 /// Implements `operator.index`: exact ints pass through, bool converts to `0`
 /// or `1`, and non-indexable values raise `TypeError`.
+///
+/// TAG-OK: tagged small ints are already canonical exact-int values.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_index(object: *mut PyObject) -> *mut PyObject {
-	crate::untag_prelude!(object);
+	if crate::tag::is_small_int(object) {
+		return object;
+	}
+	let Some(object) = normalize_tagged_arg(object) else {
+		return core::ptr::null_mut();
+	};
 	super::catch_object_helper(|| {
 		unsafe {
 			install_runtime_int_slots(object);
@@ -227,7 +236,6 @@ pub unsafe extern "C" fn pon_index(object: *mut PyObject) -> *mut PyObject {
 				if result.is_null() {
 					return core::ptr::null_mut();
 				}
-				let result = crate::tag::untag_arg(result);
 				if let Some(value) = unsafe { int::to_bigint(result) } {
 					return int::from_bigint(value);
 				}
@@ -246,6 +254,9 @@ pub fn abs_object(object: *mut PyObject) -> *mut PyObject {
 			install_runtime_int_slots(object);
 		}
 		match unsafe { numeric_value(object) } {
+			Some(NumericValue::IntI64(value)) => value
+				.checked_abs()
+				.map_or_else(|| int::from_bigint(BigInt::from(value).abs()), int::from_i64),
 			Some(NumericValue::Int(value)) => int::from_bigint(value.abs()),
 			Some(NumericValue::Float(value)) => float::from_f64(value.abs()),
 			Some(NumericValue::Complex(real, imag)) => float::from_f64(real.hypot(imag)),
@@ -263,10 +274,15 @@ pub fn divmod_objects(left: *mut PyObject, right: *mut PyObject) -> *mut PyObjec
 			install_runtime_int_slots(right);
 		}
 		match unsafe { (numeric_value(left), numeric_value(right)) } {
-			(Some(NumericValue::Int(left)), Some(NumericValue::Int(right))) => {
-				divmod_ints(&left, &right)
+			(Some(left), Some(right)) => {
+				if let (Some(left), Some(right)) =
+					(numeric_int_bigint(&left), numeric_int_bigint(&right))
+				{
+					divmod_ints(&left, &right)
+				} else {
+					divmod_reals(left, right)
+				}
 			},
-			(Some(left), Some(right)) => divmod_reals(left, right),
 			_ => raise_type_error("unsupported operands for divmod()"),
 		}
 	})
@@ -301,14 +317,16 @@ fn divmod_reals(left: NumericValue, right: NumericValue) -> *mut PyObject {
 ///
 /// On error this follows the scalar-sentinel ABI shape: it sets the current
 /// exception and returns `NaN`.
+///
+/// TAG-OK: tagged integer operands are converted directly by `numeric_value`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pon_number_as_f64(object: *mut PyObject) -> f64 {
-	crate::untag_prelude!(err = f64::NAN; object);
 	match super::catch_object_helper(|| {
 		unsafe {
 			install_runtime_int_slots(object);
 		}
 		match unsafe { numeric_value(object) } {
+			Some(NumericValue::IntI64(value)) => float::from_f64(value as f64),
 			Some(NumericValue::Int(value)) => match value.to_f64() {
 				Some(value) => float::from_f64(value),
 				None => raise_type_error("int too large to convert to float"),
@@ -324,12 +342,75 @@ pub unsafe extern "C" fn pon_number_as_f64(object: *mut PyObject) -> f64 {
 }
 
 unsafe fn install_runtime_int_slots(object: *mut PyObject) {
+	if object.is_null() || !crate::tag::is_heap(object) {
+		return;
+	}
 	unsafe { int::install_slots_for_object(object) };
 }
 
+fn normalize_tagged_arg(object: *mut PyObject) -> Option<*mut PyObject> {
+	let normalized = crate::tag::untag_arg(object);
+	if crate::tag::is_small_int(object) && normalized.is_null() {
+		None
+	} else {
+		Some(normalized)
+	}
+}
+
+fn normalize_binary_args(
+	a: *mut PyObject,
+	b: *mut PyObject,
+) -> Option<(*mut PyObject, *mut PyObject)> {
+	Some((normalize_tagged_arg(a)?, normalize_tagged_arg(b)?))
+}
+
+unsafe fn binary_fallback(
+	op: NumberOp,
+	a: *mut PyObject,
+	b: *mut PyObject,
+	inplace: bool,
+) -> *mut PyObject {
+	let Some((a, b)) = normalize_binary_args(a, b) else {
+		return core::ptr::null_mut();
+	};
+	unsafe {
+		install_runtime_int_slots(a);
+		install_runtime_int_slots(b);
+		abstract_op::binary_op_flavored(op, a, b, inplace)
+	}
+}
+
+unsafe fn unary_fallback(op: NumberOp, a: *mut PyObject) -> *mut PyObject {
+	let Some(a) = normalize_tagged_arg(a) else {
+		return core::ptr::null_mut();
+	};
+	unsafe {
+		install_runtime_int_slots(a);
+		abstract_op::unary_op(op, a)
+	}
+}
+
+unsafe fn inplace_binary_fallback(
+	op: NumberOp,
+	a: *mut PyObject,
+	b: *mut PyObject,
+) -> *mut PyObject {
+	let Some((a, b)) = normalize_binary_args(a, b) else {
+		return core::ptr::null_mut();
+	};
+	unsafe {
+		install_runtime_int_slots(a);
+		install_runtime_int_slots(b);
+		if let Some(result) = abstract_op::try_inplace_binary(op, a, b) {
+			return result;
+		}
+		binary_op_with_flavor(op, a, b, true)
+	}
+}
+
 unsafe fn numeric_value(object: *mut PyObject) -> Option<NumericValue> {
-	if let Some(value) = unsafe { bool_::to_bool(object) } {
-		return Some(NumericValue::Int(BigInt::from(if value { 1 } else { 0 })));
+	if let Some(value) = unsafe { int::to_exact_inline_i64_including_bool(object) } {
+		return Some(NumericValue::IntI64(value));
 	}
 	if let Some(value) = unsafe { int::to_bigint(object) } {
 		return Some(NumericValue::Int(value));
@@ -346,8 +427,45 @@ fn binary_numeric(op: NumberOp, left: NumericValue, right: NumericValue) -> *mut
 			binary_complex(op, left, right)
 		},
 		(NumericValue::Float(_), _) | (_, NumericValue::Float(_)) => binary_float(op, left, right),
+		(NumericValue::IntI64(left), NumericValue::IntI64(right)) => binary_i64(op, *left, *right),
+		(NumericValue::IntI64(left), NumericValue::Int(right)) => {
+			binary_int(op, &BigInt::from(*left), right)
+		},
+		(NumericValue::Int(left), NumericValue::IntI64(right)) => {
+			binary_int(op, left, &BigInt::from(*right))
+		},
 		(NumericValue::Int(left), NumericValue::Int(right)) => binary_int(op, left, right),
 	}
+}
+
+fn numeric_int_bigint(value: &NumericValue) -> Option<BigInt> {
+	match value {
+		NumericValue::IntI64(value) => Some(BigInt::from(*value)),
+		NumericValue::Int(value) => Some(value.clone()),
+		NumericValue::Float(_) | NumericValue::Complex(..) => None,
+	}
+}
+
+fn binary_i64(op: NumberOp, left: i64, right: i64) -> *mut PyObject {
+	match op {
+		BINARY_ADD => left
+			.checked_add(right)
+			.map_or_else(|| binary_i64_fallback(op, left, right), int::from_i64),
+		BINARY_SUB => left
+			.checked_sub(right)
+			.map_or_else(|| binary_i64_fallback(op, left, right), int::from_i64),
+		BINARY_MUL => left
+			.checked_mul(right)
+			.map_or_else(|| binary_i64_fallback(op, left, right), int::from_i64),
+		BINARY_AND => int::from_i64(left & right),
+		BINARY_OR => int::from_i64(left | right),
+		BINARY_XOR => int::from_i64(left ^ right),
+		_ => binary_i64_fallback(op, left, right),
+	}
+}
+
+fn binary_i64_fallback(op: NumberOp, left: i64, right: i64) -> *mut PyObject {
+	binary_int(op, &BigInt::from(left), &BigInt::from(right))
 }
 
 fn binary_int(op: NumberOp, left: &BigInt, right: &BigInt) -> *mut PyObject {
@@ -511,6 +629,14 @@ fn pow_complex(left_real: f64, left_imag: f64, right_real: f64, right_imag: f64)
 
 fn unary_numeric(op: NumberOp, value: NumericValue) -> *mut PyObject {
 	match value {
+		NumericValue::IntI64(value) => match op {
+			UNARY_NEG => value
+				.checked_neg()
+				.map_or_else(|| int::from_bigint(-BigInt::from(value)), int::from_i64),
+			UNARY_POS => int::from_i64(value),
+			UNARY_INVERT => int::from_i64(!value),
+			_ => raise_type_error(unary_unsupported_message(op)),
+		},
 		NumericValue::Int(value) => match op {
 			UNARY_NEG => int::from_bigint(-value),
 			UNARY_POS => int::from_bigint(value),
@@ -534,6 +660,7 @@ fn unary_numeric(op: NumberOp, value: NumericValue) -> *mut PyObject {
 
 fn real_as_f64(value: NumericValue) -> Option<f64> {
 	match value {
+		NumericValue::IntI64(value) => Some(value as f64),
 		NumericValue::Int(value) => value.to_f64(),
 		NumericValue::Float(value) => Some(value),
 		NumericValue::Complex(..) => None,
@@ -542,6 +669,7 @@ fn real_as_f64(value: NumericValue) -> Option<f64> {
 
 fn as_complex(value: NumericValue) -> Option<(f64, f64)> {
 	match value {
+		NumericValue::IntI64(value) => Some((value as f64, 0.0)),
 		NumericValue::Int(value) => value.to_f64().map(|value| (value, 0.0)),
 		NumericValue::Float(value) => Some((value, 0.0)),
 		NumericValue::Complex(real, imag) => Some((real, imag)),

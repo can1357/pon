@@ -941,10 +941,10 @@ pub fn as_object_ptr<T>(value: *mut T) -> *mut PyObject {
 /// Returns true when `object` has exactly the requested runtime type pointer.
 #[must_use]
 pub unsafe fn is_exact_type(object: *mut PyObject, ty: *const PyType) -> bool {
-	if object.is_null() {
+	if object.is_null() || !crate::tag::is_heap(object) {
 		return false;
 	}
-	// SAFETY: Non-null boxed values always begin with `PyObjectHeader`.
+	// SAFETY: Non-null heap values always begin with `PyObjectHeader`.
 	unsafe { ptr::addr_of!((*object).ob_type).read() == ty }
 }
 

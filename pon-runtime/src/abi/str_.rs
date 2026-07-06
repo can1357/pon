@@ -14,7 +14,7 @@ use std::{
 use crate::{
 	gcroot::{HeldRoots, RootRegistry},
 	object::{
-		PyLong, PyMappingMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType, PyUnicode,
+		PyMappingMethods, PyObject, PyObjectHeader, PySequenceMethods, PyType, PyUnicode,
 		as_object_ptr, is_exact_type,
 	},
 	types::{
@@ -2663,16 +2663,7 @@ pub(crate) fn format_object_with_spec(value: *mut PyObject, spec: &str) -> Resul
 }
 
 fn object_to_i64(value: *mut PyObject) -> Option<i64> {
-	if value.is_null() {
-		return None;
-	}
-	if let Some(value) = unsafe { crate::types::bool_::to_bool(value) } {
-		return Some(i64::from(value));
-	}
-	super::with_runtime(|runtime| unsafe {
-		is_exact_type(value, runtime.long_type).then(|| (*value.cast::<PyLong>()).value)
-	})
-	.flatten()
+	unsafe { crate::types::int::to_i64_including_bool(value) }
 }
 
 fn str_split_method(receiver: &str, args: &[*mut PyObject]) -> *mut PyObject {
@@ -4818,20 +4809,8 @@ fn str_long_value(value: *mut PyObject) -> Result<i64, String> {
 	}
 	// `bool <: int`: string indexes, slice bounds, and count arguments
 	// accept True/False exactly like 1/0 (CPython shared long payload).
-	if let Some(value) = unsafe { crate::types::bool_::to_bool(value) } {
-		return Ok(i64::from(value));
-	}
-	if let Err(message) = super::ensure_runtime_initialized() {
-		return Err(message);
-	}
-	super::with_runtime(|runtime| unsafe {
-		if is_exact_type(value, runtime.long_type) {
-			Ok((*value.cast::<PyLong>()).value)
-		} else {
-			Err("expected int object".to_owned())
-		}
-	})
-	.unwrap_or_else(|| Err("runtime is not initialized".to_owned()))
+	unsafe { crate::types::int::to_i64_including_bool(value) }
+		.ok_or_else(|| "expected int object".to_owned())
 }
 
 fn repeat_count_value(value: *mut PyObject) -> Result<isize, String> {
