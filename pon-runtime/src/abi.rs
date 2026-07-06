@@ -5782,14 +5782,11 @@ pub unsafe extern "C" fn pon_load_global(
 		}
 		// J0.3 capture discipline: version BEFORE the lookup.
 		let version = namespace_version();
-		// CPython `__globals__` scoping: the executing function's defining
-		// module wins over the caller's active module, which wins over the
-		// flat pool (builtins + cross-module last-writer fallback).
-		let resolved = defining_module_attr(name_interned)
-			.or_else(|| crate::import::active_module_attr(name_interned))
-			.or_else(|| {
-				with_runtime(|runtime| runtime.globals.get(&name_interned).copied()).flatten()
-			});
+		// CPython `__globals__` scoping: a function's globals are its
+		// defining module's namespace then builtins — the caller's active
+		// module must never leak in (numpy's module-level `min` shadowing
+		// the builtin inside `re._parser.getwidth` was exactly that leak).
+		let resolved = resolve_global_binding(name_interned);
 		match resolved {
 			Some(value) => {
 				if let Some(cell) = unsafe { feedback.as_ref() } {
@@ -5835,9 +5832,7 @@ pub unsafe extern "C" fn pon_load_name(name_interned: u32) -> *mut PyObject {
 				return value;
 			}
 		}
-		defining_module_attr(name_interned)
-			.or_else(|| crate::import::active_module_attr(name_interned))
-			.or_else(|| with_runtime(|runtime| runtime.globals.get(&name_interned).copied()).flatten())
+		resolve_global_binding(name_interned)
 			.unwrap_or_else(|| {
 				let name =
 					resolve(name_interned).unwrap_or_else(|| format!("<interned:{name_interned}>"));
@@ -6532,17 +6527,26 @@ fn module_context_registry_key(module_name: u32, module_object: *mut PyObject) -
 	}
 }
 
-/// Resolve `name` in the executing function's defining-module namespace.
-/// `None` when no scoped function is executing, when the module is gone, or
-/// when the module does not bind the name — callers then fall back to the
-/// active-module / flat-pool layers.
-fn defining_module_attr(name: u32) -> Option<*mut PyObject> {
-	let (module_name, module_object) = current_defining_module_context()?;
-	if module_object.is_null() {
-		crate::import::module_attr(module_name, name)
-	} else {
-		crate::import::module_object_attr(module_object, name)
-	}
+/// Resolves a module-global or builtin name per CPython `__globals__` scoping.
+///
+/// A compiled function executing with a recorded defining module resolves
+/// through that module's namespace and then the flat builtins pool; the
+/// caller's active module never shadows another module's globals.  Without a
+/// scoped function (module top level, embedding, dropped module record) the
+/// active module namespace applies before builtins.
+pub(crate) fn resolve_global_binding(name: u32) -> Option<*mut PyObject> {
+	let module_attr = match current_defining_module_context() {
+		Some((module_name, module_object)) => {
+			if module_object.is_null() {
+				crate::import::module_attr(module_name, name)
+			} else {
+				crate::import::module_object_attr(module_object, name)
+			}
+		},
+		None => crate::import::active_module_attr(name),
+	};
+	module_attr
+		.or_else(|| with_runtime(|runtime| runtime.globals.get(&name).copied()).flatten())
 }
 
 /// Call chain captured for `sys._getframe(depth)`: `chain[0]` describes the

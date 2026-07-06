@@ -213,6 +213,35 @@ pub unsafe extern "C" fn pon_call_ex(
 				}
 			}
 		}
+		// Slot-callable callee (builtin_function_or_method C functions,
+		// foreign faces) reached with keyword arguments: pon function/
+		// method/type objects carry no `tp_call`, so this only routes
+		// objects whose call protocol IS the C slot.  Materialize
+		// `(args, kwargs)` once and invoke it, mirroring `pon_call`'s
+		// Slot target on the no-keyword path (numpy's
+		// `_multiarray_umath` module functions take keyword arguments).
+		if !callee.is_null() {
+			let ty = unsafe { super::runtime_object_type(callee) };
+			if !ty.is_null() {
+				if let Some(call) = unsafe { (*ty).tp_call } {
+					let args_tuple =
+						match unsafe { function::build_tuple_from_slice(&flat_positional) } {
+							Ok(tuple) => tuple,
+							Err(message) => return return_null_with_error(message),
+						};
+					let pairs: Vec<(u32, *mut PyObject)> = flat_names
+						.iter()
+						.copied()
+						.zip(flat_values.iter().copied())
+						.collect();
+					let kwargs = match unsafe { function::build_kwargs_dict(&pairs) } {
+						Ok(dict) => dict,
+						Err(message) => return return_null_with_error(message),
+					};
+					return unsafe { call(callee, args_tuple, kwargs) };
+				}
+			}
+		}
 		match unsafe { function::call_bound_function(callee, &flat_positional, keywords, None, None) }
 		{
 			Ok(result) => result,
