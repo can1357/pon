@@ -80,7 +80,7 @@ print(repr(sysconfig.get_config_var('no_such_var_probe')))
 		lines[1].starts_with('\'') && lines[1].ends_with('\''),
 		"CFLAGS repr should be a Python string repr: {stdout}"
 	);
-	assert_eq!(lines[2], "0");
+	assert_eq!(lines[2], "1", "pon reports Py_GIL_DISABLED=1 (no-GIL runtime)");
 	assert_eq!(lines[3], "None");
 }
 
