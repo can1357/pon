@@ -26,7 +26,10 @@ pub fn link_executable(
 	command.args(objects).arg(runtime_a).arg("-o").arg(out);
 
 	if triple.binary_format == BinaryFormat::Elf {
-		command.args(["-lpthread", "-ldl", "-lm", "-lpanel", "-lncurses", "-llzma"]);
+		// glibc distros split the wide-character curses API into ncursesw/panelw;
+		// the runtime references wide symbols (e.g. `unget_wch`) so link the wide
+		// libs. macOS libncurses is wide-enabled, so its arm keeps `-lncurses`.
+		command.args(["-lpthread", "-ldl", "-lm", "-lpanelw", "-lncursesw", "-llzma"]);
 	} else if triple.binary_format == BinaryFormat::Macho {
 		command.args([
 			"-lpanel",
@@ -129,8 +132,8 @@ fn render_command(
 			"-lpthread".to_owned(),
 			"-ldl".to_owned(),
 			"-lm".to_owned(),
-			"-lpanel".to_owned(),
-			"-lncurses".to_owned(),
+			"-lpanelw".to_owned(),
+			"-lncursesw".to_owned(),
 			"-llzma".to_owned(),
 		]);
 	} else if triple.binary_format == BinaryFormat::Macho {
